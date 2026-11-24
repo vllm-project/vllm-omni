@@ -800,6 +800,7 @@ source_file_dependencies:
     - vllm_omni/platforms/npu/worker/talker_narrow_replay.py
     - vllm_omni/worker/talker_multiframe.py
     - docker/Dockerfile.npu.ci
+    - docker/install_mindiesd.sh
     - requirements/npu.txt
     - .buildkite/npu/scripts/build-npu-image.sh
     - .buildkite/npu/test-npu-nightly.yml

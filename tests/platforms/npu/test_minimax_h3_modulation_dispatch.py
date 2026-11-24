@@ -70,6 +70,7 @@ def test_rms_sdk_width_limit(mocker, width):
     [
         pytest.param(torch.bfloat16, 1e-6, 1, (1, 1), id="h3-bf16"),
         pytest.param(torch.float16, 1e-6, 1, (0, 0), id="fp16"),
+        pytest.param(torch.bfloat16, 0.0, 1, (0, 1), id="zero-eps"),
         pytest.param(torch.bfloat16, 1e-50, 1, (0, 1), id="eps-rounds-to-zero"),
         pytest.param(torch.bfloat16, 1e-6, 2, (0, 0), id="strided-columns"),
     ],
