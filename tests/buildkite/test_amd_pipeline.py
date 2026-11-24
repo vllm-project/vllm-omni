@@ -4177,9 +4177,10 @@ def test_qwen_image_21_accuracy_nightly_splits_the_qualified_case(case: str, gra
         assert f"Qwen-Image 2.1 {case} Accuracy" not in pipeline_path.read_text(encoding="utf-8")
 
 
-def test_omni_duplex_eval_is_one_nonblocking_nightly_job() -> None:
+def test_omni_duplex_eval_is_one_blocking_nightly_completion_job() -> None:
     step = _find_step("MiniCPM-o Omni-DuplexEval CI Guard", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
+    assert "rocm_diffusion_nightly_runner" in step["source_file_dependencies"]
     assert step["agent_pool"] == "mi300_2"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 240

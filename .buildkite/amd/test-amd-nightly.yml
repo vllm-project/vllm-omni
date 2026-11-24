@@ -1771,9 +1771,11 @@ steps:
       - label: "MiniCPM-o Omni-DuplexEval CI Guard"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        # The benchmark requires all 120 correction sessions to complete and be judged.
+        # The guarded runner also fails the job if a worker survives teardown.
+        grade: Blocking
         timeout_in_minutes: 240
-        source_file_dependencies: [omni_duplex_eval_ci, ci_rocm]
+        source_file_dependencies: [omni_duplex_eval_ci, ci_rocm, rocm_diffusion_nightly_runner]
         env:
           BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-omni-duplex-eval/benchmark-results"
           ACC_BENCH_RESULT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-omni-duplex-eval/accuracy"
