@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2025 Xiaomi Corporation.
+from __future__ import annotations
+
 import logging
 import os
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torchaudio
@@ -18,14 +20,15 @@ from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_CODEC_PAD_TOKEN_ID, MiMoAudioConfig
 from vllm_omni.model_executor.models.mimo_audio.cuda_graph_decoder_wrapper import CUDAGraphMiMoDecoderWrapper
 from vllm_omni.model_executor.models.mimo_audio.modeling_audio_tokenizer import MiMoAudioTokenizer
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -333,7 +336,7 @@ class MiMoAudioCodes:
     empty: int
 
     @classmethod
-    def from_tokenizer(cls, tokenizer: AutoTokenizer) -> "MiMoAudioCodes":
+    def from_tokenizer(cls, tokenizer: AutoTokenizer) -> MiMoAudioCodes:
         def idx(token: str) -> int:
             token_id = tokenizer.convert_tokens_to_ids(token)
             if not isinstance(token_id, int):
@@ -1022,6 +1025,8 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
     ) -> SamplerOutput | None:
         # code2wav stage does not need sampling, but needs to return a valid SamplerOutput to avoid CUDA errors
         # Use Sampler to handle sampling, even though the result will not be used
+        from vllm.v1.sample.sampler import Sampler
+
         if logits is None or logits.numel() == 0:
             return None
 

@@ -194,6 +194,7 @@ class ServingRealtimeRobotOpenPI:
     async def infer(self, obs: dict, *, session_id: str, reset: bool) -> ActionOutput:
         """raw obs → engine → actions."""
         # Build request, run inference through AsyncOmni
+        num_samples = _num_samples(obs)
         request = self.build_request(obs, session_id=session_id, reset=reset)
         result = None
         # OpenPI policy serving is one request -> one action reply. AsyncOmni
@@ -204,7 +205,7 @@ class ServingRealtimeRobotOpenPI:
         async for output in self.engine_client.generate(
             prompt=request.prompt,
             request_id=request.request_id,
-            sampling_params_list=self._stage_sampling_params_list(request.sampling_params),
+            sampling_params_list=self._stage_sampling_params_list(request.sampling_params, num_samples),
         ):
             if result is None or _has_actions(output) or not _has_actions(result):
                 result = output
@@ -213,11 +214,14 @@ class ServingRealtimeRobotOpenPI:
 
         return self._extract_actions(result)
 
-    def _stage_sampling_params_list(self, diffusion_params: OmniDiffusionSamplingParams) -> list[OmniSamplingParams]:
+    def _stage_sampling_params_list(
+        self, diffusion_params: OmniDiffusionSamplingParams, num_samples: int = 1
+    ) -> list[OmniSamplingParams]:
         """One sampling params entry per stage.
 
         Multi-stage policies get every other stage's deploy defaults; the
-        observation's seed applies to all stages.
+        observation's seed applies to all stages, and ``num_samples`` becomes
+        the first stage's ``n``.
         """
         from vllm_omni.entrypoints.openai.stage_params import (
             build_stage_sampling_params_list,
@@ -227,6 +231,8 @@ class ServingRealtimeRobotOpenPI:
 
         stage_configs = list(getattr(self.engine_client, "stage_configs", None) or [])
         if len(stage_configs) <= 1:
+            if num_samples > 1:
+                raise ValueError("sampling_params.n > 1 needs a multi-stage policy whose first stage samples")
             return [diffusion_params]
         params_list = build_stage_sampling_params_list(
             stage_configs,
@@ -238,6 +244,8 @@ class ServingRealtimeRobotOpenPI:
             for params in params_list:
                 if not isinstance(params, OmniDiffusionSamplingParams):
                     params.seed = diffusion_params.seed
+        if num_samples > 1:
+            params_list[0].n = num_samples
         return params_list
 
     def _next_request_id(self, session_id: str) -> str:
@@ -308,6 +316,14 @@ class ServingRealtimeRobotOpenPI:
         if isinstance(actions, Mapping):
             return {str(key): np.asarray(value, dtype=np.float32) for key, value in actions.items()}
         return np.asarray(actions, dtype=np.float32)
+
+
+def _num_samples(obs: Mapping[str, Any]) -> int:
+    """``sampling_params.n`` of an inference message: how many samples the policy returns (default 1)."""
+    n = (obs.get("sampling_params") or {}).get("n", 1)
+    if isinstance(n, bool) or not isinstance(n, (int, np.integer)) or n < 1:
+        raise ValueError(f"sampling_params.n must be a positive integer, got {n!r}")
+    return int(n)
 
 
 def _has_actions(output: OmniRequestOutput) -> bool:

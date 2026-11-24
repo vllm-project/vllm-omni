@@ -5,7 +5,13 @@ from copy import deepcopy
 
 import pytest
 
-from vllm_omni.config.stage_config import _merge_config_fields, resolve_deploy_yaml
+from vllm_omni.config.stage_config import (
+    DeployConfig,
+    StageDeployConfig,
+    _apply_platform_overrides,
+    _merge_config_fields,
+    resolve_deploy_yaml,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -35,6 +41,51 @@ def test_recursive_deploy_inheritance(tmp_path):
     merged = resolve_deploy_yaml(leaf)
     assert merged["speech_cache"] == {"nested": {"a": 1, "b": 0}}
     assert merged["async_chunk"] is False
+
+
+def test_platform_stage_engine_extras_merge_recursively():
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                engine_extras={
+                    "hf_overrides": {
+                        "runtime": {
+                            "preserved": 1,
+                            "replaced": 1,
+                        },
+                    },
+                },
+            ),
+        ],
+        platforms={
+            "rocm": {
+                "stages": [
+                    {
+                        "stage_id": 0,
+                        "engine_extras": {
+                            "hf_overrides": {
+                                "runtime": {
+                                    "replaced": 2,
+                                },
+                            },
+                        },
+                    },
+                ],
+            },
+        },
+    )
+
+    merged = _apply_platform_overrides(deploy, platform="rocm")
+
+    assert merged.stages[0].engine_extras == {
+        "hf_overrides": {
+            "runtime": {
+                "preserved": 1,
+                "replaced": 2,
+            },
+        },
+    }
 
 
 def test_single_stage_streaming_capability_uses_central_async_resolver():

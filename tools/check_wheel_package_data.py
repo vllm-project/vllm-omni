@@ -17,7 +17,6 @@ from pathlib import Path
 PACKAGE_NAME = "vllm_omni"
 RUNTIME_DATA_DIRS = (
     Path("deploy"),
-    Path("diffusion/distributed/csrc"),
     Path("model_executor/models/covo_audio/speaker_prompt"),
     Path("model_executor/models/step_audio2/assets"),
     Path("transformers_utils/chat_templates"),

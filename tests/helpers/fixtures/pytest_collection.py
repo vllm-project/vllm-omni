@@ -25,7 +25,7 @@ _CPU_PROFILE = pytest.StashKey[TimingProfile]()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
-    group = parser.getgroup("model-executor CPU qualification")
+    group = parser.getgroup("AMD CPU suite sharding")
     group.addoption("--cpu-shard-profile", help="Opt in to module-based CPU sharding with a timing profile")
     group.addoption("--cpu-shard-count", type=int, default=3)
     group.addoption("--cpu-shard-index", type=int)
@@ -67,17 +67,17 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 def _partition_cpu_suite(config: pytest.Config, items: list[pytest.Item]) -> None:
     if _CPU_PROFILE not in config.stash:
         return
+    profile = config.stash[_CPU_PROFILE]
     if any(
         not item.get_closest_marker("cpu")
         or not item.get_closest_marker("core_model")
-        or item.get_closest_marker("omni")
+        or (profile.suite == "model-executor" and item.get_closest_marker("omni"))
+        or (profile.suite == "diffusion" and any(item.get_closest_marker(f"cards_{count}") for count in range(2, 9)))
         for item in items
     ):
-        raise pytest.UsageError("CPU timing sharding requires core_model and cpu and not omni tests")
+        raise pytest.UsageError(f"CPU timing sharding requires the {profile.suite} CPU marker contract")
     try:
-        plan = build_plan(
-            [item.nodeid for item in items], config.stash[_CPU_PROFILE], config.getoption("cpu_shard_count")
-        )
+        plan = build_plan([item.nodeid for item in items], profile, config.getoption("cpu_shard_count"))
         destination = Path(config.getoption("cpu_shard_plan"))
         destination.parent.mkdir(parents=True, exist_ok=True)
         # Refuse to overwrite another shard's diagnostic output.

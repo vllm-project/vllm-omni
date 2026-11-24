@@ -9,8 +9,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+import vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs as wrapper_module
 from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import _config, _forward, _info, _model
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import WholeEulerCFMGraphWrapper
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
     BatchedToken2WavState,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav, _WorkItem
@@ -367,7 +369,7 @@ def test_epoch_policy_is_preserved(cross_turn):
 
 def _prepared_rows():
     _, core, _ = _candidate()
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 
     # A standalone CPU adapter avoids the fake graph while creating fixtures.
     backend = BatchedToken2Wav(core)
@@ -467,12 +469,37 @@ def test_direct_dispatch_routes_variable_shapes_to_ragged_backend(mismatch):
     model.backend.decode_batch.assert_not_called()
 
 
-def test_existing_npu_mixed_history_guard_is_preserved(monkeypatch):
-    from tests.model_executor.models.minicpmo_4_5.test_cuda_graph_wrapper import (
-        test_whole_euler_mixed_histories_do_not_enable_npu_arena,
+def test_whole_euler_mixed_histories_do_not_enable_npu_arena(monkeypatch: pytest.MonkeyPatch) -> None:
+    device = SimpleNamespace(type="npu")
+    wrapper = SimpleNamespace(
+        enabled=True,
+        npu_mixed_history=False,
+        device=device,
+        _stats={"calls": 0},
+        max_graph_batch=8,
+        _plan_groups=lambda batch: [(0, batch)],
+        row_offsets=False,
+        ragged_body=object(),
+        query_widths=(8,),
     )
-
-    test_whole_euler_mixed_histories_do_not_enable_npu_arena(monkeypatch)
+    monkeypatch.setattr(
+        wrapper_module, "_graph_api", lambda _: SimpleNamespace(is_current_stream_capturing=lambda: False)
+    )
+    prepare = Mock(side_effect=AssertionError("mixed NPU histories must not enter the arena"))
+    monkeypatch.setattr(wrapper_module, "_pad_query_for_capture", prepare)
+    result = WholeEulerCFMGraphWrapper.replay(
+        wrapper,
+        x=SimpleNamespace(device=device, shape=(2, 4, 8)),
+        mu_cfg=torch.zeros(4, 4, 8),
+        speakers_cfg=torch.zeros(4, 4),
+        cond_cfg=torch.zeros(4, 4, 8),
+        cnn_cache=None,
+        att_cache=[torch.zeros(1, 1, 2, 1, 1, length, 2) for length in [4, 8]],
+        valid_lengths=[8, 8],
+        attn_mask=torch.ones(4, 8, 16, dtype=torch.bool),
+    )
+    assert result is None
+    prepare.assert_not_called()
 
 
 @pytest.mark.parametrize("batch", [2, 3, 4])
@@ -517,7 +544,8 @@ def test_ragged_npu_inputs_match_independent_streams(batch):
 def test_ragged_npu_groups_allow_lengths_but_keep_hift_boundary():
     items, states, features = _prepared_rows()
     states[1].flow_cache["conformer_att_cache"] = torch.cat([states[1].flow_cache["conformer_att_cache"]] * 2, dim=3)
-    states[1].flow_cache["estimator_att_cache"] = torch.cat([states[1].flow_cache["estimator_att_cache"]] * 2, dim=4)
+    # Split K/V estimator cache: (n_t, depth, 2, rows, heads, frames, head_dim).
+    states[1].flow_cache["estimator_att_cache"] = torch.cat([states[1].flow_cache["estimator_att_cache"]] * 2, dim=5)
     features[1] = replace(
         features[1],
         speech_tokens=torch.cat([features[1].speech_tokens] * 2, dim=1),
@@ -584,8 +612,8 @@ def test_ragged_npu_staggered_final_and_fresh_request():
     ],
 )
 def test_backend_initialization_gates_actual_wrapper_flag(policy, expected, monkeypatch, tmp_path):
+    import vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav as core_module
     import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav as stage_module
-    import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav as core_module
 
     model, core, _ = _candidate()
     backend = model.backend

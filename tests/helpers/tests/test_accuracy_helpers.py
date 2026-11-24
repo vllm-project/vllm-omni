@@ -47,6 +47,40 @@ def test_similarity_thresholds_device_and_default(device_name, device_architectu
     )
 
 
+@pytest.mark.parametrize("device_name", ["Ascend910", "Ascend910_9382", "Ascend910_93"])
+def test_ascend910_device_name_aliases_to_a3_profile(device_name):
+    a3 = helpers.SimilarityThresholds(ssim=0.95, psnr=26.0)
+    cuda = helpers.SimilarityThresholds(ssim=0.98, psnr=34.6)
+    table = {"H100": cuda, "A3": a3, "default": cuda}
+    assert helpers.resolve_device_profile(device_name, profiles=table) == "A3"
+    assert helpers.resolve_similarity_thresholds(table, device_name=device_name) == a3
+
+
+@pytest.mark.parametrize("device_name", ["Ascend910B1", "Ascend910B4", "Ascend910B2"])
+def test_ascend910b_device_name_does_not_use_a3_alias(device_name):
+    a3 = helpers.SimilarityThresholds(ssim=0.95, psnr=26.0)
+    cuda = helpers.SimilarityThresholds(ssim=0.98, psnr=34.6)
+    table = {"H100": cuda, "A3": a3, "default": cuda}
+    assert helpers.resolve_device_profile(device_name, profiles=table) == "default"
+    assert helpers.resolve_similarity_thresholds(table, device_name=device_name) == cuda
+
+
+def test_explicit_profile_key_precedes_ascend910_alias():
+    a2 = helpers.SimilarityThresholds(ssim=0.96, psnr=28.0)
+    a3 = helpers.SimilarityThresholds(ssim=0.95, psnr=26.0)
+    table = {"Ascend910B": a2, "A3": a3, "default": a3}
+    assert helpers.resolve_device_profile("Ascend910B1", profiles=table) == "Ascend910B"
+    assert helpers.resolve_similarity_thresholds(table, device_name="Ascend910B1") == a2
+
+
+def test_npu_name_outside_ascend910_does_not_use_a3_profile():
+    table = {
+        "A3": helpers.SimilarityThresholds(ssim=0.95, psnr=26.0),
+        "default": helpers.SimilarityThresholds(ssim=0.98, psnr=34.6),
+    }
+    assert helpers.resolve_device_profile("Ascend310P3", profiles=table) == "default"
+
+
 def test_similarity_thresholds_use_runtime_rocm_architecture(monkeypatch):
     import vllm_omni.platforms as platforms
 

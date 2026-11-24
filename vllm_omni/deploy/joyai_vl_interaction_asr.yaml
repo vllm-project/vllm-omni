@@ -2,6 +2,7 @@
 # Audio-input variant of joyai_vl_interaction.yaml; requests without audio
 # bypass the ASR stage, so one deployment serves both kinds of requests.
 pipeline: joyai_vl_interaction_asr
+session_mode: turn
 async_chunk: false
 trust_remote_code: true
 
@@ -89,3 +90,13 @@ stages:
       top_k: -1
       max_tokens: 65536
       repetition_penalty: 1.0
+
+# Use the shared MRv2 runners on CUDA; preserve other platforms.
+platforms:
+  cuda:
+    model_runner: v2
+    stages:
+      - stage_id: 0
+        # 0.10 failed the native V2 stage-0 8K KV check on H100; 0.11 passed.
+        # The combined four-stage peak remains unmeasured.
+        gpu_memory_utilization: 0.11

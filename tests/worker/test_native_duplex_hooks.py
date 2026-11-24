@@ -3,14 +3,14 @@
 
 from __future__ import annotations
 
-import ast
-import inspect
 from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+
+from tests.model_executor.models.minicpmo_4_5.helpers import stage0_vision_runtime as _stage0_vision_runtime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -327,11 +327,10 @@ def test_minicpmo_model_hook_ignores_serving_new_user_turn_marker():
     assert torch.equal(logits, original_logits)
 
 
-def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
+def test_duplex_helper_builds_typed_sampling_rows():
     from vllm_omni.model_executor.duplex_sampling import DuplexSamplingHelper
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
-    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner = SimpleNamespace()
     runner.input_batch = SimpleNamespace(req_ids=["req-duplex", "req-plain"])
     runner.model_intermediate_buffer = {
         "req-duplex": {
@@ -360,102 +359,6 @@ def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
     assert rows[0].seq == 4
     assert rows[0].payload == {"is_speech": True}
     assert rows[0].max_tokens == 32
-
-
-def test_generic_ar_runner_skips_duplex_rows_without_model_hook():
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
-    runner = GPUARModelRunner.__new__(GPUARModelRunner)
-    runner.input_batch = SimpleNamespace(
-        sampling_metadata=object(),
-        update_async_output_token_ids=lambda: None,
-    )
-    runner.model = SimpleNamespace(sample=lambda *_args, **_kwargs: None, prefer_model_sampler=False)
-    runner.sampler = lambda **_kwargs: "standard-sampler"
-    runner._duplex_sampling_helper = SimpleNamespace(
-        active_request_ids={"req-duplex"},
-        rows=lambda *_args: pytest.fail("duplex rows built without a model hook"),
-    )
-
-    assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "standard-sampler"
-
-
-def test_plain_model_hook_resolution_does_not_allocate_duplex_tracking():
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
-    runner = GPUARModelRunner.__new__(GPUARModelRunner)
-    runner.model = SimpleNamespace()
-    runner._duplex_sampling_hook = None
-    runner._duplex_sampling_hook_resolved = False
-
-    assert runner._resolve_duplex_sampling_hook() is None
-    assert not hasattr(runner, "_duplex_sampling_helper")
-
-
-def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
-    calls = []
-    runner = GPUARModelRunner.__new__(GPUARModelRunner)
-    runner.requests = {}
-    runner.input_batch = SimpleNamespace(
-        sampling_metadata=SimpleNamespace(output_token_ids=[]),
-        update_async_output_token_ids=lambda: None,
-    )
-    runner.model = SimpleNamespace(
-        sample=lambda *_args, **_kwargs: "model-sampler",
-        prefer_model_sampler=True,
-        skips_model_sampler_output_token_history=True,
-        prepare_duplex_sampling=lambda *_args: calls.append("prepare"),
-    )
-    runner.sampler = SimpleNamespace()
-    runner._duplex_sampling_helper = SimpleNamespace(
-        active_request_ids=set(),
-        hook_active=False,
-        rows=lambda *_args: pytest.fail("non-duplex MiniCPM scanned request rows"),
-    )
-
-    assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
-    # The empty row set is still published: the model then skips its per-row prompt scan.
-    assert calls == ["prepare"]
-
-
-def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
-    calls = []
-    runner = GPUARModelRunner.__new__(GPUARModelRunner)
-    runner.requests = {}
-    runner.input_batch = SimpleNamespace(
-        sampling_metadata=SimpleNamespace(output_token_ids=[]),
-        update_async_output_token_ids=lambda: None,
-    )
-    runner.model = SimpleNamespace(
-        sample=lambda *_args, **_kwargs: "model-sampler",
-        prefer_model_sampler=True,
-        skips_model_sampler_output_token_history=True,
-        prepare_duplex_sampling=lambda _logits, _metadata, rows: calls.append(rows),
-    )
-    runner.sampler = SimpleNamespace()
-    runner._duplex_sampling_helper = SimpleNamespace(
-        active_request_ids=set(),
-        hook_active=True,
-        rows=lambda *_args: pytest.fail("duplex cleanup scanned request rows"),
-    )
-
-    assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
-    assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
-    assert calls == [(), ()]
-
-
-def test_generic_ar_runner_has_no_minicpmo_sampler_state_or_typeerror_probe():
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
-    source = inspect.getsource(GPUARModelRunner)
-
-    assert "_minicpmo45_duplex_row" not in source
-    assert "_minicpmo45_native_duplex_token_ids" not in source
-    assert 'if "duplex_rows" not in str(exc)' not in source
 
 
 def test_minicpmo_model_cleans_session_state_when_request_finishes():
@@ -502,10 +405,24 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
     torch.nn.Module.__init__(model)
     model.model_stage = "llm"
     model.thinker = _Thinker()
-    output = model.forward(
+    batch = SimpleNamespace(
+        req_ids=["req-a", "req-b"],
+        num_reqs=2,
         input_ids=torch.tensor([1, 2, 3, 4]),
-        positions=torch.arange(4),
-        runtime_additional_information=[
+        positions=torch.tensor([0, 1, 1, 2]),
+        is_prefilling_np=np.array([True, True]),
+        num_computed_prefill_tokens_np=np.array([0, 1]),
+        num_scheduled_tokens=np.array([2, 2]),
+        prefill_len_np=np.array([2, 3]),
+    )
+    hidden = model.forward(input_ids=batch.input_ids, positions=batch.positions)
+    assert isinstance(hidden, torch.Tensor)
+    # MRv2 attaches request metadata from the live batch after forward/replay.
+    output = model.make_omni_output_mrv2(
+        hidden,
+        input_batch=batch,
+        req_states=None,
+        model_intermediate_buffer=[
             {
                 "global_request_id": ["req-a"],
                 "duplex": {
@@ -523,6 +440,10 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
         ],
     )
 
+    assert output.text_hidden_states is hidden
+    assert output.multimodal_outputs["latent"] is hidden
+    torch.testing.assert_close(output.multimodal_outputs["latent_input_ids"], batch.input_ids[:, None])
+    torch.testing.assert_close(output.multimodal_outputs["latent_positions"], batch.positions[:, None])
     prompt_rows = output.multimodal_outputs["duplex_prompt_token_ids"]
     listen_rows = output.multimodal_outputs["meta"]["listen_token_id"]
     assert to_payload_element(prompt_rows, 0, 0, 2) == [101, 102]
@@ -881,9 +802,7 @@ def test_minicpmo_stage0_multi_chunk_append_matches_scheduler_window(mode, buffe
         # Keep the tiny fake processor's initial chunk unpadded to model carry.
         runtime._pad_first_audio_chunk_if_needed = lambda *args: None
         assert runtime._stage_prefill_embeddings_only(state, np.zeros(2, dtype=np.float32), seq=0)["success"] is False
-    first = runtime._stage_prefill_embeddings_only(
-        state, np.zeros(6 if buffered else 8, dtype=np.float32), seq=1, final=buffered
-    )
+    first = runtime._stage_prefill_embeddings_only(state, np.zeros(6 if buffered else 8, dtype=np.float32), seq=1)
     assert first["input_token_ids"] == [1, 11, 2, 1, 11]
     assert state.window_units == []
     assert state.pending_window_unit.token_ids == first["input_token_ids"]
@@ -1022,57 +941,28 @@ def test_minicpmo_stage0_window_uses_accepted_output_not_async_sampler_history(p
     assert 41 not in result["input_token_ids"]
 
 
-def _stage0_vision_runtime():
-    import torch
-
+@pytest.mark.parametrize("pending_terminator", [None, 3, 99])
+def test_minicpmo_stage0_without_window_reconciles_accepted_terminator(pending_terminator):
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
-        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
     )
 
-    class _StageModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed = torch.nn.Embedding(256, 2)
-
-        def get_input_embeddings(self):
-            return self.embed
-
-        def get_audio_hidden_states(self, _data):
-            return [torch.tensor([[0.5, 0.5]], dtype=torch.float32)]
-
-    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
-    runtime.stage_model = _StageModel()
-    runtime.thinker = runtime.stage_model
-    runtime.tokenizer = SimpleNamespace(
-        unk_token_id=0,
-        convert_tokens_to_ids=lambda token: {
-            "<unit>": 1,
-            "</unit>": 2,
-            "<|listen|>": 3,
-            "<|speak|>": 4,
-            "<|tts_bos|>": 5,
-            "<|tts_eos|>": 6,
-            "<|tts_pad|>": 7,
-            "<|chunk_eos|>": 8,
-            "<|chunk_tts_eos|>": 9,
-            "<|turn_eos|>": 10,
-            "<|audio|>": 11,
-            "<image>": 12,
-            "</image>": 13,
-            "<slice>": 14,
-            "</slice>": 15,
-        }.get(token, 0),
-        encode=lambda text, add_special_tokens=False: [201, 5],
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-no-window", window_enabled=False)
+    runtime._stage_prefill_embeddings_only(state, None, video_frames=[object()], seq=1)
+    # Emulate a late async sample overwriting the accepted listen boundary.
+    state.pending_terminator_token = pending_terminator
+    result = runtime._stage_prefill_embeddings_only(
+        state,
+        None,
+        video_frames=[object()],
+        seq=2,
+        stage0_window={"completed_token_ids": [], "completed_terminator_token_id": 3},
     )
-    runtime.processor = SimpleNamespace(get_streaming_chunk_size=lambda: 4)
-    runtime.device = "cpu"
-    runtime._init_token_ids()
-    # One 2-row block per frame keeps the expected token_ids readable; the real
-    # resampler emits VISION_EMBEDS_PER_FRAME rows per slice.
-    runtime._stage_vision_embeddings = lambda frames: [
-        [torch.full((2, 2), float(index), dtype=torch.float32)] for index in range(len(frames))
-    ]
-    return runtime
+    assert result["input_token_ids"][:3] == [3, 2, 1]  # listen, </unit>, <unit>
+    assert result["stage0_window_replaced"] is False
+    assert state.pending_terminator_token is None
+    assert not state.window_units
 
 
 def _minicpmo_seeded_silence_sampling_case(initial_user_text: str | None, *, force_listen_count: int = 0):
@@ -1176,9 +1066,7 @@ def test_minicpmo_seeded_text_survives_explicit_initial_listen():
 
 @pytest.mark.parametrize("initial_text", [None, "", "Please say hello.", "请说你好。"])
 @pytest.mark.parametrize("speech_envelope", [False, True])
-def test_minicpmo_seeded_context_keeps_assistant_turn_open_until_eos(initial_text, speech_envelope, mocker):
-    from vllm.v1.sample.metadata import SamplingMetadata
-
+def test_minicpmo_seeded_context_keeps_assistant_turn_open_until_eos(initial_text, speech_envelope):
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
 
     runtime = _stage0_vision_runtime()
@@ -1192,7 +1080,7 @@ def test_minicpmo_seeded_context_keeps_assistant_turn_open_until_eos(initial_tex
     logits = torch.zeros((1, 16), dtype=torch.float32)
     logits[0, 10] = 20.0
     original_logits = logits.clone()
-    sampling_metadata = mocker.Mock(spec=SamplingMetadata)
+    sampling_metadata = object()  # This policy hook does not consume sampler metadata.
     model.prepare_duplex_sampling(logits, sampling_metadata, (row,))
     token_ids = model._minicpmo45_native_duplex_token_ids_cache
     sampled = model._finalize_minicpmo45_native_duplex_sample(0, 7, token_ids)
@@ -1857,7 +1745,6 @@ def test_minicpmo_stage0_data_plane_final_first_chunk_does_not_add_silence_unit(
         state,
         np.arange(8, dtype=np.float32),
         seq=1,
-        final=True,
     )
 
     assert result["success"] is True
@@ -1941,7 +1828,6 @@ def test_minicpmo_stage0_final_does_not_promote_first_chunk_alignment_tail_to_un
         state,
         np.zeros(8, dtype=np.float32),
         seq=3,
-        final=True,
     )
 
     assert first["input_token_ids"].count(1) == 1
@@ -1990,7 +1876,7 @@ def test_minicpmo_stage0_runtime_uses_loaded_vllm_embed_tokens_when_get_input_em
 
 
 def test_minicpmo_remote_config_patch_handles_nested_and_dict_configs():
-    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.config import (
         patch_minicpmo_remote_config,
     )
 
@@ -2785,6 +2671,7 @@ def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
 
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model_stage = "llm"
+    model.max_speak_chars_per_chunk = 28
     model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
     vocab_size = 151723
     candidate = 202
@@ -2803,7 +2690,8 @@ def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
 
     sampled = model.sample(logits, sampling_metadata)
 
-    assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK == 28
+    assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK == 0
+    assert model.max_speak_chars_per_chunk == 28
     assert sampled is not None
     # Keep the complete token that reaches the soft character target.
     assert sampled.sampled_token_ids.tolist() == [[candidate]]
@@ -3017,131 +2905,6 @@ def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
 
     assert state.context_token_ids == [1, 2, 3, 151683, 151683, 4, 5]
     assert len(state.context_embeds) == 6
-
-
-# ---------------------------------------------------------------------------
-# Cross-platform wiring: every AR model runner must reach the duplex hook.
-#
-# GPUARModelRunner and NPUARModelRunner are siblings -- neither inherits the
-# other's _sample -- so the NPU runner once copied GPU _sample without the
-# prepare_duplex_sampling call. Parse source instead of importing NPUARModelRunner:
-# that class needs vllm_ascend, which CPU test images do not have.
-# ---------------------------------------------------------------------------
-
-_REQUIRED_DUPLEX_CALLS = {
-    "__init__": "_init_duplex_sampling_state",
-    "load_model": "_resolve_duplex_sampling_hook",
-    "_update_states": "_update_duplex_sampling_states",
-    "_sample": "_apply_duplex_sampling",
-}
-
-_MODEL_SAMPLER_CALL = "call_model_sampler"
-
-
-def _repo_root():
-    from pathlib import Path
-
-    return Path(__file__).parents[2]
-
-
-def _ar_runner_sources():
-    root = _repo_root()
-    paths = [root / "vllm_omni/worker/gpu_ar_model_runner.py"]
-    paths.extend(sorted(root.glob("vllm_omni/platforms/*/worker/*_ar_model_runner.py")))
-    return paths
-
-
-def _ar_runner_classdefs():
-    root = _repo_root()
-    found = {}
-    for path in _ar_runner_sources():
-        module = ast.parse(path.read_text())
-        for node in module.body:
-            if isinstance(node, ast.ClassDef) and node.name.endswith("ARModelRunner"):
-                found[node.name] = (node, str(path.relative_to(root)))
-    assert found, "no AR model runners discovered; the glob in _ar_runner_sources() is stale"
-    return found
-
-
-def _method_calls(method):
-    calls: dict[str, int] = {}
-    for node in ast.walk(method):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            calls.setdefault(node.func.attr, node.lineno)
-    return calls
-
-
-def _wires_duplex_sampling_directly(classdef) -> bool:
-    bases = {base.id for base in classdef.bases if isinstance(base, ast.Name)}
-    if "DuplexSamplingRunnerMixin" not in bases:
-        return False
-    methods = {node.name: node for node in classdef.body if isinstance(node, ast.FunctionDef)}
-    return all(
-        method_name in methods and required_call in _method_calls(methods[method_name])
-        for method_name, required_call in _REQUIRED_DUPLEX_CALLS.items()
-    )
-
-
-def test_every_ar_runner_reaches_the_duplex_sampling_hook():
-    classdefs = _ar_runner_classdefs()
-    wired = {name for name, (classdef, _path) in classdefs.items() if _wires_duplex_sampling_directly(classdef)}
-
-    for class_name, (classdef, path) in sorted(classdefs.items()):
-        if class_name in wired:
-            continue
-        base_names = {base.id for base in classdef.bases if isinstance(base, ast.Name)}
-        assert base_names & wired, (
-            f"{path}::{class_name} neither wires the duplex sampling hook nor derives from a "
-            f"runner that does (wired runners: {sorted(wired)}).  Inherit DuplexSamplingRunnerMixin "
-            f"and call {sorted(_REQUIRED_DUPLEX_CALLS.values())} from "
-            f"{sorted(_REQUIRED_DUPLEX_CALLS)} respectively."
-        )
-
-
-@pytest.mark.parametrize("class_name", ["GPUARModelRunner", "NPUARModelRunner"])
-def test_ar_runner_calls_every_duplex_sampling_hook_site(class_name: str):
-    classdefs = _ar_runner_classdefs()
-    assert class_name in classdefs, f"{class_name} not found by _ar_runner_sources()"
-    classdef, path = classdefs[class_name]
-
-    bases = {base.id for base in classdef.bases if isinstance(base, ast.Name)}
-    assert "DuplexSamplingRunnerMixin" in bases, (
-        f"{path}::{class_name} must inherit DuplexSamplingRunnerMixin so the duplex "
-        f"sampling hook is wired the same way on every platform"
-    )
-
-    methods = {node.name: node for node in classdef.body if isinstance(node, ast.FunctionDef)}
-    for method_name, required_call in _REQUIRED_DUPLEX_CALLS.items():
-        method = methods.get(method_name)
-        assert method is not None, f"{path}::{class_name}.{method_name} is missing; it must call {required_call}"
-        calls = _method_calls(method)
-        assert required_call in calls, f"{path}::{class_name}.{method_name} must call self.{required_call}"
-
-
-@pytest.mark.parametrize("class_name", ["GPUARModelRunner", "NPUARModelRunner"])
-def test_ar_runner_applies_duplex_sampling_before_the_model_sampler(class_name: str):
-    classdef, path = _ar_runner_classdefs()[class_name]
-    sample = next(node for node in classdef.body if isinstance(node, ast.FunctionDef) and node.name == "_sample")
-
-    apply_lineno = _method_calls(sample).get("_apply_duplex_sampling")
-    sampler_lineno = next(
-        (
-            node.lineno
-            for node in ast.walk(sample)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == _MODEL_SAMPLER_CALL
-        ),
-        None,
-    )
-    assert apply_lineno is not None, f"{path}::{class_name}._sample must call self._apply_duplex_sampling"
-    assert sampler_lineno is not None, (
-        f"{path}::{class_name}._sample no longer calls {_MODEL_SAMPLER_CALL}(); update _MODEL_SAMPLER_CALL "
-        f"so the ordering check keeps testing something"
-    )
-    assert apply_lineno < sampler_lineno, (
-        f"{path}::{class_name}._sample calls self._apply_duplex_sampling at line {apply_lineno}, after "
-        f"{_MODEL_SAMPLER_CALL}() at line {sampler_lineno}.  The hook masks the logits and publishes the "
-        f"row -> session map the sampler reads, so running it afterwards is a silent no-op."
-    )
 
 
 class _NativeDuplexTokenizer:

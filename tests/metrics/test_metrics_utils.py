@@ -8,13 +8,18 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.utils import (
     count_audio_chunk_frames,
     count_audio_frames,
     count_image_pixels,
     count_tokens_from_outputs,
     count_video_frames,
+    diffusion_output_metrics,
+    extract_diffusion_scheduler_wait_ms,
     extract_diffusion_vae_decode_ms,
+    iter_mm_outputs,
+    iter_request_output_items,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -75,6 +80,23 @@ def test_count_audio_frames_supports_model_outputs() -> None:
 @pytest.mark.parametrize("mm_out", [{}, {"audio": None}, {"model_outputs": None}])
 def test_count_audio_frames_returns_zero_without_audio(mm_out: dict[str, object]) -> None:
     assert count_audio_frames(mm_out) == 0
+
+
+def test_request_output_items_normalize_scalar_pooling_output() -> None:
+    pooling_output = SimpleNamespace(data=SimpleNamespace(shape=(2, 2)))
+    request_output = SimpleNamespace(outputs=pooling_output)
+
+    assert iter_request_output_items(request_output) == (pooling_output,)
+    assert iter_mm_outputs(request_output) == []
+
+
+def test_iter_mm_outputs_preserves_scalar_multimodal_output() -> None:
+    payload = {"audio": [1, 2, 3]}
+    request_output = SimpleNamespace(
+        outputs=SimpleNamespace(multimodal_output=payload),
+    )
+
+    assert iter_mm_outputs(request_output) == [payload]
 
 
 @pytest.mark.parametrize(
@@ -170,3 +192,27 @@ def test_extract_vae_decode_ms_ignores_other_targets(durations: dict[str, float]
 def test_extract_vae_decode_ms_without_stage_durations() -> None:
     # Pipelines pass stage_durations=None when the profiler is off.
     assert extract_diffusion_vae_decode_ms(DiffusionOutput(stage_durations=None)) is None
+
+
+def test_diffusion_output_metrics_reads_dict_or_first_list_entry() -> None:
+    assert diffusion_output_metrics(SimpleNamespace(metrics={"k": 1})) == {"k": 1}
+    assert diffusion_output_metrics(SimpleNamespace(metrics=[{"k": 2}, {"k": 3}])) == {"k": 2}
+    assert diffusion_output_metrics(SimpleNamespace(metrics=[])) == {}
+    assert diffusion_output_metrics(SimpleNamespace()) == {}
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        (SimpleNamespace(metrics={metric_defs.SCHEDULER_QUEUE_WAIT_MS: 125.0}), 125.0),
+        (SimpleNamespace(metrics={metric_defs.SCHEDULER_QUEUE_WAIT_MS: 0}), 0.0),
+        (SimpleNamespace(metrics={}), None),
+        (SimpleNamespace(), None),
+    ],
+)
+def test_extract_diffusion_scheduler_wait_ms(output: object, expected: float | None) -> None:
+    wait_ms = extract_diffusion_scheduler_wait_ms(output)
+    if expected is None:
+        assert wait_ms is None
+    else:
+        assert wait_ms == pytest.approx(expected)

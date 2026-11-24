@@ -7,9 +7,11 @@ import logging
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
+from vllm.config import ModelConfig
 
 from tests.engine.duplex.test_session_runner import (
     SESSION_ID,
@@ -100,10 +102,12 @@ def test_capabilities_advertise_image_items_not_append_frames():
 
 async def open_qwen(
     *,
+    collect_stats=False,
     calibrate=None,
     calibration_timeout_ms=1000,
     history_max_bytes=8 * 1024 * 1024,
     requires_audio=True,
+    history_policy=None,
     **config_overrides: Any,
 ):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
@@ -121,6 +125,8 @@ async def open_qwen(
         output_sink=output,
         result_sink=results,
         runtime_config=DuplexSessionRuntimeConfig(
+            model_custom_options={} if history_policy is None else {"history_policy": history_policy},
+            collect_stats=collect_stats,
             history_calibration_timeout_ms=calibration_timeout_ms,
             history_audio_max_bytes_per_session=history_max_bytes,
         ),
@@ -302,6 +308,31 @@ async def test_note_published_failure_closes_the_unpublished_call():
         assert _published_call(events, "call_paris") == []
         assert any(event.type == "session.closed" for event in events)
         assert h.runner.tool_calls.record("call_paris") is None
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("collect_stats", "history_policy"), [(False, None), (True, None), (True, "recent")])
+async def test_session_stats_tag_the_qwen_prompt_for_stage_work(collect_stats, history_policy):
+    from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer
+
+    h = await open_qwen(collect_stats=collect_stats, history_policy=history_policy)
+    try:
+        assert h.manager.runtime_config.model_custom_options == (
+            {} if history_policy is None else {"history_policy": history_policy}
+        )
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        chunk = perf_chunk_from_buffer(prompt.get("model_intermediate_buffer"))
+        if collect_stats:
+            assert h.session.perf is not None
+            (turn,) = h.session.perf.snapshot()["turns"]
+            assert chunk == (turn["epoch"], turn["chunks"][0]["seq"])
+        else:
+            assert chunk is None
+            assert "model_intermediate_buffer" not in prompt
     finally:
         await h.manager.shutdown()
 
@@ -528,10 +559,13 @@ async def test_prepare_runtime_config_rejects_an_unknown_voice_at_open():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
     # ``prepare_runtime_config`` only loads a processor when this is unset.
     plugin.processor = SimpleNamespace()
-    model_config = SimpleNamespace(
+    model_config = Mock(
+        spec=ModelConfig,
         hf_config=SimpleNamespace(talker_config=SimpleNamespace(speaker_id={"Chelsie": 1})),
         model="qwen",
         trust_remote_code=True,
+        max_model_len=4096,
+        multimodal_config=None,
     )
 
     with pytest.raises(DuplexRuntimeConfigError, match="Invalid speaker 'nova'") as exc_info:
@@ -832,6 +866,7 @@ def test_format_history_merges_user_parts_but_preserves_empty_assistant_boundary
 
 def test_audio_byte_budget_evicts_whole_multimodal_turn():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     state = plugin.create_session_state()
     first = {"role": "user", "content": [{"type": "audio_url"}]}
     image = {"role": "user", "content": [{"type": "image_url"}]}
@@ -852,6 +887,7 @@ def test_audio_byte_budget_evicts_whole_multimodal_turn():
 
 def test_audio_history_is_bounded_and_does_not_cross_sessions():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     state, other = plugin.create_session_state(), plugin.create_session_state()
     history = []
     for i in range(6):
@@ -871,6 +907,7 @@ def test_audio_history_is_bounded_and_does_not_cross_sessions():
 @pytest.mark.parametrize("assistant_text", ["", "previous answer"])
 def test_dropped_audio_removes_its_image_and_assistant(assistant_text):
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     state = plugin.create_session_state()
     image = {"role": "user", "content": [{"type": "image_url"}]}
     history = [image]
@@ -1468,7 +1505,7 @@ async def test_multiple_commits_before_response_keep_one_combined_audio_in_histo
 async def test_multimodal_turn_is_merged_retained_and_evicted_with_its_answer(image_after_commit):
     from vllm_omni.engine.duplex.commands import CreateItem
 
-    h = await open_qwen()
+    h = await open_qwen(history_policy="recent")
     try:
         for turn in range(6):
             if turn == 0 and not image_after_commit:
@@ -1584,7 +1621,7 @@ async def test_one_item_carrying_both_speech_and_a_picture_keeps_both():
 async def test_image_limit_rejects_atomically_and_delete_reclaims_capacity():
     from vllm_omni.engine.duplex.commands import CreateItem, DeleteItem
 
-    h = await open_qwen()
+    h = await open_qwen(history_policy="recent")
     try:
         for i in range(8):
             await h.run(CreateItem(item=image_item(f"camera_{i}")))
@@ -1607,6 +1644,7 @@ def test_prompt_holds_stored_images_to_the_stage_limit():
     positionally.
     """
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: repr(messages))
     url = "data:image/jpeg;base64," + camera_frame()
     history: list[dict[str, Any]] = [

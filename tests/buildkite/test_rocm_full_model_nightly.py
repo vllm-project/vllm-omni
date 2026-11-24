@@ -19,7 +19,9 @@ RUNNER = Path(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
     ("overrides", "expected_status", "executes_tests"),
     [
         ({}, 0, True),
+        ({"ROCM_E2E_RUN_LEVEL": "core_model"}, 0, True),
         ({"MODEL_KIND": "tts"}, 0, True),
+        ({"ROCM_E2E_LEVEL_MARKER": "slow", "ROCM_E2E_TIMEOUT_MINUTES": "75"}, 0, True),
         ({"COLLECTED": "0"}, 1, False),
         ({"COLLECTED": "4"}, 1, False),
         ({"COLLECTION_STATUS": "2"}, 2, False),
@@ -36,7 +38,9 @@ RUNNER = Path(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
     ],
     ids=[
         "pass",
+        "core-model-run-level",
         "tts-pass",
+        "weekly-marker-and-timeout",
         "empty-collection",
         "missing-case",
         "collection-error",
@@ -84,6 +88,7 @@ def test_nightly_runner_fails_closed(
     )
     executable(
         "timeout",
+        'printf "%s\\n" "$@" >> "$STATE/timeout-args"\n'
         'shift 3\nif [[ "$1" == pytest && "$TIMEOUT_STATUS" != 0 ]]; then exit "$TIMEOUT_STATUS"; fi\nexec "$@"\n',
     )
     executable(
@@ -120,11 +125,22 @@ def test_nightly_runner_fails_closed(
         "TIMEOUT_STATUS": "0",
         "LEAK": "0",
         "PS_FAILURE": "0",
+        "ROCM_E2E_RUN_LEVEL": "full_model",
         "MODEL_KIND": "omni",
+        "ROCM_E2E_LEVEL_MARKER": "full_model",
+        "ROCM_E2E_TIMEOUT_MINUTES": "105",
         **overrides,
     }
     result = subprocess.run(
-        ["bash", str(RUNNER), "tests/fake.py", "5", env["MODEL_KIND"], "nightly-test"],
+        [
+            "bash",
+            str(RUNNER),
+            "tests/fake.py",
+            "5",
+            env["MODEL_KIND"],
+            "nightly-test",
+            "tests/fake_extra.py",
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -133,10 +149,18 @@ def test_nightly_runner_fails_closed(
     assert result.returncode == expected_status, result.stdout + result.stderr
     assert (tmp_path / "executed").exists() == executes_tests
     args = (tmp_path / "pytest-args").read_text()
-    assert f"full_model and {env['MODEL_KIND']} and rocm and MI325 and cards_1 and not nvidia_only" in args
-    assert "--run-level\nfull_model\n" in args
+    assert (
+        f"{env['ROCM_E2E_LEVEL_MARKER']} and {env['MODEL_KIND']} and rocm and MI325 and cards_1 and not nvidia_only"
+        in args
+    )
+    assert "tests/fake.py\ntests/fake_extra.py\n" in args
+    assert f"--run-level\n{env['ROCM_E2E_RUN_LEVEL']}\n" in args
     assert "--shard-id\n0\n--num-shards\n1\n" in args
+    collection_succeeded = env["COLLECTED"] == "5" and env["COLLECTION_STATUS"] == "0"
+    if collection_succeeded:
+        assert f"{env['ROCM_E2E_TIMEOUT_MINUTES']}m" in (tmp_path / "timeout-args").read_text()
     inventory = (tmp_path / "artifacts/nightly-test/runtime-inventory.txt").read_text()
     assert "buildkite_commit=fixture-buildkite-commit" in inventory
+    assert "target=tests/fake.py\ntarget=tests/fake_extra.py\n" in inventory
     assert "checkout_head=" not in inventory
     assert (tmp_path / "artifacts/nightly-test/process-cleanup.txt").exists() != (overrides.get("PS_FAILURE") == "1")

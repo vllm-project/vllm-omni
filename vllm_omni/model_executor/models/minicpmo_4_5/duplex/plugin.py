@@ -18,6 +18,7 @@ from base64 import b64decode
 from binascii import Error as BinasciiError
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -36,8 +37,10 @@ from vllm_omni.engine.duplex.contracts import (
 )
 from vllm_omni.engine.duplex.intermediate import build_duplex_append_prompt
 from vllm_omni.engine.duplex.plugin import (
+    DefaultDuplexModelSessionState,
     DuplexModelPlugin,
     DuplexRuntimeConfigError,
+    DuplexUnitOutputs,
     EncodeAudio,
     reject_changed_runtime_value,
     reject_private_runtime_keys,
@@ -52,15 +55,13 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import (
     minicpmo45_native_capabilities,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
-    MiniCPMO45DataPlaneContext,
     MiniCPMO45DataPlaneSession,
+    is_last_tts_chunk,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import MiniCPMO45PcmAppendBuffer
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     MiniCPMO45DuplexPolicy,
     MiniCPMO45DuplexWindowConfig,
-)
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.session import (
-    MiniCPMO45ServingSessionState,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     load_default_prompt_audio,
@@ -69,6 +70,18 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
     from vllm.config import ModelConfig
+
+
+@dataclass(slots=True)
+class MiniCPMO45ServingSessionState(DefaultDuplexModelSessionState):
+    """Mutable model-owned state of one MiniCPM duplex session (owned by the session runner).
+
+    The runner-facing flag contract lives on ``DefaultDuplexModelSessionState``;
+    MiniCPM-o only binds its ~1 s PCM unit buffer.
+    """
+
+    audio_buffer: MiniCPMO45PcmAppendBuffer = field(default_factory=MiniCPMO45PcmAppendBuffer)
+
 
 _DUPLEX_CHUNK_SAMPLES = 16000
 _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
@@ -416,8 +429,8 @@ def _stage0_stop_token_ids(tokenizer: PreTrainedTokenizerBase | None) -> list[in
         "chunk_tts_eos_token_id",
         "listen_token_id",
     )
-    for field in stop_token_fields:
-        token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field]
+    for field_name in stop_token_fields:
+        token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field_name]
         token_id = _convert_token_to_id(tokenizer, token)
         if token_id is not None and token_id not in out:
             out.append(token_id)
@@ -610,11 +623,25 @@ def _apply_default_scheduler_policy(
         runtime_config["duplex_vision_tile_pixels"] = tile_pixels
 
 
+def _count(state: dict[str, object], key: str) -> int:
+    """A counter kept in the input clock's per-session plugin ``state`` (fresh after every cancel)."""
+    value = state.get(key, 0)
+    return value if isinstance(value, int) else 0
+
+
 class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     """MiniCPM-owned sampling policy, append planning, session state and output projection."""
 
     plugin_id = "minicpmo45"
     private_runtime_config_keys = PRIVATE_RUNTIME_CONFIG_KEYS
+    #: Input-clocked sessions: a unit is one 1 s chunk Stage 0 decides;
+    #: ``unit_output_complete`` below finds where Code2Wav's audio for a
+    #: speaking unit ends. Audio only: a committed turn with video frames is
+    #: split into separate VISION units (``prepare_commit_prefix``), which
+    #: the clock does not account for when the commit is deferred behind a
+    #: response.
+    supports_input_clock = True
+    input_clock_input_modalities = frozenset({"audio"})
     silence_continuation_samples = 16000
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
@@ -692,6 +719,52 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
                 final=final,
             )
         )
+
+    def unit_output_complete(
+        self,
+        *,
+        unit: DuplexUnitOutputs | None,
+        final_stage_id: int,
+        new_output: object | None,
+        new_context: object | None,
+        state: dict[str, object],
+        runtime_config: Mapping[str, object],
+    ) -> bool:
+        """Code2Wav streams across unit boundaries without marking a segment end per unit.
+
+        The Talker->Code2Wav connector forwards whole codec windows as they
+        fill and, at every Talker segment end (one per unit), flushes the rest
+        as one chunk flagged ``tts_is_last_chunk`` (an empty marker when
+        nothing is left). Code2Wav echoes the flag on its output. A speaking
+        unit is therefore complete once its Talker segment has ended and a
+        flagged Code2Wav output was credited to it. The orchestrator reads
+        each stage's stream independently, so the two may arrive in either
+        order, and the flushes of several queued units may all arrive before
+        the first Talker segment end; the engine hands every final-stage
+        output to the oldest speaking unit. The flags are therefore counted in
+        ``state`` and consumed in unit order, one per completed unit: the
+        n-th flagged output belongs to the n-th speaking unit of the epoch.
+        (Output that overtakes the unit's Stage-0 segment end is held by the
+        engine and handed over once the unit speaks.) A Code2Wav segment end
+        alone does not complete a unit: the flag is per unit, while a segment
+        end can also be a trailing control-only snapshot of the previous unit
+        (a repeated turn end), which the engine would otherwise credit to the
+        next unit.
+        """
+        del final_stage_id, new_context, runtime_config
+        if unit is None:
+            return False
+        flushes = _count(state, "code2wav_flushes")
+        if new_output is not None and is_last_tts_chunk(_multimodal_output(new_output, _first_completion(new_output))):
+            flushes += 1
+            state["code2wav_flushes"] = flushes
+        if not unit.upstream_segment_finished:
+            return False
+        completed = _count(state, "completed_units")
+        if flushes <= completed:
+            return False
+        state["completed_units"] = completed + 1
+        return True
 
     def decide_output(
         self,
@@ -893,29 +966,6 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             return MiniCPMO45DuplexWindowConfig.from_mapping(provided)
         except ValueError as exc:
             raise MiniCPMO45ClientRuntimeConfigError(str(exc), code="invalid_sliding_window_config") from exc
-
-    def data_plane_context(
-        self,
-        *,
-        epoch: int,
-        turn_id: int,
-        active_response_turn_id: int | None,
-        active_response_id: str | None,
-        auto_responds: bool,
-        response_format: str,
-        speed: float | None,
-        modalities: tuple[str, ...],
-    ) -> MiniCPMO45DataPlaneContext:
-        return MiniCPMO45DataPlaneContext(
-            epoch=epoch,
-            turn_id=turn_id,
-            active_response_turn_id=active_response_turn_id,
-            active_response_id=active_response_id,
-            auto_responds=auto_responds,
-            response_format=response_format,
-            speed=speed,
-            modalities=modalities,
-        )
 
 
 __all__ = [

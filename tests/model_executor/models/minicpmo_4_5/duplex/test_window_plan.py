@@ -2,16 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU accounting tests for the MiniCPM-o 4.5 duplex KV window planner.
 
-Pure integer/complex math: no engine, no checkpoint, no GPU. Two claims carry
-the design and each gets pinned here: a block-aligned shift leaves every retained
-row in the physical slot it already occupies (so a trim moves no memory), and
-rotating a cached key by ``-delta`` equals RoPE at the renumbered position (so a
-trim needs no forward pass).
+Pure integer math: no engine, no checkpoint, no GPU. These tests cover
+window planning and the block-aligned shift that keeps retained rows in
+their physical slots. Runtime key rotation is covered in test_window_wiring.py.
 """
 
 from __future__ import annotations
-
-import cmath
 
 import pytest
 
@@ -22,7 +18,6 @@ try:
         align_up,
         cdiv,
         plan_position_reanchor,
-        reanchor_positions,
         unit_starts,
     )
 except (ImportError, ModuleNotFoundError):
@@ -48,7 +43,6 @@ except (ImportError, ModuleNotFoundError):
     align_up = _wp.align_up
     cdiv = _wp.cdiv
     plan_position_reanchor = _wp.plan_position_reanchor
-    reanchor_positions = _wp.reanchor_positions
     unit_starts = _wp.unit_starts
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -145,7 +139,7 @@ def test_the_shift_is_a_whole_number_of_pages_so_no_row_moves():
 
     for position in range(plan.moved_from, 64 * BLOCK):
         before = divmod(position, BLOCK)
-        after = divmod(reanchor_positions(position, plan), BLOCK)
+        after = divmod(position - plan.delta, BLOCK)
         assert table_before[before[0]] == table_after[after[0]]
         assert before[1] == after[1]
 
@@ -183,27 +177,6 @@ def test_unit_aligned_cut_rejects_non_page_aligned_units():
     assert plan is None
 
 
-def test_reanchor_is_a_uniform_translation_of_the_tail():
-    geometry = _geometry(high_watermark_tokens=96)
-    plan = plan_position_reanchor(geometry, computed_tokens=200, pending_tokens=20)
-    assert plan is not None
-    assert plan.delta == plan.moved_from - plan.sink_end
-
-    assert reanchor_positions(3, plan) == 3
-    tail_old = plan.moved_from + 5
-    tail_new = reanchor_positions(tail_old, plan)
-    assert tail_new == tail_old - plan.delta
-    # Relative distances inside the tail are untouched by definition, which is
-    # what lets one rotation fix every pair at once.
-    assert reanchor_positions(plan.moved_from + 37, plan) - tail_new == 32
-    # The reclaimed range is dense: the tail lands exactly on the sink's end.
-    assert reanchor_positions(plan.moved_from, plan) == plan.sink_end
-
-    for dropped in (plan.sink_end, plan.moved_from - 1):
-        with pytest.raises(ValueError, match="dropped"):
-            reanchor_positions(dropped, plan)
-
-
 def test_reanchor_declines_when_there_is_nothing_left_to_reclaim():
     geometry = _geometry(high_watermark_tokens=96)
     # Target at or past the projected length: compacting would not help, so the
@@ -214,35 +187,6 @@ def test_reanchor_declines_when_there_is_nothing_left_to_reclaim():
     plan = plan_position_reanchor(geometry, computed_tokens=100, pending_tokens=20, target_tokens=20)
     assert plan is not None
     assert plan.sink_end >= geometry.prefix_tokens
-    assert reanchor_positions(2, plan) == 2
-
-
-@pytest.mark.parametrize("head_dim", [8, 16])
-@pytest.mark.parametrize("delta", [4, 64, 1024])
-def test_rotating_cached_keys_equals_rope_at_the_new_position(head_dim: int, delta: int):
-    """The other half of the claim: the rotation is the re-RoPE.
-
-    A key written at position ``p`` holds ``z * exp(i * p * f)`` per frequency
-    pair. Re-anchoring to ``p - delta`` can therefore be done on the cached
-    tensor by rotating ``-delta * f`` -- no recompute of the model, and exact for
-    any p, including a tail whose keys were written at different positions.
-    """
-    plan = PositionReanchor(delta=delta, moved_from=4096, sink_blocks=4096 // BLOCK)
-    inv_freq = [0.5 ** (2.0 * i / head_dim) for i in range(head_dim // 2)]
-    rng = iter(range(1, 10_000))
-    for pair, freq in enumerate(inv_freq):
-        re = complex(next(rng) % 7 - 3, next(rng) % 7 - 3)
-        for position in (plan.moved_from + 1, plan.moved_from + 3 * pair + 17, 999_999):
-            cached = re * cmath.exp(1j * position * freq)
-            rotated = cached * cmath.exp(1j * plan.rope_angle_shift_tokens * freq)
-            direct = re * cmath.exp(1j * reanchor_positions(position, plan) * freq)
-            assert rotated == pytest.approx(direct, rel=1e-9, abs=1e-12), f"pair {pair} at {position}"
-
-
-def test_reanchor_rejects_a_fractional_position():
-    plan = PositionReanchor(delta=8, moved_from=64, sink_blocks=16)
-    with pytest.raises(ValueError, match="integer"):
-        reanchor_positions(70.5, plan)
 
 
 # Realistic Stage 0 numbers: a ~100-token head context, the 6000-token low
@@ -378,19 +322,3 @@ def test_paged_retention_policy_vs_unpaged_reference():
     assert plan.moved_from == 128
     assert plan.sink_blocks == 7
     assert plan.sink_end == 112
-
-    # Verify position mapping:
-    # Sink prefix [0..100) unchanged
-    assert reanchor_positions(0, plan) == 0
-    assert reanchor_positions(99, plan) == 99
-    # Paged sink tail [100..112) unchanged
-    assert reanchor_positions(100, plan) == 100
-    assert reanchor_positions(111, plan) == 111
-    # Dropped span [112..128) raises ValueError
-    with pytest.raises(ValueError, match="was dropped by reanchor"):
-        reanchor_positions(112, plan)
-    with pytest.raises(ValueError, match="was dropped by reanchor"):
-        reanchor_positions(127, plan)
-    # Retained tail [128..164) shifts by -delta (-16)
-    assert reanchor_positions(128, plan) == 112
-    assert reanchor_positions(163, plan) == 147

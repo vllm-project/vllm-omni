@@ -58,6 +58,12 @@ def _write(path: Path, value: Any) -> None:
         temporary.unlink(missing_ok=True)
 
 
+# Judge frames are sent at source resolution unless bounded. Image tokens grow
+# with pixel count, so 4K frames overflow a 64K-token judge after ~10 frames
+# (#7375). 1920 keeps 1080p and smaller frames unchanged.
+DEFAULT_JUDGE_FRAME_MAX_SIDE = 1920
+
+
 def _text(items: list[dict[str, Any]]) -> str:
     return " ".join(str(item.get("sentence", item.get("text", ""))).strip() for item in items).strip()
 
@@ -88,6 +94,7 @@ def evaluate_sample(
     *,
     judge_fps: int = 2,
     judge_video_mode: str = "video_url",
+    judge_frame_max_side: int | None = DEFAULT_JUDGE_FRAME_MAX_SIDE,
     window_size: float = 10.0,
     allow_invalid_clock: bool = False,
 ) -> dict[str, Any]:
@@ -117,6 +124,7 @@ def evaluate_sample(
             parse_error = str(exc)
         _trace({"raw_response": raw_response, "error": parse_error})
         if parse_error is None:
+            assert parsed is not None
             return parsed
         # The judge can answer in prose instead of the required score JSON, or
         # with a malformed value in a field that is present; echo the offending
@@ -161,6 +169,7 @@ def evaluate_sample(
         "response_meta": meta,
         "judge_model": getattr(judge, "model", None),
         "judge_video_mode": judge_video_mode,
+        "judge_frame_max_side": judge_frame_max_side,
     }
     if sample.family == "rtd":
         items = normalize_response_items(raw)
@@ -182,7 +191,7 @@ def evaluate_sample(
                     }
                 )
                 continue
-            frames = _extract_frames(video_path, _times(*window, fps=judge_fps))
+            frames = _extract_frames(video_path, _times(*window, fps=judge_fps), max_side=judge_frame_max_side)
             parsed = judge_result(
                 lambda **kw: judge.temporal(
                     build_temporal_prompt(*window, item["sentence"], sample.question_text), frames, **kw
@@ -203,7 +212,7 @@ def evaluate_sample(
             )
         content_frames = None
         if judge_video_mode == "frame-sample":
-            content_frames = _extract_frames(video_path, _content_frame_times(duration))
+            content_frames = _extract_frames(video_path, _content_frame_times(duration), max_side=judge_frame_max_side)
         content_prompt = build_content_prompt(
             _text(items), sample.question_text, _gt_references([sample.answer1, sample.answer2])
         )
@@ -219,7 +228,7 @@ def evaluate_sample(
             # whole video is passed through (video_url mode): the judge answers
             # HTTP 400 "Input length (83158) exceeds model's maximum context
             # length (65536)" (#9089).  Degrade that single content call to the
-            # bounded frame-sample path instead of failing the whole run.
+            # frame-sample path instead of failing the whole run.
             if judge_video_mode != "video_url" or not _is_judge_context_length_error(exc):
                 raise
             logger.warning(
@@ -227,7 +236,7 @@ def evaluate_sample(
                 "retrying the content prompt in frame-sample mode",
                 sample.id,
             )
-            content_frames = _extract_frames(video_path, _content_frame_times(duration))
+            content_frames = _extract_frames(video_path, _content_frame_times(duration), max_side=judge_frame_max_side)
             if not content_frames:
                 # Nothing to fall back to: keep the original judge error.
                 raise
@@ -314,12 +323,12 @@ def _is_judge_context_length_error(exc: BaseException) -> bool:
     return "input length" in text and "exceed" in text
 
 
-def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
+def _extract_frames(path: str | Path, timestamps: list[float], *, max_side: int | None = None) -> list[bytes]:
     """Extract only decodable JPEG frames; clips can end on non-keyframes."""
     frames = []
     for timestamp in timestamps:
         try:
-            frame = extract_jpeg(path, timestamp=timestamp)
+            frame = extract_jpeg(path, timestamp=timestamp, max_side=max_side)
         except (OSError, ValueError):
             continue
         if frame.startswith(b"\xff\xd8"):
@@ -328,7 +337,12 @@ def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
 
 
 def _content_frame_times(duration: float) -> list[float]:
-    """Sample the full video at approximately one frame every three seconds."""
+    """Sample the full video at approximately one frame every three seconds.
+
+    The count is not capped. The ``video_url`` overflow fallback sends this
+    whole list, so a long clip can exceed the judge context again. That second
+    error is not caught and fails the sample.
+    """
     if duration <= 0:
         return []
     times = []
@@ -336,11 +350,6 @@ def _content_frame_times(duration: float) -> list[float]:
     while timestamp < duration:
         times.append(min(timestamp, max(0.0, duration - 0.01)))
         timestamp += 3.0
-    # Qwen2.5-VL has a finite per-request image-token budget. Preserve
-    # coverage while bounding long clips to a safely portable frame count.
-    if len(times) > 16:
-        stride = (len(times) - 1) / 15
-        times = [times[round(i * stride)] for i in range(16)]
     return times
 
 
@@ -364,23 +373,31 @@ def summarize_scores(score_root: str | Path) -> dict[str, Any]:
             row = _read(path)
             row.setdefault("split", path.parent.name)
             rows.append(row)
+    rtd_rows = [row for row in rows if "temporal" in row]
+    # Only RTD uses judge frames. Legacy RTD scores without the field used
+    # source resolution, the same as None.
+    frame_max_sides = {row.get("judge_frame_max_side") for row in rtd_rows}
+    if len(frame_max_sides) > 1:
+        raise ValueError(
+            f"{score_root} mixes judge_frame_max_side values {sorted(frame_max_sides, key=str)}; "
+            "rerun evaluate for all scored RTD samples with --overwrite and one value"
+        )
     rtd_temporal = [
         row["temporal"]["summary"] | {"content_score": row.get("content", {}).get("content_score", 0.0)}
-        for row in rows
-        if "temporal" in row
+        for row in rtd_rows
     ]
     pr = [{"task_type": row.get("task_type"), **row.get("pr", {})} for row in rows if "pr" in row]
     result = {"protocol_pin": PROTOCOL_PIN, "samples": len(rows)}
     if rtd_temporal:
+        result["judge_frame_max_side"] = frame_max_sides.pop()
         by_task: dict[str, list[dict[str, float]]] = {}
-        for row in rows:
-            if "temporal" in row:
-                by_task.setdefault(str(row.get("split", row.get("task_type", "unknown"))), []).append(
-                    {
-                        "content": float(row.get("content", {}).get("content_score", 0.0)),
-                        "temporal": float(row["temporal"]["summary"].get("avg_temporal_score", 0.0)),
-                    }
-                )
+        for row in rtd_rows:
+            by_task.setdefault(str(row.get("split", row.get("task_type", "unknown"))), []).append(
+                {
+                    "content": float(row.get("content", {}).get("content_score", 0.0)),
+                    "temporal": float(row["temporal"]["summary"].get("avg_temporal_score", 0.0)),
+                }
+            )
         result["rtd"] = {
             "mean_content_score": sum(item["content_score"] for item in rtd_temporal) / len(rtd_temporal),
             "mean_avg_temporal_score": sum(item["avg_temporal_score"] for item in rtd_temporal) / len(rtd_temporal),

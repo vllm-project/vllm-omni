@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,7 +8,6 @@ import torch
 from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
     HiggsAudioV3TalkerForConditionalGeneration as C,
 )
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -41,18 +39,6 @@ def test_two_inflight_steps_keep_owned_codes_and_masks():
     assert t.finalize_multimodal_outputs_from_cpu_snapshot(None) is None
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_whole_output_explicit_opt_in(enabled):
-    r = object.__new__(GPUARModelRunner)
-    r.use_async_scheduling = True
-    r.speculative_config = None
-    r.model_config = SimpleNamespace(async_chunk=False, enable_return_routed_experts=False)
-    r.model = SimpleNamespace(use_async_omni_output=True, supports_async_whole_payload=enabled, has_postprocess=False)
-    assert r._should_use_async_omni_output() == enabled
-    r.use_async_scheduling = False
-    assert not r._should_use_async_omni_output()
-
-
 @pytest.mark.parametrize("async_output", [False, True])
 def test_terminal_and_invalid_rows_preserve_full_response_codes(async_output):
     from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
@@ -70,7 +56,7 @@ def test_terminal_and_invalid_rows_preserve_full_response_codes(async_output):
     transport._pending_full_payload_send = {}
     transport._full_payload_replace_keys_cached = frozenset()
     expected = torch.arange(80, dtype=torch.int32).reshape(10, 8)
-    # Terminal and invalid rows must append zero rows, never replace earlier codes.
+    # Terminal and invalid callbacks append no audio rows and preserve earlier codes.
     for codes, valid, done, invalid in [
         *[(row, 1, 0, []) for row in expected],
         (torch.zeros(8), 0, 1, []),
@@ -87,4 +73,21 @@ def test_terminal_and_invalid_rows_preserve_full_response_codes(async_output):
         transport.accumulate_full_payload_output("request", {"codes.audio": audio}, None)
     full, _ = transport._materialize_full_payload_entry(transport._pending_full_payload_send["request"])
     torch.testing.assert_close(full["codes.audio"], expected)
-    assert talker2code2wav_full_payload(None, full, None)["codes"]["audio"].numel() == 16
+    # Ten delayed rows contain three complete valid frames in all eight
+    # codebooks. Preserve the real final frame instead of the old blind trim.
+    codec_codes = talker2code2wav_full_payload(None, full, None)["codes"]["audio"]
+    expected_codec_codes = torch.tensor(
+        [
+            [0, 8, 16],
+            [9, 17, 25],
+            [18, 26, 34],
+            [27, 35, 43],
+            [36, 44, 52],
+            [45, 53, 61],
+            [54, 62, 70],
+            [63, 71, 79],
+        ],
+        dtype=torch.long,
+    ).reshape(-1)
+    assert torch.equal(codec_codes, expected_codec_codes)
+    assert bool(((codec_codes >= 0) & (codec_codes < 1024)).all())

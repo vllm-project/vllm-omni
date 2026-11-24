@@ -91,7 +91,7 @@ def _extract_pcm(outputs) -> torch.Tensor:
     raise AssertionError(f"no audio payload in any stage output (got {len(outputs)} stages)")
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
 def test_higgs_audio_v2_offline_plain_text(omni_runner_function: OmniRunner) -> None:
     """
@@ -131,7 +131,7 @@ def test_higgs_audio_v2_offline_plain_text(omni_runner_function: OmniRunner) -> 
     assert np.isfinite(arr).all(), "audio contains non-finite samples (nan/inf)"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
 def test_higgs_audio_v2_offline_batch_two_prompts(omni_runner_function: OmniRunner) -> None:
     """
@@ -197,7 +197,7 @@ def _compose_voice_clone_request(model_name: str, text: str, ref_text: str, ref_
     }
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
 def test_higgs_audio_v2_offline_voice_clone(omni_runner_function: OmniRunner) -> None:
     """

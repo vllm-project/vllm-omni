@@ -10,6 +10,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.config import LoadConfig
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from tests.e2e.accuracy.helpers import assert_video_pixel_close
 from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -23,6 +24,14 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "H200"}, num_cards=1)]
+
+# The native PixelUMM decoder is not bitwise to the reference's BF16 kernels
+# (stacked GEMMs, vLLM RMSNorm, per-tile attention). On real latents its error
+# against an FP32 reference decode is within 1.11x of the reference's own BF16
+# error (mean 2.8e-3, p99 2.6e-2, worst frame 32.8 dB), and native vs
+# reference measured mean 2.7e-3, p99 2.4e-2, worst frame 39.6 dB. The bounds
+# allow about twice that BF16 rounding noise; a window or tile bug is far larger.
+VIDEO_TOLERANCE = {"mean_threshold": 6e-3, "p99_threshold": 5.5e-2, "frame_psnr_threshold": 32.0}
 
 REFERENCE_FILES = (
     "DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors",
@@ -68,14 +77,15 @@ def pipelines(model_cleanup):
     config.parallelism.sp_size = 1
     config.parallelism.shard_text_encoder = False
     device = get_local_device()
+    custom_args = {}
+    if "HY_NOMAS_TEXT_ENCODER" in os.environ:
+        custom_args["text_encoder"] = os.environ["HY_NOMAS_TEXT_ENCODER"]
     omni_config = OmniDiffusionConfig(
         model=os.environ.get("HY_NOMAS_MODEL", MODEL_ID),
         dtype=torch.bfloat16,
         distributed_executor_backend="mp",
         enforce_eager=True,
-        custom_pipeline_args={"text_encoder": os.environ["HY_NOMAS_TEXT_ENCODER"]}
-        if "HY_NOMAS_TEXT_ENCODER" in os.environ
-        else {},
+        custom_pipeline_args=custom_args,
     )
     reference = candidate = None
     try:
@@ -95,7 +105,7 @@ def pipelines(model_cleanup):
 @pytest.mark.parametrize("scenario", ["text", "segments", "camera"])
 @pytest.mark.parametrize("steps", [4, 8])
 @torch.no_grad()
-def test_reference_decoded_video(pipelines, scenario, offload, steps):
+def test_reference_decoded_video(pipelines, monkeypatch, scenario, offload, steps):
     reference, candidate, device = pipelines
     prompts = ["A forest beside a clear river, photorealistic, daylight."]
     boundaries = [0, 49]
@@ -104,6 +114,21 @@ def test_reference_decoded_video(pipelines, scenario, offload, steps):
         boundaries = [0, 24, 49]
     camera = "pan_left" if scenario == "camera" else None
     camera_flags = [True, True] if camera else None
+    expected_latents = []
+    actual_latents = []
+    decode = reference._decode_latents
+    post_decode = candidate.post_decode
+
+    def record_reference(value, num_frames):
+        expected_latents.append(value.detach().cpu())
+        return decode(value, num_frames)
+
+    def record_candidate(state, **kwargs):
+        actual_latents.append(state.latents.detach().cpu())
+        return post_decode(state, **kwargs)
+
+    monkeypatch.setattr(reference, "_decode_latents", record_reference)
+    monkeypatch.setattr(candidate, "post_decode", record_candidate)
     # pytest has imported vLLM; restore the SDPA backends used by a standalone reference process.
     with sdpa_kernel(
         [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
@@ -150,7 +175,15 @@ def test_reference_decoded_video(pipelines, scenario, offload, steps):
         actual = output.media.video.tensor.cpu()
         assert actual.shape == expected.shape == (1, 3, 49, 384, 640)
         assert torch.isfinite(actual).all()
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        # The DiT matches the reference exactly; only the native decoder's BF16 kernels differ.
+        assert len(expected_latents) == 1
+        torch.testing.assert_close(torch.cat(actual_latents, dim=2), expected_latents[0], rtol=0, atol=0)
+        assert_video_pixel_close(
+            model_name=f"Hy-Nomas {scenario} {steps} steps",
+            actual=actual[0].transpose(0, 1),
+            expected=expected[0].transpose(0, 1),
+            **VIDEO_TOLERANCE,
+        )
     finally:
         if offload:
             candidate.disable_omni_model_cpu_offload()
