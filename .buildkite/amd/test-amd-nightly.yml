@@ -1992,6 +1992,26 @@ steps:
             fi
             (exit "$$status")
 
+  - group: ":full_moon: Image-to-Video Documentation MI300 Nightly"
+    steps:
+      - label: "Offline Image-to-Video Documentation"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 90
+        source_file_dependencies: [diffusion_image_to_video_doc, rocm_diffusion_nightly_runner]
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-image-to-video-docs/**/*
+        commands:
+          - export OUTPUT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-image-to-video-docs/videos/$${BUILDKITE_JOB_ID:?}"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 4 75m rocm-image-to-video-docs
+            tests/examples/offline_inference/test_image_to_video.py
+            -m 'full_model and example and rocm and MI325 and cards_1'
+
   - group: ":full_moon: Wan2.2 Function 1 GPU Group"
     steps:
       - label: "Wan2.2 Device-Postprocess Equivalence"
