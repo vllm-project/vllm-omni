@@ -13,9 +13,12 @@ uses the stock vLLM-Ascend allocator.
 
 Use two Ascend 910B3 cards (64 GiB each), preferably on the same NUMA node.
 Start with the `quay.nju.edu.cn/atlas-ci/vllm-ascend:v0.34.0` image, the matching
-Ascend driver, and `numactl`. Mount the vLLM-Omni checkout and model assets into
-the container. Preserve the image's CANN environment and Python paths. The
-launcher prepends this checkout to `PYTHONPATH`.
+Ascend driver, and `numactl`. The measured image digest is
+`sha256:4ec880dc132cc9c3993d914039b2879db5db4f432ef36211417fcdcb9249d590`.
+It contains vLLM `62d4bc3c7`, vLLM-Ascend `19c063b54`, and CANN 9.3.
+Mount the vLLM-Omni checkout and model assets into the container. Preserve the
+image's CANN environment and Python paths. The launcher prepends this checkout
+to `PYTHONPATH`.
 
 ## Checkpoint assets
 
@@ -92,6 +95,7 @@ Run from the repository root after setting `MODEL_ROOT` and `DRAFT_MODEL`:
 export ASCEND_RT_VISIBLE_DEVICES=0,1
 export NUMA_NODE=0
 export PORT=8000
+export PROFILING_MODE=dynamic TASK_QUEUE_ENABLE=1
 bash recipes/OpenBMB/serve_minicpmo_ascend.sh
 ```
 

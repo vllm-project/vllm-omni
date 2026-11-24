@@ -85,12 +85,11 @@ sharing the backing does not share live request contents or shorten context.
 Without DSpark the new mixed-group path is inactive.
 Focused coverage lives in `tests/platforms/npu/test_minicpmo_shared_kv.py`.
 
-The opt-in MiniCPM-o exact-prefill, fused decode and compact-batch graphs
-qualify on their first eligible use in each worker. Active mode still returns
-the reference result while comparing hidden state/KV or codec/stop/KV state;
-only a successful check enables later replay. Mismatches keep the reference
-path. The [Ascend recipe](gh-file:recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md)
-supplies the deployment, model assets and launcher controls.
+MiniCPM-o qualifies common exact-prefill shapes during startup and other
+eligible graphs on first use. Qualification returns the reference result
+while comparing hidden state and KV or codec, stop and KV state. Successful
+checks enable later replay. The deployment, model assets and launcher controls
+are listed in the [Ascend recipe](gh-file:recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md).
 
 ## MiniMax H3 image NPU adapter
 
