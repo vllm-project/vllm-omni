@@ -694,6 +694,19 @@ As on CUDA, H3 is CFG-distilled, so keep `--cfg-parallel-size` at 1, and the H3 
 supports only its native `tile` mode. `--text-encoder-tp-size` is validated on
 gfx942; on gfx950 it was not exercised.
 
+#### Overlap RCCL with AITER attention on four gfx950 GPUs
+
+The four-GPU command above automatically overlaps RCCL transfers with AITER
+attention on qualified MiniMax-H3 video requests. Each rank computes one group
+of heads while RCCL transfers the other, using a 4+10 split.
+
+Automatic selection requires eager BF16 AITER FlashAttention, strict SP4/Ring1
+and a single packed request with 37,760 rows in one of the nine validated
+partitions. All ranks must agree on the partition and have both the supported
+gfx950 AITER kernel and native HIP transport. Single-GPU runs, other layouts,
+reference-KV modes and graph capture use the existing attention path. To turn
+overlap off explicitly, pass `--additional-config '{"rocm_h3_head_overlap":false}'`.
+
 ### Validated ROCm evidence
 
 vLLM-Omni with MiniMax H3 support, BF16. gfx942 rows measured with the

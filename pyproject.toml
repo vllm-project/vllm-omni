@@ -209,6 +209,7 @@ include = ["vllm_omni*"]
     "benchmarks/realtime_video/*.json",
     "deploy/*.md",
     "deploy/*.yaml",
+    "diffusion/attention/parallel/rocm_h3_head_overlap.hip",
     "diffusion/models/hy_nomas/camera_trajectories.json",
     "model_executor/models/covo_audio/speaker_prompt/*.npy",
     "model_executor/models/step_audio2/assets/*.wav",
@@ -340,6 +341,7 @@ markers = [
     "L4: [hardware-resource] [cuda] Tests that require L4 GPU",
     "B200: [hardware-resource] [cuda] Tests that require B200 GPU",
     "RTX5090: [hardware-resource] [cuda] Tests that require an RTX 5090 GPU (SM120, compute capability 12.0)",
+    "MI350: [hardware-resource] [rocm] Tests that require MI350 GPU (AMD/ROCm)",
     "MI325: [hardware-resource] [rocm] Tests that require MI325 GPU (AMD/ROCm)",
     "MI300: [hardware-resource] [rocm] Tests that require MI300 GPU (AMD/ROCm)",
     "B60: [hardware-resource] [xpu] Tests that require Intel Arc Pro B60 XPU",
@@ -419,6 +421,8 @@ extend-ignore-re = [
     "\\+g[0-9a-f]{7,}",
 ]
 [tool.typos.default.extend-words]
+# AMD Heterogeneous System Architecture code objects live under aiter_meta/hsa.
+hsa = "hsa"
 ue = "ue"
 # Einstein-summation index tuple for head/expert/dimension axes.
 hed = "hed"

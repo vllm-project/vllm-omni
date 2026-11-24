@@ -350,6 +350,7 @@ class MiniMaxH3Attention(nn.Module):
         max_seqlen: int,
         packed_total: int,
         num_requests: int = 1,
+        rocm_head_overlap: bool = False,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         gate_compress: torch.Tensor | None = None,
@@ -372,6 +373,10 @@ class MiniMaxH3Attention(nn.Module):
             )
         if reference_kv_compact and num_requests != 1:
             raise ValueError("compacted reference KV currently supports one request")
+        if rocm_head_overlap:
+            from .head_overlap import run_overlap
+
+            return run_overlap(q, k, v, cu_seqlens)
 
         reference_rows = 0
         if reference_kv_state is not None:
@@ -520,6 +525,7 @@ class MiniMaxH3Attention(nn.Module):
         max_seqlen: int,
         packed_total: int | None = None,
         num_requests: int = 1,
+        rocm_head_overlap: bool = False,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
@@ -574,6 +580,7 @@ class MiniMaxH3Attention(nn.Module):
             # its Python length explicitly instead of inferring it from q.
             packed_total=packed_total if packed_total is not None else q.shape[0],
             num_requests=num_requests,
+            rocm_head_overlap=rocm_head_overlap,
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
             gate_compress=gate_compress,
@@ -816,6 +823,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         max_seqlen: int,
         packed_total: int,
         num_requests: int = 1,
+        rocm_head_overlap: bool = False,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
@@ -856,6 +864,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             max_seqlen=max_seqlen,
             packed_total=packed_total,
             num_requests=num_requests,
+            **({"rocm_head_overlap": True} if rocm_head_overlap else {}),
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,

@@ -680,6 +680,24 @@ class MiniMaxH3SPGather(nn.Module):
         return hidden_states
 
 
+def _allow_rocm_head_overlap(config: OmniDiffusionConfig) -> bool:
+    enabled = (getattr(config, "additional_config", None) or {}).get("rocm_h3_head_overlap", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("rocm_h3_head_overlap must be a boolean")
+    parallel = config.parallel_config
+    return (
+        enabled
+        and torch.version.hip is not None
+        and parallel.ulysses_degree == 4
+        and parallel.ring_degree == 1
+        and parallel.allgather_degree == 1
+        and parallel.ulysses_mode == "strict"
+        and not parallel.ulysses_a2a_permute
+        and not getattr(config, "diffusion_use_graph", False)
+        and not getattr(config, "fa_deterministic", False)
+    )
+
+
 class MiniMaxH3DiTModel(nn.Module):
     # Loading is tensor-complete: constructor state plus final-layout
     # parameters and persistent buffers is sufficient to reconstruct a ready
@@ -852,6 +870,7 @@ class MiniMaxH3DiTModel(nn.Module):
             max_bytes=256 * 1024**2 if enabled else 0, offload_weights=offload_adaln
         )
         self.od_config = od_config
+        self._rocm_head_overlap = _allow_rocm_head_overlap(od_config)
         if reference_isolation_enabled(od_config) or getattr(od_config, "kv_offload_config", None) is not None:
             from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import MiniMaxH3CachedAdapter
 
@@ -1658,6 +1677,24 @@ class MiniMaxH3DiTModel(nn.Module):
         if getattr(self, "adaln_cache", None) is not None:
             self.adaln_cache.prepare(t_emb)
 
+        overlap_kwargs = {}
+        if (
+            getattr(self, "_rocm_head_overlap", False)
+            and num_requests == 1
+            and block_packed_total == 37760
+            and reference_kv_state is None
+            and reference_isolation is None
+            and vdn_window is None
+        ):
+            from .head_overlap import prepare_overlap
+
+            use_overlap = prepare_overlap(self.blocks, hidden, cu_seqlens, block_max_seqlen)
+            if use_overlap is None:
+                # All ranks agreed that a required native kernel is unavailable.
+                self._rocm_head_overlap = False
+            elif use_overlap:
+                overlap_kwargs["rocm_head_overlap"] = True
+
         for block_index, block in enumerate(self.blocks):
             hidden = block(
                 hidden,
@@ -1674,6 +1711,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 reference_kv_compact=compact_reference,
                 reference_isolation=reference_isolation,
                 vdn_window=vdn_window,
+                **overlap_kwargs,
             )
             if block_index in hints:
                 hidden = hidden + hints.pop(block_index) * control_scale
