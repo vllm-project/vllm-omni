@@ -546,6 +546,7 @@ AR_MERGED_LORA_REGISTRY: dict[str, MergedLoRARegistryEntry] = {
     "NemotronDenseForCausalLM": _runtime_only(_RUNTIME_SUPPORTS_LORA),
     "Qwen2ForCausalLM_old": _runtime_only(_RUNTIME_SUPPORTS_LORA),
     "Qwen2_5OmniThinkerModel": _runtime_only(_RUNTIME_SUPPORTS_LORA),
+    "ResponseJudgeQwen3ForCausalLM": _runtime_only(_RUNTIME_SUPPORTS_LORA),
     # MiniCPM-o 4.5 family (named in RFC #10444 §1.2 & §4)
     "MiniCPMO45OmniForConditionalGeneration": _not_capable(
         "missing packed_modules_mapping re-export from inner Qwen stack onto outer stage class"
@@ -575,6 +576,7 @@ AR_MERGED_LORA_REGISTRY: dict[str, MergedLoRARegistryEntry] = {
     "BailingTalker2": _not_capable(_PENDING_AR_MAPPING),
     "BreezeCode2Wav": _not_capable(_NON_LLM_STAGE),
     "BreezeForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
+    "ChatterboxForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "CosyVoice3Model": _not_capable(_PENDING_AR_MAPPING),
     "CovoAudioCode2WavModel": _not_capable(_NON_LLM_STAGE),
     "CovoAudioForCausalLM": _not_capable(_PENDING_AR_MAPPING),
@@ -598,6 +600,7 @@ AR_MERGED_LORA_REGISTRY: dict[str, MergedLoRARegistryEntry] = {
     "IndexTTS25TalkerForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "IndexTTS2S2MelDecoder": _not_capable(_NON_LLM_STAGE),
     "IndexTTS2TalkerForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
+    "LayaDecisionModel": _not_capable(_NON_LLM_STAGE),
     "Lfm3AudioForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "Lfm3OmniCode2Wav": _not_capable(_NON_LLM_STAGE),
     "Lfm3OmniForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
@@ -682,19 +685,24 @@ def audit_merged_lora_registries(
 
     violations: list[str] = []
 
-    for label, models, reg, loader in (
-        ("diffusion", diff_models, diff_reg, DiffusionModelRegistry),
-        ("ar", omni_models, ar_reg, OmniModelRegistry),
+    for label, reg_name, models, reg, loader in (
+        ("diffusion", "DIFFUSION_MERGED_LORA_REGISTRY", diff_models, diff_reg, DiffusionModelRegistry),
+        ("ar", "AR_MERGED_LORA_REGISTRY", omni_models, ar_reg, OmniModelRegistry),
     ):
         missing = sorted(set(models) - set(reg))
         for arch in missing:
             violations.append(
                 f"{label} model {arch!r} is missing a merged-LoRA capability declaration "
-                "(implement SupportsMergedLoRA or register RUNTIME_ONLY / NOT_CAPABLE with a reason)"
+                f"(add {arch!r} to {reg_name} in vllm_omni/lora/capability.py as "
+                "_SUPPORTED after implementing SupportsMergedLoRA, or _runtime_only(...) / _not_capable(...) "
+                "with a reason)"
             )
         stale = sorted(set(reg) - set(models))
         for arch in stale:
-            violations.append(f"{label} merged-LoRA registry contains unregistered arch {arch!r}")
+            violations.append(
+                f"{label} merged-LoRA registry ({reg_name} in vllm_omni/lora/capability.py) "
+                f"contains unregistered arch {arch!r}"
+            )
 
         for arch in sorted(set(models) & set(reg)):
             entry = reg[arch]

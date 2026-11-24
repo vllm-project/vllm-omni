@@ -242,15 +242,26 @@ def test_ci_capability_registry_audit_covers_all_registered_models():
 
 def test_ci_capability_registry_audit_rejects_undeclared_model():
     extra_diffusion = {"BrandNewUndeclaredPipeline": ("fake", "pipeline_fake", "BrandNewUndeclaredPipeline")}
+    extra_ar = {"BrandNewUndeclaredARModel": ("fake", "ar_fake", "BrandNewUndeclaredARModel")}
     violations = audit_merged_lora_registries(
         diffusion_models=extra_diffusion,
-        ar_models={},
+        ar_models=extra_ar,
         diffusion_registry=DIFFUSION_MERGED_LORA_REGISTRY,
         ar_registry=AR_MERGED_LORA_REGISTRY,
         verify_supported_classes=False,
     )
     assert any(
-        "BrandNewUndeclaredPipeline" in msg and "missing a merged-LoRA capability declaration" in msg
+        "BrandNewUndeclaredPipeline" in msg
+        and "missing a merged-LoRA capability declaration" in msg
+        and "DIFFUSION_MERGED_LORA_REGISTRY" in msg
+        and "vllm_omni/lora/capability.py" in msg
+        for msg in violations
+    )
+    assert any(
+        "BrandNewUndeclaredARModel" in msg
+        and "missing a merged-LoRA capability declaration" in msg
+        and "AR_MERGED_LORA_REGISTRY" in msg
+        and "vllm_omni/lora/capability.py" in msg
         for msg in violations
     )
 
