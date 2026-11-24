@@ -490,6 +490,18 @@ source_file_dependencies:
     - tests/diffusion/ar_diffusion/
     - vllm_omni/experimental/ar_diffusion/
 
+  diffusion_pipeline_parallel_parity:
+    - tests/diffusion/distributed/test_pipeline_parallel.py
+    - tests/helpers/distributed.py
+    - tests/helpers/mark.py
+    - tests/conftest.py
+    - vllm_omni/diffusion/distributed/pipeline_parallel.py
+    - vllm_omni/diffusion/distributed/cfg_parallel.py
+    - vllm_omni/diffusion/distributed/parallel_state.py
+    - vllm_omni/diffusion/distributed/group_coordinator.py
+    - vllm_omni/diffusion/distributed/comm.py
+    - vllm_omni/platforms/
+
   diffusion_distributed_attention:
     - tests/diffusion/distributed/
     - tests/diffusion/test_mossimage_rope.py
@@ -1542,6 +1554,17 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_qwen_image_expansion.py
     - tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py
 
+  diffusion_vae_patch_decode:
+    - *wan22
+    - *qwen_image
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/distributed/
+    - vllm_omni/platforms/
+    - tests/diffusion/distributed/test_vae_decode_parallelism.py
+    - tests/helpers/
+    - tests/conftest.py
+
   diffusion_qwen_image_accuracy:
     - *qwen_image
     - tests/e2e/accuracy/test_qwen_image.py
@@ -1648,6 +1671,17 @@ source_file_dependencies:
     - tests/assets/qwen_image_edit/
     - tests/helpers/
     - tests/conftest.py
+
+  diffusion_wan_vae_spatial_shard:
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/distributed/
+    - vllm_omni/experimental/ar_diffusion/streaming_decode.py
+    - vllm_omni/platforms/
+    - tests/diffusion/distributed/test_wan_spatial_shard.py
+    - tests/helpers/mark.py
+    - tests/conftest.py
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
 
   diffusion_collective_parity:
     - vllm_omni/diffusion/distributed/
