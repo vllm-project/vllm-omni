@@ -164,6 +164,8 @@ single object (a single object remains valid):
 
 For distilled few-step LoRAs, pass `lora_backend="distill"` together with one or more concrete `.safetensors` files. The weights are fused into the base model once at init; subsequent `generate()` calls do not need a `LoRARequest`.
 
+For Qwen-Image pipelines, single-file `lora_A`/`lora_B` weights may include the `.default` adapter suffix (for example `<module>.lora_A.default.weight`). Bias deltas are named `<module>.bias` and do not use the `.default` suffix. Both may omit the `transformer.` prefix. These names are normalized before fusion. If no weights match the transformer, loading raises an error instead of registering the adapter as fused.
+
 With tensor parallelism, the fusion loader selects each rank's portion of the
 adapter delta to match the base linear weights. Packed QKV and merged column
 projections are split per projection before being packed for each rank.
@@ -380,10 +382,22 @@ MiniMax-H3 supports the following few-step mechanisms:
   derives the total step count from the request before the adapter schedule is
   known.
 
+FlashGen native adapters require `--lora-application runtime` (the default).
+The loader rejects `merged` application before reading adapter tensors,
+because a globally merged policy does not select the adapter-declared schedule
+or validate its request contract. Native adapters cannot be stacked with other
+active adapters, including cold-loaded sources that are used transiently
+for composition without entering the adapter cache.
+
+Native v2 FL2VA/Ref2VA exports require request `scale=1.0`, `flow_shift=12`
+and `audio_flow_shift=3`. A zero scale disables the adapter and its sampling
+constraints. See the [MiniMax-H3 recipe](gh-file:recipes/MiniMaxAI/MiniMax-H3.md#flashgen-native-lora)
+for base partitions and the validated conditioning scope.
+
 Native artifacts also declare `qkv_layout=grouped`. The H3 loader reorders fused
 `qkv_proj` LoRA rows with the same `_reorder_grouped_qkv_to_qkv` helper used for
-base-weight loading, then binds the packed Q/K/V slices through the legacy PEFT
-manager without modifying `DiffusionLoRAManager`.
+base-weight loading, then binds the packed Q/K/V slices through the PEFT
+manager.
 
 Both runtime adapters run with distributed layerwise offload in request-mode
 generation, where the manager keeps the LoRA A/B buffers resident on the compute

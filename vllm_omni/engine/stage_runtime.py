@@ -47,6 +47,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.stage_client import StageClient, StagePoolClient
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
+    LocalReplicaStartupError,
     OmniMasterServer,
     StageReplicaResources,
     connect_remote_diffusion_proc,
@@ -1049,6 +1050,7 @@ class StageRuntime:
         initialized_clients_by_stage: dict[int, list[StagePoolClient | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
         }
+        replicas_left = {plan.stage_idx: len(plan.replicas) for plan in stage_plans}
         primary_exc: Exception | None = None
         init_state_lock = threading.Lock()
         self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
@@ -1091,6 +1093,11 @@ class StageRuntime:
                     )
                 except Exception as exc:
                     with init_state_lock:
+                        if isinstance(exc, LocalReplicaStartupError):
+                            replicas_left[stage_idx] -= 1
+                            if replicas_left[stage_idx] > 0:
+                                logger.warning("[StageRuntime] %s", exc)
+                                continue
                         if primary_exc is None:
                             primary_exc = exc
                     return
@@ -1122,6 +1129,8 @@ class StageRuntime:
                             if primary_exc is None:
                                 primary_exc = exc
 
+        if primary_exc is None and self._init_cancelled.is_set():
+            primary_exc = RuntimeError("Stage initialization was cancelled")
         if primary_exc is not None:
             setattr(primary_exc, "_initialized_clients_by_stage", initialized_clients_by_stage)
             raise primary_exc
@@ -1485,11 +1494,9 @@ class StageRuntime:
 
         for plan in stage_plans:
             replica_clients = initialized_clients_by_stage[plan.stage_idx]
-            first_client = replica_clients[0] if replica_clients else None
-            if first_client is None:
+            if all(client is None for client in replica_clients):
                 raise RuntimeError(f"Stage {plan.stage_idx} initialization completed with a missing client")
 
-            clients: list[StagePoolClient] = [client for client in replica_clients if client is not None]
             stage_vllm_config = None
             output_processor = None
             metadata = plan.replicas[0].metadata
@@ -1508,7 +1515,7 @@ class StageRuntime:
             stage_pools.append(
                 StagePool(
                     plan.stage_idx,
-                    clients,
+                    replica_clients,
                     output_processor=output_processor,
                     stage_vllm_config=stage_vllm_config,
                     watermarkers=watermarkers,

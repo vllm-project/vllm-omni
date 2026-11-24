@@ -661,7 +661,13 @@ class AsyncOmniEngine(OmniEngineBase):
             # because a model whose guidance is mandatory cannot decode a request
             # whose companion never arrived.
             companions: list[AddCompanionRequestMessage] = []
-            if self.prompt_expand_func is not None and final_stage_id > 0:
+            # A prompt that declares a cfg_group is paired by the atomic CFG
+            # scheduler, which admits it only with its companion, whatever stage
+            # the request ends at; without one it would wait forever.
+            declares_cfg_group = isinstance(prompt, dict) and "cfg_group" in (
+                prompt.get("additional_information") or {}
+            )
+            if self.prompt_expand_func is not None and (final_stage_id > 0 or declares_cfg_group):
                 effective_spl = msg.sampling_params_list
                 stage0_params = effective_spl[0] if effective_spl else None
                 if stage0_params is not None:
@@ -945,7 +951,7 @@ class AsyncOmniEngine(OmniEngineBase):
 
     async def add_next_stage_input_async(self, msg: NextStageInputMessage) -> None:
         """Send a next stage input returned by an earlier request to the Orchestrator."""
-        self.request_queue.sync_q.put(msg)
+        await self._put_request_queue(msg)
 
     def add_streaming_update(
         self,

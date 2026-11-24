@@ -38,7 +38,7 @@ from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
     run_omni_api_server_worker_proc,
 )
-from vllm_omni.entrypoints.utils import parse_stage_overrides, prepare_stage_config_inputs
+from vllm_omni.entrypoints.utils import mark_serve_cli_args, parse_stage_overrides, prepare_stage_config_inputs
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 if TYPE_CHECKING:
@@ -171,6 +171,7 @@ class OmniServeCommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: TrackingNamespace) -> None:
+        mark_serve_cli_args(args)
         if not os.environ.get("VLLM_DISABLE_LOG_LOGO"):
             os.environ["VLLM_DISABLE_LOG_LOGO"] = "1"
             log_logo()
@@ -477,6 +478,11 @@ class OmniServeCommand(CLISubcommand):
             type=str,
             default=None,
             help="Path to a deploy config YAML (new format with stages/engine_args).",
+        )
+        omni_config_group.add_argument(
+            "--duplex-engine-backend-as-process",
+            action="store_true",
+            help="Run the duplex runtime in a separate process to isolate the frontend GIL; serves sessions only.",
         )
         omni_config_group.add_argument(
             "--strategy-config",
@@ -1097,6 +1103,14 @@ class OmniServeCommand(CLISubcommand):
             "resident_layers (DiT only).",
         )
         omni_config_group.add_argument(
+            "--kv-isolate",
+            action="store_true",
+            default=None,
+            help="Experimental MiniMax-H3 visual-reference isolation with one-time KV capture, "
+            "Host INT8 and asynchronous layer prefetch. Changes model semantics and takes "
+            "precedence over --kv-offload-config.",
+        )
+        omni_config_group.add_argument(
             "--kv-offload-config",
             type=json.loads,
             default=None,
@@ -1478,7 +1492,7 @@ def _start_api_server_process_manager(**manager_kwargs: object) -> APIServerProc
 
 def run_multi_api_server_omni(args: TrackingNamespace) -> None:
     """Launch API subprocesses that share one set of local stage engines."""
-    from vllm.entrypoints.openai.api_server import setup_server
+    from vllm.entrypoints.launchers.launcher import setup_server
     from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
 
     num_api_servers = int(args.api_server_count)

@@ -115,6 +115,9 @@ EXCLUDED_MODELS = [
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",
     "Cosmos3OmniPipeline",
+    # Multi-camera AV variant of Cosmos3; covered by the dedicated
+    # tests/diffusion/models/cosmos3 multiview tests instead of a tiny model.
+    "Cosmos3MultiviewPipeline",
     # Causal AR bimanual sim model requiring action/camera assets and
     # persistent AR state; covered by tests/diffusion/models/cosmos3_nano_sim_bimanual.
     "Cosmos3NanoSimBimanualPipeline",
