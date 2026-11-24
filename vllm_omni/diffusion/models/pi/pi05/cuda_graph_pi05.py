@@ -26,7 +26,10 @@ static buffer only when the caller passes a different tensor.
 Each region method has the signature of the eager call it replaces and falls
 back to that call when nothing is captured, its inputs differ from the
 captured ones, or torch's default dtype is not the float32 it was captured
-under. The eager baseline is ``Pi05ForActionPrediction.cuda_graphs is None``.
+under. The graphs capture whatever the regions run: on the optimized path,
+the fused Triton kernels ``Pi05Pipeline`` enables before capturing. The eager
+baseline is ``Pi05ForActionPrediction.cuda_graphs is None`` with the fused
+kernels off.
 
 A replay overwrites the tensors the previous replay of that region returned.
 ``sample_actions`` consumes them within the call, and the chunk it returns
