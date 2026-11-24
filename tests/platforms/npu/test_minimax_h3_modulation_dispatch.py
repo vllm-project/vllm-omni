@@ -38,7 +38,7 @@ def test_platform_binds_only_loaded_h3_blocks(monkeypatch, sdk_available):
     monkeypatch.setitem(sys.modules, "mindiesd.layers.index_modulation", sdk)
     pipeline = _pipeline()
 
-    platform.apply_diffusion_model_patches(pipeline, None)
+    platform.apply_diffusion_model_patches(pipeline, SimpleNamespace(model_class_name="MiniMaxH3Pipeline"))
 
     block = pipeline.transformer[0]
     assert (block._indexed_gate is not modulation.indexed_gate) == sdk_available

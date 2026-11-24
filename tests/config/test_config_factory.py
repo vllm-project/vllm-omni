@@ -3437,6 +3437,8 @@ class TestPlatformOverrides:
         [
             ("qwen3_tts.yaml", "qwen3_tts", "v2", ()),
             ("moss_tts_local.yaml", "moss_tts_local", "v2", ()),
+            ("chatterbox_turbo.yaml", "chatterbox_turbo", "v2", ()),
+            ("chatterbox.yaml", "chatterbox", "v2", ()),
             ("moss_tts_nano.yaml", "moss_tts_nano", "v2", ()),
             ("moss_tts_realtime.yaml", "moss_tts_realtime", "v2", ()),
             ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
@@ -3464,8 +3466,18 @@ class TestPlatformOverrides:
             "minicpmo_4_5_duplex_h200.yaml",
         )
         # XPU has no V1 fallback: vLLM 0.34 removed Model Runner V1.
-        xpu_full_mrv2 = platform == "xpu" and filename in ("qwen3_tts.yaml", "moss_tts_nano.yaml")
-        rocm_full_mrv2 = platform == "rocm" and filename in ("qwen3_tts.yaml", "minicpmo_4_5.yaml")
+        xpu_full_mrv2 = platform == "xpu" and filename in (
+            "qwen3_tts.yaml",
+            "moss_tts_nano.yaml",
+            "chatterbox_turbo.yaml",
+            "chatterbox.yaml",
+        )
+        rocm_full_mrv2 = platform == "rocm" and filename in (
+            "qwen3_tts.yaml",
+            "minicpmo_4_5.yaml",
+            "chatterbox_turbo.yaml",
+            "chatterbox.yaml",
+        )
         if platform == "cuda":
             expected_runner = cuda_default_runner
         elif all_platforms_mrv2 or npu_full_mrv2 or xpu_full_mrv2 or rocm_full_mrv2:

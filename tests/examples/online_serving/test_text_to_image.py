@@ -39,7 +39,9 @@ def example_output_dir() -> Path:
 # Two additional pre-requisites:
 # - omni_server must (and indeed is) defined as a module-scoped fixture
 # - test functions sharing the same param set must be adjacent to each other
-qwen_image_server_params = [OmniServerParams(model="Qwen/Qwen-Image-2.1")]
+qwen_image_server_params = [
+    pytest.param(OmniServerParams(model="Qwen/Qwen-Image-2.1"), marks=hardware_marks(res={"rocm": "MI325"}))
+]
 
 
 # --- ### Method 1: Using curl ---

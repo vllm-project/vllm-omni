@@ -1130,7 +1130,18 @@ def llm2tts(
             # prompt token) starts the slice. The policy also rewrites a mid-unit
             # <|listen|> into <|tts_bos|>; like the official loop, that token is
             # fed and handed to the Talker with the text before it, not used as
-            # a new start that would drop the unit's earlier words.
+            # a new start that would drop the unit's earlier words. Stage 0
+            # draws the chunk terminator on every uncapped step, so it can also
+            # be a unit's FIRST decision: that unit has no speech but still
+            # ends a segment, so its (empty) slice starts at the terminator and
+            # takes the empty hand-off below. Dropping it would leave the unit
+            # without the Talker segment end the runtime and the input clock
+            # wait for, and the next speaking unit's end would be credited to
+            # it instead.
+            chunk_terminator_ids = {
+                special_token_ids.get("chunk_eos_token_id"),
+                special_token_ids.get("chunk_tts_eos_token_id"),
+            }
             folded_boundary = (
                 unit_start == 0 and prompt_token_ids_len > 0 and full_token_ids[prompt_token_ids_len - 1] == tts_bos_id
             )
@@ -1138,6 +1149,8 @@ def llm2tts(
                 out_start = 0
             elif unit_start < len(out_ids) and out_ids[unit_start] not in tts_end_ids:
                 out_start = unit_start + 1
+            elif unit_start < len(out_ids) and out_ids[unit_start] in chunk_terminator_ids:
+                out_start = unit_start
             else:
                 out_start = None
             if out_start is not None:
@@ -1146,10 +1159,7 @@ def llm2tts(
                     token_id = out_ids[idx_t]
                     if token_id in tts_end_ids:
                         out_end = idx_t
-                        native_segment_end = token_id in {
-                            special_token_ids.get("chunk_eos_token_id"),
-                            special_token_ids.get("chunk_tts_eos_token_id"),
-                        }
+                        native_segment_end = token_id in chunk_terminator_ids
                         break
                 if out_end > out_start:
                     tts_token_ids_slice = torch.tensor(out_ids[out_start:out_end], dtype=torch.long)
@@ -1162,8 +1172,9 @@ def llm2tts(
                         request_id=str(llm_output.request_id),
                     )
                 elif native_segment_end:
-                    # A speech unit can contain just speak + chunk_eos. This
-                    # still owns a segment boundary: dropping it would leave
+                    # A speech unit can contain just speak + chunk_eos, or the
+                    # chunk terminator alone. Either still owns a segment
+                    # boundary: dropping it would leave
                     # the runtime waiting for TTS before the next silence unit.
                     # Talker's empty-condition path emits no audio and closes
                     # the segment through the normal downstream transport.
