@@ -13,14 +13,14 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.forward_context import ForwardContext, MixFusionStep, override_forward_context
 from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion, plan_foreign_hooks
-from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot, MixFusionSequenceRequest, mixfusion_compatible_hook
-from vllm_omni.diffusion.mixfusion.prefix_kv import (
-    PackedDocument,
+from vllm_omni.diffusion.mixfusion.adapter import PackedDocument
+from vllm_omni.diffusion.mixfusion.execution_plan import (
     PackedDocumentGeometry,
     build_document_plan,
     pack_document_queries,
-    run_prefix_attention,
 )
+from vllm_omni.diffusion.mixfusion.packed_attention import run_prefix_attention
+from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot, MixFusionSequenceRequest, mixfusion_compatible_hook
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 

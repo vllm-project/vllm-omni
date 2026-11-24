@@ -133,7 +133,7 @@ def resolve_mixfusion_adapter(module: nn.Module, plan: dict | None) -> MixFusion
     from vllm_omni.diffusion.mixfusion.plan import MixFusionSequenceRequest
 
     if isinstance(root, MixFusionRoot) and isinstance(root.request, MixFusionSequenceRequest):
-        from vllm_omni.diffusion.mixfusion.prefix_kv import PrefixKVAdapter
+        from vllm_omni.diffusion.mixfusion.adapter import PrefixKVAdapter
 
         return PrefixKVAdapter()
     return ChunkedJointAdapter(root) if isinstance(root, MixFusionRoot) else None

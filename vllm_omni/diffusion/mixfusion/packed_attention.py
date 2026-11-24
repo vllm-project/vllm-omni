@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Packed attention entry for MixFusion chunked layouts.
+"""Packed attention for MixFusion joint streams and prefix-KV documents.
 
 Image chunks are stacked on a local batch dimension while text stays
 request-level, so the model cannot concatenate them before attention. This
@@ -13,15 +13,24 @@ The per-step plan (carrying the model's ``AttentionLayout``) travels in
 through ``extra[MIXFUSION_STREAMS_KEY]``. The positional
 ``query``/``key``/``value`` belong to the single ``"chunked"`` stream. The
 output is a ``dict`` keyed by stream name.
+
+Prefix-KV documents use their own query and KV indices to gather cached
+and current tokens into causal and full attention segments.
 """
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout
 from vllm_omni.diffusion.mixfusion.execution_plan import PackedExecutionPlan
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.layer import Attention
+    from vllm_omni.diffusion.mixfusion.adapter import PackedDocument
 
 MIXFUSION_PLAN_KEY = "mixfusion_plan"
 MIXFUSION_STREAMS_KEY = "mixfusion_streams"
@@ -250,3 +259,49 @@ def run_mixfusion_packed_attention(
             buffer.index_copy_(0, scatter, rows)
             outputs[spec.name] = buffer.view(num_requests, padded, num_query_heads, head_dim)
     return outputs
+
+
+def run_prefix_attention(
+    attn: Attention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    plan: PackedExecutionPlan,
+    documents: list[PackedDocument],
+    layer_index: int,
+) -> torch.Tensor:
+    """Gather legal KV directly from chunk storage or each request's cache."""
+    cached_keys, cached_values = [], []
+    for doc, indices in zip(documents, plan.document_indices, strict=True):
+        plen = doc.geometry.prefix_length
+        if plen:
+            pk, pv = doc.prefix_kv[layer_index]
+            if pk.shape[0] != plen or pv.shape != pk.shape:
+                raise ValueError("Packed prefix KV does not match the document's declared prefix length")
+            cached_keys.append(pk)
+            cached_values.append(pv)
+        capture = doc.geometry.capture_length
+        if capture is not None:
+            # index_select owns the captured storage. A view could pin all image tokens.
+            rows = indices[: capture - plen]
+            ck, cv = key.index_select(0, rows), value.index_select(0, rows)
+            if plen:
+                ck, cv = torch.cat((pk, ck)), torch.cat((pv, cv))
+            doc.captured_kv.append((ck.detach(), cv.detach()))
+    flat_key = torch.cat((key, *cached_keys)) if cached_keys else key
+    flat_value = torch.cat((value, *cached_values)) if cached_values else value
+    result = torch.empty_like(query)
+    for segment in plan.segments:
+        output = attn.forward_packed(
+            query.index_select(0, segment.query_indices),
+            flat_key.index_select(0, segment.kv_indices),
+            flat_value.index_select(0, segment.kv_indices),
+            cu_seqlens=segment.cu_query,
+            max_seqlen=max(segment.query_lengths),
+            cu_seqlens_k=segment.cu_key,
+            max_seqlen_k=max(segment.key_lengths),
+            causal=segment.causal,
+            sequence_lengths=(segment.query_lengths, segment.key_lengths),
+        )
+        result.index_copy_(0, segment.query_indices, output)
+    return result

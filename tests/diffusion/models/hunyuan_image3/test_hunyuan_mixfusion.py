@@ -12,8 +12,8 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from tests.diffusion.models.hunyuan_image3.test_diffusion_kv_request import _components, _prepare, _request
 from tests.diffusion.models.hunyuan_image3.test_hunyuan_image3_step_execution import _pipeline, _state
 from vllm_omni.diffusion.data import AttentionScheduleConfig, DiffusionKVCacheMode
+from vllm_omni.diffusion.mixfusion.execution_plan import build_document_plan
 from vllm_omni.diffusion.mixfusion.plan import MixFusionSequenceRequest
-from vllm_omni.diffusion.mixfusion.prefix_kv import build_document_plan
 from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability, MixFusionSequenceInfo, fits_mixfusion_budget
 from vllm_omni.diffusion.mixfusion.setup import prepare_mixfusion_admission
 from vllm_omni.diffusion.models.hunyuan_image3 import pipeline_hunyuan_image3 as pipeline_module

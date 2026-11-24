@@ -88,12 +88,9 @@ from vllm_omni.diffusion.forward_context import (
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.mixfusion.adapter import SEQUENCE_DOCUMENTS_KEY, PackedDocument
+from vllm_omni.diffusion.mixfusion.packed_attention import run_prefix_attention
 from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot, MixFusionSequenceRequest
-from vllm_omni.diffusion.mixfusion.prefix_kv import (
-    SEQUENCE_DOCUMENTS_KEY,
-    PackedDocument,
-    run_prefix_attention,
-)
 
 # ResBlock is platform-dispatched in the layers package __init__: CUDA gets
 # fused GroupNorm+SiLU and AdaGN kernels, every other backend gets the plain

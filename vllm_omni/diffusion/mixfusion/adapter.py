@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""MixFusion adapter protocol and attention-stream layout types.
+"""MixFusion adapter contract and prefix-KV packing.
 
 The root hook packs and restores a forward call through an object
 implementing :class:`MixFusionAdapter`. Models with a declarative
@@ -16,11 +16,24 @@ boundaries the plan declares.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, runtime_checkable
+from inspect import BoundArguments
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
+import torch
 from torch import nn
 
-from vllm_omni.diffusion.mixfusion.execution_plan import PackedExecutionPlan
+from vllm_omni.diffusion.mixfusion.execution_plan import (
+    PackedDocumentGeometry,
+    PackedExecutionPlan,
+    build_document_plan,
+    pack_document_queries,
+)
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionSequenceInfo
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+
+SEQUENCE_DOCUMENTS_KEY = "mixfusion_documents"
 
 #: How a stream's tokens are laid out across the packed rows. ``"chunked"``
 #: streams arrive as one row per (request, chunk) and carry one chunk per
@@ -99,3 +112,71 @@ class MixFusionAdapter(Protocol):
     def restore_output(self, module: nn.Module, output: Any, plan: PackedExecutionPlan) -> list[Any]:
         """Turn the packed forward output back into one output per request."""
         ...
+
+
+@dataclass
+class PackedDocument:
+    geometry: PackedDocumentGeometry
+    hidden_states: torch.Tensor
+    position_ids: torch.Tensor
+    cos: torch.Tensor
+    sin: torch.Tensor
+    prefix_kv: tuple[tuple[torch.Tensor, torch.Tensor], ...] = ()
+    captured_kv: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
+
+
+class PrefixKVAdapter:
+    """Root adapter for decoder-only, token-local blocks with prefix KV."""
+
+    def validate_inputs(self, module: nn.Module, input_batch: InputBatch) -> None:
+        if not isinstance(input_batch.latents, list):
+            raise ValueError("Packed sequences require per-request latents")
+        for latent, state in zip(input_batch.latents, input_batch.states, strict=True):
+            info = state.mixfusion_info
+            if not isinstance(info, MixFusionSequenceInfo) or tuple(latent.shape) != info.latent_shape:
+                raise ValueError(
+                    f"MixFusion request {state.request_id}: actual spatial latents disagree with admission"
+                )
+            if state.attention_schedule or state.attention_sigma_schedule:
+                raise ValueError("Packed prefix-KV sequences do not support request attention schedules")
+
+    def pack_inputs(self, module: nn.Module, bound: BoundArguments, *, adapter_state=None) -> PackedInputs:
+        documents = bound.arguments.get(SEQUENCE_DOCUMENTS_KEY)
+        if not documents or not all(isinstance(doc, PackedDocument) for doc in documents):
+            raise ValueError("Packed decoder input requires prepared PackedDocuments")
+        geometry = tuple(doc.geometry for doc in documents)
+        device = documents[0].hidden_states.device
+        key = (geometry, device)
+        plan = (
+            adapter_state[1]
+            if adapter_state is not None and adapter_state[0] == key
+            else build_document_plan(geometry, device)
+        )
+
+        def pack(name: str) -> torch.Tensor:
+            return pack_document_queries([getattr(doc, name)[0] for doc in documents], plan).unsqueeze(0)
+
+        bound.arguments["inputs_embeds"] = pack("hidden_states")
+        bound.arguments["position_ids"] = pack("position_ids")
+        bound.arguments["custom_pos_emb"] = (pack("cos"), pack("sin"))
+        length = bound.arguments["inputs_embeds"].shape[1]
+        bound.arguments["query_lens"] = [length]
+        bound.arguments["seq_lens"] = [length]
+        bound.arguments[SEQUENCE_DOCUMENTS_KEY] = None
+        return PackedInputs(
+            tuple(bound.args),
+            dict(bound.kwargs),
+            plan,
+            boundary_outputs={SEQUENCE_DOCUMENTS_KEY: documents},
+            adapter_state=(key, plan),
+        )
+
+    def restore_output(self, module: nn.Module, output, plan: PackedExecutionPlan) -> list[torch.Tensor]:
+        hidden = output[0]
+        restored = []
+        for doc, indices in zip(plan.documents, plan.document_indices, strict=True):
+            value = hidden.index_select(1, indices)
+            if doc.padded_length != doc.query_length:
+                value = torch.nn.functional.pad(value, (0, 0, 0, doc.padded_length - doc.query_length))
+            restored.append(value)
+        return restored

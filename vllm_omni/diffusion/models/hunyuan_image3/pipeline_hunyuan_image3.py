@@ -39,7 +39,8 @@ from vllm_omni.diffusion.forward_context import (
     request_denoise_progress,
     set_forward_context_denoise_step_idx,
 )
-from vllm_omni.diffusion.mixfusion.prefix_kv import PackedDocument, PackedDocumentGeometry
+from vllm_omni.diffusion.mixfusion.adapter import PackedDocument
+from vllm_omni.diffusion.mixfusion.execution_plan import PackedDocumentGeometry
 from vllm_omni.diffusion.mixfusion.request import mixfusion_requested
 from vllm_omni.diffusion.mixfusion.scheduling import MixFusionSequenceInfo
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader

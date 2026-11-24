@@ -304,10 +304,12 @@ implements *how*.
 | Scheduler policy | `mixfusion/scheduling.py`, `StepScheduler` | Compatibility and whole-batch admission by layout |
 | Driver | `mixfusion/driver.py` (`MixFusionDriver`) | Execution validation and arming/restoring `MixFusionStep` |
 | Hooks + plan types | `hooks/mixfusion.py`, `mixfusion/plan.py` | Applying `_mixfusion_plan` at module boundaries |
-| Chunked packing | `mixfusion/chunked.py` (`ChunkedJointAdapter`), `mixfusion/execution_plan.py` | Actual-input GCD and `PackedExecutionPlan`, per-request RoPE through the model's own boundary module, chunk split/reassembly |
-| Prefix-KV packing | `mixfusion/prefix_kv.py` (`PrefixKVAdapter`) | Shared image chunks, request/CFG indices, causal/full segments and prefix capture |
+| Chunked packing | `mixfusion/chunked.py` (`ChunkedJointAdapter`) | Adapter selection and joint text/image packing and restoration |
+| Prefix-KV packing | `mixfusion/adapter.py` (`PrefixKVAdapter`) | Decoder input packing and per-request output restoration |
+| Execution plan | `mixfusion/execution_plan.py` | Actual-input GCD, chunk ranges, stream or document indices, and causal/full segments |
 | Packed attention | `Attention.forward_packed` | Varlen or dense buckets with independent Q/K boundaries and bottom-right causal alignment when required |
 | Joint attention | `Attention.forward` (plan-key dispatch), `mixfusion/packed_attention.py` | Per-request text + image reassembly, one packed varlen forward (or the dense fallbacks), scatter back per stream |
+| Prefix-KV attention | `mixfusion/packed_attention.py` | Per-request and per-CFG prefix capture, gathering cached KV for causal/full segments, and restoring query order |
 | Startup wiring | `mixfusion/setup.py`, `mixfusion/request.py` | Config validation, mounting, request opt-in and batch-key relaxation |
 
 A model opts in with a declaration and two small hooks into existing code:

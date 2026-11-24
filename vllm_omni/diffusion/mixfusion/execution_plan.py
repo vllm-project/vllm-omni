@@ -2,12 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MixFusion sequence-packing layout primitives.
 
-Every non-attention computation is token-local and runs on sequence chunks
-stacked along the local batch dimension; attention needs the complete logical
-sequence and is reassembled per request at the attention boundary. This module
-owns the layout side: the chunk-to-request mapping, per-chunk conditioning
-expansion, chunk reassembly and the packed varlen layout (cu_seqlens /
-max_seqlen). Layout only: no model-specific semantics, no ``nn.Module`` state.
+Chunked joint streams and prefix-KV documents use the same chunk geometry.
+The plan maps chunks to requests and supplies the indices and sequence
+boundaries for attention and output restoration. It holds layout data only.
 """
 
 from __future__ import annotations
@@ -21,7 +18,20 @@ import torch
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout
-    from vllm_omni.diffusion.mixfusion.prefix_kv import PackedDocumentGeometry
+
+
+@dataclass(frozen=True)
+class PackedDocumentGeometry:
+    request_id: str
+    branch: int
+    query_length: int
+    padded_length: int
+    prefix_length: int
+    full_spans: tuple[tuple[int, int], ...]
+    # Half-open image range in the logical Q+KV sequence.
+    image_span: tuple[int, int]
+    # Capture the invariant prefix on the first denoising step only.
+    capture_length: int | None = None
 
 
 @dataclass
@@ -136,6 +146,83 @@ def build_execution_plan(
         max_seq_len=max_seq_len,
         output_indices=output_indices,
     )
+
+
+def build_document_plan(documents: tuple[PackedDocumentGeometry, ...], device: torch.device) -> PackedExecutionPlan:
+    """Address each request's queries in image-chunk then non-image storage."""
+    from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import build_segments
+
+    image_lengths = [doc.image_span[1] - doc.image_span[0] for doc in documents]
+    # Each request/CFG branch supplies one image row.
+    plan = build_chunk_plan(image_lengths, [1] * len(documents), device)
+    other_offset = plan.num_chunks * plan.chunk_size
+    kv_offset = sum(doc.query_length for doc in documents)
+    document_indices = []
+    grouped: dict[bool, list[tuple[list[int], list[int]]]] = {}
+    for doc, (chunk_start, chunk_end) in zip(documents, plan.request_chunk_ranges, strict=True):
+        qlen, plen = doc.query_length, doc.prefix_length
+        if not 0 < qlen <= doc.padded_length or plen < 0:
+            raise ValueError("Invalid packed sequence query/prefix length")
+        start, stop = doc.image_span
+        if not plen <= start < stop <= plen + qlen:
+            raise ValueError("Image chunks must cover current queries")
+        before, after = start - plen, plen + qlen - stop
+        indices = [
+            *range(other_offset, other_offset + before),
+            *range(chunk_start * plan.chunk_size, chunk_end * plan.chunk_size),
+            *range(other_offset + before, other_offset + before + after),
+        ]
+        document_indices.append(torch.tensor(indices, device=device, dtype=torch.long))
+        other_offset += before + after
+        end = 0
+        for start, stop in doc.full_spans:
+            if not end <= start < stop <= plen + qlen:
+                raise ValueError("Packed full-attention spans must be ordered and within the document")
+            end = stop
+        if doc.capture_length is not None and not plen <= doc.capture_length <= plen + qlen:
+            raise ValueError("Captured prefix must include imported KV and fit the first step")
+        keys_in_order = [*range(kv_offset, kv_offset + plen), *indices]
+        for segment in build_segments(doc.full_spans, plen, qlen):
+            query = indices[segment.q_start - plen : segment.q_end - plen]
+            keys = keys_in_order[: segment.kv_end]
+            grouped.setdefault(segment.mode == "causal", []).append((query, keys))
+        kv_offset += plen
+    batches = []
+    for causal, segments in grouped.items():
+        qi, ki, cq, ck = [], [], [0], [0]
+        for query, keys in segments:
+            qi.extend(query)
+            ki.extend(keys)
+            cq.append(len(qi))
+            ck.append(len(ki))
+        batches.append(
+            PackedAttentionSegments(
+                causal,
+                torch.tensor(qi, device=device, dtype=torch.long),
+                torch.tensor(ki, device=device, dtype=torch.long),
+                torch.tensor(cq, device=device, dtype=torch.int32),
+                torch.tensor(ck, device=device, dtype=torch.int32),
+                tuple(len(q) for q, _ in segments),
+                tuple(len(k) for _, k in segments),
+            )
+        )
+    plan.documents = documents
+    plan.document_indices = tuple(document_indices)
+    plan.segments = tuple(batches)
+    return plan
+
+
+def pack_document_queries(rows: list[torch.Tensor], plan: PackedExecutionPlan) -> torch.Tensor:
+    """Pack contiguous image rows followed by the remaining queries."""
+    images, others = [], []
+    for row, doc in zip(rows, plan.documents, strict=True):
+        start, stop = (pos - doc.prefix_length for pos in doc.image_span)
+        images.append(row[start:stop])
+        if start:
+            others.append(row[:start])
+        if stop < doc.query_length:
+            others.append(row[stop : doc.query_length])
+    return torch.cat(images + others)
 
 
 def expand_per_chunk(temb: torch.Tensor, chunk_to_request: torch.Tensor) -> torch.Tensor:
