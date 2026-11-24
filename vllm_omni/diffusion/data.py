@@ -347,9 +347,6 @@ class DiffusionParallelConfig:
     NPUSHMEM allocator, Triton-Ascend and a symmetric-memory runtime.
     """
 
-    ulysses_a2a_zero_copy: bool = False
-    """Deprecated and ignored: exchanged Q/K/V are always read in place, and the attention output is copied out."""
-
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
 
@@ -438,11 +435,6 @@ class DiffusionParallelConfig:
                     "(the default 'auto' selects a transport from the topology)."
                 )
                 self.ulysses_a2a_backend = "copy_engine_overlap" if self.ulysses_overlap_chunks else "copy_engine"
-        if self.ulysses_a2a_zero_copy:
-            logger.warning_once(
-                "ulysses_a2a_zero_copy is deprecated and ignored: exchanged Q/K/V are always read in place, "
-                "and the attention output is copied out."
-            )
         assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
             "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."

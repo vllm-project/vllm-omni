@@ -397,7 +397,6 @@ def test_kv_consumer_hooks_keep_qkv_out_of_the_workspace(monkeypatch):
         ({"ulysses_a2a_permute": True}, "copy_engine"),
         ({"ulysses_a2a_permute": True, "ulysses_a2a_backend": "flashinfer"}, "flashinfer"),
         ({"ulysses_a2a_backend": "copy_engine_overlap", "ulysses_overlap_chunks": 7}, "copy_engine_overlap"),
-        ({"ulysses_a2a_zero_copy": True}, "auto"),
     ],
 )
 def test_transport_config_aliases(values, backend):

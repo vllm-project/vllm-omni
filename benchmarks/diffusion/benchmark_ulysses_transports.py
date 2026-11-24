@@ -63,7 +63,7 @@ def _worker(rank: int, world_size: int, args: argparse.Namespace, result_file: s
         tensor_parallel_size=1,
         pipeline_parallel_size=1,
     )
-    results: dict[str, dict[int, float]] = {}
+    layers = {}
     for transport in args.transports:
         parallel_config = DiffusionParallelConfig(
             sequence_parallel_size=world_size,
@@ -77,40 +77,54 @@ def _worker(rank: int, world_size: int, args: argparse.Namespace, result_file: s
         )
         with set_forward_context(omni_diffusion_config=od_config), set_current_diffusion_config(od_config):
             try:
-                attn = Attention(
-                    num_heads=args.heads,
-                    head_size=args.head_dim,
-                    causal=False,
-                    softmax_scale=args.head_dim**-0.5,
-                    num_kv_heads=None,
-                    scatter_idx=2,
-                    gather_idx=1,
-                    use_sync=False,
+                layers[transport] = (
+                    od_config,
+                    Attention(
+                        num_heads=args.heads,
+                        head_size=args.head_dim,
+                        causal=False,
+                        softmax_scale=args.head_dim**-0.5,
+                        num_kv_heads=None,
+                        scatter_idx=2,
+                        gather_idx=1,
+                        use_sync=False,
+                    ),
                 )
             except Exception as error:  # e.g. FlashInfer without UlyssesCommunicator
                 if rank == 0:
                     print(f"{world_size} GPUs: {transport} unavailable: {error}", flush=True)
-                continue
-            times = {}
-            for seq in args.seqs:
-                s_local = seq // world_size
-                q, k, v = (
-                    torch.randn(1, s_local, args.heads, args.head_dim, device=device, dtype=dtype) for _ in range(3)
-                )
-                for _ in range(args.warmup):
-                    attn(q, k, v)
-                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                torch.accelerator.synchronize()
-                dist.barrier()
-                start.record()
-                for _ in range(args.iters):
-                    attn(q, k, v)
-                end.record()
-                torch.accelerator.synchronize()
-                elapsed = torch.tensor([start.elapsed_time(end) / args.iters], device=device)
-                dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)  # the slowest rank sets the layer time
-                times[seq] = elapsed.item()
-            results[transport] = times
+    if rank == 0:
+        name = next(iter(layers.values()))[1].attn_backend.get_name()
+        print(f"{world_size} GPUs: attention backend {name}", flush=True)
+
+    def timed(transport: str, q, k, v, iters: int) -> float:
+        od_config, attn = layers[transport]
+        with set_forward_context(omni_diffusion_config=od_config), set_current_diffusion_config(od_config):
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            torch.accelerator.synchronize()
+            dist.barrier()
+            start.record()
+            for _ in range(iters):
+                attn(q, k, v)
+            end.record()
+            torch.accelerator.synchronize()
+        elapsed = torch.tensor([start.elapsed_time(end) / iters], device=device)
+        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)  # the slowest rank sets the layer time
+        return elapsed.item()
+
+    results: dict[str, dict[int, float]] = {t: {} for t in layers}
+    for seq in args.seqs:
+        s_local = seq // world_size
+        q, k, v = (torch.randn(1, s_local, args.heads, args.head_dim, device=device, dtype=dtype) for _ in range(3))
+        for transport in layers:
+            timed(transport, q, k, v, args.warmup)
+        # Interleave the transports so clock and power drift hit all of them alike; keep the median round.
+        rounds: dict[str, list[float]] = {t: [] for t in layers}
+        for _ in range(args.rounds):
+            for transport in layers:
+                rounds[transport].append(timed(transport, q, k, v, args.iters))
+        for transport, times in rounds.items():
+            results[transport][seq] = sorted(times)[len(times) // 2]
     if rank == 0:
         with open(result_file, "w") as f:
             json.dump({t: {str(s): ms for s, ms in v.items()} for t, v in results.items()}, f)
@@ -137,7 +151,8 @@ def main() -> None:
     parser.add_argument("--overlap-chunks", type=int, default=0, help="0: two heads per chunk")
     parser.add_argument("--attention-backend", default=None, help="default: the platform's automatic choice")
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--iters", type=int, default=10, help="back-to-back layer calls per timed round")
+    parser.add_argument("--rounds", type=int, default=7, help="interleaved rounds per size (median kept)")
     parser.add_argument("--min-gain", type=float, default=0.01, help="relative gain required to enable a transport")
     parser.add_argument("--port", type=int, default=29600)
     parser.add_argument("--json", default=None, help="write raw timings here")

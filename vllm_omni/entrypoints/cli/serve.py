@@ -848,12 +848,6 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
-            "--ulysses-a2a-zero-copy",
-            action=argparse.BooleanOptionalAction,
-            default=None,
-            help="Deprecated and ignored: exchanged Q/K/V are read in place and the attention output is copied out.",
-        )
-        omni_config_group.add_argument(
             "--ring",
             "--ring-degree",
             dest="ring_degree",
