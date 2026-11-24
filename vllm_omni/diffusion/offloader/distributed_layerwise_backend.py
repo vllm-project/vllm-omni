@@ -1569,7 +1569,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         return self.dp_size > 1 and any(self.config.uses_allgather(component) for component in components)
 
     def _component_mmap_eligible(self, component: ResolvedComponent) -> bool:
-        """Whether a resolved component may stream from its checkpoint-mmap source."""
+        """Whether a resolved component streams its checkpoint-mmap source rank-locally.
+
+        This selects the transport only.  The plan's checkpoint transforms are
+        required by every transport, because the loader skipped ordinary
+        loading for every planned tensor.
+        """
         return component.selected and self._using_rank_local_mmap and component.backing is BackingKind.CHECKPOINT_MMAP
 
     def _install_hook_group(
@@ -1579,7 +1584,15 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         *,
         use_dit_mmap: bool = False,
     ) -> list[DistributedLayerwiseOffloadHook]:
-        """Install one circular block ring with the shared slot protocol."""
+        """Install one circular block ring with the shared slot protocol.
+
+        ``use_mmap`` selects rank-local staging from the checkpoint mmap
+        source.  Plan-owned transforms are passed for every transport: a
+        multi-rank AllGather still packs each rank's shard from the raw
+        checkpoint view, so it needs the same layout conversion as the
+        ordinary loader.  The map is keyed by tensor identity, so tensors
+        loaded by the ordinary loader are never transformed.
+        """
         block_list = list(blocks)
         if len(block_list) <= 1:
             raise ValueError("A distributed layerwise hook group requires at least two blocks")
@@ -1607,7 +1620,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     self.config.pin_cpu_memory,
                     shared_buffers=[None, None],
                     rank_local_mmap=self._using_rank_local_mmap if use_dit_mmap else False,
-                    tensor_transforms=self._mmap_transforms_by_tensor_id if use_dit_mmap else None,
+                    tensor_transforms=self._mmap_transforms_by_tensor_id,
                     materialization_probe_tensor=probes[id(block)],
                     chunk_size_bytes=self.config.chunk_size_bytes,
                 )
