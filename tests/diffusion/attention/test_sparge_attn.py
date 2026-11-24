@@ -163,7 +163,8 @@ def test_packed_metadata_is_rejected(fake_ark):
 
 
 @pytest.mark.parametrize("q_heads,kv_heads,expected", [(8, 8, True), (40, 8, True), (8, 40, False), (8, 3, False)])
-def test_cross_head_geometry(q_heads, kv_heads, expected):
+def test_cross_head_geometry(q_heads, kv_heads, expected, xpu_platform):
+    # XPU keeps grouped-query support; the CUDA case is covered separately below.
     assert SpargeAttentionBackend.supports_cross_head_geometry(q_heads, kv_heads) is expected
 
 
@@ -508,3 +509,8 @@ def test_cuda_short_query_compiles_fullgraph(cuda_platform):
     expected = impl.forward_cuda(query, query, query)
     actual = torch.compile(impl.forward_cuda, fullgraph=True)(query, query, query)
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("q_heads,kv_heads,expected", [(8, 8, True), (8, 2, False), (8, 40, False), (8, 3, False)])
+def test_cross_head_geometry_on_cuda(q_heads, kv_heads, expected, cuda_platform):
+    assert SpargeAttentionBackend.supports_cross_head_geometry(q_heads, kv_heads) is expected

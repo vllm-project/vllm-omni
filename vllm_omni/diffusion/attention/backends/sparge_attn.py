@@ -305,7 +305,11 @@ class SpargeAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_cross_head_geometry(cls, q_heads: int, kv_heads: int) -> bool:
-        return kv_heads > 0 and q_heads % kv_heads == 0
+        if kv_heads <= 0 or q_heads % kv_heads:
+            return False
+        # The CUDA SpargeAttn kernel requires equal Q/KV head counts; the XPU
+        # ARK kernel keeps grouped-query support.
+        return q_heads == kv_heads if current_omni_platform.is_cuda() else True
 
     @classmethod
     def resolve_capabilities(cls, context: ExecutionContext) -> ExecutionPathResult:
