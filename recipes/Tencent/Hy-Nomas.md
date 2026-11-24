@@ -105,6 +105,30 @@ decoder. Explicit `diffusion_offload_config.components` accepts `dit` and
 `text_encoder`; unselected components, including the decoder, remain resident.
 Selecting `vae` is unsupported and raises an error.
 
+### DiT attention backend
+
+Set the backend in the Hy-Nomas stage's `custom_pipeline_args` mapping in the
+deployment YAML.
+
+```yaml
+custom_pipeline_args:
+  dit_attention_backend: fa3_lse
+```
+
+| Value | DiT attention |
+| --- | --- |
+| `flex` (default) | FlexAttention. |
+| `fa3` | FlashAttention-3 for blocks without action-range masks. Action-range masks use FlexAttention. |
+| `fa3_lse` | FlashAttention-3 with log-sum-exp merging for supported action-range masks. Other action-range masks use FlexAttention. |
+
+The `fa3_lse` action path requires disjoint query ranges, a shared key set, and
+action-specific keys. For blocks without action-range masks, `fa3_lse` uses the
+standard FA3 path and compacts valid history K/V rows when a segmented
+AR-Diffusion cache is active.
+Both FA3 modes are experimental. They require CUDA compute capability 9.x and
+a vLLM build with FA3 enabled. Model initialization rejects either mode when
+the runtime reports FA3 is unavailable.
+
 ## Software and checkpoints
 
 Historical adapter validation used Linux, Python 3.12.13, PyTorch 2.13.0+cu130, CUDA 13.0,

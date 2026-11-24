@@ -954,6 +954,45 @@ def test_chunk_reuses_mask_across_denoise_steps_and_clears_after_commit(runner):
     runner.close_session("live")
 
 
+@pytest.mark.parametrize("fail_commit", [False, True])
+def test_packed_history_indices_share_chunk_cache_lifetime(runner, fail_commit):
+    pipeline = runner.pipeline
+    pipeline.dit_attention_backend = "fa3_lse"
+    state = StepRequestState(request_id="live", sampling=sampling(frames=21), prompt="forest")
+    with runner._bound_ar_session("live", description="test"):
+        pipeline.prepare_encode(state)
+        _, previous_inputs = step_chunk(pipeline, state)
+        pipeline.prepare_next_chunk(state)
+        inputs = InputBatch.make_batch([state], cached_batch=previous_inputs)
+        cache = pipeline._ar_state.segmented("cond")
+        handles = cache.handles
+        history_mask = pipeline._session().history_mask[0]
+        expected_indices = history_mask.nonzero().flatten()
+        assert 0 < expected_indices.numel() < history_mask.numel()
+
+        indices = None
+        for _ in range(state.chunk_num_steps):
+            prediction = pipeline.denoise_step(inputs, states=[state])
+            _, _, cached_indices = state.extra["hy_nomas_chunk_masks"]
+            if indices is None:
+                torch.testing.assert_close(cached_indices, expected_indices)
+                indices = cached_indices
+            assert cached_indices is indices
+            assert cache._staging().history_indices is indices
+            pipeline.step_scheduler(state, prediction)
+
+        pipeline.fail_clean = fail_commit
+        if fail_commit:
+            with pytest.raises(RuntimeError, match="injected clean-forward failure"):
+                pipeline.post_decode(state)
+            assert cache.handles == handles
+        else:
+            pipeline.post_decode(state)
+        assert state.extra["hy_nomas_chunk_masks"] is None
+        assert not cache.commit_active
+    runner.close_session("live")
+
+
 def test_inference_mode_boundary_preserves_versioned_masks_and_plan_cache(runner):
     from tests.diffusion.models.hy_nomas.test_native_runtime import _small_transformer
 

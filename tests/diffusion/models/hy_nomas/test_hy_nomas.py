@@ -662,6 +662,7 @@ def test_module_offload_rejects_unsupported_components(components, mocker):
         ({"quantization_config": "int8"}, "unquantized"),
         ({"lora_path": "adapter"}, "LoRA"),
         ({"custom_pipeline_args": {"arbitrary": True}}, "custom_pipeline_args"),
+        ({"custom_pipeline_args": {"dit_attention_backend": "unknown"}}, "dit_attention_backend"),
         ({"custom_pipeline_args": {"decoder_parallel_mode": "unknown"}}, "decoder_parallel_mode"),
         ({"custom_pipeline_args": {"decoder_parallel_mode": "window"}}, "requires more than one Ulysses rank"),
         ({"custom_pipeline_args": {"decoder_backend": "reference"}}, "Unsupported Hy-Nomas custom_pipeline_args"),

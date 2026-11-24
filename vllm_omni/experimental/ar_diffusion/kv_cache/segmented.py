@@ -36,6 +36,8 @@ class SegmentedStaging:
     capacity: int
     owner: object | None = None
     revision: int = -1
+    history_rows: int = 0
+    history_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -97,7 +99,9 @@ class ARDiffusionSegmentedKVState:
     def _staging(self) -> SegmentedStaging:
         return self.cache.segmented_staging[self.cache._kv_branch_index(self.kv_branch)]
 
-    def prepare_layer_views(self, media_tokens: int, condition_tokens: int) -> None:
+    def prepare_layer_views(
+        self, media_tokens: int, condition_tokens: int, *, history_indices: torch.Tensor | None = None
+    ) -> None:
         """Admit the shape and stage history once, outside a captured forward.
 
         Long, unpinned conditioning may grow the buffers after a memory check.
@@ -113,17 +117,35 @@ class ARDiffusionSegmentedKVState:
             raise ValueError("Segmented conditioning rows must be non-negative")
         if self._pending is not None:
             raise RuntimeError("Prepare segmented views before beginning a commit")
-        needed = self.history_tokens + media_tokens + condition_tokens
+        history_rows = self.history_tokens
+        if history_indices is not None:
+            if (
+                history_indices.ndim != 1
+                or history_indices.dtype != torch.int64
+                or history_indices.device != self.cache._k_pools[0].device
+                or history_indices.numel() > history_rows
+            ):
+                raise ValueError("Segmented KV history indices must be a 1-D int64 selection on the cache device")
+            history_rows = history_indices.numel()
+        needed = history_rows + media_tokens + condition_tokens
         self.cache.ensure_segmented_staging(self.kv_branch, needed)
         staging = self._staging()
-        if staging.owner is not self or staging.revision != self._revision:
-            if self._retained:
+        # Staging reuse relies on immutable history indices throughout the chunk.
+        if (
+            staging.owner is not self
+            or staging.revision != self._revision
+            or staging.history_indices is not history_indices
+        ):
+            if history_rows:
                 slots = torch.cat([self._allocations[handle].slots for handle in self._retained])
+                if history_indices is not None:
+                    slots = slots.index_select(0, history_indices)
                 for index, (key, value) in enumerate(staging.layers):
-                    torch.index_select(self.cache._k_pools[index], 0, slots, out=key[: self.history_tokens])
-                    torch.index_select(self.cache._v_pools[index], 0, slots, out=value[: self.history_tokens])
+                    torch.index_select(self.cache._k_pools[index], 0, slots, out=key[:history_rows])
+                    torch.index_select(self.cache._v_pools[index], 0, slots, out=value[:history_rows])
                 self.history_gathers += 1
             staging.owner, staging.revision = self, self._revision
+            staging.history_rows, staging.history_indices = history_rows, history_indices
         self._prepared = (int(media_tokens), int(condition_tokens))
         self._assembled.clear()
 
@@ -155,7 +177,7 @@ class ARDiffusionSegmentedKVState:
             if key.device != device or value.device != device:
                 raise ValueError(f"Segmented KV must be on {device}")
         key, value = staging.layers[layer_idx]
-        start = self.history_tokens
+        start = staging.history_rows
         media_end = start + media_tokens
         end = media_end + condition_tokens
         key[start:media_end].copy_(k_media)
@@ -213,7 +235,7 @@ class ARDiffusionSegmentedKVState:
         if staging.owner is not self or staging.revision != self._revision:
             raise RuntimeError("Segmented staging changed during a clean commit")
         key, value = staging.layers[layer_idx]
-        start = self.history_tokens
+        start = staging.history_rows
         end = start + pending.slots.numel()
         self.cache._k_pools[layer_idx].index_copy_(0, pending.slots, key[start:end])
         self.cache._v_pools[layer_idx].index_copy_(0, pending.slots, value[start:end])
@@ -258,7 +280,7 @@ class ARDiffusionSegmentedKVState:
         staging = self._staging()
         if staging.owner is not self or staging.revision != self._revision:
             raise RuntimeError("Segmented staging changed before archival")
-        start = self.history_tokens
+        start = staging.history_rows
         end = start + pending.slots.numel()
         return tuple((key[start:end], value[start:end]) for key, value in staging.layers)
 
@@ -300,6 +322,7 @@ class ARDiffusionSegmentedKVState:
         staging = self._staging()
         if staging.owner is self:
             staging.owner, staging.revision = None, -1
+            staging.history_rows, staging.history_indices = 0, None
         self._retained = ()
         self._prepared = None
         self._closed = True
