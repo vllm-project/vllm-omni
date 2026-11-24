@@ -973,8 +973,8 @@ steps:
             (exit "$$status")
 
   # Exact-node owners close the remaining CUDA weekly diffusion contracts.
-  # New owners remain nonblocking until their selectors pass on exact-head
-  # MI300 hardware with zero skips, retries, or leaked processes.
+  # Their selectors passed on exact-head MI300 hardware with zero skips,
+  # retries, or leaked processes, so every owner is now blocking.
   - group: "Diffusion E2E Weekly"
     steps:
       - label: "Bagel online · 1-GPU"
@@ -1009,7 +1009,7 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_bagel_weekly
@@ -1034,7 +1034,7 @@ steps:
         agent_pool: mi300_4
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_bagel_weekly
@@ -1182,7 +1182,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_sana_video_weekly
@@ -1214,7 +1214,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 600
         source_file_dependencies:
           - diffusion_sensenova_u1_weekly
@@ -1263,7 +1263,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_mammoth_moda2_weekly
@@ -1285,7 +1285,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_helios_weekly
@@ -1307,7 +1307,7 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 480
         source_file_dependencies:
           - diffusion_glm_image_weekly
@@ -1339,7 +1339,7 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_dreamzero_weekly
@@ -1360,7 +1360,7 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_hidream_o1_weekly
@@ -1383,7 +1383,7 @@ steps:
         agent_pool: mi300_4
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_magi2_weekly
@@ -1851,7 +1851,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_portable_1gpu_weekly
@@ -1884,7 +1884,7 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_portable_2gpu_weekly
@@ -1908,7 +1908,7 @@ steps:
         agent_pool: mi300_4
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 360
         source_file_dependencies:
           - diffusion_portable_4gpu_weekly

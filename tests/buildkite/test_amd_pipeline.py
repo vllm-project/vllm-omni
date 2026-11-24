@@ -2194,7 +2194,7 @@ _BAGEL_ONLINE_WEEKLY_JOBS = (
         "Bagel online · 2-GPU",
         "mi300_2",
         "2",
-        "NonBlocking",
+        "Blocking",
         "rocm-bagel-online-weekly-2gpu",
         "slow and diffusion and rocm and MI300 and cards_2",
         tuple(
@@ -2212,7 +2212,7 @@ _BAGEL_ONLINE_WEEKLY_JOBS = (
         "Bagel multi-replica · 4-GPU",
         "mi300_4",
         "4",
-        "NonBlocking",
+        "Blocking",
         "rocm-bagel-multi-replica-weekly-4gpu",
         "slow and diffusion and rocm and MI300 and cards_4",
         (
@@ -3229,7 +3229,7 @@ _FINAL_DIFFUSION_PARITY_WEEKLY_JOBS = (
 _FINAL_DIFFUSION_PARITY_WEEKLY_LABELS = {job[0] for job in _FINAL_DIFFUSION_PARITY_WEEKLY_JOBS}
 
 
-def test_final_diffusion_parity_weekly_jobs_are_exact_nonblocking_qualifiers() -> None:
+def test_final_diffusion_parity_weekly_jobs_are_exact_blocking_owners() -> None:
     def flatten_paths(items: list) -> set[str]:
         paths: set[str] = set()
         for item in items:
@@ -3256,7 +3256,7 @@ def test_final_diffusion_parity_weekly_jobs_are_exact_nonblocking_qualifiers() -
         nodes,
     ) in _FINAL_DIFFUSION_PARITY_WEEKLY_JOBS:
         step = _find_step(label, AMD_WEEKLY_PIPELINE)
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == "Blocking"
         assert step["agent_pool"] == pool
         assert step["depends_on"] == "amd-build"
         assert step["mirror_hardwares"] == ["amdproduction"]
@@ -3422,7 +3422,7 @@ _SENSENOVA_U1_ACCURACY_NODES = (
 
 def test_sensenova_weekly_captures_both_platform_specific_accuracy_candidates() -> None:
     step = _find_step("SenseNova-U1 functional and accuracy · 1-GPU", AMD_WEEKLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["depends_on"] == "amd-build"
     assert step["mirror_hardwares"] == ["amdproduction"]
@@ -7173,16 +7173,16 @@ def test_minicpmo_ready_grades_render_blocking() -> None:
         assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
 
 
-def test_weekly_has_only_final_diffusion_parity_qualifiers_nonblocking() -> None:
+def test_weekly_final_diffusion_parity_qualifiers_are_blocking() -> None:
     weekly = _load_yaml(AMD_WEEKLY_PIPELINE)
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
-    expected_nonblocking = _FINAL_DIFFUSION_PARITY_WEEKLY_LABELS | {
+    promoted_labels = _FINAL_DIFFUSION_PARITY_WEEKLY_LABELS | {
         "SenseNova-U1 functional and accuracy · 1-GPU",
         "Bagel online · 2-GPU",
         "Bagel multi-replica · 4-GPU",
     }
     assert len(steps) == 67
-    assert sum(step["grade"] == "Blocking" for step in steps) == 54
-    assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == expected_nonblocking
-    assert len(expected_nonblocking) == 13
+    assert len(promoted_labels) == 13
+    assert {step["label"] for step in steps if step["label"] in promoted_labels} == promoted_labels
+    assert all(step["grade"] == "Blocking" for step in steps)
