@@ -2,23 +2,23 @@
 
 ## Summary
 
-The `MOSSImagePipeline` serves text-to-image requests through the
-OpenAI-compatible Images API on vLLM-Omni 0.34.0. Each physical A3 card
-has two NPU dies with 64 GiB HBM per die.
+`MOSSImagePipeline` serves text-to-image requests through the
+OpenAI-compatible Images API. Each A3 card has two NPU dies with 64 GiB
+of HBM per die.
 [OpenMOSS-Team/MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base)
 
-The profiles below use DiT tensor parallelism. The text encoder and VAE
-remain replicated. The general recipe covers offline generation and sampling
-controls. [MOSS-Image-Base recipe](MOSS-Image-Base.md)
+Tensor parallelism shards the DiT. Each die keeps a copy of the text encoder
+and VAE. See the [MOSS-Image-Base recipe](MOSS-Image-Base.md) for offline
+generation and sampling options.
 
 ## Ascend A3 performance
 
-| NPU dies | Physical card capacity used | DiT TP degree | P50 (s) | Peak extra HBM (GiB/die) |
+| NPU dies | Physical cards | DiT TP degree | P50 (s) | Peak extra HBM (GiB/die) |
 | ---: | ---: | ---: | ---: | ---: |
 | 8 | 4 | 8 | 13.28 | 23.62 |
 | 4 | 2 | 4 | 15.58 | 24.77 |
 | 2 | 1 | 2 | 21.75 | 27.09 |
-| 1 | ½ | 1 | 33.90 | 31.24 |
+| 1 | 1 (one die) | 1 | 33.90 | 31.24 |
 
 The DiT and text encoder used BF16 in eager mode, and the VAE used
 FP32. Requests used 50 denoising steps, CFG 3, flow shift 5, seed 0,
@@ -29,15 +29,15 @@ CANN 9.3.0, Ascend driver 26.1.1, PyTorch 2.10.0, and torch-npu
 2.10.0.post7. The vLLM-Omni image was `v0.34.0-a3` with OCI index
 `sha256:584e105786b352505427ef81b9080b90267e12114462221f3db41b7988eb044b`.
 
-Each profile served one 1024×1024 PNG per request at concurrency 1.
-Two rounds each had one warm-up and five measured requests. The prompts
-were `p20` then `p01`–`p05` in round one, and `p19` then `p06`–`p10`
-in round two. See the [prompt corpus](../../benchmarks/diffusion/h3-image-prompts.jsonl).
+At concurrency 1, the client decoded each response as one 1024×1024 PNG.
+Each profile ran two rounds of one warm-up and five timed requests. Round 1
+used `p20` for warm-up and `p01` through `p05` for timing. Round 2 used
+`p19` for warm-up and `p06` through `p10` for timing.
+[Prompt corpus](../../benchmarks/diffusion/h3-image-prompts.jsonl)
 
-P50 is the median of the ten measured HTTP request-to-full-response
-latencies. Every PNG decoded at the requested size. Peak extra HBM is the
-largest sampled increase over the pre-launch HBM reading on any selected
-die. The sampler paused for three seconds between `npu-smi info` calls.
+P50 is the median of ten request latencies measured through receipt of the
+full HTTP response. Peak extra HBM is the largest increase over each die's
+pre-launch reading. The sampler waited three seconds between `npu-smi info` calls.
 
 ## Checkpoint
 
@@ -47,16 +47,11 @@ modelscope download --model openmoss/MOSS-Image-Base \
   --local_dir "${MODEL_ROOT}/MOSS-Image-Base" --max-workers 8
 ```
 
-The checkpoint includes the Diffusers `model_index.json`, the entry point
-for the text encoder, DiT, and VAE components.
-
 ## Environment
 
-Use `quay.io/ascend/vllm-omni:v0.34.0-a3` and follow the
-[A3 container setup](../Qwen/Qwen-Image-2.1-A3.md#start-the-container).
-The command mounts `MODEL_ROOT` at `/models` and sets `NPU_DIES` from
-the selected logical IDs. One, two, four, and eight dies use half a
-physical card, one card, two cards, and four cards, respectively.
+Use `quay.io/ascend/vllm-omni:v0.34.0-a3`. The container command mounts
+`MODEL_ROOT` at `/models` and sets `NPU_DIES` from the selected logical IDs.
+[A3 container setup](../Qwen/Qwen-Image-2.1-A3-NPU.md#start-the-container)
 
 ## Command
 
@@ -103,5 +98,3 @@ with Image.open("moss-image.png") as image:
     assert image.format == "PNG" and image.size == (1024, 1024)
 PYTHON
 ```
-
-The response should decode to exactly one 1024×1024 image.

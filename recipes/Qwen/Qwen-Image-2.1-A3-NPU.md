@@ -2,13 +2,8 @@
 
 ## Summary
 
-The `QwenImage21Pipeline` serves text-to-image requests through the
-OpenAI-compatible Images API on vLLM-Omni 0.34.0. Each physical A3 card
-has two NPU dies with 64 GiB HBM per die.
-
-The base checkpoint accepts a configurable denoising step count. Turbo uses
-a fixed eight-step distilled schedule. Both checkpoints use Ulysses sequence
-parallelism in the multi-die profiles.
+`QwenImage21Pipeline` serves both checkpoints through the OpenAI-compatible
+Images API. Each A3 card has two NPU dies with 64 GiB of HBM per die.
 [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) ·
 [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo)
 
@@ -16,33 +11,33 @@ For Atlas 800I A2, use the [A2 recipe](Qwen-Image-2.1-NPU.md).
 
 ## Ascend A3 performance
 
-| NPU dies | Physical card capacity used | Ulysses degree | Base P50 (s) | Turbo P50 (s) | Base peak extra HBM (GiB/die) | Turbo peak extra HBM (GiB/die) |
+| NPU dies | Physical cards | Ulysses degree | Base P50 (s) | Turbo P50 (s) | Base peak extra HBM (GiB/die) | Turbo peak extra HBM (GiB/die) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 8 | 4 | 8 | 1.83 | 1.06 | 37.23 | 37.93 |
 | 4 | 2 | 4 | 2.65 | 1.36 | 37.32 | 37.32 |
 | 2 | 1 | 2 | 4.19 | 1.94 | 37.24 | 37.24 |
-| 1 | ½ | 1 | 6.34 | 2.72 | 36.67 | 36.66 |
+| 1 | 1 (one die) | 1 | 6.34 | 2.72 | 36.67 | 36.66 |
 
-Both checkpoints ran BF16 in eager mode with `true_cfg_scale=1.0`, seed
-42, and a CPU random generator. The base used 20 denoising steps. Turbo
-used the checkpoint's eight-step schedule. Each multi-die profile used
-Ulysses sequence parallelism with replicated weights. Some base profiles
-ran while other checkpoints downloaded to shared storage.
+The base checkpoint ran with `num_inference_steps=20`. Turbo used its fixed
+eight-step distilled schedule. Both used BF16 eager mode,
+`true_cfg_scale=1.0`, and seed 42 with a CPU generator. Multi-die runs used
+Ulysses sequence parallelism with replicated weights. Some base runs
+overlapped checkpoint downloads to shared storage.
 
 Measured on an Atlas 900 A3 SuperPoD compute node with an arm64 host,
 CANN 9.3.0, Ascend driver 26.1.1, PyTorch 2.10.0, and torch-npu
 2.10.0.post7. The vLLM-Omni image was `v0.34.0-a3` with OCI index
 `sha256:584e105786b352505427ef81b9080b90267e12114462221f3db41b7988eb044b`.
 
-Each profile served one 1024×1024 PNG per request at concurrency 1.
-Two rounds each had one warm-up and five measured requests. The prompts
-were `p20` then `p01`–`p05` in round one, and `p19` then `p06`–`p10`
-in round two. See the [prompt corpus](../../benchmarks/diffusion/h3-image-prompts.jsonl).
+At concurrency 1, the client decoded each response as one 1024×1024 PNG.
+Each profile ran two rounds of one warm-up and five timed requests. Round 1
+used `p20` for warm-up and `p01` through `p05` for timing. Round 2 used
+`p19` for warm-up and `p06` through `p10` for timing.
+[Prompt corpus](../../benchmarks/diffusion/h3-image-prompts.jsonl)
 
-P50 is the median of the ten measured HTTP request-to-full-response
-latencies. Every PNG decoded at the requested size. Peak extra HBM is the
-largest sampled increase over the pre-launch HBM reading on any selected
-die. The sampler paused for three seconds between `npu-smi info` calls.
+P50 is the median of ten request latencies measured through receipt of the
+full HTTP response. Peak extra HBM is the largest increase over each die's
+pre-launch reading. The sampler waited three seconds between `npu-smi info` calls.
 
 ## Checkpoint
 
@@ -56,9 +51,8 @@ modelscope download --model Qwen/Qwen-Image-2.1-Turbo \
   --local_dir "${MODEL_ROOT}/Qwen-Image-2.1-Turbo" --max-workers 8
 ```
 
-The model directories must contain the Diffusers `model_index.json` and
-the text encoder, DiT, and VAE weights. The same directory layout works
-with checkpoints downloaded from Hugging Face.
+Use the same Diffusers layout for Hugging Face downloads. Each directory needs
+`model_index.json` plus the text encoder, DiT, and VAE weights.
 
 ## Environment
 
@@ -68,9 +62,8 @@ for the host requirements.
 
 ### Start the container
 
-Choose free logical IDs from `npu-smi info -m`. The counts below refer to
-NPU dies. Select both sibling dies per physical card for multi-die profiles.
-Two, four, and eight dies then occupy one, two, and four physical cards.
+Check device use with `npu-smi info`. Use `npu-smi info -m` to map logical
+IDs to physical cards. For 2, 4, or 8 dies, select both dies on each card.
 
 ```bash
 export IMAGE=quay.io/ascend/vllm-omni:v0.34.0-a3
@@ -96,8 +89,8 @@ docker run --rm -it --init --privileged --network host --shm-size 16g \
 
 ## Command
 
-Run the following in the container. Set `MODEL_ID` to
-`Qwen/Qwen-Image-2.1-Turbo` to serve Turbo with the same die layout.
+Run this in the container. Set `MODEL_ID` to `Qwen/Qwen-Image-2.1-Turbo`
+to serve Turbo.
 
 ```bash
 export MODEL_ID=Qwen/Qwen-Image-2.1
@@ -114,8 +107,7 @@ vllm serve "/models/${MODEL_ID##*/}" --omni \
 
 ## Request and verification
 
-From a second shell, set the same `MODEL_ID`. Check that the model ID is
-visible, then request one 1024×1024 PNG.
+Set the same `MODEL_ID` in a second shell.
 
 ```bash
 set -o pipefail
@@ -142,6 +134,5 @@ with Image.open("qwen-image.png") as image:
 PYTHON
 ```
 
-The response should decode to exactly one 1024×1024 image. The
-[general Qwen-Image-2.1 recipe](Qwen-Image-2.1.md#online-serving) also
-documents the image-editing endpoint and its inputs.
+For image-editing requests, see the
+[Qwen-Image-2.1 recipe](Qwen-Image-2.1.md#online-serving).
