@@ -11,6 +11,7 @@ from typing import Any, Literal, cast
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
+from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.config.watermarking import WatermarkConfig
@@ -34,6 +35,7 @@ def is_frontend_only(single_stage_id_filter: int | None) -> bool:
 # Maps model architecture names to their HuggingFace model_type values.
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
+    "ChatterboxForConditionalGeneration": "chatterbox",
     "CosyVoice3Model": "cosyvoice3",
     "GLMTTSForConditionalGeneration": "glm_tts",
     "IndexTTS2S2MelDecoder": "indextts2",
@@ -53,6 +55,11 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
+
+# Model types whose official Hub repo ships no config.json, so
+# ``_patch_empty_hf_config`` writes one for a Hub id as well as for a local
+# directory instead of letting transformers fail on the missing file.
+_CONFIG_LESS_MODEL_TYPES: frozenset[str] = frozenset({"chatterbox"})
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
 _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
@@ -94,6 +101,7 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.ming3_audio import (
@@ -132,6 +140,7 @@ def _register_omni_hf_configs() -> None:
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
+        ("chatterbox", ChatterboxConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -366,7 +375,7 @@ class OmniEngineArgs(EngineArgs):
     enable_sleep_mode: bool = False
     omni: bool = False
     # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
-    request_batch_max_wait_ms: float = 0.0
+    request_batch_max_wait_ms: float | None = None
     fa_deterministic: bool = False
     # Tensor-parallel degree for the diffusion text encoder (forwarded to
     # DiffusionParallelConfig via the generic diffusion fallback). Declared
@@ -409,6 +418,7 @@ class OmniEngineArgs(EngineArgs):
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
+    vae_stack_tiles: bool | None = None
     vae_fast_path: str | None = None
     vae_encode_fast_path: str | None = None
     enable_multithread_weight_load: bool | None = None
@@ -522,10 +532,15 @@ class OmniEngineArgs(EngineArgs):
             # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
             # Keep this exception model-scoped so other loader failures retain
             # vLLM's normal error path.
-            if model_type != "indextts2_5" or not os.path.isdir(self.model):
+            # Chatterbox's Hub repo ships none either, so its Hub id is patched
+            # too, but only when the file is absent: a failure to load an
+            # existing one stays on that error path.
+            if model_type in _CONFIG_LESS_MODEL_TYPES:
+                if file_or_path_exists(self.model, "config.json", revision=self.revision):
+                    return
+            elif model_type != "indextts2_5" or not os.path.isdir(self.model):
                 return
-            config_path = os.path.join(self.model, "config.json")
-            if os.path.lexists(config_path):
+            elif os.path.lexists(os.path.join(self.model, "config.json")):
                 return
             config_dict = {}
 
@@ -814,6 +829,7 @@ class OrchestratorArgs:
     allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
     use_hsdp: bool = False
+    hsdp_data_parallel: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = 1
     diffusion_attention_backend: str | None = None
@@ -838,6 +854,7 @@ class OrchestratorArgs:
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_stack_tiles: bool = True
     vae_fast_path: str = "lossless"
     vae_encode_fast_path: str = "lossless"
     enable_multithread_weight_load: bool = True
@@ -921,6 +938,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "step_execution",
         "vae_use_slicing",
         "vae_use_tiling",
+        "vae_stack_tiles",
         "vae_fast_path",
         "vae_encode_fast_path",
         "enable_multithread_weight_load",

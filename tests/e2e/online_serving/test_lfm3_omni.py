@@ -16,7 +16,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 MODEL = os.environ.get("LFM3_OMNI_MODEL_PATH", "LiquidAI/LFM3-Omni-2B")
 # Mandarin speech: "不用帮我叫车了，我自己坐地铁回去。"
 ASR_CLIP = Path(__file__).resolve().parents[2] / "assets" / "semantic_vad" / "complete.wav"
-NO_MEDIA = ["--limit-mm-per-prompt", '{"image":0,"audio":0,"video":0}']
+NO_MEDIA = ["--stage-overrides", '{"0":{"limit_mm_per_prompt":{"image":0,"audio":0,"video":0}}}']
 ASYNC_CHUNK_SERVER = OmniServerParams(
     model=MODEL,
     stage_config_path=get_deploy_config_path("lfm3_omni.yaml"),

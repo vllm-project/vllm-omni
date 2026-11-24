@@ -423,7 +423,7 @@ class OmniGPUWorkerBase(GPUWorker):
             return
         total = self.init_snapshot.total_memory
         free = self.init_snapshot.free_memory
-        current_util = self.cache_config.gpu_memory_utilization
+        current_util = self.cache_config.resolved_gpu_memory_utilization
         # Round up so the suggested value restores at least the reserved amount.
         # (0.8 + 0.1) * 10_000 is 9000.000000000002 in floating point, hence the inner round.
         scaled = round((current_util + cudagraph_memory_estimate / total) * 10_000, 6)

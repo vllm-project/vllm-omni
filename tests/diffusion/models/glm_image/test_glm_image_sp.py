@@ -132,7 +132,7 @@ def test_glm_image_has_sp_support():
     # Actual SP testing requires multi-GPU setup
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.sp
 def test_glm_image_sp_inference():
     """Test SP inference (requires multi-GPU setup)."""

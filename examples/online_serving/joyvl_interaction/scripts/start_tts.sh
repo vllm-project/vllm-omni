@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Serve Qwen3-TTS (vLLM-Omni) and run the webui<->TTS bridge.
 # Then start the webui with:  TTS_URL=ws://127.0.0.1:8092/v1/tts bash scripts/start_server.sh
 set -euo pipefail
@@ -13,7 +16,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CUDA_VISIBLE_DEVICES="${GPU}" vllm-omni serve "${TTS_MODEL}" \
     --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --host 0.0.0.0 --port "${TTS_PORT}" \
-    --gpu-memory-utilization 0.9 --trust-remote-code --omni &
+    --trust-remote-code --omni &
 TTS_PID=$!
 trap 'kill ${TTS_PID} 2>/dev/null || true' EXIT
 

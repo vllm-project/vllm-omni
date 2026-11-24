@@ -4,8 +4,8 @@ steps:
   - label: ":buildkit: Build and Push NPU Test Image - A2"
     key: image-build-a2
     agents: &npu-image-build-agents
-      queue: "ascend-a2b3"
-      resource_class: "npu-1"
+      queue: "ascend-a3"
+      resource_class: "npu-2"
     plugins: &npu-image-build-plugins
       - kubernetes:
           metadata:
