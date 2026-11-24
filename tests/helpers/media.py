@@ -802,6 +802,62 @@ def _get_whisper_model(model_size: str) -> Any:
     return model
 
 
+# ``openai-whisper`` fetches its ``.pt`` checkpoints from the OpenAI CDN, which
+# an offline CI image cannot populate from its HF cache. Passing a HF repo id
+# (``org/name``) as ``model_size`` selects the transformers backend instead and
+# reuses the cached snapshot. HF's ``whisper-small`` is a conversion of the same
+# weights, so transcript similarity thresholds are unaffected.
+_HF_WHISPER_MODELS: dict[str, tuple[Any, Any]] = {}
+
+
+def _is_hf_whisper_model(model_size: str) -> bool:
+    """True when ``model_size`` is a HF repo id rather than an openai-whisper size."""
+    return "/" in model_size
+
+
+def _get_hf_whisper_model(model_id: str) -> tuple[Any, Any]:
+    global _WHISPER_LOADED_DEVICE
+    cached = _HF_WHISPER_MODELS.get(model_id)
+    if cached is None:
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+        device = _WHISPER_LOADED_DEVICE
+        if device is None:
+            device = _select_whisper_device()
+            _WHISPER_LOADED_DEVICE = device
+        processor = WhisperProcessor.from_pretrained(model_id)
+        model = WhisperForConditionalGeneration.from_pretrained(model_id).to(device)
+        model.eval()
+        cached = (model, processor)
+        _HF_WHISPER_MODELS[model_id] = cached
+    return cached
+
+
+def _load_audio_16k_mono(output_path: str) -> np.ndarray:
+    """Decode to 16 kHz mono float32, as Whisper's input features require."""
+    from vllm.multimodal.audio import AudioResampler
+
+    data, sample_rate = sf.read(output_path, dtype="float32", always_2d=True)
+    waveform = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
+    waveform = np.ascontiguousarray(waveform, dtype=np.float32)
+    if int(sample_rate) != 16000:
+        waveform = AudioResampler(target_sr=16000).resample(waveform, orig_sr=int(sample_rate))
+    return np.asarray(waveform, dtype=np.float32).reshape(-1)
+
+
+def _hf_whisper_transcribe(output_path: str, model_id: str, language: str | None) -> str:
+    import torch
+
+    model, processor = _get_hf_whisper_model(model_id)
+    audio = _load_audio_16k_mono(output_path)
+    inputs = processor(audio, sampling_rate=16000, return_tensors="pt")
+    input_features = inputs.input_features.to(model.device)
+    generate_kwargs: dict[str, Any] = {"language": language} if language else {}
+    with torch.no_grad():
+        predicted_ids = model.generate(input_features, **generate_kwargs)
+    return (processor.batch_decode(predicted_ids, skip_special_tokens=True)[0] or "").strip()
+
+
 def _whisper_process_reserved_gib() -> float:
     """GiB held by this worker's caching allocator, or 0 on CPU / if unreadable.
 
@@ -830,22 +886,30 @@ def _whisper_transcribe_in_current_process(
     language: str | None = None,
     temperature_fallback: bool = False,
 ) -> tuple[str, str, float]:
-    model = _get_whisper_model(model_size)
-    if temperature_fallback:
-        import torch
+    if _is_hf_whisper_model(model_size):
+        # transformers generate() has no openai-whisper temperature-fallback
+        # tuple, so temperature_fallback is intentionally ignored on this path.
+        text = _hf_whisper_transcribe(output_path, model_size, language)
+    else:
+        model = _get_whisper_model(model_size)
+        if temperature_fallback:
+            import torch
 
-        # Seed only the isolated ASR worker. This keeps fallback sampling
-        # reproducible without modifying the model server or pytest RNG state.
-        torch.manual_seed(WHISPER_TEMPERATURE_FALLBACK_SEED)
-    text = model.transcribe(
-        output_path,
-        temperature=WHISPER_TEMPERATURE_FALLBACK if temperature_fallback else 0.0,
-        word_timestamps=True,
-        condition_on_previous_text=False,
-        # None keeps whisper's auto-detection. Do not default this to a
-        # language: callers include non-English audio tests.
-        language=language,
-    )["text"]
+            # Seed only the isolated ASR worker. This keeps fallback sampling
+            # reproducible without modifying the model server or pytest RNG state.
+            # Load first: the first call constructs Whisper(dims) and draws from
+            # the CPU generator during nn init, so seeding before it would make
+            # the first fallback transcription differ from later cached ones.
+            torch.manual_seed(WHISPER_TEMPERATURE_FALLBACK_SEED)
+        text = model.transcribe(
+            output_path,
+            temperature=WHISPER_TEMPERATURE_FALLBACK if temperature_fallback else 0.0,
+            word_timestamps=True,
+            condition_on_previous_text=False,
+            # None keeps whisper's auto-detection. Do not default this to a
+            # language: callers include non-English audio tests.
+            language=language,
+        )["text"]
     device = _WHISPER_LOADED_DEVICE or "cpu"
     reserved = _whisper_process_reserved_gib() if _accelerator_index_from_device(device) is not None else 0.0
     return text or "", device, reserved
