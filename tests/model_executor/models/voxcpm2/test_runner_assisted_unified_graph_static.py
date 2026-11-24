@@ -6,6 +6,7 @@ These tests intentionally avoid importing torch/vLLM so they can run in a
 lightweight local checkout. Runtime audio quality still requires a CUDA test.
 """
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -16,15 +17,23 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 REPO_ROOT = Path(__file__).resolve().parents[4]
 RUNNER_ASSISTED_METADATA = REPO_ROOT / "vllm_omni" / "worker" / "runner_assisted_metadata.py"
 TALKER = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "voxcpm2_talker.py"
+CUDA_GRAPH_WRAPPER = TALKER.with_name("cuda_graph_wrapper.py")
 VOXCPM2_RUNTIME_CONFIG = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "runtime_config.py"
 VOXCPM2_PIPELINE = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "pipeline.py"
-VOXCPM2_SCHEDULER = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "scheduler.py"
 OMNI_AR_SCHEDULER = REPO_ROOT / "vllm_omni" / "core" / "sched" / "omni_ar_scheduler.py"
 DEPLOY = REPO_ROOT / "vllm_omni" / "deploy" / "voxcpm2.yaml"
 
 
+def _method_source(path: Path, name: str) -> str:
+    source = path.read_text()
+    node = next(n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef) and n.name == name)
+    result = ast.get_source_segment(source, node)
+    assert result is not None
+    return result
+
+
 def test_voxcpm2_graph_paths_fail_closed_and_preserve_deterministic_noise():
-    source = TALKER.read_text()
+    source = CUDA_GRAPH_WRAPPER.read_text() + "\n" + TALKER.read_text()
     runtime_config_source = VOXCPM2_RUNTIME_CONFIG.read_text()
     compact_source = "".join(source.split())
 
@@ -32,8 +41,7 @@ def test_voxcpm2_graph_paths_fail_closed_and_preserve_deterministic_noise():
     assert "def _compile_without_inductor_cudagraphs" not in source
     assert "_voxcpm2_unwrap_torch_compile" in source
     assert "_orig_mod" in source
-    compile_source = source[source.index("def _voxcpm2_compile_without_inductor_cudagraphs") :]
-    compile_source = compile_source[: compile_source.index("def _setup_torch_compile")]
+    compile_source = _method_source(CUDA_GRAPH_WRAPPER, "_voxcpm2_compile_without_inductor_cudagraphs")
     assert "torch._inductor.config" not in compile_source
     assert '"triton.cudagraphs": False' in compile_source
     assert '"triton.cudagraph_trees": False' in compile_source
@@ -42,8 +50,7 @@ def test_voxcpm2_graph_paths_fail_closed_and_preserve_deterministic_noise():
     assert "andnotself.deterministic_cfm_noise" in "".join(runtime_config_source.split())
     assert "decode_tail_graph" not in source
 
-    unified_source = source[source.index("def _forward_unified_decode") :]
-    unified_source = unified_source[: unified_source.index("# -------------------- vllm hooks")]
+    unified_source = _method_source(CUDA_GRAPH_WRAPPER, "replay_unified")
     assert "except Exception:" not in unified_source
     assert "_failed_unified_graph_sizes" not in source
     assert "self._enable_unified_decode_graph = False" not in unified_source
@@ -52,7 +59,6 @@ def test_voxcpm2_graph_paths_fail_closed_and_preserve_deterministic_noise():
     assert "record_fallback" not in source
     assert "fallbacks" not in source
     assert "**info_dict: Unpack[VoxCPM2PreprocessInput]" in source
-    assert "**info: Unpack[VoxCPM2PostprocessInput]" in source
     assert "reference_audio: Any" not in source
     assert "prompt_audio: Any" not in source
     assert "def _nullify_volatile_metadata(ctx: _ForwardContextLike) -> _ForwardContextLike" in source
@@ -61,8 +67,7 @@ def test_voxcpm2_graph_paths_fail_closed_and_preserve_deterministic_noise():
     assert 'inputs["audio_feat"]' not in source
     assert 'inputs["text_token"]' not in source
 
-    capture_source = source[source.index("def _capture_unified_decode_graph") :]
-    capture_source = capture_source[: capture_source.index("def _unified_decode_graph_skip_reason")]
+    capture_source = _method_source(CUDA_GRAPH_WRAPPER, "_capture_unified_decode_graph")
     assert "_voxcpm2_compile_unified_capture_estimator" in capture_source
     assert "_voxcpm2_compile_unified_capture_feat_encoder" in capture_source
     graph_body = capture_source[capture_source.index("with torch.cuda.graph") :]
@@ -75,7 +80,7 @@ def test_voxcpm2_graph_paths_fail_closed_and_preserve_deterministic_noise():
 
 
 def test_voxcpm2_batch_unified_graph_requires_runner_metadata_marker():
-    source = TALKER.read_text()
+    source = CUDA_GRAPH_WRAPPER.read_text() + "\n" + TALKER.read_text()
     compact_source = "".join(source.split())
 
     assert "enable_runner_assisted_unified_decode_graph" not in source
@@ -88,14 +93,14 @@ def test_voxcpm2_batch_unified_graph_requires_runner_metadata_marker():
     assert "_build_unified_graph_bucket_sizes" in source
     assert "_select_unified_graph_bucket_size" in source
 
-    capture_source = source[source.index("def _capture_unified_decode_graph") :]
-    capture_source = capture_source[: capture_source.index("def _unified_decode_graph_skip_reason")]
+    capture_source = _method_source(CUDA_GRAPH_WRAPPER, "_capture_unified_decode_graph")
     assert "override_forward_context" in capture_source
     assert "_nullify_volatile_metadata" in capture_source
     assert "capture_context = override_forward_context(self._nullify_volatile_metadata(ctx))" in capture_source
     assert "ifsize>1:continue" not in compact_source
-    forward_source = source[source.index("def _forward_unified_decode") :]
-    forward_source = forward_source[: forward_source.index("# -------------------- vllm hooks")]
+    forward_source = _method_source(CUDA_GRAPH_WRAPPER, "get_unified_graph") + _method_source(
+        CUDA_GRAPH_WRAPPER, "replay_unified"
+    )
     assert "graph_size = self._select_unified_graph_bucket_size(num_reqs)" in forward_source
     assert "self._unified_graphs if mixed_token_capacity is None else self._mixed_graphs" in forward_source
     assert "graph_cache[graph_key] = g" in forward_source
@@ -104,15 +109,14 @@ def test_voxcpm2_batch_unified_graph_requires_runner_metadata_marker():
     assert "g.input_embeds[last : last + 1].expand" in forward_source
     assert "ifnum_reqs>1andnotself._runner_assisted_unified_decode_graph_active" in compact_source
     assert "andnotcfg.enable_runner_assisted_unified_decode_graph" not in compact_source
-    needs_source = source[source.index("def get_runner_assisted_full_attention_metadata_request") :]
-    needs_source = needs_source[: needs_source.index("def set_runner_assisted_full_attention_metadata_context")]
+    needs_source = _method_source(CUDA_GRAPH_WRAPPER, "get_runner_assisted_full_attention_metadata_request")
     assert "_select_unified_graph_bucket_size(num_reqs)" in needs_source
     assert "_should_use_decode_graph(num_reqs)" not in needs_source
     assert "RunnerAssistedFullAttentionMetadataRequest(" in needs_source
 
 
 def test_voxcpm2_unified_skip_preserves_segmented_decode_graphs():
-    source = TALKER.read_text()
+    source = CUDA_GRAPH_WRAPPER.read_text() + "\n" + TALKER.read_text()
     compact_source = "".join(source.split())
     forward_source = source[source.index("def forward(") :]
     forward_source = forward_source[: forward_source.index("# -------------------- prefill / decode helpers")]
@@ -120,13 +124,13 @@ def test_voxcpm2_unified_skip_preserves_segmented_decode_graphs():
     assert "use_segmented_decode_graph" in forward_source
     assert "unified_skip_reasonisnotNone" in compact_source
     assert "notself._enable_unified_decode_graphorunified_skip_reasonisnotNone" in compact_source
+    assert "self._forward_unified_decode(" in forward_source
     assert "ifuse_segmented_decode_graph:" in compact_source
     assert "anduse_segmented_decode_graph" in compact_source
 
 
-def test_voxcpm2_scheduler_policy_stays_model_local():
+def test_voxcpm2_uses_shared_scheduler():
     common_source = OMNI_AR_SCHEDULER.read_text()
-    voxcpm2_scheduler_source = VOXCPM2_SCHEDULER.read_text()
     pipeline_source = VOXCPM2_PIPELINE.read_text()
 
     assert "VoxCPM2TalkerForConditionalGeneration" not in common_source
@@ -135,17 +139,7 @@ def test_voxcpm2_scheduler_policy_stays_model_local():
     assert "_schedule_with_optional_waiting_deferral" not in common_source
     assert "def _should_defer_waiting_admission(self) -> bool:" in common_source
 
-    assert "class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler)" in voxcpm2_scheduler_source
-    assert "import vllm_omni.platforms as omni_platform" in voxcpm2_scheduler_source
-    assert "from .runtime_config import _VoxCPM2RuntimeConfig" in voxcpm2_scheduler_source
-    assert "_VoxCPM2RuntimeConfig.from_vllm_config(self.vllm_config)" in voxcpm2_scheduler_source
-    assert "use_cuda_graph=omni_platform.current_omni_platform.is_cuda()" in voxcpm2_scheduler_source
-    assert "_should_defer_waiting_for_unified_decode_graph" in voxcpm2_scheduler_source
-    assert "def schedule(" not in voxcpm2_scheduler_source
-    assert "create_request_queue" not in voxcpm2_scheduler_source
-    assert "original_waiting.prepend_requests(deferred_waiting)" not in voxcpm2_scheduler_source
-    assert "return self._should_defer_waiting_for_unified_decode_graph()" in voxcpm2_scheduler_source
-    assert "vllm_omni.model_executor.models.voxcpm2.scheduler.VoxCPM2OmniARAsyncScheduler" in pipeline_source
+    assert "scheduler_cls=" not in pipeline_source
 
 
 def test_voxcpm2_deploy_defaults_to_full_unified_graph_only():

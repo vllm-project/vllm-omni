@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Float32 reference-audio byte transport shared by MRV1 and MRV2."""
+"""Float32 reference-audio byte transport for VoxCPM2."""
 
 from types import SimpleNamespace
 

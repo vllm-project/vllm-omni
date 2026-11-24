@@ -3,14 +3,10 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 from vllm.v1.request import RequestStatus
 
 import vllm_omni.core.sched.omni_ar_scheduler as scheduler_mod
-import vllm_omni.model_executor.models.voxcpm2.scheduler as voxcpm2_scheduler_mod
-from vllm_omni.model_executor.models.voxcpm2.scheduler import VoxCPM2OmniARAsyncScheduler
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -55,94 +51,12 @@ class _MockRequest:
         return RequestStatus.is_finished(self.status)
 
 
-@pytest.fixture(autouse=True)
-def _mock_cuda_graph_platform(monkeypatch) -> None:
-    monkeypatch.setattr(voxcpm2_scheduler_mod.omni_platform.current_omni_platform, "is_cuda", lambda: True)
-
-
-def _make_scheduler(
-    *,
-    enable_unified_decode_graph: bool | None = True,
-    deterministic_cfm_noise: bool = False,
-    runtime_config_on_model_config: bool = False,
-) -> VoxCPM2OmniARAsyncScheduler:
-    sched = VoxCPM2OmniARAsyncScheduler.__new__(VoxCPM2OmniARAsyncScheduler)
-    hf_config = SimpleNamespace()
-    model_config = SimpleNamespace(hf_config=hf_config)
-    if enable_unified_decode_graph is not None or deterministic_cfm_noise:
-        runtime_config = SimpleNamespace(
-            enable_unified_decode_graph=True if enable_unified_decode_graph is None else enable_unified_decode_graph,
-            deterministic_cfm_noise=deterministic_cfm_noise,
-        )
-        if runtime_config_on_model_config:
-            model_config.voxcpm2_runtime_config = runtime_config
-        else:
-            hf_config.voxcpm2_runtime_config = runtime_config
-    sched.vllm_config = SimpleNamespace(model_config=model_config)
-    # Upstream ``Scheduler.__init__`` always creates ``kv_holding_waiting``; the
-    # abort sweep at the top of ``schedule()`` reads it.
+def _make_scheduler():
+    sched = scheduler_mod.OmniARAsyncScheduler.__new__(scheduler_mod.OmniARAsyncScheduler)
+    sched._should_defer_waiting_admission = lambda: True
     sched.kv_holding_waiting = _MockQueue()
     sched.deferred_waiting = set()
     return sched
-
-
-@pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting"])
-def test_voxcpm2_unified_decode_graph_defers_waiting_when_decode_ready(queue_name) -> None:
-    scheduler = _make_scheduler()
-    scheduler.running = [_MockRequest("decode")]
-    scheduler.waiting = _MockQueue()
-    setattr(scheduler, queue_name, _MockQueue([_MockRequest("prefill", status=RequestStatus.WAITING)]))
-
-    assert scheduler._should_defer_waiting_for_unified_decode_graph()
-
-
-def test_voxcpm2_unified_decode_graph_does_not_defer_without_decode_ready() -> None:
-    scheduler = _make_scheduler()
-    scheduler.running = [_MockRequest("prefill-running", num_prompt_tokens=8, num_computed_tokens=4)]
-    scheduler.waiting = _MockQueue([_MockRequest("waiting", status=RequestStatus.WAITING)])
-
-    assert not scheduler._should_defer_waiting_for_unified_decode_graph()
-
-
-def test_voxcpm2_unified_decode_graph_does_not_defer_when_disabled() -> None:
-    scheduler = _make_scheduler(enable_unified_decode_graph=False)
-    scheduler.running = [_MockRequest("decode")]
-    scheduler.waiting = _MockQueue([_MockRequest("prefill", status=RequestStatus.WAITING)])
-
-    assert not scheduler._should_defer_waiting_for_unified_decode_graph()
-
-
-def test_voxcpm2_unified_decode_graph_uses_model_runtime_defaults() -> None:
-    scheduler = _make_scheduler(enable_unified_decode_graph=None)
-    scheduler.running = [_MockRequest("decode")]
-    scheduler.waiting = _MockQueue([_MockRequest("prefill", status=RequestStatus.WAITING)])
-
-    assert scheduler._should_defer_waiting_for_unified_decode_graph()
-
-
-def test_voxcpm2_unified_decode_graph_reads_model_config_runtime_config() -> None:
-    scheduler = _make_scheduler(enable_unified_decode_graph=True, runtime_config_on_model_config=True)
-    scheduler.running = [_MockRequest("decode")]
-    scheduler.waiting = _MockQueue([_MockRequest("prefill", status=RequestStatus.WAITING)])
-
-    assert scheduler._should_defer_waiting_for_unified_decode_graph()
-
-
-def test_voxcpm2_unified_decode_graph_does_not_defer_with_deterministic_noise() -> None:
-    scheduler = _make_scheduler(deterministic_cfm_noise=True)
-    scheduler.running = [_MockRequest("decode")]
-    scheduler.waiting = _MockQueue([_MockRequest("prefill", status=RequestStatus.WAITING)])
-
-    assert not scheduler._should_defer_waiting_for_unified_decode_graph()
-
-
-def test_voxcpm2_unified_decode_graph_does_not_defer_without_cuda_graph(monkeypatch) -> None:
-    monkeypatch.setattr(voxcpm2_scheduler_mod.omni_platform.current_omni_platform, "is_cuda", lambda: False)
-    scheduler = _make_scheduler()
-    scheduler.running = [_MockRequest("decode")]
-    scheduler.waiting = _MockQueue([_MockRequest("prefill", status=RequestStatus.WAITING)])
-
-    assert not scheduler._should_defer_waiting_for_unified_decode_graph()
 
 
 def test_unified_decode_graph_deferral_restores_waiting_queue(monkeypatch) -> None:

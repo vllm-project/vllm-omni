@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
+from vllm_omni.model_executor.models.voxcpm2.model_state import (
     finish_graph_prefills,
     mixed_request_is_ready,
     patch_is_valid,
