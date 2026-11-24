@@ -179,11 +179,21 @@ def npu_worker_start_affinity(od_config: OmniDiffusionConfig, device_index: int,
             os.sched_setaffinity(0, before)
         if requested is True:
             raise RuntimeError(f"requested worker start CPU binding failed: {exc}") from exc
-        logger.warning("Worker start CPU binding unavailable; preserving incoming affinity: %s", exc)
+        logger.warning(
+            "Worker start CPU binding unavailable; preserving incoming affinity: %s",
+            exc,
+            extra={"binding_phase": "start"},
+        )
         yield
         return
     try:
-        logger.info("Starting NPU worker: physical_device=%d numa_node=%d CPUs=%s", physical, node, sorted(target))
+        logger.debug(
+            "Starting NPU worker: physical_device=%d numa_node=%d CPUs=%s",
+            physical,
+            node,
+            sorted(target),
+            extra={"physical_device": physical, "numa_node": node, "cpu_count": len(target), "binding_phase": "start"},
+        )
         yield
     finally:
         os.sched_setaffinity(0, before)
@@ -227,12 +237,13 @@ def maybe_bind_npu_offload_cpu(od_config: OmniDiffusionConfig, device: torch.dev
         actual = set(os.sched_getaffinity(0))
         if not actual or not actual <= target:
             raise RuntimeError("CPU binding verification failed")
-        logger.info(
+        logger.debug(
             "NPU offload CPU binding: physical_device=%d numa_node=%d CPUs=%s existing_threads_bound=%d",
             physical,
             node,
             sorted(actual),
             len(changed),
+            extra={"physical_device": physical, "numa_node": node, "cpu_count": len(actual), "binding_phase": "load"},
         )
         return True
     except (OSError, RuntimeError, ValueError, AttributeError) as exc:
@@ -243,5 +254,9 @@ def maybe_bind_npu_offload_cpu(od_config: OmniDiffusionConfig, device: torch.dev
                 continue
         if requested is True:
             raise RuntimeError(f"requested NPU CPU binding failed: {exc}") from exc
-        logger.warning("NPU offload CPU binding unavailable; preserving incoming affinity: %s", exc)
+        logger.warning(
+            "NPU offload CPU binding unavailable; preserving incoming affinity: %s",
+            exc,
+            extra={"binding_phase": "load"},
+        )
         return False

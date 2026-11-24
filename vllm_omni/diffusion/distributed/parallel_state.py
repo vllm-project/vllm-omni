@@ -622,7 +622,13 @@ def _new_sequence_parallel_group(ranks: list[int], kind: str):
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
     options.hccl_config = {"hccl_op_expansion_mode": mode}
     group = torch.distributed.new_group(ranks, backend="hccl", pg_options=options)
-    logger.info("%s HCCL group ranks=%s expansion_mode=%d", kind, ranks, mode)
+    logger.debug(
+        "%s HCCL group ranks=%s expansion_mode=%d",
+        kind,
+        ranks,
+        mode,
+        extra={"parallel_kind": kind, "group_ranks": ranks, "hccl_expansion_mode": mode},
+    )
     return group
 
 
