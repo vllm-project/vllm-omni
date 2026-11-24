@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import VllmConfig
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod, fused_experts
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import UnquantizedMoeBackend
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -170,6 +171,9 @@ class HFNumericsSparseMoeBlock(Qwen3MoeSparseMoeBlock):
             self.top_k,
             self.norm_topk_prob,
         )
+        if self.tp_size > 1:
+            # Each rank holds a slice of the intermediate dimension, as in the stock block.
+            out = tensor_model_parallel_all_reduce(out)
         return out.view(hidden_states.shape)
 
 
@@ -187,10 +191,8 @@ class HFNumericsDecoderLayer(Qwen3MoeDecoderLayer):
         self.self_attn.rotary_emb = HFNumericsRotaryEmbedding(config)
         if not isinstance(self.mlp, Qwen3MoeSparseMoeBlock):
             raise ValueError("hf_numerics supports MoE decoder layers only")
-        if self.mlp.tp_size != 1 or self.mlp.ep_size != 1 or self.mlp.is_sequence_parallel:
-            raise ValueError(
-                "hf_numerics needs tensor_parallel_size=1, no expert parallelism and no sequence-parallel MoE"
-            )
+        if vllm_config.parallel_config.enable_expert_parallel or self.mlp.is_sequence_parallel:
+            raise ValueError("hf_numerics needs no expert parallelism and no sequence-parallel MoE")
         if self.mlp.shared_expert is not None:
             raise ValueError("hf_numerics does not support shared experts")
         quant_method = self.mlp.experts.routed_experts.quant_method
