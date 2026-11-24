@@ -112,6 +112,14 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "video_output_warmup",
         "video_output_warmup_timeout",
         SERVE_CLI_SCOPE_KEY,
+        # Subcommand selected by omni's `vllm bench` parser
+        "bench_type",
+        # `vllm bench startup --omni` flags
+        # Ref: https://github.com/vllm-project/vllm/blob/v0.34.0/vllm/benchmarks/startup.py#L192
+        "num_iters_cold",
+        "num_iters_warm",
+        "num_iters_warmup",
+        "output_json",
     }
 )
 

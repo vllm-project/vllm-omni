@@ -11,7 +11,13 @@ from vllm_omni.benchmarks.patch import patch
 
 from vllm_omni.entrypoints.cli.benchmark.omni_duplex_eval import OmniDuplexEvalSubcommand
 from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+from vllm_omni.entrypoints.cli.benchmark.startup import OmniBenchmarkStartupSubcommand
 
 from .serve import OmniServeCommand
 
-__all__ = ["OmniServeCommand", "OmniBenchmarkServingSubcommand", "OmniDuplexEvalSubcommand"]
+__all__ = [
+    "OmniServeCommand",
+    "OmniBenchmarkServingSubcommand",
+    "OmniBenchmarkStartupSubcommand",
+    "OmniDuplexEvalSubcommand",
+]
