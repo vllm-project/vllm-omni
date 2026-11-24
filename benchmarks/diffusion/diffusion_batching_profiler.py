@@ -13,8 +13,8 @@ from statistics import mean, median
 
 PROFILE_RE = re.compile(
     r"\[DiffusionBatchProfiler\]\s+batch_size=(?P<batch_size>\d+)\s+"
-    r"request_compute_units=(?P<request_compute_units>\d+)\s+"
-    r"total_compute_units=(?P<total_compute_units>\d+)\s+"
+    r"request_tokens=(?P<request_tokens>\d+)\s+"
+    r"total_tokens=(?P<total_tokens>\d+)\s+"
     r"denoise_step_time=(?P<denoise_step_time>[\d.]+)"
 )
 
@@ -29,8 +29,8 @@ def parse_profile_records(log_file: Path) -> list[dict[str, int | float]]:
             records.append(
                 {
                     "batch_size": int(match.group("batch_size")),
-                    "request_compute_units": int(match.group("request_compute_units")),
-                    "total_compute_units": int(match.group("total_compute_units")),
+                    "request_tokens": int(match.group("request_tokens")),
+                    "total_tokens": int(match.group("total_tokens")),
                     "denoise_step_time": float(match.group("denoise_step_time")),
                 }
             )
@@ -111,25 +111,25 @@ def _piecewise_fit(
 
 def choose_sweet_spot_batch(
     records: list[dict[str, int | float]],
-    reference_compute_units: int | None,
+    reference_tokens: int | None,
     min_samples_per_batch: int,
     min_segment_points: int,
 ) -> tuple[int, int, dict[str, object]]:
     if not records:
         raise ValueError("No DiffusionBatchProfiler records found in log file.")
 
-    by_units: dict[int, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
+    by_tokens: dict[int, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
     for record in records:
-        units = int(record["request_compute_units"])
+        tokens = int(record["request_tokens"])
         batch_size = int(record["batch_size"])
-        by_units[units][batch_size].append(float(record["denoise_step_time"]))
+        by_tokens[tokens][batch_size].append(float(record["denoise_step_time"]))
 
-    ref_units = reference_compute_units or min(by_units)
-    if ref_units not in by_units:
-        raise ValueError(f"reference_compute_units={ref_units} not found in logs; available values: {sorted(by_units)}")
+    ref_tokens = reference_tokens or min(by_tokens)
+    if ref_tokens not in by_tokens:
+        raise ValueError(f"reference_tokens={ref_tokens} not found in logs; available values: {sorted(by_tokens)}")
 
     points: list[tuple[int, float]] = []
-    for batch_size, values in by_units[ref_units].items():
+    for batch_size, values in by_tokens[ref_tokens].items():
         if len(values) < min_samples_per_batch:
             continue
         filtered_values = _iqr_filter(values)
@@ -160,7 +160,7 @@ def choose_sweet_spot_batch(
             ],
             "fit": fit,
         }
-        return ref_units, sweet_spot_batch, analysis
+        return ref_tokens, sweet_spot_batch, analysis
 
     best_point = min(points, key=lambda point: point[1] / point[0])
     analysis = {
@@ -174,19 +174,22 @@ def choose_sweet_spot_batch(
             for batch_size, median_time in points
         ],
     }
-    return ref_units, best_point[0], analysis
+    return ref_tokens, best_point[0], analysis
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate diffusion compute-budget batching config from profiler logs."
+        description="Generate a diffusion token budget for the DRR batching policy from profiler logs."
     )
     parser.add_argument("--log-file", type=Path, required=True)
     parser.add_argument(
-        "--reference-compute-units",
+        "--reference-tokens",
         type=int,
         default=None,
-        help=("Compute units for the profiled 512x512 reference request. Defaults to the smallest value in logs."),
+        help=(
+            "Packed patch tokens of the profiled reference request; 1024 for a 512x512 image. "
+            "Defaults to the smallest value in logs."
+        ),
     )
     parser.add_argument(
         "--min-samples-per-batch",
@@ -204,20 +207,17 @@ def main() -> None:
     args = parser.parse_args()
 
     records = parse_profile_records(args.log_file)
-    ref_units, sweet_spot_batch, analysis = choose_sweet_spot_batch(
+    ref_tokens, sweet_spot_batch, analysis = choose_sweet_spot_batch(
         records,
-        args.reference_compute_units,
+        args.reference_tokens,
         args.min_samples_per_batch,
         args.min_segment_points,
     )
-    compute_unit_budget = ref_units * sweet_spot_batch
     output = {
-        "reference_compute_units": ref_units,
+        "reference_tokens": ref_tokens,
         "sweet_spot_batch_size": sweet_spot_batch,
+        "max_num_batched_tokens": ref_tokens * sweet_spot_batch,
         "analysis": analysis,
-        "diffusion_batching_config": {
-            "compute_unit_budget": compute_unit_budget,
-        },
     }
 
     if args.output_json is not None:
