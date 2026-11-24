@@ -556,7 +556,9 @@ async def test_text_release_opens_response_after_listening(force_listen):
         state = _MiniCPMO45Stage0SessionState(session_id="s0")
         state.current_turn_ended = True
         runtime = stage0_vision_runtime()
-        kwargs = dict(text_token_ids=payload["text_token_ids"], force_listen=payload["force_listen"], epoch=0, seq=1)
+        kwargs = dict(
+            input_text_token_ids=payload["text_token_ids"], force_listen=payload["force_listen"], epoch=0, seq=1
+        )
         result = runtime._stage_prefill_embeddings_only(state, None, **kwargs)
         assert result["text_input"] is not force_listen
         model = _policy_model_with_state(state)

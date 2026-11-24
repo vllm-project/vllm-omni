@@ -395,7 +395,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         *,
         video_frames: list[Image.Image] | None = None,
         encoded_frames: list[list[torch.Tensor]] | None = None,
-        text_token_ids: list[int] | None = None,
+        input_text_token_ids: list[int] | None = None,
         epoch: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
@@ -437,7 +437,9 @@ class MiniCPMO45Stage0DuplexRuntime:
                 # the scheduler's canonical boundary, just like its content.
                 state.pending_terminator_token = completed_terminator
         num_frames = len(encoded_frames) if encoded_frames is not None else len(video_frames or ())
-        has_text = bool(text_token_ids)
+        # Client TEXT units are separate from server-owned result tokens
+        # appended after the unit's media embeddings below.
+        has_text = bool(input_text_token_ids)
         vision_only = audio_waveform is None or len(audio_waveform) == 0
         if vision_only and not num_frames and not has_text:
             return self._stage_prefill_result(False, start_time, "empty audio")
@@ -572,12 +574,12 @@ class MiniCPMO45Stage0DuplexRuntime:
                 token_ids.extend(
                     [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
                 )
-            if text_token_ids and units_built == 0:
+            if input_text_token_ids and units_built == 0:
                 # Match native streaming_prefill(text_list=...): raw text after
                 # this unit's media, without a new chat template or audio clock.
-                text_ids = torch.tensor(text_token_ids, dtype=torch.long, device=self._model_device())
+                text_ids = torch.tensor(input_text_token_ids, dtype=torch.long, device=self._model_device())
                 embed_parts.append(self._token_embedder()(text_ids))
-                token_ids.extend(text_token_ids)
+                token_ids.extend(input_text_token_ids)
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             units_built += 1
