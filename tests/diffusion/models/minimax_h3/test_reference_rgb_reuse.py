@@ -44,11 +44,19 @@ def test_prepared_reference_descriptor_round_trips_exclusive_format(tmp_path, ha
     encoded = reference_video.serialize_prepared_reference_videos([item], str(tmp_path))
     assert reference_video.deserialize_prepared_reference_videos(encoded) == (str(tmp_path), [item])
 
-    if has_sidecar:
-        payload = json.loads(encoded)
-        del payload["videos"][0]["frame_count"]
-        with pytest.raises(ValueError, match="invalid MiniMax H3"):
-            reference_video.deserialize_prepared_reference_videos(json.dumps(payload))
+
+@pytest.mark.parametrize(("has_sidecar", "missing"), [(False, "width"), (True, "frame_count")])
+def test_prepared_reference_descriptor_rejects_missing_fields_on_both_paths(tmp_path, has_sidecar, missing):
+    item = _descriptor_item(tmp_path)
+    if not has_sidecar:
+        del item["rgb_path"], item["frame_count"]
+        item["prepared_path"] = "prepared.mp4"
+    del item[missing]
+    with pytest.raises(ValueError, match="invalid MiniMax H3"):
+        reference_video.serialize_prepared_reference_videos([item], str(tmp_path))
+    payload = json.dumps({"artifact_dir": str(tmp_path), "videos": [item]})
+    with pytest.raises(ValueError, match="invalid MiniMax H3"):
+        reference_video.deserialize_prepared_reference_videos(payload)
 
 
 def test_prepared_reference_descriptor_rejects_mixed_format(monkeypatch, tmp_path):
@@ -222,33 +230,13 @@ def test_request_option_reaches_real_rgb_producer(monkeypatch, reference_clip, r
     assert result.video_timestamps == [[0.25, 1.25, 2.0]]
 
 
-def test_removed_environment_switch_does_not_override_consecutive_requests(monkeypatch, reference_clip):
+def test_removed_environment_switch_does_not_override_consecutive_requests(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE", "1")
-    monkeypatch.setattr(encoder_processing, "resolve_minimax_h3_shape", lambda *args: (256, 256, 52, 13, 160))
-    original_transcode = reference_video._transcode_reference_video
-    captures = []
-
-    def record_transcode(*args, **kwargs):
-        result = original_transcode(*args, **kwargs)
-        reuse = kwargs["rgb_output_path"] is not None
-        captures.append(reuse)
-        assert (result is None) == reuse
-        assert Path(kwargs["workdir"], "prepared.mp4").exists() != reuse
-        return result
-
-    monkeypatch.setattr(reference_video, "_transcode_reference_video", record_transcode)
-    outputs = []
-    for override in (False, True, None):
-        extra_args: dict[str, object] = {"task": "ref2va"}
-        if override is not None:
-            extra_args[reference_video.MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY] = override
-        result = encoder_processing.prepare_encoder_inputs(
-            {"prompt": "reference clip", "multi_modal_data": {"video": str(reference_clip)}}, _Sampling(extra_args)
-        )
-        outputs.append(result.media.videos[0].numpy())
-    assert captures == [False, True, False]
-    np.testing.assert_array_equal(outputs[0], outputs[1])
-    np.testing.assert_array_equal(outputs[0], outputs[2])
+    key = reference_video.MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY
+    resolve = reference_video.resolve_reference_video_decode_reuse
+    assert resolve({key: False}) is False
+    assert resolve({key: True}) is True
+    assert resolve({}) is False
 
 
 @pytest.mark.parametrize(

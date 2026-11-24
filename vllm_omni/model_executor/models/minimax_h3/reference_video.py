@@ -29,41 +29,8 @@ def resolve_reference_video_decode_reuse(extra_args: Mapping[str, object]) -> bo
     return value
 
 
-def serialize_prepared_reference_videos(items: list[dict[str, Any]], artifact_dir: str) -> str:
-    if any(("prepared_path" in item) == ("rgb_path" in item) for item in items):
-        raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor: require exactly one media path")
-    required_fields = (
-        "original_path",
-        "input_has_audio",
-        "width",
-        "height",
-        "start_time_seconds",
-        "duration_seconds",
-        "audio_duration_seconds",
-    )
-    optional_fields = ("prepared_path", "rgb_path", "frame_count")
-    return json.dumps(
-        {
-            "artifact_dir": artifact_dir,
-            "videos": [
-                {field: item[field] for field in (*required_fields, *optional_fields) if field in item}
-                for item in items
-            ],
-        },
-        separators=(",", ":"),
-    )
-
-
-def deserialize_prepared_reference_videos(value: str) -> tuple[str, list[dict[str, Any]]]:
-    try:
-        payload = json.loads(value)
-        artifact_dir = payload["artifact_dir"]
-        videos = payload["videos"]
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor") from exc
-    if not isinstance(artifact_dir, str) or not isinstance(videos, list):
-        raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor")
-    required = {
+_REQUIRED_REFERENCE_FIELDS = frozenset(
+    {
         "original_path",
         "input_has_audio",
         "width",
@@ -72,19 +39,43 @@ def deserialize_prepared_reference_videos(value: str) -> tuple[str, list[dict[st
         "duration_seconds",
         "audio_duration_seconds",
     }
-    optional = {"prepared_path", "rgb_path", "frame_count"}
-    if any(
-        not isinstance(item, dict)
-        or not required.issubset(item)
-        or not set(item).issubset(required | optional)
-        or (("prepared_path" in item) == ("rgb_path" in item))
-        or ("prepared_path" in item and not isinstance(item["prepared_path"], str))
-        or (("rgb_path" in item) != ("frame_count" in item))
-        or ("rgb_path" in item and not isinstance(item["rgb_path"], str))
-        or ("frame_count" in item and (not isinstance(item["frame_count"], int) or item["frame_count"] <= 0))
-        for item in videos
-    ):
-        raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor")
+)
+_REFERENCE_FIELDS = _REQUIRED_REFERENCE_FIELDS | {"prepared_path", "rgb_path", "frame_count"}
+
+
+def _validate_prepared_reference_videos(artifact_dir: Any, videos: Any) -> None:
+    error = "invalid MiniMax H3 prepared-reference-video descriptor"
+    if not isinstance(artifact_dir, str) or not isinstance(videos, list):
+        raise ValueError(error)
+    for item in videos:
+        if not isinstance(item, dict) or not _REQUIRED_REFERENCE_FIELDS <= item.keys() <= _REFERENCE_FIELDS:
+            raise ValueError(error)
+        if ("prepared_path" in item) == ("rgb_path" in item):
+            raise ValueError(f"{error}: require exactly one media path")
+        if (
+            ("prepared_path" in item and not isinstance(item["prepared_path"], str))
+            or (("rgb_path" in item) != ("frame_count" in item))
+            or ("rgb_path" in item and not isinstance(item["rgb_path"], str))
+            or ("frame_count" in item and (type(item["frame_count"]) is not int or item["frame_count"] <= 0))
+        ):
+            raise ValueError(error)
+
+
+def serialize_prepared_reference_videos(items: list[dict[str, Any]], artifact_dir: str) -> str:
+    # In-process items may hold extra metadata that is not part of the wire format.
+    videos = [{key: value for key, value in item.items() if key in _REFERENCE_FIELDS} for item in items]
+    _validate_prepared_reference_videos(artifact_dir, videos)
+    return json.dumps({"artifact_dir": artifact_dir, "videos": videos}, separators=(",", ":"))
+
+
+def deserialize_prepared_reference_videos(value: str) -> tuple[str, list[dict[str, Any]]]:
+    try:
+        payload = json.loads(value)
+        artifact_dir = payload["artifact_dir"]
+        videos = payload["videos"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor") from exc
+    _validate_prepared_reference_videos(artifact_dir, videos)
     return artifact_dir, videos
 
 
