@@ -570,7 +570,7 @@ For comprehensive testing guidelines, please refer to the [Test Writing Guide](.
 
 After implementing and testing your model, add a recipe under this repository's
 `recipes/` directory. Follow the
-[`add-recipe` skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/add-recipe/SKILL.md)
+[`add-recipe` skill](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/add-recipe/SKILL.md)
 and [`recipes/TEMPLATE.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/TEMPLATE.md),
 then update the model row in
 [`recipes/README.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/README.md).

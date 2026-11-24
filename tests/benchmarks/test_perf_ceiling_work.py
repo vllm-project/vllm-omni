@@ -14,7 +14,7 @@ from transformers import AutoConfig, AutoModel, LlamaConfig, LlamaForCausalLM
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-SCRIPT = Path(__file__).resolve().parents[2] / ".claude/skills/omni-perf-ceiling/scripts/count_reference_work.py"
+SCRIPT = Path(__file__).resolve().parents[2] / ".agents/skills/omni-perf-ceiling/scripts/count_reference_work.py"
 
 
 @pytest.fixture

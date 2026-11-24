@@ -10,7 +10,7 @@ PORT_FROM: stable_audio_3/model.py StableAudioModel (top-level facade)
 
 This pipeline IS the bridge between vllm-omni's engine and SA3's internals.
 
-Engine contract (from .claude/skills/add-diffusion-model/SKILL.md):
+Engine contract (from .agents/skills/add-diffusion-model/SKILL.md):
   - subclass nn.Module + SupportAudioOutput + (later) SupportsComponentDiscovery
   - implement forward(req: OmniDiffusionRequest) → DiffusionOutput
   - define self.weights_sources so DiffusersPipelineLoader knows where to load

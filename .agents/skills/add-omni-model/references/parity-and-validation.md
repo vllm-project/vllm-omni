@@ -66,7 +66,7 @@ and repeated copies of one prompt do not replace dataset or crosstalk validation
 Then run one accuracy dataset that covers the claimed modalities, for example
 Daily-Omni or Video-MME for understanding and Seed-TTS WER for speech, through
 `vllm bench serve --omni` (see
-`.claude/skills/vllm-omni/references/benchmarking.md`).
+`.agents/skills/vllm-omni/references/benchmarking.md`).
 
 ## Common failure causes
 
@@ -83,7 +83,7 @@ Daily-Omni or Video-MME for understanding and Seed-TTS WER for speech, through
 | Graph-only mismatch | Stale static buffers; autocast context differs between capture and replay (MiniCPM-o code2wav regression) |
 | Stage 1 waits forever | Full-payload hook returned `None`; `requires_full_payload_input` set without a producer |
 
-Use `.claude/skills/vllm-omni/references/debugging.md` for runtime symptoms
+Use `.agents/skills/vllm-omni/references/debugging.md` for runtime symptoms
 (hangs, OOM, connector stalls).
 
 ## Evidence to attach to the PR

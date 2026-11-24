@@ -136,8 +136,8 @@ Wire contract, handshake pitfalls, L1 pytest command, 9-point GPU acceptance bar
 ## Phase 7: Recipe, Docs & Pre-PR
 
 - Add the model recipe (`recipes/<Vendor>/<Model>.md` + `recipes/README.md` row) via [add-recipe](../add-recipe/SKILL.md) and update `docs/models/supported_models.md` with validated backends only.
-- Do not add new model-specific Python scripts under `examples/` (`.claude/skills/precheck-pr/references/examples-policy.md`).
-- Run [precheck-pr](../precheck-pr/SKILL.md), `pre-commit run --files ...`, `git diff --check`, and sign commits with `git commit -s`; include pinned revision, hardware, deploy YAML, and voiced E2E / eval evidence (`.claude/skills/review-pr/references/checks/model-addition-checklist.md`).
+- Do not add new model-specific Python scripts under `examples/` (`.agents/skills/precheck-pr/references/examples-policy.md`).
+- Run [precheck-pr](../precheck-pr/SKILL.md), `pre-commit run --files ...`, `git diff --check`, and sign commits with `git commit -s`; include pinned revision, hardware, deploy YAML, and voiced E2E / eval evidence (`.agents/skills/review-pr/references/checks/model-addition-checklist.md`).
 
 ## Integration Checklist
 

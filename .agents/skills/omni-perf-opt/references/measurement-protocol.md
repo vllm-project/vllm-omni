@@ -90,7 +90,7 @@ STAGE_OVERRIDES="{\"1\":{\"profiler_config\":$PROFILE}}" ./serve.sh
 curl -sS -X POST http://127.0.0.1:8091/start_profile -H 'Content-Type: application/json' -d '{"stages":[1]}'
 ./request.sh
 curl -sS -X POST http://127.0.0.1:8091/stop_profile -H 'Content-Type: application/json' -d '{"stages":[1]}'
-python3 .claude/skills/diffusion-perf-opt/scripts/trace_analyzer.py /tmp/omni_profile/<trace>.json.gz --min-gap-ms 1 --topn 20
+python3 .agents/skills/diffusion-perf-opt/scripts/trace_analyzer.py /tmp/omni_profile/<trace>.json.gz --min-gap-ms 1 --topn 20
 ```
 
 - Run one shape trace (`record_shapes` on, stack off) and one host-stack

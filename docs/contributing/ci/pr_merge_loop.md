@@ -132,7 +132,7 @@ contributor TODOs:
 For a PR that needs a conflict fix, a verified CI code-failure repair, or missing evidence, the configured loop may send one consolidated, actionable GitHub comment to its author or relevant maintainer. Before commenting, inspect existing comments, reviews, and replies; reuse the existing discussion and avoid duplicate requests or unchanged nudges. State the head, verified blocker, exact missing evidence or next step, and what will trigger recheck. An unchanged head/blocker is not by itself a reason to comment again.
 
 For contributor-facing action lists, follow the canonical review skill's
-[consolidated-reply format](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/review-pr/references/delivery/maintainer-style-study.md#consolidated-replies-with-multiple-actions):
+[consolidated-reply format](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/review-pr/references/delivery/maintainer-style-study.md#consolidated-replies-with-multiple-actions):
 a few contributor-owned checkboxes with concrete deliverables and only necessary
 context. Omit routine maintainer/CI status sections and process explanations.
 Keep material testing limitations brief without implying unperformed validation.
@@ -247,8 +247,8 @@ linked evidence and current code before applying a historical lesson.
 
 | Pattern ≥3 days (or same-area twice on main) | Where it lands |
 | --------------------------------------------- | ---------------- |
-| CI / precheck mechanics | Auto → this tree + `.claude/skills/precheck-pr` (+ bot precheck sync); **≤1 regulation PR/day** |
-| Review bars (non-claim) | Auto → `.claude/skills/review-pr` (+ bot review sync) |
+| CI / precheck mechanics | Auto → this tree + `.agents/skills/precheck-pr` (+ bot precheck sync); **≤1 regulation PR/day** |
+| Review bars (non-claim) | Auto → `.agents/skills/review-pr` (+ bot review sync) |
 | Claim / docs language | **Draft for maintainer yes** → then `docs/contributing` / [Documentation Build Guide](../DOCS_GUIDE.md) + skills |
 
 One shared bible for humans and agents — not a bot-only shadow.

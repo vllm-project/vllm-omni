@@ -42,7 +42,7 @@ Use existing pages; a draft invariant is not an automatic blocker. -->
 <!-- Name the regression test or other supporting evidence, commands and actual
 results at the reported commit. Explicitly list relevant checks not run. -->
 
-**BEFORE SUBMITTING:** read [CONTRIBUTING.md](https://github.com/vllm-project/vllm-omni/blob/main/CONTRIBUTING.md) and run the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) with the code agent for a self-check against project conventions.
+**BEFORE SUBMITTING:** read [CONTRIBUTING.md](https://github.com/vllm-project/vllm-omni/blob/main/CONTRIBUTING.md) and run the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/precheck-pr/SKILL.md) with the code agent for a self-check against project conventions.
 
 > [!NOTE]
 > To avoid agent spam, vLLM-Omni limits contributors without write access to **5 open PRs**. If this blocks well-intentioned critical work, please contact a committer to request bypass list access.

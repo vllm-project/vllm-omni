@@ -90,7 +90,7 @@ has no queueing term, so judge it at concurrency 1.
    measurement timestamp. Keep client/server sampling clocks synchronized.
 
 4. **Build the ledger.** Run
-   `python .claude/skills/omni-perf-ceiling/scripts/ceiling_report.py`
+   `python .agents/skills/omni-perf-ceiling/scripts/ceiling_report.py`
    on the result JSON and bench log of each cell. It checks Little's law,
    derives aggregate audio RTF from complete client `request_audio_metrics`
    (unavailable for legacy or partial data), per-stage time shares, GPU idle share,
@@ -258,5 +258,5 @@ term left "not bounded: <reason>"]
   on Ascend NPU, what MPS and pmon are replaced by, reservation and
   `npu-smi` sampling, and how the bound terms shift
 - `omni-perf-opt`: measurement protocol, quality gate, optimization levers
-- `.claude/skills/vllm-omni/references/models/`: per-model stage maps and
+- `.agents/skills/vllm-omni/references/models/`: per-model stage maps and
   deploy YAMLs

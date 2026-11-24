@@ -13,7 +13,7 @@ the step actually collected and executed.
 | `.buildkite/npu/test-npu-nightly.yml` | NPU nightly Perf step (if NPU support is claimed) |
 | `.buildkite/cuda/test-weekly.yml` | Only if the row is a `slow`/weekly job (no diffusion Perf step exists here yet) |
 | `.buildkite/common/ci_source_file_dependencies.yml` | `diffusion_<slug>_perf` alias (source files that should trigger the step) |
-| `.claude/skills/readme.md` | Only when adding this skill, not per model |
+| `.agents/skills/README.md` | Only when adding this skill, not per model |
 
 Do not add a model-specific helper under `tests/helpers/`; keep constants in the
 perf JSON.
