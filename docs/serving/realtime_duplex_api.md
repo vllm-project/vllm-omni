@@ -645,6 +645,16 @@ ships a preset:
 Keyword overrides on a preset replace the corresponding `SessionConfig`
 field, e.g. `create_duplex_session_config(ref_audio=..., temperature=0.6)`.
 
+MiniCPM-o 4.5 honors `instructions` at session open: the text becomes the
+Thinker's system prompt, embedded between `<|im_start|>system` and the
+reference-audio block. Omitting the field (or passing an empty string)
+substitutes the built-in default `"Streaming Omni Conversation."`, so an
+explicitly default string builds the identical Stage-0 context. Custom text
+is embedded in the same position and the scheduler's first-append
+reservation follows it. `instructions` cannot be changed after the session
+is created: `session.update` rejects the change with
+`instructions_update_unsupported`.
+
 MiniCPM-o 4.5 uses `sliding_window_mode: "basic"` by default for the Thinker
 (Stage 0). When the projected context exceeds `basic_window_high_tokens`
 (8000), the window drops the oldest units, including the model's own output
