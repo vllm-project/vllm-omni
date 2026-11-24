@@ -1217,6 +1217,24 @@ class DiffusionWorker:
                     exc_info=True,
                 )
 
+    def abort_weight_update(self) -> None:
+        """Abort an active weight update session without committing staged tensors."""
+        engine = self._get_weight_transfer_engine()
+        if not self._weight_update_active:
+            return
+        self._weight_update_active = False
+        abort_fn = getattr(engine, "abort_weight_update", None)
+        try:
+            if callable(abort_fn):
+                abort_fn()
+            else:
+                engine.reset_weight_update_target()
+        except Exception:
+            logger.warning(
+                "Failed to clean up diffusion weight transfer engine during abort_weight_update.",
+                exc_info=True,
+            )
+
     def execute_model(
         self,
         req: OmniDiffusionRequest | list[NewRequestData],

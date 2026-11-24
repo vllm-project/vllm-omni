@@ -355,7 +355,16 @@ def _two_rank_all_gather_worker(rank: int, port: int, fail_sender_rpc: bool) -> 
         # Both ranks must reach outcome exchange and ipc_collect without deadlocking.
         assert ipc_collect_calls == 1
         if rank == 0:
-            assert len(received_payloads) == 1
+            if fail_sender_rpc:
+                assert len(received_payloads) == 2
+                assert received_payloads[1] == {
+                    "names": [],
+                    "dtype_names": [],
+                    "shapes": [],
+                    "abort": True,
+                }
+            else:
+                assert len(received_payloads) == 1
             payload = received_payloads[0]
             assert payload["names"] == ["a.lora_A.weight", "b.lora_B.weight"]
             decoded = decode_ipc_handles(payload["ipc_handles"])
@@ -382,6 +391,7 @@ def _rank_failure_phase_worker(rank: int, port: int, mode: str) -> None:
     torch.distributed.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2)
     try:
         ipc_collect_calls = 0
+        reduce_calls = 0
 
         def on_ipc_collect():
             nonlocal ipc_collect_calls
@@ -405,7 +415,13 @@ def _rank_failure_phase_worker(rank: int, port: int, mode: str) -> None:
                 raise RuntimeError("injected rank1 staging OOM")
             return t.detach().clone().contiguous()
 
+        def sync_fn() -> None:
+            if mode == "sync_fail_rank1" and rank == 1:
+                raise RuntimeError("injected rank1 async CUDA sync error")
+
         def reduce_fn(t: torch.Tensor):
+            nonlocal reduce_calls
+            reduce_calls += 1
             if mode == "sender_encode_fail" and rank == 0:
                 # Picklable built-in class rejected by encode_ipc_handles on sender AFTER all-gather.
                 return (None, _fake_cuda_ipc_args(t, tensor_cls=object))
@@ -423,7 +439,7 @@ def _rank_failure_phase_worker(rank: int, port: int, mode: str) -> None:
                 reduce_tensor_fn=reduce_fn,
                 stage_tensor_fn=stage_fn,
                 ipc_collect_fn=on_ipc_collect,
-                synchronize_fn=lambda: None,
+                synchronize_fn=sync_fn,
             ),
             client=NoopClient(),
             source=source,
@@ -433,6 +449,16 @@ def _rank_failure_phase_worker(rank: int, port: int, mode: str) -> None:
             match = "injected rank1 staging OOM" if rank == 1 else "trainer preparation failed on rank 1"
             with pytest.raises(RuntimeError, match=match):
                 trainer.send_weights()
+            # No rank may export CUDA IPC handles when preparation fails.
+            assert reduce_calls == 0
+            assert ipc_collect_calls == 0
+        elif mode == "sync_fail_rank1":
+            match = "injected rank1 async CUDA sync error" if rank == 1 else "trainer preparation failed on rank 1"
+            with pytest.raises(RuntimeError, match=match):
+                trainer.send_weights()
+            # Local synchronize failure is coordinated before any IPC export.
+            assert reduce_calls == 0
+            assert ipc_collect_calls == 0
         else:
             if rank == 0:
                 with pytest.raises(ValueError, match="Unsupported tensor class"):
@@ -440,12 +466,13 @@ def _rank_failure_phase_worker(rank: int, port: int, mode: str) -> None:
             else:
                 with pytest.raises(RuntimeError, match="weight sync failed on rank 0"):
                     trainer.send_weights()
-        assert ipc_collect_calls == 1
+            assert reduce_calls == 1
+            assert ipc_collect_calls == 1
     finally:
         torch.distributed.destroy_process_group()
 
 
-@pytest.mark.parametrize("mode", ["prep_oom_rank1", "sender_encode_fail"])
+@pytest.mark.parametrize("mode", ["prep_oom_rank1", "sync_fail_rank1", "sender_encode_fail"])
 def test_trainer_multi_rank_failures_before_and_after_gather_do_not_deadlock(mode):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -453,13 +480,44 @@ def test_trainer_multi_rank_failures_before_and_after_gather_do_not_deadlock(mod
     torch.multiprocessing.spawn(_rank_failure_phase_worker, args=(port, mode), nprocs=2)
 
 
-def test_trainer_aborts_remote_worker_session_when_update_weights_fails_before_reaching_worker(monkeypatch):
-    """If update_weights fails in transport after start, trainer aborts the worker session so next sync works."""
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "start_reply_lost",
+        "update_before_worker",
+        "update_reply_lost_after_staging",
+        "finish_before_worker",
+        "finish_reply_lost_after_commit",
+    ],
+)
+@pytest.mark.parametrize("client_has_abort_method", [False, True])
+def test_trainer_aborts_remote_worker_without_committing_on_interrupted_rpc(
+    monkeypatch,
+    failure_mode,
+    client_has_abort_method,
+):
+    """Interrupted start, update, or finish must keep worker state consistent and usable.
+
+    Covers:
+    - start_weight_update reaching the worker with only the reply lost
+    - update_weights failing before reaching the worker
+    - update_weights reaching the worker (staging the full adapter) with only the reply lost
+    - finish_weight_update failing before reaching the worker
+    - finish_weight_update committing on the worker with only the reply lost
+    for both a standard 4-method VLLMWeightSyncClient (abort sentinel) and a client
+    exposing an explicit abort_weight_update() method, with an existing merged adapter live.
+    """
     from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 
     for mod in (linear, parameter):
         monkeypatch.setattr(mod, "get_tensor_model_parallel_world_size", lambda: 1)
         monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: 0)
+
+    def _expected_merged(base_weight: torch.Tensor, lora_a: torch.Tensor, lora_b: torch.Tensor) -> torch.Tensor:
+        expected = base_weight.detach().clone()
+        delta = torch.mm(lora_b.float(), lora_a.float())
+        expected[:6].copy_((base_weight[:6].float() + delta).to(base_weight.dtype))
+        return expected
 
     with set_current_vllm_config(VllmConfig()):
         model = torch.nn.Module()
@@ -498,32 +556,69 @@ def test_trainer_aborts_remote_worker_session_when_update_weights_fails_before_r
 
         monkeypatch.setattr(IPCWeightTransferEngine, "receive_weights", fake_receive)
 
-        should_drop_update = {"drop": True}
+        fault_armed = {"armed": False}
+        staged_before_reply_loss = {"count": 0}
 
-        class FlakyTransportClient:
+        class FourMethodFlakyClient:
             def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:
                 worker.init_weight_transfer_engine(init_info)
 
             def start_weight_update(self) -> None:
+                if fault_armed["armed"] and failure_mode == "start_reply_lost":
+                    fault_armed["armed"] = False
+                    worker.start_weight_update()
+                    raise ConnectionError("simulated start reply loss after worker started session")
                 worker.start_weight_update()
 
             def update_weights(self, update_info: dict[str, Any]) -> None:
-                if should_drop_update["drop"]:
-                    should_drop_update["drop"] = False
-                    # Fails BEFORE reaching worker.update_weights!
-                    raise ConnectionError("simulated transport drop")
+                if fault_armed["armed"] and not update_info.get("abort"):
+                    if failure_mode == "update_before_worker":
+                        fault_armed["armed"] = False
+                        raise ConnectionError("simulated update transport drop")
+                    if failure_mode == "update_reply_lost_after_staging":
+                        fault_armed["armed"] = False
+                        # Worker receives and stages the FULL adapter, then only the reply is lost!
+                        worker.update_weights(update_info)
+                        staged_before_reply_loss["count"] = len(worker_engine._staged.tensors)
+                        raise ConnectionError("simulated update reply loss after worker staged adapter")
                 worker.update_weights(update_info)
 
             def finish_weight_update(self, weight_version: str | None = None) -> None:
+                if fault_armed["armed"]:
+                    if failure_mode == "finish_before_worker":
+                        fault_armed["armed"] = False
+                        # Fails BEFORE reaching worker.finish_weight_update!
+                        raise ConnectionError("simulated finish transport drop")
+                    if failure_mode == "finish_reply_lost_after_commit":
+                        fault_armed["armed"] = False
+                        worker.finish_weight_update()
+                        raise ConnectionError("simulated finish reply loss after worker committed")
                 worker.finish_weight_update()
 
+        class AbortCapableFlakyClient(FourMethodFlakyClient):
+            def abort_weight_update(self) -> None:
+                worker.abort_weight_update()
+
+        client = AbortCapableFlakyClient() if client_has_abort_method else FourMethodFlakyClient()
+
         generator = torch.Generator().manual_seed(53)
+        a10 = torch.randn(2, 4, generator=generator)
+        b10 = torch.randn(6, 2, generator=generator)
+        a11 = torch.randn(2, 4, generator=generator)
+        b11 = torch.randn(6, 2, generator=generator)
+        a12 = torch.randn(2, 4, generator=generator)
+        b12 = torch.randn(6, 2, generator=generator)
+        expected_10 = _expected_merged(base, a10, b10)
+        expected_11 = _expected_merged(base, a11, b11)
+        expected_12 = _expected_merged(base, a12, b12)
+
         source = LoRAAdapterWeightSource(
             {
-                "base_model.model.transformer.gate.lora_A.weight": torch.randn(2, 4, generator=generator),
-                "base_model.model.transformer.gate.lora_B.weight": torch.randn(6, 2, generator=generator),
+                "base_model.model.transformer.gate.lora_A.weight": a10,
+                "base_model.model.transformer.gate.lora_B.weight": b10,
             },
             peft_config={"r": 2, "lora_alpha": 2, "target_modules": ["gate"]},
+            lora_int_id=10,
         )
         trainer = WeightTransferTrainerFactory.trainer_init(
             MergedLoRAIPCTrainerInitInfo(
@@ -534,21 +629,202 @@ def test_trainer_aborts_remote_worker_session_when_update_weights_fails_before_r
                 ipc_collect_fn=lambda: None,
                 synchronize_fn=lambda: None,
             ),
-            client=FlakyTransportClient(),
+            client=client,
             source=source,
         )
 
-        with pytest.raises(ConnectionError, match="simulated transport drop"):
+        # Commit an initial adapter (id=10) so aborts are verified against a live merged policy.
+        trainer.send_weights()
+        assert manager.list_adapters() == [10]
+        torch.testing.assert_close(model.transformer.gate_up.weight, expected_10, rtol=0, atol=0)
+        torch.testing.assert_close(model.transformer.gate_up.weight[6:], base[6:], rtol=0, atol=0)
+
+        # Attempt adapter id=11 with the simulated RPC fault armed.
+        source.update(
+            {
+                "base_model.model.transformer.gate.lora_A.weight": a11,
+                "base_model.model.transformer.gate.lora_B.weight": b11,
+            },
+            lora_int_id=11,
+        )
+        fault_armed["armed"] = True
+        with pytest.raises(ConnectionError, match="simulated"):
             trainer.send_weights()
 
-        # Worker session was aborted cleanly and base weights are untouched.
+        if failure_mode == "update_reply_lost_after_staging":
+            assert staged_before_reply_loss["count"] == 2
+
         assert worker._weight_update_active is False
+        assert not worker_engine._staged.tensors
+        if failure_mode == "finish_reply_lost_after_commit":
+            # Worker already committed before reply loss; live state must remain consistent.
+            assert manager.list_adapters() == [11]
+            torch.testing.assert_close(model.transformer.gate_up.weight, expected_11, rtol=0, atol=0)
+            torch.testing.assert_close(model.transformer.gate_up.weight[6:], base[6:], rtol=0, atol=0)
+            # Subsequent sync with adapter id=12 succeeds cleanly.
+            source.update(
+                {
+                    "base_model.model.transformer.gate.lora_A.weight": a12,
+                    "base_model.model.transformer.gate.lora_B.weight": b12,
+                },
+                lora_int_id=12,
+            )
+            trainer.send_weights()
+            assert worker._weight_update_active is False
+            assert manager.list_adapters() == [12]
+            torch.testing.assert_close(model.transformer.gate_up.weight, expected_12, rtol=0, atol=0)
+            torch.testing.assert_close(model.transformer.gate_up.weight[6:], base[6:], rtol=0, atol=0)
+        else:
+            # Must fail closed: previous live adapter (id=10) survives untouched, nothing new committed.
+            assert manager.list_adapters() == [10]
+            torch.testing.assert_close(model.transformer.gate_up.weight, expected_10, rtol=0, atol=0)
+            torch.testing.assert_close(model.transformer.gate_up.weight[6:], base[6:], rtol=0, atol=0)
+            # Subsequent retry of adapter id=11 succeeds cleanly with exact merged weights.
+            trainer.send_weights()
+            assert worker._weight_update_active is False
+            assert manager.list_adapters() == [11]
+            torch.testing.assert_close(model.transformer.gate_up.weight, expected_11, rtol=0, atol=0)
+            torch.testing.assert_close(model.transformer.gate_up.weight[6:], base[6:], rtol=0, atol=0)
+
+
+def test_trainer_does_not_abort_unrelated_already_active_session(monkeypatch):
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    for mod in (linear, parameter):
+        monkeypatch.setattr(mod, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: 0)
+
+    with set_current_vllm_config(VllmConfig()):
+        model = torch.nn.Module()
+        model.transformer = torch.nn.Module()
+        model.transformer.stacked_params_mapping = [("gate_up", "gate", 0), ("gate_up", "up", 1)]
+        model.transformer.gate_up = linear.MergedColumnParallelLinear(
+            4, [6, 6], bias=False, params_dtype=torch.bfloat16
+        )
+        manager = DiffusionLoRAManager(model, torch.device("cpu"), torch.bfloat16, lora_application="merged")
+        worker_engine = MergedLoRAIPCWeightTransferEngine(
+            WeightTransferConfig(backend="omni_lora_ipc"), VllmConfig(), torch.device("cpu"), model
+        )
+        worker_engine.lora_manager = manager
+        worker = object.__new__(DiffusionWorker)
+        worker.weight_transfer_engine = worker_engine
+        worker._weight_update_active = False
+
+        # Pre-existing active session owned by another caller.
+        worker.start_weight_update()
+        worker_engine._staged.tensors["existing"] = torch.ones(2, 4)
+
+        class WorkerClient:
+            def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:
+                worker.init_weight_transfer_engine(init_info)
+
+            def start_weight_update(self) -> None:
+                worker.start_weight_update()
+
+            def update_weights(self, update_info: dict[str, Any]) -> None:
+                worker.update_weights(update_info)
+
+            def finish_weight_update(self, weight_version: str | None = None) -> None:
+                worker.finish_weight_update()
+
+        source = LoRAAdapterWeightSource(
+            {"base_model.model.transformer.gate.lora_A.weight": torch.ones(2, 4)},
+            peft_config={"r": 2, "lora_alpha": 2, "target_modules": ["gate"]},
+            lora_int_id=12,
+        )
+        trainer = WeightTransferTrainerFactory.trainer_init(
+            MergedLoRAIPCTrainerInitInfo(
+                rank=0,
+                gpu_uuid="gpu-0",
+                reduce_tensor_fn=lambda t: (None, _fake_cuda_ipc_args(t)),
+                stage_tensor_fn=lambda t: t.detach().clone().contiguous(),
+                ipc_collect_fn=lambda: None,
+                synchronize_fn=lambda: None,
+            ),
+            client=WorkerClient(),
+            source=source,
+        )
+
+        with pytest.raises(RuntimeError, match="already active"):
+            trainer.send_weights()
+
+        # Pre-existing active session must remain untouched.
+        assert worker._weight_update_active is True
+        assert "existing" in worker_engine._staged.tensors
+
+
+def test_abort_update_info_rejects_non_empty_tensor_payload():
+    with pytest.raises(ValueError, match="Abort update info must not carry tensor payloads"):
+        MergedLoRAIPCUpdateInfo(
+            names=["a"],
+            dtype_names=["float32"],
+            shapes=[[1]],
+            ipc_handles=[{}],
+            abort=True,
+        )
+
+
+def test_ar_worker_abort_weight_update_drops_staged_without_committing(monkeypatch):
+    from vllm_omni.lora.weight_transfer import _ABORT_UPDATE_PAYLOAD, MergedLoRASessionAbortedError
+    from vllm_omni.worker.base import OmniGPUWorkerBase
+
+    for mod in (linear, parameter):
+        monkeypatch.setattr(mod, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: 0)
+
+    vllm_config = VllmConfig()
+    with set_current_vllm_config(vllm_config):
+        model = torch.nn.Module()
+        model.transformer = torch.nn.Module()
+        model.transformer.stacked_params_mapping = [("gate_up", "gate", 0), ("gate_up", "up", 1)]
+        model.transformer.gate_up = linear.MergedColumnParallelLinear(
+            4, [6, 6], bias=False, params_dtype=torch.bfloat16
+        )
+        with torch.no_grad():
+            model.transformer.gate_up.weight.fill_(0.25)
+        base = model.transformer.gate_up.weight.detach().clone()
+
+        manager = DiffusionLoRAManager(model, torch.device("cpu"), torch.bfloat16, lora_application="merged")
+        engine = MergedLoRAIPCWeightTransferEngine(
+            WeightTransferConfig(backend="omni_lora_ipc"), vllm_config, torch.device("cpu"), model
+        )
+        engine.lora_manager = manager
+        engine.start_weight_update()
+        engine._staged.tensors["dummy"] = torch.ones(2, 4)
+
+        close_count = {"count": 0}
+
+        class _Loan:
+            def close(self) -> None:
+                close_count["count"] += 1
+
+        worker = object.__new__(OmniGPUWorkerBase)
+        worker.vllm_config = vllm_config
+        worker.weight_transfer_engine = engine
+        worker._weight_update_active = True
+        worker._weight_update_is_draft = False
+        worker._weight_update_kv_cache_loan = _Loan()
+
+        # Repeated abort_weight_update calls must be idempotent and close the KV loan once.
+        worker.abort_weight_update()
+        worker.abort_weight_update()
+        assert worker._weight_update_active is False
+        assert close_count["count"] == 1
+        assert not engine._staged.tensors
+        assert manager.list_adapters() == []
         torch.testing.assert_close(model.transformer.gate_up.weight, base, rtol=0, atol=0)
 
-        # Next sync succeeds cleanly without "already active" error.
-        trainer.send_weights()
+        # Subsequent session aborted via the 4-method GPUWorker.update_weights sentinel path.
+        engine.start_weight_update()
+        engine._staged.tensors["dummy2"] = torch.ones(2, 4)
+        worker._weight_update_active = True
+        with pytest.raises(MergedLoRASessionAbortedError, match="aborted by trainer"):
+            worker.update_weights(dict(_ABORT_UPDATE_PAYLOAD))
         assert worker._weight_update_active is False
-        assert not torch.equal(model.transformer.gate_up.weight, base)
+        assert close_count["count"] == 2
+        assert not engine._staged.tensors
+        assert manager.list_adapters() == []
+        torch.testing.assert_close(model.transformer.gate_up.weight, base, rtol=0, atol=0)
 
 
 def _mismatched_names_worker(rank: int, port: int) -> None:
@@ -569,14 +845,26 @@ def _mismatched_names_worker(rank: int, port: int) -> None:
                 pass
 
         tensors = {"a.lora_A.weight": torch.ones(2, 4)} if rank == 0 else {"b.lora_A.weight": torch.ones(2, 4)}
+        reduce_calls = 0
+        ipc_collect_calls = 0
+
+        def counting_reduce(t: torch.Tensor):
+            nonlocal reduce_calls
+            reduce_calls += 1
+            return (None, _fake_cuda_ipc_args(t))
+
+        def counting_ipc_collect() -> None:
+            nonlocal ipc_collect_calls
+            ipc_collect_calls += 1
+
         source = LoRAAdapterWeightSource(tensors, peft_config={"r": 2, "lora_alpha": 2, "target_modules": ["gate"]})
         trainer = WeightTransferTrainerFactory.trainer_init(
             MergedLoRAIPCTrainerInitInfo(
                 rank=rank,
                 gpu_uuid=f"gpu-{rank}",
-                reduce_tensor_fn=lambda t: (None, _fake_cuda_ipc_args(t)),
+                reduce_tensor_fn=counting_reduce,
                 stage_tensor_fn=lambda t: t.detach().clone().contiguous(),
-                ipc_collect_fn=lambda: None,
+                ipc_collect_fn=counting_ipc_collect,
                 synchronize_fn=lambda: None,
             ),
             client=NoopClient(),
@@ -584,6 +872,8 @@ def _mismatched_names_worker(rank: int, port: int) -> None:
         )
         with pytest.raises(ValueError, match="parameter name mismatch"):
             trainer.send_weights()
+        assert reduce_calls == 0
+        assert ipc_collect_calls == 0
     finally:
         torch.distributed.destroy_process_group()
 

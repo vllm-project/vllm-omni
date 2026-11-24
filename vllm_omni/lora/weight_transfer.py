@@ -90,14 +90,31 @@ def warn_if_expandable_segments_disabled(
     return True
 
 
+class MergedLoRASessionAbortedError(RuntimeError):
+    """Raised on the worker when the trainer explicitly aborts a staged session."""
+
+
+_ABORT_UPDATE_PAYLOAD: dict[str, Any] = {
+    "names": [],
+    "dtype_names": [],
+    "shapes": [],
+    "abort": True,
+}
+
+
 @dataclass
 class MergedLoRAIPCUpdateInfo(IPCWeightTransferUpdateInfo):
     """IPC tensor metadata plus PEFT config; omit config for a full base update."""
 
     peft_config: dict | None = None
     lora_int_id: int = 1
+    abort: bool = False
 
     def __post_init__(self) -> None:
+        if self.abort:
+            if self.names or self.dtype_names or self.shapes or self.ipc_handles or self.ipc_handles_pickled:
+                raise ValueError("Abort update info must not carry tensor payloads")
+            self.ipc_handles = []
         super().__post_init__()
         if self.ipc_handles is not None:
             self.ipc_handles = decode_ipc_handles(self.ipc_handles)
@@ -222,12 +239,23 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
             finally:
                 self.reset_weight_update_target()
 
+    def abort_weight_update(self) -> None:
+        """Discard staged adapter tensors without preparing or committing."""
+        self._kind = None
+        self._peft_config = None
+        self._error = None
+        self._cleanup_session(suppress_errors=True)
+
     def update_weights(self, update_info: dict) -> None:
         """Receive a chunk, discarding staged tensors if receiving fails.
 
         Args:
             update_info: Serialized ``MergedLoRAIPCUpdateInfo``.
         """
+        if isinstance(update_info, dict) and update_info.get("abort"):
+            self.parse_update_info(update_info)
+            self.abort_weight_update()
+            raise MergedLoRASessionAbortedError("Merged LoRA weight-update session aborted by trainer")
         try:
             super().update_weights(update_info)
         except Exception as error:
@@ -486,17 +514,61 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
             return 1
         return torch.distributed.get_world_size(group=self.process_group)
 
+    def _coordinate_preparation(
+        self,
+        *,
+        names: list[str],
+        local_error: BaseException | None = None,
+    ) -> None:
+        """Coordinate local staging/sync status and parameter names before IPC export.
+
+        Running this exchange before ``reduce_tensor`` ensures that a staging
+        error, asynchronous device sync error, or cross-rank name mismatch never
+        creates unopened CUDA IPC exports or strands peer ranks in a later
+        collective.
+        """
+        world_size = self._group_world_size()
+        if world_size == 1:
+            if local_error is not None:
+                raise local_error
+            return
+
+        gathered: list[Any] = [None] * world_size
+        local_err_msg = repr(local_error) if local_error is not None else None
+        torch.distributed.all_gather_object(gathered, (names, local_err_msg), group=self.process_group)
+
+        peer_errors: list[tuple[int, str]] = []
+        for rank_idx, item in enumerate(gathered):
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ValueError(f"Invalid gathered preparation payload from rank {rank_idx}")
+            _, rank_err = item
+            if rank_err is not None:
+                peer_errors.append((rank_idx, rank_err))
+
+        if local_error is not None:
+            raise local_error
+        if peer_errors:
+            err_rank, err_msg = peer_errors[0]
+            raise RuntimeError(f"omni_lora_ipc trainer preparation failed on rank {err_rank}: {err_msg}")
+
+        for rank_idx, (rank_names, _) in enumerate(gathered):
+            if rank_names != names:
+                raise ValueError(
+                    f"omni_lora_ipc parameter name mismatch across trainer ranks: "
+                    f"rank {rank_idx} exported {rank_names}, expected {names}"
+                )
+
     def _all_gather_and_merge_handles(
         self,
         handles: list[dict[str, tuple]],
         names: list[str] | None = None,
         local_error: BaseException | None = None,
     ) -> list[dict[str, tuple]]:
-        """All-gather preparation status and per-tensor GPU UUID handles.
+        """All-gather and merge exported per-tensor GPU UUID handles.
 
-        Coordinates local preparation errors across every trainer rank so a
-        staging or reduction failure on one rank never strands peer ranks inside
-        the collective.
+        Staging and local device synchronization already completed in
+        ``_coordinate_preparation``; this collective coordinates any export
+        failure and merges handle dicts across ranks.
         """
         world_size = self._group_world_size()
         if world_size == 1:
@@ -522,9 +594,7 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
             raise local_error
         if peer_errors:
             err_rank, err_msg = peer_errors[0]
-            raise RuntimeError(f"omni_lora_ipc trainer preparation failed on rank {err_rank}: {err_msg}")
-
-        self._synchronize_fn()
+            raise RuntimeError(f"omni_lora_ipc handle export failed on rank {err_rank}: {err_msg}")
 
         expected = len(handles)
         rank_handle_lists: list[list[dict[str, tuple]]] = []
@@ -565,8 +635,16 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
                 return rank_idx, msg
         return None
 
-    def _release_staged_refs(self, weight_refs: list[torch.Tensor], *, suppress_errors: bool) -> None:
+    def _release_staged_refs(
+        self,
+        weight_refs: list[torch.Tensor],
+        *,
+        run_ipc_collect: bool = True,
+        suppress_errors: bool,
+    ) -> None:
         weight_refs.clear()
+        if not run_ipc_collect:
+            return
         try:
             self._ipc_collect_fn()
         except Exception as exc:
@@ -578,26 +656,49 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
             if not suppress_errors:
                 raise
 
-    def _abort_remote_session(self) -> None:
-        """Best-effort abort when start_weight_update succeeded but update_weights failed.
+    def _abort_remote_session(self, *, finish_attempted: bool = False) -> None:
+        """Drop staged weights on the worker without committing when a session fails.
 
-        If ``update_weights`` failed before reaching the worker (for example on
-        client transport or serialization), calling ``finish_weight_update``
-        forces the worker to close the empty staged session fail-closed so
-        subsequent updates are not rejected as already active.
+        Uses ``client.abort_weight_update()`` when the client exposes it, and
+        otherwise sends the abort-sentinel payload through the standard 4-method
+        ``VLLMWeightSyncClient.update_weights`` route so both diffusion and AR
+        workers discard staged tensors without committing and clear
+        ``_weight_update_active``.
         """
+        abort_fn = getattr(self.client, "abort_weight_update", None)
+        if callable(abort_fn):
+            try:
+                abort_fn()
+                if finish_attempted:
+                    logger.warning(
+                        "Remote omni_lora_ipc session aborted after an interrupted finish_weight_update; "
+                        "if only the finish reply was lost, the worker may already have committed."
+                    )
+                else:
+                    logger.debug("Remote omni_lora_ipc session aborted via client.abort_weight_update")
+            except Exception as abort_exc:
+                logger.warning(
+                    "Remote omni_lora_ipc abort_weight_update failed before releasing trainer IPC references: %s",
+                    abort_exc,
+                    exc_info=True,
+                )
+            return
+
         try:
-            self.client.finish_weight_update()
+            self.client.update_weights(dict(_ABORT_UPDATE_PAYLOAD))
         except Exception as abort_exc:
             msg = str(abort_exc)
-            # Expected outcomes: worker already ended the session on update error,
-            # or closed the empty staged adapter session fail-closed.
-            expected = (
-                "without a matching start_weight_update" in msg
-                or "TensorLoRARequest requires lora_tensors and peft_config" in msg
-            )
-            if expected:
-                logger.debug("Remote omni_lora_ipc session aborted cleanly: %s", abort_exc)
+            if isinstance(abort_exc, MergedLoRASessionAbortedError) or "aborted by trainer" in msg:
+                logger.debug("Remote omni_lora_ipc session aborted cleanly without committing: %s", abort_exc)
+            elif "start_weight_update must be called before update_weights" in msg:
+                if finish_attempted:
+                    logger.warning(
+                        "Remote omni_lora_ipc session was already closed after an interrupted "
+                        "finish_weight_update; worker policy state may reflect the committed update: %s",
+                        abort_exc,
+                    )
+                else:
+                    logger.debug("Remote omni_lora_ipc session was already closed on the worker: %s", abort_exc)
             else:
                 logger.warning(
                     "Remote omni_lora_ipc abort could not confirm worker session closure before "
@@ -634,16 +735,17 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
         names: list[str] = []
         dtype_names: list[str] = []
         shapes: list[list[int]] = []
-        ipc_handles: list[dict[str, tuple]] = []
         weight_refs: list[torch.Tensor] = []
         normalized_cfg: dict[str, Any] | None = None
         resolved_id = self.default_lora_int_id
         prep_error: BaseException | None = None
 
-        # Phase 1: local preparation + coordinated handle/status all-gather.
+        # Phase 1a: stage tensors locally and synchronize before exporting any
+        # CUDA IPC handles so peer staging/sync failures never leave unopened
+        # exports sitting in IPC limbo.
+        raw_items: dict[str, torch.Tensor] = {}
         try:
             normalized_cfg, resolved_id = self._resolve_adapter_metadata(peft_config, lora_int_id)
-            raw_items: dict[str, torch.Tensor] = {}
             for name, tensor in self.source.iter_full():
                 if name in raw_items:
                     raise ValueError(f"Duplicate LoRA tensor name from weight source: {name}")
@@ -657,28 +759,51 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
                 names.append(name)
                 dtype_names.append(str(staged.dtype).split(".")[-1])
                 shapes.append(list(staged.shape))
-                _, ipc_args = self._reduce_tensor_fn(staged)
-                ipc_handles.append({self.gpu_uuid: ipc_args})
                 del staged
-            raw_items.clear()
+            self._synchronize_fn()
         except BaseException as exc:
             prep_error = exc
+        finally:
+            raw_items.clear()
+
+        # Phase 1b: coordinate staging/sync status and sorted names across ranks.
+        try:
+            self._coordinate_preparation(names=names, local_error=prep_error)
+        except BaseException:
+            self._release_staged_refs(weight_refs, run_ipc_collect=False, suppress_errors=True)
+            raise
+
+        # Phase 1c: export IPC handles only after every rank is ready, then all-gather.
+        ipc_handles: list[dict[str, tuple]] = []
+        export_error: BaseException | None = None
+        try:
+            for idx in range(len(weight_refs)):
+                _, ipc_args = self._reduce_tensor_fn(weight_refs[idx])
+                ipc_handles.append({self.gpu_uuid: ipc_args})
+        except BaseException as exc:
+            export_error = exc
 
         try:
             merged_handles = self._all_gather_and_merge_handles(
                 ipc_handles,
                 names=names,
-                local_error=prep_error,
+                local_error=export_error,
             )
         except BaseException:
-            self._release_staged_refs(weight_refs, suppress_errors=True)
+            self._release_staged_refs(
+                weight_refs,
+                run_ipc_collect=bool(ipc_handles),
+                suppress_errors=True,
+            )
             raise
 
         # Phase 2: sender encoding + RPC session + collective outcome broadcast.
         rpc_error: BaseException | None = None
         peer_failure: tuple[int, str] | None = None
+        start_attempted = False
         session_started = False
         session_finished = False
+        finish_attempted = False
         try:
             if self.is_sender:
                 assert normalized_cfg is not None
@@ -695,15 +820,18 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
                     "peft_config": normalized_cfg,
                     "lora_int_id": resolved_id,
                 }
+                start_attempted = True
                 self.client.start_weight_update()
                 session_started = True
                 self.client.update_weights(payload)
-                session_finished = True
+                finish_attempted = True
                 self.client.finish_weight_update()
+                session_finished = True
         except BaseException as exc:
             rpc_error = exc
-            if self.is_sender and session_started and not session_finished:
-                self._abort_remote_session()
+            should_abort = session_started or (start_attempted and "already active" not in str(exc))
+            if self.is_sender and should_abort and not session_finished:
+                self._abort_remote_session(finish_attempted=finish_attempted)
         finally:
             # Keep staging references strongly alive until after the worker ack
             # and collective outcome exchange across all trainer ranks.

@@ -185,6 +185,32 @@ class OmniGPUWorkerBase(GPUWorker):
                     )
             raise
 
+    def abort_weight_update(self) -> None:
+        """Abort an active merged-LoRA update session without committing."""
+        if not getattr(self, "_weight_update_active", False):
+            return
+        self._weight_update_active = False
+        engine = getattr(self, "weight_transfer_engine", None)
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine):
+            engine.abort_weight_update()
+        elif engine is not None:
+            try:
+                engine.reset_weight_update_target()
+            except Exception:
+                logger.warning(
+                    "Failed to reset weight update target during abort_weight_update.",
+                    exc_info=True,
+                )
+        kv_loan = getattr(self, "_weight_update_kv_cache_loan", None)
+        if kv_loan is not None and callable(getattr(kv_loan, "close", None)):
+            try:
+                kv_loan.close()
+            except Exception:
+                logger.warning(
+                    "Failed to close KV cache loan during abort_weight_update.",
+                    exc_info=True,
+                )
+
     def remove_lora(self, lora_id: int) -> bool:
         """Restore the dense base for a merged policy, or remove a runtime adapter.
 
