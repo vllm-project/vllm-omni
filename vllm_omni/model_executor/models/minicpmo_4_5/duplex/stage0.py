@@ -31,7 +31,6 @@ logger = init_logger(__name__)
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
-_MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
 _MINICPMO45_FRAME_POOL_LOCK = Lock()
 _MINICPMO45_FRAME_POOL: ThreadPoolExecutor | None = None
 
@@ -403,6 +402,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         seq: int | None = None,
         is_speech: bool = False,
         stage0_window: dict[str, object] | None = None,
+        text_token_ids: list[int] | None = None,
     ) -> _PrefillSteps:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 
@@ -579,8 +579,28 @@ class MiniCPMO45Stage0DuplexRuntime:
                 state.pending_window_unit.embeds.extend(embed_parts[unit_embed_start:])
                 state.pending_window_unit.token_ids.extend(token_ids[unit_token_start:])
             chunk_size = self._streaming_chunk_size(processor)
-        # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
-        # turn is opened once at session init; re-emitting the turn-open prefix per chunk
+        if text_token_ids and units_built:
+            # Official mixed-mode prefill puts <backend> text after the media
+            # and samples from its final token, in the same resident KV.
+            import torch
+
+            ids = torch.tensor(text_token_ids, dtype=torch.long, device=self._model_device())
+            text_embeds = self._as_2d_tensor(self._token_embedder()(ids))
+            embed_parts.append(text_embeds)
+            token_ids.extend(text_token_ids)
+            if state.pending_window_unit is not None:
+                state.pending_window_unit.embeds.append(text_embeds)
+                state.pending_window_unit.token_ids.extend(text_token_ids)
+            state.pending_speech_context = True
+            state.pending_speech_append_identity = append_identity
+            # A server-owned result resumes the assistant after delegation,
+            # even if the model already ended that turn. Match a seeded
+            # response's open-turn state so silence advances the answer until
+            # its next turn_eos instead of leaving it in the listening loop.
+            state.current_turn_ended = False
+            state.pending_speech_response_open = True
+        # Match official streaming_prefill: a unit carries media and optional text.
+        # The assistant turn opens once at session init; re-emitting its prefix per chunk
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
         # model-generated and tracked via current_turn_ended (mirrors streaming_generate).
         prompt_suffix_len = 0
@@ -1202,6 +1222,8 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "chunk_eos_token_id": self.chunk_eos_token_id,
                 "chunk_tts_eos_token_id": self.chunk_tts_eos_token_id,
                 "turn_eos_token_id": self.turn_eos_token_id,
+                "delegate_open_token_id": getattr(self, "delegate_open_token_id", -1),
+                "delegate_close_token_id": getattr(self, "delegate_close_token_id", -1),
             }.items()
             if isinstance(value, int) and value >= 0
         }
@@ -1211,27 +1233,12 @@ class MiniCPMO45Stage0DuplexRuntime:
         if not model_path:
             return None
         try:
-            from transformers import AutoImageProcessor, AutoProcessor
+            from transformers import AutoProcessor
 
-            original_register = AutoImageProcessor.register
+            from vllm_omni.model_executor.models.minicpmo_4_5.processor import legacy_image_processor_registration
 
-            def register_image_processor(config_class, *args, **kwargs):
-                # The checkpoint's auto_map already loads this class. Its
-                # legacy string registration is incompatible with some
-                # Transformers versions and is otherwise redundant.
-                if config_class == "MiniCPMVImageProcessor":
-                    return None
-                return original_register(config_class, *args, **kwargs)
-
-            with _MINICPMO45_PROCESSOR_LOAD_LOCK:
-                setattr(AutoImageProcessor, "register", staticmethod(register_image_processor))
-                try:
-                    processor = AutoProcessor.from_pretrained(
-                        model_path,
-                        trust_remote_code=True,
-                    )
-                finally:
-                    setattr(AutoImageProcessor, "register", staticmethod(original_register))
+            with legacy_image_processor_registration():
+                processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         except Exception as exc:
             raise RuntimeError(f"Failed to load MiniCPM-o duplex processor from {model_path!r}") from exc
         if getattr(processor, "tokenizer", None) is None:
