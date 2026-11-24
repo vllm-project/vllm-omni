@@ -183,7 +183,10 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             return input_ids, input_embeds, update
 
         update = {KEY_DECODE_STEP: int(info_dict.get(KEY_DECODE_STEP, 0))}
-        prompt_latents = _resolve_prompt_latents(self, info_dict)
+        prompt_generator = None
+        if info_dict.get("prompt_waveform", info_dict.get("prompt_waveforms")) is not None:
+            prompt_generator = self.model._get_request_generator(info_dict, input_embeds.device)
+        prompt_latents = _resolve_prompt_latents(self, info_dict, generator=prompt_generator)
         history = _initial_history(
             prompt_latents["frames"] if prompt_latents is not None else None,
             history_size=self.ming_config.history_patch_size,

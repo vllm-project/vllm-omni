@@ -602,7 +602,7 @@ class MingLLMModel(nn.Module):
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         shape = (1, self.ming_config.patch_size, self.ming_config.latent_dim)
-        if self._dense_single_frame:
+        if getattr(self, "_dense_single_frame", False):
             # Reproduce the release's two BF16 draws per frame, independently per request.
             initial, solver = [], []
             for generator in generators:

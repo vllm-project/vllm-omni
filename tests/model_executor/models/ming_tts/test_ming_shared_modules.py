@@ -35,6 +35,7 @@ from vllm_omni.model_executor.models.ming_tts.constants import (
     SPEAKER_EMBEDDING_DIM,
     VAE_PATCH_SIZE,
 )
+from vllm_omni.model_executor.models.ming_tts.ming_tts import MingTTSForConditionalGeneration
 from vllm_omni.model_executor.models.ming_tts.ming_tts_llm import MingLLMModel
 from vllm_omni.model_executor.models.ming_tts.prompt_assembly import build_ming_dense_prompt
 from vllm_omni.model_executor.models.ming_tts.speaker_extractor import _resolve_speaker_embeddings
@@ -720,3 +721,41 @@ def test_cfm_solver_accepts_precomputed_per_step_noise():
     ).integrate(timesteps)
 
     assert torch.allclose(solution[-1], torch.full_like(y0, 2.0 * (0.5**0.5)))
+
+
+@torch.inference_mode()
+def test_seeded_voice_clone_prefill_uses_request_generator():
+    cfg = MingTTSConfig(patch_size=1, history_patch_size=4, latent_dim=2, llm_hidden_size=2, sample_rate=SAMPLE_RATE)
+    vae = SimpleNamespace(config=SimpleNamespace(enc_kwargs={"input_dim": 882}, patch_size=-1), encoder=True)
+    vae.encode_latent = lambda *args, **kwargs: AudioVAE.encode_latent(vae, *args, **kwargs)
+    llm = SimpleNamespace(
+        ming_config=cfg,
+        fm_dtype=torch.float32,
+        _dense_single_frame=True,
+        _request_generators={},
+        _generator_key=MingLLMModel._generator_key,
+        linear_proj_audio=lambda patches: patches,
+    )
+    llm._get_request_generator = lambda info, dev: MingLLMModel._get_request_generator(llm, info, dev)
+    wrapper = SimpleNamespace(
+        ming_config=cfg,
+        model=llm,
+        _speaker_cache=None,
+        _prompt_encoder=vae,
+        _prompt_encoder_forward=lambda _enc, wav: torch.zeros((1, wav.shape[-1] // 882, 4)),
+    )
+    ids = torch.tensor([1, cfg.audio_start_token_id] + [cfg.audio_dummy_token_id] * 4)
+
+    def _clone(req_id: str, seed: int, global_seed: int):
+        torch.manual_seed(global_seed)
+        info = {"req_id": req_id, "prompt_waveform": torch.zeros((1, 3528)), "tts_local_seed": seed}
+        _, embeds, update = MingTTSForConditionalGeneration._prefill_preprocess(
+            wrapper, ids, torch.zeros((6, 2)), **info
+        )
+        return embeds, update[KEY_LATENT_HISTORY]
+
+    embeds_1, history_1 = _clone("clone-1", seed=42, global_seed=1)
+    embeds_2, history_2 = _clone("clone-2", seed=42, global_seed=9999)
+    _, history_other = _clone("clone-3", seed=43, global_seed=1)
+    assert torch.equal(embeds_1, embeds_2) and torch.equal(history_1, history_2)
+    assert not torch.equal(history_1, history_other)
