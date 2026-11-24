@@ -7,10 +7,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+from vllm.logger import init_logger
+
 if TYPE_CHECKING:
     from torch import nn
 
     from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+logger = init_logger(__name__)
 
 _PATCHED = False
 
@@ -58,6 +63,61 @@ def apply_text_encoder_dtype(model: nn.Module, od_config: OmniDiffusionConfig) -
             parameter.data = parameter.data.to(dtype)
 
 
+def apply_vae_encode_tiling_patch(model: nn.Module, od_config: OmniDiffusionConfig) -> None:
+    """Keep VAE *decode* tiling while encoding the condition image untiled.
+
+    310P enables ``use_tiling`` so that the tile-parallel decode has tiles to
+    work on, but the same flag also routes :meth:`encode` through
+    ``tiled_encode``. Tiling moves the condition-image latents before denoising
+    starts, which costs much more accuracy on this device than it does on the
+    decode side: measured against the Atlas 800I A2 BF16 reference, image
+    conditioned generation sits at 0.79 SSIM / 17.2 dB with the encoder tiled
+    and 0.96 / 28.8 dB with only the decode tiled, at the same noise. The
+    untiled encoder is also the faster path here (0.68 s vs 1.04 s for the
+    768x1024 condition image).
+
+    The wrapper restores the flag afterwards and falls back to the tiled encode
+    if the untiled pass runs out of memory, so this only changes numerics, not
+    whether a configuration can run.
+    """
+    vae = getattr(model, "vae", None)
+    if vae is None or not getattr(vae, "use_tiling", False) or getattr(vae, "_310p_untiled_encode", False):
+        return
+
+    encode = vae.encode
+
+    def encode_untiled(*args, **kwargs):
+        vae.use_tiling = False
+        try:
+            try:
+                return encode(*args, **kwargs)
+            except RuntimeError as exc:
+                if "out of memory" not in str(exc).lower():
+                    raise
+        finally:
+            vae.use_tiling = True
+
+        # Retry outside the handler: while it is active its traceback keeps the
+        # failed encode frames - and the intermediates their locals reference -
+        # alive, and empty_cache() cannot free live allocations. Leaving the
+        # `except` block releases the exception (the `as` name is cleared with
+        # it), so the tiled retry starts from a genuinely empty cache. The flag
+        # is already restored above, which is what the tiled retry needs.
+        logger.warning(
+            "Untiled VAE encode ran out of memory; retrying with tiling. "
+            "Image-conditioned output will carry the tiling difference."
+        )
+        npu = getattr(torch, "npu", None)
+        if npu is not None and npu.is_available():
+            npu.empty_cache()
+        return encode(*args, **kwargs)
+
+    vae.encode = encode_untiled
+    vae._310p_untiled_encode = True
+    logger.info("310P: VAE tiling applies to decode only; the encoder runs untiled.")
+
+
 def apply_qwen_image_21_patches(model: nn.Module, od_config: OmniDiffusionConfig) -> None:
     apply_rotary_patches()
     apply_text_encoder_dtype(model, od_config)
+    apply_vae_encode_tiling_patch(model, od_config)
