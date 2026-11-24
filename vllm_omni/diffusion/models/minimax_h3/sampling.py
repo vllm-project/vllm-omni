@@ -114,7 +114,7 @@ class MiniMaxH3ModelBatch:
         """Why these requests cannot share one packed forward, or None if they can."""
         if pdd:
             # PDD heads take one request-local step index per forward.
-            return logger.debug, "FastH3 Omni PDD executes requests separately with request-local step indices."
+            return logger.debug, "MiniMax H3 PDD heads execute requests separately with request-local step indices."
         if len({id(m.transformer) for m in models}) > 1:
             return logger.warning_once, "MiniMax H3 step batch contains requests for different task-specific DiTs."
         if any("reference_kv_state" in m.branch.static_kwargs for m in models):
@@ -172,7 +172,11 @@ class MiniMaxH3ModelBatch:
         minimax_h3_publish_denoise_progress(*(request_progress[0] if uniform_progress else (None, None, None)))
         context = get_forward_context() if is_forward_context_available() else None
         try:
-            pdd = getattr(getattr(models[0].transformer, "arch", None), "pdd_steps", None) is not None
+            transformer = models[0].transformer
+            pdd = (
+                getattr(getattr(transformer, "arch", None), "pdd_steps", None) is not None
+                or getattr(getattr(transformer, "final_layer", None), "fused_pdd_heads", None) is not None
+            )
             if len(models) > 1:
                 scheduled = context is not None and bool(
                     getattr(context, "attention_schedule", None) or getattr(context, "attention_sigma_schedule", None)

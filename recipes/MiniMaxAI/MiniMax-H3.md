@@ -889,7 +889,7 @@ at most 15 seconds combined.
 ## Fun ControlNet Union (CTRL-01)
 
 The original [Alibaba PAI Fun ControlNet Union checkpoint](https://huggingface.co/alibaba-pai/MiniMax-H3-Fun-Controlnet-Union)
-adds one control branch to the existing FL2VA transformer. It accepts prepared
+adds one control branch to the server's transformer. It accepts prepared
 Canny, Depth, HED, MLSD or Pose videos and mask-based video inpainting. The
 control checkpoint contains only branch weights; keep the base FL2VA components
 available. ComfyUI-repacked, pruned and quantized control checkpoints are not
@@ -912,9 +912,11 @@ vllm serve "$MODEL" --omni --task-type fl2va --trust-remote-code \
 The initial control path uses resident BF16 weights and tensor parallelism.
 Keyframe conditioning, visual timeline guides, continuation (`continue_from` and long-video), sequence parallelism,
 approximate cache acceleration and quantized control execution require separate support; do not combine them with
-this configuration. On base H3 weights control also takes no references. The FastH3 Omni checkpoint takes control as
-Ref2VA with its reference images; see [FastH3 Omni control](../FastVideo/FastH3-Omni.md#controlnet). Control/Turbo combinations need their own validation and
-are not established by ordinary H3 Turbo results.
+this configuration. The branch hints the task its DiT serves: an FL2VA server (`--task-type fl2va`) takes control on
+T2VA requests without references, and a Ref2VA server (`--task-type ref2va`) takes it on Ref2VA requests with their
+reference images, as the FastH3 Omni checkpoint does; see [FastH3 Omni control](../FastVideo/FastH3-Omni.md#controlnet).
+Reference rows receive no hint. A combined server has two DiTs and one branch, so it is refused at startup.
+Control/Turbo combinations need their own validation and are not established by ordinary H3 Turbo results.
 
 Active control conditioning cannot be reused in a `latent_refine` pass at a
 larger canvas after `latent_upscale`: its hint/source/mask rows still describe
@@ -1794,6 +1796,54 @@ Use `--lora-backend peft` to load ComfyUI-style single-file A/B LoRA adapters us
 Use a `lora` array to combine multiple adapters, each with its own `scale`. These adapters can also be combined with the supported Turbo LoRA. Start with `scale=1.0` and adjust it to control adapter strength.
 
 Select a specific file when a directory contains multiple adapters. General Diffusers checkpoint conversion is not supported.
+
+### Pika Flex Turbo LoRA
+
+[Pika-Labs/Pika-H3-Flex-Turbo-LoRA](https://huggingface.co/Pika-Labs/Pika-H3-Flex-Turbo-LoRA) fuses Pika's Flex
+adapter with a few-step distill into one native-layout LoRA, so it loads through the ComfyUI-style path above. The
+files carry no metadata; as with Turbo, the filename is the contract and must not be renamed:
+
+| Artifact | Server | `num_inference_steps` | `flow_shift` |
+| --- | --- | ---: | ---: |
+| `pika_h3_flex_turbo_<n>step[_draft\|_hd]_ref2va[_lite_r32].safetensors` | `--task-type ref2va` | `n` | 12 |
+| `pika_h3_flex_turbo_<n>step[_hd]_fl2va[_lite_r32].safetensors` | `--task-type fl2va` | `n` | 6 |
+
+`audio_flow_shift` is `3.0`. A request with another step count or shift is rejected. The full files are rank 768 on
+the packed QKV projection, which sets the per-layer LoRA buffer rank to 768 for the whole server; the `_lite_r32`
+files stay at rank 96.
+
+### PDD acceleration LoRA
+
+[alibaba-pai/MiniMax-H3-Acc-LoRAs](https://huggingface.co/alibaba-pai/MiniMax-H3-Acc-LoRAs) applies Parallel
+Decoding Distillation: a rank-64 LoRA plus 32 copies of both output heads, of which four fuse into the head of each
+of eight forwards. The server fuses the heads when it loads the adapter and binds them for the requests that
+activate it, so it is selected like any other adapter:
+
+```bash
+hf download alibaba-pai/MiniMax-H3-Acc-LoRAs MiniMax-H3-Ref2VA-Acc-8Step.safetensors --local-dir "${PDD_DIR}"
+```
+
+Start a `--task-type ref2va` server with `--lora-backend peft` (`--task-type fl2va` for
+`MiniMax-H3-FL2VA-Acc-8Step.safetensors`) and send `num_inference_steps=8` with the base model's shifts
+(`flow_shift=12`, `audio_flow_shift=3`) and the adapter in `lora` at `scale=1.0`. A combined server and step
+execution are refused: the heads belong to one DiT and are bound for one request at a time.
+
+### Conditioning features with adapters
+
+ControlNet, `continue_from` and long-video continuation, latent-mask editing and timeline guides do not depend on
+how a request is sampled, so they are available with every adapter above on its own schedule. On one H200 node
+(TP 8, `--task-type ref2va`, 480x832, 124 frames, one reference image, seed 20261124):
+
+| Weights | Depth control | Guide at frame 96, SSIM to the guide (unguided) | Edit, kept half PSNR | `continue_from`, SSIM across the join (inside a clip) | 20 s `long_video` |
+| --- | --- | --- | --- | --- | --- |
+| Base Ref2VA, 20 steps | follows the pose | - | - | - | - |
+| LightX2V `ref2v_turbo_8step_v1.0_768p` | follows the pose | 0.914 (0.725) | 37.6 dB | 0.821 (0.838) | 481 frames |
+| Pika `8step_hd_ref2va` | follows the pose | 0.936 (0.724) | 38.4 dB | 0.907 (0.865) | 481 frames |
+| Pika `4step_ref2va_lite_r32` | follows the pose | 0.879 (0.723) | 36.6 dB | 0.796 (0.806) | 481 frames |
+| PAI `Ref2VA-Acc-8Step` | follows the pose | 0.932 (0.747) | 37.9 dB | 0.824 (0.794) | 481 frames |
+
+Depth control was judged by eye against the control clip; the other columns are measured on the returned MP4s. These
+runs establish that each combination completes and takes effect, not a quality ranking: one prompt, one seed.
 
 ## Key parameters
 

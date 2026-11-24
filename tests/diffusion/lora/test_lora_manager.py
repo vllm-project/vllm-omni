@@ -1797,6 +1797,8 @@ def test_lora_manager_max_rank_validation(monkeypatch, rank):
     req1 = _dummy_lora_request(1)
     with pytest.raises(ValueError):
         manager.add_adapter(req1)
+    # A rejected adapter must not stay cached: a retry would skip loading and fail while binding.
+    assert req1.lora_int_id not in manager._registered_adapters
 
 
 def test_lora_manager_discovers_bagel_component(monkeypatch):
@@ -2586,3 +2588,20 @@ def test_compose_h3_packed_and_separate_projections(scales):
             torch.testing.assert_close(weights.lora_b @ weights.lora_a, delta)
     assert set(first.loras) == set(packed_weights)
     assert first.loras["transformer.blocks.0.attn.qkv_proj"] is packed_weights["transformer.blocks.0.attn.qkv_proj"]
+
+
+@pytest.mark.parametrize(("rank", "buffer_rank"), [(513, 768), (768, 768), (769, 1024), (1024, 1024)])
+def test_lora_manager_holds_ranks_above_the_vllm_literal(monkeypatch, rank, buffer_rank):
+    """A fused few-step adapter concatenates its sources; its rank only sizes the buffers."""
+    manager = DiffusionLoRAManager(pipeline=torch.nn.Module(), device=torch.device("cpu"), dtype=torch.bfloat16)
+
+    def _fake_load(_req: LoRARequest):
+        return type("LM", (), {"id": _req.lora_int_id})(), type("PH", (), {"r": rank})()
+
+    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    manager.add_adapter(_dummy_lora_request(1))
+    assert manager._max_lora_rank == buffer_rank
+    config = manager._buffer_lora_config()
+    assert (config.max_lora_rank, config.max_loras) == (buffer_rank, 1)
+    # Ranks vLLM names are passed through unchanged.
+    assert manager._lora_config(64, lora_dtype=torch.bfloat16).max_lora_rank == 64

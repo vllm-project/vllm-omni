@@ -620,6 +620,20 @@ class MiniMaxH3FinalLayer(nn.Module):
         self.fused_pdd_heads = heads
         return steps
 
+    def set_fused_pdd_heads(self, heads: Mapping[str, torch.Tensor] | None) -> None:
+        """Project the next forwards with ``heads`` (one row per step), or with the released heads for ``None``.
+
+        A request-scoped PDD adapter owns its heads, so the pipeline binds them
+        per request instead of loading them once as a PDD release does.
+        """
+        if heads is None:
+            self.fused_pdd_heads = None
+            return
+        if self.pdd_steps is not None:
+            raise ValueError("fused PDD heads cannot replace the FastH3 pdd_steps heads")
+        device = self.video_out.weight.device
+        self.fused_pdd_heads = {key: value.to(device=device, dtype=_FP32_DTYPE) for key, value in heads.items()}
+
     def _fused_pdd_project(self, h: torch.Tensor, name: str, step: int | None) -> torch.Tensor:
         heads = self.fused_pdd_heads
         stack = heads[f"{name}.weight"]

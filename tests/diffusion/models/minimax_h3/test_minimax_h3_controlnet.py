@@ -480,16 +480,26 @@ def test_startup_rejects_public_and_legacy_offload(control_startup, offload):
         pipeline_module.MiniMaxH3Pipeline(od_config=config)
 
 
-@pytest.mark.parametrize("partition", ["combined", "ref2va"])
-def test_control_rejects_secondary_or_ref2va_partition_before_loading(control_startup, monkeypatch, partition):
+def test_control_rejects_a_combined_server_before_loading(control_startup, monkeypatch):
     pipeline_module, config = control_startup
-    monkeypatch.setattr(pipeline_module, "_minimax_h3_partition_for_task", lambda *args: partition)
+    monkeypatch.setattr(pipeline_module, "_minimax_h3_partition_for_task", lambda *args: "combined")
     config.model = "/unused/MiniMax-H3"
     config.task_type = "auto"
     with patch.object(pipeline_module, "_resolve_minimax_h3_model_root") as resolve_root:
-        with pytest.raises(ValueError, match="FL2VA checkpoint partition"):
+        with pytest.raises(ValueError, match="binds to one DiT"):
             pipeline_module.MiniMaxH3Pipeline(od_config=config)
         resolve_root.assert_not_called()
+
+
+def test_control_startup_accepts_the_ref2va_partition(control_startup, monkeypatch):
+    """Base Ref2VA weights take control with references, as the FastH3 Omni student does."""
+    pipeline_module, config = control_startup
+    monkeypatch.setattr(pipeline_module, "_minimax_h3_partition_for_task", lambda *args: "ref2va")
+    config.model = "/unused/MiniMax-H3"
+    config.task_type = "ref2va"
+    with patch.object(pipeline_module, "_resolve_minimax_h3_model_root", side_effect=RuntimeError("guard accepted")):
+        with pytest.raises(RuntimeError, match="guard accepted"):
+            pipeline_module.MiniMaxH3Pipeline(od_config=config)
 
 
 def test_startup_accepts_resident_default_policy(control_startup):
@@ -862,24 +872,20 @@ def test_control_startup_guard_for_fasth3_checkpoints(control_startup, monkeypat
         with pytest.raises(RuntimeError, match="accepted"):
             pipeline_module.MiniMaxH3Pipeline(od_config=config)
     else:
-        message = "dense weights" if case == "omni-nvfp4" else "FL2VA checkpoint partition or the FastH3 Omni"
+        message = "dense weights" if case == "omni-nvfp4" else "FastH3 V2 requires --task-type fl2va"
         with pytest.raises(ValueError, match=message):
             pipeline_module.MiniMaxH3Pipeline(od_config=config)
 
 
-def test_control_task_follows_the_checkpoint():
-    from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import (
-        FastH3CheckpointSpec,
-        FastH3OmniCheckpointSpec,
-    )
+def test_control_task_follows_the_partition_not_the_release():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "fl2va"
     assert pipeline._control_task() == "t2va"
-    pipeline._fasth3_checkpoint = FastH3CheckpointSpec()
-    assert pipeline._control_task() == "t2va"
-    pipeline._fasth3_checkpoint = FastH3OmniCheckpointSpec()
+    # Any Ref2VA DiT hints its target rows: base weights, an adapter on them, or a full student.
+    pipeline.partition = "ref2va"
     assert pipeline._control_task() == "ref2va"
 
 
@@ -909,6 +915,7 @@ def test_fasth3_omni_control_runs_as_ref2va(monkeypatch):
 
     _, pipeline, conditioning, sampling, media, rows = _control_request(monkeypatch)
     pipeline._fasth3_checkpoint = FastH3OmniCheckpointSpec()
+    pipeline.partition = "ref2va"
     conditioning.task = "ref2va"
     pipeline._resolve_task = lambda *args, **kwargs: "ref2va"
     sampling.extra_args = {**sampling.extra_args, "task": "ref2va"}

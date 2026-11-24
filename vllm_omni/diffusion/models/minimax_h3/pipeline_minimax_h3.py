@@ -172,7 +172,12 @@ from .latent_upscaler import (
     resolve_minimax_h3_latent_upscaler,
 )
 from .lightvae import resolve_h3_lightvae_decoder_path
-from .lora import TurboSpec, load_minimax_h3_native_adapter, load_minimax_h3_turbo_lora
+from .lora import (
+    TurboSpec,
+    load_minimax_h3_native_adapter,
+    load_minimax_h3_turbo_lora,
+    parse_pika_turbo_filename,
+)
 from .minimax_h3_blocks import (
     MiniMaxH3Attention,
     _attention_isolates_packed_requests,
@@ -194,6 +199,7 @@ from .packed_tokens import (
     minimax_h3_unpack_audio_tokens,
     minimax_h3_unpatchify_video_tokens,
 )
+from .pdd_lora import load_minimax_h3_pdd_lora
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
 from .reference_isolation import reference_isolation_enabled
 from .regenerate import (
@@ -217,6 +223,7 @@ from .vae import (
     _VideoVAEPartProxy,
     vae_compile_allowed,
 )
+from .variant import BASE_H3, FASTH3_PREVIEW, H3Feature, H3Variant, control_task
 from .vdnh3 import VDNCheckpoint
 
 if TYPE_CHECKING:
@@ -740,6 +747,12 @@ class MiniMaxH3Pipeline(
         "post_decode",
     ]
     dummy_run_num_frames: ClassVar[int] = 0
+    # Resolved from --task-type and the checkpoint during construction; the FL2VA default keeps
+    # partially constructed pipelines on the released text-to-video path.
+    partition: str = "fl2va"
+    # The released checkpoint's flow shifts; a release that pins others replaces them during construction.
+    default_video_shift: float = 12.0
+    default_audio_shift: float = 3.0
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
@@ -786,6 +799,25 @@ class MiniMaxH3Pipeline(
             self._turbo_lora_specs[lora_request.lora_int_id] = turbo_spec
             return lora_model, peft_helper
 
+        modes = list(offload_modes)
+        if getattr(od_config, "step_execution", False):
+            # The heads are bound to the DiT for one request at a time.
+            modes.append("step execution")
+        pdd_loaded = load_minimax_h3_pdd_lora(
+            partition=self.partition,
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            video_shift=self.default_video_shift,
+            audio_shift=self.default_audio_shift,
+            unsupported_mode=" or ".join(modes) or None,
+        )
+        if pdd_loaded is not None:
+            lora_model, peft_helper, pdd_spec = pdd_loaded
+            # Held to its step count and shifts like a Turbo artifact; its heads ride on the spec.
+            self._turbo_lora_specs[lora_request.lora_int_id] = pdd_spec
+            return lora_model, peft_helper
+
         # Selection is by the artifact's safetensors ``key_format``, not by the
         # running platform: the native loader is checkpoint-format parsing with
         # no ``torch_npu`` dependency, so it needs no ``current_omni_platform``
@@ -802,13 +834,25 @@ class MiniMaxH3Pipeline(
             lora_model, peft_helper, spec = native_loaded
             self._native_lora_specs[lora_request.lora_int_id] = spec
             return lora_model, peft_helper
-        return load_minimax_h3_native_adapter(
+        loaded = load_minimax_h3_native_adapter(
             transformer=self.transformer,
             lora_request=lora_request,
             lora_path=lora_path,
             dtype=dtype,
             unsupported_offload_mode=" or ".join(offload_modes) or None,
         )
+        # A few-step adapter in the native layout loads like any other; its name still pins how it samples.
+        pika_spec = parse_pika_turbo_filename(Path(lora_path).name)
+        if loaded is not None and pika_spec is not None:
+            served = "ref2v" if self.partition == "ref2va" else "fl2v"
+            if self.partition == "combined" or pika_spec.task_family != served:
+                task_type = "ref2va" if pika_spec.task_family == "ref2v" else "fl2va"
+                raise ValueError(
+                    f"{pika_spec.filename} binds to the {task_type.upper()} DiT; start the server with "
+                    f"--task-type {task_type} (task_type={self.partition!r})"
+                )
+            self._turbo_lora_specs[lora_request.lora_int_id] = pika_spec
+        return loaded
 
     def _validate_diffusion_lora_composition(self, *, lora_model: LoRAModel) -> None:
         # Transient sources are not in the manager cache. Check each source
@@ -1058,8 +1102,10 @@ class MiniMaxH3Pipeline(
         if control_path:
             if not Path(control_path).is_file() or Path(control_path).suffix != ".safetensors":
                 raise ValueError("--controlnet-model-path must be a local original .safetensors file")
-            if not modular and self.partition != "fl2va":
-                raise ValueError("H3 control requires the FL2VA checkpoint partition")
+            if not modular and control_task(self.partition) is None:
+                raise ValueError(
+                    "H3 control binds to one DiT; start the server with --task-type fl2va or --task-type ref2va"
+                )
             unsupported = (
                 not self.load_vae_encoder
                 or int(self.parallel_config.ulysses_degree) != 1
@@ -1093,12 +1139,12 @@ class MiniMaxH3Pipeline(
             )
             if str(od_config.task_type or "auto").lower() == "auto":
                 self.partition = self._fasth3_checkpoint.partition
-            if (
-                control_path
-                and self.partition != "fl2va"
-                and not isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec)
-            ):
-                raise ValueError("H3 control requires the FL2VA checkpoint partition or the FastH3 Omni checkpoint")
+            if control_path and self.partition != self._fasth3_checkpoint.partition:
+                # The branch hints the DiT this release ships; another partition has none to bind.
+                raise ValueError(
+                    f"H3 control on {self._fasth3_checkpoint.name} requires "
+                    f"--task-type {self._fasth3_checkpoint.partition}"
+                )
             if (
                 control_path
                 and (model_root / self._fasth3_checkpoint.transformer_component / "nvfp4_weights.safetensors").is_file()
@@ -1629,9 +1675,43 @@ class MiniMaxH3Pipeline(
             )
         return sigma_schedule.base_schedule, num_steps
 
+    @property
+    def _variant(self) -> H3Variant:
+        """The weight set this server loaded; request-scoped adapters refine it per request."""
+        if self._fasth3_checkpoint is not None:
+            return self._fasth3_checkpoint.variant
+        if self._fasth3 is not None:
+            return FASTH3_PREVIEW
+        return BASE_H3
+
+    def _request_variant(
+        self,
+        turbo_spec: TurboSpec | None = None,
+        native_spec: NativeDistilledLoRASpec | None = None,
+    ) -> H3Variant:
+        """The server's weights with this request's few-step adapter, if one is active."""
+        variant = self._variant
+        adapter = None
+        if turbo_spec is not None:
+            adapter = turbo_spec.filename
+        elif native_spec is not None:
+            adapter = "MiniMax-H3 native distilled LoRA"
+        if adapter is None:
+            return variant
+        if not variant.distilled_adapters:
+            raise OmniClientError(f"{variant.name} supports ordinary LoRA adapters, not Turbo or distilled adapters")
+        return variant.with_adapter(adapter)
+
+    def _bind_adapter_heads(self, turbo_spec: TurboSpec | None) -> None:
+        """Project this request with its PDD adapter's per-step heads, or with the checkpoint's own."""
+        final_layer = getattr(getattr(self, "transformer", None), "final_layer", None)
+        if final_layer is None or final_layer.pdd_steps is not None:
+            return
+        final_layer.set_fused_pdd_heads(getattr(turbo_spec, "pdd_heads", None) or None)
+
     def _control_task(self) -> str:
-        """The task control requests use: Ref2VA on the FastH3 Omni checkpoint, T2VA otherwise."""
-        return "ref2va" if isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec) else "t2va"
+        """The task control requests use: Ref2VA on a Ref2VA DiT, T2VA on an FL2VA one."""
+        return control_task(self.partition) or "t2va"
 
     def _base_schedule_for_task(self, task: str) -> DMD2SigmaSchedule | None:
         """Return the distilled schedule of the partition that serves ``task``."""
@@ -2385,7 +2465,7 @@ class MiniMaxH3Pipeline(
                 audio_edit_restore_mask_rows,
             )
 
-        if isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec):
+        if self._variant.pdd:
             from .pdd import pdd_sigmas
 
             video_sigmas, audio_sigmas = pdd_sigmas(video_shift), pdd_sigmas(audio_shift)
@@ -3525,10 +3605,8 @@ class MiniMaxH3Pipeline(
             return self._prepare_regenerate_inputs(conditioning, sampling)
         turbo_spec = self._active_turbo_spec(sampling)
         native_spec = self._active_native_spec(sampling)
-        if isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec) and (
-            turbo_spec is not None or native_spec is not None
-        ):
-            raise OmniClientError("FastH3 Omni supports ordinary LoRA adapters, not Turbo or distilled adapters")
+        variant = self._request_variant(turbo_spec, native_spec)
+        self._bind_adapter_heads(turbo_spec)
         task = self._resolve_task(
             conditioning.task,
             turbo_spec=turbo_spec,
@@ -3875,8 +3953,7 @@ class MiniMaxH3Pipeline(
                     sampling,
                     task,
                     cache_dit=quality_plan.cache_dit,
-                    turbo=turbo_spec is not None,
-                    native_lora=native_spec is not None,
+                    variant=variant,
                 )
             # A continuation's hidden prefix rides as a frame-0 guide, so its
             # request takes the guided layout; FL2VA keyframes then address the
@@ -4171,25 +4248,15 @@ class MiniMaxH3Pipeline(
         task: str,
         *,
         cache_dit: Any,
-        turbo: bool,
-        native_lora: bool,
+        variant: H3Variant,
     ) -> None:
-        """Guides are validated against base weights and the full schedule only."""
+        """Guides are clean rows, so they need uncached denoising and weights that take them."""
         if cache_dit is not None:
             raise OmniClientError("MiniMax H3 timeline guides require cache-free execution; use quality=lossless")
         cache_backend = str(self.od_config.cache_backend or "none").lower()
         if cache_backend not in ("none", "cache_dit"):
             raise OmniClientError("MiniMax H3 timeline guides do not support cache acceleration")
-        # The FastH3 Omni checkpoint takes guides on its pinned PDD grid. The fused FastH3 V2
-        # student and other distilled schedules stay rejected: they were not validated with guides.
-        fasth3_omni = isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec)
-        if self._fasth3 is not None or (self._fasth3_checkpoint is not None and not fasth3_omni):
-            raise OmniClientError("MiniMax H3 timeline guides require base H3 weights or FastH3 Omni")
-        active_lora = bool(filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale))
-        if turbo or native_lora or active_lora:
-            raise OmniClientError("MiniMax H3 timeline guides do not support active LoRA/Turbo adapters")
-        if not fasth3_omni and self._sigma_schedule_for_request(sampling, task) is not None:
-            raise OmniClientError("MiniMax H3 timeline guides do not support distilled schedules")
+        variant.require(H3Feature.TIMELINE_GUIDES)
 
     def _merge_timeline_guides(
         self,

@@ -7,7 +7,7 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from enum import Enum
-from typing import Protocol, get_args
+from typing import Any, Protocol, get_args
 
 import torch
 import torch.nn as nn
@@ -118,8 +118,13 @@ class LoRAManager:
     Pipeline-specific module selection and packing are supplied by hooks.
     """
 
-    # Valid max allowed ranks for LoRA in vLLM
-    _VALID_MAX_RANKS: list[int] = sorted(get_args(MaxLoRARanks))
+    # vLLM types ``max_lora_rank`` as a closed Literal that stops at 512. The
+    # rank only sizes the per-layer A/B buffers, so diffusion adapters may go
+    # higher: a fused few-step adapter concatenates its sources' factors (Pika
+    # Flex Turbo is rank 768 on H3's packed QKV), and so does request stacking.
+    _EXTENDED_MAX_RANKS: tuple[int, ...] = (768, 1024)
+    # Buffer ranks an adapter's rank is rounded up to.
+    _VALID_MAX_RANKS: list[int] = sorted({*get_args(MaxLoRARanks), *_EXTENDED_MAX_RANKS})
 
     # Adapter whose weights are still uploaded while gated off. Class-level so
     # a manager built without __init__ (some tests use object.__new__) reads as
@@ -817,7 +822,7 @@ class LoRAManager:
                 raise ValueError("TensorLoRARequest requires lora_tensors and peft_config")
             peft_helper = PEFTHelper.from_dict(lora_request.peft_config)
             peft_helper.validate_legal(
-                LoRAConfig(max_lora_rank=self._get_smallest_valid_max_rank(peft_helper.r), lora_dtype=self.dtype)
+                self._lora_config(self._get_smallest_valid_max_rank(peft_helper.r), lora_dtype=self.dtype)
             )
             if peft_helper.modules_to_save:
                 raise ValueError("Merged LoRA supports A/B adapters only, without modules_to_save")
@@ -988,13 +993,7 @@ class LoRAManager:
             return _match_target_modules(module_name, target_modules_list)
 
         # dummy lora config
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
+        lora_config = self._buffer_lora_config()
 
         for component_name, component in self._iter_lora_components():
             # Collect replacements first to avoid mutating the module tree
@@ -1106,13 +1105,7 @@ class LoRAManager:
         """Replace every MoE runner so LoRA-capable kernels get a mapping."""
         from vllm.model_executor.layers.fused_moe import MoERunner
 
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
+        lora_config = self._buffer_lora_config()
         for component_name, component in self._iter_lora_components():
             pending: list[tuple[str, str, nn.Module]] = []
             runner_names: set[str] = set()
@@ -1145,6 +1138,30 @@ class LoRAManager:
                     self._lora_modules[full_module_name] = lora_layer
                     logger.debug("Replaced MoE runner: %s -> %s", full_module_name, type(lora_layer).__name__)
 
+    @staticmethod
+    def _lora_config(max_lora_rank: int, **fields: Any) -> LoRAConfig:
+        """A vLLM ``LoRAConfig`` whose rank may be one of ``_EXTENDED_MAX_RANKS``.
+
+        The config validates its rank against vLLM's Literal on construction
+        only, so an extended rank is assigned afterwards; every consumer reads
+        it as a plain buffer size.
+        """
+        vllm_max_rank = max(get_args(MaxLoRARanks))
+        config = LoRAConfig(max_lora_rank=min(max_lora_rank, vllm_max_rank), **fields)
+        if max_lora_rank > vllm_max_rank:
+            config.max_lora_rank = max_lora_rank
+        return config
+
+    def _buffer_lora_config(self) -> LoRAConfig:
+        """The config per-layer LoRA buffers are allocated from: one slot at the current maximum rank."""
+        return self._lora_config(
+            self._max_lora_rank,
+            max_loras=1,
+            max_cpu_loras=self.max_cached_adapters,
+            lora_dtype=self.dtype,
+            fully_sharded_loras=False,
+        )
+
     def _ensure_max_lora_rank(self, min_rank: int) -> None:
         """Ensure LoRA buffers can accommodate adapters up to `min_rank`.
 
@@ -1164,13 +1181,7 @@ class LoRAManager:
         if not self._lora_modules:
             return
 
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
+        lora_config = self._buffer_lora_config()
 
         # Recreate per-layer buffers with the new maximum rank. The previous
         # upload is gone, so nothing may be re-armed afterwards.
@@ -1642,13 +1653,7 @@ class LoRAManager:
         if max_tokens is None:
             raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
         # GPU Punica requires LoRAConfig; also pass it to NPU.
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
+        lora_config = self._buffer_lora_config()
         punica = get_punica_wrapper(max_tokens, max_batches=1, device=self.device, lora_config=lora_config)
         mapping, lora_index_to_id = self._moe_token_lora_mapping()
         punica.update_metadata(mapping, lora_index_to_id, 1, 0)
@@ -1820,7 +1825,14 @@ class LoRAManager:
 
         self._registered_adapters[adapter_id] = lora_model
 
-        self._replace_layers_with_lora(peft_helper)
+        try:
+            self._replace_layers_with_lora(peft_helper)
+        except Exception:
+            # An adapter the buffers cannot hold must not stay cached: a retry
+            # would skip loading and fail while binding instead.
+            self._registered_adapters.pop(adapter_id, None)
+            self._adapter_access_order.pop(adapter_id, None)
+            raise
 
         logger.debug(
             "Adapter %d added, cache size: %d/%d", adapter_id, len(self._registered_adapters), self.max_cached_adapters
