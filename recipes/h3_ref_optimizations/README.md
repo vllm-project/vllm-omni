@@ -10,19 +10,20 @@ fixed step count.
 ## Install
 
 Use the normal [Ascend installation](../../docs/getting_started/installation/npu.md)
-with this source branch:
+with this source branch. The four-device smoke run used
+`quay.io/ascend/vllm-omni:v0.33.0rc1-a5`, vLLM `0.33.0+empty`, and
+`torch-npu==2.10.0.post7`.
 
 ```bash
-git clone --branch h3-ref-opt-main --single-branch https://github.com/march7th-26/vllm-omni.git
+git clone --branch h3-ref2va-opt-upstream --single-branch https://github.com/march7th-26/vllm-omni.git
 cd vllm-omni
+python -m pip install "mindiesd==3.3.0"
 VLLM_OMNI_TARGET_DEVICE=npu pip install -e . --no-build-isolation
 ```
 
-Reference-image sparsity uses the official MindIE-SD implementation from
-[PR #859](https://gitcode.com/Ascend/MindIE-SD/pull/859). Build MindIE-SD from
-official `dev` at `b7386be8b8397581a63dcc78d73feb64eabe92a0` and install it
-separately from vLLM-Omni. The rectangular reuse path uses the image-aware RF
-permutation helper from that revision.
+Reference-image sparsity uses the APIs introduced in
+[MindIE-SD #859](https://gitcode.com/Ascend/MindIE-SD/merge_requests/859) and
+available in the [MindIE-SD 3.3.0 wheel](https://pypi.org/project/mindiesd/3.3.0/).
 
 ## Add reference KV reuse
 
@@ -88,22 +89,33 @@ It contains 259 BF16 A/B pairs with rank-64 attention/MLP and rank-16 AdaLN
 deltas, using contiguous Q/K/V. The loader validates this artifact before
 binding; FlashGen and LightX2V formats retain their existing loading paths.
 
-Select four Ascend A5 devices through the standard device settings. This
-example uses existing MXFP8 weight quantization and mix attention, with the
-two Ref options enabled:
+Select four Ascend A5 devices through the standard device settings. The
+[launcher](serve_ref2va_opt.sh) enables MXFP8 DiT weights and RainFusion mix,
+with video and reference-image sparsity both set to 0.8. It refreshes the
+resident reference KV on the first of the eight denoise steps.
 
 ```bash
 export MODEL=/path/to/MiniMax-H3
-export LORA=/path/to/minimax_h3_turbo_v4_step600_ema.safetensors
+export LORA_PATH=/path/to/minimax_h3_turbo_v4_step600_ema.safetensors
+bash recipes/h3_ref_optimizations/serve_ref2va_opt.sh "$MODEL" --num-gpus 4
+```
+
+The smoke run selected the Mesh AllGather algorithm with
+`HCCL_ALGO='AllGather:Sole{level0=Mesh}'`. Set it in the launch environment
+if that algorithm is available and required by your HCCL setup.
+
+To customize individual flags, use the equivalent core serve options:
+
+```bash
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 vllm serve "$MODEL" --omni --task-type ref2va \
     --host 127.0.0.1 --port 9098 --trust-remote-code \
     --num-gpus 4 --usp 4 --ring 1 --text-encoder-tp-size 4 \
     --vae-parallel-mode tile --vae-use-tiling --vae-patch-parallel-size 4 \
-    --lora-path "$LORA" --lora-backend distill --lora-scale 1 \
+    --lora-path "$LORA_PATH" --lora-backend distill --lora-scale 1 \
     --diffusion-quantization-config '{"transformer":{"method":"mxfp8"}}' \
-    --diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"precision":"mix"},"rainfusion":{"image_sparsity":0.9}}}' \
+    --diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"precision":"mix"},"rainfusion":{"image_sparsity":0.8}}}' \
     --kv-offload-config '{"mode":"on","kv_storage":"npu","kv_refresh_interval":8,"kv_host_quantization":"none"}'
 ```
 
@@ -126,6 +138,12 @@ curl --fail-with-body http://127.0.0.1:9098/v1/videos/sync \
     --form-string 'extra_params={"task":"ref2va","duration":4}' \
     --form 'input_references=@/path/to/reference.jpg;type=image/jpeg' \
     --output output.mp4
+```
+
+An HTTP 200 response yields an MP4. To inspect its video and audio streams:
+
+```bash
+ffprobe -v error -show_entries stream=codec_type,width,height,r_frame_rate,sample_rate output.mp4
 ```
 
 The adapter is installed once at startup and adds BF16 `B(A(x))` deltas after
@@ -158,16 +176,19 @@ normal request endpoint and your existing sampling and LoRA flags.
 The contribution is based on official main
 `4bc340899368f817c1c481b9c5a060c705270304`, which already includes host reference
 KV reuse. This branch adds device storage, compact SP alignment and image
-selection integration plus the optional adapter hookup. Earlier experiments
-of a complete LoRA/quantization/reference configuration do not validate this
-revision or attribute performance to the two extensions individually.
+selection integration plus the optional adapter hookup.
+
+The combined profile at source commit
+`3fd374d27417ecfd8ff08c5c4efa953e46870ebb` completed 24 HTTP requests
+across six Ref2VA inputs on four Ascend A5 devices. Each run logged one
+reference-KV refresh and seven resident reuse steps per rank. Matched
+speedup and output-quality comparisons against upstream are pending.
 
 CPU tests cover typed configuration, ownership, default-path preservation,
 step-profile dispatch, host/resident KV values, refresh intervals and cleanup,
 SP padding/metadata, and LoRA arithmetic/binding. Native calls in routing tests
-are recording doubles;
-they do not execute or simulate device operators or distributed communication.
-NPU end-to-end execution, performance and output quality remain unverified.
+are recording doubles. Device operator execution and distributed
+communication are covered by separate NPU runs.
 
 For a minimal CPU environment, install PyTorch, safetensors, pytest, pytest-mock
 and pytest-asyncio. Run:
