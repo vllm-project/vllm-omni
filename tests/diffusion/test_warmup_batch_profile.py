@@ -203,13 +203,17 @@ def test_config_new_fields_from_dict():
             "warmup_auto_calibrate": True,
             "warmup_profile_max_batch": 64,
             "warmup_profile_max_step_ms": 1500.0,
-            "unknown_field": 123,  # ignored
         }
     )
     assert cfg.warmup_auto_calibrate is True
     assert cfg.warmup_profile_max_batch == 64
     assert cfg.warmup_profile_max_step_ms == 1500.0
     assert cfg.policy == "auto"
+
+
+def test_config_unknown_field_is_rejected():
+    with pytest.raises(ValueError, match="unknown_field"):
+        DiffusionBatchingConfig.from_dict({"unknown_field": 1})
 
 
 # ---------------------------------------------------------------------------

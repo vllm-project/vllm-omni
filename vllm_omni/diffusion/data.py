@@ -994,8 +994,13 @@ class DiffusionBatchingConfig:
         if not isinstance(data, dict):
             raise TypeError(f"Expected batching config dict, got {type(data)!r}")
         field_names = {f.name for f in fields(cls)}
-        known_params = {k: v for k, v in data.items() if k in field_names}
-        return cls(**known_params)
+        unknown = sorted(set(data) - field_names)
+        if unknown:
+            raise ValueError(
+                f"Unknown diffusion batching config field(s): {', '.join(unknown)}. "
+                f"Valid fields are: {', '.join(sorted(field_names))}."
+            )
+        return cls(**data)
 
     def resolve_policy(self, *, enable_mixfusion: bool) -> str:
         """Resolve the default ``auto`` policy against the MixFusion flag."""

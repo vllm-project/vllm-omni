@@ -357,4 +357,9 @@ def create_diffusion_batching_policy(
         return ComputeBudgetDiffusionBatchingPolicy(config, request_budget_units=request_budget_units)
     if config.uses_profiler:
         return DiffusionBatchProfilerPolicy(config)
-    return FixedDiffusionBatchingPolicy()
+    if config.policy in ("auto", "fixed"):
+        return FixedDiffusionBatchingPolicy()
+    raise ValueError(
+        f"Unknown diffusion batching policy {config.policy!r}; "
+        "expected one of 'auto', 'fixed', 'compute_budget', 'profile', 'profiler'."
+    )

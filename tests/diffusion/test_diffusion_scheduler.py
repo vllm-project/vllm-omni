@@ -3030,6 +3030,10 @@ class TestBatchingPolicyResolution:
         assert scheduler.batching_config.policy == "fixed"
         assert isinstance(scheduler.batching_policy, FixedDiffusionBatchingPolicy)
 
+    def test_unknown_policy_fails_at_startup(self) -> None:
+        with pytest.raises(ValueError, match="bogus_policy"):
+            self._initialize(enable_mixfusion=False, policy="bogus_policy")
+
 
 class TestPendingFinishedRequestIds:
     def test_reports_finished_ids_that_still_hold_state_without_clearing_them(self):
