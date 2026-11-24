@@ -1528,16 +1528,17 @@ class TestSequenceParallelPaddedGather:
         return chunks
 
     @pytest.mark.parametrize(("total", "world"), [(10, 4), (9, 4), (11, 3), (12, 4)])
-    def test_uneven_shards_are_padded_then_trimmed(self, monkeypatch, total, world):
+    @pytest.mark.parametrize("dim", [0, 1])
+    def test_uneven_shards_are_padded_then_trimmed(self, monkeypatch, total, world, dim):
         from vllm_omni.diffusion.distributed.sp_sharding import sp_gather_padded
 
         torch.manual_seed(0)
-        hidden = 3
-        global_tensor = torch.randn(2, total, hidden)
-        chunks = self._fake_group(monkeypatch, global_tensor, dim=1, world_size=world)
+        shape = [total, 2, 3] if dim == 0 else [2, total, 3]
+        global_tensor = torch.randn(*shape)
+        chunks = self._fake_group(monkeypatch, global_tensor, dim=dim, world_size=world)
 
         for rank, local in enumerate(chunks):
-            value = sp_gather_padded(local.clone(), dim=1, global_size=total)
+            value = sp_gather_padded(local.clone(), dim=dim, global_size=total)
             assert value.shape == global_tensor.shape
             torch.testing.assert_close(value, global_tensor, rtol=0, atol=0)
 
