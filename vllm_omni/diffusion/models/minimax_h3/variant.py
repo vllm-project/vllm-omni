@@ -11,26 +11,14 @@ step count, the flow shifts, and whether the output heads are parallel-decoding
 
 They do not differ in how a request is *conditioned*. ControlNet hints,
 latent-tail continuation, latent-mask editing and timeline guides are rows and
-masks packed around the target latent; none of them reads the schedule. A
-feature is therefore available on every variant unless the variant names a
-reason, and the pipeline asks the variant rather than testing for one release.
+masks packed around the target latent; none of them reads the schedule, so the
+pipeline serves them on every weight set without asking the variant. The one
+conditioning restriction a weight set carries is why it refuses timeline guides.
 """
 
 from __future__ import annotations
 
-import enum
-from dataclasses import dataclass, field, replace
-
-from vllm_omni.errors import OmniClientError
-
-
-class H3Feature(enum.Enum):
-    """Conditioning features a request can ask for on top of plain generation."""
-
-    CONTROL = "control"
-    CONTINUATION = "continuation"
-    LATENT_EDIT = "latent-mask editing"
-    TIMELINE_GUIDES = "timeline guides"
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -41,35 +29,14 @@ class H3Variant:
     own grid and one fused output head per step. ``distilled_adapters`` says
     whether a few-step adapter (Turbo, native distilled LoRA) may be activated
     on top; a full student already pins its schedule, so it takes ordinary
-    adapters only. ``unsupported`` maps a feature to the message a request for
-    it receives.
+    adapters only. ``guides_unsupported`` is the message a timeline-guide
+    request receives, or ``None`` where guides are served.
     """
 
     name: str
     pdd: bool = False
     distilled_adapters: bool = True
-    unsupported: tuple[tuple[H3Feature, str], ...] = field(default_factory=tuple)
-
-    def reason(self, feature: H3Feature) -> str | None:
-        """Why ``feature`` is unavailable on these weights, or ``None`` when it is available."""
-        return dict(self.unsupported).get(feature)
-
-    def supports(self, feature: H3Feature) -> bool:
-        return self.reason(feature) is None
-
-    def require(self, feature: H3Feature) -> None:
-        """Reject the request when these weights cannot serve ``feature``."""
-        reason = self.reason(feature)
-        if reason is not None:
-            raise OmniClientError(reason)
-
-    def with_adapter(self, name: str) -> H3Variant:
-        """These weights with a request-scoped adapter active on top.
-
-        An adapter changes the sampling contract, which its own spec enforces;
-        it adds no conditioning restriction, so only the name moves.
-        """
-        return replace(self, name=name)
+    guides_unsupported: str | None = None
 
 
 _GUIDES_NEED_REFERENCE_STUDENT = "MiniMax H3 timeline guides require base H3 weights or FastH3 Omni"
@@ -81,14 +48,8 @@ FASTH3_OMNI = H3Variant(name="FastH3 Omni", pdd=True, distilled_adapters=False)
 # T2VA-only students trained with VSA compression gates. Guide rows change the
 # token layout those gates were trained on, and no guided output of either has
 # been checked, so guides stay off until one is.
-FASTH3_V2 = H3Variant(
-    name="FastH3 V2",
-    unsupported=((H3Feature.TIMELINE_GUIDES, _GUIDES_NEED_REFERENCE_STUDENT),),
-)
-FASTH3_PREVIEW = H3Variant(
-    name="FastH3 Preview",
-    unsupported=((H3Feature.TIMELINE_GUIDES, _GUIDES_NEED_REFERENCE_STUDENT),),
-)
+FASTH3_V2 = H3Variant(name="FastH3 V2", guides_unsupported=_GUIDES_NEED_REFERENCE_STUDENT)
+FASTH3_PREVIEW = H3Variant(name="FastH3 Preview", guides_unsupported=_GUIDES_NEED_REFERENCE_STUDENT)
 
 
 def control_task(partition: str) -> str | None:

@@ -223,7 +223,7 @@ from .vae import (
     _VideoVAEPartProxy,
     vae_compile_allowed,
 )
-from .variant import BASE_H3, FASTH3_PREVIEW, H3Feature, H3Variant, control_task
+from .variant import BASE_H3, FASTH3_PREVIEW, H3Variant, control_task
 from .vdnh3 import VDNCheckpoint
 
 if TYPE_CHECKING:
@@ -774,9 +774,9 @@ class MiniMaxH3Pipeline(
         # A cache eviction may be followed by a different adapter reusing the
         # same client-supplied ID. Every real load replaces the classification.
         self._clear_adaln_caches()
-        self._turbo_lora_specs.pop(lora_request.lora_int_id, None)
         # Reclaim evicted specs even when adapters are loaded without inference.
-        self._prune_native_lora_specs()
+        self._prune_lora_specs()
+        self._turbo_lora_specs.pop(lora_request.lora_int_id, None)
         self._native_lora_specs.pop(lora_request.lora_int_id, None)
         od_config = getattr(self, "od_config", None)
         offload_modes = []
@@ -821,6 +821,10 @@ class MiniMaxH3Pipeline(
         )
         if pdd_loaded is not None:
             lora_model, peft_helper, pdd_spec = pdd_loaded
+            final_layer = getattr(getattr(self, "transformer", None), "final_layer", None)
+            if final_layer is not None and final_layer.pdd_steps is None:
+                # A full PDD student refuses the adapter per request; every other DiT must fit the heads.
+                final_layer.check_fused_pdd_heads(pdd_spec.pdd_heads)
             # Held to its step count and shifts like a Turbo artifact; its heads ride on the spec.
             self._turbo_lora_specs[lora_request.lora_int_id] = pdd_spec
             return lora_model, peft_helper
@@ -901,6 +905,7 @@ class MiniMaxH3Pipeline(
         constrains the task nor imposes its sampler contract.
         """
 
+        self._prune_lora_specs()
         adapters = filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
         specs = [
             self._turbo_lora_specs[request.lora_int_id]
@@ -910,7 +915,6 @@ class MiniMaxH3Pipeline(
         if len(specs) > 1:
             raise OmniClientError("MiniMax-H3 supports at most one Turbo adapter in a composition")
         # Request-time fallback; the manager checks each source before composing.
-        self._prune_native_lora_specs()
         if len(adapters) > 1 and any(request.lora_int_id in self._native_lora_specs for request, _ in adapters):
             raise OmniClientError("MiniMax-H3 native distilled LoRA cannot be composed with other adapters")
         return specs[0] if specs else None
@@ -918,17 +922,28 @@ class MiniMaxH3Pipeline(
     def _bind_diffusion_lora_manager(self, manager) -> None:
         self._lora_manager_ref = weakref.ref(manager) if manager is not None else None
         if manager is None:
+            self._turbo_lora_specs.clear()
             self._native_lora_specs.clear()
 
-    def _prune_native_lora_specs(self) -> None:
+    def _prune_lora_specs(self) -> None:
+        """Drop the specs of adapters no request can activate without loading them again.
+
+        A spec lives as long as the manager's entry for its adapter: a cached
+        adapter, or a source of a cached stack, which is served from the
+        composed entry without a reload. A PDD spec owns its fused heads, so
+        this is also what releases them after eviction, removal or a
+        registration that failed.
+        """
         ref = getattr(self, "_lora_manager_ref", None)
         manager = ref() if ref is not None else None
         if manager is not None:
-            for adapter_id in self._native_lora_specs.keys() - set(manager.list_adapters()):
-                self._native_lora_specs.pop(adapter_id)
+            reachable = manager.reachable_adapter_ids()
+            for specs in (self._turbo_lora_specs, self._native_lora_specs):
+                for adapter_id in specs.keys() - reachable:
+                    specs.pop(adapter_id)
 
     def _active_native_spec(self, sampling: Any) -> NativeDistilledLoRASpec | None:
-        self._prune_native_lora_specs()
+        self._prune_lora_specs()
         for request, _ in filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale):
             if (spec := self._native_lora_specs.get(request.lora_int_id)) is not None:
                 return spec
@@ -1721,18 +1736,15 @@ class MiniMaxH3Pipeline(
         turbo_spec: TurboSpec | None = None,
         native_spec: NativeDistilledLoRASpec | None = None,
     ) -> H3Variant:
-        """The server's weights with this request's few-step adapter, if one is active."""
+        """The server's weights, once they are known to take this request's few-step adapter.
+
+        An adapter changes the sampling contract, which its own spec enforces;
+        it adds no conditioning restriction, so the variant itself is unchanged.
+        """
         variant = self._variant
-        adapter = None
-        if turbo_spec is not None:
-            adapter = turbo_spec.filename
-        elif native_spec is not None:
-            adapter = "MiniMax-H3 native distilled LoRA"
-        if adapter is None:
-            return variant
-        if not variant.distilled_adapters:
+        if (turbo_spec is not None or native_spec is not None) and not variant.distilled_adapters:
             raise OmniClientError(f"{variant.name} supports ordinary LoRA adapters, not Turbo or distilled adapters")
-        return variant.with_adapter(adapter)
+        return variant
 
     def _bind_adapter_heads(self, turbo_spec: TurboSpec | None) -> None:
         """Project this request with its PDD adapter's per-step heads, or with the checkpoint's own."""
@@ -3602,6 +3614,10 @@ class MiniMaxH3Pipeline(
         sampling: Any,
         control_media: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        # Adapter heads are bound once this request has passed every check below. Until then the
+        # DiT projects with its own, so a rejected request or one that takes the Regenerate path
+        # never leaves or inherits another request's heads.
+        self._bind_adapter_heads(None)
         extra = sampling.extra_args or {}
         try:
             control = parse_control(extra, control_media)
@@ -3638,7 +3654,6 @@ class MiniMaxH3Pipeline(
         turbo_spec = self._active_turbo_spec(sampling)
         native_spec = self._active_native_spec(sampling)
         variant = self._request_variant(turbo_spec, native_spec)
-        self._bind_adapter_heads(turbo_spec)
         task = self._resolve_task(
             conditioning.task,
             turbo_spec=turbo_spec,
@@ -4004,6 +4019,7 @@ class MiniMaxH3Pipeline(
             )
         num_outputs = _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt)
         cache_key = extra.get(LATENT_CACHE_KEY)
+        self._bind_adapter_heads(turbo_spec)
         return {
             "continuation": continuation,
             "latent_continuation": latent_continuation,
@@ -4290,7 +4306,8 @@ class MiniMaxH3Pipeline(
         cache_backend = str(self.od_config.cache_backend or "none").lower()
         if cache_backend not in ("none", "cache_dit"):
             raise OmniClientError("MiniMax H3 timeline guides do not support cache acceleration")
-        variant.require(H3Feature.TIMELINE_GUIDES)
+        if variant.guides_unsupported is not None:
+            raise OmniClientError(variant.guides_unsupported)
 
     def _merge_timeline_guides(
         self,

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""The variant decides which conditioning features a weight set serves."""
+"""The variant names what a weight set pins: its sampler, the adapters it takes, and whether it takes guides."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from vllm_omni.diffusion.models.minimax_h3.variant import (
     FASTH3_OMNI,
     FASTH3_PREVIEW,
     FASTH3_V2,
-    H3Feature,
     control_task,
 )
 from vllm_omni.errors import OmniClientError
@@ -35,25 +34,21 @@ def _pipeline(checkpoint=None, fused=None):
     return pipeline
 
 
+def _guide_check(variant):
+    pipeline = _pipeline()
+    pipeline.od_config = SimpleNamespace(cache_backend=None)
+    pipeline._validate_timeline_guide_sampling(SimpleNamespace(), "ref2va", cache_dit=None, variant=variant)
+
+
 @pytest.mark.parametrize("variant", [BASE_H3, FASTH3_OMNI])
-def test_reference_weights_serve_every_conditioning_feature(variant):
-    for feature in H3Feature:
-        assert variant.supports(feature)
-        variant.require(feature)
+def test_reference_weights_serve_timeline_guides(variant):
+    _guide_check(variant)
 
 
 @pytest.mark.parametrize("variant", [FASTH3_V2, FASTH3_PREVIEW])
 def test_vsa_students_name_why_guides_are_off(variant):
-    assert variant.supports(H3Feature.CONTROL)
     with pytest.raises(OmniClientError, match="timeline guides require base H3 weights or FastH3 Omni"):
-        variant.require(H3Feature.TIMELINE_GUIDES)
-
-
-def test_an_adapter_keeps_the_features_of_the_weights_under_it():
-    adapted = BASE_H3.with_adapter(REF2V_TURBO.filename)
-    assert adapted.name == REF2V_TURBO.filename
-    assert all(adapted.supports(feature) for feature in H3Feature)
-    assert not FASTH3_V2.with_adapter("x").supports(H3Feature.TIMELINE_GUIDES)
+        _guide_check(variant)
 
 
 @pytest.mark.parametrize(
@@ -77,9 +72,16 @@ def test_pipeline_reports_the_variant_it_loaded(checkpoint, fused, expected):
     assert _pipeline(checkpoint, fused)._variant is expected
 
 
-def test_request_variant_takes_a_few_step_adapter_on_base_weights_only():
+def test_a_few_step_adapter_leaves_the_variant_of_the_weights_under_it():
     assert _pipeline()._request_variant() is BASE_H3
-    assert _pipeline()._request_variant(turbo_spec=REF2V_TURBO).name == REF2V_TURBO.filename
-    assert _pipeline()._request_variant(native_spec=object()).supports(H3Feature.TIMELINE_GUIDES)
+    assert _pipeline()._request_variant(turbo_spec=REF2V_TURBO) is BASE_H3
+    assert _pipeline()._request_variant(native_spec=object()) is BASE_H3
+    # The adapter adds no conditioning restriction and lifts none.
+    assert _pipeline(FastH3CheckpointSpec())._request_variant(turbo_spec=REF2V_TURBO) is FASTH3_V2
+
+
+@pytest.mark.parametrize("adapter", [{"turbo_spec": REF2V_TURBO}, {"native_spec": object()}])
+def test_a_full_student_refuses_few_step_adapters(adapter):
+    assert _pipeline(FastH3OmniCheckpointSpec())._request_variant() is FASTH3_OMNI
     with pytest.raises(OmniClientError, match="FastH3 Omni supports ordinary LoRA adapters"):
-        _pipeline(FastH3OmniCheckpointSpec())._request_variant(turbo_spec=REF2V_TURBO)
+        _pipeline(FastH3OmniCheckpointSpec())._request_variant(**adapter)

@@ -270,3 +270,225 @@ def test_requests_that_leave_the_fused_schedule_are_rejected(request_fields, mes
         pipeline._validate_pdd_sampling(sampling, spec)
     sampling = SimpleNamespace(lora_request=LoRARequest("pdd", 1, "/models/pdd"), lora_scale=1.0, extra_args={})
     pipeline._validate_pdd_sampling(sampling, spec)
+
+
+def _final_layer(video=(6, 5), audio=(4, 5)):
+    """A final layer with the projection widths of the fixture's heads, recording what is bound."""
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3FinalLayer
+
+    bound: list[object] = []
+    layer = SimpleNamespace(
+        pdd_steps=None,
+        video_out=SimpleNamespace(output_size=video[0], input_size=video[1]),
+        audio_out=SimpleNamespace(output_size=audio[0], input_size=audio[1]),
+        set_fused_pdd_heads=bound.append,
+    )
+    layer.check_fused_pdd_heads = lambda heads: MiniMaxH3FinalLayer.check_fused_pdd_heads(layer, heads)
+    return layer, bound
+
+
+def test_pipeline_refuses_heads_the_dit_cannot_project_with(adapter):
+    pipeline = _serving_pipeline()
+    layer, _ = _final_layer()
+    object.__setattr__(pipeline, "transformer", SimpleNamespace(final_layer=layer))
+    _pipeline_load(pipeline, adapter[0])
+    assert isinstance(pipeline._turbo_lora_specs[1], PDDSpec)
+
+    # The same artifact against a DiT of another hidden width: refused at load, not in the first denoise step.
+    pipeline = _serving_pipeline()
+    layer, _ = _final_layer(video=(6, 7))
+    object.__setattr__(pipeline, "transformer", SimpleNamespace(final_layer=layer))
+    with pytest.raises(ValueError, match=r"video_out.weight must have shape \(4, 6, 7\), got \(4, 6, 5\)"):
+        _pipeline_load(pipeline, adapter[0])
+    assert pipeline._turbo_lora_specs == {}
+
+    # An audio-free DiT has no projection for the adapter's audio heads.
+    layer, _ = _final_layer()
+    layer.audio_out = None
+    object.__setattr__(pipeline, "transformer", SimpleNamespace(final_layer=layer))
+    with pytest.raises(ValueError, match="must hold exactly"):
+        _pipeline_load(pipeline, adapter[0])
+    assert pipeline._turbo_lora_specs == {}
+
+
+def _request_pipeline(spec):
+    """A pipeline that can prepare a Ref2VA request with ``spec`` loaded as adapter 1."""
+    from unittest.mock import Mock
+
+    pipeline = _serving_pipeline(
+        diffusion_attention_schedule=None,
+        attention_sigma_schedule=None,
+        controlnet_model_path=None,
+        cache_backend=None,
+        additional_config=None,
+    )
+    pipeline.supported_tasks = frozenset({"ref2va"})
+    pipeline.device = torch.device("cpu")
+    pipeline._base_schedule_by_partition = {"t2va": None, "fl2va": None, "ref2va": None}
+    pipeline._quality_policy = Mock()
+    pipeline._quality_policy.resolve.return_value = SimpleNamespace(cache_dit=None)
+    pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda spec: None)
+    pipeline._turbo_lora_specs = {1: spec}
+    layer, bound = _final_layer()
+    object.__setattr__(pipeline, "transformer", SimpleNamespace(final_layer=layer))
+    return pipeline, bound
+
+
+def _ref2va_request(height=64, **extra_args):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MINIMAX_H3_FPS, MINIMAX_H3_SHAPE_PLANNER
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderConditioning
+
+    num_frames = 25
+    conditioning = MiniMaxH3EncoderConditioning(
+        hidden_states=torch.ones(2, 8, dtype=torch.bfloat16),
+        token_tags=torch.ones(2, dtype=torch.long),
+        task="ref2va",
+        height=height,
+        width=96,
+        num_frames=num_frames,
+        latent_t=MINIMAX_H3_SHAPE_PLANNER.video_latent_t(num_frames),
+        audio_t=MINIMAX_H3_SHAPE_PLANNER.audio_latent_t(num_frames / MINIMAX_H3_FPS),
+        ref_blocks=({"kind": "image", "latent_h": 4, "latent_w": 6},),
+        visual_condition_shapes=((1, 4, 6),),
+    )
+    sampling = OmniDiffusionSamplingParams(
+        quality="lossless",
+        fps=24,
+        num_inference_steps=4,
+        lora_request=LoRARequest("pdd", 1, "/models/pdd"),
+        lora_scale=1.0,
+        extra_args={"task": "ref2va", **extra_args},
+    )
+    return conditioning, sampling
+
+
+def test_heads_are_bound_only_for_a_request_that_passed_validation():
+    from vllm_omni.errors import OmniClientError
+
+    heads = {"video_out.weight": torch.zeros(4, 6, 5)}
+    spec = PDDSpec("a.safetensors", "ref2v", 4, 12.0, 3.0, 1, 1.0, pdd_heads=heads)
+    pipeline, bound = _request_pipeline(spec)
+
+    pipeline._prepare_encoder_conditioning_inputs(*_ref2va_request())
+    assert bound == [None, heads]
+
+    # Rejected by the adapter's own contract: the previous request's heads are released and none are bound.
+    with pytest.raises(OmniClientError, match="requires sampler='euler'"):
+        pipeline._prepare_encoder_conditioning_inputs(*_ref2va_request(sampler="heun"))
+    assert bound == [None, heads, None]
+
+    # Rejected by a check that runs after the adapter's: still nothing bound.
+    with pytest.raises(OmniClientError, match="canvas must be divisible by 32"):
+        pipeline._prepare_encoder_conditioning_inputs(*_ref2va_request(height=72))
+    assert bound == [None, heads, None, None]
+
+    # A request without the adapter runs on the checkpoint's own heads.
+    conditioning, sampling = _ref2va_request()
+    sampling.lora_request = None
+    pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
+    assert bound == [None, heads, None, None, None, None]
+
+
+def _managed_pipeline(monkeypatch, adapter_path, max_cached_adapters=1):
+    """A LoRA manager over a pipeline that loads the fixture for odd adapter IDs and an ordinary LoRA for even ones."""
+    from vllm.lora.lora_model import LoRAModel
+
+    from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+
+    pipeline = _serving_pipeline()
+    layer, bound = _final_layer()
+    object.__setattr__(pipeline, "transformer", SimpleNamespace(final_layer=layer))
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline, device=torch.device("cpu"), dtype=torch.float32, max_cached_adapters=max_cached_adapters
+    )
+    assert pipeline._lora_manager_ref() is manager
+    loads: list[int] = []
+
+    def load(request):
+        loads.append(request.lora_int_id)
+        if request.lora_int_id % 2:
+            return pipeline._load_diffusion_lora_adapter(
+                lora_request=request, lora_path=adapter_path, dtype=torch.float32
+            )
+        pipeline._prune_lora_specs()  # every real load starts by reclaiming specs
+        return LoRAModel(lora_model_id=request.lora_int_id, rank=1, loras={}), type("PH", (), {"r": 1})()
+
+    monkeypatch.setattr(manager, "_load_adapter", load)
+    monkeypatch.setattr(manager, "_validate_adapter_targets", lambda _peft: None)
+    monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
+    monkeypatch.setattr(manager, "_activate_adapter", lambda _adapter_id, _scale: None)
+    monkeypatch.setattr(
+        manager,
+        "_compose_lora_models",
+        lambda composed_id, _specs: (
+            LoRAModel(lora_model_id=composed_id, rank=2, loras={}),
+            type("PH", (), {"r": 2})(),
+        ),
+    )
+    return pipeline, manager, loads, bound
+
+
+def _request(adapter_id):
+    return LoRARequest(f"adapter-{adapter_id}", adapter_id, f"/models/adapter-{adapter_id}")
+
+
+def test_a_cached_stack_keeps_its_pdd_heads_for_every_request(monkeypatch, adapter):
+    """Cache capacity 1: the stack is cached under a composed ID and its sources are never registered."""
+    pipeline, manager, loads, bound = _managed_pipeline(monkeypatch, adapter[0])
+    pdd, style = _request(1), _request(2)
+    sampling = SimpleNamespace(lora_request=[pdd, style], lora_scale=[1.0, 0.8], extra_args={})
+
+    for _ in range(2):
+        manager.set_active_adapters(sampling.lora_request, sampling.lora_scale)
+        spec = pipeline._active_turbo_spec(sampling)
+        assert isinstance(spec, PDDSpec)
+        pipeline._validate_pdd_sampling(sampling, spec)
+        pipeline._bind_adapter_heads(spec)
+        assert bound[-1] is spec.pdd_heads
+    # The second request was served from the composed entry: no source was loaded again.
+    assert loads == [1, 2]
+    assert len(manager.list_adapters()) == 1 and not {1, 2} & set(manager.list_adapters())
+
+    # Another adapter takes the slot; the stack is evicted and its heads go with it.
+    other = SimpleNamespace(lora_request=_request(4), lora_scale=1.0, extra_args={})
+    manager.set_active_adapters(other.lora_request, other.lora_scale)
+    assert pipeline._active_turbo_spec(other) is None
+    assert pipeline._turbo_lora_specs == {}
+
+    # The stack again: recomposed from freshly loaded sources, heads bound as before.
+    manager.set_active_adapters(sampling.lora_request, sampling.lora_scale)
+    assert isinstance(pipeline._active_turbo_spec(sampling), PDDSpec)
+    assert loads == [1, 2, 4, 1, 2]
+
+
+def test_pdd_heads_leave_with_the_adapter_entry(monkeypatch, adapter):
+    """Eviction, removal and failed registration each release the spec that owns the fused heads."""
+    pipeline, manager, loads, _ = _managed_pipeline(monkeypatch, adapter[0])
+    idle = SimpleNamespace(lora_request=None, lora_scale=1.0, extra_args={})
+
+    # Distinct IDs loaded without inference: at most the cached adapter and the one just evicted are held.
+    for adapter_id in (1, 3, 5, 7, 9):
+        manager.add_adapter(_request(adapter_id))
+        assert set(pipeline._turbo_lora_specs) <= {adapter_id, adapter_id - 2}
+    pipeline._active_turbo_spec(idle)
+    assert set(pipeline._turbo_lora_specs) == {9}
+
+    manager.remove_adapter(9)
+    pipeline._active_turbo_spec(idle)
+    assert pipeline._turbo_lora_specs == {}
+
+    def fail(_peft):
+        raise torch.OutOfMemoryError("buffer allocation failed")
+
+    monkeypatch.setattr(manager, "_replace_layers_with_lora", fail)
+    with pytest.raises(torch.OutOfMemoryError):
+        manager.add_adapter(_request(11))
+    assert manager.list_adapters() == []
+    pipeline._active_turbo_spec(idle)
+    assert pipeline._turbo_lora_specs == {}
+
+    # Closing the manager drops whatever is left.
+    pipeline._turbo_lora_specs[13] = object()
+    manager.close()
+    assert pipeline._turbo_lora_specs == {}
