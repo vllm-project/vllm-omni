@@ -41,8 +41,19 @@ def _state() -> _MiniCPMO45Stage0SessionState:
     return _MiniCPMO45Stage0SessionState(session_id="s0")
 
 
-def _sampler(boundary: dict[int, torch.Tensor], offsets_by_req: dict[str, list[int]]) -> Any:
-    infos = {req_id: {"duplex": {"duplex_boundary_offsets": offsets}} for req_id, offsets in offsets_by_req.items()}
+def _sampler(
+    boundary: dict[int, torch.Tensor],
+    offsets_by_req: dict[str, list[int]],
+    seeds_by_req: dict[str, int] | None = None,
+) -> Any:
+    seeds_by_req = seeds_by_req or {}
+    infos = {
+        req_id: {
+            "duplex": {"duplex_boundary_offsets": offsets},
+            "sampling_params": SimpleNamespace(seed=seeds_by_req.get(req_id)),
+        }
+        for req_id, offsets in offsets_by_req.items()
+    }
     model = SimpleNamespace(
         _mrv2_sampling_infos=infos,
         _minicpmo45_duplex_token_ids={"chunk_eos_token_id": CHUNK_EOS},
@@ -55,10 +66,10 @@ def _sampler(boundary: dict[int, torch.Tensor], offsets_by_req: dict[str, list[i
     model._duplex_boundary_chunk_eos_probs = probs
     sampler = object.__new__(MiniCPMO45DuplexSampler)
     sampler.model = model
+    sampler.generators = {}
     input_batch = SimpleNamespace(
         _duplex_boundary_logits=boundary,
         req_ids=list(offsets_by_req),
-        generators={},
     )
     return sampler, input_batch
 
@@ -128,6 +139,36 @@ def test_multi_boundary_outcomes_report_all_listen_and_first_speak() -> None:
     assert outcomes == {
         0: {"all_listen": False, "first_speak": 0, "offsets": [3, 4, 5]},
     }
+
+
+def test_multi_boundary_outcomes_draw_from_the_request_seeded_generator() -> None:
+    """Intermediate draws consume the per-request seeded stream in order.
+
+    A seeded request's K-1 intermediate draws must come from the same
+    get-or-create generator the regular boundary draw uses, so the final
+    boundary sees exactly the draws separately scheduled appends would have
+    left it (Dong1017's review point).
+    """
+    sampler, batch = _sampler({0: torch.zeros(2, 8)}, {"r0": [3, 4, 5]}, seeds_by_req={"r0": 1234})
+    outcomes = sampler._duplex_multi_boundary_outcomes(batch)
+    assert 0 in outcomes
+
+    # The call created and cached the request's seeded generator...
+    row_gen = sampler.generators["r0"]
+    assert isinstance(row_gen, torch.Generator)
+
+    # ...and consumed exactly K-1 = 2 draws from it: the next draw from the
+    # cached generator matches the reference stream seeded the same way.
+    ref = torch.Generator().manual_seed(1234)
+    _ = torch.rand((2,), generator=ref)  # the two draws the call consumed
+    assert torch.equal(torch.rand((1,), generator=row_gen), torch.rand((1,), generator=ref))
+
+    # A second call continues the same stream (draws 3 and 4).
+    sampler, batch = _sampler({0: torch.zeros(2, 8)}, {"r0": [3, 4, 5]}, seeds_by_req={"r0": 1234})
+    sampler.generators["r0"] = row_gen
+    outcomes = sampler._duplex_multi_boundary_outcomes(batch)
+    _ = torch.rand((2,), generator=ref)  # the second call's two draws
+    assert torch.equal(torch.rand((1,), generator=row_gen), torch.rand((1,), generator=ref))
 
 
 # ------------------------------------------------ 3. all-listen acceptance hook

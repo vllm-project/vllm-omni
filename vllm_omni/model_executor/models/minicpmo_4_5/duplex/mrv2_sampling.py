@@ -134,12 +134,13 @@ class MiniCPMO45DuplexSampler(OmniSampler):
     def _duplex_multi_boundary_outcomes(self, input_batch: Any) -> dict[int, dict[str, object]]:
         """Run the intermediate boundary Bernoullis for multi-unit appends (#8710).
 
-        ``input_batch._duplex_boundary_logits`` maps each multi-unit row to the
-        K-1 intermediate boundary logits (the final boundary is the row's
-        regular logits, sampled by the normal path). Each boundary draw uses the
-        row's own generator in sequential order, matching per-unit execution.
-        Returns {row_idx: {"all_listen": bool, "first_speak": int | None,
-        "offsets": list[int]}} for the acceptance step; absent rows are skipped.
+                ``input_batch._duplex_boundary_logits`` maps each multi-unit row to the
+                K-1 intermediate boundary logits (the final boundary is the row's
+                regular logits, sampled by the normal path). Each boundary draw uses the
+                row's own seeded generator in sequential order (the same get-or-create
+        stream ``_metadata`` uses), matching per-unit execution.
+                Returns {row_idx: {"all_listen": bool, "first_speak": int | None,
+                "offsets": list[int]}} for the acceptance step; absent rows are skipped.
         """
         boundary = getattr(input_batch, "_duplex_boundary_logits", None)
         if not isinstance(boundary, dict) or not boundary:
@@ -167,8 +168,19 @@ class MiniCPMO45DuplexSampler(OmniSampler):
             if not isinstance(offsets, list) or len(offsets) < 2 or logits.shape[0] != len(offsets) - 1:
                 continue
             probs = model._duplex_boundary_chunk_eos_probs(logits, chunk_eos_id)
-            generators = getattr(input_batch, "generators", None) or {}
-            row_gen = generators.get(row_idx) if isinstance(generators, dict) else None
+            sp = info.get("sampling_params") if isinstance(info, dict) else None
+            seed = getattr(sp, "seed", None)
+            if seed is not None:
+                # The same per-request seeded generator the regular boundary
+                # draw uses (`_metadata`'s get-or-create), so the K-1
+                # intermediate draws consume the stream ahead of the final
+                # boundary exactly like separately scheduled per-unit appends.
+                row_gen = self.generators.get(str(req_id))
+                if row_gen is None:
+                    row_gen = torch.Generator(device=probs.device).manual_seed(seed)
+                    self.generators[str(req_id)] = row_gen
+            else:
+                row_gen = None
             draws = torch.rand((probs.shape[0],), generator=row_gen, device=probs.device)
             hits = draws < probs
             first_speak = int((~hits).nonzero()[0].item()) if bool((~hits).any()) else None
