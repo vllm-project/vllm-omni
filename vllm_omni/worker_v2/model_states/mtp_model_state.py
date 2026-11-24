@@ -128,6 +128,7 @@ class MTPState:
         self._mtp_offsets: torch.Tensor | None = None
         self._stage_offsets = DeviceStager()  # per-step MTP row offsets, read in place by the GPU
         self._mtp_sample_uniforms: torch.Tensor | None = None
+        self._mtp_sample_uniforms_step: torch.Tensor | None = None
         self._mtp_runner: Any | None = None
         # Captured whole-MTP graph entry per batch size, once a replay through
         # the wrapper has resolved it: (padded rows, entry).
@@ -152,6 +153,15 @@ class MTPState:
                     dtype=torch.float32,
                     device=device,
                 )
+                if bool(getattr(model, "mtp_sample_uniforms_preserve_eager_stream", False)):
+                    # ``buffer[:, step, :]`` is not contiguous. Reuse one
+                    # contiguous step buffer to match eager unseeded draws of
+                    # shape [batch, vocab] before copying into graph storage.
+                    self._mtp_sample_uniforms_step = torch.empty(
+                        (max_bs, sample_vocab_size),
+                        dtype=torch.float32,
+                        device=device,
+                    )
             self._mtp_runner = self._init_mtp_runner(model)
             if getattr(model, "has_talker_mtp", False):
                 self.embeds = torch.zeros((max_bs, self.owner._embed_dim), dtype=self.owner.dtype, device=device)
@@ -921,7 +931,7 @@ class MTPState:
                 # what the wrapper path below does, minus its per-call Python.
                 num_tokens, entry = replay
                 assert self._mtp_sample_uniforms is not None
-                self._mtp_sample_uniforms[:num_tokens].uniform_(1e-20, 1.0 - 1e-20)
+                self._prepare_mtp_sample_uniforms([None] * bsz, num_tokens)
                 get_offloader().sync_prev_onload()
                 entry.cudagraph.replay()
                 return entry.output
@@ -1068,6 +1078,45 @@ class MTPState:
             )
 
         active = sample_uniforms[:bsz]
+        if bool(getattr(self.owner.model, "mtp_sample_uniforms_preserve_eager_stream", False)):
+            # Qwen3-Omni's eager predictor draws once per residual step. With
+            # per-row generators it then draws each row separately; without
+            # them it draws one contiguous [batch, vocab] tensor. Keep those
+            # exact call shapes and ordering so graph input preparation leaves
+            # both generated values and generator states unchanged.
+            if num_tokens > bsz:
+                sample_uniforms[bsz:num_tokens].fill_(0.5)
+            if any(generator is not None for generator in generators):
+                for step in range(active.shape[1]):
+                    for row, generator in enumerate(generators):
+                        active[row : row + 1, step, :].uniform_(
+                            1e-20,
+                            1.0 - 1e-20,
+                            generator=generator,
+                        )
+            else:
+                step_uniforms = self._mtp_sample_uniforms_step
+                if (
+                    step_uniforms is None
+                    or step_uniforms.shape[0] < sample_uniforms.shape[0]
+                    or step_uniforms.shape[1] != sample_uniforms.shape[2]
+                    or step_uniforms.device != sample_uniforms.device
+                    or step_uniforms.dtype != sample_uniforms.dtype
+                ):
+                    # Real model construction preallocates this buffer. Keep a
+                    # lazy fallback for lightweight model-state tests.
+                    step_uniforms = torch.empty(
+                        (sample_uniforms.shape[0], sample_uniforms.shape[2]),
+                        dtype=sample_uniforms.dtype,
+                        device=sample_uniforms.device,
+                    )
+                    self._mtp_sample_uniforms_step = step_uniforms
+                for step in range(active.shape[1]):
+                    step_active = step_uniforms[:bsz]
+                    step_active.uniform_(1e-20, 1.0 - 1e-20)
+                    active[:, step, :].copy_(step_active)
+            return sample_uniforms[:num_tokens]
+
         if any(generator is not None for generator in generators):
             # Consume one request-local stream for the whole residual span so the
             # outer MTP graph can treat sampling noise as a stable tensor input.

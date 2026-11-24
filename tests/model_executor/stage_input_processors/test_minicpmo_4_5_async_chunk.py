@@ -472,6 +472,35 @@ def test_duplex_short_units_wait_for_minimum_stream_body() -> None:
     )
 
 
+@pytest.mark.parametrize("unit_frames", [1, 4, 5, 24, 25, 26, 29, 30, 50, 54])
+def test_duplex_unit_flag_leaves_at_most_a_short_tail_and_the_turn_end_flushes_it(unit_frames: int) -> None:
+    """The bound input-clocked sessions document for MiniCPM-o (realtime_duplex_api.md, model note).
+
+    When a non-final speaking unit's chunk flagged ``tts_is_last_chunk`` goes
+    out, fewer than 5 of the unit's codec frames may still be held (they go
+    out with the next unit's first chunk, as in real time); the chunk that
+    ends the turn sends every frame left.
+    """
+    manager = _manager()
+    request = _request("req-duplex")
+    sent = 0
+    for start in range(0, unit_frames, 25):
+        payload = tts2code2wav_async_chunk(
+            manager, _duplex_delta(*range(start, min(start + 25, unit_frames))), request, False
+        )
+        if payload is not None:
+            assert payload.meta.tts_is_last_chunk is False
+            sent += payload.meta.codec_chunk_frames
+    flagged = tts2code2wav_async_chunk(manager, _duplex_delta(), request, True)
+    assert flagged is not None and flagged.meta.tts_is_last_chunk is True and flagged.meta.last_chunk is False
+    sent += flagged.meta.codec_chunk_frames
+    assert 0 <= unit_frames - sent < 5
+
+    turn_end = tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request, True)
+    assert turn_end is not None and turn_end.meta.last_chunk is True
+    assert sent + turn_end.meta.codec_chunk_frames == unit_frames
+
+
 def test_duplex_empty_finish_callback_does_not_replay_previous_text() -> None:
     manager = _manager()
     request = _request("req-duplex")

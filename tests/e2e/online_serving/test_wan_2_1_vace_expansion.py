@@ -31,8 +31,8 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 MODEL = "Wan-AI/Wan2.1-VACE-1.3B-diffusers"
 PROMPT = "A cat walking slowly across a sunlit garden path"
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 
 
 def _get_vace_feature_cases():
