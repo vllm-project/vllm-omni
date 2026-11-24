@@ -53,7 +53,7 @@ and confirm the consumer in the target revision. For example:
 - MiniCPM-o encoder: `hf_overrides.encoder_cuda_graph`, consumed by
   `minicpmo_4_5/encoder_graph.py` under `model_executor/models/`.
 - MiniCPM-o flow encoder: connector `extra.cfm_encoder_cuda_graph`, consumed by
-  `minicpmo_4_5/minicpmo_4_5_code2wav.py` and `batched_token2wav.py`.
+  `minicpmo_4_5/minicpmo_4_5_code2wav.py` and `code2wav/token2wav.py`.
 - LFM3 depth head: the [pinned LFM3 case](lfm3-omni.md) names its model override.
 
 These examples are not an exhaustive list of graphs; trace every touched

@@ -43,7 +43,10 @@ from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
-from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
+from vllm_omni.core.sched.omni_scheduling_coordinator import (
+    uses_native_mrv2_data_plane,
+    uses_native_qwen3_omni_resumable,
+)
 from vllm_omni.data_entry_keys import (
     ASYNC_CHUNK_PREWARM_NS,
     FIRST_AUDIO_KEY,
@@ -82,7 +85,12 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
     UnregisterRemoteReplicaMessage,
 )
-from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
+from vllm_omni.engine.orchestrator_monitor import (
+    _NULL_ORCH_MONITOR,
+    OrchestratorMonitorBase,
+    create_orch_monitor,
+    replica_key,
+)
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.shared_request_queue import SharedRequestQueue
 from vllm_omni.engine.stage_client import DiffusionSubmitKwargs
@@ -226,6 +234,9 @@ def build_engine_core_request_from_tokens(
     wire_payload: dict[str, Any] | None = None
     if isinstance(raw_additional_information, dict):
         wire_payload = dict(raw_additional_information)
+        # Deferred image/video stays on the original prompt for the orchestrator;
+        # keep it off the wire, where PIL images and video arrays cannot be serialized.
+        wire_payload.pop("deferred_multi_modal_data", None)
     additional_info_payload = serialize_additional_information(
         wire_payload,
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
@@ -370,6 +381,11 @@ class OrchestratorRequestState:
 
     # Per-request pipeline timing accumulator (milliseconds)
     pipeline_timings: dict[str, float] = field(default_factory=dict)
+    # Event-driven central-dispatch residence accumulated until a stage
+    # segment finishes and consumes the values into StageRequestStats.
+    dispatch_wait_total_ms: dict[int, float] = field(default_factory=dict)
+    dispatch_wait_max_ms: dict[int, float] = field(default_factory=dict)
+    dispatch_batches: dict[int, int] = field(default_factory=dict)
     # A session-owned request's lifetime belongs to a session (duplex), not to
     # its own ``finished`` flag: no synthetic terminal on the client queue, no
     # client emission of stage-0 segment ends, no terminal re-forward, no
@@ -468,6 +484,7 @@ class OrchestratorBase:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
+    _orch_monitor: OrchestratorMonitorBase = _NULL_ORCH_MONITOR
     collect_stage_metrics: bool = True
     tracer: Tracer | None = None
 
@@ -1090,6 +1107,30 @@ class OrchestratorBase:
                 samples[key] = pool.replica_monitor_sample(replica_id)
         return samples
 
+    def _record_dispatch_residence(
+        self,
+        stage_id: int,
+        outputs: list[object],
+        wait_ms: float,
+        raw_terminal_request_ids: set[str] | None = None,
+    ) -> None:
+        """Attribute one ready-queue residence sample to each request in a batch."""
+        request_ids = {str(request_id) for request_id in (raw_terminal_request_ids or ())}
+        for output in outputs:
+            request_id = getattr(output, "request_id", None)
+            if request_id is None:
+                continue
+            request_ids.add(str(request_id))
+
+        wait_ms = max(float(wait_ms), 0.0)
+        for request_id in request_ids:
+            req_state = self.request_states.get(request_id)
+            if req_state is None:
+                continue
+            req_state.dispatch_wait_total_ms[stage_id] = req_state.dispatch_wait_total_ms.get(stage_id, 0.0) + wait_ms
+            req_state.dispatch_wait_max_ms[stage_id] = max(req_state.dispatch_wait_max_ms.get(stage_id, 0.0), wait_ms)
+            req_state.dispatch_batches[stage_id] = req_state.dispatch_batches.get(stage_id, 0) + 1
+
     async def _orchestration_output_handler(self) -> None:
         """Poll all stages, handle transfers, send final outputs to main."""
         try:
@@ -1439,7 +1480,7 @@ class OrchestratorBase:
         task churn) is removed. Diffusion stages keep their nowait-poll contract
         via a per-pool poller task feeding the same queue.
         """
-        ready_q: asyncio.Queue[tuple[str, int, int, Any]] = asyncio.Queue()
+        ready_q: asyncio.Queue[tuple[float, str, int, int, Any]] = asyncio.Queue()
         readers: dict[tuple[int, int], tuple[asyncio.Task, Any]] = {}
         pollers: dict[int, asyncio.Task] = {}
         reaped: list[asyncio.Task] = []
@@ -1458,12 +1499,12 @@ class OrchestratorBase:
                     if raw_outputs is None:
                         await asyncio.sleep(0.001)
                         continue
-                    await ready_q.put(("llm", stage_id, replica_id, raw_outputs))
+                    await ready_q.put((_time.perf_counter(), "llm", stage_id, replica_id, raw_outputs))
                     self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
             except asyncio.CancelledError:
                 raise
             except BaseException as e:  # noqa: BLE001 - routed to the dispatcher
-                await ready_q.put(("error", stage_id, replica_id, e))
+                await ready_q.put((_time.perf_counter(), "error", stage_id, replica_id, e))
 
         async def _diffusion_poller(stage_id: int, pool: StagePool) -> None:
             try:
@@ -1473,18 +1514,18 @@ class OrchestratorBase:
                         try:
                             output = pool.poll_diffusion_output(replica_id)
                         except EngineDeadError as e:
-                            await ready_q.put(("error", stage_id, replica_id, e))
+                            await ready_q.put((_time.perf_counter(), "error", stage_id, replica_id, e))
                             continue
                         if output is None:
                             continue
-                        await ready_q.put(("diffusion", stage_id, replica_id, output))
+                        await ready_q.put((_time.perf_counter(), "diffusion", stage_id, replica_id, output))
                         self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
                         got = True
                     await asyncio.sleep(0 if got else 0.001)
             except asyncio.CancelledError:
                 raise
             except BaseException as e:  # noqa: BLE001 - routed to the dispatcher
-                await ready_q.put(("error", stage_id, -1, e))
+                await ready_q.put((_time.perf_counter(), "error", stage_id, -1, e))
 
         def _reconcile_readers() -> None:
             """Track available replicas: spawn/reap LLM readers and diffusion pollers.
@@ -1618,8 +1659,9 @@ class OrchestratorBase:
                     if not done:
                         self._orch_monitor.note_loop(idle=True)
                     continue
-                kind, stage_id, replica_id, payload = pending_get.result()
+                enqueued_at, kind, stage_id, replica_id, payload = pending_get.result()
                 pending_get = None
+                dispatch_wait_ms = max((_time.perf_counter() - enqueued_at) * 1000.0, 0.0)
                 # Record the queue after dequeue so the gauge reflects work
                 # still waiting for dispatch rather than producer-side depth.
                 self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
@@ -1683,6 +1725,12 @@ class OrchestratorBase:
                     )
                     raise
 
+                self._record_dispatch_residence(
+                    stage_id,
+                    processed,
+                    dispatch_wait_ms,
+                    raw_terminal_request_ids,
+                )
                 await self._handle_processed_outputs(stage_id, replica_id, processed)
                 await self._finish_raw_terminal_requests(stage_id, replica_id, raw_terminal_request_ids)
                 # Mirrors the legacy loop, which sets idle=False only after a
@@ -1762,6 +1810,12 @@ class OrchestratorBase:
             req_state.pipeline_timings["queue_wait_ms"] = req_state.pipeline_timings.get("queue_wait_ms", 0.0) + wait_ms
         if self.collect_stage_metrics:
             stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+            stage_metrics.orchestrator_snapshot = self._orch_monitor.snapshot()
+        dispatch_batches = req_state.dispatch_batches.pop(stage_id, None)
+        if dispatch_batches is not None:
+            stage_metrics.orchestrator_dispatch_wait_ms = req_state.dispatch_wait_total_ms.pop(stage_id, 0.0)
+            stage_metrics.orchestrator_dispatch_wait_max_ms = req_state.dispatch_wait_max_ms.pop(stage_id, 0.0)
+            stage_metrics.orchestrator_dispatch_batches = dispatch_batches
         return stage_metrics
 
     async def _handle_stage_error(
@@ -2396,13 +2450,19 @@ class OrchestratorBase:
                 final_output_type=final_output_type,
                 audio_sample_rate=pool._infer_audio_sample_rate(),
             )
+            stage_metrics = self._attach_finished_stage_metrics(
+                stage_id,
+                replica_id,
+                terminal_output,
+                req_state,
+            )
             await self.output_async_queue.put(
                 OutputMessage(
                     request_id=request_id,
                     stage_id=stage_id,
                     replica_id=replica_id,
                     engine_outputs=terminal_output,
-                    metrics=None,
+                    metrics=stage_metrics,
                     finished=True,
                     stage_submit_ts=req_state.stage_submit_ts.get(stage_id),
                 )
@@ -3790,8 +3850,15 @@ class OrchestratorBase:
                         memo,
                     )
                     if "additional_information" in original_prompt:
+                        raw_additional_info = original_prompt["additional_information"]
+                        if isinstance(raw_additional_info, dict) and "deferred_multi_modal_data" in raw_additional_info:
+                            # Deferred visuals belong to the raw prompt for stage handoff,
+                            # not to prewarmed downstream wire placeholders.
+                            raw_additional_info = {
+                                k: v for k, v in raw_additional_info.items() if k != "deferred_multi_modal_data"
+                            }
                         base_input["additional_information"] = copy_request_snapshot(
-                            original_prompt["additional_information"],
+                            raw_additional_info,
                             memo,
                             shared_types=(torch.Tensor,),
                         )
@@ -4209,28 +4276,57 @@ class Orchestrator(OrchestratorBase):
             return
 
         if getattr(prompt, "resumable", False):
-            for active_stage_id in range(stage_id, min(final_stage_id, len(self.stage_pools) - 1) + 1):
-                vllm_config = getattr(self.stage_pools[active_stage_id], "stage_vllm_config", None)
-                model_config = getattr(vllm_config, "model_config", None)
-                hf_config = getattr(model_config, "hf_config", None)
-                spec_config = getattr(vllm_config, "speculative_config", None)
-                if (
-                    getattr(hf_config, "model_type", None) == "qwen3_omni_moe"
-                    and spec_config is not None
-                    and spec_config.use_dflash()
-                ):
+            active_configs = [
+                getattr(self.stage_pools[index], "stage_vllm_config", None)
+                for index in range(stage_id, min(final_stage_id + 1, len(self.stage_pools)))
+            ]
+            entry_spec_config = getattr(active_configs[0], "speculative_config", None)
+            native_resume = (
+                entry_spec_config is not None
+                and entry_spec_config.use_dflash()
+                and all(
+                    uses_native_qwen3_omni_resumable(getattr(config, "model_config", None))
+                    and not getattr(getattr(config, "scheduler_config", None), "async_scheduling", False)
+                    for config in active_configs
+                )
+            )
+            # Thinker-only requests have no cross-stage speech spans.
+            if final_stage_id > stage_id:
+                for active_stage_id in range(stage_id, min(final_stage_id, len(self.stage_pools) - 1) + 1):
+                    vllm_config = getattr(self.stage_pools[active_stage_id], "stage_vllm_config", None)
+                    model_config = getattr(vllm_config, "model_config", None)
+                    hf_config = getattr(model_config, "hf_config", None)
+                    spec_config = getattr(vllm_config, "speculative_config", None)
+                    if getattr(hf_config, "model_type", None) != "qwen3_omni_moe":
+                        continue
+                    if spec_config is None or not spec_config.use_dflash():
+                        continue
+                    if (
+                        self.async_chunk
+                        and active_stage_id == stage_id
+                        and (
+                            native_resume
+                            or not uses_native_mrv2_data_plane(
+                                model_config,
+                                use_v2_model_runner=bool(getattr(model_config, "use_v2_model_runner", False)),
+                            )
+                        )
+                        and not getattr(getattr(vllm_config, "scheduler_config", None), "async_scheduling", False)
+                        and not getattr(getattr(vllm_config, "cache_config", None), "enable_prefix_caching", False)
+                        and self._stage_receives_async_chunks(stage_id + 1)
+                    ):
+                        continue
                     cleanup_request_artifact_dirs(artifact_dirs)
                     await self._fail_request_client_error(
                         request_id,
                         stage_id,
                         f"streaming (resumable) input is not supported with Qwen3-Omni DFlash on stage "
-                        f"{active_stage_id}; disable DFlash for streaming input or use a non-resumable request",
+                        f"{active_stage_id} in this configuration; speech requires async_chunk, "
+                        "synchronous Thinker scheduling and disabled Thinker prefix caching",
                     )
                     return
             mrv2_stage_id = self._native_mrv2_receiver_stage(final_stage_id)
-            if mrv2_stage_id is not None:
-                # Streaming-input sessions replace downstream prompts through
-                # the V1 chunk adapter, which MRv2's native data plane lacks.
+            if mrv2_stage_id is not None and not native_resume:
                 cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(
                     request_id,

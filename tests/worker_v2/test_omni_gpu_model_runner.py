@@ -776,10 +776,10 @@ def test_capture_contract_uses_model_declaration(stage, declared):
 
 
 @pytest.mark.parametrize(
-    ("stage", "use_mrv2", "returns_aux", "exclude_full"),
-    [("llm", True, False, False), ("tts", True, False, False), ("llm", True, True, False), ("llm", False, False, True)],
+    ("stage", "returns_aux"),
+    [("llm", False), ("tts", False), ("llm", True)],
 )
-def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
+def test_minicpmo_capture_contract(stage, returns_aux):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
@@ -787,18 +787,17 @@ def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     torch.nn.Module.__init__(model)
     model.model_stage = stage
-    model._use_v2_model_runner = use_mrv2
     model._returns_aux_hidden_states = returns_aux
     model.have_multimodal_outputs = True
-    assert model.mrv2_forward_returns_tensor is (use_mrv2 and (stage == "tts" or not returns_aux))
-    assert model.mrv2_forward_returns_native_aux is (use_mrv2 and stage == "llm" and returns_aux)
+    assert model.mrv2_forward_returns_tensor is (stage == "tts" or not returns_aux)
+    assert model.mrv2_forward_returns_native_aux is (stage == "llm" and returns_aux)
 
     runner = _make_runner()
     runner.model = model
     runner._configure_cudagraph_output_contract()
 
-    assert runner._model_has_structured_output is exclude_full
-    assert runner._exclude_full_graph is exclude_full
+    assert runner._model_has_structured_output is False
+    assert runner._exclude_full_graph is False
 
 
 def _make_graph_contract_model(architecture, stage):

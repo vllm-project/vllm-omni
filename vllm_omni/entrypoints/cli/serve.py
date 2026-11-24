@@ -1103,6 +1103,14 @@ class OmniServeCommand(CLISubcommand):
             "resident_layers (DiT only).",
         )
         omni_config_group.add_argument(
+            "--kv-isolate",
+            action="store_true",
+            default=None,
+            help="Experimental MiniMax-H3 visual-reference isolation with one-time KV capture, "
+            "Host INT8 and asynchronous layer prefetch. Changes model semantics and takes "
+            "precedence over --kv-offload-config.",
+        )
+        omni_config_group.add_argument(
             "--kv-offload-config",
             type=json.loads,
             default=None,
@@ -1484,7 +1492,7 @@ def _start_api_server_process_manager(**manager_kwargs: object) -> APIServerProc
 
 def run_multi_api_server_omni(args: TrackingNamespace) -> None:
     """Launch API subprocesses that share one set of local stage engines."""
-    from vllm.entrypoints.openai.api_server import setup_server
+    from vllm.entrypoints.launchers.launcher import setup_server
     from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
 
     num_api_servers = int(args.api_server_count)
