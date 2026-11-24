@@ -1161,7 +1161,10 @@ def llm2tts(
                 special_token_ids.get("chunk_tts_eos_token_id"),
             }
             unit_start = 0
-            while unit_start < len(out_ids) and out_ids[unit_start] in previous_unit_ends:
+            # Preserve the final token: it may be the current audio unit's
+            # only terminator and still owes the Talker a segment boundary.
+            # Empty text units are intercepted before reaching this handoff.
+            while unit_start + 1 < len(out_ids) and out_ids[unit_start] in previous_unit_ends:
                 unit_start += 1
             # Only the unit's opening decision (or a boundary folded as the last
             # prompt token) starts the slice. The policy also rewrites a mid-unit

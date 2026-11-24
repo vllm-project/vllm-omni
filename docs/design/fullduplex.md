@@ -60,6 +60,10 @@ assistant turn once during prefill, since text has no microphone silence
 marking the end of input. When no response is active, the runner creates one before submission;
 an empty `<|chunk_eos|>` unit returns directly to the session to advance the
 normal continuation clock instead of waiting for nonexistent Talker output.
+This shortcut applies only to model-confirmed unforced text input. Empty audio
+units retain their Talker handoff and segment boundary, including when the
+chunk terminator is their only token, so input-clock acknowledgements keep
+their unit ownership.
 For a response released by unforced text, incomplete buffered PCM does not
 block that clock. The PCM remains charged and unconsumed; queued appends,
 reserved input, and complete audio or vision units retain priority over

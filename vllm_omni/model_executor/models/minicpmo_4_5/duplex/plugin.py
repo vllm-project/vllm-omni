@@ -905,7 +905,10 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         chunk_eos_id = special_token_ids.get("chunk_eos_token_id")
         unit_terminators = {listen_id, chunk_eos_id, special_token_ids.get("chunk_tts_eos_token_id")}
         empty_unit = (
-            bool(unit_ids) and unit_ids[-1] == chunk_eos_id and (len(unit_ids) == 1 or unit_ids[-2] in unit_terminators)
+            _coerce_int(output_metadata.get("duplex_text_input")) == 1
+            and bool(unit_ids)
+            and unit_ids[-1] == chunk_eos_id
+            and (len(unit_ids) == 1 or unit_ids[-2] in unit_terminators)
         )
         if not empty_unit and _coerce_int(stop_reason) != listen_id and (not token_ids or token_ids[-1] != listen_id):
             return None
