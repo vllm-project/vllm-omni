@@ -15,8 +15,12 @@ from tests.e2e.accuracy import sensenova_u1 as accuracy
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def test_committed_reference_has_valid_cases_and_pixels():
-    reference = json.loads(accuracy.REFERENCE_PATH.read_text())
+@pytest.mark.parametrize(
+    ("hardware", "reference_path"),
+    [(hardware, path) for hardware, path in accuracy.REFERENCE_PATHS.items() if path.is_file()],
+)
+def test_committed_reference_has_valid_cases_and_pixels(hardware, reference_path):
+    reference = json.loads(reference_path.read_text())
     assert isinstance(reference, dict), "Reference must be a JSON object"
     assert type(reference.get("schema_version")) is int and reference["schema_version"] == 1, (
         "Reference schema_version must be integer 1"
@@ -26,6 +30,13 @@ def test_committed_reference_has_valid_cases_and_pixels():
     for case, expected_size in {"t2i": [1536, 2720], "i2i": [2560, 1664]}.items():
         record = cases[case]
         assert isinstance(record, dict) and record.get("case") == case, f"{case}: case identity mismatch"
+        recorded_hardware = record.get("environment", {}).get("reference_hardware")
+        if recorded_hardware is None:
+            recorded_hardware = next(
+                (name for name in accuracy.REFERENCE_PATHS if name in record.get("environment", {}).get("gpu", "")),
+                None,
+            )
+        assert recorded_hardware == hardware, f"{case}: expected {hardware} reference, got {recorded_hardware}"
         contract = record.get("contract")
         assert isinstance(contract, dict), f"{case}: missing input contract"
         assert contract.get("model_id") == accuracy.MODEL_ID, f"{case}: unexpected model ID"
@@ -61,7 +72,9 @@ def test_committed_reference_has_valid_cases_and_pixels():
 def recorded_case(tmp_path, monkeypatch):
     monkeypatch.setenv("SENSENOVA_U1_ARTIFACT_DIR", str(tmp_path))
     monkeypatch.setattr(
-        accuracy, "_environment_metadata", lambda: {"gpu": "NVIDIA H100", "packages": {"torch": "test"}}
+        accuracy,
+        "_environment_metadata",
+        lambda: {"reference_hardware": "H100", "gpu": "NVIDIA H100", "packages": {"torch": "test"}},
     )
     monkeypatch.setattr(accuracy, "_source_metadata", lambda: {"git_commit": "unit-test"})
     params = SimpleNamespace(

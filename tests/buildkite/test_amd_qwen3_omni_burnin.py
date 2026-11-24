@@ -120,6 +120,22 @@ def test_qwen3_omni_correctness_blocks_while_perf_stays_nonblocking() -> None:
         assert JOB_SPECS.keys().isdisjoint(labels)
 
 
+def test_qwen3_omni_perf_bounds_rocm_runtime_resources() -> None:
+    nightly = _pipeline_steps(NIGHTLY_PIPELINE)
+    expected = {
+        "MIOPEN_FIND_MODE": "FAST",
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+    }
+
+    for label in ("Qwen3-Omni No-Async-Chunk Perf", "Qwen3-Omni Async-Chunk Perf"):
+        env = nightly[label]["env"]
+        assert {name: env[name] for name in expected} == expected
+
+    correctness_env = nightly["Qwen3-Omni Multi-Replica Correctness"]["env"]
+    assert expected.keys().isdisjoint(correctness_env)
+
+
 def test_runner_requires_complete_artifacts_and_clean_teardown() -> None:
     source = RUNNER.read_text(encoding="utf-8")
     assert RUNNER.stat().st_mode & stat.S_IXUSR
