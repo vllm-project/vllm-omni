@@ -37,6 +37,7 @@ def test_default_does_not_build_optional_extension(monkeypatch, parallel_context
 @pytest.mark.parametrize("allgather", [1, 2])
 def test_explicit_exchange_setting_is_forwarded(monkeypatch, parallel_context, enabled, allgather):
     parallel_context.ulysses_a2a_permute = enabled
+    parallel_context.ulysses_a2a_zero_copy = enabled
     parallel_context.allgather_degree = allgather
     strategy = Mock()
     name = "UlyssesAllGatherKVParallelAttention" if allgather > 1 else "UlyssesParallelAttention"
@@ -45,3 +46,4 @@ def test_explicit_exchange_setting_is_forwarded(monkeypatch, parallel_context, e
     factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
 
     assert strategy.call_args.kwargs["ulysses_a2a_permute"] is enabled
+    assert strategy.call_args.kwargs["ulysses_a2a_zero_copy"] is enabled
