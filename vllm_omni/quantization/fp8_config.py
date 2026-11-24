@@ -9,11 +9,18 @@ from typing import Any, Literal
 import regex as re
 from torch import nn
 from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
+from vllm.model_executor.layers.fused_moe import RoutedExperts, UnquantizedFusedMoEMethod
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
 from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 from vllm.model_executor.layers.quantization.online.fp8 import Fp8PerBlockOnlineLinearMethod
-from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape, QuantKey, create_fp8_quant_key
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    QuantKey,
+    create_fp8_quant_key,
+    is_layer_skipped,
+)
 from vllm.platforms import current_platform
 
 
@@ -133,6 +140,9 @@ class DiffusionFp8Config(OnlineQuantizationConfig):
         self.online_block_size = online_block_size
         self._online_block_weight_key = block_weight_key
         self._online_block_activation_key = block_activation_key
+        # `ignored_layers` entries name a layer's full prefix. A pipeline that documents
+        # them as short module-name patterns raises this mode, as DiffusionMXFP8Config does.
+        self.ignored_layers_match_mode: Literal["exact", "substring", "suffix"] = "exact"
 
     def _get_method_cls(
         self,
@@ -152,7 +162,26 @@ class DiffusionFp8Config(OnlineQuantizationConfig):
             return OnlineBlockFp8LinearMethod
         return super()._get_method_cls(spec, table, layer_cls)
 
+    def _skips_layer(self, prefix: str) -> bool:
+        """Whether a raised ``ignored_layers_match_mode`` covers ``prefix``.
+
+        The ``exact`` mode needs no help: the base class already matches a full prefix.
+        """
+        if not self.ignored_layers or self.ignored_layers_match_mode == "exact":
+            return False
+        return is_layer_skipped(
+            prefix=prefix,
+            ignored_layers=self.ignored_layers,
+            fused_mapping=self.packed_modules_mapping,
+            match_mode=self.ignored_layers_match_mode,
+        )
+
     def get_quant_method(self, layer: nn.Module, prefix: str) -> QuantizeMethodBase | None:
+        if self._skips_layer(prefix):
+            if isinstance(layer, LinearBase):
+                return UnquantizedLinearMethod()
+            if isinstance(layer, RoutedExperts):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
         if self.online_block_size is not None:
             resolved = self.resolve_quant_method_cls(type(layer), prefix)
             if resolved is not None:

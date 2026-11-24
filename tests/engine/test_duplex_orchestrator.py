@@ -56,7 +56,7 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState, build_engine_core_request_from_tokens
-from vllm_omni.engine.stage_pool import StageUnavailableError
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 from vllm_omni.outputs import OmniRequestOutput
@@ -1378,6 +1378,64 @@ def _placement_config(**kwargs) -> DuplexSessionRuntimeConfig:
     return DuplexSessionRuntimeConfig(
         replica_policy="least_sessions", max_sessions=8, max_sessions_per_replica=2, **kwargs
     )
+
+
+@pytest.mark.parametrize("groups", [None, [{0: 0}, {0: 1}]], ids=["implicit", "explicit"])
+@pytest.mark.asyncio
+async def test_least_sessions_skips_replica_that_exited_before_ready(groups) -> None:
+    # StageRuntime leaves a hole for replica 0 when it exits before READY.
+    survivor = FakeStageClient(final_output=True)
+    pool = StagePool(
+        0,
+        [None, survivor],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=_stage_configs(1)[0],
+    )
+    orchestrator = DuplexOrchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+        plugin=MiniCPMO45DuplexPlugin(_encode_audio),
+        duplex_session_config=_placement_config(replica_groups=groups),
+    )
+    try:
+        assert (await _open(orchestrator, orchestrator.rpc_async_queue)).ok
+        await _submit(orchestrator, _append_audio())
+        assert survivor.add_request_calls
+        request = survivor.add_request_calls[0][0]
+        assert request.request_id == _stage0_request_id()
+        assert pool.get_bound_replica_id(request.request_id) == 1
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("groups", [None, [{0: 0, 1: 0}, {0: 1, 1: 1}]], ids=["implicit", "explicit"])
+async def test_crossed_startup_failures_respect_session_groups(groups) -> None:
+    pools = [StagePool(0, [None, FakeStageClient()]), StagePool(1, [FakeStageClient(final_output=True), None])]
+    rpc = asyncio.Queue()
+    orchestrator = DuplexOrchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=rpc,
+        stage_pools=pools,
+        plugin=MiniCPMO45DuplexPlugin(_encode_audio),
+        duplex_session_config=_placement_config(replica_groups=groups),
+    )
+    try:
+        result = await _open(orchestrator, rpc)
+        if groups is None:
+            assert result.ok
+            assert [orchestrator.replica_placement.route(SESSION_ID, stage) for stage in (0, 1)] == [1, 0]
+        else:
+            assert not result.ok and result.error_code == "replica_unavailable"
+            assert not result.error_retryable
+            snapshot = orchestrator.replica_placement.snapshot()
+            assert snapshot["groups"] == groups
+            assert not snapshot["sessions"]
+    finally:
+        await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio
