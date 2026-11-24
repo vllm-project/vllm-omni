@@ -245,6 +245,26 @@ def test_ltx_reference_runner_resolves_gemma4_rope_layer_config(monkeypatch: pyt
     assert ROPE_INIT_FUNCTIONS["proportional"] is installed_proportional
 
 
+@pytest.mark.parametrize(
+    ("hip_version", "expected_deterministic"),
+    [(None, True), ("6.3.0", False)],
+    ids=["cuda", "rocm"],
+)
+def test_ltx_reference_runner_uses_platform_vocoder_determinism(
+    monkeypatch: pytest.MonkeyPatch,
+    hip_version: str | None,
+    expected_deterministic: bool,
+) -> None:
+    from .run_ltx25_reference import _official_vocoder_deterministic_cudnn
+
+    monkeypatch.setattr(torch.version, "hip", hip_version)
+    previous = not expected_deterministic
+    with torch.backends.cudnn.flags(deterministic=previous):
+        with _official_vocoder_deterministic_cudnn("cuda"):
+            assert torch.backends.cudnn.deterministic is expected_deterministic
+        assert torch.backends.cudnn.deterministic is previous
+
+
 def test_connector_weight_index_is_authoritative(tmp_path: Path) -> None:
     from .run_ltx25_reference import _connector_weight_files
 

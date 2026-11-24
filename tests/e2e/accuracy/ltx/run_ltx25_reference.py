@@ -9,6 +9,8 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -210,6 +212,24 @@ def _configure_official_gemma4_rope_compatibility() -> None:
         ROPE_INIT_FUNCTIONS["proportional"] = compute_proportional_rope_parameters
 
 
+@contextmanager
+def _official_vocoder_deterministic_cudnn(device_type: str) -> Iterator[None]:
+    if device_type != "cuda":
+        yield
+        return
+
+    previous = torch.backends.cudnn.deterministic
+    try:
+        # PyTorch exposes ROCm devices through the ``cuda`` device type, but
+        # MIOpen has no deterministic algorithm for the LTX BWE resampler's
+        # grouped conv1d. Keep NVIDIA's reproducible policy without forcing
+        # the unsupported MIOpen path on ROCm.
+        torch.backends.cudnn.deterministic = torch.version.hip is None
+        yield
+    finally:
+        torch.backends.cudnn.deterministic = previous
+
+
 def _configure_official_vocoder_determinism() -> None:
     """Make the pinned official LTX-2.5 vocoder a stable reference."""
     from ltx_core.model.audio_vae.vocoder import VocoderWithBWE
@@ -219,15 +239,8 @@ def _configure_official_vocoder_determinism() -> None:
         return
 
     def deterministic_forward(self: Any, mel_spec: torch.Tensor) -> torch.Tensor:
-        device_type = mel_spec.device.type
-        if device_type != "cuda":
+        with _official_vocoder_deterministic_cudnn(mel_spec.device.type):
             return original_forward(self, mel_spec)
-        previous = torch.backends.cudnn.deterministic
-        try:
-            torch.backends.cudnn.deterministic = True
-            return original_forward(self, mel_spec)
-        finally:
-            torch.backends.cudnn.deterministic = previous
 
     setattr(deterministic_forward, "_vllm_omni_deterministic", True)
     setattr(VocoderWithBWE, "forward", deterministic_forward)
