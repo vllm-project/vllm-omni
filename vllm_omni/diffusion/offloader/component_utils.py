@@ -161,13 +161,12 @@ def prepare_pipeline_components(
     device: torch.device,
     staged_components: list[nn.Module],
     enable_encoder_blocks: Callable[[ResolvedComponent], bool],
-    place_unselected: bool = True,
 ) -> None:
     """Apply the shared encoder/VAE/resident placement policy.
 
-    ``place_unselected`` is false when the user explicitly selected components:
-    an unselected component is inactive for this run and must not be moved to
-    the accelerator (RFC #10943).
+    An unselected DiT only opts out of offloading. It still runs for
+    generation with device-side inputs, so it is placed on the accelerator
+    like any active module.
     """
     for component in resolved.encoders:
         blockwise = bool(component.stacks) and enable_encoder_blocks(component)
@@ -196,6 +195,5 @@ def prepare_pipeline_components(
 
     for component in resolved.dits:
         if not component.selected:
-            if place_unselected:
-                component.module.to(device)
+            component.module.to(device)
             continue

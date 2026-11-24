@@ -89,7 +89,7 @@ def _resolved_unselected_dit(module: nn.Module) -> ResolvedOffloadPlan:
     )
 
 
-def test_explicit_selection_does_not_place_an_unselected_dit() -> None:
+def test_an_unselected_dit_is_placed_for_generation() -> None:
     dit = _PlacementProbe()
 
     prepare_pipeline_components(
@@ -97,21 +97,6 @@ def test_explicit_selection_does_not_place_an_unselected_dit() -> None:
         device=torch.device("cpu"),
         staged_components=[],
         enable_encoder_blocks=lambda _component: False,
-        place_unselected=False,
-    )
-
-    assert not dit.moved
-
-
-def test_legacy_selection_keeps_placing_an_unselected_dit() -> None:
-    dit = _PlacementProbe()
-
-    prepare_pipeline_components(
-        _resolved_unselected_dit(dit),
-        device=torch.device("cpu"),
-        staged_components=[],
-        enable_encoder_blocks=lambda _component: False,
-        place_unselected=True,
     )
 
     assert dit.moved

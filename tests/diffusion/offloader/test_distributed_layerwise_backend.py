@@ -3167,6 +3167,39 @@ class TestDistributedComponentSelection:
         with pytest.raises(ValueError, match="cannot use AllGather without.*streamable block plan"):
             backend.enable(Pipeline())
 
+    def test_encoder_only_selection_keeps_the_dit_on_device_for_generation(self, patched_offload_runtime):
+        """``components`` selects what to offload, not what the pipeline executes.
+
+        Full generation still calls the DiT with device-side inputs, so a DiT
+        that is merely unselected for offload must be placed on the accelerator
+        and must not receive streaming hooks.
+        """
+        placements = []
+
+        class Transformer(_SingleBlockModel):
+            def to(self, *args, **kwargs):
+                placements.append(args[0] if args else kwargs.get("device"))
+                return super().to(*args, **kwargs)
+
+        pipeline = _GenericDistributedEncoderPipeline()
+        pipeline.transformer = Transformer(num_blocks=2)
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                components=frozenset({"text_encoder"}),
+            ),
+            torch.device("cpu"),
+        )
+
+        backend.enable(pipeline)
+
+        assert placements and all(placement == backend.device for placement in placements)
+        dit_hooks = [hook for group in backend._all_hook_groups for hook in group]
+        assert dit_hooks  # the encoder is streamed
+        assert all(getattr(block, "_hook_registry", None) is None for block in pipeline.transformer.blocks)
+        backend.disable()
+
     def test_explicit_single_block_dit_is_rejected(self, patched_offload_runtime):
         pipeline = nn.Module()
         pipeline.transformer = _SingleBlockModel(num_blocks=1)

@@ -2013,7 +2013,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             device=self.device,
             staged_components=self._staged_components,
             enable_encoder_blocks=self._try_layerwise_offload_encoder,
-            place_unselected=self.config.components is None,
         )
 
         if any(component.selected for component in resolved.dits):
@@ -2131,9 +2130,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self.enabled = True
 
         if self._using_mmap and not self._using_rank_local_mmap:
-            # AllGather mode copied each rank's persistent shard, so the source
-            # mappings are no longer needed. Rank-local mode retains them as
-            # the node-shared host master until disable().
+            # AllGather packing copied each rank's persistent shard, and a
+            # rank-local encoder's hooks keep their own host copies, so the
+            # checkpoint mappings are no longer needed. Fully rank-local mode
+            # retains them as the node-shared host master until disable().
             self._release_mmap_handles()
 
         self._cleanup_after_loading()
