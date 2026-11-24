@@ -13,6 +13,7 @@ from weakref import WeakKeyDictionary
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.minicpmo_4_5.config import stage_connector_extra
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 
 logger = init_logger(__name__)
@@ -151,7 +152,7 @@ def _graphable_estimator_step(
     # while the buffers kept across steps split K/V on a leading axis: pack on
     # the way in and unpack the result back into ``att_out``, so the graph's
     # output placeholder stays on the split layout the next step expects.
-    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
         _pack_att_cache,
         _packed_att_buffer,
         _unpack_att_cache,
@@ -359,7 +360,7 @@ def _patched_build_backend(self) -> None:
     if self.backend is not None:
         return
 
-    extra = self._extra_config()
+    extra = stage_connector_extra(self.vllm_config)
     if bool(extra.get(_BF16_ATTENTION_CACHE_KEY, False)):
         raise ValueError(
             "MiniCPM-o Code2Wav code2wav_bfloat16_attention_cache is "
@@ -446,7 +447,7 @@ def apply_minicpmo_4_5_code2wav_patch() -> None:
     if _PATCHED:
         return
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
         BatchedToken2Wav,
     )
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (

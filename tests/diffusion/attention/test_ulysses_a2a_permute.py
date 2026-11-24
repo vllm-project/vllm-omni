@@ -19,6 +19,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("use_sync", [False, True])
 def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_sync):
     """Both platforms share attention routing, including joint slicing."""
+    monkeypatch.setenv("VLLM_OMNI_PACKED_QKV", "1")
     calls = []
     platform = SimpleNamespace(is_npu=lambda: npu, synchronize=lambda: calls.append("sync"))
     monkeypatch.setattr(ulysses, "current_omni_platform", platform)
@@ -33,6 +34,7 @@ def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_syn
     )
     monkeypatch.setattr(ulysses.dist, "get_world_size", lambda pg: 2)
     strategy = ulysses.UlyssesParallelAttention(group, 2, 1, use_sync, ulysses_a2a_permute=True)
+    assert strategy._packed_qkv is False
     query = torch.randn(1, 3, 4, 16)
     key = torch.randn(1, 3, 2, 16)
     value = torch.randn_like(key)

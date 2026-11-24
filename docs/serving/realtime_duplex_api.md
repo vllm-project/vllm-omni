@@ -942,6 +942,7 @@ It never contains client text.
 | Qwen3-Omni | As a tool message on the next prompt, for every reason except a suppressed repeat. A notice does not start a response by itself. |
 | Nemotron VoiceChat | On the function channel of the open request. After an epoch cancellation the model is told only if it repeats the call. |
 | JoyAI-VL-Interaction | As a delegated result on the next observation. After an epoch cancellation the question does not resurface, and the model is told only if it asks again. |
+| Realtime-Venus Omni | As a `<backend>` result on the next native input unit. After epoch cancellation, the notice is sent only if the model repeats the call. |
 
 **Interruptions.** `extra_body.function_call_interrupt_policy` sets what an epoch advance
 does to pending calls. It is fixed at session open. With `cancel` (the default),
@@ -965,14 +966,14 @@ model sets them; a client only reads them.
 | --- | --- | --- |
 | `none` | The model has no tool support. Non-empty `tools` is refused with `tools_unsupported`. | MiniCPM-o, PersonaPlex, Aura |
 | `declared` | The client defines the tools. The model reads their name, description and parameters in its prompt and calls them by name. | Qwen3-Omni, Nemotron VoiceChat |
-| `delegate_only` | The model has one built-in function, `delegate`, which hands a plain-language question to the application. Other tools are refused. | JoyAI-VL-Interaction |
+| `delegate_only` | The model has one built-in function, `delegate`, which hands a plain-language question to the application. Other tools are refused. | JoyAI-VL-Interaction, Realtime-Venus Omni |
 
 `function_call_output_continuation` values:
 
 | Value | What the client does after `function_call_output` | Models |
 | --- | --- | --- |
 | `client_response_create` | Send `response.create`. The model is turn-based, and the result is used in the response that event opens. Without it, the result waits for the next user turn. | Qwen3-Omni |
-| `automatic` | Nothing more. The result is fed into a later frame of the running request, and the model continues by itself. | Nemotron VoiceChat |
+| `automatic` | No `response.create`. The result is fed into a later frame of the running request. Keep streaming input or silence for native model time. | Nemotron VoiceChat, Realtime-Venus Omni |
 | `next_observation` | Nothing more. The next camera commit carries the result. To have it spoken, send a short user turn such as "Answer now with the result you received." | JoyAI-VL-Interaction |
 | `none` | Not applicable: the model has no tool support. | MiniCPM-o, PersonaPlex, Aura |
 
@@ -1062,6 +1063,17 @@ so audio playback and ACKs are not needed. List all flags with:
 python -m vllm_omni.clients.tool_calls --help
 ```
 
+For native input, replace `--prompt` with `--input-wav` (mono PCM16, 16 kHz),
+or `--initial-user-text` on a model that supports initial text seeding. These
+modes stream silence after the supplied input until the timeout, so tools run
+alongside incoming audio and native models can continue their answer. Native
+input requests text and audio; use `--output-wav answer.wav` to save the speech.
+For offline probes, `--ack-collected-audio` explicitly simulates immediate
+playback of received audio. Interactive applications must acknowledge audio
+actually played. See the
+[Venus tool examples](gh-file:recipes/inclusionAI/Realtime-Venus.md#tool-execution)
+for local arithmetic, inventory lookup and voice requests.
+
 Deployment setting `duplex_session.max_tool_calls_per_session` (default 4096)
 bounds the records one session may track, pending calls and settled tombstones
 together, until it closes; it must be a positive integer. At the limit, a new
@@ -1085,11 +1097,19 @@ await client.commit(create_response=False)
 summary = collector.timing_summary(after_s=commit_sent_at, input_committed_at_s=commit_sent_at)
 ```
 
-`timing_summary` reports client-observed first-text / first-audio latency,
+`timing_summary` prefers the server's per-response TTFT / TTFP from
+`response_request_metrics` when `response.created` or an audio delta carries
+them (`source: server_request_start_and_client_receive`); otherwise it falls
+back to client-observed first-text / first-audio latency. It also reports
 audio cadence, and, when the deployment attaches engine stage metrics to the
 response events (the benchmark requests them with
-`extra_body.return_stage_metrics=True`), the Stage 0 token metrics
-(`ttft_ms`, `tpot_ms`, `itls_ms`). It reports raw measurements only —
+`extra_body.return_stage_metrics=True`), per-stage engine metrics under `stages`
+(keyed by stage id), with Stage 0 also available as `stage0_tokens`
+(`ttft_ms`, `tpot_ms`, `itls_ms`). The `stage_metrics` mapping retains each stage's
+final cumulative raw snapshot for benchmark aggregation, including fields such
+as `num_tokens_out`, `vllm_ttft_ms`, and `stage_gen_time_ms`. Pass `response_id`
+to scope these snapshots to one assistant response in a multi-turn session.
+It reports raw measurements only —
 derived metrics such as the audio RTF are computed by the caller from
 `audio_generation_ms` / `audio_duration_ms` (the benchmarks use
 `vllm_omni.metrics.definitions.compute_audio_rtf`), keeping metric
@@ -1389,9 +1409,36 @@ Input clocking is available only for models whose plugin declares it
 model's real unit boundaries to know when a unit's output is complete. On any
 other model, a session with `clock: "input"` is refused with error
 `input_clock_unsupported` — at session creation, or on a `session.update`
-that sets it. No model shipped with vLLM-Omni declares it yet: the option is
-for plugins that opt in once their unit boundaries are mapped (see
-*Input-clocked sessions* in the model's entry when it does).
+that sets it.
+
+Models that support input-clocked sessions, and how each maps onto units:
+
+| Model | Unit | Decision | A speaking unit is complete when | Input |
+| --- | --- | --- | --- | --- |
+| MiniCPM-o 4.5 | 1 s audio chunk (an append submits every whole chunk it completes) | Stage 0 `listen` ends the unit; any other Stage-0 segment end makes it a speaking unit | its Talker segment has ended and Code2Wav has emitted the chunk that flushes the unit's remaining codes (`tts_is_last_chunk`) | audio only |
+
+For a speaking MiniCPM-o 4.5 unit, the acknowledgement guarantees that the
+unit's text (unless the unit has 5 or fewer codec frames in all, whose text
+can follow with the next unit's audio) and all of its audio that the
+vocoder could synthesise by then have been emitted. The last codec frames
+of a speaking unit that does not end the turn are synthesised together with
+the next unit's codes, because of the vocoder's lookahead and because a
+remainder shorter than 5 frames is carried into the next unit's first
+chunk, so that audio goes out after the unit's acknowledgement, exactly
+when real-time operation emits it: usually 200–440 ms (p10–p90), measured
+up to about 0.76 s, and it can exceed 1 s under concurrent load. There is
+no structural bound on it. The next unit is a speaking unit of the same
+turn because the model rewrites a `<|listen|>` sampled while the turn is
+open to `<|tts_bos|>`; a model change that allowed a listen mid-turn would
+let the tail wait across listen units. The unit that ends the turn is
+flushed completely before its acknowledgement.
+
+An input-clocked MiniCPM-o 4.5 session takes audio only: its capabilities
+list no `video` input modality, and an `input_audio_buffer.append` with
+`video_frames` is refused with `invalid_input_modality` and acknowledged as
+`rejected`. A committed turn with video frames is split into separate vision
+units, which the clock does not account for when the commit is deferred
+behind a response. Sessions without the clock are unchanged.
 
 An input-clocked session never overlaps turns: a commit during a response
 waits for that response, also on a model that otherwise runs concurrent turn
@@ -1608,8 +1655,8 @@ A stock client ignores the extra keys; the extensions are additive.
 | Message | Extension |
 | --- | --- |
 | `session.created` / `session.updated` | top-level `attachment_generation`, `resume_token`; inside `session`: `state`, `turn_state`, `epoch`, `turn_id`, `active_request_id`, `active_response_id`, `active_response_turn_id`, `overlap_policy`, `overlap_*_ms/rms`, `playback_commit_policy`, `playback`, `capabilities`, `ref_audio`, `extra_body`, `idle_timeout_s`, `response_format` |
-| `response.created` / `response.done` / `response.listen` | `response_id` at top level; the raw duplex event under `response.metadata` (`duplex_event`); `status_details.reason` uses vLLM reasons (`barge_in`, `client_cancelled`, `new_response`, …) |
-| `response.output_audio.delta` | `format`, `sample_rate_hz`, `metadata{session_id, epoch, model_speak, end_of_turn, audio_duration_ms, audio_text_marks, playback}` |
+| `response.created` / `response.done` / `response.listen` | `response_id` at top level; the raw duplex event under `response.metadata` (`duplex_event`), whose `response.created` carries `response_request_metrics` (`ttft_ms` / `ttfp_ms` once known, `measurement_origin`); `status_details.reason` uses vLLM reasons (`barge_in`, `client_cancelled`, `new_response`, …) |
+| `response.output_audio.delta` | `format`, `sample_rate_hz`, `metadata{session_id, epoch, model_speak, end_of_turn, audio_duration_ms, audio_text_marks, playback, vllm_omni.response_request_metrics}` |
 | `response.speak` (inserted before the first delta) | not an OpenAI event, but rides the OpenAI response envelope (`response_id`, `item_id`, `output_index`, `content_index`) |
 | `input_audio_buffer.append` | `is_speech`, `video_frames` (+ `max_slice_nums`), `duration_ms`, `audio_end_ms`, per-event `format` / `sample_rate_hz` |
 | `input_audio_buffer.commit` | `final`, `response_create`, `is_speech:false` (silence declaration) |

@@ -47,6 +47,7 @@ from vllm_omni.diffusion.diffusion_kv.config import (
 from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.media import DiffusionMediaOutput
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+from vllm_omni.diffusion.utils.flow_matching import normalize_shift
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.quantization import build_quant_config
@@ -1061,6 +1062,7 @@ class OmniDiffusionConfig:
     # the internal typed resolution used at runtime.
     diffusion_offload_config: dict[str, Any] | None = None
     kv_offload_config: dict[str, Any] | None = None
+    kv_isolate: bool = False
     # Compatibility aliases. Some model-specific legacy stage lifecycles are
     # intentionally broader than the compact dit/text_encoder selector.
     # When enabled, DiT and encoders swap GPU access (mutual exclusion):
@@ -1094,6 +1096,7 @@ class OmniDiffusionConfig:
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_stack_tiles: bool = True
     # Wan VAE decoder fast path. ``"lossless"`` installs the bit-exact fused
     # kernels on every diffusers Wan VAE, ``"channels_last"`` additionally
     # converts decoder convolution weights to channels-last memory format and
@@ -1380,12 +1383,14 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
-        from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
+        from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config, validate_kv_isolate
 
         if type(self.dlo_chunk_size_mb) is not int or self.dlo_chunk_size_mb <= 0:
             raise ValueError(f"dlo_chunk_size_mb must be a positive integer, got {self.dlo_chunk_size_mb!r}")
 
-        parse_reference_kv_config(self.kv_offload_config)
+        validate_kv_isolate(self.kv_isolate)
+        if not self.kv_isolate:
+            parse_reference_kv_config(self.kv_offload_config)
         if self.hsdp_weight_load_strategy not in {"full", "pre_sharded"}:
             raise ValueError(
                 f"hsdp_weight_load_strategy must be 'full' or 'pre_sharded', got {self.hsdp_weight_load_strategy!r}"
@@ -1495,6 +1500,8 @@ class OmniDiffusionConfig:
                     "request_batch_max_wait_ms must be a finite non-negative number, "
                     f"got {self.request_batch_max_wait_ms}."
                 )
+        if self.flow_shift is not None:
+            self.flow_shift = normalize_shift(self.flow_shift, name="flow_shift")
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig
