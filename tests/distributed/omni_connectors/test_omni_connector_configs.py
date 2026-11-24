@@ -78,6 +78,7 @@ config_files = get_config_files()
     [
         ("sender", 0, False, True),
         ("receiver", 1, True, False),
+        ("none", 1, False, False),
         (None, 0, True, False),
         (None, None, True, True),
     ],

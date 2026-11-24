@@ -53,6 +53,25 @@ per hook at warning level (subsequent failures at debug) and leave the inline
 reference preparation path available. Connector and auxiliary-output work
 still runs on every idle step.
 
+## Native resumable Qwen3-Omni output
+
+For native MRv2 resumable requests, the connector sender rank retains completed
+step payloads until the scheduler returns accepted token IDs and the segment
+decision. The data plane publishes committed payloads in order. Other TP ranks
+participate in request cleanup without retaining unpublished output queues.
+
+A segment marker pauses receiver polling until the current segment has been
+processed. This prevents the next Talker prompt or Code2Wav chunk from
+overwriting unconsumed data. Resumable DFlash speech requires async chunks,
+synchronous AR scheduling, disabled Thinker prefix caching, PP=1, and eager
+Thinker and drafter execution. The optional
+`qwen3_omni_moe_resumable` pipeline uses scheduler-owned chunk transfer.
+
+The CUDA TP1/TP2 hardware results used vLLM 0.33.0 and require revalidation on
+the current vLLM 0.34 runtime. See the
+[configuration requirements](../../user_guide/examples/online_serving/qwen3_omni.md#dflash-thinker-decoding)
+and [validation report](../qwen3_omni_dflash_validation.md).
+
 ## Related files
 
 - `vllm_omni/worker_v2/omni_ar_model_runner.py`: AR output snapshots and materialization.

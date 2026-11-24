@@ -56,11 +56,15 @@ def append_fence(session: DuplexEngineSession, payload: object, *, epoch: int | 
         turn_id = session.active_response_turn_id
     if turn_id is None:
         turn_id = session.turn_id
-    return DuplexFence(
-        session.session_id,
-        epoch=session.epoch if epoch is None else epoch,
-        turn_id=turn_id,
-    )
+    epoch = session.epoch if epoch is None else epoch
+    # The reply to an earlier turn can still own the response slot after the
+    # user has opened a newer one (they talked over it). New input belongs to
+    # the newer turn: an append fenced at the older turn would be rejected as
+    # stale, and every later append with it.
+    accepted = session.accepted_fence
+    if accepted.session_id == session.session_id and accepted.epoch == epoch:
+        turn_id = max(turn_id, accepted.turn_id)
+    return DuplexFence(session.session_id, epoch=epoch, turn_id=turn_id)
 
 
 def response_in_progress(session: DuplexEngineSession, tasks: DuplexSessionTasks) -> bool:

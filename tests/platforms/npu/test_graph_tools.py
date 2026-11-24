@@ -184,7 +184,6 @@ def test_code2wav_removed_qkv_switch_warns_without_changing_dispatch(monkeypatch
     monkeypatch.setattr(code2wav_patch, "_original_build_backend", lambda model: setattr(model, "backend", object()))
     model = SimpleNamespace(
         backend=None,
-        _extra_config=lambda: {},
         _cfm_graph_config={"enabled": False},
         vllm_config=SimpleNamespace(additional_config=additional_config),
     )
@@ -231,7 +230,6 @@ def test_code2wav_patch_reads_stage_additional_config(
 
     model = SimpleNamespace(
         backend=None,
-        _extra_config=lambda: {},
         _cfm_graph_config={"enabled": True, "max_graphs": 32, "enable_whole_euler": True},
         vllm_config=SimpleNamespace(
             additional_config={
@@ -266,14 +264,23 @@ def test_code2wav_patch_reads_stage_additional_config(
         assert model.backend not in code2wav_patch._backend_graph_runners
 
 
+def _code2wav_model_with_attention_cache(value):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="/fake/model",
+            stage_connector_config={"extra": {"code2wav_bfloat16_attention_cache": value}},
+        ),
+    )
+    return MiniCPMO45Code2Wav(vllm_config=config)
+
+
 @pytest.mark.parametrize("value", [True, "true", "false", "0", "off"])
 def test_code2wav_patch_rejects_bfloat16_attention_cache(monkeypatch, value):
     built = False
 
-    model = SimpleNamespace(
-        backend=None,
-        _extra_config=lambda: {"code2wav_bfloat16_attention_cache": value},
-    )
+    model = _code2wav_model_with_attention_cache(value)
 
     def build_backend(_instance):
         nonlocal built
@@ -291,10 +298,7 @@ def test_code2wav_patch_rejects_bfloat16_attention_cache(monkeypatch, value):
 def test_code2wav_patch_allows_disabled_bfloat16_attention_cache(monkeypatch, value):
     built = False
 
-    model = SimpleNamespace(
-        backend=None,
-        _extra_config=lambda: {"code2wav_bfloat16_attention_cache": value},
-    )
+    model = _code2wav_model_with_attention_cache(value)
 
     def build_backend(instance):
         nonlocal built
@@ -664,11 +668,12 @@ def test_vae_npu_graph_runner_is_per_instance(monkeypatch):
             return compute(*inputs)
 
     constructed = []
-    monkeypatch.setattr(
-        graph_tools_module,
-        "NPUExactGraphRunner",
-        lambda **kwargs: (constructed.append(kwargs) or _FakeRunner(**kwargs)),
-    )
+
+    def build_runner(**kwargs):
+        constructed.append(kwargs)
+        return _FakeRunner(**kwargs)
+
+    monkeypatch.setattr(graph_tools_module, "NPUExactGraphRunner", build_runner)
 
     class _FakeVae:
         def __init__(self, tag):

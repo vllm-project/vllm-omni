@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
-    MiniCPMO45DataPlaneContext,
     MiniCPMO45DataPlaneSession,
 )
 
@@ -33,7 +33,7 @@ def _boundary(seq: int, *, samples: int = 0, cache_epoch: int = 0):
 
 
 def _project(plane, output):
-    context = MiniCPMO45DataPlaneContext(auto_responds=True, active_response_id="response", active_response_turn_id=0)
+    context = DuplexDataPlaneContext(auto_responds=True, active_response_id="response", active_response_turn_id=0)
     return list(plane.project_output(output, context=context))
 
 
