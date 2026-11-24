@@ -132,7 +132,56 @@ def test_speech_truncation_includes_either_phase(abc_truncated, semantic_truncat
     assert metadata["audio_truncated"] == (abc_truncated or semantic_truncated)
 
 
-@pytest.mark.parametrize("cot,cfg_scale", [("full", 1), ("full", 1.5), ("off", 1.5)])
+@pytest.mark.parametrize(
+    "overrides,expected_fragments",
+    [
+        pytest.param({"instructions": None}, ("instructions",), id="instructions_missing"),
+        pytest.param({"instructions": "   "}, ("instructions",), id="instructions_blank"),
+        pytest.param({"input": "   "}, ("input",), id="lyrics_blank"),
+        pytest.param({"voice": "alloy"}, ("voice",), id="voice_rejected"),
+        pytest.param({"speed": 1.5}, ("speed",), id="speed_rejected"),
+        pytest.param(
+            {"extra_params": {"temperature": 0.3}},
+            ("temperature",),
+            id="temperature_rejected",
+        ),
+        pytest.param(
+            {"max_new_tokens": Yue2Adapter.max_new_tokens_min - 1},
+            ("max_new_tokens",),
+            id="frame_budget_below_minimum",
+        ),
+        pytest.param(
+            {"max_new_tokens": Yue2Adapter.max_new_tokens_max + 1},
+            ("max_new_tokens",),
+            id="frame_budget_above_maximum",
+        ),
+        pytest.param(
+            {"extra_params": {"abc": "X:1\nK:C\nC"}},
+            ("abc", "cot"),
+            id="abc_without_cot",
+        ),
+    ],
+)
+def test_yue2_adapter_validation_rejects_invalid_requests(overrides, expected_fragments):
+    body = {
+        "input": "lyrics",
+        "instructions": "style",
+        "max_new_tokens": 250,
+    }
+    for key, value in overrides.items():
+        if value is None:
+            body.pop(key)
+        else:
+            body[key] = value
+
+    adapter = Yue2Adapter(SpeechServingContext(server=None))
+    error = adapter.validate(OpenAICreateSpeechRequest(**body))
+
+    assert error is not None
+    assert all(fragment in error for fragment in expected_fragments)
+
+
+@pytest.mark.parametrize("cot,cfg_scale", [("melody", 1), ("full", 1), ("full", 1.5), ("off", 1.5)])
 @pytest.mark.asyncio
 async def test_http_song_sampling_isolated_from_defaults(mocker, cot, cfg_scale):
     engine = mocker.Mock(
@@ -262,13 +311,10 @@ def test_existing_model_and_pipeline_names_resolve_to_unified_path():
     deploy_root = Path(__file__).parents[2] / "vllm_omni/deploy"
     deploy = load_deploy_config(deploy_root / "yue2.yaml")
     assert deploy.pipeline == "yue2"
-    assert deploy.model_runner == "v1"
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        merge_pipeline_deploy(pipeline, deploy)
-    supported = OMNI_PIPELINES["qwen2_5_omni"]
-    assert isinstance(supported, PipelineConfig)
-    stages = merge_pipeline_deploy(supported, load_deploy_config(deploy_root / "qwen2_5_omni.yaml"))
+    assert deploy.model_runner == "v2"
+    stages = merge_pipeline_deploy(pipeline, deploy)
     assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+    assert stages[0].yaml_engine_args.get("worker_cls", "auto") == "auto"
     family, module, name = _OMNI_MODELS["Yue2ForCausalLM"]
     assert getattr(import_module(f"vllm_omni.model_executor.models.{family}.{module}"), name) is Yue2ForCausalLM
     assert detect_tts_model_type("yue2", "Yue2ForCausalLM") == "yue2"

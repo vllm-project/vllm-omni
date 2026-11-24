@@ -66,6 +66,7 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
     model.batched_gpu_staging_keys = set()
     model.mtp_accepts_per_row_generators = False
     model.mtp_accepts_req_infos = False
+    model.mtp_sample_uniforms_preserve_eager_stream = False
     model.mtp_output_key = ("codes", "audio")
     model.mtp_validity_key = None
     model.mtp_sampling_params = {}
@@ -435,6 +436,48 @@ def test_decode_cohort_uses_batch_hook(hook_name):
     assert torch.equal(seen_text_steps[0], torch.tensor([[51.0, 52.0], [61.0, 62.0]]))
 
 
+def test_decode_cohort_accepts_three_value_hook_without_mtp():
+    # preprocess_phase_contract.md: without talker_mtp the hook returns
+    # (input_ids, inputs_embeds, updates), as Voxtral TTS does.
+    state = _make_state(max_num_reqs=2, has_preprocess=True)
+    state.intermediate_buffer.buffers[0] = {"req_id": "r1", "meta": {"step": 1}}
+    state.intermediate_buffer.buffers[1] = {"req_id": "r2", "meta": {"step": 2}}
+    new_embeds = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+
+    def preprocess_decode_batch(*, input_ids, req_infos):
+        assert [info["req_id"] for info in req_infos] == ["r1", "r2"]
+        return input_ids, new_embeds, [{"meta": {"step": 11}}, {"meta": {"step": 12}}]
+
+    def unexpected_preprocess(*_args, **_kwargs):
+        raise AssertionError("decode requests must use the batch hook")
+
+    state.model.preprocess_decode_batch = preprocess_decode_batch
+    state.model.preprocess = unexpected_preprocess
+    model_inputs = {
+        "input_ids": torch.tensor([101, 202], dtype=torch.long),
+        "inputs_embeds": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+    }
+    state.run_preprocess(
+        _DummyInputBatch([0, 1], num_computed_tokens_cpu=[1, 1]),
+        model_inputs,
+    )
+    assert torch.equal(model_inputs["input_ids"], torch.tensor([101, 202]))
+    assert torch.equal(model_inputs["inputs_embeds"], new_embeds)
+    assert state.intermediate_buffer.buffers[1]["meta"]["step"] == 12
+
+
+def test_decode_cohort_rejects_three_value_hook_with_mtp():
+    state = _make_state(max_num_reqs=1, has_preprocess=True)
+    state.intermediate_buffer.buffers[0] = {"req_id": "r1"}
+    state.model.preprocess_decode_batch = lambda *, input_ids, req_infos: (input_ids, torch.zeros(1, 2), [{}])
+    state._has_mtp = True
+    with pytest.raises(RuntimeError, match="five values"):
+        state.run_preprocess(
+            _DummyInputBatch([0], num_computed_tokens_cpu=[1]),
+            {"input_ids": torch.tensor([101], dtype=torch.long), "inputs_embeds": torch.zeros(1, 2)},
+        )
+
+
 def test_static_decode_embeddings_refresh_from_input_ids():
     # FULL-graph replay reads the static buffer: it must hold fresh embeddings.
     state = _make_state(has_preprocess=True)
@@ -666,8 +709,11 @@ def test_seed_independence_resolve_once_and_sampling_kwargs():
     state.intermediate_buffer.buffers[1] = {"req_id": "r1", "sampling_params": _seeded(22)}
     resolver = MagicMock(wraps=state._mtp_state._get_mtp_generator)
     state._mtp_state._get_mtp_generator = resolver
+    mtp_calls = 0
 
     def mtp(input_ids, input_embeds, last_hidden, text_step, **kwargs):
+        nonlocal mtp_calls
+        mtp_calls += 1
         assert (kwargs["do_sample"], kwargs["temperature"]) == (True, 0.7)
         assert all(isinstance(g, torch.Generator) for g in kwargs["generators"])
         return input_embeds + 10, torch.tensor([[1, 2, 3], [4, 5, 6]])
@@ -677,6 +723,7 @@ def test_seed_independence_resolve_once_and_sampling_kwargs():
         [0, 1], torch.tensor([101, 202]), torch.zeros(2, 3), torch.zeros(2, 3), torch.zeros(2, 3)
     )
     assert resolver.call_count == 2
+    assert mtp_calls == 1
     assert torch.equal(codes, torch.tensor([[1, 2, 3], [4, 5, 6]]))
 
 
@@ -707,22 +754,120 @@ def test_mtp_prepares_request_local_uniforms_for_graph_paths(order, is_npu, grap
         mtp_state._mtp_forward(order, torch.tensor([101, 202]), torch.zeros(2, 3), torch.zeros(2, 3), torch.zeros(2, 3))
 
 
-def test_seeded_mtp_bypasses_outer_graph_runner():
+def test_mtp_exact_uniforms_match_eager_seeded_streams_across_order_and_padding():
+    seeds = {"a": 11, "b": 22}
+    steps = 3
+    vocab = 5
+
+    expected = {}
+    expected_states = {}
+    for req_id, seed in seeds.items():
+        generator = torch.Generator().manual_seed(seed)
+        values = torch.empty((1, steps, vocab), dtype=torch.float32)
+        for step in range(steps):
+            values[:, step, :].uniform_(1e-20, 1.0 - 1e-20, generator=generator)
+        expected[req_id] = values[0]
+        expected_states[req_id] = generator.get_state()
+
+    def draw(order, num_tokens):
+        state = _make_state(max_num_reqs=4)
+        state.model.mtp_sample_uniforms_preserve_eager_stream = True
+        mtp_state = state._mtp_state
+        mtp_state._mtp_sample_uniforms = torch.empty((4, steps, vocab), dtype=torch.float32)
+        generators = {req_id: torch.Generator().manual_seed(seed) for req_id, seed in seeds.items()}
+        values = mtp_state._prepare_mtp_sample_uniforms([generators[req_id] for req_id in order], num_tokens)
+        assert values is not None
+        return (
+            {req_id: values[row].clone() for row, req_id in enumerate(order)},
+            {req_id: generator.get_state() for req_id, generator in generators.items()},
+            values.clone(),
+        )
+
+    forward, forward_states, unpadded = draw(("a", "b"), 2)
+    reversed_, reversed_states, padded = draw(("b", "a"), 4)
+    for req_id in seeds:
+        torch.testing.assert_close(forward[req_id], expected[req_id], rtol=0, atol=0)
+        torch.testing.assert_close(reversed_[req_id], expected[req_id], rtol=0, atol=0)
+        assert torch.equal(forward_states[req_id], expected_states[req_id])
+        assert torch.equal(reversed_states[req_id], expected_states[req_id])
+    torch.testing.assert_close(unpadded, torch.stack([expected["a"], expected["b"]]), rtol=0, atol=0)
+    torch.testing.assert_close(padded[2:], torch.full((2, steps, vocab), 0.5), rtol=0, atol=0)
+
+
+def test_mtp_exact_uniforms_match_eager_mixed_generator_streams():
+    state = _make_state(max_num_reqs=3)
+    state.model.mtp_sample_uniforms_preserve_eager_stream = True
+    mtp_state = state._mtp_state
+    mtp_state._mtp_sample_uniforms = torch.empty((3, 2, 4), dtype=torch.float32)
+    saved_global_state = torch.random.get_rng_state()
+    try:
+        torch.manual_seed(101)
+        expected_generator = torch.Generator().manual_seed(17)
+        expected = torch.empty((2, 2, 4), dtype=torch.float32)
+        for step in range(2):
+            expected[0:1, step, :].uniform_(1e-20, 1.0 - 1e-20, generator=expected_generator)
+            expected[1:2, step, :].uniform_(1e-20, 1.0 - 1e-20)
+        expected_global_state = torch.random.get_rng_state()
+        expected_generator_state = expected_generator.get_state()
+
+        torch.manual_seed(101)
+        actual_generator = torch.Generator().manual_seed(17)
+        actual = mtp_state._prepare_mtp_sample_uniforms([actual_generator, None], 3)
+        assert actual is not None
+        torch.testing.assert_close(actual[:2], expected, rtol=0, atol=0)
+        torch.testing.assert_close(actual[2], torch.full((2, 4), 0.5), rtol=0, atol=0)
+        assert torch.equal(torch.random.get_rng_state(), expected_global_state)
+        assert torch.equal(actual_generator.get_state(), expected_generator_state)
+    finally:
+        torch.random.set_rng_state(saved_global_state)
+
+
+def test_mtp_exact_unseeded_uniforms_match_eager_contiguous_step_draws():
+    state = _make_state(max_num_reqs=4)
+    state.model.mtp_sample_uniforms_preserve_eager_stream = True
+    mtp_state = state._mtp_state
+    mtp_state._mtp_sample_uniforms = torch.empty((4, 3, 5), dtype=torch.float32)
+    saved_global_state = torch.random.get_rng_state()
+    try:
+        torch.manual_seed(202)
+        expected = torch.empty((2, 3, 5), dtype=torch.float32)
+        for step in range(3):
+            expected[:, step, :] = torch.empty((2, 5), dtype=torch.float32).uniform_(1e-20, 1.0 - 1e-20)
+        expected_global_state = torch.random.get_rng_state()
+
+        torch.manual_seed(202)
+        actual = mtp_state._prepare_mtp_sample_uniforms([None, None], 4)
+        assert actual is not None
+        torch.testing.assert_close(actual[:2], expected, rtol=0, atol=0)
+        torch.testing.assert_close(actual[2:], torch.full((2, 3, 5), 0.5), rtol=0, atol=0)
+        assert torch.equal(torch.random.get_rng_state(), expected_global_state)
+    finally:
+        torch.random.set_rng_state(saved_global_state)
+
+
+def test_seeded_mtp_uniform_buffer_uses_outer_graph_runner_once():
     state = _make_state(max_num_reqs=2)
-    raw_calls = []
+    state.model.mtp_accepts_per_row_generators = True
+    state.model.mtp_sample_uniforms_preserve_eager_stream = True
+    _init_static(state, 2)
+    state.intermediate_buffer.buffers[0] = {"req_id": "r0", "sampling_params": _seeded(11)}
+    state.intermediate_buffer.buffers[1] = {"req_id": "r1", "sampling_params": _seeded(22)}
+    mtp_state = state._mtp_state
+    mtp_state._mtp_sample_uniforms = torch.empty((2, 2, 4), dtype=torch.float32)
+    mtp_state._is_mtp_graph_runner = MagicMock(return_value=True)
+    raw_mtp = state.model.mtp = MagicMock(side_effect=AssertionError("seeded rows must use graph input uniforms"))
+    graph_runner = mtp_state._mtp_runner = MagicMock(return_value=(torch.ones(2, 3), torch.tensor([[1, 2], [3, 4]])))
 
-    def mtp(*args, **kwargs):
-        raw_calls.append(kwargs)
-        return args[1], args[0].reshape(-1, 1)
-
-    state.model.mtp = mtp
-    state._mtp_state._mtp_runner = MagicMock(side_effect=AssertionError("seeded sampling must not replay the graph"))
-    generators = [torch.Generator().manual_seed(11), torch.Generator().manual_seed(22)]
-    state._mtp_state._call_mtp_runner(
-        torch.tensor([101, 202]), torch.zeros(2, 3), torch.zeros(2, 3), torch.zeros(2, 3), generators=generators
+    _, codes = mtp_state._mtp_forward(
+        [0, 1], torch.tensor([101, 202]), torch.zeros(2, 3), torch.zeros(2, 3), torch.zeros(2, 3)
     )
-    assert raw_calls == [{"generators": generators}]
-    state._mtp_state._mtp_runner.assert_not_called()
+
+    raw_mtp.assert_not_called()
+    graph_runner.assert_called_once()
+    kwargs = graph_runner.call_args.kwargs
+    assert kwargs["sample_uniforms"].shape == (2, 2, 4)
+    assert "generator" not in kwargs and "generators" not in kwargs
+    assert torch.equal(codes, torch.tensor([[1, 2], [3, 4]]))
 
 
 def test_mtp_forward_uses_dispatched_graph_descriptor():
@@ -798,11 +943,14 @@ def test_steady_unseeded_mtp_replays_the_resolved_graph_entry():
         assert emb is output[0] and codes is output[1]
         assert runner.calls == 1 and state._mtp_state._mtp_replays == {2: (4, entry)}
         state._mtp_state._mtp_sample_uniforms.zero_()
+        prepare_uniforms = MagicMock(wraps=state._mtp_state._prepare_mtp_sample_uniforms)
+        state._mtp_state._prepare_mtp_sample_uniforms = prepare_uniforms
         # Same size, unseeded rows: the entry replays without the wrapper; the
         # padded rows draw fresh noise as the wrapper path does.
         assert state._mtp_state._mtp_forward([0, 1], *inputs, lambda bsz: graph_desc, req_ids=["r0", "r1"]) is output
         assert runner.calls == 1 and entry.cudagraph.replay.call_count == 2
         assert (state._mtp_state._mtp_sample_uniforms > 0).all()
+        prepare_uniforms.assert_called_once_with([None, None], 4)
         # A row new this step resolves its generator in place and keeps the replay.
         _fill_buffers(state, "r0", "r3")
         state._mtp_state._mtp_forward([0, 1], *inputs, lambda bsz: graph_desc, req_ids=["r0", "r3"])
@@ -856,8 +1004,14 @@ def test_rope_shim_constructs_sequential_mrope_state():
     assert rope.prefill_positions._staged_write_indices == [3, 4, 5]
     # The pin's StagedWriteTensor keeps ndarray staged rows by reference in
     # _staged_write_chunks instead of extending _staged_write_contents.
+    # With UVA available, omni's staged-write shim replaces stage_write and
+    # stages the same rows as a list of ndarrays in _staged_write_contents,
+    # leaving _staged_write_chunks empty. Accept either representation.
     staged = rope.prefill_positions._staged_write_chunks
-    assert [np.asarray(chunk).tolist() for chunk in staged] == [[0, 1, 2, 3]] * 3
+    if not staged:
+        contents = rope.prefill_positions._staged_write_contents
+        staged = contents if isinstance(contents, list) else [contents]
+    assert [np.asarray(chunk).reshape(-1).tolist() for chunk in staged] == [[0, 1, 2, 3]] * 3
 
 
 @pytest.mark.parametrize("output_key", [None, ("only_one",)])

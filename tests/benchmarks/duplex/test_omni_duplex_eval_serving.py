@@ -21,6 +21,7 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 from tests.helpers.assertions import assert_duplex_artifact_publication
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_runner as runner
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_serving as adapter
+from vllm_omni.benchmarks.metrics.metrics import _build_stage_metrics_from_outputs
 from vllm_omni.benchmarks.patch import patch
 from vllm_omni.entrypoints.cli.benchmark.cli_args import preprocess_serve_args
 from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
@@ -277,6 +278,7 @@ def test_evaluation_requires_a_judge_model(tmp_path):
     [
         ("--duplex-eval-judge-timeout-s", "nan"),
         ("--duplex-eval-judge-fps", "0"),
+        ("--duplex-eval-judge-frame-max-side", "-1"),
         ("--duplex-eval-window-size", "-1"),
         ("--duplex-eval-eval-workers", "0"),
     ],
@@ -286,7 +288,10 @@ def test_evaluation_rejects_invalid_options(tmp_path, option, value):
         _args(tmp_path, option, value)
 
 
-def test_evaluation_reuses_selected_samples_and_existing_scores(tmp_path, prepared, monkeypatch):
+@pytest.mark.parametrize("frame_limit,expected_max_side", [(None, 1920), ("768", 768), ("0", None)])
+def test_evaluation_reuses_selected_samples_and_existing_scores(
+    tmp_path, prepared, monkeypatch, frame_limit, expected_max_side
+):
     args = _args(
         tmp_path,
         "--duplex-eval-evaluate",
@@ -304,6 +309,7 @@ def test_evaluation_reuses_selected_samples_and_existing_scores(tmp_path, prepar
         "0.5",
         "--duplex-eval-eval-workers",
         "2",
+        *([] if frame_limit is None else ["--duplex-eval-judge-frame-max-side", frame_limit]),
     )
     preprocess_serve_args(args)
     samples = patch.get_samples(args, None)
@@ -321,7 +327,18 @@ def test_evaluation_reuses_selected_samples_and_existing_scores(tmp_path, prepar
     output.duplex_eval_result = _result(samples[0])
     summary = adapter.finalize_duplex_eval(samples, [output])
     accuracy = summary["accuracy"]
-    assert observed == [("1", 0.5, {"judge_fps": 3, "judge_video_mode": "frame-sample", "window_size": 12.0})]
+    assert observed == [
+        (
+            "1",
+            0.5,
+            {
+                "judge_fps": 3,
+                "judge_video_mode": "frame-sample",
+                "judge_frame_max_side": expected_max_side,
+                "window_size": 12.0,
+            },
+        )
+    ]
     assert accuracy["status"] == "completed" and accuracy["evaluated"] == accuracy["total"] == 1
     score_root = Path(accuracy["score_root"])
     assert not (score_root / "PR_correction/0.json").exists()
@@ -1273,3 +1290,46 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
         else:
             assert accuracy["failed"] == 2 and "pr" not in accuracy
         assert "Omni-DuplexEval accuracy:" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("success", [False, True])
+async def test_adapter_retains_each_response_for_stage_aggregation(tmp_path, prepared, monkeypatch, success):
+    sample = _samples(tmp_path)[0]
+    rows = [
+        {
+            "response_id": f"r{index}",
+            "stage_metrics": {
+                "0": {
+                    "final_output_type": "text",
+                    "num_tokens_out": tokens,
+                    "stage_gen_time_ms": 10.0 * tokens,
+                },
+                "1": {"output_unit_type": "stream", "stage_gen_time_ms": 5.0 * tokens},
+            },
+        }
+        for index, tokens in enumerate((2, 3))
+    ]
+    result = replace(
+        _result(sample),
+        request_metrics=rows,
+        output_tokens=5,
+        metadata={"response_done": success},
+        error="" if success else "session failed",
+    )
+
+    async def generate(*args, **kwargs):
+        return result
+
+    monkeypatch.setattr(runner, "generate_sample", generate)
+    output = await patch.async_request_openai_realtime_duplex(_request(sample), session=None)
+    assert output.success is success
+    assert output.stage_metrics_by_response == {row["response_id"]: row["stage_metrics"] for row in rows}
+    stages = _build_stage_metrics_from_outputs([output])
+    if success:
+        assert [stage.stage_id for stage in stages] == [0, 1]
+        assert stages[0].total_output == 5
+        assert stages[0].stage_gen_times_ms == [20.0, 30.0]
+        assert stages[1].stage_gen_times_ms == [10.0, 15.0]
+    else:
+        assert stages == []

@@ -190,6 +190,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         super().__init__()
         from vllm_omni.platforms import current_omni_platform
 
+        # The NPU platform must finish initialization before patching the Talker.
+        if current_omni_platform.is_npu():
+            from vllm_omni.platforms.npu.models.qwen3_tts import apply_qwen3_tts_patches
+
+            apply_qwen3_tts_patches()
+
         if (
             current_omni_platform.is_npu()
             and not getattr(vllm_config.model_config, "use_v2_model_runner", False)

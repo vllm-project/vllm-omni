@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Launch vLLM-Omni server for higgs-audio v3.
 #
 # Supports plain text TTS and voice cloning via /v1/audio/speech.
@@ -20,6 +23,14 @@ echo "  MODEL=$MODEL"
 echo "  PORT=$PORT"
 echo "  CUDA_VISIBLE_DEVICES=$GPUS"
 
+stage_overrides=$(python3 -c '
+import json
+import sys
+
+gpu_util = float(sys.argv[1])
+print(json.dumps({"0": {"gpu_memory_utilization": gpu_util}}))
+' "$GPU_UTIL")
+
 CUDA_VISIBLE_DEVICES="$GPUS" \
 VLLM_USE_DEEP_GEMM=0 \
 VLLM_MOE_USE_DEEP_GEMM=0 \
@@ -27,6 +38,6 @@ vllm-omni serve "$MODEL" \
     --deploy-config vllm_omni/deploy/higgs_multimodal_qwen3.yaml \
     --host 0.0.0.0 \
     --port "$PORT" \
-    --gpu-memory-utilization "$GPU_UTIL" \
+    --stage-overrides "$stage_overrides" \
     --trust-remote-code \
     --omni

@@ -30,6 +30,32 @@ def test_all_configured_baseline_metrics_have_a_direction() -> None:
         assert isinstance(metric_lower_is_better(name), bool), name
 
 
+def test_baseline_confirmation_policies_reference_existing_metrics() -> None:
+    for config_path in sorted(Path(__file__).parent.glob("*.json")):
+        configs = json.loads(config_path.read_text(encoding="utf-8"))
+        for config in configs:
+            for params in config.get("benchmark_params", []):
+                policies = params.get("baseline_confirmation", {})
+                assert isinstance(policies, dict), f"{config_path}: baseline_confirmation must be a hardware map"
+                for hardware, policy in policies.items():
+                    assert isinstance(policy, dict), f"{config_path}: invalid {hardware} confirmation policy"
+                    metrics = policy.get("metrics")
+                    attempts = policy.get("attempts", 3)
+                    assert (
+                        isinstance(metrics, list) and metrics and all(isinstance(metric, str) for metric in metrics)
+                    ), f"{config_path}: {hardware} confirmation metrics must be a non-empty string list"
+                    assert isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 2, (
+                        f"{config_path}: {hardware} confirmation attempts must be at least 2"
+                    )
+                    bucket = params.get("baseline", {}).get(hardware)
+                    assert isinstance(bucket, dict) and bucket, (
+                        f"{config_path}: {hardware} confirmation requires a non-empty baseline bucket"
+                    )
+                    assert set(metrics) <= set(bucket), (
+                        f"{config_path}: {hardware} confirmation metrics must remain blocking baseline metrics"
+                    )
+
+
 def test_unknown_metric_direction_is_rejected() -> None:
     with pytest.raises(ValueError, match="no regression direction"):
         metric_lower_is_better("custom_score")
@@ -169,6 +195,25 @@ def test_omni_assert_result_uses_resolved_baseline_only_when_enabled() -> None:
         assert_result(result, params, 1, check_baseline=True)
     result.pop("baseline")
     assert_result(result, params, 1, check_baseline=True)
+
+
+def test_omni_assert_result_finishes_nonbaseline_validation_before_reporting_regression() -> None:
+    from tests.dfx.conftest import PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = {
+        "completed": 1,
+        "Hardware": "H100",
+        "request_throughput": 0.7,
+        "baseline": {"H100": {"request_throughput": 1.0}},
+    }
+    params = {"expected_duplex_audio_turns_per_session": 2}
+    with pytest.raises(AssertionError, match="Duplex session metrics are missing"):
+        assert_result(result, params, 1, check_baseline=True)
+
+    result["duplex_session_metrics"] = [{"audio_turn_count": 2}]
+    with pytest.raises(PerformanceBaselineRegressionError, match="request_throughput"):
+        assert_result(result, params, 1, check_baseline=True)
 
 
 def test_diffusion_assert_result_checks_named_hardware_only_when_enabled() -> None:
