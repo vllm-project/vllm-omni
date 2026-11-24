@@ -199,7 +199,7 @@ from .packed_tokens import (
     minimax_h3_unpack_audio_tokens,
     minimax_h3_unpatchify_video_tokens,
 )
-from .pdd_lora import load_minimax_h3_pdd_lora
+from .pdd_lora import PDDSpec, load_minimax_h3_pdd_lora
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
 from .reference_isolation import reference_isolation_enabled
 from .regenerate import (
@@ -803,6 +803,13 @@ class MiniMaxH3Pipeline(
         if getattr(od_config, "step_execution", False):
             # The heads are bound to the DiT for one request at a time.
             modes.append("step execution")
+        if getattr(od_config, "lora_application", "runtime") == "merged":
+            # A merged adapter has no request to bind its heads for.
+            modes.append("--lora-application merged")
+        cache_backend = str(getattr(od_config, "cache_backend", None) or "none").lower()
+        if cache_backend not in ("none", "cache_dit"):
+            # TeaCache replays the final layer without the step that selects a head.
+            modes.append(f"--cache-backend {cache_backend}")
         pdd_loaded = load_minimax_h3_pdd_lora(
             partition=self.partition,
             lora_request=lora_request,
@@ -842,7 +849,11 @@ class MiniMaxH3Pipeline(
             unsupported_offload_mode=" or ".join(offload_modes) or None,
         )
         # A few-step adapter in the native layout loads like any other; its name still pins how it samples.
-        pika_spec = parse_pika_turbo_filename(Path(lora_path).name)
+        adapter_file = Path(lora_path)
+        if adapter_file.is_dir():
+            files = sorted(adapter_file.glob("*.safetensors"))
+            adapter_file = files[0] if len(files) == 1 else adapter_file
+        pika_spec = parse_pika_turbo_filename(adapter_file.name)
         if loaded is not None and pika_spec is not None:
             served = "ref2v" if self.partition == "ref2va" else "fl2v"
             if self.partition == "combined" or pika_spec.task_family != served:
@@ -1014,6 +1025,25 @@ class MiniMaxH3Pipeline(
         if not math.isclose(audio_shift, spec.audio_shift):
             raise OmniClientError(f"{spec.filename} requires audio_flow_shift={spec.audio_shift:g}")
 
+    def _validate_pdd_sampling(self, sampling: Any, spec: PDDSpec) -> None:
+        """Hold a request to what a PDD adapter's fused heads were built for.
+
+        Head ``k`` is the mean velocity of block ``k`` of the full schedule, so it is
+        only right for the ``k``-th Euler step of that schedule with the LoRA at full strength.
+        """
+
+        extra = sampling.extra_args or {}
+        for request, scale in filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale):
+            if self._turbo_lora_specs.get(request.lora_int_id) is spec and scale != 1.0:
+                raise OmniClientError(f"{spec.filename} requires lora scale=1.0: its output heads cannot be scaled")
+        sampler = resolve_sampler_name(extra.get("sampler"))
+        if sampler != "euler":
+            raise OmniClientError(
+                f"{spec.filename} requires sampler='euler': its heads predict a block's mean velocity, got {sampler!r}"
+            )
+        if self._resolve_latent_refine(extra) is not None:
+            raise OmniClientError(f"{spec.filename} does not support partial-schedule latent refinement")
+
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""
 
@@ -1117,11 +1147,13 @@ class MiniMaxH3Pipeline(
                 or resolve_offload(od_config).strategy is not OffloadStrategy.NONE
                 or od_config.host_weight_runtime_mode != "disabled"
                 or od_config.cache_backend not in (None, "none")
+                # Reference-KV offload compacts reference rows during the loop; the branch needs every row.
+                or getattr(od_config, "kv_offload_config", None)
             )
             if unsupported:
                 raise ValueError(
                     "H3 control requires request mode, local VAE encoding, dense weights, "
-                    "and no cache/offload/SP/HSDP; TP is supported"
+                    "and no cache/offload/SP/HSDP or reference-KV offload; TP is supported"
                 )
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_lora_specs: dict[int, NativeDistilledLoRASpec] = {}
@@ -3629,6 +3661,8 @@ class MiniMaxH3Pipeline(
             )
         if turbo_spec is not None:
             self._validate_turbo_sampling(sampling, turbo_spec)
+        if isinstance(turbo_spec, PDDSpec):
+            self._validate_pdd_sampling(sampling, turbo_spec)
         if native_spec is not None:
             self._validate_native_sampling(sampling, task=task)
         if self._fasth3_checkpoint is not None:

@@ -915,7 +915,8 @@ approximate cache acceleration and quantized control execution require separate 
 this configuration. The branch hints the task its DiT serves: an FL2VA server (`--task-type fl2va`) takes control on
 T2VA requests without references, and a Ref2VA server (`--task-type ref2va`) takes it on Ref2VA requests with their
 reference images, as the FastH3 Omni checkpoint does; see [FastH3 Omni control](../FastVideo/FastH3-Omni.md#controlnet).
-Reference rows receive no hint. A combined server has two DiTs and one branch, so it is refused at startup.
+Reference rows receive no hint. A combined server has two DiTs and one branch, so it is refused at startup, and so
+is reference-KV offload (`kv_offload_config`), which compacts reference rows during the loop.
 Control/Turbo combinations need their own validation and are not established by ordinary H3 Turbo results.
 
 Active control conditioning cannot be reused in a `latent_refine` pass at a
@@ -1808,7 +1809,8 @@ files carry no metadata; as with Turbo, the filename is the contract and must no
 | `pika_h3_flex_turbo_<n>step[_draft\|_hd]_ref2va[_lite_r32].safetensors` | `--task-type ref2va` | `n` | 12 |
 | `pika_h3_flex_turbo_<n>step[_hd]_fl2va[_lite_r32].safetensors` | `--task-type fl2va` | `n` | 6 |
 
-`audio_flow_shift` is `3.0`. A request with another step count or shift is rejected. The full files are rank 768 on
+`audio_flow_shift` is `3.0`. A request with another step count or shift is rejected, whether `lora.path` names the
+file or a directory holding only that file. The full files are rank 768 on
 the packed QKV projection, which sets the per-layer LoRA buffer rank to 768 for the whole server; the `_lite_r32`
 files stay at rank 96.
 
@@ -1825,8 +1827,10 @@ hf download alibaba-pai/MiniMax-H3-Acc-LoRAs MiniMax-H3-Ref2VA-Acc-8Step.safeten
 
 Start a `--task-type ref2va` server with `--lora-backend peft` (`--task-type fl2va` for
 `MiniMax-H3-FL2VA-Acc-8Step.safetensors`) and send `num_inference_steps=8` with the base model's shifts
-(`flow_shift=12`, `audio_flow_shift=3`) and the adapter in `lora` at `scale=1.0`. A combined server and step
-execution are refused: the heads belong to one DiT and are bound for one request at a time.
+(`flow_shift=12`, `audio_flow_shift=3`) and the adapter in `lora` at `scale=1.0`. Each head is the mean velocity
+of one block of that schedule, so a request with another scale, a sampler other than `euler`, or `latent_refine` is
+rejected. The adapter is refused at load on a combined server and with step execution, `--lora-application merged`
+or `--cache-backend tea_cache`: the heads belong to one DiT and are bound for one request at a time.
 
 ### Conditioning features with adapters
 

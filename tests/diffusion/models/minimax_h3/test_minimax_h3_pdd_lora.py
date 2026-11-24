@@ -206,3 +206,67 @@ def test_probing_skips_files_it_cannot_read(adapter, tmp_path):
     (tmp_path / "truncated.safetensors").write_bytes(b"\x10\x00\x00\x00\x00\x00\x00\x00{")
     assert _load(tmp_path) is None
     assert _load(tmp_path / "truncated.safetensors") is None
+
+
+def _serving_pipeline(**od_config):
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "ref2va"
+    pipeline.od_config = SimpleNamespace(**{"additional_config": {}, "step_execution": False, **od_config})
+    pipeline._turbo_lora_specs = {}
+    pipeline._native_lora_specs = {}
+    return pipeline
+
+
+def _pipeline_load(pipeline, path):
+    return pipeline._load_diffusion_lora_adapter(
+        lora_request=LoRARequest("pdd", 1, str(path)), lora_path=path, dtype=torch.float32
+    )
+
+
+def test_pipeline_holds_a_pdd_adapter_to_its_contract_like_a_turbo_artifact(adapter):
+    pipeline = _serving_pipeline()
+    lora_model, _ = _pipeline_load(pipeline, adapter[0])
+    spec = pipeline._turbo_lora_specs[1]
+    assert isinstance(spec, PDDSpec) and (spec.video_shift, spec.audio_shift) == (12.0, 3.0)
+    assert "blocks.0.adaln_proj.linear" in lora_model.loras
+
+
+@pytest.mark.parametrize(
+    ("od_config", "mode"),
+    [
+        ({"step_execution": True}, "step execution"),
+        ({"lora_application": "merged"}, "--lora-application merged"),
+        ({"cache_backend": "tea_cache"}, "--cache-backend tea_cache"),
+    ],
+)
+def test_pipeline_refuses_a_pdd_adapter_where_its_heads_cannot_be_bound(adapter, od_config, mode):
+    pipeline = _serving_pipeline(**od_config)
+    with pytest.raises(ValueError, match=f"PDD adapters do not support {mode}"):
+        _pipeline_load(pipeline, adapter[0])
+    assert pipeline._turbo_lora_specs == {}
+
+
+@pytest.mark.parametrize(
+    ("request_fields", "message"),
+    [
+        ({"lora_scale": 0.5}, "requires lora scale=1.0"),
+        ({"extra_args": {"sampler": "heun"}}, "requires sampler='euler'"),
+        ({"extra_args": {"latent_refine": 0.5}}, "partial-schedule latent refinement"),
+    ],
+)
+def test_requests_that_leave_the_fused_schedule_are_rejected(request_fields, message):
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _serving_pipeline()
+    spec = PDDSpec(
+        "a.safetensors", "ref2v", 8, 12.0, 3.0, 64, 64.0, pdd_heads={"video_out.weight": torch.zeros(8, 1, 1)}
+    )
+    pipeline._turbo_lora_specs = {1: spec}
+    sampling = SimpleNamespace(
+        **{"lora_request": LoRARequest("pdd", 1, "/models/pdd"), "lora_scale": 1.0, "extra_args": {}, **request_fields}
+    )
+    with pytest.raises(OmniClientError, match=message):
+        pipeline._validate_pdd_sampling(sampling, spec)
+    sampling = SimpleNamespace(lora_request=LoRARequest("pdd", 1, "/models/pdd"), lora_scale=1.0, extra_args={})
+    pipeline._validate_pdd_sampling(sampling, spec)

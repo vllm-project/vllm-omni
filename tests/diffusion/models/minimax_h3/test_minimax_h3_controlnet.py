@@ -480,6 +480,14 @@ def test_startup_rejects_public_and_legacy_offload(control_startup, offload):
         pipeline_module.MiniMaxH3Pipeline(od_config=config)
 
 
+def test_startup_rejects_reference_kv_offload(control_startup):
+    """Reference rows are compacted during the loop; the control branch needs every row."""
+    pipeline_module, config = control_startup
+    config.kv_offload_config = {"enabled": True}
+    with pytest.raises(ValueError, match="reference-KV offload"):
+        pipeline_module.MiniMaxH3Pipeline(od_config=config)
+
+
 def test_control_rejects_a_combined_server_before_loading(control_startup, monkeypatch):
     pipeline_module, config = control_startup
     monkeypatch.setattr(pipeline_module, "_minimax_h3_partition_for_task", lambda *args: "combined")

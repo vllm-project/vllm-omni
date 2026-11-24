@@ -2605,3 +2605,33 @@ def test_lora_manager_holds_ranks_above_the_vllm_literal(monkeypatch, rank, buff
     assert (config.max_lora_rank, config.max_loras) == (buffer_rank, 1)
     # Ranks vLLM names are passed through unchanged.
     assert manager._lora_config(64, lora_dtype=torch.bfloat16).max_lora_rank == 64
+
+
+def test_failed_buffer_growth_restores_the_previous_rank():
+    """A growth that fails partway must not leave layers at two ranks or the manager at the new one."""
+
+    class _Layer:
+        def __init__(self, fail_above: int | None = None):
+            self.rank, self.fail_above = 64, fail_above
+
+        def create_lora_weights(self, max_loras, lora_config, model_config=None):
+            if self.fail_above is not None and lora_config.max_lora_rank > self.fail_above:
+                raise torch.OutOfMemoryError("buffer allocation failed")
+            self.rank = lora_config.max_lora_rank
+
+    manager = DiffusionLoRAManager(pipeline=torch.nn.Module(), device=torch.device("cpu"), dtype=torch.bfloat16)
+    manager._max_lora_rank = 64
+    first, second = _Layer(), _Layer(fail_above=64)
+    manager._lora_modules = {"transformer.a": first, "transformer.b": second}
+    manager._active_adapter_id = 7
+
+    with pytest.raises(torch.OutOfMemoryError):
+        manager._ensure_max_lora_rank(768)
+    assert manager._max_lora_rank == 64
+    assert (first.rank, second.rank) == (64, 64)
+    # The buffers were reset, so nothing is uploaded any more.
+    assert manager._active_adapter_id is None
+
+    second.fail_above = None
+    manager._ensure_max_lora_rank(768)
+    assert (manager._max_lora_rank, first.rank, second.rank) == (768, 768, 768)

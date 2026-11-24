@@ -596,7 +596,13 @@ class LoRAManager:
         self._evict_for_new_adapter()
         self._registered_adapters[composed_id] = composed_model
         self._touch_adapter_info(composed_id)
-        self._replace_layers_with_lora(peft_helper)
+        try:
+            self._replace_layers_with_lora(peft_helper)
+        except Exception:
+            # As in add_adapter: a stack the buffers cannot hold must not stay cached.
+            self._registered_adapters.pop(composed_id, None)
+            self._adapter_access_order.pop(composed_id, None)
+            raise
 
         self._composed_adapters[key] = composed_id
         self._composed_adapters.move_to_end(key)
@@ -1175,18 +1181,33 @@ class LoRAManager:
         valid_max_rank = self._get_smallest_valid_max_rank(min_rank)
 
         logger.info("Increasing max LoRA rank: %d -> %d", self._max_lora_rank, valid_max_rank)
+        previous_rank = self._max_lora_rank
         self._max_lora_rank = valid_max_rank
         self._moe_punica_wrapper = None
 
         if not self._lora_modules:
             return
 
-        lora_config = self._buffer_lora_config()
-
         # Recreate per-layer buffers with the new maximum rank. The previous
         # upload is gone, so nothing may be re-armed afterwards.
-        for lora_layer in self._lora_modules.values():
-            lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+        try:
+            lora_config = self._buffer_lora_config()
+            for lora_layer in self._lora_modules.values():
+                lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+        except Exception:
+            # A growth that fails partway (an allocation at rank 768 or 1024 can)
+            # leaves layers at two ranks. Put every layer back at the previous
+            # rank, with nothing uploaded, so a retry grows again from a
+            # consistent state instead of binding into the old buffers.
+            self._max_lora_rank = previous_rank
+            self._suspended_adapter_id = None
+            self._active_adapter_id = None
+            if previous_rank > 0:
+                lora_config = self._buffer_lora_config()
+                for lora_layer in self._lora_modules.values():
+                    lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+            invalidate_denoise_graphs("LoRA buffer growth failed")
+            raise
         self._suspended_adapter_id = None
         invalidate_denoise_graphs("LoRA buffers reallocated")
 
