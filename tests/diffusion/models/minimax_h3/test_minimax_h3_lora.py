@@ -704,13 +704,14 @@ def test_h3_turbo_loads_the_eight_step_v1_2_layout(tmp_path):
     assert re.search(pattern, "transformer.controlnet.blocks.0.adaln_proj.linear") is None
 
 
-def test_h3_turbo_v1_1_eight_step_and_v1_3_four_step_run_at_the_base_flow_shift():
-    """The later 768p retrains also run at shift 12, not the 768p default 6."""
+def test_h3_turbo_v1_1_eight_step_and_v1_3_four_step_use_the_768p_default_flow_shift():
+    """These artifacts follow the 768p default 6/3 contract."""
     v11 = _spec("minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors")
     v13 = _spec("minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetensors")
-    assert (v11.denoise_steps, v11.video_shift, v11.audio_shift) == (8, 12.0, 3.0)
-    assert (v13.denoise_steps, v13.video_shift, v13.audio_shift) == (4, 12.0, 3.0)
-    # Older 768p artifacts keep the short shift their version implies.
+    assert (v11.denoise_steps, v11.video_shift, v11.audio_shift) == (8, 6.0, 3.0)
+    assert (v13.denoise_steps, v13.video_shift, v13.audio_shift) == (4, 6.0, 3.0)
+    # v1.2 8-step remains the exception at the base model's shift.
+    assert _spec("minimax_h3_fl2v_turbo_8step_v1.2_768p_bf16.safetensors").video_shift == 12.0
     assert _spec("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors").video_shift == 6.0
     assert _spec("minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors").video_shift == 6.0
 

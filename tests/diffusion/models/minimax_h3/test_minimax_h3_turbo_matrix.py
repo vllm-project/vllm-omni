@@ -27,12 +27,11 @@ PUBLISHED = [
     ("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_768P),
     ("minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_768P),
     ("minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_768P),
-    # The later v1.3 retrain and the v1.1 eight-step artifact kept the base
-    # model's shift instead of the 768p short-shift default.
-    ("minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetensors", "fl2v", 4, 12.0),
+    # v1.3 4-step and v1.1 8-step follow the 768p default of 6.0.
+    ("minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_768P),
     ("minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors", "fl2v", 8, _TURBO_VIDEO_SHIFT_544P),
     ("minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors", "fl2v", 8, _TURBO_VIDEO_SHIFT_768P),
-    ("minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors", "fl2v", 8, 12.0),
+    ("minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors", "fl2v", 8, _TURBO_VIDEO_SHIFT_768P),
     ("minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors", "ref2v", 4, _TURBO_VIDEO_SHIFT_544P),
     ("minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors", "ref2v", 8, _TURBO_VIDEO_SHIFT_768P),
 ]
