@@ -1658,7 +1658,10 @@ what forcing* — the two surfaces this contract adds.
   (request/reply on the session's outbox, so a concurrent `events()` consumer
   is unaffected) and `DuplexOmni.collect_action_records(session_id)` after
   close. Wire: `session.action_records.get` → `session.action.records`
-  (Tier 3; see the [serving guide](../serving/realtime_duplex_api.md)).
+  (Tier 3; see the [serving guide](../serving/realtime_duplex_api.md)). The
+  wire reaches the ledger's one-set retention window only: a scope the
+  session already spilled is retrievable post-close through
+  `DuplexOmni.collect_action_records`, not through the socket.
 - **Weight-sync fence.** A session that appended data depends on the weights
   it sampled under: `DuplexOmni.start_weight_update` / `add_lora` reject with
   `weight_sync_sessions_open` while any such session is open (session open
@@ -1673,4 +1676,9 @@ an independent recomputation at CPU scale
 (`tests/model_executor/models/minicpmo_4_5/test_duplex_action_capture.py`) and
 at engine scale on GPU CI
 (`tests/e2e/online_serving/test_minicpmo_4_5_duplex_action_capture.py`).
+The e2e server subprocess runs with the repository root as its working
+directory (`tests/helpers/runtime.py`), so the checkout's `vllm_omni`
+package shadows any installed one: an engine change under test must be in
+the checkout, and a mirrored edit under `site-packages` is not what the
+test runs.
 Other duplex models adopt through per-model follow-ups without engine changes.
