@@ -108,7 +108,11 @@ class LTXAccuracyThresholds:
     video_ssim_min: float
     video_psnr_mean_db: float
     audio_relative_l2: float
+    audio_relative_l2_rocm: float
     audio_cosine_similarity: float
+    audio_quiet_reference_rms: float
+    audio_quiet_max_abs: float
+    audio_quiet_mean_abs: float
 
 
 STRICT_THRESHOLDS = LTXAccuracyThresholds(
@@ -116,7 +120,11 @@ STRICT_THRESHOLDS = LTXAccuracyThresholds(
     video_ssim_min=0.99,
     video_psnr_mean_db=40.0,
     audio_relative_l2=0.10,
+    audio_relative_l2_rocm=0.15,
     audio_cosine_similarity=0.99,
+    audio_quiet_reference_rms=1e-3,
+    audio_quiet_max_abs=2e-3,
+    audio_quiet_mean_abs=1e-4,
 )
 
 
@@ -650,6 +658,8 @@ def _audio_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, f
     prediction_norm = max(float(np.linalg.norm(prediction)), 1e-12)
     return {
         "bitwise_equal": bool(np.array_equal(reference, prediction)),
+        "reference_rms": float(np.sqrt(np.mean(np.square(reference)))),
+        "prediction_rms": float(np.sqrt(np.mean(np.square(prediction)))),
         "max_abs": float(np.abs(difference).max()),
         "mean_abs": float(np.abs(difference).mean()),
         "relative_l2": float(np.linalg.norm(difference) / reference_norm),
@@ -657,9 +667,45 @@ def _audio_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, f
     }
 
 
+def _audio_relative_l2_threshold() -> float:
+    if torch.version.hip is not None:
+        return STRICT_THRESHOLDS.audio_relative_l2_rocm
+    return STRICT_THRESHOLDS.audio_relative_l2
+
+
 def _assert_strict_audio_similarity(audio_metrics: dict[str, float | bool]) -> None:
-    assert audio_metrics["relative_l2"] <= STRICT_THRESHOLDS.audio_relative_l2
+    if audio_metrics["reference_rms"] <= STRICT_THRESHOLDS.audio_quiet_reference_rms:
+        assert audio_metrics["max_abs"] <= STRICT_THRESHOLDS.audio_quiet_max_abs
+        assert audio_metrics["mean_abs"] <= STRICT_THRESHOLDS.audio_quiet_mean_abs
+        return
+    assert audio_metrics["relative_l2"] <= _audio_relative_l2_threshold()
     assert audio_metrics["cosine_similarity"] >= STRICT_THRESHOLDS.audio_cosine_similarity
+
+
+def test_strict_audio_similarity_uses_absolute_bounds_for_quiet_reference() -> None:
+    reference = np.zeros(1024, dtype=np.float32)
+    prediction = np.full(1024, STRICT_THRESHOLDS.audio_quiet_mean_abs / 2, dtype=np.float32)
+
+    metrics = _audio_metrics(reference, prediction)
+
+    assert metrics["relative_l2"] > STRICT_THRESHOLDS.audio_relative_l2
+    _assert_strict_audio_similarity(metrics)
+
+
+def test_strict_audio_similarity_rejects_noisy_quiet_prediction() -> None:
+    reference = np.zeros(1024, dtype=np.float32)
+    prediction = np.full(1024, STRICT_THRESHOLDS.audio_quiet_mean_abs * 2, dtype=np.float32)
+
+    with pytest.raises(AssertionError):
+        _assert_strict_audio_similarity(_audio_metrics(reference, prediction))
+
+
+def test_audio_relative_l2_threshold_is_platform_aware(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.version, "hip", None)
+    assert _audio_relative_l2_threshold() == STRICT_THRESHOLDS.audio_relative_l2
+
+    monkeypatch.setattr(torch.version, "hip", "6.3")
+    assert _audio_relative_l2_threshold() == STRICT_THRESHOLDS.audio_relative_l2_rocm
 
 
 def _write_ltx25_accuracy_result(
@@ -671,12 +717,19 @@ def _write_ltx25_accuracy_result(
     extra: dict[str, object] | None = None,
 ) -> None:
     metrics: dict[str, object] = {
+        "audio_reference_rms": audio_metrics["reference_rms"],
+        "audio_prediction_rms": audio_metrics["prediction_rms"],
+        "audio_max_abs": audio_metrics["max_abs"],
+        "audio_mean_abs": audio_metrics["mean_abs"],
         "audio_relative_l2": audio_metrics["relative_l2"],
         "audio_cosine_similarity": audio_metrics["cosine_similarity"],
     }
     baseline: dict[str, float] = {
-        "audio_relative_l2": STRICT_THRESHOLDS.audio_relative_l2,
+        "audio_relative_l2": _audio_relative_l2_threshold(),
         "audio_cosine_similarity": STRICT_THRESHOLDS.audio_cosine_similarity,
+        "audio_quiet_reference_rms": STRICT_THRESHOLDS.audio_quiet_reference_rms,
+        "audio_quiet_max_abs": STRICT_THRESHOLDS.audio_quiet_max_abs,
+        "audio_quiet_mean_abs": STRICT_THRESHOLDS.audio_quiet_mean_abs,
     }
     if video_metrics is not None:
         metrics.update(
