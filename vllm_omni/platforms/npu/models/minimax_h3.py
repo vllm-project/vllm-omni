@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
 from importlib.util import find_spec
 from pathlib import Path
 from types import MethodType
@@ -124,16 +123,8 @@ def apply_minimax_h3_qwen3vl_swiglu_patch() -> None:
     _SWIGLU_PATCHED = True
 
 
-def _matches_int8_swiglu_inputs(inputs: list[dict[str, object]]) -> bool:
-    return (
-        inputs[0]["dtype"] == inputs[1]["dtype"] == "int8"
-        and inputs[1]["format"] == "ND"
-        and inputs[2]["dtype"] == "float32"
-    )
-
-
 def _has_eagle_kernel(
-    kernels: Path, registration: object, matches_inputs: Callable[[list[dict[str, object]]], bool]
+    kernels: Path, registration: object, *input_dtypes: str, weight_format: str | None = None
 ) -> bool:
     binaries = registration.get("binaryList") if isinstance(registration, dict) else None
     if not isinstance(binaries, list):
@@ -143,7 +134,12 @@ def _has_eagle_kernel(
             if not (kernels / entry["binPath"]).is_file():
                 continue
             descriptor = json.loads((kernels / entry["jsonPath"]).read_text(encoding="utf-8"))["supportInfo"]
-            if descriptor["outputs"][0]["dtype"] == "bfloat16" and matches_inputs(descriptor["inputs"]):
+            inputs = descriptor["inputs"]
+            if (
+                descriptor["outputs"][0]["dtype"] == "bfloat16"
+                and all(inputs[i]["dtype"] == dtype for i, dtype in enumerate(input_dtypes))
+                and (weight_format is None or inputs[1]["format"] == weight_format)
+            ):
                 return True
         except (OSError, ValueError, TypeError, KeyError, IndexError):
             continue
@@ -249,13 +245,11 @@ def apply_minimax_h3_dit_fusions(model: torch.nn.Module, early_opp_paths: frozen
         return
     if not isinstance(index, dict) or not isinstance(op_info, dict):
         return
-    use_qkv = _QKV in op_info and _has_eagle_kernel(
-        kernels, index.get(_QKV), lambda inputs: inputs[0]["dtype"] == "bfloat16"
-    )
+    use_qkv = _QKV in op_info and _has_eagle_kernel(kernels, index.get(_QKV), "bfloat16")
     use_swiglu = (
         soc == "ascend910b"
         and _SWIGLU in op_info
-        and _has_eagle_kernel(kernels, index.get(_SWIGLU), _matches_int8_swiglu_inputs)
+        and _has_eagle_kernel(kernels, index.get(_SWIGLU), "int8", "int8", "float32", weight_format="ND")
     )
     fp32 = torch.finfo(torch.float32)
     for module in model.modules():
