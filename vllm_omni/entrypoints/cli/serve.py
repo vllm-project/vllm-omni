@@ -1046,6 +1046,16 @@ class OmniServeCommand(CLISubcommand):
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
         )
         omni_config_group.add_argument(
+            "--vae-stack-tiles",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Decode a rank's VAE spatial tiles in batches of up to 7 (default). Currently only the "
+                "MiniMax-H3 video VAE reads this flag; other models ignore it. --no-vae-stack-tiles "
+                "decodes one tile at a time."
+            ),
+        )
+        omni_config_group.add_argument(
             "--vae-fast-path",
             choices=("off", "lossless", "channels_last"),
             default="lossless",
