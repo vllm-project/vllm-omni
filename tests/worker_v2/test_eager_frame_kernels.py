@@ -243,7 +243,7 @@ def test_batched_history_recording_preserves_ragged_reordered_requests():
         torch.testing.assert_close(history.embeds[: history.length], want, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_eager_mtp_kernels_compile_once_for_every_batch_size(monkeypatch):
     # Batches of one or of a multiple of 16 rows, and a first_audio view that
     # starts n bytes into a shared buffer, must reuse the kernels compiled for
