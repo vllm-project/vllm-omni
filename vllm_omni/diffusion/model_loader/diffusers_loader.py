@@ -18,7 +18,7 @@ from torch import nn
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     filter_files_not_needed_for_inference,
@@ -33,7 +33,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_skip_softmax_calibration
 from vllm_omni.diffusion.attention.layer import validate_attention_schedule_candidates
 from vllm_omni.diffusion.config import set_current_diffusion_config
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, requires_prefix_bf16_dlo
 from vllm_omni.diffusion.distributed.hsdp import (
     HSDPInferenceConfig,
     HSDPShardContext,
@@ -798,8 +798,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 dit_uses_allgather = dit_distributed_offload and resolved_offload.uses_allgather(DIT_COMPONENT)
                 tensor_parallel_size = int(self.parallel_config.tensor_parallel_size)
                 use_hsdp = bool(self.parallel_config.use_hsdp)
-                data_parallel_size = int(self.parallel_config.data_parallel_size)
-                sequence_parallel_size = int(self.parallel_config.sequence_parallel_size)
+                data_parallel_size = self.parallel_config.data_parallel_size or 1
+                sequence_parallel_size = self.parallel_config.sequence_parallel_size or 1
                 dlo_group_size = data_parallel_size if data_parallel_size > 1 else sequence_parallel_size
                 modules = ModuleDiscovery.discover(model)
                 plan = get_offload_plan(model)
@@ -1023,9 +1023,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
     def _unsupported_dlo_allgather_online_quant_methods(model: nn.Module) -> tuple[str, ...]:
         """Return unsupported online-quant methods for DLO AllGather.
 
-        Per-tensor online FP8, online INT8, online MXFP8, and the vLLM XPU
-        MXFP4 online method are safe after the ordinary loader has finalized
-        their weight and scale parameters.
+        Per-tensor online FP8, online INT8, online MXFP8, and online MXFP4
+        (NPU single-scale and vLLM XPU) methods are safe after the ordinary
+        loader has finalized their weight and scale parameters.
         DLO shards those runtime tensors by dtype and reconstructs their
         recorded shapes and strides before the kernel consumes them. They all
         keep plain transportable 1-byte dtypes over ordinary strided views:
@@ -1077,10 +1077,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
         try:
             from vllm_omni.quantization.mxfp4_config import (
+                NPUMxfp4OnlineLinearMethod,
                 VllmMxfp4OnlineLinearMethod,
             )
 
-            mxfp4_online_methods: tuple[type, ...] = (VllmMxfp4OnlineLinearMethod,)
+            mxfp4_online_methods: tuple[type, ...] = (
+                NPUMxfp4OnlineLinearMethod,
+                VllmMxfp4OnlineLinearMethod,
+            )
         except ImportError:
             # MXFP4 requires a vLLM build with Mxfp4OnlineLinearMethod support.
             mxfp4_online_methods = ()
@@ -1379,6 +1383,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     model = DiffusersAdapterPipeline(od_config=self.od_config, device=target_device)
                 else:
                     raise ValueError(f"Unknown load_format: {load_format}")
+        self._validate_prefix_bf16_offload_components(model)
         prepare_model_for_weight_reload(model, self.od_config, target_device)
         return model
 
@@ -1518,6 +1523,46 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         model = model.eval()
         self._attach_offload_startup_state(model)
         return model
+
+    def _validate_prefix_bf16_offload_components(self, model: nn.Module) -> None:
+        """Check actual quantized components before loading any checkpoint weights."""
+        if not isinstance(self.quant_config, QuantizationConfig) or not requires_prefix_bf16_dlo(self.quant_config):
+            return
+
+        def uses_dlo_prefix(module: nn.Module) -> bool:
+            return any(
+                requires_prefix_bf16_dlo(getattr(getattr(layer, "quant_method", None), "quant_config", None))
+                for layer in module.modules()
+            )
+
+        if not uses_dlo_prefix(model):
+            return
+
+        from vllm_omni.diffusion.offloader.base import OffloadConfig
+        from vllm_omni.diffusion.offloader.plan_resolver import resolve_offload_plan
+
+        config = OffloadConfig.from_od_config(self.od_config)
+        if config.strategy is not OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+            raise ValueError("prefix_bf16_master_mode='dlo' requires distributed layerwise offload")
+        resolved = resolve_offload_plan(model, config)
+        for component in resolved.components:
+            if not component.selected and uses_dlo_prefix(component.module):
+                raise ValueError(
+                    f"prefix_bf16_master_mode='dlo' requires distributed layerwise offload "
+                    f"for component {component.path!r}; include this component in diffusion_offload_config "
+                    "or use prefix_bf16_master_mode='cpu' or 'resident'"
+                )
+        selected_modules = {
+            id(layer) for component in resolved.components if component.selected for layer in component.module.modules()
+        }
+        for path, layer in model.named_modules():
+            quant_config = getattr(getattr(layer, "quant_method", None), "quant_config", None)
+            if id(layer) not in selected_modules and requires_prefix_bf16_dlo(quant_config):
+                raise ValueError(
+                    f"prefix_bf16_master_mode='dlo' for layer {path!r} requires a selected "
+                    "distributed layerwise offload component; declare and select its component, "
+                    "or use prefix_bf16_master_mode='cpu' or 'resident'"
+                )
 
     def _load_model_with_pre_sharded_hsdp(
         self,
