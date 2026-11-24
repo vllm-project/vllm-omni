@@ -73,7 +73,13 @@ class AdaLNWeightCache:
 
     def _fallback(self, reason: str, count: int, size: int) -> frozenset[int]:
         self.status = AdaLNCacheStatus(True, False, reason, count, size)
-        logger.warning("AdaLN cache disabled: %s; tensors=%d bytes=%d; using ordinary LO", reason, count, size)
+        logger.warning(
+            "AdaLN cache disabled: %s; tensors=%d bytes=%d; using ordinary LO",
+            reason,
+            count,
+            size,
+            extra={"cache_scope": "adaln", "tensor_count": count, "cache_bytes": size},
+        )
         return frozenset()
 
     def prepare(self, modules: Iterable[nn.Module], *, max_gib: float, reserve_gib: float) -> frozenset[int]:
@@ -133,7 +139,13 @@ class AdaLNWeightCache:
             return self._fallback("cache_allocation_or_copy_failed", len(tensors), size)
 
         self.status = AdaLNCacheStatus(True, True, "enabled", len(tensors), size)
-        logger.info("AdaLN cache enabled: tensors=%d bytes=%d reserve_bytes=%d", len(tensors), size, reserve)
+        logger.info(
+            "AdaLN cache enabled: tensors=%d bytes=%d reserve_bytes=%d",
+            len(tensors),
+            size,
+            reserve,
+            extra={"cache_scope": "adaln", "tensor_count": len(tensors), "cache_bytes": size, "reserve_bytes": reserve},
+        )
         return self.resident_ids
 
     def restore(self) -> None:
