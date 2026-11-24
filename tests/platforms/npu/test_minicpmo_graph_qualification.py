@@ -112,7 +112,8 @@ def test_active_fused_decode_checks_shadow_before_commit(tmp_path, monkeypatch, 
 
 @pytest.mark.parametrize("mismatch", [None, "hidden", "kv"])
 @pytest.mark.parametrize("rows", [2, 12, 16])
-def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, mismatch, rows):
+@pytest.mark.parametrize("wide_capacity", (512, 256))
+def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, mismatch, rows, wide_capacity):
     mode = tmp_path / "mode"
     mode.write_text("active_fixed")
     monkeypatch.setattr(talker_batched_decode, "MODE", str(mode))
@@ -125,7 +126,10 @@ def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, mismatch, r
         seq_lens_device=torch.full((rows,), 32), block_tables=torch.zeros(rows, 4), slot_mapping=torch.arange(tokens)
     )
     runner = Mock(spec=["model_config", "model_state", "vllm_config"])
-    runner.vllm_config = Mock(cache_config=Mock(block_size=128))
+    runner.vllm_config = Mock(
+        cache_config=Mock(block_size=128),
+        additional_config={"minicpmo_talker_wide_graph_capacity": wide_capacity},
+    )
     runner.model_config = Mock(max_model_len=512)
     runner.model_state = Mock(attn_metadata={"layer": metadata})
     runner.model_state._request_token_spans.return_value = [(i, i + 16) for i in range(0, tokens, 16)]
@@ -139,6 +143,10 @@ def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, mismatch, r
     if rows > 8:
         assert talker_batched_decode.prepare(runner, None, inputs, batch, 16) is None
         mode.write_text("active_fixed_wide" if rows == 16 else "active_fixed_padded")
+        if wide_capacity == 256:
+            batch.seq_lens_np.fill(257)
+            assert talker_batched_decode.prepare(runner, None, inputs, batch, 16) is None
+            batch.seq_lens_np.fill(32)
 
     class Graph:
         def __init__(self, *args, **kwargs):
@@ -146,7 +154,7 @@ def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, mismatch, r
             self.slots = torch.arange(16 if rows > 8 else rows)
             self.kv = kv
             if rows > 8:
-                assert args[-3:] == (16, 512, 256)
+                assert args[-3:] == (16, wide_capacity, 256)
 
         def prepare_step(self, *args):
             pass

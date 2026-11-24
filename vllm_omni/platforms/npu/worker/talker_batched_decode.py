@@ -348,8 +348,18 @@ def prepare(runner, talker, model_inputs, input_batch, width):
     # window. A bucket that fits it is safe for every frame in the step.
     # Use 512 on any build that cannot provide a host length vector.
     preferred = full_capacity
-    # The 16-row variant uses one capture shape to bound retained graph memory.
-    if length is not None and graph_rows != 16:
+    # Keep one 16-row capture. A longer sequence takes the existing full-context path.
+    if graph_rows == 16:
+        extra = getattr(runner.vllm_config, "additional_config", None)
+        short_capacity = extra.get("minicpmo_talker_wide_graph_capacity", full_capacity) if isinstance(extra, dict) else full_capacity
+        if not isinstance(short_capacity, int) or short_capacity not in (256, full_capacity):
+            raise ValueError("minicpmo_talker_wide_graph_capacity must be 256 or 512")
+        if short_capacity != full_capacity:
+            if length is None or length > short_capacity:
+                trace_context(input_batch, "wide_graph_full_context_fallback", length, short_capacity)
+                return None
+            preferred = full_capacity = short_capacity
+    elif length is not None:
         preferred = static_shape_decode.select_bucket(length, (128, 256, full_capacity))
     candidate_capacities = (preferred, full_capacity) if preferred != full_capacity else (full_capacity,)
     for capacity in candidate_capacities:

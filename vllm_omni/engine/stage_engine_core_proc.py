@@ -263,6 +263,17 @@ class StageEngineCoreProc(EngineCoreProc):
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
             os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
 
+            vllm_config = kwargs.get("vllm_config")
+            model_config = getattr(vllm_config, "model_config", None)
+            connector = getattr(model_config, "stage_connector_config", None) or {}
+            if (
+                int(omni_replica_id) == 0
+                and getattr(model_config, "model_stage", None) == "code2wav"
+                and connector.get("extra", {}).get("minicpmo_code2wav_sync_primary", False)
+            ):
+                vllm_config.scheduler_config.async_scheduling = False
+                logger.info("MiniCPM-o primary Code2Wav uses synchronous EngineCore scheduling")
+
             # Patch the decoder type so process_input_sockets (started
             # during __init__) decodes OmniEngineCoreRequest (which
             # carries additional_information) instead of the base

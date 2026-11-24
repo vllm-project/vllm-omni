@@ -490,7 +490,13 @@ class MiniCPMO45Code2Wav(nn.Module):
             ):
                 raise ValueError("code2wav_encoder_graph_singleton_history_frames must be [start, stop, stride]")
             history = range(history[0], history[1] + 1, history[2])
+        padded_history = int(extra.get("code2wav_encoder_padded_flow_history", 0))
+        if padded_history < 0 or padded_history % 2:
+            raise ValueError("code2wav_encoder_padded_flow_history must be zero or a positive even number")
         self._chunk_encoder_graph_config = {
+            "padded_flow_history": padded_history,
+            "padded_flow_continuations": os.getenv("VLLM_OMNI_REPLICA_ID", "0") == "0"
+            and read_bool_flag(extra, "code2wav_encoder_padded_flow_continuations", False),
             "singleton_history_frames": history,
             "enabled": read_bool_flag(extra, "enable_code2wav_encoder_graph", False),
             "max_graphs": int(extra.get("code2wav_encoder_max_graphs", 8)),

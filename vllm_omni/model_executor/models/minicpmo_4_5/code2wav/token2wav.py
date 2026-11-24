@@ -547,6 +547,9 @@ class BatchedToken2Wav(nn.Module):
         self._chunk_encoder_steady_width = left_context + chunk_frames
         self._chunk_encoder_singleton_history = encoder_cfg.get("singleton_history_frames")
         self._precapture_encoder_tails = bool(encoder_cfg.get("precapture_tails", False))
+        self._padded_flow_history = int(encoder_cfg.get("padded_flow_history", 0))
+        self._padded_flow_continuations = bool(encoder_cfg.get("padded_flow_continuations", False))
+        self._padded_flow_encoder = None
         self._tail_encoder_graph: FlowEncoderGraphs | None = None
         self._c8_mixed_tail_checks: dict[tuple, int] = {}
         self._c8_mixed_tail_replays = 0
@@ -1071,6 +1074,137 @@ class BatchedToken2Wav(nn.Module):
         )
         return self.flow.encoder_proj(hidden), new_cnn, new_att
 
+    def _forward_padded_flow_encoder(
+        self, tokens, convolution, low_history, high_history, lengths, valid_lengths, offsets
+    ) -> tuple[torch.Tensor, ...]:
+        encoder = self.flow.encoder
+        lookahead = encoder.pre_lookahead_layer
+        stride = encoder.up_layer.stride
+        width = tokens.shape[1]
+        history = high_history.shape[3]
+        x, _, _ = encoder.embed(self.flow.input_embedding(tokens), None)
+        real_tokens = torch.arange(width, device=x.device)[None, :] < lengths[:, None]
+        embedded = torch.where(real_tokens[..., None], x, 0.0)
+        x = F.pad(embedded, (0, 0, 0, lookahead.pre_lookahead_len))
+        cnn_low = F.leaky_relu(lookahead.conv1(x.transpose(1, 2).contiguous()))
+        x = lookahead.conv2(torch.cat((convolution[:, :, :2], cnn_low), dim=2))
+        x = x.transpose(1, 2).contiguous() + embedded
+
+        low_end = history // stride + width
+        positions = encoder.embed.position_encoding(offset=None, size=low_end)
+        columns = torch.arange(low_end, device=x.device)[None, None, :]
+        mask = (columns >= (offsets // stride)[:, None, None]) & (
+            columns < (history // stride + valid_lengths)[:, None, None]
+        )
+        next_low = []
+        for layer, previous in zip(encoder.encoders, low_history, strict=True):
+            x, _, updated, _ = layer(x, mask, positions, att_cache=previous)
+            next_low.append(updated)
+
+        upsample = encoder.up_layer
+        cnn_high = F.interpolate(x.transpose(1, 2).contiguous(), scale_factor=upsample.scale_factor, mode="nearest")
+        x = upsample.conv(torch.cat((convolution[:, :, 2:], cnn_high), dim=2))
+        x, _, _ = encoder.up_embed(x.transpose(1, 2).contiguous(), None)
+        high_end = history + width * stride
+        positions = encoder.embed.position_encoding(offset=None, size=high_end)
+        columns = torch.arange(high_end, device=x.device)[None, None, :]
+        mask = (columns >= offsets[:, None, None]) & (columns < (history + valid_lengths * stride)[:, None, None])
+        next_high = []
+        for layer, previous in zip(encoder.up_encoders, high_history, strict=True):
+            x, _, updated, _ = layer(x, mask, positions, att_cache=previous)
+            next_high.append(updated)
+        x = encoder.after_norm(x) if encoder.normalize_before else x
+        return self.flow.encoder_proj(x), cnn_low, cnn_high, torch.stack(next_low), torch.stack(next_high)
+
+    def _encode_padded_flow_chunks(
+        self,
+        tokens: list[torch.Tensor],
+        states: list[BatchedToken2WavState],
+        last_chunks: list[bool],
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        runner = self._padded_flow_encoder
+        assert runner is not None and 1 <= len(tokens) == len(states) <= 4
+        real_rows = len(tokens)
+        tokens = tokens + [tokens[-1]] * (4 - real_rows)
+        states = states + [states[-1]] * (4 - real_rows)
+        last_chunks = last_chunks + [last_chunks[-1]] * (4 - real_rows)
+        split = len(self.flow.encoder.encoders)
+        history = self._padded_flow_history
+        width = self._chunk_encoder_steady_width
+        caches = [state.flow_cache["conformer_att_cache"] for state in states]
+        lengths = [int(value.numel()) for value in tokens]
+        lookahead = self.flow.encoder.pre_lookahead_layer.pre_lookahead_len
+        valid_lengths = [length if last else length - lookahead for length, last in zip(lengths, last_chunks, strict=True)]
+        offsets = [history - int(cache.shape[3]) for cache in caches]
+
+        padded = torch.stack([F.pad(value, (0, width - length)) for value, length in zip(tokens, lengths, strict=True)])
+        convolution = torch.cat([state.flow_cache["conformer_cnn_cache"] for state in states])
+        low = torch.cat(
+            [F.pad(cache[:split, :, :, : cache.shape[3] // 2], (0, 0, offset // 2, 0))
+             for cache, offset in zip(caches, offsets, strict=True)],
+            dim=1,
+        )
+        high = torch.cat(
+            [F.pad(cache[split:], (0, 0, offset, 0)) for cache, offset in zip(caches, offsets, strict=True)],
+            dim=1,
+        )
+        with self._autocast(padded.device):
+            hidden, cnn_low, cnn_high, low, high = runner.run(
+                "padded_flow_chunks",
+                (padded, convolution, low, high, index_to_device(lengths, padded.device),
+                 index_to_device(valid_lengths, padded.device), index_to_device(offsets, padded.device)),
+                (),
+                self._forward_padded_flow_encoder,
+            )
+        result = []
+        for row in range(real_rows):
+            length, offset = valid_lengths[row], offsets[row]
+            lower = low[:, row : row + 1, :, offset // 2 : history // 2 + length].repeat(1, 1, 1, 2, 1)
+            upper = high[:, row : row + 1, :, offset : history + length * 2]
+            convolution = torch.cat(
+                (cnn_low[row : row + 1, :, length - 2 : length],
+                 cnn_high[row : row + 1, :, length * 2 - 4 : length * 2]),
+                dim=2,
+            )
+            result.append((hidden[row : row + 1, : length * 2], convolution, torch.cat((lower, upper))))
+        return result
+
+    def _precapture_padded_flow_encoder(self, cnn: torch.Tensor, att: torch.Tensor) -> int:
+        history = self._padded_flow_history
+        if not history or self._padded_flow_encoder is not None or self._upsample_stride() != 2:
+            return 0
+        from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
+
+        runner = NPUExactGraphRunner(
+            max_graphs=1,
+            component_name="MiniCPM-o padded mixed-chunk Flow Encoder",
+            disable_config_hint="remove code2wav_encoder_padded_flow_history",
+        )
+        if not runner.is_supported():
+            return 0
+        rows = 4
+        split = len(self.flow.encoder.encoders)
+        width = self._chunk_encoder_steady_width
+        tokens = torch.zeros((rows, width), device=att.device, dtype=torch.long)
+        convolution = cnn.expand(rows, -1, -1).contiguous()
+        probe = att.new_zeros((att.shape[0], 1, att.shape[2], history, att.shape[4]))
+        self._ensure_relpos_pe(tokens, probe)
+        self._padded_flow_position_tables = self._encoder_position_tables()
+        low = att.new_zeros((split, rows, att.shape[2], history // 2, att.shape[4]))
+        high = att.new_zeros((att.shape[0] - split, rows, att.shape[2], history, att.shape[4]))
+        runner.run(
+            "padded_flow_chunks",
+            (
+                tokens, convolution, low, high,
+                tokens.new_full((rows,), width), tokens.new_full((rows,), width), tokens.new_zeros(rows),
+            ),
+            (),
+            self._forward_padded_flow_encoder,
+        )
+        runner.freeze()
+        self._padded_flow_encoder = runner
+        return runner.stats["captures"]
+
     def _flow_supports_graphs(self) -> bool:
         flow_parameter = next(self.flow.parameters(), None)
         return flow_parameter is not None and flow_parameter.device.type in {"cuda", "npu"}
@@ -1234,6 +1368,10 @@ class BatchedToken2Wav(nn.Module):
         }
         with self._autocast(att.device):
             captured = graph.capture(keys, **layouts)
+            if att.device.type == "npu":
+                captured_padded_flow = self._precapture_padded_flow_encoder(cnn, att)
+                if captured_padded_flow:
+                    logger.info("MiniCPM-o Flow Encoder prepared a padded mixed-chunk graph")
             if att.device.type == "npu" and self._precapture_encoder_tails:
                 # Finalization zero-pads right context in the real encoder and
                 # emits all supplied token frames. Keep tail shapes and storage
@@ -2636,7 +2774,37 @@ class BatchedToken2Wav(nn.Module):
         hidden_rows: list[torch.Tensor | None] = [None] * batch_size
         conformer_cnn_rows: list[torch.Tensor | None] = [None] * batch_size
         conformer_att_rows: list[torch.Tensor | None] = [None] * batch_size
+        if self._padded_flow_encoder is not None:
+            terminal_rows = []
+            continuation_rows = []
+            width_cap = self._chunk_encoder_steady_width
+            exact_graphs = self._encoder_graphs
+            for (_, att_shape, width, last_chunk), rows in encoder_groups.items():
+                history = att_shape[3]
+                fits_history = history > 0 and history <= self._padded_flow_history and history % 2 == 0
+                if not fits_history or not 2 <= width <= width_cap:
+                    continue
+                if last_chunk:
+                    terminal_rows.extend(rows)
+                elif self._padded_flow_continuations and width == width_cap and (
+                    exact_graphs is None or (len(rows), width, history) not in exact_graphs.graphs
+                ):
+                    continuation_rows.extend(rows)
+            terminal_batches = [terminal_rows[start : start + 4] for start in range(0, len(terminal_rows), 4)]
+            continuation_batches = [
+                continuation_rows[start : start + 4] for start in range(0, len(continuation_rows), 4)
+                if len(continuation_rows) - start >= 2
+            ]
+            for rows in terminal_batches + continuation_batches:
+                outputs = self._encode_padded_flow_chunks(
+                    [tokens[row] for row in rows], [states[row] for row in rows], [last_chunks[row] for row in rows]
+                )
+                for row, (hidden, cnn, att) in zip(rows, outputs, strict=True):
+                    hidden_rows[row], conformer_cnn_rows[row], conformer_att_rows[row] = hidden, cnn, att
         for (*_, last_chunk), rows in encoder_groups.items():
+            rows = [row for row in rows if hidden_rows[row] is None]
+            if not rows:
+                continue
             group_states = [states[row] for row in rows]
             group_tokens = torch.stack([tokens[row] for row in rows], dim=0)
             with self._autocast(group_tokens.device):

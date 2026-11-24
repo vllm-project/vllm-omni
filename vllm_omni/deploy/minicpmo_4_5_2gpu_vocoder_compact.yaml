@@ -1,0 +1,17 @@
+base_config: minicpmo_4_5_2gpu_vocoder_balanced.yaml
+
+platforms:
+  npu:
+    connectors:
+      connector_of_shared_memory:
+        extra:
+          code2wav_encoder_padded_flow_history: 416
+          code2wav_encoder_padded_flow_continuations: true
+          minicpmo_code2wav_sync_primary: true
+          generation_first_chunk_express: true
+          generation_first_chunk_express_min_slack_s: 0.30
+    stages:
+    - stage_id: 1
+      additional_config:
+        minicpmo_talker_refill_coalesce: true
+        minicpmo_talker_wide_graph_capacity: 256
