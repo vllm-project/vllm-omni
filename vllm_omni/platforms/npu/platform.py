@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import os
 from contextlib import nullcontext
 from functools import cache
 from typing import Any
@@ -16,6 +17,13 @@ from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBa
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 logger = init_logger(__name__)
+
+
+def _custom_opp_paths() -> frozenset[str]:
+    return frozenset(filter(None, os.getenv("ASCEND_CUSTOM_OPP_PATH", "").split(os.pathsep)))
+
+
+_STARTUP_OPP_PATHS = _custom_opp_paths()
 
 _DIFFUSION_PACKED_MODULES_MAPPING = {
     "HunyuanImage3Pipeline": {
@@ -67,6 +75,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     _omni_enum = OmniPlatformEnum.NPU
     dist_backend: str = "hccl"
+    _early_diffusion_opp_paths: frozenset[str] | None = None
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):
@@ -263,7 +272,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         if isinstance(model, (MiniMaxH3Pipeline, MiniMaxH3ImagePipeline)):
             from vllm_omni.platforms.npu.models.minimax_h3_dit import apply_minimax_h3_dit_fusions
 
-            apply_minimax_h3_dit_fusions(model)
+            apply_minimax_h3_dit_fusions(model, cls._early_diffusion_opp_paths or _STARTUP_OPP_PATHS)
         apply_minimax_h3_image_graphs(model, od_config)
         if od_config.model_class_name == "QwenImage21Pipeline" and is_310p():
             from vllm_omni.platforms.npu._310p.patch.qwen_image_21 import apply_qwen_image_21_patches
@@ -356,7 +365,17 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         head_size: int,
         allow_trtllm_default: bool = True,
     ) -> str:
-        # NPU has no TRTLLM backend; accepted for signature parity, ignored.
+        if cls._early_diffusion_opp_paths is not None:
+            return cls._select_diffusion_attn_backend(selected_backend)
+        before_import = _custom_opp_paths()
+        backend = cls._select_diffusion_attn_backend(selected_backend)
+        # Only the first backend's eager MindIE-SD import can add paths here.
+        # Later imports can change the environment after CANN has frozen its registry.
+        cls._early_diffusion_opp_paths = _STARTUP_OPP_PATHS | (_custom_opp_paths() - before_import)
+        return backend
+
+    @classmethod
+    def _select_diffusion_attn_backend(cls, selected_backend: str | None) -> str:
         from importlib.util import find_spec
 
         if selected_backend is not None:

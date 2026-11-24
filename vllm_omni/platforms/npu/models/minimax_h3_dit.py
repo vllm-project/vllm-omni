@@ -19,28 +19,33 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3Attention, MiniMaxH3MLP
 
 _FP32_INFO = torch.finfo(torch.float32)
+_QKV = "EagleSplitNormRopeConcat"
+_SWIGLU = "EagleQuantBatchMatmulSwiglu"
 
 
-def _supports_eagle_qkv_on_a5() -> bool:
-    """Require the active MindIE-SD OPP to contain the compiled 950 BF16 kernel."""
-    sdk = find_spec("mindiesd")
-    if sdk is None or sdk.origin is None:
+def _has_eagle_kernel(kernels: Path, op: str, registration: object) -> bool:
+    binaries = registration.get("binaryList") if isinstance(registration, dict) else None
+    if not isinstance(binaries, list):
         return False
-    vendor = (Path(sdk.origin).parent / "ops/vendors/aie_ascendc").resolve()
-    opp_paths = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "").split(os.pathsep)
-    if not any(path and Path(path).resolve() == vendor for path in opp_paths):
-        return False
-
-    kernels = vendor / "op_impl/ai_core/tbe/kernel"
-    manifest = kernels / "config/ascend950/eagle_split_norm_rope_concat.json"
-    try:
-        for entry in json.loads(manifest.read_text(encoding="utf-8"))["binList"]:
-            if entry["inputs"][0]["dtype"] == "bfloat16":
-                descriptor = kernels / entry["binInfo"]["jsonFilePath"]
-                if descriptor.is_file() and descriptor.with_suffix(".o").is_file():
+    for entry in binaries:
+        try:
+            if not (kernels / entry["binPath"]).is_file():
+                continue
+            descriptor = json.loads((kernels / entry["jsonPath"]).read_text(encoding="utf-8"))["supportInfo"]
+            inputs = descriptor["inputs"]
+            if descriptor["outputs"][0]["dtype"] != "bfloat16":
+                continue
+            if op == _QKV:
+                if inputs[0]["dtype"] == "bfloat16":
                     return True
-    except (OSError, ValueError, TypeError, KeyError, IndexError):
-        pass
+            elif (
+                inputs[0]["dtype"] == inputs[1]["dtype"] == "int8"
+                and inputs[1]["format"] == "ND"
+                and inputs[2]["dtype"] == "float32"
+            ):
+                return True
+        except (OSError, ValueError, TypeError, KeyError, IndexError):
+            continue
     return False
 
 
@@ -61,7 +66,8 @@ def _npu_project_qkv(
     qkv_numel = rows * sum(heads) * self.head_dim
     eps = self.q_norm.variance_epsilon
     if (
-        rope_table is None
+        x.dtype != torch.bfloat16
+        or rope_table is None
         or (self.vdn is not None and vdn_window is None)
         or self.head_dim != 128
         or self.rot_dim not in (32, 64, 96, 128)
@@ -110,6 +116,7 @@ def forward_h3_mlp(self: MiniMaxH3MLP, x: torch.Tensor) -> torch.Tensor:
     # LoRA can wrap fc1 after the platform installs this forward.
     if (
         x.device.type == "npu"
+        and x.dtype == torch.bfloat16
         and type(self.fc1) is MergedColumnParallelLinear
         and isinstance(self.fc1.quant_method, NPUInt8LinearMethod)
     ):
@@ -129,13 +136,32 @@ def forward_h3_mlp(self: MiniMaxH3MLP, x: torch.Tensor) -> torch.Tensor:
     return type(self).forward(self, x)
 
 
-def apply_minimax_h3_dit_fusions(model: nn.Module) -> None:
+def apply_minimax_h3_dit_fusions(model: nn.Module, early_opp_paths: frozenset[str]) -> None:
     """Bind eligible H3 blocks without changing classes or loading MindIE-SD on other platforms."""
     device_name = _ascend_device_name()
-    if device_name != "A2" and not (device_name == "A5" and _supports_eagle_qkv_on_a5()):
+    if device_name not in ("A2", "A5") or not early_opp_paths:
         return
+    sdk = find_spec("mindiesd")
+    if sdk is None or sdk.origin is None:
+        return
+    vendor = (Path(sdk.origin).parent / "ops/vendors/aie_ascendc").resolve()
+    active_paths = early_opp_paths.intersection(os.getenv("ASCEND_CUSTOM_OPP_PATH", "").split(os.pathsep))
+    if not any(Path(path).resolve() == vendor for path in active_paths):
+        return
+    tbe = vendor / "op_impl/ai_core/tbe"
+    kernels = tbe / "kernel"
+    soc = "ascend910b" if device_name == "A2" else "ascend950"
+    try:
+        op_info = json.loads((tbe / "config" / soc / f"aic-{soc}-ops-info.json").read_text(encoding="utf-8"))
+        index = json.loads((kernels / "config" / soc / "binary_info_config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(index, dict) or not isinstance(op_info, dict):
+        return
+    use_qkv = _QKV in op_info and _has_eagle_kernel(kernels, _QKV, index.get(_QKV))
+    use_swiglu = device_name == "A2" and _SWIGLU in op_info and _has_eagle_kernel(kernels, _SWIGLU, index.get(_SWIGLU))
     for module in model.modules():
-        if isinstance(module, MiniMaxH3Attention):
+        if use_qkv and isinstance(module, MiniMaxH3Attention):
             module._project_qkv = MethodType(_npu_project_qkv, module)  # type: ignore[method-assign]
-        elif isinstance(module, MiniMaxH3MLP) and device_name == "A2":
+        elif use_swiglu and isinstance(module, MiniMaxH3MLP):
             module.forward = MethodType(forward_h3_mlp, module)  # type: ignore[method-assign]
