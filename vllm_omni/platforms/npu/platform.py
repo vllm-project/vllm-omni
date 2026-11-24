@@ -255,20 +255,16 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def apply_diffusion_model_patches(cls, model, od_config) -> None:
-        from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-        from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_image import MiniMaxH3ImagePipeline
         from vllm_omni.platforms.npu._310p import is_310p
         from vllm_omni.platforms.npu.models.minimax_h3_image import apply_minimax_h3_image_graphs
+        from vllm_omni.platforms.npu.models.minimax_h3_modulation import apply_minimax_h3_modulation
 
         apply_minimax_h3_image_graphs(model, od_config)
-        if isinstance(model, (MiniMaxH3Pipeline, MiniMaxH3ImagePipeline)):
-            from vllm_omni.platforms.npu.models.minimax_h3_modulation import apply_minimax_h3_modulation
-
-            apply_minimax_h3_modulation(model)
         if od_config.model_class_name == "QwenImage21Pipeline" and is_310p():
             from vllm_omni.platforms.npu._310p.patch.qwen_image_21 import apply_qwen_image_21_patches
 
             apply_qwen_image_21_patches(model, od_config)
+        apply_minimax_h3_modulation(model)
 
     @classmethod
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:

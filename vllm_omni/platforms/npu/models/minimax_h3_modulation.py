@@ -76,17 +76,17 @@ def _rms_norm_indexed_scale_shift(
 
 def apply_minimax_h3_modulation(model: nn.Module) -> None:
     """Install MindIE-SD modulation on the loaded H3 blocks on Ascend 910 and 950."""
-    if not torch.npu.get_device_name().lower().startswith(("ascend910", "ascend950")):
+    blocks = [block for block in model.modules() if isinstance(block, MiniMaxH3DiTBlock)]
+    if not blocks or not torch.npu.get_device_name().lower().startswith(("ascend910", "ascend950")):
         return
     try:
-        from mindiesd import rms_norm_indexed_scale_shift as sdk_rms
         from mindiesd.layers.index_modulation import indexed_gate as sdk_gate
+        from mindiesd.layers.index_modulation import rms_norm_indexed_scale_shift as sdk_rms
     except ImportError:
         return
 
     gate = partial(_indexed_gate, sdk_gate)
     rms = partial(_rms_norm_indexed_scale_shift, sdk_rms)
-    for block in model.modules():
-        if isinstance(block, MiniMaxH3DiTBlock):
-            block._indexed_gate = gate  # type: ignore[method-assign]
-            block._rms_norm_indexed_scale_shift = rms  # type: ignore[method-assign]
+    for block in blocks:
+        block._indexed_gate = gate  # type: ignore[method-assign]
+        block._rms_norm_indexed_scale_shift = rms  # type: ignore[method-assign]
