@@ -122,7 +122,9 @@ class OpenAICreateSpeechRequest(BaseModel):
         description=(
             "Streaming output format. 'audio' streams raw pcm/wav bytes; "
             "'sse' streams OpenAI speech.audio.* SSE events. If omitted, stream=true "
-            "selects SSE and stream=false remains non-streaming."
+            "selects SSE and stream=false remains non-streaming. When set, this field "
+            "takes precedence over `stream`: stream=false with stream_format='audio' "
+            "still streams raw bytes."
         ),
     )
     stream: bool = Field(
