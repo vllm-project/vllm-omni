@@ -852,7 +852,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "Diffusion · Model Test",
         AMD_READY_PIPELINE,
         "Blocking",
-        122,
+        121,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -2716,6 +2716,21 @@ _LTX_WEEKLY_1GPU_PATHS = (
     "tests/e2e/accuracy/ltx/test_ltx_official_similarity.py",
     "tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py",
 )
+_LTX_WEEKLY_FUNCTIONAL_PATHS = _LTX_WEEKLY_1GPU_PATHS[:4]
+_LTX25_WEEKLY_DISTILLED_ACCURACY_NODES = (
+    "tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_distilled_two_stage_matches_official",
+)
+_LTX25_WEEKLY_FULL_ONE_STAGE_ACCURACY_NODES = (
+    "tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_full_matches_official[full_one_stage-t2v]",
+    "tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_full_matches_official[full_one_stage-i2v]",
+)
+_LTX25_WEEKLY_FULL_TWO_STAGE_ACCURACY_NODES = (
+    "tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_full_matches_official[full_two_stage-t2v]",
+    "tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_full_matches_official[full_two_stage-i2v]",
+)
+_LTX25_WEEKLY_T2A_ACCURACY_NODES = (
+    "tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_t2a_matches_official",
+)
 _AMD_DIFFUSION_PARITY_WEEKLY_JOBS = (
     (
         "LongCat online · 1-GPU",
@@ -2928,14 +2943,69 @@ def test_ltx_weekly_jobs_are_exact_blocking_rocm_owners_and_ready_qualifies_na3d
     runner = ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh"
     jobs = (
         (
-            "LTX functional and accuracy · 1-GPU",
+            "LTX functional · 1-GPU",
             "mi300_1",
-            300,
+            120,
             "1",
-            "19",
-            "285m",
-            "rocm-ltx-weekly-1gpu",
-            _LTX_WEEKLY_1GPU_PATHS,
+            "9",
+            "105m",
+            "rocm-ltx-functional-weekly-1gpu",
+            _LTX_WEEKLY_FUNCTIONAL_PATHS,
+            "slow and diffusion and rocm and MI325 and cards_1",
+        ),
+        (
+            "LTX legacy accuracy · 1-GPU",
+            "mi300_1",
+            120,
+            "1",
+            "3",
+            "105m",
+            "rocm-ltx-legacy-accuracy-weekly-1gpu",
+            ("tests/e2e/accuracy/ltx/test_ltx_official_similarity.py",),
+            "slow and diffusion and rocm and MI325 and cards_1",
+        ),
+        (
+            "LTX-2.5 distilled accuracy · 1-GPU",
+            "mi300_1",
+            120,
+            "1",
+            "2",
+            "105m",
+            "rocm-ltx25-distilled-accuracy-weekly-1gpu",
+            _LTX25_WEEKLY_DISTILLED_ACCURACY_NODES,
+            "slow and diffusion and rocm and MI325 and cards_1",
+        ),
+        (
+            "LTX-2.5 full one-stage accuracy · 1-GPU",
+            "mi300_1",
+            150,
+            "1",
+            "2",
+            "135m",
+            "rocm-ltx25-full-one-stage-accuracy-weekly-1gpu",
+            _LTX25_WEEKLY_FULL_ONE_STAGE_ACCURACY_NODES,
+            "slow and diffusion and rocm and MI325 and cards_1",
+        ),
+        (
+            "LTX-2.5 full two-stage accuracy · 1-GPU",
+            "mi300_1",
+            180,
+            "1",
+            "2",
+            "165m",
+            "rocm-ltx25-full-two-stage-accuracy-weekly-1gpu",
+            _LTX25_WEEKLY_FULL_TWO_STAGE_ACCURACY_NODES,
+            "slow and diffusion and rocm and MI325 and cards_1",
+        ),
+        (
+            "LTX-2.5 T2A accuracy · 1-GPU",
+            "mi300_1",
+            120,
+            "1",
+            "1",
+            "105m",
+            "rocm-ltx25-t2a-accuracy-weekly-1gpu",
+            _LTX25_WEEKLY_T2A_ACCURACY_NODES,
             "slow and diffusion and rocm and MI325 and cards_1",
         ),
         (
@@ -2950,6 +3020,10 @@ def test_ltx_weekly_jobs_are_exact_blocking_rocm_owners_and_ready_qualifies_na3d
             "slow and diffusion and rocm and MI325 and cards_2",
         ),
     )
+
+    one_gpu_jobs = [job for job in jobs if job[3] == "1"]
+    assert sum(int(job[4]) for job in one_gpu_jobs) == 19
+    assert {path.split("::", maxsplit=1)[0] for job in one_gpu_jobs for path in job[7]} == set(_LTX_WEEKLY_1GPU_PATHS)
 
     for label, pool, timeout, gpus, tests, run_timeout, artifact, paths, marker in jobs:
         step = _find_step(label, AMD_WEEKLY_PIPELINE)
