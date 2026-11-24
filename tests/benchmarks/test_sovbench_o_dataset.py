@@ -531,3 +531,45 @@ def test_length_limited_turn_stays_out_of_replay_history() -> None:
         session, 1, [complete], reference_mode="sample_level_multi_turn", prior_finish_reasons=[]
     )
     assert f"Assistant answer: {complete}" in _text_parts(messages)
+
+
+def test_length_limited_question_echo_stays_out_of_replay_history() -> None:
+    """A length-limited question echo is omitted even though the loose scorer
+    fallback reads a letter out of it (y-null's session-76, 256-token run).
+
+    The truncated turn began with ``Turn 22``/``User question:`` and repeated
+    the question until the token limit without ever naming an option; the
+    any-letter fallback still extracted ``E`` from ``USER``. The replay history
+    requires an explicit option for length-limited turns, and the two-turn
+    replay keeps the question block but drops the answer line.
+    """
+    from vllm_omni.benchmarks.data_modules.sovbench_o_eval import extract_sovbench_choice_letter
+
+    session = _parse_session(_session_item(), session_id=0)
+    assert session is not None
+    echo = "Turn 2\nUser question: What does the user set up first?\nUser question: What does the user set up first?"
+    # The loose fallback reads a letter out of the echoed question; the
+    # explicit mode (answer tag / JSON / boxed / phrase-stripped letter) does not.
+    assert extract_sovbench_choice_letter(echo) != ""
+    assert extract_sovbench_choice_letter(echo, allow_any_letter_fallback=False) == ""
+
+    messages = build_sovbench_o_turn_messages(
+        session, 1, [echo], reference_mode="sample_level_multi_turn", prior_finish_reasons=["length"]
+    )
+    body = _text_parts(messages)
+    assert "Assistant answer:" not in body, "truncated echo must not be replayed"
+    assert "Turn 1\nUser question: What is in the opening scene?" in body
+
+    # The same echo under an ordinary finish reason is replayed as-is.
+    messages = build_sovbench_o_turn_messages(
+        session, 1, [echo], reference_mode="sample_level_multi_turn", prior_finish_reasons=["stop"]
+    )
+    assert f"Assistant answer: {echo}" in _text_parts(messages)
+
+    # A length-limited response that names an option explicitly is kept.
+    boxed = "Still thinking through the clips. <answer>D</answer>"
+    assert extract_sovbench_choice_letter(boxed, allow_any_letter_fallback=False) == "D"
+    messages = build_sovbench_o_turn_messages(
+        session, 1, [boxed], reference_mode="sample_level_multi_turn", prior_finish_reasons=["length"]
+    )
+    assert f"Assistant answer: {boxed}" in _text_parts(messages)

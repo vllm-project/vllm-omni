@@ -318,8 +318,11 @@ def sovbench_o_history_text(
 ) -> str:
     """Render the dialogue-history block, using the model's own previous predictions.
 
-    A length-limited response that never produced a complete option is omitted
-    from the history (its raw text stays in ``turn_predictions`` for scoring):
+    A length-limited response is omitted from the history unless it names an
+    option explicitly (answer tag, JSON, boxed/bold, or a phrase-stripped
+    letter); the any-letter fallback does not count, so a truncated question
+    echo cannot masquerade as an answer (its raw text stays in
+    ``turn_predictions`` for scoring, where the loose fallback is fine):
     replaying a truncated non-answer as an ``Assistant answer`` teaches the
     next turns to repeat the truncation.
     """
@@ -332,7 +335,8 @@ def sovbench_o_history_text(
         block = f"Turn {turn_idx + 1}\nUser question: {question}\nChoices:\n" + "\n".join(choices)
         pred = _safe_str(prior_predictions[turn_idx]).strip() if turn_idx < len(prior_predictions) else ""
         finish = prior_finish_reasons[turn_idx] if turn_idx < len(prior_finish_reasons) else ""
-        if pred and not (finish == "length" and not extract_sovbench_choice_letter(pred)):
+        explicit = extract_sovbench_choice_letter(pred, allow_any_letter_fallback=False) if finish == "length" else True
+        if pred and explicit:
             block += f"\nAssistant answer: {pred}"
         history_lines.append(block)
     return "\n\n".join(history_lines)

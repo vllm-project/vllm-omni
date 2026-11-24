@@ -161,3 +161,25 @@ def test_answer_verification_against_reference_annotations() -> None:
     parsed = _parse_session(item, session_id=0)
     assert parsed is not None
     assert parsed.turns[0].answer == "B"
+
+
+def test_extract_letter_explicit_mode_rejects_any_letter_fallback() -> None:
+    """The explicit mode keeps every structured form but drops the any-letter layer.
+
+    The replay-history filter for length-limited turns uses it so a truncated
+    question echo (whose only "letter" comes from words such as USER) cannot
+    masquerade as an answer; the default scorer path is unchanged.
+    """
+    # Loose fallback would read a letter out of the echoed question.
+    assert extract_sovbench_choice_letter("User question: what happens after the timer") != ""
+    assert (
+        extract_sovbench_choice_letter("User question: what happens after the timer", allow_any_letter_fallback=False)
+        == ""
+    )
+    # Every explicit form still resolves in explicit mode.
+    assert extract_sovbench_choice_letter("The answer is B", allow_any_letter_fallback=False) == "B"
+    assert extract_sovbench_choice_letter('"answer": "C"', allow_any_letter_fallback=False) == "C"
+    assert extract_sovbench_choice_letter("\boxed{A}", allow_any_letter_fallback=False) == "A"
+    assert extract_sovbench_choice_letter("<answer>E</answer>", allow_any_letter_fallback=False) == "E"
+    # The default (scorer) behavior is unchanged.
+    assert extract_sovbench_choice_letter("The answer is B") == "B"

@@ -52,13 +52,18 @@ def _safe_str(value: object) -> str:
     return str(value)
 
 
-def extract_sovbench_choice_letter(prediction: object) -> str:
+def extract_sovbench_choice_letter(prediction: object, *, allow_any_letter_fallback: bool = True) -> str:
     """Extract the option letter (A-E) from a model prediction.
 
     Faithful port of the reference ``_extract_choice_letter``: ``<answer>``
     tags (last match), JSON-style ``"answer": "A"``, ``\\boxed``/``\\box``/bold
     forms, phrase-stripped letter patterns, and finally the first A-E
     character anywhere in the output. Empty or failed predictions return "".
+
+    The any-letter fallback is the loosest layer (it reads ``E`` out of
+    ``USER``); pass ``allow_any_letter_fallback=False`` to accept only the
+    explicit forms above, e.g. the replay-history filter for length-limited
+    turns must not mistake a truncated question echo for an answer.
     """
     s = _safe_str(prediction).strip()
     if not s or SOVBENCH_O_FAIL_MSG in s:
@@ -86,6 +91,8 @@ def extract_sovbench_choice_letter(prediction: object) -> str:
         if m:
             return m.group(1)
 
+    if not allow_any_letter_fallback:
+        return ""
     m = _ANY_LETTER_RE.search(s_up)
     return m.group(0) if m else ""
 
