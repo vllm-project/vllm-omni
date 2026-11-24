@@ -176,8 +176,10 @@ logger = init_logger(__name__)
 # is listed when the image request can set it and it changes the output or the
 # compute cost: vLLM's core sampling fields for AR stages, and for diffusion
 # stages the fields set from n, size, seed, num_inference_steps, guidance_scale,
-# true_cfg_scale, layers, generator_device and the extra num_frames field.
-# Prompt text, tensors, runtime state and open-ended dicts/lists are not logged.
+# true_cfg_scale, layers and the extra num_frames field. Free-form request
+# strings (prompt text, generator_device), tensors, runtime state and open-ended
+# dicts/lists are not logged. Undeclared request fields reach some of these
+# params unvalidated, so only bounded numbers are logged (_is_loggable_number).
 _IMAGE_REQUEST_LOG_FIELDS = (
     "n",
     "num_outputs_per_prompt",
@@ -193,8 +195,19 @@ _IMAGE_REQUEST_LOG_FIELDS = (
     "guidance_scale",
     "true_cfg_scale",
     "layers",
-    "generator_device",
 )
+# Same bounds as the private constants in protocol/images.py (used for ``seed``).
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+
+def _is_loggable_number(value: Any) -> bool:
+    """Return True for an int within int64 range or a float (bools excluded)."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return _INT64_MIN <= value <= _INT64_MAX
+    return isinstance(value, float)
 
 
 async def _identity_async(value: Any) -> Any:
@@ -3716,7 +3729,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 prompt if max_log_len is None else prompt[:max_log_len],
             )
         params = [
-            {name: value for name in _IMAGE_REQUEST_LOG_FIELDS if (value := getattr(sp, name, None)) is not None}
+            {name: value for name in _IMAGE_REQUEST_LOG_FIELDS if _is_loggable_number(value := getattr(sp, name, None))}
             for sp in sampling_params_list
         ]
         logger.log(level, "Received request %s: params: %s.", request_id, params)

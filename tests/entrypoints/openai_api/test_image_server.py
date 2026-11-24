@@ -958,7 +958,13 @@ def test_multistage_generate_logs_request_summary(async_omni_test_client, caplog
     with caplog.at_level(logging.INFO, logger="vllm_omni.entrypoints.openai.serving_chat"):
         response = async_omni_test_client.post(
             "/v1/images/generations",
-            json={"prompt": "a cat", "size": "128x256", "seed": 7, "num_inference_steps": 12},
+            json={
+                "prompt": "a cat",
+                "size": "128x256",
+                "seed": 7,
+                "num_inference_steps": 12,
+                "generator_device": "cpu\nINJECTED",
+            },
             headers={"X-Request-Id": "trace-123"},
         )
     assert response.status_code == 200
@@ -976,8 +982,41 @@ def test_multistage_generate_logs_request_summary(async_omni_test_client, caplog
     assert "'seed': 7" in message
     assert "'num_frames': 1" in message  # effective defaults are logged, as in vLLM
     assert "a cat" not in message
-    for raw_field in ("latents", "generator", "extra_step_kwargs", "extra_args", "kv_metadata"):
+    assert "INJECTED" not in message  # free-form request strings are not logged
+    for raw_field in ("latents", "generator", "generator_device", "extra_step_kwargs", "extra_args", "kv_metadata"):
         assert f"'{raw_field}':" not in message
+
+
+def test_multistage_generate_log_summary_drops_unvalidated_extra_values(async_omni_test_client, caplog):
+    """Undeclared request fields can reach logged params; only bounded numbers are logged."""
+    chat_handler = async_omni_test_client.app.state.openai_serving_chat
+    chat_handler.request_logger = RequestLogger(max_log_len=None)
+
+    with caplog.at_level(logging.INFO, logger="vllm_omni.entrypoints.openai.serving_chat"):
+        response = async_omni_test_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "a cat",
+                "num_inference_steps": 12,
+                "num_frames": 2**64,
+                "num_outputs_per_prompt": "INJECTED_N",
+                "cfg_scale": "INJECTED_CFG",
+            },
+            headers={"X-Request-Id": "trace-123"},
+        )
+    assert response.status_code == 200
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "img_gen-trace-123" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    message = messages[0]
+    assert "'num_inference_steps': 12" in message
+    assert "INJECTED" not in message
+    for dropped_field in ("num_frames", "num_outputs_per_prompt", "true_cfg_scale"):
+        assert f"'{dropped_field}':" not in message
 
 
 def test_multistage_generate_without_log_requests_logs_summary_at_debug(async_omni_test_client, caplog):
