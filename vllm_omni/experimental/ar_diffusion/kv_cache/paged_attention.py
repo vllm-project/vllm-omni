@@ -71,11 +71,8 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     seq_lens: torch.Tensor
     max_query_len: int
     max_seq_len: int
-    # Visible KV length (video + action tokens) as a 0-dim CPU tensor, NOT a
-    # python int: the value changes as the window grows, and an int graph input
-    # becomes a dynamo value guard (a recompile per distinct length). The
-    # Ascend branch needs it to skip the per-layer .item() host sync when
-    # slicing the gathered window to the kernel-visible length.
+    # Visible KV length (video + action tokens) as a 0-dim CPU tensor, not a python int: an int
+    # would become a dynamo value guard and recompile per distinct length. NPU-only.
     kv_len: torch.Tensor | None = None
     # Contiguous K/V staging for this layer, when reuse_history_staging is on. ``reuse_history`` is a host
     # bool decided once per forward (``_prepare_history_staging``): it selects one of two compiled variants.
@@ -593,12 +590,6 @@ class ARDiffusionPagedForwardContext:
             seq_lens=self.seq_lens,
             max_query_len=int(self.max_query_len),
             max_seq_len=int(self.max_seq_len),
-            # Pack the 0-dim host tensor only on NPU: on CUDA/ROCm a CPU tensor
-            # argument to the mutating custom op breaks inductor's cudagraph
-            # static-input pool bookkeeping (build #19741,
-            # test_staged_attention_replays_inductor_cudagraph), and those
-            # devices never read the value -- the branch is device-gated. This
-            # mirrors npu_lengths' opt-in semantics: non-NPU callers ship None.
             kv_len=torch.tensor(int(self.kv_len)) if key_pool.device.type == "npu" else None,
             stage_key=stage_key,
             stage_value=stage_value,
@@ -845,12 +836,6 @@ def ar_diffusion_paged_attention(
         # (-4.1% full 40-chunk request at SP4, -7.3% steady chunk interval at
         # SP8 on 910C; 477-frame precodec output bit-identical).
         block_size = key_cache.shape[1]
-        # kv_len may arrive as a host int (AR-Diffusion path, threaded through
-        # the custom op) or None (NoisyLayerContext / lingbot direct-replay
-        # path). Normalize to a host int; the None case pays the pre-diff
-        # .item() sync once instead of silently dropping to the fp32 reference
-        # implementation, which would break direct replay's documented
-        # contract of sharing the realtime path's fused kernel.
         if kv_len is None:
             kv_len = int(seq_lens[0].item())
         else:
@@ -859,12 +844,6 @@ def ar_diffusion_paged_attention(
         block_ids = block_table[0, :num_blocks].long()
         gathered_k = key_cache.index_select(0, block_ids).flatten(0, 1)[:kv_len]
         gathered_v = value_cache.index_select(0, block_ids).flatten(0, 1)[:kv_len]
-        # Both lengths are host ints now, so the per-layer .item() +
-        # .cpu().tolist() host syncs the original branch paid (3 per layer
-        # per forward = 600 per AR block at 40 layers) are gone on the
-        # threaded path. The query length is known statically from the
-        # flattened shape. When npu_lengths is supplied (main's eager NPU
-        # metadata), the values above are the same pair, already validated.
         actual_seq_q = [int(query_flat.shape[0])]
         actual_seq_kv = [kv_len]
         out = torch_npu.npu_fusion_attention(
