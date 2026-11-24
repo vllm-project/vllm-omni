@@ -2717,6 +2717,11 @@ _LTX_WEEKLY_1GPU_PATHS = (
     "tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py",
 )
 _LTX_WEEKLY_FUNCTIONAL_PATHS = _LTX_WEEKLY_1GPU_PATHS[:4]
+_LTX_LEGACY_ACCURACY_NODES = (
+    "tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx23_distilled_i2v]",
+    "tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx2_two_stage_layer_fused_t2v]",
+    "tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx23_two_stage_layer_fused_i2v]",
+)
 _LTX25_WEEKLY_DISTILLED_ACCURACY_NODES = (
     "tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_distilled_two_stage_matches_official",
 )
@@ -2954,14 +2959,36 @@ def test_ltx_weekly_jobs_are_exact_blocking_rocm_owners_and_ready_qualifies_na3d
             "slow and diffusion and rocm and MI325 and cards_1",
         ),
         (
-            "LTX legacy accuracy · 1-GPU",
+            "LTX legacy · LTX-2.3 distilled I2V · 1-GPU",
             "mi300_1",
             120,
             "1",
-            "3",
+            "1",
             "105m",
-            "rocm-ltx-legacy-accuracy-weekly-1gpu",
-            ("tests/e2e/accuracy/ltx/test_ltx_official_similarity.py",),
+            "rocm-ltx23-distilled-i2v-accuracy-weekly-1gpu",
+            (_LTX_LEGACY_ACCURACY_NODES[0],),
+            "slow and diffusion and rocm and MI325 and cards_1",
+        ),
+        (
+            "LTX legacy · LTX-2 two-stage T2V · 1-GPU",
+            "mi300_1",
+            120,
+            "1",
+            "1",
+            "105m",
+            "rocm-ltx2-two-stage-t2v-accuracy-weekly-1gpu",
+            (_LTX_LEGACY_ACCURACY_NODES[1],),
+            "slow and diffusion and rocm and MI325 and cards_1",
+        ),
+        (
+            "LTX legacy · LTX-2.3 two-stage I2V · 1-GPU",
+            "mi300_1",
+            120,
+            "1",
+            "1",
+            "105m",
+            "rocm-ltx23-two-stage-i2v-accuracy-weekly-1gpu",
+            (_LTX_LEGACY_ACCURACY_NODES[2],),
             "slow and diffusion and rocm and MI325 and cards_1",
         ),
         (
@@ -7271,7 +7298,7 @@ def test_weekly_final_diffusion_parity_qualifiers_are_blocking() -> None:
         "Bagel online · 2-GPU",
         "Bagel multi-replica · 4-GPU",
     }
-    assert len(steps) == 72
+    assert len(steps) == 74
     assert len(promoted_labels) == 13
     assert {step["label"] for step in steps if step["label"] in promoted_labels} == promoted_labels
     assert all(step["grade"] == "Blocking" for step in steps)

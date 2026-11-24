@@ -1797,8 +1797,8 @@ steps:
             -m 'slow and diffusion and rocm and MI325 and cards_2'
 
       # Mirror CUDA's complete one-card LTX functional and official-reference
-      # contract. Keep the semantic owner exact while isolating the long-lived
-      # reference families so checkpoint cold starts run in parallel instead
+      # contract. Keep the semantic owner exact while isolating each long-lived
+      # reference case so checkpoint cold starts run in parallel instead
       # of serializing several hours on one GPU. CUDA keeps NATTEN/cuDNN; ROCm
       # uses bundled Triton na3d and platform-default PyTorch SDPA without
       # weakening the requested cases.
@@ -1826,7 +1826,7 @@ steps:
             tests/e2e/offline_inference/test_ltx25_audio.py
             -m 'slow and diffusion and rocm and MI325 and cards_1'
 
-      - label: "LTX legacy accuracy · 1-GPU"
+      - label: "LTX legacy · LTX-2.3 distilled I2V · 1-GPU"
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
@@ -1839,12 +1839,54 @@ steps:
           VLLM_ROCM_USE_AITER: "0"
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
-          - artifacts/rocm-ltx-legacy-accuracy-weekly-1gpu/**/*
+          - artifacts/rocm-ltx23-distilled-i2v-accuracy-weekly-1gpu/**/*
         commands:
           - >-
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
-            1 3 105m rocm-ltx-legacy-accuracy-weekly-1gpu
-            tests/e2e/accuracy/ltx/test_ltx_official_similarity.py
+            1 1 105m rocm-ltx23-distilled-i2v-accuracy-weekly-1gpu
+            tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx23_distilled_i2v]
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "LTX legacy · LTX-2 two-stage T2V · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 120
+        source_file_dependencies:
+          - diffusion_ltx_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-ltx2-two-stage-t2v-accuracy-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 105m rocm-ltx2-two-stage-t2v-accuracy-weekly-1gpu
+            tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx2_two_stage_layer_fused_t2v]
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "LTX legacy · LTX-2.3 two-stage I2V · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 120
+        source_file_dependencies:
+          - diffusion_ltx_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-ltx23-two-stage-i2v-accuracy-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 105m rocm-ltx23-two-stage-i2v-accuracy-weekly-1gpu
+            tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx23_two_stage_layer_fused_i2v]
             -m 'slow and diffusion and rocm and MI325 and cards_1'
 
       - label: "LTX-2.5 distilled accuracy · 1-GPU"
