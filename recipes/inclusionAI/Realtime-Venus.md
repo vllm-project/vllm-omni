@@ -229,6 +229,10 @@ async def delegate(arguments):
     if len(numbers) == 2 and any(word in question.lower() for word in ("add", "sum", "+", "加")):
         return json.dumps({"sum": int(numbers[0]) + int(numbers[1])})
     raise ValueError("This demo handles inventory lookup and adding two integers only")
+
+async def delayed_delegate(arguments):
+    await asyncio.sleep(0.5)
+    return await delegate(arguments)
 PY
 cat > tools.json <<'JSON'
 [{"type":"function","name":"delegate","description":"Delegate a task to the application",
@@ -267,6 +271,37 @@ file changes the tool's result without changing the prompt. Inspect the emitted
 `response.function_call_arguments.done`, the accepted `function_call_output`
 item, and the subsequent answer. A successful connection alone is not proof
 that the model delegated or used the result.
+
+### Check a delayed tool result
+
+Use the delayed handler to keep input streaming while the lookup is pending:
+
+```bash
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+python -m vllm_omni.clients.tool_calls \
+  --url 'ws://127.0.0.1:8091/v1/realtime?duplex=1' \
+  --model ./Realtime-Venus/Realtime-Venus-Omni \
+  --tools-json tools.json --handler delegate=tool_handlers:delayed_delegate \
+  --initial-user-text 'Please delegate a lookup of the current widget inventory to the backend. Do not guess the count.' \
+  --temperature 0 --timeout 60 --output-wav delayed-answer.wav --ack-collected-audio
+```
+
+Check that one call receives one accepted result, the answer after acceptance
+contains `73`, and that response emits nonempty audio and completes in the same
+session without protocol errors. Preserve the event log, checkpoint revision,
+server commit and deployment settings when reporting the result.
+
+The public events do not expose the internal pending-result queue. The CPU
+regression below separately checks that an accepted result remains queued
+through an ordinary segment completion, reaches exactly one append at a model
+listen, turn-end or repeated-delegation boundary, and cannot be replayed by a
+duplicate result. Run it alongside the real-weight smoke when changing these
+boundaries:
+
+```bash
+python -m pytest -q \
+  tests/engine/duplex/test_session_runner_venus_tools.py::test_result_reaches_one_append_and_duplicate_cannot_replay_it
+```
 
 ### Ask by voice
 
