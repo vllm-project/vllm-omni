@@ -1150,7 +1150,7 @@ steps:
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
         grade: Blocking
-        timeout_in_minutes: 360
+        timeout_in_minutes: 390
         source_file_dependencies:
           - diffusion_cosmos3_function
           - .buildkite/amd/scripts/prewarm_cosmos3_aiter.py
@@ -1164,11 +1164,13 @@ steps:
           # Cosmos3 starts its server with both masked and unmasked BF16 AITER
           # MHA modules. Compile them before the 900-second orchestrator startup
           # window, then reuse the same job-local cache for both generation tests.
+          # Their sequential cold builds nearly exhausted 55 minutes in #17369
+          # and crossed that boundary in #17385, so retain deterministic headroom.
           - export AITER_JIT_DIR="/tmp/vllm-omni-cosmos3-aiter-$$BUILDKITE_JOB_ID"
           - export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-cosmos3-torch-extensions-$$BUILDKITE_JOB_ID"
           - mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"
           - >-
-            timeout --signal=TERM --kill-after=2m 55m
+            timeout --signal=TERM --kill-after=2m 75m
             python .buildkite/amd/scripts/prewarm_cosmos3_aiter.py
           - >-
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh

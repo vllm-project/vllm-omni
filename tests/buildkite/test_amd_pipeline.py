@@ -3527,7 +3527,7 @@ def test_cosmos3_weekly_is_blocking_and_replaces_narrow_nightly_owner() -> None:
     assert step["agent_pool"] == "mi300_1"
     assert step["depends_on"] == "amd-build"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 360
+    assert step["timeout_in_minutes"] == 390
     assert step["source_file_dependencies"] == [
         "diffusion_cosmos3_function",
         ".buildkite/amd/scripts/prewarm_cosmos3_aiter.py",
@@ -3543,7 +3543,7 @@ def test_cosmos3_weekly_is_blocking_and_replaces_narrow_nightly_owner() -> None:
     )
     assert 'mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"' in step["commands"]
     prewarm_command = next(item for item in step["commands"] if "prewarm_cosmos3_aiter.py" in item)
-    assert "timeout --signal=TERM --kill-after=2m 55m" in prewarm_command
+    assert "timeout --signal=TERM --kill-after=2m 75m" in prewarm_command
     runner_command = next(item for item in step["commands"] if "run-rocm-diffusion-nightly.sh" in item)
     assert step["commands"].index(prewarm_command) < step["commands"].index(runner_command)
 
