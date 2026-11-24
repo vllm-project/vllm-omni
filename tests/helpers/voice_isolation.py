@@ -50,6 +50,7 @@ from tests.helpers.speaker_similarity import (
     embed_references,
     format_table,
     load_audio_16k,
+    load_opening_speech_check,
     min_margins,
     reference_matrix,
     retain_failed_voice_isolation,
@@ -264,10 +265,24 @@ class VoiceIsolationSuite:
         refs = {name: load_audio_16k(get_asset_path(rel)) for name, (rel, _) in self.voices.items()}
         return {
             "embedders": embedders,
+            "window_has_speech": load_opening_speech_check(),
             "refs": refs,
             "ref_emb": embed_references(refs, embedders),
             "ref_matrix": reference_matrix(refs, embedders),
         }
+
+    def score_outputs(self, outputs, scorers) -> tuple[list[OutputScore], list[OutputScore]]:
+        kwargs = {"reference_embeddings": scorers["ref_emb"]}
+        full = score(outputs, scorers["refs"], scorers["embedders"], **kwargs)
+        first = score(
+            outputs,
+            scorers["refs"],
+            scorers["embedders"],
+            window=self.first_window_s,
+            window_has_speech=scorers["window_has_speech"],
+            **kwargs,
+        )
+        return full, first
 
     def get_run(self, mode: str, source: str, concurrency: int, scorers) -> RunResult:
         key = (mode, source, concurrency)
@@ -279,9 +294,7 @@ class VoiceIsolationSuite:
         requests, audio, wall = gen["requests"], gen["audio"], gen["wall_s"]
 
         outputs = [(r["voice"], a) for r, a in zip(requests, audio)]
-        kwargs = {"reference_embeddings": scorers["ref_emb"]}
-        full = score(outputs, scorers["refs"], scorers["embedders"], window=None, **kwargs)
-        first = score(outputs, scorers["refs"], scorers["embedders"], window=self.first_window_s, **kwargs)
+        full, first = self.score_outputs(outputs, scorers)
 
         print(
             f"\n=== voice isolation: mode={mode} voices={source} concurrency={concurrency} "

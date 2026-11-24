@@ -54,7 +54,6 @@ from tests.helpers.speaker_similarity import (
     WAVLM_SV_MODEL,
     CampPlusEmbedder,
     WavLMSVEmbedder,
-    score,
 )
 from tests.helpers.stage_config import get_deploy_config_path
 from tests.helpers.voice_isolation import VoiceIsolationSuite, server_mode
@@ -88,7 +87,6 @@ SUITE = VoiceIsolationSuite(
     ],
 )
 CONCURRENCY = SUITE.concurrency
-FIRST_WINDOW_S = SUITE.first_window_s
 
 
 def _server_params(*extra_args: str):
@@ -200,16 +198,14 @@ def test_swapped_labels_fail_with_real_embedders(scorers) -> None:
     Input Setting: the 3 reference clips, labels of two of them swapped
     Datasets: tests/assets reference clips
     """
-    refs, embedders = scorers["refs"], scorers["embedders"]
+    refs = scorers["refs"]
     names = list(refs)
     # request index -> voice label the output of ``names[index]`` is (wrongly) sent under
     swapped = {1: "indextts2", 2: "jiayan_zh"}
     outputs = [(swapped.get(i, n), refs[n]) for i, n in enumerate(names)]
-    for window in (None, FIRST_WINDOW_S):
-        results = score(outputs, refs, embedders, window=window, reference_embeddings=scorers["ref_emb"])
+    for results in SUITE.score_outputs(outputs, scorers):
         labels = {r.idx: r.label for r in results}
         assert labels == {0: LABEL_CORRECT, 1: LABEL_WRONG_BOTH_AGREE, 2: LABEL_WRONG_BOTH_AGREE}, (
-            window,
             [r.to_dict() for r in results],
         )
         assert results[1].wrong_voice == "jiayan_zh" and results[2].wrong_voice == "indextts2"

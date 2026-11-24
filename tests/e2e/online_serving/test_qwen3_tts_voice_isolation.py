@@ -30,11 +30,20 @@ import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
+import numpy as np
 import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.speaker_similarity import WAVLM_SV_MODEL, CampPlusEmbedder, WavLMSVEmbedder
+from tests.helpers.speaker_similarity import (
+    LABEL_CORRECT,
+    LABEL_UNSCORABLE,
+    LABEL_WRONG_BOTH_AGREE,
+    SAMPLE_RATE,
+    WAVLM_SV_MODEL,
+    CampPlusEmbedder,
+    WavLMSVEmbedder,
+)
 from tests.helpers.stage_config import get_deploy_config_path
 from tests.helpers.voice_isolation import SOURCES, VoiceIsolationSuite
 
@@ -134,3 +143,26 @@ def test_voice_isolation_asr(monkeypatch) -> None:
     Input Setting: the outputs kept by the speaker tests of this module
     """
     SUITE.run_asr_check(monkeypatch)
+
+
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
+def test_noise_and_wrong_speaker_in_opening(scorers) -> None:
+    """Score two clips with the same target voice after the first two seconds.
+
+    Input Setting: a stationary noise opening and a spoken opening from another voice
+    Datasets: tests/assets reference clips
+    """
+    from scipy.signal import lfilter
+
+    target = "jiayan_zh"
+    other = "clone_2"
+    n = int(SUITE.first_window_s * SAMPLE_RATE)
+    noise = lfilter([1.0], [1.0, -0.9], np.random.default_rng(10608).standard_normal(n))
+    # Match the RMS of a low-level opening previously classified as a speaker.
+    noise *= 0.00156 / np.sqrt(np.mean(noise**2))
+    tail = np.tile(scorers["refs"][target], 3)
+    openings = [noise.astype(np.float32), scorers["refs"][other][:n]]
+    full, first = SUITE.score_outputs([(target, np.concatenate((opening, tail))) for opening in openings], scorers)
+    assert [r.label for r in full] == [LABEL_CORRECT, LABEL_CORRECT]
+    assert [r.label for r in first] == [LABEL_UNSCORABLE, LABEL_WRONG_BOTH_AGREE]
+    assert first[1].wrong_voice == other

@@ -1435,6 +1435,8 @@ source_file_dependencies:
     - vllm_omni/worker_v2/
     - vllm_omni/entrypoints/openai/serving_speech.py
     - tests/e2e/online_serving/test_cosyvoice3_voice_isolation.py
+    - tests/helpers/client.py
+    - vllm_omni/engine/duplex/vad.py
     - tests/helpers/speaker_similarity.py
     - tests/helpers/voice_isolation.py
 
@@ -1453,6 +1455,8 @@ source_file_dependencies:
     - tests/assets/glm_tts/jiayan_zh.wav
     - tests/assets/indextts2/ref_audio.wav
     - tests/e2e/online_serving/test_qwen3_tts_voice_isolation.py
+    - tests/helpers/client.py
+    - vllm_omni/engine/duplex/vad.py
     - tests/helpers/speaker_similarity.py
     - tests/helpers/voice_isolation.py
 
