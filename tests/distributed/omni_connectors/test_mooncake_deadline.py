@@ -81,6 +81,9 @@ def connectors(monkeypatch):
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
+        # The fake native engine represents an acknowledged-completion build;
+        # individual tests override the peer capability for rejection cases.
+        config.setdefault("native_tcp_proto_version", 2)
         c = module.MooncakeTransferEngineConnector({"host": "127.0.0.1", "role": role, "zmq_port": port, **config})
         made.append(c)
         return c
@@ -215,8 +218,9 @@ def test_tcp_capability_mismatch_rejects_before_native_submission(connectors):
 
 
 @pytest.mark.parametrize("protocol", ["tcp", "rdma"])
-@pytest.mark.parametrize("peer_capability", [1, 2])
-def test_sender_checks_tcp_completion_before_native_submission(connectors, monkeypatch, protocol, peer_capability):
+@pytest.mark.parametrize("peer_capability", [0, 1, 2])
+def test_sender_checks_completion_before_native_submission(connectors, monkeypatch, protocol, peer_capability):
+    monkeypatch.delenv("MC_FORCE_HCA", raising=False)
     monkeypatch.delenv("MC_FORCE_TCP", raising=False)
     sender = connectors("sender", protocol=protocol, native_tcp_proto_version=2)
     publish(sender)
@@ -227,8 +231,9 @@ def test_sender_checks_tcp_completion_before_native_submission(connectors, monke
     # safely instead of passing via a missing-source or length-mismatch rejection.
     destinations = [ctypes.create_string_buffer(size) for size in lengths]
     if protocol == "rdma":
-        # Exercise the sender-side defense after passing the startup guard.
-        monkeypatch.setenv("MC_FORCE_TCP", "1")
+        # A non-empty topology does not prove the effective transport: some
+        # native builds select TCP for an unforced RDMA request.
+        assert sender.engine.get_local_topology()
     ctx = zmq.Context()
     sock = ctx.socket(zmq.REQ)
     sock.setsockopt(zmq.RCVTIMEO, 2000)
@@ -308,7 +313,7 @@ def test_rdma_force_hca_receiver_requires_acknowledged_completion(connectors, mo
     monkeypatch.delenv("MC_FORCE_HCA", raising=False)
     sender = connectors("sender", protocol="rdma", native_tcp_proto_version=2)
     monkeypatch.setenv("MC_FORCE_HCA", "1")
-    monkeypatch.setattr(sender, "_requires_tcp_completion", lambda: False)
+    monkeypatch.setattr(sender, "_requires_acknowledged_completion", lambda: False)
     receiver = connectors(protocol="rdma", native_tcp_proto_version=2)
     metadata = publish(sender)
     metadata["native_tcp_proto_version"] = peer_capability

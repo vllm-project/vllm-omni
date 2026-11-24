@@ -31,6 +31,7 @@ connectors:
       host: "auto"                  # Auto-detect local RDMA IP
       zmq_port: 50051               # ZMQ base port (see "Port Offset Scheme" below)
       protocol: "rdma"              # "rdma" or "tcp"
+      native_tcp_proto_version: 2   # verified completion capability on both endpoints
       device_name: ""               # RDMA device (e.g., "mlx5_0"), empty for auto-detect
       memory_pool_size: 4294967296  # 4 GB (CPU); use 2147483648 (2 GB) for GPU
       memory_pool_device: "cpu"     # "cpu" for pinned memory (recommended), "cuda" for GPUDirect RDMA
@@ -74,22 +75,18 @@ stages:
 | `sender_host` | `None` | **Internal.** Receiver-side only — dynamically resolved via `update_sender_info()`. Not needed in YAML. |
 | `sender_zmq_port` | `None` | **Internal.** Receiver-side only — defaults to the sender's adjusted port. Not needed in YAML. |
 | `device_name` | `""` | RDMA device name (e.g., `"mlx5_0"`). Empty for auto-detect. Can also be set via `RDMA_DEVICE_NAME` env var. |
+| `native_tcp_proto_version` | `0` | Acknowledged-completion capability; set to `2` on both endpoints. |
 
 #### RDMA Transport Guard
 
-With `protocol: "rdma"`, connector startup verifies the local Mooncake
-topology before initializing the data engine. Startup fails when no HCA is
-available, when a configured `device_name` is not discovered, or when
-`MC_FORCE_TCP` is set. This prevents Mooncake from silently falling back to
-TCP, whose completion semantics may not protect a remote destination buffer.
+> **Required on both endpoints:** set `native_tcp_proto_version: 2` for
+> `protocol: "rdma"` or `protocol: "tcp"`. Missing or mismatched values are
+> rejected before a destination is published or native WRITE is submitted.
 
-Set `MC_FORCE_HCA=1` only when the native SDK must be the authority for
-RDMA-only initialization. This skips the Python topology probe, but does not
-prove the effective transport for every native build. For this transport-
-uncertain path, configure `native_tcp_proto_version: 2` on both endpoints
-after verifying acknowledged TCP support. Do not use `MC_FORCE_TCP` with
-`protocol: "rdma"`; use `protocol: "tcp"` instead and configure the same
-capability explicitly.
+For `protocol: "rdma"`, startup verifies local HCA availability unless
+`MC_FORCE_HCA=1` delegates that check to the native SDK; `MC_FORCE_TCP` is
+rejected. Topology discovery does not prove the effective transport, so the
+capability requirement applies even when an HCA is found.
 
 #### ZMQ Port Offset Scheme
 
@@ -738,17 +735,9 @@ The `receive_capacity_rejections` health metric and rate-limited warning make
 capacity pressure distinguishable from a payload that has not been published.
 
 Both peers must use connector protocol v2: `put()` metadata, metadata-query
-responses and transfer requests carry `protocol_version=2`. Old metadata is
-rejected before publishing a destination; unversioned requests are rejected
-before a write. Upgrade both endpoints together. Successful TCP writes require
-acknowledged SDK completion; legacy `MC_TCP_PROTO=1` is rejected.
-Because the Python binding does not expose the native peer's negotiated TCP
-capability, explicit TCP deployments and transport-uncertain RDMA deployments
-(`MC_FORCE_HCA=1`) must set `native_tcp_proto_version: 2` on both connectors
-after verifying the installed SDK/build supports Mooncake's acknowledged TCP
-framing. The value is exchanged in control metadata and a mismatch is rejected
-before publishing a destination or invoking native WRITE. RDMA deployments
-with a verified RDMA topology do not require this setting.
+responses and transfer requests carry `protocol_version=2`. Old metadata and
+legacy `MC_TCP_PROTO=1` are rejected before a write. See **RDMA Transport
+Guard** for the acknowledged-completion requirement.
 
 #### 11.3 Connector Shutdown
 

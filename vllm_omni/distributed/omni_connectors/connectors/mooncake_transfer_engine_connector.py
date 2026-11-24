@@ -230,16 +230,22 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._init_pool()
         self._init_listener(config)
 
-    def _requires_tcp_completion(self) -> bool:
-        """Return whether the effective native path may use TCP.
+    def _requires_acknowledged_completion(self) -> bool:
+        """Return whether the native path needs an ACK capability.
 
-        ``MC_FORCE_HCA`` skips the Python topology probe, but does not prove
-        that every Mooncake build will install an RDMA transport.  EFA/CXI
-        builds can select TCP for an ``rdma`` request, so both forced paths
-        require the acknowledged-completion capability handshake.
+        The Python binding does not expose the effective transport for a
+        submitted transfer.  In particular, EFA/CXI builds can select TCP
+        for an ``rdma`` request even when topology discovery finds an HCA.
+        Treat every RDMA request as transport-uncertain until the native SDK
+        exposes a stronger capability, and reuse the acknowledged-completion
+        handshake already used by TCP.
         """
-        return self.protocol.lower() == "tcp" or (
-            self.protocol.lower() == "rdma" and ("MC_FORCE_TCP" in os.environ or "MC_FORCE_HCA" in os.environ)
+        return self.protocol.lower() in {"tcp", "rdma"}
+
+    def _has_acknowledged_completion(self, peer_version: int | None) -> bool:
+        """Check the local and peer completion capability as one predicate."""
+        return not self._requires_acknowledged_completion() or (
+            self.native_tcp_proto_version == 2 and peer_version == 2
         )
 
     def _validate_rdma_transport(self) -> None:
@@ -252,7 +258,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             )
         # MC_FORCE_HCA requests HCA-backed initialization, but some native
         # builds may still select TCP for an ``rdma`` request.  Skip the
-        # Python topology probe here; _requires_tcp_completion() treats this
+        # Python topology probe here; the completion guard still treats this
         # path as uncertain and enforces the capability handshake.
         if "MC_FORCE_HCA" in os.environ:
             return
@@ -861,10 +867,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             return None
         if metadata.get("protocol_version") != _PROTOCOL_VERSION:
             raise RuntimeError("Mooncake deadline receive requires protocol v2 on both peers")
-        if self._requires_tcp_completion() and (
-            metadata.get("native_tcp_proto_version") != 2 or self.native_tcp_proto_version != 2
-        ):
-            raise RuntimeError("Mooncake TCP acknowledged completion is not available on both peers")
+        if not self._has_acknowledged_completion(metadata.get("native_tcp_proto_version")):
+            raise RuntimeError("Mooncake acknowledged completion is not available on both peers")
 
         _t1 = _time_mod.perf_counter()
         query_ms = (_t1 - _t0) * 1000
@@ -1466,9 +1470,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             if meta.protocol_version != _PROTOCOL_VERSION:
                 response = TRANS_ERROR
                 return
-            if self._requires_tcp_completion() and (
-                meta.native_tcp_proto_version != 2 or self.native_tcp_proto_version != 2
-            ):
+            if not self._has_acknowledged_completion(meta.native_tcp_proto_version):
                 response = TRANS_NOT_SUBMITTED
                 return
             with self._state_lock:
