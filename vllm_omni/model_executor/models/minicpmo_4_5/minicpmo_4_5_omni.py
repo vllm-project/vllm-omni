@@ -402,11 +402,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         }
         # Per-row capture context and the derived per-request generators.
         self._minicpmo45_duplex_row_request_ids = {row.row_idx: row.request_id for row in rows}
+        # The third field is the envelope seq (frozen at request creation); the
+        # capture seq advances per stashed unit from it.
         self._minicpmo45_duplex_row_identity = {
             row.row_idx: (row.session_id, self._minicpmo45_duplex_row_epoch(row), row.seq) for row in rows
         }
         self._minicpmo45_duplex_row_capture = self._minicpmo45_duplex_row_capture_configs(rows)
-        self._minicpmo45_duplex_capture_generators = self._minicpmo45_duplex_make_capture_generators(rows)
+        self._minicpmo45_duplex_capture_generators = self._minicpmo45_duplex_make_capture_generators(
+            rows, device=logits.device
+        )
+        # Rows masked to p(listen)=1 this step: their units are forced, not sampled.
+        pinned_rows: set[int] = set()
+        self._minicpmo45_force_listen_pinned_rows = pinned_rows
         if self.model_stage != "llm" or not rows or logits.ndim != 2:
             return
 
@@ -460,6 +467,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 logits[row_idx].fill_(float("-inf"))
                 logits[row_idx].narrow(0, listen_id, 1).fill_(0.0)
                 force_listen_segments.add(segment_key)
+                pinned_rows.add(row_idx)
 
     # -------------------- Device utilities --------------------
     @staticmethod
@@ -1227,13 +1235,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     sessions.pop(session_key, None)
                     finished_sessions.add(session_key)
         for session_key in finished_sessions:
-            # The session's derived capture generators die with it.
+            # The session's derived capture generators and seq counters die with it.
             state = getattr(self, "_minicpmo45_duplex_capture_generator_state", None)
             if state:
                 prefix = f"{session_key}:"
                 for key in [key for key in state if key.startswith(prefix)]:
                     state.pop(key, None)
                     getattr(self, "_minicpmo45_duplex_capture_seed_by_key", {}).pop(key, None)
+            seqs = getattr(self, "_minicpmo45_duplex_capture_seq", None)
+            if isinstance(seqs, dict):
+                seqs.pop(session_key, None)
         forced_segments = getattr(self, "_minicpmo45_force_listen_applied_segments", None)
         if isinstance(forced_segments, set):
             finished = set(finished_req_ids)
@@ -1280,14 +1291,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         return configs
 
     def _minicpmo45_duplex_make_capture_generators(
-        self, rows: tuple[DuplexSamplingRow, ...]
+        self, rows: tuple[DuplexSamplingRow, ...], *, device: torch.device | None = None
     ) -> dict[int, tuple[str, torch.Generator]]:
         """Derived per-request generators, one per (session, epoch, response_index):
-        a new response re-derives the seed; a fixed seed replays identically."""
+        a new response re-derives the seed; a fixed seed replays identically.
+
+        The generators live on ``device``, the step's logits device where the
+        draws run; without a tensor at hand, the module's parameter device."""
         capture_rows = self._minicpmo45_duplex_row_capture
         if not capture_rows:
             return {}
-        device = getattr(self, "device", None)
+        if device is None:
+            device = self._module_device(self)
         generators: dict[int, tuple[str, torch.Generator]] = {}
         existing = getattr(self, "_minicpmo45_duplex_capture_generator_state", None) or {}
         if not hasattr(self, "_minicpmo45_duplex_capture_seed_by_key"):
@@ -1682,16 +1697,20 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
                 resolved[row_idx] = self._finalize_minicpmo45_native_duplex_sample(row_idx, sampled, token_ids)
         if capture_rows:
+            pinned = getattr(self, "_minicpmo45_force_listen_pinned_rows", None) or frozenset()
             for row_idx in capture_rows:
+                # Masked to p(listen)=1 before the draw: an override, not a
+                # policy decision. A cap that resolved the row first still wins.
+                forced_listen = row_idx in pinned and row_idx not in capped_reasons
                 self._minicpmo45_duplex_capture_row(
                     row_idx,
                     resolved[row_idx],
                     token_ids,
                     row_params,
-                    reason=capped_reasons.get(row_idx),
-                    boundary_prob=boundary_probs.get(row_idx),
-                    stage2_logprob=stage2_logprobs.get(row_idx),
-                    raw_sampled=raw_sampled.get(row_idx),
+                    reason="force_listen" if forced_listen else capped_reasons.get(row_idx),
+                    boundary_prob=None if forced_listen else boundary_probs.get(row_idx),
+                    stage2_logprob=None if forced_listen else stage2_logprobs.get(row_idx),
+                    raw_sampled=None if forced_listen else raw_sampled.get(row_idx),
                 )
         return [int(resolved[row_idx]) for row_idx in row_idxs]
 
@@ -1705,6 +1724,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         session_id, epoch, seq = identity
         if not session_id or seq is None:
             return
+        seq = self._minicpmo45_duplex_next_capture_seq(session_id, epoch, seq)
         self._minicpmo45_duplex_capture_stash(
             row_idx,
             build_unit_payload(
@@ -1729,6 +1749,27 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if not capture:
             return []
         return [row_idx for row_idx in row_idxs if row_idx in capture]
+
+    def _minicpmo45_duplex_next_capture_seq(self, session_id: str, epoch: int | None, envelope_seq: int) -> int:
+        """The capture ``seq`` of the next stashed unit of ``(session_id, epoch)``.
+
+        The envelope seq is frozen at request creation, so every unit of a
+        response would repeat it and the ledger's per-scope monotonicity check
+        rejects the second. A strictly monotone counter per session epoch
+        replaces it: the first unit takes the envelope seq itself (the ledger
+        joins a unit to its input annotation by that seq), each later unit is
+        one more, and a request whose envelope seq outran the counter lifts it.
+        A new epoch is a new counter, as ledger scopes never span epochs.
+        """
+        counters = getattr(self, "_minicpmo45_duplex_capture_seq", None)
+        if not isinstance(counters, dict):
+            counters = {}
+            self._minicpmo45_duplex_capture_seq = counters
+        per_epoch = counters.setdefault(session_id, {})
+        key = epoch if epoch is not None else 0
+        seq = max(per_epoch.get(key, 0), envelope_seq - 1) + 1
+        per_epoch[key] = seq
+        return seq
 
     def _minicpmo45_duplex_capture_effective_seed(self, row_idx: int) -> int | None:
         """The derived generator seed of a capture row, when the session set one."""
@@ -1785,12 +1826,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     ) -> dict[str, Any] | None:
         """Assemble one row's unit payload. The universal ``logprob`` is the joint
         (``log P(chunk_eos)`` for a boundary hit, else ``log(1-P) + stage-2``) —
-        per-stage quantities ride the ``model`` extension; capped rows record no draw."""
+        per-stage quantities ride the ``model`` extension; forced rows record no draw."""
         from vllm_omni.protocol.duplex.action_records import ACTION_FORCED, ACTION_SAMPLED, build_unit_payload
 
         session_id, epoch, seq = identity
         if not session_id or seq is None:
             return None
+        seq = self._minicpmo45_duplex_next_capture_seq(session_id, epoch, seq)
         chunk_eos_id = int(token_ids.get("chunk_eos_token_id", -1))
         temperature, top_k, top_p = params
 

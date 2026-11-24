@@ -7,12 +7,14 @@ The parity test recomputes every recorded log-probability independently from
 the recorded distribution inputs (raw-softmax Bernoulli, forbidden mask,
 repetition penalty, top-k/top-p renormalized stage 2) and must match within
 tolerance on all sampled tokens. Taxonomy, seeded replay, cap-without-draw,
-and same-step publication are pinned beside it.
+force-listen-without-draw, same-step publication, the generator device and
+the per-unit capture seq are pinned beside it.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,6 +27,7 @@ from tests.model_executor.models.minicpmo_4_5.test_native_duplex_sampling import
     TTS_PAD,
     _setup,
 )
+from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.protocol.duplex.action_records import decode_unit_payload
@@ -32,6 +35,22 @@ from vllm_omni.protocol.duplex.action_records import decode_unit_payload
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 Model = minicpmo_4_5_omni.MiniCPMO45OmniForConditionalGeneration
+
+
+def _capture_row(
+    row: int, *, seq: int | None = None, epoch: int = 0, payload: dict[str, object] | None = None
+) -> DuplexSamplingRow:
+    """A capture-on row as ``DuplexSamplingHelper.rows`` builds it from the request envelope."""
+    return DuplexSamplingRow(
+        row_idx=row,
+        request_id=f"req-{row}",
+        session_id="sess-capture",
+        seq=100 + row if seq is None else seq,
+        payload=payload,
+        max_tokens=None,
+        epoch=epoch,
+        action_capture={"enabled": True, "seed": 11, "response_index": 0},
+    )
 
 
 def _enable_capture(model, *, seed: int | None = 11, response_index: int = 0, rows: range = range(6)) -> None:
@@ -42,19 +61,7 @@ def _enable_capture(model, *, seed: int | None = 11, response_index: int = 0, ro
     model._minicpmo45_duplex_row_request_ids = {row: f"req-{row}" for row in rows}
     model._minicpmo45_duplex_row_identity = {row: ("sess-capture", 0, 100 + row) for row in rows}
     model._minicpmo45_duplex_capture_generators = model._minicpmo45_duplex_make_capture_generators(
-        tuple(
-            SimpleNamespace(
-                row_idx=row,
-                request_id=f"req-{row}",
-                session_id="sess-capture",
-                seq=100 + row,
-                payload=None,
-                max_tokens=None,
-                epoch=0,
-                action_capture={"enabled": True, "seed": seed, "response_index": response_index},
-            )
-            for row in rows
-        )
+        tuple(_capture_row(row) for row in rows), device=torch.device("cpu")
     )
 
 
@@ -238,3 +245,149 @@ def test_capture_rows_force_the_synchronous_path() -> None:
         else:
             assert payload["reason_codes"][0]
     assert tokens
+
+
+_DEVICES = [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")),
+]
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_capture_generators_live_on_the_logits_device(device: str) -> None:
+    """The boundary and stage-2 draws run on the logits device with these generators.
+
+    A CPU generator (the former default: no device was ever sourced) makes the
+    first ``torch.rand(..., device=logits.device)`` raise on an accelerator."""
+    model, _, _, _ = _setup(0)
+    model._minicpmo45_duplex_row_capture = {row: {"enabled": True, "seed": 11, "response_index": 0} for row in range(6)}
+    logits = torch.empty(0, device=device)
+    generators = model._minicpmo45_duplex_make_capture_generators(
+        tuple(_capture_row(row) for row in range(6)), device=logits.device
+    )
+    assert set(generators) == set(range(6))
+    assert all(generator.device == logits.device for _, generator in generators.values())
+    # Reusing the derived generator of a (session, epoch, response) keeps its device.
+    again = model._minicpmo45_duplex_make_capture_generators(
+        tuple(_capture_row(row) for row in range(6)), device=logits.device
+    )
+    assert all(again[row][1] is generators[row][1] for row in range(6))
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_capture_generators_fall_back_to_the_module_parameter_device(device: str) -> None:
+    """Without a tensor at hand, the module's parameter device is the draw device."""
+    model, _, _, _ = _setup(0)
+    torch.nn.Module.__init__(model)
+    model.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1, device=device)))
+    model.register_buffer("spare", torch.zeros(1, dtype=torch.bool, device=device))
+    model._minicpmo45_duplex_row_capture = {0: {"enabled": True, "seed": 11, "response_index": 0}}
+    generators = model._minicpmo45_duplex_make_capture_generators((_capture_row(0),))
+    assert generators[0][1].device == model._parameters["anchor"].device
+
+
+def test_capture_seq_advances_per_unit_within_a_session_epoch() -> None:
+    """The envelope seq is frozen at request creation; the capture seq is not.
+
+    Every unit of one (session, epoch) repeats the frozen envelope seq, and the
+    ledger rejects the second (``seq N is not after N`` per scope). The capture
+    seq seeds at the envelope seq (the ledger joins a unit to its input
+    annotation by it), advances per stashed unit, lifts to a later request's
+    envelope seq when that outran the counter, and restarts with a new epoch:
+    ledger scopes never span epochs.
+    """
+    model, _, md, steps = _setup(0)
+    rows = (_capture_row(0, seq=7), *(replace(_capture_row(row), action_capture=None) for row in range(1, 6)))
+    seqs = []
+    for logits in steps:
+        model.prepare_duplex_sampling(logits, md, rows)
+        model._sample_minicpmo45_native_duplex_stage0(logits.clone(), md, duplex_rows=list(range(6)))
+        seqs.append(decode_unit_payload(_published(model)["req-0"])["seq"])
+    assert model._minicpmo45_duplex_row_identity[0] == ("sess-capture", 0, 7)
+    assert seqs[0] == 7
+    assert seqs[1] == seqs[0] + 1
+
+    def sample_req0(epoch: int, seq: int | None) -> int:
+        step = tuple(replace(rows[row], epoch=epoch, seq=seq) if row == 0 else rows[row] for row in range(6))
+        model.prepare_duplex_sampling(steps[0], md, step)
+        model._sample_minicpmo45_native_duplex_stage0(steps[0].clone(), md, duplex_rows=list(range(6)))
+        return decode_unit_payload(_published(model)["req-0"])["seq"]
+
+    assert sample_req0(epoch=0, seq=7) == seqs[1] + 1  # same request: the counter resumes
+    assert sample_req0(epoch=0, seq=20) == 20  # a later request whose envelope seq outran the counter
+    assert sample_req0(epoch=0, seq=7) == 21  # ... and the counter stays above it
+    assert sample_req0(epoch=1, seq=3) == 3  # a new epoch restarts at its own envelope seq
+
+
+def test_finished_session_frees_its_capture_seq_counter() -> None:
+    model, _, _, _ = _setup(0)
+    model.model = SimpleNamespace()
+    model._minicpmo45_duplex_capture_seq = {"sid-a": {0: 4}, "sid-b": {0: 9}}
+    model._minicpmo45_duplex_request_sessions = {"req-a": "sid-a"}
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={"sid-a": object(), "sid-b": object()})
+    model.on_requests_finished({"req-a"})
+    assert model._minicpmo45_duplex_capture_seq == {"sid-b": {0: 9}}
+
+
+@pytest.mark.parametrize("source", ["payload", "turn_ended"])
+def test_capture_records_force_listen_as_forced_without_logprob(source: str) -> None:
+    """A row the force-listen policy masked to p(listen)=1 is an override, not a decision.
+
+    Both forcing classes pin the same way: the payload's ``force_listen`` flag
+    (VAD speech) and the turn-ended latch on a silent unit. Sampled as-is, the
+    pinned distribution yields ``sampled`` with logprob exactly 0 (log 1):
+    indistinguishable from the policy choosing to listen. The record is
+    ``forced``/``force_listen`` with the protocol's no-draw logprob slot. Only
+    the record changes: the draws still run, so the generator advances as
+    before (the trainer's replay mirrors that sequence) and the other rows'
+    records are those of the same step without the mask.
+    """
+    forced = {0, 4}  # a sampled row and a greedy one: the mask, not the argmax, decides
+    records: dict[bool, tuple[list[int], dict[str, dict[str, Any]]]] = {}
+    pinned_rows: dict[bool, set[int]] = {}
+    for pinned in (False, True):
+        model, _, md, steps = _setup(0)
+        if source == "turn_ended":
+            # The latch forces a silent unit to listen; pending speech releases it.
+            model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(
+                sessions={"sess-capture": SimpleNamespace(current_turn_ended=True, pending_speech_context=not pinned)}
+            )
+            payload: dict[str, object] | None = {"is_speech": False}
+        else:
+            payload = {"force_listen": pinned}
+        rows = tuple(_capture_row(row, payload=payload if row in forced else None) for row in range(6))
+        model._minicpmo45_duplex_payload_for_row = lambda row, rows=rows: rows[row].payload
+        logits = steps[0].clone()
+        model.prepare_duplex_sampling(logits, md, rows)
+        pinned_rows[pinned] = getattr(model, "_minicpmo45_force_listen_pinned_rows", set())
+        before = {row: gen.get_state().clone() for row, (_, gen) in model._minicpmo45_duplex_capture_generators.items()}
+        out = model._sample_minicpmo45_native_duplex_stage0(logits, md, duplex_rows=list(range(6)))
+        records[pinned] = (
+            out.sampled_token_ids.squeeze(-1).tolist(),
+            {k: decode_unit_payload(v) for k, v in _published(model).items()},
+        )
+        if pinned:
+            assert all(
+                not torch.equal(model._minicpmo45_duplex_capture_generators[row][1].get_state(), before[row])
+                for row in forced
+            )
+
+    tokens, entries = records[True]
+    baseline_tokens, baseline = records[False]
+    for row in forced:
+        record = entries[f"req-{row}"]
+        assert tokens[row] == LISTEN
+        assert record["token_ids"] == [LISTEN]
+        assert record["action_kinds"] == ["forced"]
+        assert record["reason_codes"] == ["force_listen"]
+        assert record["logprobs"] == [None]
+        extension = record["model"]["minicpmo_duplex"]
+        assert "stage0_prob_chunk_eos" not in extension
+        assert "stage2_logprob" not in extension
+        assert "sampled_token" not in extension
+        assert record["terminators"] == [{"token_id": LISTEN, "kind": "listen"}]
+    for row in set(range(6)) - forced:
+        assert tokens[row] == baseline_tokens[row]
+        assert entries[f"req-{row}"] == baseline[f"req-{row}"]
+    # The mask is per step: a step without it pins nothing.
+    assert pinned_rows == {False: set(), True: forced}
