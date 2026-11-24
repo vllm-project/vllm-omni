@@ -1,14 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""NPU patches for the MiniMax H3 text encoder and diffusion transformer."""
+"""NPU patches for the MiniMax H3 Qwen3-VL text encoder."""
 
 from __future__ import annotations
 
-import json
-import os
-from importlib.util import find_spec
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -21,8 +17,6 @@ from vllm_omni.platforms.npu.layers.rotary_embedding import (
 )
 
 logger = init_logger(__name__)
-
-_QKV = "EagleSplitNormRopeConcat"
 
 _ROPE_PATCHED = False
 _SDPA_PATCHED = False
@@ -120,48 +114,3 @@ def apply_minimax_h3_qwen3vl_swiglu_patch() -> None:
 
     encoder.MiniMaxH3Qwen3VLTextMLP.forward = _forward_minimax_h3_qwen3vl_text_mlp_npu  # type: ignore[method-assign]
     _SWIGLU_PATCHED = True
-
-
-def supports_minimax_h3_eagle_qkv(early_opp_paths: frozenset[str]) -> bool:
-    """Check for an early-registered EagleSplitNormRopeConcat BF16 kernel on this SoC."""
-    if not early_opp_paths:
-        return False
-    try:
-        from vllm_ascend.utils import get_ascend_device_type
-
-        soc = {"A2": "ascend910b", "A5": "ascend950"}.get(get_ascend_device_type().name)
-    except (ImportError, KeyError, RuntimeError):
-        return False
-    if soc is None:
-        return False
-
-    sdk = find_spec("mindiesd")
-    if sdk is None or sdk.origin is None:
-        return False
-    vendor = (Path(sdk.origin).parent / "ops/vendors/aie_ascendc").resolve()
-    active_paths = early_opp_paths.intersection(os.getenv("ASCEND_CUSTOM_OPP_PATH", "").split(os.pathsep))
-    if not any(Path(path).resolve() == vendor for path in active_paths):
-        return False
-
-    tbe = vendor / "op_impl/ai_core/tbe"
-    kernels = tbe / "kernel"
-    try:
-        op_info = json.loads((tbe / "config" / soc / f"aic-{soc}-ops-info.json").read_text(encoding="utf-8"))
-        if not isinstance(op_info, dict) or _QKV not in op_info:
-            return False
-        index = json.loads((kernels / "config" / soc / "binary_info_config.json").read_text(encoding="utf-8"))
-        binaries = index[_QKV]["binaryList"]
-    except (OSError, ValueError, TypeError, KeyError):
-        return False
-    if not isinstance(binaries, list):
-        return False
-    for entry in binaries:
-        try:
-            if not (kernels / entry["binPath"]).is_file():
-                continue
-            info = json.loads((kernels / entry["jsonPath"]).read_text(encoding="utf-8"))["supportInfo"]
-            if info["inputs"][0]["dtype"] == info["outputs"][0]["dtype"] == "bfloat16":
-                return True
-        except (OSError, ValueError, TypeError, KeyError, IndexError):
-            continue
-    return False
