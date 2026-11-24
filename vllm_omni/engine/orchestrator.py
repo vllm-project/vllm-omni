@@ -83,6 +83,7 @@ from vllm_omni.engine.stage_client import DiffusionSubmitKwargs
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
+from vllm_omni.lora.inventory import LORA_ADAPTERS_RPC
 from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
@@ -466,6 +467,7 @@ class OrchestratorBase:
         self._stage_input_submission_locks: dict[int, asyncio.Lock] = {}
 
         self._shutdown_event = asyncio.Event()
+        self._inventory_rpc_tasks: set[asyncio.Task[None]] = set()
         self._stages_shutdown = False
         self._event_driven_orch = _event_driven_orch_enabled()
 
@@ -596,6 +598,9 @@ class OrchestratorBase:
             raise
         finally:
             self._shutdown_event.set()
+            inventory_tasks = list(self._inventory_rpc_tasks)
+            for task in inventory_tasks:
+                task.cancel()
             for task in tasks:
                 if not task.done():
                     task.cancel()
@@ -603,6 +608,8 @@ class OrchestratorBase:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except Exception:
                 pass
+            if inventory_tasks:
+                await asyncio.gather(*inventory_tasks, return_exceptions=True)
             for state in self.request_states.values():
                 if state.trace is not None:
                     state.trace.fail("engine_shutdown")
@@ -698,7 +705,15 @@ class OrchestratorBase:
             if msg_type == "abort":
                 await self._handle_abort(msg)
             elif msg_type == "collective_rpc":
-                await self._handle_collective_rpc(msg)
+                if isinstance(msg, CollectiveRPCRequestMessage) and msg.method == LORA_ADAPTERS_RPC:
+                    task = asyncio.create_task(
+                        self._handle_collective_rpc(msg),
+                        name=f"orchestrator-lora-inventory-{msg.rpc_id}",
+                    )
+                    self._inventory_rpc_tasks.add(task)
+                    task.add_done_callback(self._inventory_rpc_tasks.discard)
+                else:
+                    await self._handle_collective_rpc(msg)
             elif isinstance(msg, RegisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_register(msg.stage_id, msg.replica_id)
@@ -905,6 +920,30 @@ class OrchestratorBase:
                     logger.warning("[Orchestrator] collective_rpc: ignoring invalid stage_id %s", lid)
                     continue
                 target_pools.append(self.stage_pools[lid])
+
+        if method == LORA_ADAPTERS_RPC:
+            targets = [(pool, replica_id) for pool in target_pools for replica_id in pool.live_replica_ids()]
+            results = await asyncio.gather(
+                *(
+                    pool.collective_rpc(
+                        replica_id=replica_id,
+                        method=method,
+                        timeout=timeout,
+                        args=args,
+                        kwargs=kwargs,
+                    )
+                    for pool, replica_id in targets
+                )
+            )
+            await self.rpc_async_queue.put(
+                CollectiveRPCResultMessage(
+                    rpc_id=rpc_id,
+                    method=method,
+                    stage_ids=[pool.stage_id for pool, _ in targets],
+                    results=list(results),
+                )
+            )
+            return
 
         results: list[Any] = []
         stage_ids: list[int] = []

@@ -148,7 +148,9 @@ The runtime LoRA inventory RPC is a read-only control query. Stage pools attach
 logical stage and physical replica identity to its results, while worker ranks
 are merged within their owning replica. A failed inventory query produces a
 query-scoped error; it must not terminate the orchestrator or mutate request
-routing and adapter state.
+routing and adapter state. Inventory queries are dispatched as tracked
+background control tasks, and live replica queries are fanned out concurrently
+so a slow inventory request does not block generation or abort handling.
 
 ## Promotion gate
 

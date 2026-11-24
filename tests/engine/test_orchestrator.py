@@ -61,6 +61,7 @@ from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
+from vllm_omni.lora.inventory import LORA_ADAPTERS_RPC
 from vllm_omni.metrics.stats import StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
@@ -3706,6 +3707,45 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
         assert "collective_rpc: ignoring invalid stage_id 99" in caplog.text
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_inventory_rpc_does_not_block_request_handler() -> None:
+    request_queue: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=request_queue,
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+    )
+    inventory_started = asyncio.Event()
+    release_inventory = asyncio.Event()
+
+    async def slow_inventory(_msg):
+        inventory_started.set()
+        await release_inventory.wait()
+
+    orchestrator._handle_collective_rpc = slow_inventory  # type: ignore[method-assign]
+    request_task = asyncio.create_task(orchestrator._request_handler())
+    try:
+        await request_queue.put(
+            CollectiveRPCRequestMessage(
+                rpc_id="rpc-inventory",
+                method=LORA_ADAPTERS_RPC,
+                timeout=1.0,
+                args=(),
+                kwargs={},
+                stage_ids=None,
+            )
+        )
+        await asyncio.wait_for(inventory_started.wait(), timeout=1.0)
+        await request_queue.put(ShutdownRequestMessage())
+        await asyncio.wait_for(request_task, timeout=1.0)
+    finally:
+        release_inventory.set()
+        for task in list(orchestrator._inventory_rpc_tasks):
+            task.cancel()
+        await asyncio.gather(*orchestrator._inventory_rpc_tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio
