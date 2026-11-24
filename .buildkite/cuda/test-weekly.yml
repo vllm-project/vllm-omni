@@ -79,8 +79,11 @@ steps:
           VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         # One pytest process. File order is the boot order: offline VoxCPM2,
         # then the four vanilla online cases in test_voxcpm2_tts.py, then LoRA,
-        # then Voxtral. pytest still continues after a failed test. A crash
-        # that kills the process stops the rest of this job.
+        # then Voxtral. pytest still continues after a failed test.
+        # --continue-on-collection-errors runs modules that collected cleanly
+        # when another module fails to import or collect, and the job still
+        # fails for that collection error. A crash that kills the process
+        # stops the rest of this job.
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -93,6 +96,7 @@ steps:
             tests/e2e/offline_inference/test_voxtral_tts_expansion.py
             tests/e2e/online_serving/test_voxtral_tts_expansion.py
             -m "slow and L4 and tts" --run-level "full_model"
+            --continue-on-collection-errors
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: E2E Tests"
