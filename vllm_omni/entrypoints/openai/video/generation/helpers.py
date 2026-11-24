@@ -810,8 +810,8 @@ def _validate_h3_control_uploads(
         reject("control_type=inpaint requires mask_reference.")
     if has_references:
         reject(
-            "MiniMax H3 control cannot be combined with input/image/video/audio references, "
-            "keyframes, or latent-mask editing."
+            "MiniMax H3 control cannot be combined with keyframes or latent-mask editing, "
+            "or with input/image/video/audio references outside task=ref2va."
         )
     config = extras.get(selected, {})
     if not isinstance(config, Mapping):
@@ -1333,14 +1333,21 @@ async def _parse_video_form(
                 control_type,
                 source_reference,
                 mask_reference,
-                has_references=bool(input_references)
-                or any(
-                    item is not None
-                    for item in (
-                        input_reference,
-                        parsed_image_reference,
-                        parsed_video_reference,
-                        parsed_audio_reference,
+                # Ref2VA references may accompany control; the pipeline checks the task its
+                # checkpoint takes control with (Ref2VA only on FastH3 Omni, T2VA otherwise).
+                has_references=(
+                    str((request.extra_params or {}).get("task", "")).lower() != "ref2va"
+                    and (
+                        bool(input_references)
+                        or any(
+                            item is not None
+                            for item in (
+                                input_reference,
+                                parsed_image_reference,
+                                parsed_video_reference,
+                                parsed_audio_reference,
+                            )
+                        )
                     )
                 )
                 or has_latent_edit,

@@ -16,8 +16,8 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-# CPU unit tests are marked core_model + cpu. The multi-GPU correctness test at
-# the end uses hardware_test (H100 x2) plus full_model / diffusion / parallel.
+# CPU unit tests are marked core_model + cpu. The full-model tests exercise
+# spatially sharded decode across two GPUs.
 
 
 @pytest.mark.core_model
@@ -686,10 +686,11 @@ def _spatial_shard_decode_worker(rank: int, split_dim: str, return_dict, master_
             vae.set_parallel_size(1, mode="tile")
             reference = vae.decode(latents, return_dict=False)[0].float()
 
-            # Spatially-sharded decode across the full group (requires tiling to enter tiled_decode).
+            # Check the actual decoder split so a fallback cannot compare the reference to itself.
             vae.use_tiling = True
             vae.set_parallel_size(_SPATIAL_SHARD_WORLD_SIZE, mode=f"spatial_shard_{split_dim}")
             sharded = vae.decode(latents, return_dict=False)[0].float()
+            assert getattr(vae, "_vllm_omni_wan_spatial_shard_split_dim", None) == split_dim
 
         # Only rank 0 assembles the full decoded sample (matching broadcast_result=False);
         # non-zero ranks return an empty placeholder, so the comparison runs on rank 0 only.
@@ -788,7 +789,7 @@ def _streaming_shard_worker(rank: int, return_dict, master_port: str) -> None:
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=_SPATIAL_SHARD_WORLD_SIZE)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=_SPATIAL_SHARD_WORLD_SIZE)
 def test_streaming_shard_decode_matches_unsharded_streaming_on_every_rank():
     manager = mp.get_context("spawn").Manager()
     return_dict = manager.dict()
@@ -806,7 +807,7 @@ def test_streaming_shard_decode_matches_unsharded_streaming_on_every_rank():
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=_SPATIAL_SHARD_WORLD_SIZE)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=_SPATIAL_SHARD_WORLD_SIZE)
 @pytest.mark.parametrize("split_dim", ["height", "width"])
 def test_spatial_shard_decode_matches_reference(split_dim: str):
     manager = mp.get_context("spawn").Manager()
