@@ -567,7 +567,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             result = helper._stage_prefill_embeddings_only(state, audio_waveform, **prefill_kwargs)
         update_result = dict(result)
         update_result["duplex_explicit_reply"] = (
-            prefill_kwargs["final"] and payload.get("_native_explicit_reply") is True
+            duplex.get("final") is True and payload.get("_native_explicit_reply") is True
         )
         if result.get("stage0_window_replaced") is True:
             window = duplex.get("stage0_window", {})
