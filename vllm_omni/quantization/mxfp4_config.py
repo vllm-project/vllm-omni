@@ -57,6 +57,7 @@ Reference: MindIE-SD W4A4MXFP4QuantLinear / W4A4MXFP4DualQuantLinear (mindiesd/q
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import regex as re
@@ -91,6 +92,65 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class MXFP4BF16Master:
+    """Caller-owned transposed BF16 master used only during prefix steps."""
+
+    weight: torch.Tensor
+    mode: str
+
+
+class MXFP4BF16Fallback:
+    """Framework-local BF16 prefix policy for online single-scale MXFP4."""
+
+    def __init__(self, steps: int, master_mode: str) -> None:
+        self.steps = steps
+        self.master_mode = "cpu" if master_mode == "dlo" else master_mode
+
+    def prepare_master(self, weight: torch.Tensor) -> MXFP4BF16Master:
+        source = weight.detach()
+        master = source.to(device="cpu", dtype=torch.bfloat16).transpose(0, 1).contiguous()
+        if self.master_mode == "resident":
+            if source.device.type != "npu":
+                raise RuntimeError("Resident BF16 master must be prepared on the loading NPU")
+            master = master.to(device=source.device)
+        return MXFP4BF16Master(weight=master, mode=self.master_mode)
+
+    def use_bf16(self, step_idx: int | None) -> bool:
+        return step_idx is not None and 0 <= step_idx < self.steps
+
+    def apply(
+        self,
+        master: object,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+        ori_dtype: torch.dtype,
+        step_idx: int | None,
+    ) -> torch.Tensor | None:
+        if not self.use_bf16(step_idx):
+            return None
+        if not isinstance(master, MXFP4BF16Master):
+            raise RuntimeError("BF16 prefix requested without a materialized MXFP4 master")
+        if master.weight.numel() == 0:
+            raise RuntimeError("BF16 prefix master is not materialized")
+        if master.mode == "resident" and master.weight.device != x.device:
+            raise RuntimeError("Resident BF16 master and activation device mismatch")
+        weight = master.weight.to(device=x.device, dtype=x.dtype)
+        output = torch.matmul(x, weight)
+        if bias is not None:
+            output = output + bias.to(device=output.device, dtype=output.dtype)
+        return output.to(dtype=ori_dtype)
+
+
+def _current_denoise_step() -> int | None:
+    from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+    if not is_forward_context_available():
+        return None
+    step = get_forward_context().denoise_step_idx
+    return None if step is None else int(step)
 
 
 def _validate_w4a8_fallback_steps(steps: list[int] | None) -> list[int]:
@@ -160,8 +220,20 @@ class DiffusionMXFP4Config(QuantizationConfig):
         require_smooth_scale: bool = False,
         w4a8_fallback_layers: list[str] | None = None,
         mxfp4_scale_alg: int = 0,
+        prefix_bf16_steps: int = 0,
+        prefix_bf16_master_mode: str = "cpu",
     ) -> None:
         super().__init__()
+        if isinstance(prefix_bf16_steps, bool) or not isinstance(prefix_bf16_steps, int):
+            raise TypeError("prefix_bf16_steps must be an integer")
+        if prefix_bf16_steps < 0:
+            raise ValueError("prefix_bf16_steps must be non-negative")
+        if prefix_bf16_master_mode not in ("cpu", "resident", "dlo"):
+            raise ValueError(f"Unknown MXFP4 prefix master mode: {prefix_bf16_master_mode}")
+        if is_checkpoint_mxfp4_serialized and prefix_bf16_steps:
+            raise ValueError("BF16 prefix fallback currently requires online MXFP4 weights")
+        self.prefix_bf16_steps = prefix_bf16_steps
+        self.prefix_bf16_master_mode = prefix_bf16_master_mode
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers or []
         self.w4a8_fallback_steps = _validate_w4a8_fallback_steps(w4a8_fallback_steps)
@@ -208,6 +280,8 @@ class DiffusionMXFP4Config(QuantizationConfig):
             w4a8_fallback_layers=config.get("w4a8_fallback_layers"),
             require_smooth_scale=config.get("require_smooth_scale", False),
             mxfp4_scale_alg=config.get("mxfp4_scale_alg", 0),
+            prefix_bf16_steps=config.get("prefix_bf16_steps", 0),
+            prefix_bf16_master_mode=config.get("prefix_bf16_master_mode", "cpu"),
         )
 
     _XPU_OFFLINE_UNSUPPORTED = (
@@ -233,6 +307,8 @@ class DiffusionMXFP4Config(QuantizationConfig):
                     return NPUMxfp4LinearMethod(self, prefix=prefix)
                 return NPUMxfp4OnlineLinearMethod(self, prefix=prefix)
             if current_omni_platform.is_rocm():
+                if self.prefix_bf16_steps:
+                    raise NotImplementedError("BF16 prefix fallback is only supported for online NPU MXFP4")
                 if self.mxfp4_scale_alg != 0:
                     raise NotImplementedError("MXFP4 UOS quantization is currently only supported on NPU (Ascend).")
                 if self.w4a8_fallback_steps or self.w4a8_fallback_layers:
@@ -246,6 +322,8 @@ class DiffusionMXFP4Config(QuantizationConfig):
                     raise NotImplementedError("Pre-quantized MXFP4 checkpoints are not yet supported on ROCm.")
                 return ROCmMxfp4OnlineLinearMethod(self)
             if current_omni_platform.is_xpu():
+                if self.prefix_bf16_steps:
+                    raise NotImplementedError("BF16 prefix fallback is only supported for online NPU MXFP4")
                 if self.mxfp4_scale_alg != 0:
                     raise NotImplementedError("MXFP4 UOS quantization is currently only supported on NPU (Ascend).")
                 if self.w4a8_fallback_steps or self.w4a8_fallback_layers:
@@ -285,6 +363,15 @@ def _npu_quantize_mxfp4(x: torch.Tensor, scale_alg: int) -> tuple[torch.Tensor, 
     )
 
 
+def _ensure_zero_offset_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Return a zero-offset packed-FP4 weight tensor for NPU GEMM."""
+    # The packed-FP4 GEMM misinterprets byte offsets into a shared DLO buffer.
+    # A contiguous view can still have a nonzero offset; clone only those weights.
+    if weight.storage_offset() != 0:
+        return weight.clone()
+    return weight
+
+
 def _npu_w4a8_matmul(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -302,6 +389,7 @@ def _npu_w4a8_matmul(
     # in the target A5 runtime. Restore the caller's dtype afterwards.
     if bias is not None:
         bias = bias.to(torch.bfloat16).reshape(1, -1)
+    weight = _ensure_zero_offset_fp4_weight(weight)
     output = torch_npu.npu_quant_matmul(
         x_q,
         weight.transpose(0, 1),
@@ -474,9 +562,10 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
         # FP4 differences vs FP8:
         #   weight (N,K) transposed inline → (K,N); scale (N,S/2,2) transposed inline → (S/2,N,2).
         #   x1_dtype / x2_dtype required — FP4 dtype not inferred from tensor dtype.
+        weight = _ensure_zero_offset_fp4_weight(cast(torch.Tensor, layer.weight))
         return torch_npu.npu_quant_matmul(
             x_q,
-            layer.weight.transpose(0, 1),  # (K, N) inline
+            weight.transpose(0, 1),  # (K, N) inline
             layer.weight_scale.transpose(0, 1),  # (S/2, N, 2) inline
             scale_dtype=torch_npu.float8_e8m0fnu,
             x1_dtype=torch_npu.float4_e2m1fn_x2,
@@ -505,6 +594,47 @@ class NPUMxfp4OnlineLinearMethod(_LazyWeightMixin, NPUMxfp4LinearMethod):
       apply / ops     : NPUMxfp4LinearMethod / MXFPLinearMethodBase (shared)
     """
 
+    def __init__(self, quant_config: DiffusionMXFP4Config, *, prefix: str = "") -> None:
+        super().__init__(quant_config, prefix=prefix)
+        self._bf16_fallback = (
+            MXFP4BF16Fallback(quant_config.prefix_bf16_steps, quant_config.prefix_bf16_master_mode)
+            if quant_config.prefix_bf16_steps
+            else None
+        )
+
+    def get_layerwise_prefix_weights(
+        self, layer: Module
+    ) -> tuple[int, dict[str, torch.Tensor], tuple[str, ...]] | None:
+        if not self.quant_config.prefix_bf16_steps or self.quant_config.prefix_bf16_master_mode != "dlo":
+            return None
+        master = getattr(layer, "_mxfp4_prefix_master", None)
+        if master is None:
+            raise RuntimeError("DLO BF16 prefix requested without the original MXFP4 master")
+        return (
+            self.quant_config.prefix_bf16_steps,
+            {"_mxfp4_prefix_master": master.weight},
+            ("weight", "weight_scale"),
+        )
+
+    def _apply_inner(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+        ori_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        step = _current_denoise_step() if self._bf16_fallback is not None else None
+        if self._bf16_fallback is not None and self._bf16_fallback.use_bf16(step):
+            master = getattr(layer, "_mxfp4_prefix_master", None)
+            if getattr(layer, "_layerwise_prefix_managed", False) and (
+                master is None or master.weight.device != x.device or master.weight.numel() == 0
+            ):
+                raise RuntimeError("DLO BF16 prefix master was not prefetched for this block")
+            output = self._bf16_fallback.apply(master, x, bias, ori_dtype, step)
+            if output is not None:
+                return output
+        return super()._apply_inner(layer, x, bias, ori_dtype)
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
@@ -519,6 +649,10 @@ class NPUMxfp4OnlineLinearMethod(_LazyWeightMixin, NPUMxfp4LinearMethod):
             _copy_missing_attrs(layer.weight, weight)
             layer.register_parameter("weight", weight)
             initialize_single_dummy_weight(layer.weight)
+
+        if self._bf16_fallback is not None:
+            layer._mxfp4_prefix_master = self._bf16_fallback.prepare_master(layer.weight)
+            layer._mxfp4_prefix_master_mode = self.quant_config.prefix_bf16_master_mode
 
         # Prepare once; offline checkpoints keep their existing weight algorithm.
         weight_fp4, weight_scale_raw = _npu_quantize_mxfp4(
