@@ -289,6 +289,21 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         if not num_scheduled_tokens:
             return
+        requests = getattr(self, "requests", {})
+        if any(
+            (request := requests.get(rid)) is not None
+            and request.num_computed_tokens < len(getattr(request, "prompt_token_ids", ()) or ())
+            for rid in spec_tokens
+        ):
+            # Upstream pads a resumed one-token prompt as if it were decode.
+            # Venus's speech flush appends only <audio_bos>; those extra draft
+            # rows have no condition embeddings. Drop drafts before booking
+            # the step, keeping all real prefill rows and single-frame peers.
+            for rid, drafts in spec_tokens.items():
+                num_scheduled_tokens[rid] -= len(drafts)
+            spec_tokens.clear()
+            scheduler_output.total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+            return
         dynamic_lookup = getattr(self, "dynamic_sd_lookup", None)
         vllm_config = getattr(self, "vllm_config", None)
         device_config = getattr(vllm_config, "device_config", None)

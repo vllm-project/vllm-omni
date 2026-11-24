@@ -16,6 +16,7 @@ from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneConte
 from vllm_omni.model_executor.common.request_outputs import coerce_int
 from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import TEXT_WITHOUT_AUDIO_KEY
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
 logger = init_logger(__name__)
@@ -185,7 +186,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             text = ""
 
         finished = bool(getattr(output, "finished", False))
-        tts_is_last_chunk = _bool_metadata(mm_output, ("tts_is_last_chunk",), default=False)
+        tts_is_last_chunk = is_last_tts_chunk(mm_output)
         token_ids = _completion_token_ids(completion)
         native_decision = _native_decision(completion, mm_output, token_ids=token_ids, finished=finished)
         if native_decision == "listen":
@@ -345,6 +346,29 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     yield from pending_audio
                     return
                 request_state.pending_audio_without_text = pending_audio
+
+        if tts_segment_end and _bool_metadata(mm_output, (TEXT_WITHOUT_AUDIO_KEY,), default=False) and text:
+            # Venus text also carries delegation control. Deliver it even
+            # when a mixed speech unit reaches codec EOS without a waveform.
+            delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id, chunk_key=chunk_key)
+            result = runtime_result(
+                stage_role="tts",
+                is_listen=False,
+                data_plane_request_id=request_id,
+                text=delta_text,
+                audio_data="",
+                audio_duration_ms=0,
+                audio_format=context.response_format,
+                audio_text_mark=False,
+                end_of_turn=unit_end_of_turn,
+                abort_data_plane_request=True,
+            )
+            if output_turn_id is not None:
+                result["model_turn_id"] = output_turn_id
+            if delta_text and text_turn_state is not None:
+                text_turn_state.has_text = True
+            yield result
+            return
 
         if tts_segment_end:
             if unit_end_of_turn and request_state is not None and request_state.pending_audio_without_text:
@@ -695,6 +719,11 @@ def _audio_num_samples(audio_data: object) -> int | None:
         return int(np.asarray(audio_data, dtype=np.float32).size)
     except Exception:
         return None
+
+
+def is_last_tts_chunk(mm_output: dict[str, object]) -> bool:
+    """Whether a Code2Wav output carries the connector's flush of a unit's remaining codes (``tts_is_last_chunk``)."""
+    return _bool_metadata(mm_output, ("tts_is_last_chunk",), default=False)
 
 
 def _bool_metadata(

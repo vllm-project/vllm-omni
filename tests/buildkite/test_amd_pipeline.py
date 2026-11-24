@@ -80,6 +80,7 @@ NIGHTLY_BLOCKING_COLLECTIVE_JOBS = (
 )
 NIGHTLY_BLOCKING_FULL_MODEL_LABELS = (
     "Qwen3-TTS Base Full-Model Expansion",
+    "Qwen3-TTS CustomVoice Full-Model Expansion",
     "MiniCPM-o Offline Full-Model Modalities",
     "MiniCPM-o Online Full-Model Modalities",
 )
@@ -267,6 +268,26 @@ def test_qwen_image_has_one_amd_official_weight_nightly_owner() -> None:
     assert len(nightly) == 1
     assert nightly[0]["label"] == QWEN_IMAGE_SMOKE_LABEL
     assert ready == []
+
+
+def test_qwen_image_21_docs_run_the_three_one_card_examples() -> None:
+    step = _find_step("Qwen-Image 2.1 Text-to-Image Documentation", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "Blocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["source_file_dependencies"] == ["diffusion_text_to_image_doc", "rocm_diffusion_nightly_runner"]
+    assert split(step["commands"][-1]) == [
+        "bash",
+        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+        "1",
+        "3",
+        "75m",
+        "rocm-qwen-image-21-docs",
+        "tests/examples/offline_inference/test_text_to_image.py::test_text_to_image[more_cli_examples_001]",
+        "tests/examples/online_serving/test_text_to_image.py::test_api_calls_001[omni_server0]",
+        "tests/examples/online_serving/test_text_to_image.py::test_api_calls_002[omni_server0]",
+        "-m",
+        "full_model and example and rocm and MI325 and cards_1",
+    ]
 
 
 def test_qwen_image_merge_smoke_is_one_blocking_sdpa_job() -> None:
@@ -1079,7 +1100,7 @@ def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
 
     assert step["agent_pool"] == agent_pool
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == ("NonBlocking" if expected_count == 2 else "Blocking")
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 50
     assert step["artifact_paths"] == [artifacts]
     assert "retry" not in step
@@ -2945,7 +2966,7 @@ _COSMOS3_T2I_NODE = "tests/e2e/online_serving/test_cosmos3.py::test_text_to_imag
 
 _WAN21_VACE_WEEKLY_JOBS = (
     (
-        "Wan2.1 VACE probe · 1-GPU",
+        "Wan2.1 VACE · 1-GPU",
         "mi300_1",
         "1",
         "2",
@@ -2958,7 +2979,7 @@ _WAN21_VACE_WEEKLY_JOBS = (
         ),
     ),
     (
-        "Wan2.1 VACE probe · 2-GPU",
+        "Wan2.1 VACE · 2-GPU",
         "mi300_2",
         "2",
         "5",
@@ -3044,7 +3065,7 @@ def test_cosmos3_weekly_is_blocking_and_replaces_narrow_nightly_owner() -> None:
     assert _steps_selecting_node(AMD_NIGHTLY_PIPELINE, _COSMOS3_T2I_NODE) == []
 
 
-def test_wan21_vace_weekly_has_two_exact_nonblocking_rocm_probes() -> None:
+def test_wan21_vace_weekly_has_two_exact_blocking_rocm_jobs() -> None:
     def flatten_paths(items: list) -> set[str]:
         paths: set[str] = set()
         for item in items:
@@ -3070,7 +3091,7 @@ def test_wan21_vace_weekly_has_two_exact_nonblocking_rocm_probes() -> None:
         nodes,
     ) in _WAN21_VACE_WEEKLY_JOBS:
         step = _find_step(label, AMD_WEEKLY_PIPELINE)
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == "Blocking"
         assert step["agent_pool"] == agent_pool
         assert step["depends_on"] == "amd-build"
         assert step["mirror_hardwares"] == ["amdproduction"]
@@ -3081,7 +3102,6 @@ def test_wan21_vace_weekly_has_two_exact_nonblocking_rocm_probes() -> None:
 
         assert len(step["commands"]) == 1
         command = step["commands"][0]
-        assert "MI325" not in command
         assert "-m rocm" not in command
         tokens = split(command)
         runner_index = tokens.index(runner)
@@ -3115,9 +3135,9 @@ def test_wan21_vace_weekly_has_two_exact_nonblocking_rocm_probes() -> None:
     } <= dependency_paths
 
     source = Path("tests/e2e/online_serving/test_wan_2_1_vace_expansion.py").read_text(encoding="utf-8")
-    assert 'SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})' in source
-    assert 'PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)' in source
-    assert '"rocm": "MI325"' not in source
+    assert 'SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})' in source
+    assert "PARALLEL_FEATURE_MARKS = hardware_marks(" in source
+    assert 'res={"cuda": "H100", "rocm": "MI325"}, num_cards=2' in source
 
 
 @pytest.mark.parametrize(
@@ -4039,75 +4059,76 @@ def test_qwen3_tts_perf_is_one_nonblocking_nightly_job() -> None:
         assert "Qwen3-TTS Perf" not in text
 
 
-def test_minicpmo_accuracy_keeps_daily_nonblocking_and_promotes_seed_tts() -> None:
+def test_minicpmo_accuracy_nightly_jobs_block_on_one_gpu() -> None:
     group = _find_group(":full_moon: MiniCPM-o 4.5 Accuracy MI300 Nightly", AMD_NIGHTLY_PIPELINE)
-    jobs: tuple[tuple[str, str, str, str, str, dict[str, str]], ...] = (
-        (
-            "MiniCPM-o 4.5 Daily-Omni Accuracy",
-            "test_minicpmo_4_5_daily_omni_accuracy_bench",
-            "artifacts/rocm-minicpmo-daily-omni-accuracy/**/*",
-            "ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR",
-            "Expected exactly one MiniCPM-o 4.5 Daily-Omni accuracy node",
-            {},
-        ),
-        (
-            "MiniCPM-o 4.5 Seed-TTS Accuracy",
-            "test_minicpmo_4_5_seed_tts_wer_bench",
-            "artifacts/rocm-minicpmo-seed-tts-accuracy/**/*",
-            "ROCM_MINICPMO_SEED_ACCURACY_ARTIFACT_DIR",
-            "Expected exactly one MiniCPM-o 4.5 Seed-TTS accuracy node",
-            {
-                "ROCM_E2E_TIMEOUT_MINUTES": "165",
-                "SEED_TTS_WER_EVAL": "1",
-                "SEED_TTS_SIM_EVAL": "1",
-                "VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S": "60",
-            },
-        ),
+    jobs = (
+        ("MiniCPM-o 4.5 Daily-Omni Accuracy", "test_minicpmo_4_5_daily_omni_accuracy_bench", "daily-omni"),
+        ("MiniCPM-o 4.5 Seed-TTS Accuracy", "test_minicpmo_4_5_seed_tts_wer_bench", "seed-tts"),
     )
 
-    assert [step["label"] for step in group["steps"]] == [job[0] for job in jobs]
-    all_nodes = {job[1] for job in jobs}
-    for step, (label, node, artifact, artifact_env, collection_guard, env) in zip(group["steps"], jobs, strict=True):
-        commands = "\n".join(step["commands"])
-        assert step["label"] == label
-        assert step["grade"] == ("Blocking" if env else "NonBlocking")
+    assert [step["label"] for step in group["steps"]] == [label for label, _, _ in jobs]
+    for step, (label, node, kind) in zip(group["steps"], jobs, strict=True):
+        artifact = f"rocm-minicpmo-{kind}-accuracy"
+        assert step["grade"] == "Blocking"
         assert step["agent_pool"] == "mi300_1"
         assert step["mirror_hardwares"] == ["amdproduction"]
         assert step["timeout_in_minutes"] == 180
         assert step["source_file_dependencies"] == "omni_minicpmo_4_5_accuracy"
-        assert step["artifact_paths"] == [artifact]
-        assert step.get("env", {}) == env
-        if env:
+        assert step["artifact_paths"] == [f"artifacts/{artifact}/**/*"]
+        assert step["env"]["ROCM_E2E_TIMEOUT_MINUTES"] == "165"
+        commands = "\n".join(step["commands"])
+        if kind == "daily-omni":
+            runner_command = step["commands"][2]
+            assert step["env"]["ACC_BENCH_RESULT_DIR"] == (
+                f"$${{BUILDKITE_BUILD_CHECKOUT_PATH:?}}/artifacts/{artifact}/results"
+            )
+            assert 'rm -f "$${ACC_BENCH_RESULT_DIR:?}"/result_acc_*_daily_omni_*.json' in commands
+        else:
             runner_command = commands.split("; then", 1)[0].removeprefix("if ")
-            assert split(runner_command.replace("\\\n", " ")) == [
-                "bash",
-                ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh",
-                f"tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::{node}",
-                "1",
-                "omni",
-                "rocm-minicpmo-seed-tts-accuracy",
-            ]
+            assert step["env"] == {
+                "ROCM_E2E_TIMEOUT_MINUTES": "165",
+                "SEED_TTS_WER_EVAL": "1",
+                "SEED_TTS_SIM_EVAL": "1",
+                "VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S": "60",
+            }
             assert "cp -a tests/e2e/accuracy/minicpmo_4_5/results/." in commands
             assert 'exit "$$status"' in commands
-        else:
-            assert "full_model and omni and rocm and MI325 and cards_1" in commands
-            assert "--run-level full_model" in commands
-            assert commands.count("--collect-only") == 1
-            assert "exit 5" in commands
-            assert "pytest.xml" in commands
-            assert "timeout --signal=TERM --kill-after=2m 165m" in commands
-            assert artifact_env in commands
-            assert collection_guard in commands
-            assert commands.count(node) == 2
-        for other_node in all_nodes - {node}:
-            assert other_node not in commands
+        assert split(runner_command.replace("\\\n", " ")) == [
+            "bash",
+            ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh",
+            f"tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::{node}",
+            "1",
+            "omni",
+            artifact,
+        ]
         assert "SEED_TTS_EVAL_DEVICE" not in commands
         assert "SEED_TTS_UTMOS_EVAL" not in commands
+        for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+            assert label not in pipeline_path.read_text(encoding="utf-8")
 
-    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
-        text = pipeline_path.read_text(encoding="utf-8")
-        for label, *_ in jobs:
-            assert label not in text
+
+@pytest.mark.parametrize(
+    ("overrides", "should_pass"),
+    [
+        ({}, True),
+        (None, False),
+        ({"daily_omni_evaluated_ok": 1196}, False),
+        ({"daily_omni_no_gold": 1}, False),
+        ({"daily_omni_request_failed": 1}, False),
+    ],
+    ids=["complete", "skipped", "partial", "missing-gold", "failed-request"],
+)
+def test_minicpmo_daily_omni_requires_complete_dataset(
+    tmp_path: Path, overrides: dict[str, int] | None, should_pass: bool
+) -> None:
+    step = _find_step("MiniCPM-o 4.5 Daily-Omni Accuracy", AMD_NIGHTLY_PIPELINE)
+    check = step["commands"][-1].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    if overrides is not None:
+        metrics = {"daily_omni_evaluated_ok": 1197, "daily_omni_no_gold": 0, "daily_omni_request_failed": 0}
+        metrics.update(overrides)
+        (tmp_path / "result_acc_MiniCPM-o-4_5_daily_omni_test.json").write_text(json.dumps(metrics), encoding="utf-8")
+    result = subprocess.run([sys.executable, "-c", check, str(tmp_path)], capture_output=True, text=True)
+    assert (result.returncode == 0) == should_pass, result.stderr
 
 
 @pytest.mark.parametrize(("case", "grade"), [("T2I", "Blocking"), ("IT2I", "NonBlocking")])
@@ -6639,10 +6660,10 @@ def test_minicpmo_ready_grades_render_blocking() -> None:
         assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
 
 
-def test_weekly_keeps_only_wan21_vace_burn_in_nonblocking() -> None:
+def test_weekly_has_no_nonblocking_jobs_after_vace_promotion() -> None:
     weekly = _load_yaml(AMD_WEEKLY_PIPELINE)
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
     assert len(steps) == 54
-    assert sum(step["grade"] == "Blocking" for step in steps) == 52
-    assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == _WAN21_VACE_WEEKLY_LABELS
+    assert sum(step["grade"] == "Blocking" for step in steps) == 54
+    assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == set()

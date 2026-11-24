@@ -580,6 +580,7 @@ def _transformers_processor_stub(auto_processor):
 def test_minicpmo_stage0_loads_processor_from_hf_id(monkeypatch):
     import sys
 
+    from vllm_omni.model_executor.models.minicpmo_4_5 import processor as processor_module
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
     )
@@ -611,6 +612,9 @@ def test_minicpmo_stage0_loads_processor_from_hf_id(monkeypatch):
         ),
     )
 
+    # Import the owner before stubbing transformers so teardown restores the
+    # real class even when this test is the module's first importer.
+    monkeypatch.setattr(processor_module, "AutoImageProcessor", _AutoImageProcessor)
     loaded = MiniCPMO45Stage0DuplexRuntime._load_processor_from_path(model_id)
 
     assert loaded is processor
