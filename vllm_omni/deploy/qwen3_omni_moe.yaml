@@ -19,6 +19,11 @@
 #     MIOpen conv_transpose1d is not capture-safe in the Code2Wav graph path.
 #   * Platform sections flip enforce_eager per-stage where platform
 #     cudagraph support differs.
+#   * Stages 0/1 (thinker, talker) omit moe_backend here: stage_init_utils
+#     defaults unquantized Qwen3-Omni MoE stages to triton (#7019), while
+#     quantized MoE stages (e.g. AutoRound W4A16, ModelOpt NVFP4/FP8) defer
+#     to vLLM's quantization-aware oracle via auto. Explicit user overrides
+#     are always preserved.
 model_runner: v2
 async_chunk: true
 
@@ -35,7 +40,6 @@ stages:
     max_num_batched_tokens: 32768
     max_num_seqs: 64
     gpu_memory_utilization: 0.9
-    moe_backend: triton
     trust_remote_code: true
     enable_prefix_caching: true
     devices: "0"
@@ -47,7 +51,6 @@ stages:
     max_num_batched_tokens: 32768
     max_num_seqs: 64
     gpu_memory_utilization: 0.6
-    moe_backend: triton
     trust_remote_code: true
     enable_prefix_caching: false
     devices: "1"

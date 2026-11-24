@@ -7,7 +7,7 @@ import copy
 import json
 import sys
 import types
-from dataclasses import fields, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,6 +20,7 @@ from vllm.config import LoadConfig as VllmLoadConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
+from vllm.config.kernel import KernelConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.models.utils import extract_layer_index
 
@@ -208,6 +209,165 @@ def test_qwen3_omni_nvfp4_ci_config_preserves_auto_moe_backend(tmp_path):
             build_engine_args_dict_from_omni_stage_config(typed_stage, str(tmp_path)),
         ):
             assert engine_args["moe_backend"] == expected_backend
+
+
+@dataclass
+class _FakeAutoRoundQuantConfig:
+    block_name_to_quantize: str | list[str]
+
+
+@dataclass
+class _FakeModelOptQuantConfig:
+    exclude_modules: list[str]
+
+
+@dataclass
+class _FakeCompressedTensorsQuantConfig:
+    ignore: list[str]
+
+
+@dataclass
+class _FakeGenericQuantConfig:
+    weight_bits: int = 4
+
+
+@dataclass
+class _FakeHFConfig:
+    pass
+
+
+@dataclass
+class _FakeStageModelConfig:
+    hf_config: _FakeHFConfig = field(default_factory=_FakeHFConfig)
+
+
+@dataclass
+class _FakeVllmConfig:
+    kernel_config: KernelConfig
+    quant_config: object = None
+    model_config: _FakeStageModelConfig = field(default_factory=_FakeStageModelConfig)
+
+
+def test_qwen3_omni_skips_triton_default_for_generation_and_explicit_quant():
+    code2wav_args = {
+        "model_arch": "Qwen3OmniMoeForConditionalGeneration",
+        "model_stage": "code2wav",
+        "worker_type": "generation",
+    }
+    stage_init_utils._maybe_set_qwen3_omni_moe_backend(code2wav_args)
+    assert "moe_backend" not in code2wav_args
+
+    quant_args = {
+        "model_arch": "Qwen3OmniMoeForConditionalGeneration",
+        "model_stage": "thinker",
+        "worker_type": "ar",
+        "quantization": "inc",
+    }
+    stage_init_utils._maybe_set_qwen3_omni_moe_backend(quant_args)
+    assert "moe_backend" not in quant_args
+
+
+@pytest.mark.parametrize(
+    ("quant_config", "model_stage", "expected_backend"),
+    [
+        # Unquantized BF16 keeps triton on both Thinker and Talker.
+        (None, "thinker", "triton"),
+        (None, "talker", "triton"),
+        # Thinker-only AutoRound W4A16 resets Thinker to auto, keeps Talker on triton.
+        (_FakeAutoRoundQuantConfig(block_name_to_quantize="thinker.model.layers"), "thinker", "auto"),
+        (_FakeAutoRoundQuantConfig(block_name_to_quantize="thinker.model.layers"), "talker", "triton"),
+        # Multi-stage AutoRound resets both Thinker and Talker to auto.
+        (
+            _FakeAutoRoundQuantConfig(block_name_to_quantize=["thinker.model.layers", "talker.model.layers"]),
+            "talker",
+            "auto",
+        ),
+        # Stage-unprefixed block name applies to the stage.
+        (_FakeAutoRoundQuantConfig(block_name_to_quantize="model.layers"), "thinker", "auto"),
+        # ModelOpt exclude_modules excludes Talker but quantizes Thinker.
+        (_FakeModelOptQuantConfig(exclude_modules=["talker*", "code2wav*", "thinker.visual*"]), "thinker", "auto"),
+        (_FakeModelOptQuantConfig(exclude_modules=["talker*", "code2wav*", "thinker.visual*"]), "talker", "triton"),
+        # CompressedTensors ignore regex excludes Talker.
+        (_FakeCompressedTensorsQuantConfig(ignore=["re:.*talker.*", "lm_head"]), "thinker", "auto"),
+        (_FakeCompressedTensorsQuantConfig(ignore=["re:.*talker.*", "lm_head"]), "talker", "triton"),
+        # Generic quantized checkpoint (e.g. GPTQ/AWQ) resets to auto.
+        (_FakeGenericQuantConfig(weight_bits=4), "thinker", "auto"),
+    ],
+)
+def test_qwen3_omni_reset_default_triton_for_quantized_stages(quant_config, model_stage, expected_backend):
+    vllm_config = _FakeVllmConfig(
+        kernel_config=KernelConfig(moe_backend="triton"),
+        quant_config=quant_config,
+    )
+
+    stage_init_utils._maybe_reset_qwen3_omni_quantized_moe_backend(
+        vllm_config,  # type: ignore[arg-type]
+        model_arch="Qwen3OmniMoeForConditionalGeneration",
+        model_stage=model_stage,
+        moe_backend_is_explicit=False,
+    )
+
+    assert vllm_config.kernel_config.moe_backend == expected_backend
+
+
+def test_qwen3_omni_quantized_stage_preserves_explicit_triton_override():
+    vllm_config = _FakeVllmConfig(
+        kernel_config=KernelConfig(moe_backend="triton"),
+        quant_config=_FakeAutoRoundQuantConfig(block_name_to_quantize="thinker.model.layers"),
+    )
+
+    stage_init_utils._maybe_reset_qwen3_omni_quantized_moe_backend(
+        vllm_config,  # type: ignore[arg-type]
+        model_arch="Qwen3OmniMoeForConditionalGeneration",
+        model_stage="thinker",
+        moe_backend_is_explicit=True,
+    )
+
+    assert vllm_config.kernel_config.moe_backend == "triton"
+
+
+def test_build_vllm_config_qwen3_omni_default_deploy_resets_quantized_thinker(monkeypatch, tmp_path):
+    """Default qwen3_omni_moe.yaml resets stage 0 to auto on Thinker-only AutoRound while keeping stage 1 triton."""
+    hf_config = Qwen3OmniMoeConfig(enable_audio_output=True)
+    pipeline = resolve_pipeline_config("qwen3_omni_moe", hf_config)
+    assert pipeline is not None
+    deploy = load_deploy_config(get_deploy_config_path("qwen3_omni_moe.yaml"))
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=copy.deepcopy(deploy),
+        cli_overrides={"model": str(tmp_path)},
+    )
+
+    fake_quant = _FakeAutoRoundQuantConfig(block_name_to_quantize="thinker.model.layers")
+
+    def _fake_create_engine_config(self, **_kwargs):
+        return _FakeVllmConfig(
+            kernel_config=KernelConfig(moe_backend=self.moe_backend),
+            quant_config=fake_quant,
+        )
+
+    monkeypatch.setattr(stage_init_utils.OmniEngineArgs, "create_engine_config", _fake_create_engine_config)
+    monkeypatch.setattr(stage_init_utils.Executor, "get_class", staticmethod(lambda _cfg: object))
+    monkeypatch.setattr(stage_init_utils.OmniINCConfig, "maybe_upgrade", classmethod(lambda cls, q: q))
+
+    thinker_cfg, _ = stage_init_utils.build_vllm_config(omni_config.stage_by_id(0), str(tmp_path))
+    talker_cfg, _ = stage_init_utils.build_vllm_config(omni_config.stage_by_id(1), str(tmp_path))
+
+    assert thinker_cfg.kernel_config.moe_backend == "auto"
+    assert talker_cfg.kernel_config.moe_backend == "triton"
+
+    # Explicit user override on stage 0 is always preserved even with quantized checkpoint.
+    explicit_deploy = modify_stage_config(
+        get_deploy_config_path("qwen3_omni_moe.yaml"),
+        updates={"stages": {0: {"moe_backend": "triton"}}},
+    )
+    explicit_omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=load_deploy_config(explicit_deploy),
+        cli_overrides={"model": str(tmp_path)},
+    )
+    explicit_thinker_cfg, _ = stage_init_utils.build_vllm_config(explicit_omni_config.stage_by_id(0), str(tmp_path))
+    assert explicit_thinker_cfg.kernel_config.moe_backend == "triton"
 
 
 def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, str]:
