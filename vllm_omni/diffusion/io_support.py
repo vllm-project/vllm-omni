@@ -47,11 +47,18 @@ def supports_audio_output(model_class_name: str) -> bool:
 
 def get_diffusion_output_type(model_class_name: str | None) -> str:
     """Return the declared final modality for a diffusion model."""
-    declared_output_type = get_diffusion_model_metadata(model_class_name).final_output_type
+    metadata = get_diffusion_model_metadata(model_class_name)
+    declared_output_type = metadata.final_output_type
     if declared_output_type is not None:
         return declared_output_type
     if model_class_name and supports_audio_output(model_class_name):
         return "audio"
+    if metadata.supports_segmentation:
+        return "segmentation"
+    if metadata.supports_video_segmentation:
+        return "video_segmentation"
+    if metadata.supports_video_depth:
+        return "video_depth"
     return "image"
 
 
