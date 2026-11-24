@@ -13,6 +13,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from diffusers.models.autoencoders import AutoencoderKLQwenImage
 
+from vllm_omni.diffusion import registry
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders import qwen_spatial_shard, wan_spatial_shard
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeExecutor
@@ -55,6 +57,38 @@ def test_uninitialized_spatial_decode_rejected(mode):
     vae.distributed_executor = _executor(mode)
     with pytest.raises(RuntimeError, match="initialized"):
         vae.decode(torch.randn(2, 2, 1, 3, 3))
+
+
+@pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])
+@pytest.mark.parametrize("dp_size", [1, 2], ids=["shared-request", "rank-local-requests"])
+def test_registry_qwen_spatial_shard_requires_shared_request(monkeypatch, mode, dp_size):
+    class Pipeline(torch.nn.Module):
+        def __init__(self, od_config):
+            super().__init__()
+            self.vae = _model()
+            self.vae.distributed_executor = _executor("tile", size=1)
+
+    monkeypatch.setattr(registry.DiffusionModelRegistry, "_try_load_model_cls", lambda _: Pipeline)
+    config = OmniDiffusionConfig(
+        model_class_name="test_qwen_vae",
+        parallel_config=DiffusionParallelConfig(
+            data_parallel_size=dp_size,
+            ulysses_degree=2 if dp_size == 1 else 1,
+            vae_patch_parallel_size=2,
+            vae_parallel_mode=mode,
+        ),
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["dit"],
+            "layer_options": {"dit": {"weight_transfer": "allgather"}},
+        },
+    )
+    if dp_size == 2:
+        with pytest.raises(ValueError, match="rank-local DP"):
+            registry.initialize_model(config)
+    else:
+        executor = registry.initialize_model(config).vae.distributed_executor
+        assert (executor.parallel_size, executor.parallel_mode) == (2, mode)
 
 
 def _worker(rank, path, direction):

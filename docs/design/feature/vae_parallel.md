@@ -531,6 +531,7 @@ Ming-Image; the other pipelines remain unvalidated on this path.
 ### Notes
 
 - After a Qwen multi-rank spatial decode, changing direction, process group, parallel size, or returning to tile mode requires a fresh VAE instance.
+- Model initialization rejects Qwen multi-rank spatial decode with rank-local DP concurrency because every spatial shard must belong to the same request.
 - Qwen spatial decode synchronizes installation and preparation errors before entering the decoder. A multi-rank installation failure or failure inside the decoder is fatal: MP and Ray workers exit, and the executor's worker monitor shuts down the group. Restart the engine before submitting more requests; request-level recovery cannot safely reuse a partially patched decoder or a group whose peers may be blocked in halo or attention communication. Preparation errors after successful installation remain recoverable.
 - Qwen checkpoint correctness is covered by `tests/diffusion/distributed/test_qwen_spatial_shard_correctness.py` for both split directions in the dedicated B200 two-GPU nightly job.
 - The decoder is patched **in place** the first time spatial-shard decode runs and is bound to a single split dimension for the lifetime of the VAE instance.
