@@ -3221,7 +3221,7 @@ class TestDistributedComponentSelection:
         with pytest.raises(RuntimeError, match="recreate the backend and reload the pipeline"):
             backend.enable(nn.Module())
 
-    def test_worker_shutdown_skips_allgather_restore(self, patched_offload_runtime, mocker):
+    def test_worker_shutdown_skips_allgather_and_rank_local_restore(self, patched_offload_runtime, mocker):
         # Restoring AllGather blocks rebuilds the full DiT on every rank's host,
         # which outlived the executor's shutdown grace period (issue 8081).
         backend = DistributedLayerwiseOffloadBackend(
@@ -3245,7 +3245,7 @@ class TestDistributedComponentSelection:
         worker.shutdown()
 
         allgather_hook.restore_next_block_to_cpu.assert_not_called()
-        rank_local_hook.restore_next_block_to_cpu.assert_called_once_with()
+        rank_local_hook.restore_next_block_to_cpu.assert_not_called()
         assert not backend.enabled
         assert not backend._all_hook_groups
 

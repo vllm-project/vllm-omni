@@ -69,6 +69,7 @@ from .tensor_utils import (
     make_offload_placeholder,
     materialization_probe,
     module_materialization_probe,
+    physical_storage_numel,
     restore_tensor_storage,
     set_tensor_storage,
     tensor_storage_metadata,
@@ -422,11 +423,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             if fused is not None:
                 runtime_source = fused.runtime_layout()
                 stride = runtime_source.stride()
-                storage_numel = (
-                    0
-                    if runtime_source.numel() == 0
-                    else 1 + sum((size - 1) * axis_stride for size, axis_stride in zip(runtime_source.shape, stride))
-                )
+                storage_numel = physical_storage_numel(runtime_source)
                 cpu_sources.setdefault(dtype, []).append(
                     {
                         "name": name,
@@ -469,11 +466,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     f"got dtype={runtime_source.dtype}, shape={tuple(runtime_source.shape)}"
                 )
             stride = runtime_source.stride()
-            storage_numel = (
-                0
-                if runtime_source.numel() == 0
-                else 1 + sum((size - 1) * axis_stride for size, axis_stride in zip(runtime_source.shape, stride))
-            )
+            storage_numel = physical_storage_numel(runtime_source)
 
             cpu_sources.setdefault(dtype, []).append(
                 {
@@ -2145,7 +2138,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         except Exception:
             pass
 
-    def _disable(self, *, restore_allgather_weights: bool) -> None:
+    def _disable(
+        self,
+        *,
+        restore_allgather_weights: bool,
+        restore_host_weights: bool = True,
+    ) -> None:
         has_open_lease = self._host_weight_lease is not None and not self._host_weight_lease.closed
         has_registration = self._host_registration is not None
         has_carrier = (
@@ -2198,6 +2196,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 "Distributed layerwise offload skipped AllGather weight restoration; "
                 "recreate the backend and reload the pipeline before retrying"
             )
+        elif not restore_host_weights and (rank_local_hooks or self._resident_layer_group is not None):
+            # Shutdown has no later user either. Restoring a rank-local mmap
+            # block re-materializes its runtime weights, fused ones included,
+            # in host memory. Leave the placeholders and poison the backend.
+            self._poisoned_reason = (
+                "Distributed layerwise offload skipped rank-local weight restoration; "
+                "recreate the backend and reload the pipeline before retrying"
+            )
 
         collective_error = None
         if restore_allgather_weights:
@@ -2206,9 +2212,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             collective_error = run_cleanup_steps(
                 ("restoring an AllGather block", hook.restore_next_block_to_cpu) for hook in allgather_hooks
             )
-        rank_local_error = run_cleanup_steps(
-            ("restoring a rank-local block", hook.restore_next_block_to_cpu) for hook in rank_local_hooks
-        )
+        rank_local_error = None
+        if restore_host_weights:
+            rank_local_error = run_cleanup_steps(
+                ("restoring a rank-local block", hook.restore_next_block_to_cpu) for hook in rank_local_hooks
+            )
         removal_error = run_cleanup_steps(
             (
                 "removing a distributed block hook",
@@ -2226,7 +2234,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         )
 
         resident_error = None
-        if self._resident_layer_group is not None:
+        if restore_host_weights and self._resident_layer_group is not None:
             # Resident layers are always rank-local (the public parser rejects
             # resident DiT layers combined with AllGather).
             resident_error = run_cleanup_steps(
@@ -2286,8 +2294,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
     def shutdown(self) -> None:
         # Restoring AllGather blocks rebuilds the full DiT in every rank's host
-        # memory, which can outlast the executor's shutdown grace period.
-        self._disable(restore_allgather_weights=False)
+        # memory, and restoring a rank-local mmap block re-materializes its
+        # runtime weights. Either can outlast the executor's shutdown grace
+        # period, and shutdown has no later user for either.
+        self._disable(restore_allgather_weights=False, restore_host_weights=False)
 
     @staticmethod
     def _allocate_shared_buffers(
