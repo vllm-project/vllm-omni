@@ -22,7 +22,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 # The Diffusers-layout artifacts covered by this matrix, with the contract each
 # one implies. The ComfyUI export of an artifact is a fused-QKV re-packing of the
 # same weights and is not served.
-PUBLISHED = [
+ARTIFACTS = [
     ("minimax_h3_fl2v_turbo_4step_v0.1.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_544P),
     ("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_768P),
     ("minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_768P),
@@ -39,8 +39,8 @@ PUBLISHED = [
 ]
 
 
-@pytest.mark.parametrize(("filename", "task", "steps", "video_shift"), PUBLISHED)
-def test_every_published_artifact_is_recognised(filename: str, task: str, steps: int, video_shift: float) -> None:
+@pytest.mark.parametrize(("filename", "task", "steps", "video_shift"), ARTIFACTS)
+def test_every_matrix_artifact_is_recognised(filename: str, task: str, steps: int, video_shift: float) -> None:
     spec = parse_turbo_filename(filename)
     assert spec is not None, filename
     assert spec.filename == filename
@@ -54,8 +54,8 @@ def test_every_published_artifact_is_recognised(filename: str, task: str, steps:
 
 
 def test_artifact_matrix_has_no_duplicates() -> None:
-    assert len(PUBLISHED) == 10
-    assert len({name for name, *_ in PUBLISHED}) == 10
+    assert len(ARTIFACTS) == 10
+    assert len({name for name, *_ in ARTIFACTS}) == 10
 
 
 @pytest.mark.parametrize(
@@ -86,7 +86,7 @@ def test_sigma_points_follow_the_step_count() -> None:
     assert _spec("minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors").sigma_points == 9
 
 
-@pytest.mark.parametrize(("filename", "task", "steps", "video_shift"), PUBLISHED)
+@pytest.mark.parametrize(("filename", "task", "steps", "video_shift"), ARTIFACTS)
 def test_turbo_request_counts_evaluations_and_preserves_sigma_grid(filename, task, steps, video_shift):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
