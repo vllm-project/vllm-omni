@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project and The HuggingFace Team
 """Sequence Parallelism sharding utilities.
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from typing import cast
 
 import torch
 from vllm.logger import init_logger
@@ -99,6 +101,67 @@ def sp_gather(
 
     sp_group = get_sp_group()
     return sp_group.all_gather(tensor, dim=dim)
+
+
+def sp_gather_padded(
+    tensor: torch.Tensor,
+    dim: int,
+    global_size: int,
+) -> torch.Tensor:
+    """Gather shards that are not equally long.
+
+    ``all_gather`` needs one shape per rank, while :func:`sp_shard` uses
+    ``torch.chunk``: when ``global_size`` is not divisible by the SP world
+    size, every chunk is full (``ceil(global_size / world_size)`` rows) except
+    the last one. Pad each shard to that largest chunk, gather, then drop each
+    rank's padding so the result holds exactly ``global_size`` rows in global
+    order.
+
+    This is the gather counterpart of the strict-mode-friendly
+    :func:`sp_shard_with_padding`, for callers that shard without padding
+    (``advanced_uaa``) or compact rows between the split and the gather
+    (reference-KV reuse).
+
+    Args:
+        tensor: This rank's shard.
+        dim: Dimension along which the tensor was sharded.
+        global_size: Row count along ``dim`` before sharding.
+
+    Returns:
+        The full tensor, ``global_size`` long along ``dim``.
+    """
+    world_size = get_sequence_parallel_world_size()
+    if world_size == 1:
+        if tensor.size(dim) != global_size:
+            raise ValueError(
+                f"SP world size is 1 but the tensor is {tensor.size(dim)} long along dim {dim}, "
+                f"expected global_size={global_size}."
+            )
+        return tensor
+
+    chunk = -(-global_size // world_size)
+    local = tensor.size(dim)
+    if local > chunk:
+        raise ValueError(
+            f"SP shard is {local} long along dim {dim}, but global_size={global_size} with "
+            f"world_size={world_size} allows at most {chunk} rows per rank."
+        )
+
+    padded = tensor
+    if local < chunk:
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = chunk - local
+        padded = torch.cat([tensor, tensor.new_zeros(pad_shape)], dim=dim)
+
+    gathered = cast(torch.Tensor, get_sp_group().all_gather(padded, dim=dim))
+    if chunk * world_size == global_size:
+        return gathered
+
+    sizes = [min(chunk, max(0, global_size - rank * chunk)) for rank in range(world_size)]
+    index = torch.cat(
+        [torch.arange(rank * chunk, rank * chunk + size, device=gathered.device) for rank, size in enumerate(sizes)]
+    )
+    return gathered.index_select(dim, index)
 
 
 def sp_shard_with_padding(

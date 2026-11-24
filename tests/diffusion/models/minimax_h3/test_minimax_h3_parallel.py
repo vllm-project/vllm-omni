@@ -602,13 +602,69 @@ def test_advanced_uaa_accepts_a_non_divisible_ulysses_degree(monkeypatch):
     _validate_ulysses_head_divisibility(56, tp_size=1, ulysses_degree=8, ulysses_mode="advanced_uaa")
 
 
-def test_non_divisible_advanced_uaa_is_npu_only(monkeypatch):
+def test_advanced_uaa_is_platform_independent(monkeypatch):
+    """The uneven-row fault is fixed by the padded gather, not platform-scoped.
+
+    U7 divides 56 heads but still shards rows unevenly (packed lengths are
+    multiples of 64, not of 7); U16 needs both head and row padding. Both are
+    legal on every platform now that ``sp_gather_padded`` trims the gather
+    back to ``seq_len`` rows.
+    """
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         _validate_ulysses_head_divisibility,
     )
 
     _patch_platform(monkeypatch, is_npu=False)
-    with pytest.raises(ValueError, match="Ascend NPU only"):
-        _validate_ulysses_head_divisibility(56, tp_size=1, ulysses_degree=16, ulysses_mode="advanced_uaa")
+    _validate_ulysses_head_divisibility(56, tp_size=1, ulysses_degree=16, ulysses_mode="advanced_uaa")
+    _validate_ulysses_head_divisibility(56, tp_size=1, ulysses_degree=7, ulysses_mode="advanced_uaa")
     # A divisible degree never needs padding, so it stays platform-independent.
     _validate_ulysses_head_divisibility(56, tp_size=1, ulysses_degree=8, ulysses_mode="advanced_uaa")
+
+
+def test_local_compact_positions_follow_chunk_semantics():
+    """Reference-KV compaction may leave a non-divisible row count.
+
+    A 960x544 reference contributes 510 rows; removing them from a 64-aligned
+    packed length leaves 2 rows modulo 16 for the SP split. The per-rank
+    selection must follow ``torch.chunk`` exactly so the padded gather can
+    reassemble the compact rows in global order.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        _local_compact_positions,
+    )
+
+    world_size = 16
+    seq_len = 203776
+    local_len = seq_len // world_size
+    compact_total = seq_len - 510
+    assert compact_total % world_size == 2  # the uneven case from the review
+
+    active = torch.arange(compact_total)
+    pieces = [
+        _local_compact_positions(active, seq_len=seq_len, local_start=rank * local_len, local_len=local_len)
+        for rank in range(world_size)
+    ]
+    expected_sizes = [len(chunk) for chunk in torch.chunk(active, world_size)]
+    assert [piece.numel() for piece in pieces] == expected_sizes
+    # torch.chunk keeps every chunk full except the last one.
+    assert sum(expected_sizes) == compact_total
+    assert expected_sizes[-1] < expected_sizes[0]
+    assert torch.equal(torch.cat(pieces), active)
+
+    # A single-rank layout owns the compact rows unchanged.
+    assert torch.equal(
+        _local_compact_positions(active, seq_len=compact_total, local_start=0, local_len=compact_total),
+        active,
+    )
+
+
+def test_sp_gather_declares_the_boundary_row_count():
+    """The gather module exposes the exact pre-split row count to the hook."""
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3SPGather,
+    )
+
+    gather = MiniMaxH3SPGather()
+    assert gather.sp_gather_global_rows is None
+    tensor = torch.randn(4, 8)
+    assert torch.equal(gather(tensor), tensor)

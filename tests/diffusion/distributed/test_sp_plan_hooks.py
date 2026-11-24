@@ -1493,3 +1493,97 @@ class TestSequenceParallelConfig:
 
         config = SequenceParallelConfig(ulysses_degree=2, ring_degree=4)
         assert config.sequence_parallel_size == 8
+
+
+# =============================================================================
+# Padded gather for unequally long shards (advanced_uaa / row compaction)
+# =============================================================================
+
+
+@pytest.mark.cpu
+class TestSequenceParallelPaddedGather:
+    """``sp_gather_padded`` restores exactly ``global_size`` rows."""
+
+    @staticmethod
+    def _fake_group(monkeypatch, global_tensor, dim, world_size):
+        from vllm_omni.diffusion.distributed import sp_sharding as mod
+
+        chunks = list(torch.chunk(global_tensor, world_size, dim=dim))
+        chunk = max(int(c.size(dim)) for c in chunks)
+        monkeypatch.setattr(mod, "get_sequence_parallel_world_size", lambda: world_size)
+
+        class FoldGroup:
+            def all_gather(self, tensor, dim):
+                assert int(tensor.size(dim)) == chunk, "every rank must pad to the largest chunk"
+                parts = []
+                for shard in chunks:
+                    if int(shard.size(dim)) < chunk:
+                        pad_shape = list(shard.shape)
+                        pad_shape[dim] = chunk - int(shard.size(dim))
+                        shard = torch.cat([shard, shard.new_zeros(pad_shape)], dim=dim)
+                    parts.append(shard)
+                return torch.cat(parts, dim=dim)
+
+        monkeypatch.setattr(mod, "get_sp_group", lambda: FoldGroup())
+        return chunks
+
+    @pytest.mark.parametrize(("total", "world"), [(10, 4), (9, 4), (11, 3), (12, 4)])
+    def test_uneven_shards_are_padded_then_trimmed(self, monkeypatch, total, world):
+        from vllm_omni.diffusion.distributed.sp_sharding import sp_gather_padded
+
+        torch.manual_seed(0)
+        hidden = 3
+        global_tensor = torch.randn(2, total, hidden)
+        chunks = self._fake_group(monkeypatch, global_tensor, dim=1, world_size=world)
+
+        for rank, local in enumerate(chunks):
+            value = sp_gather_padded(local.clone(), dim=1, global_size=total)
+            assert value.shape == global_tensor.shape
+            torch.testing.assert_close(value, global_tensor, rtol=0, atol=0)
+
+    def test_rejects_a_shard_larger_than_the_global_chunk(self, monkeypatch):
+        from vllm_omni.diffusion.distributed.sp_sharding import sp_gather_padded
+
+        global_tensor = torch.randn(1, 10, 2)
+        self._fake_group(monkeypatch, global_tensor, dim=1, world_size=3)
+        with pytest.raises(ValueError, match="allows at most"):
+            # ceil(10 / 3) == 4 rows per rank, so a 5-row shard is impossible.
+            sp_gather_padded(torch.randn(1, 5, 2), dim=1, global_size=10)
+
+    def test_world_size_one_requires_the_full_tensor(self, monkeypatch):
+        from vllm_omni.diffusion.distributed import sp_sharding as mod
+        from vllm_omni.diffusion.distributed.sp_sharding import sp_gather_padded
+
+        monkeypatch.setattr(mod, "get_sequence_parallel_world_size", lambda: 1)
+        value = sp_gather_padded(torch.randn(1, 6, 2), dim=1, global_size=6)
+        assert value.shape == (1, 6, 2)
+        with pytest.raises(ValueError, match="expected global_size"):
+            sp_gather_padded(torch.randn(1, 5, 2), dim=1, global_size=6)
+
+
+@pytest.mark.cpu
+class TestGatherHookGlobalRows:
+    """The gather hook prefers the module's exact global row count."""
+
+    def test_module_global_rows_drive_the_padded_gather(self, monkeypatch):
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, SequenceParallelOutput
+        from vllm_omni.diffusion.hooks import sequence_parallel as hooks
+
+        seen: dict[str, int] = {}
+
+        def fake_gather(tensor, dim, global_size):
+            seen["global_size"] = global_size
+            return tensor
+
+        monkeypatch.setattr(hooks, "sp_gather_padded", fake_gather)
+        hook = hooks.SequenceParallelGatherHook(
+            SequenceParallelOutput(gather_dim=1),
+            SequenceParallelConfig(ulysses_degree=2),
+        )
+        module = nn.Module()
+        module.sp_gather_global_rows = 203266
+
+        out = hook.post_forward(module, torch.randn(1, 3, 4))
+
+        assert seen["global_size"] == 203266
+        assert out.shape == (1, 3, 4)
