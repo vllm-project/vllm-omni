@@ -1120,6 +1120,7 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         host._local_rank = 0
         host._request_ids_mapping["r1"] = "ext-r1"
         host._get_req_chunk["r1"] = 0
+        host._pending_load_reqs["r1"] = object()
         payload = {"tok": [10], "finished": torch.tensor(True)}
         connector_result = (payload, 123)
         host._omni_connector.get.return_value = connector_result
@@ -1304,6 +1305,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
 
     def test_rank0_only_polls_connector_for_tp_async_chunk(self):
         host = self._make_host(rank=0)
+        host._pending_load_reqs["r1"] = object()
         payload = {
             "codes": {"audio": [10, 11]},
             "meta": {"left_context_size": 0, "finished": torch.tensor(False)},
@@ -1325,6 +1327,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
     def test_poll_single_request_accepts_tensor_audio_codes(self):
         host = self._make_host(rank=0)
         host._scheduling_metadata_adapter = MagicMock()
+        host._pending_load_reqs["r1"] = object()
         audio_codes = torch.tensor([[10, 11, 12]], dtype=torch.long)
         payload = {
             "codes": {"audio": audio_codes},
@@ -1351,6 +1354,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
 
     def test_finish_only_chunk_publishes_terminal_metadata_to_sink(self):
         host = self._make_host(rank=0)
+        host._pending_load_reqs["r1"] = object()
         host._omni_connector.get.return_value = ({"meta": {"finished": torch.tensor(True)}}, 1)
         sink = MagicMock()
         host.set_omni_connector_output_sink(sink)
@@ -1575,6 +1579,7 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host._model_mode = "ar"
         host._request_ids_mapping["r1"] = "ext-r1"
         host._get_req_chunk["r1"] = 0
+        host._pending_load_reqs["r1"] = object()
 
         host._omni_connector.get.side_effect = [
             (
@@ -1640,6 +1645,7 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host._model_mode = "gen"
         host._request_ids_mapping["r1"] = "ext-r1"
         host._get_req_chunk["r1"] = 1
+        host._pending_load_reqs["r1"] = object()
         host._local_request_metadata["r1"] = SchedulingMetadataUpdate(prompt_token_ids=(10, 11, 12))
         host._finished_load_reqs.add("r1")
 
