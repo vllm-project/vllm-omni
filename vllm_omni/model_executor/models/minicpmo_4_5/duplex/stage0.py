@@ -93,8 +93,27 @@ class _MiniCPMO45Stage0SessionState:
     attempted_append_identity: tuple[int | None, int] | None = None
     #: This step's batched prefill result, taken by the append's own preprocess.
     staged_prefill: tuple[tuple[int | None, int], dict[str, object]] | None = None
-    pending_terminator_token: int | None = None
+    _pending_terminator_tokens: list[int] = field(default_factory=list)
     last_terminator_token: int | None = None
+
+    @property
+    def pending_terminator_token(self) -> int | None:
+        """The oldest pending terminator (single-unit view of the K queue)."""
+        return self._pending_terminator_tokens[0] if self._pending_terminator_tokens else None
+
+    @pending_terminator_token.setter
+    def pending_terminator_token(self, value: int | None) -> None:
+        """A single-unit write replaces the whole queue (the legacy semantics)."""
+        self._pending_terminator_tokens = [value] if value is not None else []
+
+    @property
+    def pending_terminator_tokens(self) -> list[int]:
+        return self._pending_terminator_tokens
+
+    @pending_terminator_tokens.setter
+    def pending_terminator_tokens(self, value: list[int]) -> None:
+        self._pending_terminator_tokens = [int(v) for v in value]
+
     pending_speech_context: bool = False
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
@@ -480,6 +499,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             embed_parts.extend(state.context_embeds)
             token_ids.extend(state.context_token_ids)
 
+        unit_boundary_token_counts: list[int] = []
         # Consume every complete processor chunk in the buffer so the appended
         # span and the scheduler's slot reservation agree exactly. The serving
         # PCM buffer pads a final real residual before it reaches Stage0. Do not
@@ -523,13 +543,14 @@ class MiniCPMO45Stage0DuplexRuntime:
                 # sampled terminator token, so it is re-injected here ahead of
                 # the closure; the model's listen/speak policy depends on
                 # seeing its own past decisions in context.
-                pending_terminator = state.pending_terminator_token
+                pending_terminators = list(state.pending_terminator_tokens)
                 closure_token_ids: list[int] = []
-                if pending_terminator is not None and units_built == 0:
-                    state.pending_terminator_token = None
-                    embed_parts.append(self._embed_token(pending_terminator))
-                    token_ids.append(int(pending_terminator))
-                    closure_token_ids.append(int(pending_terminator))
+                if pending_terminators and units_built == 0:
+                    state.pending_terminator_tokens = []
+                    for pending_terminator in pending_terminators:
+                        embed_parts.append(self._embed_token(pending_terminator))
+                        token_ids.append(int(pending_terminator))
+                        closure_token_ids.append(int(pending_terminator))
                 embed_parts.append(self._embed_token(self.unit_end_token_id))
                 token_ids.append(self.unit_end_token_id)
                 closure_token_ids.append(self.unit_end_token_id)
@@ -569,6 +590,10 @@ class MiniCPMO45Stage0DuplexRuntime:
                 )
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
+            # #8710 phase-1: boundary position of this unit — the token count
+            # at its end. The sampler draws the listen/speak boundary from the
+            # logits at hidden position (L_i - 1) after this append's prefill.
+            unit_boundary_token_counts.append(len(token_ids))
             units_built += 1
             if state.window_enabled:
                 if state.pending_window_unit is None:
@@ -616,6 +641,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "special_token_ids": self._special_token_ids(),
                 "num_input_tokens": int(inputs_embeds.shape[0]),
                 "prompt_suffix_len": prompt_suffix_len,
+                "duplex_boundary_offsets": list(unit_boundary_token_counts),
                 "uses_model_runner_scheduler": True,
                 "runner_kv_backed": True,
                 "runtime_impl": "scheduler_data_plane",

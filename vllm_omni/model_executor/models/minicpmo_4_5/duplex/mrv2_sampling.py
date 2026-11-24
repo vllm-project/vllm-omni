@@ -131,6 +131,54 @@ class MiniCPMO45DuplexSampler(OmniSampler):
             all_greedy=all(sp.temperature <= 0 for sp in params),
         )
 
+    def _duplex_multi_boundary_outcomes(self, input_batch: Any) -> dict[int, dict[str, object]]:
+        """Run the intermediate boundary Bernoullis for multi-unit appends (#8710).
+
+        ``input_batch._duplex_boundary_logits`` maps each multi-unit row to the
+        K-1 intermediate boundary logits (the final boundary is the row's
+        regular logits, sampled by the normal path). Each boundary draw uses the
+        row's own generator in sequential order, matching per-unit execution.
+        Returns {row_idx: {"all_listen": bool, "first_speak": int | None,
+        "offsets": list[int]}} for the acceptance step; absent rows are skipped.
+        """
+        boundary = getattr(input_batch, "_duplex_boundary_logits", None)
+        if not isinstance(boundary, dict) or not boundary:
+            return {}
+        infos = getattr(self.model, "_mrv2_sampling_infos", {})
+        chunk_eos_id = None
+        model = self.model
+        # The row's regular logits carry chunk_eos via the active token ids;
+        # reuse the policy's boundary probability helper with the same id the
+        # sync sampler derives. Fall back to the policy's chunk terminator set
+        # when the runtime token map is not exposed here.
+        token_ids = getattr(model, "_minicpmo45_duplex_token_ids", None) or {}
+        chunk_eos_id = token_ids.get("chunk_eos_token_id")
+        if chunk_eos_id is None:
+            return {}
+        outcomes: dict[int, dict[str, object]] = {}
+        for row_idx, logits in boundary.items():
+            offsets = None
+            req_id = input_batch.req_ids[row_idx] if row_idx < len(input_batch.req_ids) else None
+            info = infos.get(str(req_id)) if req_id is not None else None
+            if isinstance(info, dict):
+                duplex = info.get("duplex")
+                if isinstance(duplex, dict):
+                    offsets = duplex.get("duplex_boundary_offsets")
+            if not isinstance(offsets, list) or len(offsets) < 2 or logits.shape[0] != len(offsets) - 1:
+                continue
+            probs = model._duplex_boundary_chunk_eos_probs(logits, chunk_eos_id)
+            generators = getattr(input_batch, "generators", None) or {}
+            row_gen = generators.get(row_idx) if isinstance(generators, dict) else None
+            draws = torch.rand((probs.shape[0],), generator=row_gen, device=probs.device)
+            hits = draws < probs
+            first_speak = int((~hits).nonzero()[0].item()) if bool((~hits).any()) else None
+            outcomes[int(row_idx)] = {
+                "all_listen": first_speak is None,
+                "first_speak": first_speak,
+                "offsets": [int(o) for o in offsets],
+            }
+        return outcomes
+
     def sample_step(self, hidden_states, input_batch, req_states, grammar_output, standard_sample):
         # Publish the Thinker payload through the MRv2 output-channel contract:
         # its latent row ledger is inter-stage only. The full-payload fallback
@@ -143,6 +191,14 @@ class MiniCPMO45DuplexSampler(OmniSampler):
         infos = getattr(self.model, "_mrv2_sampling_infos", {})
         helper = self._helper
         runner = _sampling_context(input_batch, infos)
+        # Multi-unit duplex appends: run the intermediate boundary draws before
+        # the regular path samples the final boundary (#8710 phase-1). The
+        # outcomes are published for the model hook's acceptance step.
+        multi_outcomes = self._duplex_multi_boundary_outcomes(input_batch)
+        if multi_outcomes:
+            self.model._minicpmo45_duplex_multi_boundaries = multi_outcomes
+        elif getattr(self.model, "_minicpmo45_duplex_multi_boundaries", None):
+            self.model._minicpmo45_duplex_multi_boundaries = {}
         for request_id in input_batch.req_ids:
             helper.refresh_active_request(runner, request_id)
         rows = helper.rows(runner)

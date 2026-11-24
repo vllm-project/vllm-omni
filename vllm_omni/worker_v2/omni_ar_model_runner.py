@@ -241,7 +241,51 @@ class OmniARModelRunner(OmniGPUModelRunner):
     # sample_tokens: OmniOutput handling + pooler_output + async D2H
     # ------------------------------------------------------------------
 
+    def _duplex_boundary_logits(self, hidden_states: torch.Tensor, input_batch: Any) -> dict[int, torch.Tensor] | None:
+        """Extra boundary logits rows for multi-unit duplex appends (#8710 phase-1).
+
+        For each duplex request whose append result carried
+        ``duplex_boundary_offsets`` with more than one unit, project the hidden
+        states at the K-1 *intermediate* unit boundaries to logits and publish
+        them on the input batch as ``_duplex_boundary_logits`` keyed by the
+        request's logit row. The final boundary is the request's regular last
+        row, which the normal path already samples. Partial prefills are
+        skipped: their appends will re-arrive, so the offsets would be stale.
+        """
+        rows: dict[int, torch.Tensor] = {}
+        infos = getattr(self, "model_intermediate_buffer", None)
+        if not isinstance(infos, dict) or not input_batch.num_reqs:
+            return None
+        for row_idx, req_id in enumerate(input_batch.req_ids):
+            info = infos.get(str(req_id))
+            duplex = info.get("duplex") if isinstance(info, dict) else None
+            if not isinstance(duplex, dict):
+                continue
+            offsets = duplex.get("duplex_boundary_offsets")
+            if not isinstance(offsets, list) or len(offsets) < 2:
+                continue
+            # Only complete prefills: a partial chunk re-feeds this append.
+            if getattr(input_batch, "is_prefilling_np", None) is not None and input_batch.is_prefilling_np[row_idx]:
+                computed = int(input_batch.num_computed_prefill_tokens_np[row_idx])
+                scheduled = int(input_batch.num_scheduled_tokens[row_idx])
+                if computed + scheduled < int(input_batch.prefill_len_np[row_idx]):
+                    continue
+            start = int(input_batch.query_start_loc_np[row_idx])
+            positions = [start + int(offset) - 1 for offset in offsets[:-1] if int(offset) >= 1]
+            if not positions:
+                continue
+            boundary_hidden = hidden_states[torch.as_tensor(positions, device=hidden_states.device)]
+            rows[row_idx] = self.model_state.compute_sample_logits(boundary_hidden)
+        return rows or None
+
     def sample(self, hidden_states, input_batch, grammar_output):
+        # Multi-unit duplex appends: publish the intermediate boundary logits
+        # for the sampler hook before the normal single-row path runs (#8710).
+        boundary_logits = self._duplex_boundary_logits(hidden_states, input_batch)
+        if boundary_logits is not None:
+            input_batch._duplex_boundary_logits = boundary_logits
+        elif getattr(input_batch, "_duplex_boundary_logits", None) is not None:
+            delattr(input_batch, "_duplex_boundary_logits")
         # An explicitly declared model-state hook may return already determined
         # tokens. Unsupported sampling features retain the upstream path.
         sample_determined = getattr(type(self.model_state), "sample_determined_tokens", None)

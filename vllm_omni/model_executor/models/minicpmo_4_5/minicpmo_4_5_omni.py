@@ -1670,6 +1670,15 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         tts_bos_id = token_ids.get("tts_bos_token_id", -1)
         turn_eos_id = token_ids.get("turn_eos_token_id", -1)
         if sampled in self._minicpmo45_chunk_terminator_token_ids(token_ids):
+            multi = getattr(self, "_minicpmo45_duplex_multi_boundaries", None) or {}
+            outcome = multi.get(row_idx) if isinstance(multi, dict) else None
+            if isinstance(outcome, dict) and outcome.get("all_listen") is True:
+                # #8710 phase-1: every unit of this append listened, so queue
+                # one terminator per accepted unit — the next append re-injects
+                # them in order, matching per-unit execution.
+                state.pending_terminator_tokens = [int(sampled)] * len(outcome.get("offsets", []))
+                state.last_terminator_token = int(sampled)
+                return
             state.pending_terminator_token = int(sampled)
             state.last_terminator_token = int(sampled)
             opening_explicit_response = (
