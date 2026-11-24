@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 
 _CLASS_TO_MODULE: dict[str, str] = {
+    "RealtimeVenusOmniConfig": "vllm_omni.transformers_utils.configs.realtime_venus",
     "Audio8TTSConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "Audio8TTSSlowARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "Audio8TTSFastARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
@@ -44,6 +45,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "AuKConfig": "vllm_omni.transformers_utils.configs.auk",
     "SenseNovaU1Config": "vllm_omni.transformers_utils.configs.sensenova_u1",
     "SenseNovaU1MoELLMConfig": "vllm_omni.transformers_utils.configs.sensenova_u1",
+    "ChatterboxConfig": "vllm_omni.transformers_utils.configs.chatterbox",
 }
 
 __all__ = [
@@ -81,6 +83,7 @@ __all__ = [
     "WhisperEncoderConfig",
     "SenseNovaU1Config",
     "SenseNovaU1MoELLMConfig",
+    "ChatterboxConfig",
 ]
 
 
@@ -101,6 +104,7 @@ def __dir__():
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
 from vllm_omni.transformers_utils.configs import audio8_tts as _audio8_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import auk as _auk  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import chatterbox as _chatterbox  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_omni as _fish_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
@@ -113,6 +117,7 @@ from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_
 from vllm_omni.transformers_utils.configs import minimax_music3 as _minimax_music3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import phonon as _phonon  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import realtime_venus as _realtime_venus  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import sensenova_u1 as _sensenova_u1  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import vibevoice as _vibevoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402

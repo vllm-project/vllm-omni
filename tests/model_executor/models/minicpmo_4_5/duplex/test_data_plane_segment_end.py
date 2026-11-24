@@ -64,6 +64,24 @@ def test_new_input_does_not_rearm_an_already_delivered_boundary():
     assert _project(plane, _boundary(4))
 
 
+@pytest.mark.parametrize("turn_end", [False, True])
+@pytest.mark.parametrize("text_without_audio", [None, False, True])
+def test_zero_frame_text_delivery_is_opt_in_and_deduplicated(turn_end, text_without_audio):
+    plane = MiniCPMO45DataPlaneSession(lambda *args: "")
+    output = _boundary(0)
+    output.outputs[0].text = "<delegate>look up the weather</delegate>Done."
+    if text_without_audio is not None:
+        output.multimodal_output["meta.text_without_audio"] = text_without_audio
+    output.multimodal_output["meta.turn_end"] = turn_end
+    events = _project(plane, output)
+    assert len(events) == 1
+    assert events[0]["text"] == (output.outputs[0].text if text_without_audio else "")
+    assert events[0]["audio_data"] == ""
+    assert events[0]["end_of_turn"] is turn_end
+    assert events[0]["abort_data_plane_request"] is True
+    assert _project(plane, output) == []
+
+
 def test_chunk_sequence_can_restart_in_a_new_audio_cache_epoch():
     plane = MiniCPMO45DataPlaneSession(
         lambda audio, *args: "audio" if audio is not None and np.asarray(audio).size else ""
