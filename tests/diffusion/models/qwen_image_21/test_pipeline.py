@@ -424,3 +424,67 @@ def test_online_fp8_ignored_layers_become_name_patterns() -> None:
     text_encoder_config = _exclude_text_encoder_subtrees_from_quant(build_quant_config("fp8"))
     assert text_encoder_config.ignored_layers == ["model.visual", "lm_head"]
     assert text_encoder_config.ignored_layers_match_mode == "substring"
+
+
+def _decode_latents_pipeline(decoded: torch.Tensor) -> tuple[QwenImage21Pipeline, list[torch.Tensor]]:
+    """A pipeline stub with just what `_decode_latents` touches.
+
+    `_vae_decode` records what it was handed, so a test can assert the normalisation was
+    applied and that the resolved decode callable - compiled or not - is the one used.
+    """
+    pipeline = QwenImage21Pipeline.__new__(QwenImage21Pipeline)
+    seen: list[torch.Tensor] = []
+
+    def decode(latents: torch.Tensor, return_dict: bool = True):
+        seen.append(latents)
+        return (decoded,)
+
+    pipeline.vae = SimpleNamespace(
+        dtype=torch.float32,
+        config=SimpleNamespace(z_dim=4, latents_mean=[0.0, 1.0, 2.0, 3.0], latents_std=[1.0, 2.0, 4.0, 8.0]),
+        decode=lambda *args, **kwargs: pytest.fail("the raw vae.decode must not be called directly"),
+    )
+    pipeline._vae_decode = decode
+    pipeline._latent_stats = None
+    pipeline.vae_scale_factor = 16
+    pipeline._unpack_latents = lambda latents, *args: latents
+    return pipeline, seen
+
+
+def test_decode_latents_uses_the_resolved_decode_callable() -> None:
+    """`_decode_latents` must go through `_vae_decode`, which is where the compiled decode lands."""
+    decoded = torch.zeros(1, 4, 1, 8, 8)
+    pipeline, seen = _decode_latents_pipeline(decoded)
+
+    out = pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
+
+    assert len(seen) == 1
+    assert out.output.shape == (1, 4, 8, 8)
+
+
+def test_decode_latents_builds_the_latent_statistics_once() -> None:
+    """The normalisation constants are checkpoint config, so they are not rebuilt per request."""
+    pipeline, seen = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
+
+    pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
+    first = pipeline._latent_stats
+    assert first is not None, "nothing was cached, so reuse cannot be asserted"
+    pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
+
+    assert pipeline._latent_stats is first, "the statistics were rebuilt on the second request"
+    # and they are applied: latents of zero come back as the mean, broadcast over the grid
+    assert torch.equal(seen[0][0, :, 0, 0, 0], torch.tensor([0.0, 1.0, 2.0, 3.0]))
+
+
+def test_decode_latents_rebuilds_the_statistics_for_a_new_dtype() -> None:
+    """A different dtype or device needs its own copies rather than a silent mismatch."""
+    pipeline, _ = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
+
+    pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
+    first = pipeline._latent_stats
+    assert first is not None, "nothing was cached, so a rebuild cannot be asserted"
+    pipeline.vae.dtype = torch.float64
+    pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
+
+    assert pipeline._latent_stats is not first
+    assert pipeline._latent_stats[1].dtype == torch.float64

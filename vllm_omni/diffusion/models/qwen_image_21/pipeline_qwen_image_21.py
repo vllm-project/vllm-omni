@@ -64,6 +64,7 @@ from vllm_omni.diffusion.utils.size_utils import (
     normalize_min_aligned_size,
 )
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.vae_fast_path import vae_compile_allowed
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.quantization import resolve_component_quant_config
@@ -467,6 +468,24 @@ class QwenImage21Pipeline(
         self._drop_idx = len(sys_tokens[0])
         self._img_token_id = self.processor.tokenizer.encode("<|image_pad|>")[0]
         self._max_length = 8192
+
+        # Decoding runs once per request, after the denoise loop. Compiling it lets
+        # Inductor fuse the elementwise and layout work between the convolutions while
+        # each convolution stays an extern kernel. Gated like the other pipelines that
+        # compile their VAE: `--enforce-eager` vetoes it and the platform must support
+        # inductor. `dynamic=False` because a deployment serves a fixed resolution; a new
+        # size recompiles rather than failing.
+        from vllm_omni.platforms import current_omni_platform
+
+        vae = getattr(self, "vae", None)
+        self._vae_decode = vae.decode if vae is not None else None
+        if vae is not None and vae_compile_allowed(bool(self.od_config.enforce_eager), current_omni_platform):
+            self._vae_decode = torch.compile(vae.decode, mode="default", fullgraph=False, dynamic=False)
+            logger.info("Qwen-Image-2.1: VAE decode is compiled")
+
+        # `latents_mean` / `latents_std` are checkpoint constants, so they are built once
+        # per (device, dtype) instead of on every request.
+        self._latent_stats: tuple[tuple[torch.device, torch.dtype], torch.Tensor, torch.Tensor] | None = None
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -1133,18 +1152,17 @@ class QwenImage21Pipeline(
 
         latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
         latents = latents.to(self.vae.dtype)
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
+        key = (latents.device, latents.dtype)
+        if self._latent_stats is None or self._latent_stats[0] != key:
+            shape = (1, self.vae.config.z_dim, 1, 1, 1)
+            self._latent_stats = (
+                key,
+                torch.tensor(self.vae.config.latents_mean).view(shape).to(*key),
+                torch.tensor(self.vae.config.latents_std).view(shape).to(*key),
+            )
+        _, latents_mean, latents_std = self._latent_stats
         latents = latents * latents_std + latents_mean
-        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        image = self._vae_decode(latents, return_dict=False)[0][:, :, 0]
         return DiffusionOutput(
             output=image,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
