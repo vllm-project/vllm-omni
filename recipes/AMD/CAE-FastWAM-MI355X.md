@@ -151,6 +151,15 @@ values in `{-1.0, 1.0}`.
 - No custom kernels, fp8 or tuning tables: this is the plain PyTorch path. The
   published 12.82 ms (10 steps) latency used the GEAK kernels from the
   reference repository and is not comparable.
+- Two ERROR blocks at server start are expected. `amd/CAE-FastWAM` has a root
+  `config.json` with `model_type: fastwam` (it names the FastWAM preset and the
+  checkpoint layout). vLLM's generic Hugging Face config probe (`repo_utils`)
+  tries to parse it as a Transformers config, logs "The checkpoint you are
+  trying to load has model type `fastwam` but Transformers does not recognize
+  this architecture", retries once and logs the same block again. FastWAM does
+  not use a Transformers config: the server then loads `FastWAMPipeline` and
+  serves normally. The messages are harmless; upgrading Transformers, as they
+  suggest, is not needed.
 - Known limitations: one observation per forward; LIBERO two-camera layout only
   (RoboTwin three-camera checkpoints are not supported); the optional-IDM
   inference mode and future-video prediction are not implemented.
