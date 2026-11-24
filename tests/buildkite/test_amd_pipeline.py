@@ -4549,43 +4549,52 @@ def test_minimax_h3_accuracy_jobs_are_blocking() -> None:
         assert "MiniMax-H3 I2VA Ref2VA Accuracy" not in text
 
 
-def test_voxtral_tts_perf_is_one_nonblocking_nightly_job() -> None:
-    step = _find_step("Voxtral TTS Perf", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_1"
-    assert step["depends_on"] == "amd-build"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 180
-    assert step["source_file_dependencies"] == "tts_voxtral_tts_perf"
-    assert step["env"]["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] == "1"
-    assert "VLLM_ROCM_USE_AITER" not in step["env"]
-    commands = "\n".join(step["commands"])
-    marker = "full_model and tts and rocm and MI325 and cards_1"
-    assert marker in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "exit 5" in commands
-    assert "pytest.xml" in commands
-    assert "tests/dfx/perf/tests/test_tts.json" in commands
-    assert "Expected exactly $${#nodes[@]} Voxtral TTS perf nodes" in commands
-    assert commands.count("--shard-id=0 --num-shards=1") == 2
-    assert "Expected exactly three executed Voxtral TTS perf tests" in commands
-    assert "skipped != 0" in commands
-    assert "Expected exactly 3 Voxtral TTS result JSON files" in commands
-    assert "result_test_voxtral_tts_*.json" in commands
-    assert 'rm -rf "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR"' in commands
-    assert "python3 -c 'import sys, xml.etree.ElementTree as ET" in commands
-    nodes = (
-        "test_voxtral_tts-default_voice_latency_seed-tts-text",
-        "test_voxtral_tts-default_voice_throughput_seed-tts-text",
-        "test_voxtral_tts-default_voice_stress_seed-tts-text",
+def test_voxtral_tts_nightly_splits_c1_latency_from_throughput_and_stress() -> None:
+    latency = _find_step("Voxtral TTS C1 Latency", AMD_NIGHTLY_PIPELINE)
+    remaining = _find_step("Voxtral TTS Perf", AMD_NIGHTLY_PIPELINE)
+    assert latency["grade"] == "Blocking"
+    assert remaining["grade"] == "NonBlocking"
+    expected_nodes = (
+        ("test_voxtral_tts-default_voice_latency_seed-tts-text",),
+        (
+            "test_voxtral_tts-default_voice_throughput_seed-tts-text",
+            "test_voxtral_tts-default_voice_stress_seed-tts-text",
+        ),
     )
-    for node in nodes:
-        assert commands.count(node) == 2
-    assert "test_qwen3_tts" not in commands
-    assert "cards_2" not in commands
-    nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
-    assert nightly.count('label: "Voxtral TTS Perf"') == 1
+    expected_results = (
+        {
+            "test_voxtral_tts": "1",
+        },
+        {
+            "test_voxtral_tts": "2",
+        },
+    )
+    for step, cases, results, kind in zip(
+        (latency, remaining), expected_nodes, expected_results, ("latency", "perf"), strict=True
+    ):
+        artifact = f"rocm-voxtral-tts-{kind}"
+        assert step["agent_pool"] == "mi300_1"
+        assert step["depends_on"] == "amd-build"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["timeout_in_minutes"] == 180
+        assert step["source_file_dependencies"] == ["tts_voxtral_tts_perf", "rocm_tts_perf_runner"]
+        assert step["env"] == {"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"}
+        assert step["artifact_paths"] == [f"artifacts/{artifact}/**/*"]
+        (command,) = step["commands"]
+        args = split(command)
+        assert args[:6] == [
+            "python3",
+            ".buildkite/amd/scripts/run_rocm_tts_perf.py",
+            "--gpus",
+            "1",
+            "--artifact-name",
+            artifact,
+        ]
+        index = args.index("--cases")
+        assert args[6:index] == [
+            token for model, count in results.items() for token in ("--expect-results", model, count)
+        ]
+        assert tuple(args[index + 1 :]) == cases
     config = json.loads(Path("tests/dfx/perf/tests/test_tts.json").read_text(encoding="utf-8"))
     voxtral = next(case for case in config if case["test_name"] == "test_voxtral_tts")
     res = voxtral["mark"][0]["hardware_marks"]["res"]
@@ -4611,9 +4620,22 @@ def test_voxtral_tts_perf_is_one_nonblocking_nightly_job() -> None:
     assert "vllm_omni/transformers_utils/parsers/voxtral_tts.py" in dependencies
     assert "vllm_omni/engine/stage_runtime.py" in dependencies
     assert "vllm_omni/distributed/omni_connectors/" in dependencies
+    latency_models = {case.split("-", 1)[0] for case in expected_nodes[0]}
+    latencies = [
+        phase
+        for case in config
+        if case["test_name"] in latency_models
+        for phase in case["benchmark_params"]
+        if phase["eval_phase"] == "latency"
+    ]
+    assert len(latencies) == len(expected_nodes[0])
+    for phase in latencies:
+        assert phase["max_concurrency"] == [1]
+        assert phase["baseline"]["MI300"]
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "Voxtral TTS Perf" not in text
+        assert "Voxtral TTS C1 Latency" not in text
 
 
 def test_qwen3_tts_perf_is_one_nonblocking_nightly_job() -> None:
@@ -5082,48 +5104,6 @@ def _assert_nightly_junit_guard(
         check=False,
     )
     assert result.returncode == expected_status, result.stdout + result.stderr
-
-
-@pytest.mark.parametrize(
-    ("pytest_status", "tests", "skipped", "timeout_status", "result_files", "expected_status"),
-    [
-        (0, 3, 0, None, 3, 0),
-        (0, 3, 1, None, 3, 5),
-        (0, 0, 0, None, 3, 5),
-        (1, 3, 0, None, 3, 1),
-        (0, 3, 0, 124, 3, 124),
-        (0, 3, 0, None, 2, 5),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout", "missing-result"),
-)
-def test_voxtral_tts_perf_executes_evidence_guards_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    result_files: int,
-    expected_status: int,
-) -> None:
-    benchmark_dir = tmp_path / "benchmark-results"
-    benchmark_dir.mkdir()
-    for index in range(result_files):
-        (benchmark_dir / f"result_test_voxtral_tts_{index}.json").write_text("{}\n", encoding="utf-8")
-
-    _assert_nightly_junit_guard(
-        tmp_path,
-        step_label="Voxtral TTS Perf",
-        command_fragment='pytest -s -v -ra "$${nodes[@]}"',
-        expected_message="Expected exactly three executed Voxtral TTS perf tests",
-        artifact_env="ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR",
-        job_id_prefix="voxtral-tts-perf-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-        extra_env={"BENCHMARK_DIR": str(benchmark_dir)},
-    )
 
 
 @pytest.mark.parametrize(

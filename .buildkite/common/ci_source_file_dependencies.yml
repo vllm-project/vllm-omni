@@ -576,6 +576,11 @@ source_file_dependencies:
     - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
     - .buildkite/amd/scripts/assert-pytest-collection.sh
 
+  rocm_tts_perf_runner:
+    - .buildkite/amd/scripts/run_rocm_tts_perf.py
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+
   # Tiny-model diffusion jobs (shared across many model trees under models/).
   diffusion_tiny_model:
     - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
