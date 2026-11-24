@@ -1080,6 +1080,21 @@ def test_fused_kernels_are_off_until_enabled_and_need_cuda():
     assert model.paligemma_with_expert.fused_kernels is False
 
 
+@pytest.mark.parametrize("max_shared_mem", [64 * 1024, 228 * 1024])
+def test_fused_gemm_stages_fit_the_device_shared_memory(monkeypatch, max_shared_mem):
+    """The ``linear`` GEMM's 4 stages need 96 KB and drop to 3 on 64 KB (gfx942);
+    every other tile set keeps its stages."""
+    monkeypatch.setattr(modeling_pi05, "_max_shared_mem", lambda device_index: max_shared_mem)
+    device = torch.device("cuda", 0)
+    stages = {
+        kernel: modeling_pi05._num_stages(t, dtype, device) for (kernel, dtype), t in modeling_pi05._TILES.items()
+    }
+    expected = {kernel: t.num_stages for (kernel, _), t in modeling_pi05._TILES.items()}
+    if max_shared_mem == 64 * 1024:
+        expected["linear"] = 3
+    assert stages == expected
+
+
 @pytest.mark.slow
 def test_fused_kernels_serve_only_batch_one_on_a_single_head_kv_cache(tiny_model):
     """Calls the kernels do not cover run eagerly even once they are enabled."""
