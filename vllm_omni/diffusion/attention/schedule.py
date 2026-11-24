@@ -8,7 +8,6 @@ from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeAlias
 
-from vllm_omni.diffusion.models.interface import role_loads_component
 from vllm_omni.errors import OmniClientError
 
 if TYPE_CHECKING:
@@ -205,6 +204,8 @@ def stage_runs_denoising(model_class_name: str | None, stage_role: str) -> bool:
 
     ``stage_role`` is the stage's role as ``resolve_diffusion_stage_role`` returns it.
     """
+    from vllm_omni.diffusion.models.interface import role_loads_component
+
     return model_class_name not in DECODE_ONLY_PIPELINES and role_loads_component(stage_role, "dit")
 
 

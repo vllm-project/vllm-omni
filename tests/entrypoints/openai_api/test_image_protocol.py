@@ -7,10 +7,12 @@ import zipfile
 
 import pytest
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
 from vllm_omni.entrypoints.openai.protocol.images import (
     _FILE_RESPONSE_CHUNK_SIZE,
     ImageData,
+    ImageGenerationRequest,
     ImageGenerationResponse,
 )
 
@@ -30,6 +32,16 @@ def _response(*payloads: bytes) -> ImageGenerationResponse:
 
 async def _collect(response: StreamingResponse) -> list[bytes]:
     return [bytes(chunk) async for chunk in response.body_iterator]
+
+
+@pytest.mark.parametrize("true_cfg_scale", ["bad", [], {}])
+def test_image_request_rejects_non_numeric_true_cfg_scale(true_cfg_scale):
+    with pytest.raises(ValidationError, match="true_cfg_scale"):
+        ImageGenerationRequest(prompt="a teapot", true_cfg_scale=true_cfg_scale)
+
+
+def test_image_request_parses_numeric_true_cfg_scale():
+    assert ImageGenerationRequest(prompt="a teapot", true_cfg_scale="1.0").true_cfg_scale == 1.0
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,48 @@
+# Qwen-Image 2.1 Encode/Denoise/Decode deployment on three devices.
+# E: Qwen3-VL + VAE encoder. G: DiT. D: VAE decoder.
+# Select with --deploy-config vllm_omni/deploy/qwen_image_21_egd.yaml.
+# Template: requires three GPUs; shipped settings have not been smoke-tested.
+pipeline: qwen_image_21_egd
+async_chunk: false
+
+trust_remote_code: false
+distributed_executor_backend: mp
+
+connectors:
+  qwen_image_21_encode_connector:
+    name: SharedMemoryConnector
+  qwen_image_21_latent_connector:
+    name: SharedMemoryConnector
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    tensor_parallel_size: 1
+    output_connectors:
+      to_stage_1: qwen_image_21_encode_connector
+    default_sampling_params:
+      seed: 42
+
+  - stage_id: 1
+    devices: "1"
+    max_num_seqs: 1
+    enforce_eager: true
+    tensor_parallel_size: 1
+    input_connectors:
+      from_stage_0: qwen_image_21_encode_connector
+    output_connectors:
+      to_stage_2: qwen_image_21_latent_connector
+    default_sampling_params:
+      seed: 42
+
+  - stage_id: 2
+    devices: "2"
+    max_num_seqs: 1
+    enforce_eager: true
+    tensor_parallel_size: 1
+    input_connectors:
+      from_stage_1: qwen_image_21_latent_connector
+    default_sampling_params:
+      seed: 42

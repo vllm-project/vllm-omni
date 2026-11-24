@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from vllm_omni.config.stage_config import DiffusionStageOperator, DiffusionStageRole
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.flux.pipeline_flux import FluxDMD2Pipeline, FluxPipeline
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
     LTX2I2VDMD2Pipeline,
@@ -176,6 +178,32 @@ def test_request_batch_sanitizes_each_request(pipeline):
         assert request.sampling_params.do_classifier_free_guidance is False
         assert request.sampling_params.is_cfg_negative is False
         assert "negative_prompt" not in request.prompt
+
+
+def test_wan_explicit_operator_runs_dmd2_request_preparation():
+    pipeline = _make_pipeline(WanT2VDMD2Pipeline)
+    pipeline.stage_role = DiffusionStageRole.FULL
+    pipeline.initialize_stage_execution(step_execution=False)
+    request = _make_request(
+        prompt={"prompt": "a cat", "negative_prompt": "blurry"},
+        num_inference_steps=40,
+        guidance_scale=5.0,
+        guidance_scale_provided=True,
+    )
+    seen = {}
+
+    def diffuse_batch(batch):
+        seen["batch"] = batch
+        return [DiffusionOutput(custom_output={"latents": torch.ones(1)})]
+
+    pipeline.diffuse_batch = diffuse_batch
+    pipeline.run_stage(DiffusionRequestBatch([request]), operator=DiffusionStageOperator.DIFFUSE)
+
+    assert seen["batch"].requests[0] is request
+    assert request.sampling_params.num_inference_steps == pipeline.dmd2_config.num_inference_steps
+    assert request.sampling_params.guidance_scale == pipeline.dmd2_config.guidance_scale
+    assert request.sampling_params.do_classifier_free_guidance is False
+    assert "negative_prompt" not in request.prompt
 
 
 # ---------------------------------------------------------------------------
