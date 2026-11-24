@@ -574,7 +574,7 @@ def test_npu_int8_nz_ordinary_offload(mocker, quantized):
     ("spec", "reject"),
     [
         (None, False),
-        ({"transformer": "int8"}, False),
+        ({"transformer": {"method": "int8"}}, False),
         ({"method": "int8", "weight_nz_mode": "cast"}, True),
         ({"transformer": {"method": "int8", "weight_nz_mode": "reactor"}}, True),
     ],
