@@ -15,6 +15,7 @@ from vllm_omni.diffusion.distributed.ulysses_transport import (
     eligible_transports,
     explicit_plan,
 )
+from vllm_omni.platforms.interface import OmniPlatformEnum, UnspecifiedOmniPlatform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -139,13 +140,17 @@ class _FakeDist:
         tensor.copy_(torch.minimum(tensor, torch.tensor(self.remote_features, dtype=tensor.dtype)))
 
 
+class _CudaPlatform(UnspecifiedOmniPlatform):
+    _omni_enum = OmniPlatformEnum.CUDA
+
+
 def _probe(monkeypatch, *, hosts_differ=False, nvlink=True, remote_features=(1, 1, 1, 100, 1, 1)):
     local_uuid, peer_uuid = uuid.uuid4(), uuid.uuid4()
     host = ulysses_transport.zlib.crc32(ulysses_transport.socket.gethostname().encode()) & 0x7FFFFFFF
     fake = _FakeDist([host, host + 1 if hosts_differ else host], [local_uuid, peer_uuid], list(remote_features))
     checked = []
     monkeypatch.setattr(ulysses_transport, "dist", fake)
-    monkeypatch.setattr(ulysses_transport, "current_omni_platform", SimpleNamespace(is_cuda=lambda: True))
+    monkeypatch.setattr(ulysses_transport, "current_omni_platform", _CudaPlatform())
     monkeypatch.setattr(ulysses_transport.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(
         ulysses_transport.torch.cuda,
@@ -189,8 +194,8 @@ def test_probe_is_cached_per_group(monkeypatch):
 def _resolve(requested, monkeypatch, topology, backend="FLASHINFER_ATTN", impl="cute-dsl"):
     messages = []
     monkeypatch.setattr(ulysses_transport, "_LOGGED", set())
-    monkeypatch.setattr(ulysses_transport.logger, "info", lambda m: messages.append(("info", m)))
-    monkeypatch.setattr(ulysses_transport.logger, "warning", lambda m: messages.append(("warning", m)))
+    monkeypatch.setattr(ulysses_transport.logger, "info", lambda m, *args: messages.append(("info", m % args)))
+    monkeypatch.setattr(ulysses_transport.logger, "warning", lambda m, *args: messages.append(("warning", m % args)))
     monkeypatch.setattr(ulysses_transport, "probe_ulysses_topology", lambda group, world_size: topology)
     plans = [
         ulysses_transport.resolve_ulysses_transports(
@@ -234,3 +239,17 @@ def test_explicit_backend_skips_the_probe(monkeypatch):
     plan, messages = _resolve("nccl", monkeypatch, None)
     assert plan == ulysses_transport.NCCL_PLAN
     assert messages == [("info", "Using Ulysses a2a transport 'nccl' for group 'sp0' (explicit)")]
+
+
+@pytest.mark.parametrize(
+    "backend, permute, expected",
+    [("auto", False, "nccl"), ("nccl", False, "nccl"), ("copy_engine", False, None), ("auto", True, None)],
+)
+def test_require_default_transport_pins_auto_to_nccl(backend, permute, expected):
+    parallel = SimpleNamespace(ulysses_a2a_backend=backend, ulysses_a2a_permute=permute)
+    if expected is None:
+        with pytest.raises(ValueError, match="supports only ulysses_a2a_backend='nccl'"):
+            ulysses_transport.require_default_ulysses_transport(parallel, "Model")
+    else:
+        ulysses_transport.require_default_ulysses_transport(parallel, "Model")
+        assert parallel.ulysses_a2a_backend == expected

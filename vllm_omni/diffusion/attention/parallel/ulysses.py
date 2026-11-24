@@ -314,6 +314,11 @@ class UlyssesParallelAttention:
                     ensure_flashinfer_ulysses_available()
 
     @property
+    def output_views(self) -> bool:
+        """Whether attention outputs may stay views of reused transport buffers (``VLLM_OMNI_ULYSSES_OUTPUT_VIEWS``)."""
+        return self._output_views
+
+    @property
     def enabled(self) -> bool:
         return True
 

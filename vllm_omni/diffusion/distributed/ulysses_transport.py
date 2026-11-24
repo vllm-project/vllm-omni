@@ -99,9 +99,11 @@ def overlap_chunk_count(heads_per_rank: int | None, requested: int = 0) -> int:
 
 
 def _flashinfer_available() -> bool:
+    # OSError: FlashInfer is installed but its shared libraries fail to load (e.g. a CUDA version mismatch).
     try:
         from flashinfer.comm import UlyssesCommunicator  # noqa: F401
-    except Exception:
+    except (ImportError, OSError) as error:
+        logger.debug("FlashInfer UlyssesCommunicator unavailable: %s", error)
         return False
     return True
 
@@ -109,7 +111,8 @@ def _flashinfer_available() -> bool:
 def _symmetric_memory_available() -> bool:
     try:
         import torch.distributed._symmetric_memory  # noqa: F401
-    except Exception:
+    except ImportError as error:
+        logger.debug("torch symmetric memory unavailable: %s", error)
         return False
     return True
 
@@ -292,13 +295,15 @@ def explicit_plan(backend: str, *, heads_per_rank: int | None, overlap_chunks: i
     raise ValueError(f"unknown ulysses_a2a_backend {backend!r}")
 
 
-_LOGGED: set[str] = set()
+_LOGGED: set[tuple[str, str]] = set()
 
 
-def _log_once(level: str, message: str) -> None:
-    if message not in _LOGGED:
-        _LOGGED.add(message)
-        getattr(logger, level)(message)
+def _log_once(level: str, message: str, *args: object) -> None:
+    """Log ``message % args`` once per distinct rendered line (e.g. once per group)."""
+    key = (level, message % args)
+    if key not in _LOGGED:
+        _LOGGED.add(key)
+        getattr(logger, level)(message, *args)
 
 
 def resolve_ulysses_transports(
@@ -316,7 +321,7 @@ def resolve_ulysses_transports(
     heads_per_rank = num_heads // world_size if num_heads and num_heads % world_size == 0 else None
     group_name = getattr(group, "group_name", "ulysses")
     if requested != "auto":
-        _log_once("info", f"Using Ulysses a2a transport {requested!r} for group {group_name!r} (explicit)")
+        _log_once("info", "Using Ulysses a2a transport %r for group %r (explicit)", requested, group_name)
         return explicit_plan(requested, heads_per_rank=heads_per_rank, overlap_chunks=overlap_chunks)
 
     topology = probe_ulysses_topology(group, world_size)
@@ -326,12 +331,14 @@ def resolve_ulysses_transports(
         attention = f"{attention_backend}({attention_impl})" if attention_impl else attention_backend
         _log_once(
             "info",
-            f"Ulysses a2a transport {COPY_ENGINE_OVERLAP!r} skipped for {attention} attention on group "
-            f"{group_name!r}: not per-head invariant",
+            "Ulysses a2a transport %r skipped for %s attention on group %r: not per-head invariant",
+            COPY_ENGINE_OVERLAP,
+            attention,
+            group_name,
         )
     for name, reason in reasons.items():
         if reason is not None and topology.cuda:
-            _log_once("warning", f"Ulysses a2a transport {name!r} disabled on group {group_name!r}: {reason}")
+            _log_once("warning", "Ulysses a2a transport %r disabled on group %r: %s", name, group_name, reason)
     plan = auto_plan(
         topology,
         pure_strict=pure_strict,
@@ -351,8 +358,10 @@ def resolve_ulysses_transports(
     ]
     _log_once(
         "info",
-        f"Using {enabled} Ulysses a2a transports (in dispatch order) for group {group_name!r} "
-        f"out of potential: {list(DISPATCH_ORDER)}",
+        "Using %s Ulysses a2a transports (in dispatch order) for group %r out of potential: %s",
+        enabled,
+        group_name,
+        list(DISPATCH_ORDER),
     )
     return plan
 

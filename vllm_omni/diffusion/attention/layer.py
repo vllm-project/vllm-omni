@@ -1260,7 +1260,7 @@ class Attention(nn.Module):
             chunks=chunks,
         )
         # The runner reuses its output buffer on the next call; model code gets its own copy unless opted in.
-        return output if strategy._output_views else output.clone()
+        return output if strategy.output_views else output.clone()
 
     def _forward_impl(
         self,

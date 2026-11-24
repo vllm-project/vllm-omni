@@ -13,8 +13,17 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel import factory, ulysses
 from vllm_omni.diffusion.distributed import a2a_permute, flashinfer_ulysses
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.platforms.interface import UnspecifiedOmniPlatform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class _NoSyncPlatform(UnspecifiedOmniPlatform):
+    """Not an NPU; ``synchronize`` is a no-op."""
+
+    @classmethod
+    def synchronize(cls) -> None:
+        pass
 
 
 @pytest.mark.parametrize("npu", [False, True])
@@ -112,7 +121,7 @@ def test_qkv_views_survive_gate_exchange_and_output_is_copied_out(monkeypatch):
         return 0
 
     runtime = SimpleNamespace(lib=SimpleNamespace(cudaMemcpy2DAsync=copy2d), CUDART_CHECK=lambda result: None)
-    platform = SimpleNamespace(is_npu=lambda: False, synchronize=lambda: None)
+    platform = _NoSyncPlatform()
     monkeypatch.setattr(ulysses, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: None)
@@ -212,7 +221,7 @@ def test_qkv_views_survive_gate_exchange_and_output_is_copied_out(monkeypatch):
 def test_flashinfer_backend_routes_qkv_and_reverse(monkeypatch, with_gate):
     """FlashInfer carries Q/K/V and the output; gate_compress keeps Q/K/V on the copy engines."""
     calls = []
-    platform = SimpleNamespace(is_npu=lambda: False, synchronize=lambda: None)
+    platform = _NoSyncPlatform()
     monkeypatch.setattr(ulysses, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: calls.append("ce_init"))
@@ -366,7 +375,7 @@ def test_disabled_optimization_does_not_load_backend(monkeypatch):
 
 def test_kv_consumer_hooks_keep_qkv_out_of_the_workspace(monkeypatch):
     """Hooks that keep or reread K/V after the exchange get copied-out Q/K/V (and skip FlashInfer)."""
-    platform = SimpleNamespace(is_npu=lambda: False, synchronize=lambda: None)
+    platform = _NoSyncPlatform()
     monkeypatch.setattr(ulysses, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: None)

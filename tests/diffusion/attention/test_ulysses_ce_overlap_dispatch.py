@@ -31,7 +31,7 @@ def _case(**overrides):
         name="ulysses",
         ce_overlap_chunks=2,
         _ulysses_a2a_permute=True,
-        _output_views=False,
+        output_views=False,
         _scatter_idx=2,
         _gather_idx=1,
         _sp_group=SimpleNamespace(ring_world_size=1, ulysses_world_size=2),
@@ -102,5 +102,5 @@ def test_eligible_layer_runs_local_attention_per_chunk(monkeypatch):
     output = layer.Attention._forward_ulysses_ce_overlap(attention, strategy, query, query, query, metadata, 2)
     # The runner's output buffer is reused by the next call, so model code gets a copy.
     assert torch.equal(output, query) and output is not query and calls == [metadata]
-    strategy._output_views = True
+    strategy.output_views = True
     assert layer.Attention._forward_ulysses_ce_overlap(attention, strategy, query, query, query, metadata, 2) is query

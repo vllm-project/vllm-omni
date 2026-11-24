@@ -92,3 +92,19 @@ def test_overlap_chunks_are_resolved_per_layer(monkeypatch, parallel_context, ch
     factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False, num_heads=8)
 
     assert strategy.call_args.kwargs["transports"].overlap_chunks == expected
+
+
+def test_model_nccl_pin_reaches_the_strategy(monkeypatch, parallel_context):
+    """Hy-Nomas, LingBot World, SeedVR2 and TaoMate-H3 pin ``auto`` at the start of their pipeline ``__init__``, on
+    the worker's ``od_config``, which is also the forward-context config their Attention layers are built under."""
+    parallel_context.ulysses_a2a_backend = "auto"
+    parallel_context.ulysses_a2a_permute = False
+    ulysses_transport.require_default_ulysses_transport(parallel_context, "model")
+    monkeypatch.setattr(ulysses_transport, "probe_ulysses_topology", Mock(side_effect=AssertionError("probed")))
+    strategy = Mock()
+    monkeypatch.setattr(factory, "UlyssesParallelAttention", strategy)
+
+    factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
+
+    assert parallel_context.ulysses_a2a_backend == "nccl"
+    assert strategy.call_args.kwargs["transports"] == ulysses_transport.NCCL_PLAN
