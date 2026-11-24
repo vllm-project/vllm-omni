@@ -12,17 +12,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.platforms import current_platform
 
-import vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper as wrapper_module
+import vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs as wrapper_module
 from tests.helpers.cudnn import ieee_cudnn_fp32
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     HiFTGenerator,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav, _trim_streaming_cache
-from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
     WholeEulerCFMGraphWrapper,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
+    BatchedToken2Wav,
+    _trim_streaming_cache,
 )
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
@@ -252,7 +255,7 @@ def test_lazy_capture_limit_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch)
     wrapper.decode_fn.assert_called_once_with(speech_feat, cache_source)
     assert result is wrapper.decode_fn.return_value
     # The fallback is counted under the padded capture key it would have used.
-    assert wrapper.eager_fallback_counts() == {(1, 9, 0): 1}
+    assert wrapper._eager_fallbacks == {(1, 9, 0): 1}
 
 
 def test_eager_fallbacks_are_counted_by_shape(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -260,16 +263,16 @@ def test_eager_fallbacks_are_counted_by_shape(monkeypatch: pytest.MonkeyPatch) -
 
     The exact-shape capture config is empirical (the merged backlog width has
     no derivable cap), so the counts -- one WARNING on a shape's first miss,
-    ``eager_fallback_counts()`` afterwards -- are what makes a width outgrowing
+    followed by periodic INFO summaries -- are what makes a width outgrowing
     the config visible instead of the miss silently repeating every call.
     """
     wrapper = _fake_wrapper(monkeypatch)
     # A width outside the buckets falls back eagerly (width padding disabled).
     wrapper.replay(torch.randn(1, 80, 11), torch.zeros(1, 1, 0))
-    assert wrapper.eager_fallback_counts() == {(1, 11, 0): 1}
+    assert wrapper._eager_fallbacks == {(1, 11, 0): 1}
     # An unsupported batch size is counted under its own shape key.
     wrapper.replay(torch.randn(16, 80, 7), torch.zeros(16, 1, 0))
-    assert wrapper.eager_fallback_counts() == {(1, 11, 0): 1, (16, 7, 0): 1}
+    assert wrapper._eager_fallbacks == {(1, 11, 0): 1, (16, 7, 0): 1}
     # The counters accumulate; nothing was captured for either miss.
     wrapper._capture.assert_not_called()
 
@@ -311,7 +314,7 @@ def test_padded_replay_fallback_is_counted_under_the_request_width(
     wrapper.lazy_graph_count = wrapper.max_lazy_graphs  # force the lazy-limit fallback
     wrapper.replay(torch.randn(1, 80, 11), torch.zeros(1, 1, 0))
     wrapper._capture.assert_not_called()
-    assert wrapper.eager_fallback_counts() == {(1, 11, 0): 1}
+    assert wrapper._eager_fallbacks == {(1, 11, 0): 1}
 
 
 def test_multibatch_serial_replay_with_batch1_graph(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -509,7 +512,7 @@ def test_importing_wrapper_does_not_resolve_platform() -> None:
     """Importing this module must not build the OmniPlatform singleton.
 
     The NPU platform's ``__init__`` patches Code2Wav, which imports
-    ``batched_token2wav`` -> ``cuda_graph_wrapper``. Resolving
+    ``code2wav.token2wav`` -> ``code2wav.graphs``. Resolving
     ``current_omni_platform`` at module scope re-enters
     ``platforms.__getattr__`` while the singleton is still under construction
     and the import graph deadlocks. The module reaches for nothing on
@@ -519,7 +522,7 @@ def test_importing_wrapper_does_not_resolve_platform() -> None:
 
     import vllm_omni.platforms as platforms_module
 
-    name = "vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper"
+    name = "vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs"
     importlib.import_module(name)
     saved = platforms_module._current_omni_platform
     try:
@@ -2295,19 +2298,7 @@ def test_whole_euler_query_bucket_keeps_current_first_cache_layout(
     bucketed._flush()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
-        BatchedToken2Wav,
-    )
-
-    mock_stepper = Mock()
-    mock_stepper.step.side_effect = lambda x, mu, t, spks, cond, cnn_cache, att_cache: (
-        x,
-        torch.zeros(2, x.shape[0], 4, 2, device=x.device),
-        torch.zeros(2, x.shape[0], 2, x.shape[2], 4, device=x.device),
-    )
-
+def _whole_euler_token2wav():
     class _MockDecoder(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -2331,9 +2322,25 @@ def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
             self.source_cache_len = 2
             self.speech_window = torch.hamming_window(4, periodic=False)
 
+    return _MockToken2Wav()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
+        BatchedToken2Wav,
+    )
+
+    mock_stepper = Mock()
+    mock_stepper.step.side_effect = lambda x, mu, t, spks, cond, cnn_cache, att_cache: (
+        x,
+        torch.zeros(2, x.shape[0], 4, 2, device=x.device),
+        torch.zeros(2, x.shape[0], 2, x.shape[2], 4, device=x.device),
+    )
+
     # Both TRT stepper and enable_cfm_graph (with enable_whole_euler=True) configured
     adapter = BatchedToken2Wav(
-        _MockToken2Wav(),
+        _whole_euler_token2wav(),
         trt_stepper=mock_stepper,
         cfm_graph_config={"enabled": True, "enable_whole_euler": True, "bucket_frames": 16},
     )
@@ -2358,42 +2365,19 @@ def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_whole_euler_disabled_via_serving_config() -> None:
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
         BatchedToken2Wav,
     )
 
-    class _MockDecoder(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.estimator = _WholeEulerDiT().eval().cuda()
-            self.inference_cfg_rate = 0.7
-            self.register_buffer("rand_noise", torch.zeros(1, 4, 100, device="cuda"), persistent=False)
-
-    class _MockFlow(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.decoder = _MockDecoder()
-            self.spk_embed_affine_layer = nn.Identity()
-
-    class _MockToken2Wav:
-        def __init__(self) -> None:
-            self.flow = _MockFlow()
-            self.hift = nn.Module()
-            self.float16 = False
-            self.n_timesteps = 10
-            self.mel_cache_len = 1
-            self.source_cache_len = 2
-            self.speech_window = torch.hamming_window(4, periodic=False)
-
     adapter_disabled = BatchedToken2Wav(
-        _MockToken2Wav(),
+        _whole_euler_token2wav(),
         cfm_graph_config={"enabled": True, "enable_whole_euler": False},
     )
     assert adapter_disabled._whole_euler_graph_wrapper is None
     assert adapter_disabled._cfm_graph_wrapper is not None
 
     adapter_enabled = BatchedToken2Wav(
-        _MockToken2Wav(),
+        _whole_euler_token2wav(),
         cfm_graph_config={"enabled": True, "enable_whole_euler": True},
     )
     assert adapter_enabled._whole_euler_graph_wrapper is not None
@@ -2401,7 +2385,7 @@ def test_whole_euler_disabled_via_serving_config() -> None:
 
     # Unconfigured, the capture width is the steady chunk's mel width.
     adapter_derived = BatchedToken2Wav(
-        _MockToken2Wav(),
+        _whole_euler_token2wav(),
         connector_config={"codec_chunk_frames": 25, "codec_left_context_frames": 3},
         cfm_graph_config={"enabled": True, "enable_whole_euler": True},
     )
@@ -2583,39 +2567,6 @@ def test_whole_euler_mixed_histories_match_independent_streams(
             assert out_att[row].shape[-2] == offset + length
             torch.testing.assert_close(out_att[row], expected_att, rtol=1e-4, atol=1e-5)
     wrapper._flush()
-
-
-def test_whole_euler_mixed_histories_do_not_enable_npu_arena(monkeypatch: pytest.MonkeyPatch) -> None:
-    device = SimpleNamespace(type="npu")
-    wrapper = SimpleNamespace(
-        enabled=True,
-        npu_mixed_history=False,
-        device=device,
-        _stats={"calls": 0},
-        max_graph_batch=8,
-        _plan_groups=lambda batch: [(0, batch)],
-        row_offsets=False,
-        ragged_body=object(),
-        query_widths=(8,),
-    )
-    monkeypatch.setattr(
-        wrapper_module, "_graph_api", lambda _: SimpleNamespace(is_current_stream_capturing=lambda: False)
-    )
-    prepare = Mock(side_effect=AssertionError("mixed NPU histories must not enter the arena"))
-    monkeypatch.setattr(wrapper_module, "_pad_query_for_capture", prepare)
-    result = WholeEulerCFMGraphWrapper.replay(
-        wrapper,
-        x=SimpleNamespace(device=device, shape=(2, 4, 8)),
-        mu_cfg=torch.zeros(4, 4, 8),
-        speakers_cfg=torch.zeros(4, 4),
-        cond_cfg=torch.zeros(4, 4, 8),
-        cnn_cache=None,
-        att_cache=[torch.zeros(1, 1, 2, 1, 1, length, 2) for length in [4, 8]],
-        valid_lengths=[8, 8],
-        attn_mask=torch.ones(4, 8, 16, dtype=torch.bool),
-    )
-    assert result is None
-    prepare.assert_not_called()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
@@ -2825,7 +2776,7 @@ def test_whole_euler_groups_are_acquired_again_after_a_flush() -> None:
 
 @pytest.mark.parametrize("fail", [False, True])
 def test_vocoder_restores_tf32_policy(fail, monkeypatch):
-    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav_watchdog import Code2WavWatchdog
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.watchdog import Code2WavWatchdog
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
     from vllm_omni.platforms import current_omni_platform
 

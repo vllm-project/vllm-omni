@@ -23,9 +23,10 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 Omni keeps soundfile as the first automatic audio decoder to preserve input
 waveforms with vLLM 0.34. Switching decoders can change BF16 audio
 features and mixed-media answers. Formats unsupported by soundfile continue
-through upstream's torchcodec/PyAV fallback. To explicitly select a decoder,
-use `--media-io-kwargs '{"audio":{"audio_backend":"torchcodec"}}'` (or
-`soundfile` / `pyav`); explicit selections retain upstream behavior.
+through upstream's torchcodec/PyAV fallback. To select a decoder, set
+`media_io_kwargs` on the Thinker (stage 0) with
+`--stage-overrides '{"0":{"media_io_kwargs":{"audio":{"audio_backend":"torchcodec"}}}}'`.
+The other decoder choices are `soundfile` and `pyav`.
 
 ### Send Multi-modal Request
 

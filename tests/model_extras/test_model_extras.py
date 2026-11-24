@@ -301,6 +301,21 @@ def test_reference_image_size_policy_threads_revision(monkeypatch: pytest.Monkey
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("model_class_name", "preserves"),
+    [
+        ("Cosmos3OmniDiffusersPipeline", True),
+        ("Cosmos3OmniPipeline", True),
+        # Sim-Bimanual uses the requested output geometry as given.
+        ("Cosmos3NanoSimBimanualPipeline", False),
+    ],
+)
+def test_cosmos3_reference_image_size_policy(model_class_name: str, preserves: bool) -> None:
+    assert should_preserve_reference_image_size(model_class_name, model="nvidia/Cosmos3-Nano") is preserves
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 @pytest.mark.parametrize("model_class_name", ["MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"])
 def test_minimax_h3_preserves_reference_image_size(model_class_name: str) -> None:
     assert should_preserve_reference_image_size(

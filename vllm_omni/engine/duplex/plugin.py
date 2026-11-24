@@ -539,8 +539,8 @@ class DuplexModelPlugin(ABC):
     projects_intermediate_outputs: bool = False
     supports_auxiliary_requests: bool = False
     #: Whether sessions of this model may set ``extra_body.clock == "input"``;
-    #: otherwise such a session is refused (``input_clock_unsupported``). No
-    #: model opts in yet. A plugin opts in once ``unit_decision`` /
+    #: otherwise such a session is refused (``input_clock_unsupported``).
+    #: MiniCPM-o 4.5 opts in. A plugin opts in once ``unit_decision`` /
     #: ``unit_output_complete`` match its real unit boundaries, and only if
     #: Stage 0 ends every accepted submission with exactly one segment end, in
     #: submission order, with the unit's decision taken on that segment-ending
@@ -559,6 +559,16 @@ class DuplexModelPlugin(ABC):
     #: its input's acknowledgement was fixed and is reported with the next
     #: client input; a plugin that relies on those paths does not opt in yet.
     supports_input_clock: bool = False
+    #: Input modalities an input-clocked session of this model accepts, or
+    #: ``None`` for the model's usual ones. A model whose committed turn can
+    #: split into several Stage-0 submissions for some modality (vision units
+    #: it replays separately, ``PcmAppendBuffer.prepare_commit_prefix``) is
+    #: not accounted for by the clock when that commit is deferred behind a
+    #: response, so it names the other modalities here: the session is created
+    #: without the rest (``apply_input_clock_capabilities``) and an append
+    #: carrying one of them is refused (``invalid_input_modality``) and
+    #: acknowledged as rejected.
+    input_clock_input_modalities: frozenset[str] | None = None
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
     #: Reasons this model can show a notice for. The notice goes through the
@@ -840,6 +850,19 @@ class DuplexModelPlugin(ABC):
         """
         del stage_count
         return frozenset()
+
+    def prewarms_downstream_stages(self, request_id: str) -> bool:
+        """Whether a new Stage0 request pre-submits its downstream stages.
+
+        In async-chunk mode the orchestrator pre-submits every connector-fed
+        stage after Stage0 when the request is first sent. Return False when
+        this request can never reach those stages (for example, a turn whose
+        response modalities have no audio), so no placeholder is created only
+        to be aborted when the turn ends. Called after ``plan_append`` bound
+        the request. Default is True.
+        """
+        del request_id
+        return True
 
     # ---- input-clocked sessions (extra_body.clock == "input") ----
 

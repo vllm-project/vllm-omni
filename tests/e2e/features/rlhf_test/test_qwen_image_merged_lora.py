@@ -35,7 +35,7 @@ async def _publish(engine: AsyncOmni, factors: list[tuple[str, torch.Tensor]]) -
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_qwen_image_merged_lora_changes_and_restores_generation():
     with ExitStack() as after:

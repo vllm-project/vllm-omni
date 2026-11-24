@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Launch vLLM-Omni server for Qwen3-TTS models
 #
 # Usage:
@@ -34,6 +37,5 @@ vllm-omni serve "$MODEL" \
     --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --host 0.0.0.0 \
     --port 8091 \
-    --gpu-memory-utilization 0.9 \
     --trust-remote-code \
     --omni
