@@ -33,15 +33,27 @@ import torch.multiprocessing as mp
 
 from tests.helpers.mark import hardware_test
 
+# Import the pipeline module at module level, like the sibling rank-failure
+# regression in tests/diffusion/distributed/test_vae_error_recovery.py. The
+# workers import it again under spawn, and importing it here warms the page
+# cache, so the two workers reach the rendezvous close together.
+from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 _ENCODER_FAILURE = "npu_rms_norm: NPU function error: call aclnnRmsNorm failed, error code is 561002"
 
+# The workers import the pipeline module (vllm, transformers) before they
+# rendezvous, so the rendezvous timeout has to absorb the import skew between
+# the two workers, and the watchdog has to cover the import itself plus the
+# rendezvous. Both bounds are backstops: the assertion on the elapsed time
+# inside the worker is what detects a wedged rank.
+_RENDEZVOUS_TIMEOUT = timedelta(seconds=180)
+_WATCHDOG_SECONDS = 600
+
 
 def _encode_prompt_worker(rank, rendezvous, backend, encoder_tp_size, failing_rank):
     """Drive ``encode_prompt`` on two ranks, with and without a failing encoder."""
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
-
     torch.set_num_threads(1)
     device = torch.device("cuda", rank) if backend == "nccl" else torch.device("cpu")
     if backend == "nccl":
@@ -49,7 +61,11 @@ def _encode_prompt_worker(rank, rendezvous, backend, encoder_tp_size, failing_ra
 
         current_omni_platform.set_device(device)
     dist.init_process_group(
-        backend, init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=45)
+        backend,
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=_RENDEZVOUS_TIMEOUT,
     )
     try:
         # Both group views point at the two-rank gloo world: the tensor
@@ -120,11 +136,11 @@ def _run_encode_prompt(tmp_path, backend, encoder_tp_size=1, failing_rank=0):
         nprocs=2,
         join=False,
     )
-    deadline = time.monotonic() + 150
+    deadline = time.monotonic() + _WATCHDOG_SECONDS
     try:
         while not context.join(timeout=1):
             if time.monotonic() > deadline:
-                pytest.fail("MiniMax H3 encode_prompt did not finish within 150 seconds")
+                pytest.fail(f"MiniMax H3 encode_prompt did not finish within {_WATCHDOG_SECONDS} seconds")
     finally:
         for process in context.processes:
             if process.is_alive():
