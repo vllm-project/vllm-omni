@@ -1866,7 +1866,7 @@ def test_sub_config_fields_match_structured_scopes():
         "ulysses_mode",
         "ulysses_a2a_permute",
         "ulysses_a2a_zero_copy",
-        "ulysses_ce_overlap_chunks",
+        "ulysses_overlap_chunks",
         "ulysses_a2a_backend",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
@@ -2155,8 +2155,7 @@ def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
 @pytest.mark.parametrize(
     "values, message",
     [
-        ({"ulysses_a2a_permute": True, "ulysses_a2a_backend": "nccl"}, "must be 'copy_engine' or 'flashinfer'"),
-        ({"ulysses_a2a_backend": "flashinfer"}, "requires ulysses_a2a_permute=True"),
+        ({"ulysses_a2a_backend": "nvshmem"}, "ulysses_a2a_backend must be one of"),
     ],
 )
 def test_diffusion_parallel_config_rejects_invalid_ulysses_a2a_backend(values, message):

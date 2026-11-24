@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
     VLLM_OMNI_PACKED_QKV: bool = False
+    VLLM_OMNI_ULYSSES_OUTPUT_VIEWS: bool = False
     VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS: str | None = None
     VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS: bool = False
 
@@ -34,6 +35,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in portable packed QKV/O exchanges for strict Ulysses. Read
     # when the attention strategy is constructed; all ranks must agree.
     "VLLM_OMNI_PACKED_QKV": lambda: os.environ.get("VLLM_OMNI_PACKED_QKV", "0") == "1",
+    # Return the Ulysses attention output of the symmetric-memory transports (copy engine, its overlap and
+    # FlashInfer) as a view of their buffer instead of copying it out. A view stays valid only until the next
+    # exchange on the group, so enable only for models that consume it at once. Read at strategy construction.
+    "VLLM_OMNI_ULYSSES_OUTPUT_VIEWS": lambda: os.environ.get("VLLM_OMNI_ULYSSES_OUTPUT_VIEWS", "0") == "1",
     # Minimum rotary-table span (B*S positions) at which consumers of the shared
     # fused_qk_norm_rope op take the fused path instead of their eager chain;
     # "0" = always fuse; unset = each consumer's own measured default. Raw

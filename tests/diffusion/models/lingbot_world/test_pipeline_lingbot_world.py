@@ -892,7 +892,6 @@ def test_pure_ulysses_parallel_config_is_supported(monkeypatch) -> None:
         {"ring_degree": 2},  # Isolate each clause from the SP-size mismatch.
         {"allgather_degree": 2},
         {"ulysses_mode": "advanced_uaa"},
-        {"ulysses_a2a_permute": True},
         {"ulysses_degree": None},  # Missing degree must not imply pure Ulysses.
     ],
 )
@@ -908,6 +907,16 @@ def test_unsupported_sp_config_fails_before_component_loading(overrides):
     with pytest.raises(NotImplementedError, match="pure Ulysses"):
         module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=config))
     assert module._loader_state.prefetch_calls == []
+
+
+@pytest.mark.parametrize("backend", ["copy_engine", "copy_engine_overlap", "flashinfer"])
+def test_symmetric_memory_ulysses_transport_is_rejected(backend):
+    module = _load_pipeline_module()
+    config = _od_config().parallel_config
+    config.sequence_parallel_size = config.ulysses_degree = 2
+    config.ulysses_a2a_backend = backend
+    with pytest.raises(NotImplementedError, match="ulysses_a2a_backend='nccl'"):
+        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=config))
 
 
 def test_quantization_reaches_transformer_factory() -> None:

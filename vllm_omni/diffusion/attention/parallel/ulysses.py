@@ -20,11 +20,18 @@ from vllm_omni.diffusion.distributed.packed_qkv import (
     packed_qkv_all_to_all,
     packed_qkv_eligible,
 )
+from vllm_omni.diffusion.distributed.ulysses_transport import (
+    FLASHINFER,
+    NCCL,
+    UlyssesTransportPlan,
+    explicit_plan,
+)
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     get_ulysses_mode,
     is_forward_context_available,
 )
+from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -75,6 +82,15 @@ def _maybe_warn_uaa_pad_ratio(
         ulysses_world_size,
         padded_query_head_cnt,
     )
+
+
+# Attention metadata hooks that read or keep the exchanged K/V besides the attention call itself.
+_KV_CONSUMER_HOOKS = ("minimax_h3_reference_kv_post_parallel", REFERENCE_ISOLATION)
+
+
+def _qkv_read_only_by_attention(attn_metadata: AttentionMetadata | None) -> bool:
+    """Whether the exchanged Q/K/V may stay views of the transport buffer (the attention call is their only reader)."""
+    return attn_metadata is None or not any(hook in attn_metadata.extra for hook in _KV_CONSUMER_HOOKS)
 
 
 def _a2a_permute_enabled(enabled: bool, scatter_idx: int, gather_idx: int, world_size: int) -> bool:
@@ -231,6 +247,8 @@ class _UlyssesCtx(ParallelAttentionContext):
     orig_head_cnt: int = 0
     joint_orig_head_cnt: int = 0
     use_packed_qkv: bool = False
+    # Transport of this call's Q/K/V exchange; the output exchange uses the same one.
+    a2a_transport: str = "nccl"
 
 
 class UlyssesParallelAttention:
@@ -251,12 +269,19 @@ class UlyssesParallelAttention:
         gather_idx: int,
         use_sync: bool,
         ulysses_a2a_permute: bool = False,
-        ulysses_a2a_zero_copy: bool = False,
+        ulysses_a2a_backend: str = "nccl",
         ce_overlap_chunks: int = 0,
-        ulysses_a2a_backend: str = "copy_engine",
+        transports: UlyssesTransportPlan | None = None,
     ) -> None:
+        if transports is None:
+            if ulysses_a2a_permute and ulysses_a2a_backend == "nccl":
+                ulysses_a2a_backend = "copy_engine"  # deprecated alias
+            transports = explicit_plan(ulysses_a2a_backend, heads_per_rank=None, overlap_chunks=ce_overlap_chunks)
+        ulysses_a2a_permute = transports.symmetric_memory
         self._sp_group = sp_group
-        self.ce_overlap_chunks = int(ce_overlap_chunks)
+        self._transports = transports
+        # Head chunks for the copy-engine overlap, run by the attention layer when the call is eligible.
+        self.ce_overlap_chunks = transports.overlap_chunks
         self._ulysses_pg = sp_group.ulysses_group
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx
@@ -265,8 +290,9 @@ class UlyssesParallelAttention:
         # Every rank must use the same setting. Unsupported layouts keep their
         # existing exchange, and explicit symmetric memory takes precedence.
         self._packed_qkv = not ulysses_a2a_permute and envs.VLLM_OMNI_PACKED_QKV
-        self._ulysses_a2a_zero_copy = ulysses_a2a_zero_copy
-        self._flashinfer_a2a = ulysses_a2a_permute and ulysses_a2a_backend == "flashinfer"
+        self._flashinfer_a2a = transports.flashinfer_min_bytes is not None
+        # The output goes back to model code, so it is copied out of transport buffers unless opted in.
+        self._output_views = envs.VLLM_OMNI_ULYSSES_OUTPUT_VIEWS
         if ulysses_a2a_permute:
             from vllm_omni.diffusion.distributed.a2a_permute import (
                 ensure_a2a_permute_available,
@@ -320,6 +346,7 @@ class UlyssesParallelAttention:
             validate_a2a_permute_config(ulysses_mode=mode)
         ulysses_world_size = self._sp_group.ulysses_world_size
         use_packed_qkv = False
+        a2a_transport = NCCL
         gate_compress = None
         if attn_metadata is not None:
             candidate = attn_metadata.extra.get("gate_compress")
@@ -564,20 +591,27 @@ class UlyssesParallelAttention:
                     )
 
             # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
+            # Q/K/V stay in the transport's buffers (no copy-out) when attention is their only reader;
+            # those buffers are reused by the next exchange on the group.
+            in_place = _qkv_read_only_by_attention(attn_metadata)
             if _a2a_permute_enabled(
                 self._ulysses_a2a_permute,
                 self._scatter_idx,
                 self._gather_idx,
                 ulysses_world_size,
             ):
+                a2a_transport = self._transports.exchange(
+                    query.numel() * query.element_size(), flashinfer_ok=gate_compress is None and in_place
+                )
+            if a2a_transport != NCCL:
                 # Keep optional transports lazy so default Ulysses does not
                 # require the CUDA symmetric-memory or Triton backends.
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd, ulysses_qkv_fwd_group
 
                 group_name = self._ulysses_pg.group_name
-                use_flashinfer = self._flashinfer_a2a and gate_compress is None
+                use_flashinfer = a2a_transport == FLASHINFER
                 # Exchange the gate first: it is copied out of the shared
-                # workspace, while zero-copy Q/K/V stay views of it that any
+                # workspace, while in-place Q/K/V stay views of it that any
                 # later exchange would overwrite before attention reads them.
                 if gate_compress is not None:
                     gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
@@ -587,7 +621,7 @@ class UlyssesParallelAttention:
                     query, key, value = ulysses_fi_qkv(query, key, value, group_name, ulysses_world_size)
                 else:
                     query, key, value = ulysses_qkv_fwd_group(
-                        query, key, value, group_name, ulysses_world_size, self._ulysses_a2a_zero_copy
+                        query, key, value, group_name, ulysses_world_size, in_place
                     )
                 if self._use_sync:
                     current_omni_platform.synchronize()
@@ -659,6 +693,7 @@ class UlyssesParallelAttention:
             orig_head_cnt=int(orig_head_cnt) if mode == "advanced_uaa" else 0,
             joint_orig_head_cnt=int(joint_orig_head_cnt) if mode == "advanced_uaa" else 0,
             use_packed_qkv=use_packed_qkv,
+            a2a_transport=a2a_transport,
         )
         use_2d_mask = False
         if attn_metadata is not None:
@@ -729,19 +764,14 @@ class UlyssesParallelAttention:
                 )
             elif ctx.use_packed_qkv:
                 output_img = packed_output_all_to_all(ctx.ulysses_pg, output_img, ctx.use_sync)
-            elif _a2a_permute_enabled(
-                self._ulysses_a2a_permute,
-                ctx.scatter_idx,
-                ctx.gather_idx,
-                dist.get_world_size(ctx.ulysses_pg),
-            ):
+            elif ctx.a2a_transport != NCCL:
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
 
                 output_img = ulysses_o_rev(
                     output_img,
                     ctx.ulysses_pg.group_name,
                     dist.get_world_size(ctx.ulysses_pg),
-                    self._ulysses_a2a_zero_copy,
+                    self._output_views,
                 )
                 if ctx.use_sync:
                     current_omni_platform.synchronize()
@@ -779,16 +809,14 @@ class UlyssesParallelAttention:
             )
         if ctx.use_packed_qkv:
             return packed_output_all_to_all(ctx.ulysses_pg, attn_output, ctx.use_sync)
-        if _a2a_permute_enabled(
-            self._ulysses_a2a_permute,
-            ctx.scatter_idx,
-            ctx.gather_idx,
-            dist.get_world_size(ctx.ulysses_pg),
-        ):
-            if self._flashinfer_a2a:
+        if ctx.a2a_transport != NCCL:
+            if ctx.a2a_transport == FLASHINFER:
                 from vllm_omni.diffusion.distributed.flashinfer_ulysses import ulysses_fi_o
 
                 output = ulysses_fi_o(attn_output, ctx.ulysses_pg.group_name, dist.get_world_size(ctx.ulysses_pg))
+                if not self._output_views:
+                    # The output goes back to model code; FlashInfer reuses this buffer on the next gather.
+                    output = output.clone()
             else:
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
 
@@ -796,7 +824,7 @@ class UlyssesParallelAttention:
                     attn_output,
                     ctx.ulysses_pg.group_name,
                     dist.get_world_size(ctx.ulysses_pg),
-                    self._ulysses_a2a_zero_copy,
+                    self._output_views,
                 )
             if ctx.use_sync:
                 current_omni_platform.synchronize()

@@ -815,45 +815,43 @@ class OmniServeCommand(CLISubcommand):
             "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
         )
         omni_config_group.add_argument(
+            "--ulysses-a2a-backend",
+            type=str,
+            default=None,
+            choices=["auto", "nccl", "copy_engine", "copy_engine_overlap", "flashinfer"],
+            help=(
+                "Transport for the strict Ulysses all-to-all. 'auto' (default) probes the Ulysses group (single node, "
+                "NVLink between every pair, compute capability, symmetric memory, FlashInfer) and picks the transport "
+                "measured fastest there, otherwise NCCL. 'nccl': process-group all-to-all. 'copy_engine': copy "
+                "engines into peers' symmetric memory. 'copy_engine_overlap': copy-engine exchange in head chunks "
+                "overlapped with attention (strict pure Ulysses). 'flashinfer': FlashInfer UlyssesCommunicator "
+                "NVLink kernels for the Q/K/V scatter and output gather."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--ulysses-overlap-chunks",
+            type=int,
+            default=None,
+            help=(
+                "Head chunks for --ulysses-a2a-backend copy_engine_overlap (must divide num_heads / ulysses_degree). "
+                "Defaults to two heads per chunk."
+            ),
+        )
+        omni_config_group.add_argument(
             "--ulysses-a2a-permute",
             action=argparse.BooleanOptionalAction,
             default=None,
             help=(
-                "Enable Ulysses all-to-all over platform symmetric memory "
-                "(CUDA copy engines on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
-                "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
-                "TorchNPU NPUSHMEM and Triton-Ascend, "
-                "with libshmem.so on LD_LIBRARY_PATH. Defaults to disabled."
+                "Deprecated alias for --ulysses-a2a-backend copy_engine (CUDA copy engines on CUDA, TorchNPU "
+                "symmetric memory on NPU). NPU currently requires --enforce-eager, pure Ulysses over all ranks in one "
+                "HCCS domain, TorchNPU NPUSHMEM and Triton-Ascend, with libshmem.so on LD_LIBRARY_PATH."
             ),
         )
         omni_config_group.add_argument(
             "--ulysses-a2a-zero-copy",
             action=argparse.BooleanOptionalAction,
             default=None,
-            help=(
-                "With --ulysses-a2a-permute on CUDA, return the exchanged Q/K/V and attention output as views of the "
-                "symmetric-memory workspace instead of copying them out. Defaults to disabled."
-            ),
-        )
-        omni_config_group.add_argument(
-            "--ulysses-ce-overlap-chunks",
-            type=int,
-            default=None,
-            help=(
-                "With --ulysses-a2a-permute on CUDA, split each rank's attention heads into this many chunks and "
-                "move them on copy engines while earlier chunks compute (must divide num_heads / ulysses_degree; "
-                "0 disables). Requires strict pure Ulysses. Defaults to disabled."
-            ),
-        )
-        omni_config_group.add_argument(
-            "--ulysses-a2a-backend",
-            type=str,
-            default=None,
-            choices=["copy_engine", "flashinfer"],
-            help=(
-                "Transport for --ulysses-a2a-permute on CUDA: 'copy_engine' (default) or 'flashinfer' "
-                "(FlashInfer UlyssesCommunicator one-sided NVLink kernels for the Q/K/V scatter and output gather)."
-            ),
+            help="Deprecated and ignored: exchanged Q/K/V are read in place and the attention output is copied out.",
         )
         omni_config_group.add_argument(
             "--ring",

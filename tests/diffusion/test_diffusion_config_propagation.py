@@ -84,35 +84,31 @@ class TestParallelConfigPropagation:
             tensor_parallel_size=2,
             ulysses_degree=2,
             ring_degree=1,
-            ulysses_a2a_permute=True,
-            ulysses_a2a_zero_copy=True,
             ulysses_a2a_backend="flashinfer",
         )
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.parallel_config.ulysses_degree == 2
         assert od.parallel_config.ring_degree == 1
-        assert od.parallel_config.ulysses_a2a_permute is True
         assert od.parallel_config.ulysses_a2a_backend == "flashinfer"
-        assert od.parallel_config.ulysses_a2a_zero_copy is True
 
     def test_ulysses_ce_overlap_roundtrip(self):
-        pc = DiffusionParallelConfig(ulysses_degree=2, ulysses_a2a_permute=True, ulysses_ce_overlap_chunks=4)
+        pc = DiffusionParallelConfig(ulysses_degree=2, ulysses_a2a_permute=True, ulysses_overlap_chunks=4)
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
-        assert od.parallel_config.ulysses_ce_overlap_chunks == 4
+        assert od.parallel_config.ulysses_overlap_chunks == 4
+        assert od.parallel_config.ulysses_a2a_backend == "copy_engine_overlap"
 
     @pytest.mark.parametrize(
         "overrides",
         [
-            {"ulysses_ce_overlap_chunks": -1},
-            {"ulysses_a2a_permute": False},
+            {"ulysses_overlap_chunks": -1},
             {"ulysses_mode": "advanced_uaa"},
             {"ring_degree": 2},
         ],
     )
     def test_ulysses_ce_overlap_rejects_invalid_config(self, overrides):
-        values = dict(ulysses_degree=2, ulysses_a2a_permute=True, ulysses_ce_overlap_chunks=2)
+        values = dict(ulysses_degree=2, ulysses_a2a_permute=True, ulysses_overlap_chunks=2)
         values.update(overrides)
-        with pytest.raises(ValueError, match="ulysses_ce_overlap_chunks"):
+        with pytest.raises(ValueError, match="ulysses_overlap_chunks|copy_engine_overlap"):
             DiffusionParallelConfig(**values)
 
     def test_mask_sp_padding_roundtrip(self):
