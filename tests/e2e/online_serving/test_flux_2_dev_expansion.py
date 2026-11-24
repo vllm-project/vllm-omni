@@ -30,8 +30,8 @@ MODEL = "black-forest-labs/FLUX.2-dev"
 PROMPT = "A cinematic mountain landscape at sunrise, dramatic clouds, ultra-detailed, realistic photography."
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 
 
 def _get_flux_2_dev_feature_cases(model: str):

@@ -135,11 +135,11 @@ selection must remain visible without breaking unrelated nightly coverage.
 
 Use the maintained NPU pipeline when the requested model and reference support
 that platform. The existing
-[HunyuanImage3 accuracy case](../../../../tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py)
+[HunyuanImage3 accuracy case](../../../../tests/e2e/accuracy/test_hunyuan_image3.py)
 declares `@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=4)`
 for its online comparison. Its
 [nightly step](../../../../.buildkite/npu/test-npu-nightly.yml) selects the exact
-file with `-m "full_model and A3" --run-level full_model`, uses `a3_npu_4`, and
+file with `-m "full_model and diffusion and npu and A3 and cards_4" --run-level full_model`, uses `a3_npu_4`, and
 sets `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA`. These are that case's resources and
 backend, not defaults for every NPU model.
 
