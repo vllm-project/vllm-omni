@@ -248,6 +248,10 @@ steps:
         timeout_in_minutes: 300
         source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
         env:
+          # Avoid solver searches on new codec shapes and oversized host pools.
+          MIOPEN_FIND_MODE: "FAST"
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
           QWEN3_OMNI_REQUIRE_BASELINE: "1"
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-no-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
@@ -270,6 +274,9 @@ steps:
         timeout_in_minutes: 180
         source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
         env:
+          MIOPEN_FIND_MODE: "FAST"
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
           QWEN3_OMNI_REQUIRE_BASELINE: "1"
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
@@ -1461,6 +1468,8 @@ steps:
         timeout_in_minutes: 180
         source_file_dependencies: tts_qwen3_tts_perf
         env:
+          # Use cached/immediate solvers instead of searching during decoding.
+          MIOPEN_FIND_MODE: "FAST"
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-tts-perf/benchmark-results"
         artifact_paths:
