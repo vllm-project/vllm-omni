@@ -677,6 +677,7 @@ vllm_omni/
 │       ├── turn_detection.py        server-side VAD turn detector used by the session
 │       ├── audio.py                 compatibility re-export, via protocol/duplex
 │       ├── vad.py / intermediate.py
+│       ├── response_judge.py        post-ASR judge: does a committed turn need a reply
 │       └── session/                 one engine-resident session and everything that runs it
 │           ├── engine_session.py    DuplexEngineSession: ledgers, lease, fence, stage resources, append sequencing
 │           ├── runner.py            DuplexSessionRunner (per-session mailbox on the orchestrator loop)
@@ -1321,6 +1322,14 @@ generation ends, including when the ACK precedes terminal metadata. Late ACKs
 cannot reopen a retired gate; the early-stop marker is removed at response end.
 A successful write is not proof of server acceptance, and the runner never sends
 playback ACKs on behalf of the application.
+
+The output-decision and concurrent-turn-release hooks receive the current
+request's streaming context. A host plugin can use that context to share a
+decision with its stage-input bridge without retaining request state on the
+shared plugin. For the optional response judge, AURA returns its listen
+decision from `decide_output`; the generic orchestrator does not interpret
+judge output. AURA resolves its stage roles in `configure_pipeline`, before
+serving requests, and rejects missing required roles or duplicate roles.
 
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage
