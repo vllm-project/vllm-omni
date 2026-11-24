@@ -16,10 +16,15 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("followup_kind", ["camera", "text", "speech"])
 @pytest.mark.parametrize("cancelled", [False, True], ids=["played", "cancelled"])
-@pytest.mark.parametrize("deleted", [False, True], ids=["retained", "deleted"])
-async def test_asr_history_keeps_query_in_its_visual_turn(mocker, followup_kind, cancelled, deleted):
+@pytest.mark.parametrize(
+    ("transcript_state", "followup_kind", "intervening_camera"),
+    [(state, kind, False) for state in ("retained", "deleted") for kind in ("camera", "text", "speech")]
+    + [(state, "text", camera) for state in ("reused", "reused_same_text") for camera in (False, True)],
+)
+async def test_asr_history_keeps_query_in_its_visual_turn(
+    mocker, followup_kind, cancelled, transcript_state, intervening_camera
+):
     h = await open_joyai(asr=True)
     processor = h.runner.plugin.processor
     template = mocker.spy(processor, "apply_chat_template")
@@ -28,7 +33,7 @@ async def test_asr_history_keeps_query_in_its_visual_turn(mocker, followup_kind,
         return_value=processor,
     )
     transcript = "For every new image, say the color of only the newest image."
-    new_query = "Describe the newest image."
+    new_query = transcript if transcript_state == "reused_same_text" else "Describe the newest image."
     try:
         await h.run(AppendAudio(audio=struct.pack("<h", 1000) * 16000, video_frames=(frame("red"),)))
         await h.run(Commit(final=True, create_response=True))
@@ -58,13 +63,20 @@ async def test_asr_history_keeps_query_in_its_visual_turn(mocker, followup_kind,
         else:
             await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=3, segment_finished=True)
             await h.run(AckPlayback(response_id=response_id, played_ms=1000))
-        if deleted:
+        if intervening_camera:
+            await h.run(AppendAudio(audio=b"", video_frames=(frame("green"),)))
+            await h.run(Commit(final=True, create_response=True))
+            camera_request_id = h.port.submissions[-1].context.request_id
+            await h.deliver_and_settle(
+                tts_output(camera_request_id, text="</silence>", finished=True), stage_id=1, segment_finished=True
+            )
+        if transcript_state != "retained":
             await h.run(DeleteItem(item_id=transcript_item_id))
         if followup_kind == "text":
             await h.run(
                 CreateItem(
                     item={
-                        "id": "new-query",
+                        "id": transcript_item_id if transcript_state.startswith("reused") else "new-query",
                         "type": "message",
                         "role": "user",
                         "content": [{"type": "input_text", "text": new_query}],
@@ -90,13 +102,35 @@ async def test_asr_history_keeps_query_in_its_visual_turn(mocker, followup_kind,
             for message in messages
             if isinstance(message["content"], list) and any(part["type"] == "image" for part in message["content"])
         ]
-        assert len(visual_turns) == 2
+        assert len(visual_turns) == (3 if intervening_camera else 2)
         if followup_kind != "camera":
             assert new_query in visual_turns[-1]["content"][0]["text"]
-            assert new_query not in str(visual_turns[0]["content"])
+            assert all(new_query not in str(turn["content"]) for turn in visual_turns[:-1])
         # A standalone historical user message loses the original query/frame association.
-        if deleted:
-            assert all(transcript not in str(message["content"]) for message in messages)
+        if transcript_state != "retained":
+            assert transcript not in str(visual_turns[0]["content"])
+            assert sum(transcript in str(message["content"]) for message in messages) == (
+                1 if transcript_state == "reused_same_text" else 0
+            )
+            if transcript_state.startswith("reused"):
+                # A later prompt must keep the recreated query with blue,
+                # rather than letting an old anchor suppress its capture.
+                await h.deliver_and_settle(
+                    tts_output(followup.context.request_id, text="</silence>", finished=True),
+                    stage_id=1,
+                    segment_finished=True,
+                )
+                await h.run(AppendAudio(audio=b"", video_frames=(frame("yellow"),)))
+                await h.run(Commit(final=True, create_response=True))
+                messages = template.call_args.args[0]
+                visual_turns = [
+                    message
+                    for message in messages
+                    if isinstance(message["content"], list)
+                    and any(part["type"] == "image" for part in message["content"])
+                ]
+                assert new_query in visual_turns[-2]["content"][0]["text"]
+                assert sum(new_query in str(message["content"]) for message in messages) == 1
             return
         assert transcript in visual_turns[0]["content"][0]["text"]
         assert transcript not in str(visual_turns[1]["content"])

@@ -530,6 +530,27 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             # source awaits consolidation. Preserve the original visual turn;
             # summarized or deleted sources are no longer in pending.
             working_frames = tuple(state.visual_memory.pending[-1:])
+        user_sources = config.get("conversation_user_source_ids", {})
+        observations = []
+        for observation in state.observations:
+            stale_items = {
+                item_id
+                for item_id, source_id in observation.user_item_sources
+                if user_sources.get(item_id) != source_id
+            }
+            # Recreated user items must not inherit old ordering anchors or
+            # suppress the new observation's accept-time query.
+            observations.append(
+                replace(
+                    observation,
+                    query="" if observation.query_item_id in stale_items else observation.query,
+                    history_anchor_item_ids=tuple(
+                        item_id for item_id in observation.history_anchor_item_ids if item_id not in stale_items
+                    ),
+                )
+                if stale_items
+                else observation
+            )
         return {
             **config,
             "joyai_state": state,
@@ -537,7 +558,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             "joyai_conversation_images": images,
             "joyai_new_frames": new_images,
             "joyai_pending_frames": working_frames,
-            "joyai_observations": tuple(state.observations),
+            "joyai_observations": tuple(observations),
             "joyai_queries": tuple(state.queries),
             "joyai_closed_frame_id": state.closed_frame_id,
             "joyai_visual_summaries": tuple([*state.visual_memory.long_term, *state.visual_memory.mid_term]),
@@ -900,6 +921,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         request.history_anchor_item_ids = tuple(
             item_id for item_id in item_ids[-(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES) :] if item_id
         )
+        referenced_items = {*request.history_anchor_item_ids, request.query_item_id, request.transcript_item_id}
+        request.user_item_sources = tuple(
+            (item_id, source_id)
+            for item_id, source_id in config.get("conversation_user_source_ids", {}).items()
+            if item_id in referenced_items
+        )
         latest_query, latest_index = self._latest_query(config, runtime_config)
         latest_item_id = item_ids[latest_index] if 0 <= latest_index < len(item_ids) else None
         # Speech owns a new query whose text arrives after this plan. Its
@@ -970,6 +997,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                         request.query_index,
                         query_item_id=request.query_item_id,
                         transcript_item_id=request.transcript_item_id,
+                        user_item_sources=request.user_item_sources,
                         history_anchor_item_ids=request.history_anchor_item_ids,
                     )
                 )
@@ -1117,11 +1145,16 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         for _, frames, observation in groups:
             content = []
             query_key = observation.transcript_item_id or observation.query_item_id or observation.query_index
-            observation_query = (
-                user_queries.get(observation.transcript_item_id, "")
-                if observation.transcript_item_id is not None
-                else observation.query
-            )
+            observation_query = observation.query
+            if observation.transcript_item_id is not None:
+                source_id = dict(observation.user_item_sources).get(observation.transcript_item_id)
+                observation_query = (
+                    user_queries.get(observation.transcript_item_id, "")
+                    if source_id is not None
+                    and session_config.get("conversation_user_source_ids", {}).get(observation.transcript_item_id)
+                    == source_id
+                    else ""
+                )
             included_query_key = None
             # Text edits/deletions remain authoritative in Session.history.
             if (

@@ -435,6 +435,11 @@ class ModelChannel:
             else:
                 snapshot = session.history_snapshot()
                 history, item_ids = session.history, snapshot.item_ids
+            user_item_ids = tuple(
+                item_id
+                for item_id, message in zip(item_ids, history)
+                if item_id is not None and message.get("role") == "user"
+            )
             prompt_session = {
                 **request_context.session_config,
                 # Keep the prompt accessor's nested content identity: Qwen
@@ -444,6 +449,11 @@ class ModelChannel:
                 # as read-only; only the session writes authoritative history.
                 "conversation": list(history),
                 "conversation_item_ids": item_ids,
+                # Public IDs can be reused; source IDs survive transcript
+                # updates but change when an item is deleted and recreated.
+                "conversation_user_source_ids": dict(
+                    zip(user_item_ids, session.user_source_ids_for_items(user_item_ids))
+                ),
                 "modalities": list(session.response_config.modalities),
             }
             prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
