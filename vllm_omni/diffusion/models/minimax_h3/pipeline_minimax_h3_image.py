@@ -45,7 +45,7 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 
 from vllm_omni.diffusion.cancellation import check_request_cancellation
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, validate_diffusion_sleep
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
@@ -358,8 +358,8 @@ class MiniMaxH3ImagePipeline(
         retain = additional.get("minimax_h3_retain_resident_cores", False)
         if type(retain) is not bool:
             raise ValueError("minimax_h3_retain_resident_cores must be a bool")
-        if retain and od_config.enable_sleep_mode:
-            raise ValueError("minimax_h3_retain_resident_cores is incompatible with sleep mode")
+        if od_config.enable_sleep_mode:
+            validate_diffusion_sleep("MiniMaxH3ImagePipeline", additional)
 
         root = self._resolve_model_root(str(od_config.model), od_config.revision)
         self.model_root = root

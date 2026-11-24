@@ -35,6 +35,7 @@ from vllm.tasks import SupportedTask
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import ErrorMessage, NextStageInputMessage, OutputMessage
+from vllm_omni.engine.stage_init_utils import validate_diffusion_stage_sleep
 from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S, AsyncOmniBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
@@ -1423,6 +1424,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # slept, so wake_up() has no tags to restore and never reaches the
         # block that clears ``_paused``.
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        for stage_id in diffusion_stage_ids:
+            validate_diffusion_stage_sleep(self.engine.stage_configs[stage_id])
 
         # Block admission before any sleep RPC so generate() waits on
         # _pause_cond during the drain/offload window. Wait until generate()

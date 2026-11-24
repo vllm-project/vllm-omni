@@ -170,7 +170,8 @@ can also avoid its H2D load on subsequent requests:
 ```
 
 This option defaults to false and requires a positive `resident_layers` count
-and sleep mode disabled.
+and sleep mode disabled. A runtime sleep request targeting a stage with retained
+cores returns HTTP 400 before pausing request admission.
 It keeps those core allocations live during later text encoding and VAE
 decoding, including graph capture. Validate cold and warmed memory headroom
 before enabling it. The parameter bindings remain placeholders outside the

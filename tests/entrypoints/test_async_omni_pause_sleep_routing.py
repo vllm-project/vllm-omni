@@ -357,6 +357,57 @@ def test_sleep_waits_for_in_flight_generate_admission():
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize(("level", "stage_ids"), [(1, [0]), (2, None)])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_retained_core_sleep_rejected_before_admission(level, stage_ids, legacy):
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion", "llm"])
+        options = {
+            "model_class_name": "MiniMaxH3ImagePipeline",
+            "additional_config": {"minimax_h3_retain_resident_cores": True},
+        }
+        if legacy:
+            # Legacy stages can leave the pipeline class for the worker to resolve.
+            omni.engine.stage_configs[0].engine_args = {"additional_config": options["additional_config"]}
+        else:
+            stage = StageConfigFactory.create_typed_default_diffusion("unused", options).stage_by_id(0)
+            omni.engine.stage_configs[0] = stage
+
+        pending = asyncio.get_running_loop().create_future()
+        omni._pending_submits = {"queued": pending}
+        with pytest.raises(ValueError, match="minimax_h3_retain_resident_cores.*sleep"):
+            await omni.sleep(level=level, stage_ids=stage_ids)
+
+        assert omni._generation_admission_ready()
+        assert not pending.cancelled()
+        assert not await omni.is_sleeping()
+        omni.collective_rpc.assert_not_awaited()
+        omni._clear_frontend_mm_cache.assert_not_awaited()
+
+        # The retained stage is outside this request's target set.
+        await omni.sleep(level=1, stage_ids=[1])
+        omni.collective_rpc.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(("model_class_name", "retain"), [("FluxPipeline", True), ("MiniMaxH3ImagePipeline", False)])
+def test_sleep_allows_diffusion_stage_without_active_h3_retention(model_class_name, retain):
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        omni.engine.stage_configs[0].diffusion_config = SimpleNamespace(
+            model_class_name=model_class_name, additional_config={"minimax_h3_retain_resident_cores": retain}
+        )
+        await omni.sleep(stage_ids=[0], level=1)
+        assert await omni.is_sleeping(stage_ids=[0])
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_sleep_rejects_invalid_stage_ids_without_blocking_admission():
     """Invalid stage_ids must raise before _paused is set.
 
