@@ -13,11 +13,11 @@ msgpack without ``pickle`` or ``VLLM_ALLOW_INSECURE_SERIALIZATION``.
 
 from __future__ import annotations
 
-import base64
 import binascii
 from collections.abc import Sequence
 from typing import Any
 
+import pybase64 as base64
 import torch
 
 IPC_WIRE_TAG = "__omni_cuda_ipc_v1__"
