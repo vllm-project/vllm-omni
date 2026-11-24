@@ -68,7 +68,8 @@ def _small_od_config(*, class_name=None):
         arch["_class_name"] = class_name
     return SimpleNamespace(
         tf_model_config=arch,
-        parallel_config=SimpleNamespace(ulysses_degree=1),
+        # Mirror the required DiffusionParallelConfig fields the DiT constructor reads.
+        parallel_config=SimpleNamespace(ulysses_degree=1, ulysses_mode="strict"),
     )
 
 
