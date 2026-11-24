@@ -745,13 +745,9 @@ Select one of these deployment profiles:
 
 | Profile | Runner | Intended use |
 | --- | --- | --- |
-| `higgs_audio_v2.yaml` | V2 talker (default) | Shipped default; v1 codec stage |
-| `higgs_audio_v2_mrv2.yaml` | V2 talker | Explicit alias of the default selection |
+| `higgs_audio_v2.yaml` | V2 | Shipped default |
 
-The default's `platforms:` section keeps both stages on V1 for NPU, XPU,
-ROCm and MUSA (XPU rejects v2 stages at deploy load; NPU generation workers
-reject v2 at init). To run the talker on v1 on CUDA, copy the deploy file
-and remove the stage-0 `model_runner` key.
+With vLLM 0.34, V2 is the only supported model runner for this profile.
 
 ## Qwen3-TTS with Model Runner V2
 
