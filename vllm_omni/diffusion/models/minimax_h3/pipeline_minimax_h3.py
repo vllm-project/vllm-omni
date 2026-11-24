@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
@@ -12,6 +13,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
+from functools import partial
 from itertools import groupby
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
@@ -1000,6 +1002,10 @@ class MiniMaxH3Pipeline(
         # rejects; fail here instead of on every such request.
         service_schedule = od_config.diffusion_attention_schedule
         additional_config = od_config.additional_config or {}
+        file_backed = additional_config.get("minimax_h3_file_backed_offload", False)
+        if not isinstance(file_backed, bool):
+            raise ValueError("minimax_h3_file_backed_offload must be a boolean")
+        self._file_backed_offload = file_backed
         if (
             service_schedule is not None
             and service_schedule.default
@@ -1012,6 +1018,23 @@ class MiniMaxH3Pipeline(
                 "latent_refine default."
             )
         self.device = get_local_device()
+        if file_backed:
+            if (
+                not current_omni_platform.is_cuda()
+                or self.device.type != "cuda"
+                or od_config.num_gpus != 1
+                or self.parallel_config.use_hsdp
+            ):
+                raise ValueError("MiniMax H3 file-backed offload requires a single CUDA GPU without HSDP")
+            if not od_config.enforce_eager or od_config.step_execution or od_config.streaming_output:
+                raise ValueError("MiniMax H3 file-backed offload requires eager, non-streaming full-request execution")
+            if (
+                resolve_offload_strategy(od_config) is not OffloadStrategy.NONE
+                or od_config.host_weight_runtime_mode != "disabled"
+                or od_config.weight_transfer_config is not None
+                or getattr(od_config, "weight_sharing", None) is not None
+            ):
+                raise ValueError("MiniMax H3 file-backed offload cannot be combined with other weight management modes")
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
         self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
@@ -1055,6 +1078,14 @@ class MiniMaxH3Pipeline(
             str(od_config.model),
         )
         control_path = od_config.controlnet_model_path
+        if file_backed and (
+            modular
+            or self.partition != "fl2va"
+            or od_config.quantization_config is not None
+            or od_config.lora_path
+            or control_path
+        ):
+            raise ValueError("MiniMax H3 file-backed offload requires native BF16 FL2VA without LoRA or ControlNet")
         if control_path:
             if not Path(control_path).is_file() or Path(control_path).suffix != ".safetensors":
                 raise ValueError("--controlnet-model-path must be a local original .safetensors file")
@@ -1222,11 +1253,12 @@ class MiniMaxH3Pipeline(
                 ),
             )
         transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
-        self.transformer = transformer_cls(
-            od_config,
-            quant_config=transformer_quant_config,
-            diffusers_weights=modular,
-        )
+        with torch.device("meta") if file_backed else nullcontext():
+            self.transformer = transformer_cls(
+                od_config,
+                quant_config=transformer_quant_config,
+                diffusers_weights=modular,
+            )
         if self._fasth3_checkpoint is not None:
             spec = self._fasth3_checkpoint
             if isinstance(spec, FastH3OmniCheckpointSpec) and self.transformer.arch.pdd_steps != 32:
@@ -1333,13 +1365,14 @@ class MiniMaxH3Pipeline(
                 )
             self.text_encoder_tp_size = text_encoder_tp_size
             self.text_encoder_group = self._build_text_encoder_group(text_encoder_tp_size)
-            self.text_encoder = MiniMaxH3Qwen3VLEncoder(
-                os.path.join(encoder_model_path, "text_encoder"),
-                device=self.device,
-                load_model=rank < text_encoder_tp_size,
-                encoder_group=self.text_encoder_group,
-                quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
-            )
+            with torch.device("meta") if file_backed else nullcontext():
+                self.text_encoder = MiniMaxH3Qwen3VLEncoder(
+                    os.path.join(encoder_model_path, "text_encoder"),
+                    device=self.device,
+                    load_model=rank < text_encoder_tp_size,
+                    encoder_group=self.text_encoder_group,
+                    quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
+                )
             if rank < text_encoder_tp_size:
                 self.weights_sources.append(
                     DiffusersPipelineLoader.ComponentSource(
@@ -1359,12 +1392,13 @@ class MiniMaxH3Pipeline(
         # Preserve the legacy MiniMax-H3 low-residency path. The compact API
         # deliberately limits explicit component selection to dit/text_encoder,
         # so VAEs stay resident for new configurations.
-        component_load_device = torch.device("cpu") if legacy_manual_components else self.device
+        component_load_device = torch.device("cpu") if file_backed or legacy_manual_components else self.device
         self.video_vae = None
         self.audio_vae = None
         if self.load_vae_decoder:
             lightvae_decoder_path = resolve_h3_lightvae_decoder_path(od_config.additional_config or {})
-            self.video_vae = MiniMaxH3VideoVAE(
+            video_vae_factory = partial(
+                MiniMaxH3VideoVAE,
                 os.path.join(vae_model_path, "video_vae"),
                 device=self.device,
                 load_device=component_load_device,
@@ -1384,13 +1418,19 @@ class MiniMaxH3Pipeline(
                     current_omni_platform,
                 ),
             )
-            self.audio_vae = MiniMaxH3AudioVAE(
+            audio_vae_factory = partial(
+                MiniMaxH3AudioVAE,
                 os.path.join(vae_model_path, "audio_vae"),
                 device=self.device,
                 load_device=component_load_device,
                 decode_only=not self.load_vae_encoder,
                 trust_remote_code=od_config.trust_remote_code,
             )
+            if file_backed:
+                self._file_backed_vae_factories = (video_vae_factory, audio_vae_factory)
+            else:
+                self.video_vae = video_vae_factory()
+                self.audio_vae = audio_vae_factory()
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
 
@@ -1429,9 +1469,94 @@ class MiniMaxH3Pipeline(
         self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
         self._latent_clip_cache = LatentClipCache(latent_cache_clips(od_config.additional_config))
 
+        if file_backed:
+            self.prepare_file_backed_offload()
+
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler)
         )
+
+    def prepare_file_backed_offload(self) -> None:
+        """Claim checkpoint sources after their manifests have been validated."""
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+
+        from .dit_offload import MiniMaxH3DiTOffloader
+
+        dit_offloader: MiniMaxH3DiTOffloader | None = None
+        covered_sources: set[str] = set()
+        covered_weights: set[str] = set()
+        for source in self.weights_sources:
+            root = Path(source.model_or_path) / (source.subfolder or "")
+            if source.prefix == "transformer.":
+                component = self.transformer
+                dit_offloader = MiniMaxH3DiTOffloader(component, root, self.device)
+                entries = dit_offloader.entries
+            elif source.prefix == "text_encoder.":
+                component = self.text_encoder
+                entries = component.enable_block_offload(root).entries
+            else:
+                continue
+            names = {entry["runtime_name"] for entry in entries if not entry.get("buffer", False)}
+            for module in component.modules():
+                method = getattr(module, "quant_method", None)
+                if not isinstance(method, QuantizeMethodBase):
+                    continue
+                if type(method) is not UnquantizedLinearMethod:
+                    raise ValueError("MiniMax H3 file-backed offload requires native CUDA linear weights")
+                # On CUDA this method needs no resident weights. Use the existing
+                # completion marker so the loader never tries to move meta tensors.
+                method.process_weights_after_loading(module)
+                module._already_called_process_weights_after_loading = True
+            covered_sources.add(source.prefix)
+            covered_weights.update(source.prefix + name for name in names)
+
+        if dit_offloader is None:
+            raise ValueError("MiniMax H3 file-backed offload requires a native DiT checkpoint source")
+        dit_offloader.install_hooks()
+        self._file_backed_dit = dit_offloader
+        self._file_backed_weight_names = covered_weights
+        self.weights_sources = [source for source in self.weights_sources if source.prefix not in covered_sources]
+
+    @staticmethod
+    def _media_requires_audio_encoder(media: MiniMaxH3EncoderMediaInput | None) -> bool:
+        return media is not None and (
+            bool(media.audios)
+            or any(audio is not None for audio in media.video_audios)
+            or media.audio_edit is not None
+            or any(guide.audio is not None for guide in media.timeline_guides)
+        )
+
+    @contextmanager
+    def _file_backed_vaes(self, *, encode_only: bool = False, encode_audio: bool = False):
+        """Load and release native VAEs per stage only for file-backed offload."""
+        factories = getattr(self, "_file_backed_vae_factories", None)
+        if factories is None:
+            yield
+            return
+        video_factory, audio_factory = factories
+        try:
+            if encode_only:
+                self.video_vae = video_factory(
+                    encode_only=True,
+                    decode_only=False,
+                    decoder_source=None,
+                    pin_memory=False,
+                )
+                if encode_audio:
+                    self.audio_vae = audio_factory(encode_only=True, decode_only=False, pin_memory=False)
+            else:
+                # Reuse full native loading, including the unused video encoder.
+                self.video_vae = video_factory(decode_only=False, pin_memory=False)
+                self.audio_vae = audio_factory(decode_only=False, pin_memory=False)
+            self.vae = self.video_vae
+            yield
+        finally:
+            self.vae = self.video_vae = self.audio_vae = None
+            # Part proxies retain their VAE owner; discard those cycles and CPU
+            # staging snapshots before the next model allocates its weights.
+            gc.collect()
+            self._release_stage_cache()
 
     def load_weights(
         self,
@@ -1444,7 +1569,7 @@ class MiniMaxH3Pipeline(
                 return prefix
             raise ValueError(f"unexpected MiniMax-H3 weight {name!r}")
 
-        loaded_with_prefix: set[str] = set()
+        loaded_with_prefix = set(getattr(self, "_file_backed_weight_names", ()))
         loaded_prefixes: set[str] = set()
         transformer_loaded: set[str] = set()
         for prefix, grouped_weights in groupby(weights, key=source_prefix):
@@ -1475,8 +1600,8 @@ class MiniMaxH3Pipeline(
                 self._finish_adaln_sidecar(component)
             loaded_prefix = "transformer.controlnet." if prefix == "controlnet." else prefix
             loaded_with_prefix.update(loaded_prefix + name for name in loaded)
-        # Both VAEs load eagerly in ``__init__`` rather than through
-        # ``weights_sources``. The text encoder uses the shared component
+        # Native VAEs load outside ``weights_sources`` (per codec stage for
+        # file-backed offload). The text encoder uses the shared component
         # loader so online quantization and offload processing follow the same
         # path as the DiT.
         for component_name in ("video_vae", "audio_vae", "latent_upscaler"):
@@ -1794,6 +1919,8 @@ class MiniMaxH3Pipeline(
         return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
 
     def _uses_manual_component_offload(self, component: nn.Module) -> bool:
+        if getattr(self, "_file_backed_offload", False):
+            return True
         od_config = getattr(self, "od_config", None)
         if od_config is None:
             return False
@@ -2057,6 +2184,14 @@ class MiniMaxH3Pipeline(
 
     @contextmanager
     def _resident_dit_layers_on_device(self, *, enabled: bool = True):
+        offloader = getattr(self, "_file_backed_dit", None)
+        if offloader is not None and enabled:
+            try:
+                offloader.activate()
+                yield
+            finally:
+                offloader.deactivate()
+            return
         controller = getattr(self, "_dlo_residency_controller", None)
         if controller is not None and enabled:
             controller.load_resident_layers()
@@ -2856,14 +2991,15 @@ class MiniMaxH3Pipeline(
         cached = context.get(_REFINE_KEYFRAME_CONDITION)
         if cached is None:
             target = context["latent_upscale"]
-            cached = self._encode_visual_conditions(
-                [
-                    image.resize((target.width, target.height), Image.Resampling.LANCZOS)
-                    for image in context["keyframe_images"]
-                ],
-                None,
-                video_count=0,
-            )
+            with self._file_backed_vaes(encode_only=True):
+                cached = self._encode_visual_conditions(
+                    [
+                        image.resize((target.width, target.height), Image.Resampling.LANCZOS)
+                        for image in context["keyframe_images"]
+                    ],
+                    None,
+                    video_count=0,
+                )
             context[_REFINE_KEYFRAME_CONDITION] = cached
         return cached
 
@@ -3410,7 +3546,12 @@ class MiniMaxH3Pipeline(
                 for index, prompt in enumerate(prompts[1:], start=2):
                     logger.info("MiniMax H3 encoding continuation prompt %d/%d", index, len(prompts))
                     window_text.append(self.encode_prompt(replace(prepared, prompt=prompt) if rank == 0 else None))
-            media = self._encode_local_media(prepared.media if prepared is not None else None)
+            media_input = prepared.media if prepared is not None else None
+            with self._file_backed_vaes(
+                encode_only=True,
+                encode_audio=self._media_requires_audio_encoder(media_input),
+            ):
+                media = self._encode_local_media(media_input)
             if initial_noise is not None:
                 assert request_context is not None
                 request_context["precomputed_initial_noise"] = initial_noise.result()
@@ -3799,6 +3940,10 @@ class MiniMaxH3Pipeline(
             num_inference_steps=num_steps,
             extra_args=extra,
         )
+        if quality_plan.cache_dit is not None and getattr(self, "_file_backed_offload", False):
+            raise OmniClientError(
+                "MiniMax H3 Cache-DiT cannot be combined with file-backed offload; use quality=lossless."
+            )
         if sampler == "heun" and quality_plan.cache_dit is not None:
             raise OmniClientError("Heun requires uncached model runs; set quality=lossless")
         if continuation is not None and quality_plan.cache_dit is not None:
@@ -4350,43 +4495,44 @@ class MiniMaxH3Pipeline(
                 videos.append(video_latent)
                 audios.append(audio_latent)
                 continue
-            if context["preencode_mp4"]:
-                videos.append(
-                    self.decode_to_mp4(
+            with self._file_backed_vaes():
+                if context["preencode_mp4"]:
+                    videos.append(
+                        self.decode_to_mp4(
+                            video_latent,
+                            audio_latent,
+                            height=height,
+                            width=width,
+                            video_codec_options=context["video_codec_options"],
+                            batch_frames=context["preencode_batch_frames"],
+                            frame_counts=frame_counts,
+                            trim=trim,
+                        )
+                    )
+                    audios.append(None)
+                else:
+                    video, audio = self.decode(
                         video_latent,
                         audio_latent,
                         height=height,
                         width=width,
-                        video_codec_options=context["video_codec_options"],
-                        batch_frames=context["preencode_batch_frames"],
-                        frame_counts=frame_counts,
-                        trim=trim,
                     )
-                )
-                audios.append(None)
-            else:
-                video, audio = self.decode(
-                    video_latent,
-                    audio_latent,
-                    height=height,
-                    width=width,
-                )
-                if trim is not None:
-                    # Decode keeps the real tail as causal context; return only new frames.
-                    video, audio = trim_decoded_overlap(video, audio, **trim)
-                # Rebind rather than append the expression: the local would
-                # otherwise keep the decoded frames' device storage alive for the
-                # rest of the iteration, and the next seed's diffuse() -- the DiT
-                # reload this release exists to make room for -- runs before the
-                # loop rebinds it. post_decode() rebinds for the same reason.
-                video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
-                videos.append(video)
-                # The FP32 decoded frames are quantized into the appended uint8
-                # tensor; drop the reference and return the idle pages instead of
-                # holding them through the next output's denoise/decode.
-                del video
-                self._release_stage_cache()
-                audios.append(audio)
+                    if trim is not None:
+                        # Decode keeps the real tail as causal context; return only new frames.
+                        video, audio = trim_decoded_overlap(video, audio, **trim)
+                    # Rebind rather than append the expression: the local would
+                    # otherwise keep the decoded frames' device storage alive for the
+                    # rest of the iteration, and the next seed's diffuse() -- the DiT
+                    # reload this release exists to make room for -- runs before the
+                    # loop rebinds it. post_decode() rebinds for the same reason.
+                    video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
+                    videos.append(video)
+                    # The FP32 decoded frames are quantized into the appended uint8
+                    # tensor; drop the reference and return the idle pages instead of
+                    # holding them through the next output's denoise/decode.
+                    del video
+                    self._release_stage_cache()
+                    audios.append(audio)
         if not self.load_vae_decoder:
             return self._decoder_stage_output(
                 videos, audios, {**context, "height": height, "width": width, "trim": trim}
