@@ -156,29 +156,58 @@ def _gemma4_rope_config_for_layer(
 
 def _configure_official_gemma4_rope_compatibility() -> None:
     """Make the pinned official Gemma4 buffer setup heterogeneity-safe."""
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
     from transformers.models.gemma4_unified.modeling_gemma4_unified import (
         Gemma4UnifiedTextRotaryEmbedding,
     )
 
     original = Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters
-    if getattr(original, "_vllm_omni_heterogeneous_head_dim_compat", False):
-        return
+    if not getattr(original, "_vllm_omni_heterogeneous_head_dim_compat", False):
 
-    def compute_default_rope_parameters(
-        config: Gemma4UnifiedTextConfig,
-        device: torch.device | None = None,
-        layer_type: str | None = None,
-        **kwargs: object,
-    ) -> tuple[torch.Tensor, float]:
-        layer_config = _gemma4_rope_config_for_layer(config, layer_type)
-        return original(config=layer_config, device=device, layer_type=layer_type, **kwargs)
+        def compute_default_rope_parameters(
+            config: Gemma4UnifiedTextConfig,
+            device: torch.device | None = None,
+            layer_type: str | None = None,
+            **kwargs: object,
+        ) -> tuple[torch.Tensor, float]:
+            layer_config = _gemma4_rope_config_for_layer(config, layer_type)
+            return original(config=layer_config, device=device, layer_type=layer_type, **kwargs)
 
-    setattr(compute_default_rope_parameters, "_vllm_omni_heterogeneous_head_dim_compat", True)
-    setattr(
-        Gemma4UnifiedTextRotaryEmbedding,
-        "compute_default_rope_parameters",
-        staticmethod(compute_default_rope_parameters),
-    )
+        setattr(compute_default_rope_parameters, "_vllm_omni_heterogeneous_head_dim_compat", True)
+        setattr(
+            Gemma4UnifiedTextRotaryEmbedding,
+            "compute_default_rope_parameters",
+            staticmethod(compute_default_rope_parameters),
+        )
+
+    proportional = ROPE_INIT_FUNCTIONS["proportional"]
+    if not getattr(proportional, "_vllm_omni_heterogeneous_head_dim_compat", False):
+
+        def compute_proportional_rope_parameters(
+            config: Gemma4UnifiedTextConfig,
+            device: torch.device | None = None,
+            seq_len: int | None = None,
+            layer_type: str | None = None,
+            head_dim_key: str = "head_dim",
+            **kwargs: object,
+        ) -> tuple[torch.Tensor, float]:
+            layer_config = _gemma4_rope_config_for_layer(config, layer_type)
+            # LTX's pinned official loader still requests the legacy
+            # ``global_head_dim`` field. Transformers 5.22 moves that value into
+            # the resolved per-layer config as ``head_dim``.
+            if layer_config is not config and head_dim_key == "global_head_dim":
+                head_dim_key = "head_dim"
+            return proportional(
+                config=layer_config,
+                device=device,
+                seq_len=seq_len,
+                layer_type=layer_type,
+                head_dim_key=head_dim_key,
+                **kwargs,
+            )
+
+        setattr(compute_proportional_rope_parameters, "_vllm_omni_heterogeneous_head_dim_compat", True)
+        ROPE_INIT_FUNCTIONS["proportional"] = compute_proportional_rope_parameters
 
 
 def _configure_official_vocoder_determinism() -> None:

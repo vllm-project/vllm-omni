@@ -185,6 +185,9 @@ TWO_STAGE_CASES = (
         gemma_model_env="VLLM_TEST_LTX23_MODEL",
         enable_layerwise_offload=True,
         image=I2V_IMAGE,
+        omni_stage_init_timeout_s=1200,
+        omni_init_timeout_s=1800,
+        omni_process_timeout_s=2400,
     ),
     LTXAccuracyCase(
         name="ltx2_two_stage_layer_fused_t2v",

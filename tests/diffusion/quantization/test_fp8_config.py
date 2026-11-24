@@ -112,7 +112,7 @@ def test_online_fp8_substring_match_mode_covers_text_encoder_subtrees():
     assert isinstance(config.get_quant_method(layer, "lm_head"), UnquantizedLinearMethod)
 
 
-def test_online_fp8_rocm_keeps_only_non_aligned_linear_inputs_unquantized(monkeypatch):
+def test_online_fp8_rocm_keeps_non_aligned_local_linear_dimensions_unquantized(monkeypatch):
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
     import vllm_omni.quantization.fp8_config as fp8_config_module
@@ -129,14 +129,22 @@ def test_online_fp8_rocm_keeps_only_non_aligned_linear_inputs_unquantized(monkey
     layer = linear_cls.__new__(linear_cls)
     layer.input_size = 2520
     layer.input_size_per_partition = 2520
+    layer.output_size = 10240
+    layer.output_size_per_partition = 10240
 
     method = config.get_quant_method(layer, "gen_transformer.context_refiner.0.attn.to_q")
 
     assert isinstance(method, UnquantizedLinearMethod)
     assert config._reported_rocm_alignment_fallback
 
-    layer.input_size = 2520
+    layer.input_size = 2528
     layer.input_size_per_partition = 2528
+    layer.output_size = 2520
+    layer.output_size_per_partition = 2520
+    assert config._requires_rocm_alignment_fallback(layer)
+
+    layer.output_size = 2528
+    layer.output_size_per_partition = 2528
     assert not config._requires_rocm_alignment_fallback(layer)
 
 

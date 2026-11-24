@@ -156,6 +156,7 @@ def test_ltx_reference_runner_unwraps_audio_only_output() -> None:
 
 
 def test_ltx_reference_runner_resolves_gemma4_rope_layer_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
     from transformers.models.gemma4_unified.modeling_gemma4_unified import (
         Gemma4UnifiedTextRotaryEmbedding,
     )
@@ -177,7 +178,8 @@ def test_ltx_reference_runner_resolves_gemma4_rope_layer_config(monkeypatch: pyt
         def head_dim(self) -> int:
             raise AssertionError("heterogeneous global head_dim must not be read")
 
-    observed: list[tuple[object, torch.device | None, str | None, dict[str, object]]] = []
+    observed_default: list[tuple[object, torch.device | None, str | None, dict[str, object]]] = []
+    observed_proportional: list[tuple[object, torch.device | None, int | None, str | None, str, dict[str, object]]] = []
 
     def original_compute_default_rope_parameters(
         config: object,
@@ -185,20 +187,33 @@ def test_ltx_reference_runner_resolves_gemma4_rope_layer_config(monkeypatch: pyt
         layer_type: str | None = None,
         **kwargs: object,
     ) -> tuple[torch.Tensor, float]:
-        observed.append((config, device, layer_type, kwargs))
+        observed_default.append((config, device, layer_type, kwargs))
         return torch.empty(0), 1.0
+
+    def original_compute_proportional_rope_parameters(
+        config: object,
+        device: torch.device | None = None,
+        seq_len: int | None = None,
+        layer_type: str | None = None,
+        head_dim_key: str = "head_dim",
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, float]:
+        observed_proportional.append((config, device, seq_len, layer_type, head_dim_key, kwargs))
+        return torch.empty(0), 2.0
 
     monkeypatch.setattr(
         Gemma4UnifiedTextRotaryEmbedding,
         "compute_default_rope_parameters",
         staticmethod(original_compute_default_rope_parameters),
     )
+    monkeypatch.setitem(ROPE_INIT_FUNCTIONS, "proportional", original_compute_proportional_rope_parameters)
 
     config = Config()
     _configure_official_gemma4_rope_compatibility()
-    installed = Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters
+    installed_default = Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters
+    installed_proportional = ROPE_INIT_FUNCTIONS["proportional"]
     device = torch.device("cpu")
-    inv_freq, attention_scaling = installed(
+    inv_freq, attention_scaling = installed_default(
         cast("Gemma4UnifiedTextConfig", config),
         device=device,
         layer_type="sliding_attention",
@@ -207,10 +222,27 @@ def test_ltx_reference_runner_resolves_gemma4_rope_layer_config(monkeypatch: pyt
 
     assert inv_freq.numel() == 0
     assert attention_scaling == 1.0
-    assert observed == [(config.per_layer_config["sliding_attention"], device, "sliding_attention", {"sentinel": True})]
+    assert observed_default == [
+        (config.per_layer_config["sliding_attention"], device, "sliding_attention", {"sentinel": True})
+    ]
+
+    inv_freq, attention_scaling = installed_proportional(
+        cast("Gemma4UnifiedTextConfig", config),
+        device=device,
+        seq_len=1024,
+        layer_type="full_attention",
+        head_dim_key="global_head_dim",
+        sentinel=True,
+    )
+    assert inv_freq.numel() == 0
+    assert attention_scaling == 2.0
+    assert observed_proportional == [
+        (config.per_layer_config["full_attention"], device, 1024, "full_attention", "head_dim", {"sentinel": True})
+    ]
 
     _configure_official_gemma4_rope_compatibility()
-    assert Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters is installed
+    assert Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters is installed_default
+    assert ROPE_INIT_FUNCTIONS["proportional"] is installed_proportional
 
 
 def test_connector_weight_index_is_authoritative(tmp_path: Path) -> None:

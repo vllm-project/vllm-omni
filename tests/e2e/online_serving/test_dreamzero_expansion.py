@@ -27,10 +27,12 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "GEAR-Dreams/DreamZero-DROID"
+DREAMZERO_INIT_TIMEOUT_S = 1800
 
 test_params = [
     OmniServerParams(
         model=MODEL,
+        init_timeout=DREAMZERO_INIT_TIMEOUT_S,
         stage_config_path=get_deploy_config_path("dreamzero_tp1_cfg2.yaml"),
         env_dict={
             "ATTENTION_BACKEND": "torch",

@@ -1141,6 +1141,45 @@ def test_flux2_klein_tiny_diffusion_has_cold_start_headroom() -> None:
     assert 'model_kwargs["init_timeout"] = settings.offline_init_timeout_s' in offline_source
 
 
+def test_flux2_klein_weekly_pixel_contract_uses_native_image_diff() -> None:
+    source = Path("tests/e2e/offline_inference/test_flux2_klein.py").read_text(encoding="utf-8")
+
+    assert "ImageChops.difference(first, second).getbbox(alpha_only=False)" in source
+    assert "list(images1[0].getdata())" not in source
+    assert "zip(images1[0].getdata(), images2[0].getdata())" not in source
+
+
+def test_flux2_dev_weekly_online_has_cold_start_headroom() -> None:
+    path = Path("tests/e2e/online_serving/test_flux_2_dev_expansion.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    timeout_assignment = next(
+        statement
+        for statement in tree.body
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "FLUX_2_DEV_INIT_TIMEOUT_S" for target in statement.targets
+        )
+    )
+    assert isinstance(timeout_assignment.value, ast.Constant)
+    assert timeout_assignment.value.value == 1800
+
+    cases = next(
+        statement
+        for statement in tree.body
+        if isinstance(statement, ast.FunctionDef) and statement.name == "_get_flux_2_dev_feature_cases"
+    )
+    server_params = [
+        node
+        for node in ast.walk(cases)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "OmniServerParams"
+    ]
+    assert len(server_params) == 6
+    for params in server_params:
+        timeout = next(keyword.value for keyword in params.keywords if keyword.arg == "init_timeout")
+        assert isinstance(timeout, ast.Name)
+        assert timeout.id == "FLUX_2_DEV_INIT_TIMEOUT_S"
+
+
 def test_wan_sdpa_alignment_cpu_case_stays_shared_and_cuda_kernel_stays_nvidia() -> None:
     cpu_case = Path("tests/diffusion/distributed/test_wan_attention_sdpa_alignment.py").read_text(encoding="utf-8")
     cuda_case = Path("tests/diffusion/distributed/test_wan_attention_sdpa_alignment_cuda.py").read_text(
@@ -2260,6 +2299,10 @@ def test_bagel_online_weekly_has_exact_rocm_owners() -> None:
     expansion = Path("tests/e2e/online_serving/test_bagel_expansion.py").read_text(encoding="utf-8")
     assert 'hardware_marks(res={"cuda": "H100", "rocm": "MI300"})' in expansion
     assert expansion.count('hardware_marks(res={"cuda": "H100", "rocm": "MI300"}, num_cards=2)') == 2
+    assert "BAGEL_COLD_STAGE_INIT_TIMEOUT_S = 1200" in expansion
+    assert "BAGEL_COLD_INIT_TIMEOUT_S = 1800" in expansion
+    assert expansion.count("stage_init_timeout=BAGEL_COLD_STAGE_INIT_TIMEOUT_S") == 9
+    assert expansion.count("init_timeout=BAGEL_COLD_INIT_TIMEOUT_S") == 9
     multi_replica = Path("tests/e2e/online_serving/test_bagel_multi_replicas.py").read_text(encoding="utf-8")
     assert '@hardware_test(res={"cuda": "H100", "rocm": "MI300"}, num_cards=4)' in multi_replica
 
@@ -3336,12 +3379,20 @@ def test_final_diffusion_parity_weekly_jobs_are_exact_nonblocking_qualifiers() -
     assert "SSIM_THRESHOLD = 0.8" in hidream_source
     assert "PSNR_THRESHOLD = 19.0" in hidream_source
 
+    dreamzero_source = Path("tests/e2e/online_serving/test_dreamzero_expansion.py").read_text(encoding="utf-8")
+    assert "DREAMZERO_INIT_TIMEOUT_S = 1800" in dreamzero_source
+    assert "init_timeout=DREAMZERO_INIT_TIMEOUT_S" in dreamzero_source
+
 
 def test_ltx_weekly_two_stage_accuracy_has_bounded_cold_start_headroom() -> None:
     accuracy_source = Path("tests/e2e/accuracy/ltx/test_ltx_official_similarity.py").read_text(encoding="utf-8")
     runner_source = Path("tests/e2e/accuracy/ltx/run_ltx_reference.py").read_text(encoding="utf-8")
 
-    for case_name in ("ltx2_two_stage_layer_fused_t2v", "ltx23_two_stage_layer_fused_i2v"):
+    for case_name in (
+        "ltx23_distilled_i2v",
+        "ltx2_two_stage_layer_fused_t2v",
+        "ltx23_two_stage_layer_fused_i2v",
+    ):
         case_source = accuracy_source.split(f'name="{case_name}"', maxsplit=1)[1].split("    ),", maxsplit=1)[0]
         assert "omni_stage_init_timeout_s=1200" in case_source
         assert "omni_init_timeout_s=1800" in case_source

@@ -184,18 +184,21 @@ class DiffusionFp8Config(OnlineQuantizationConfig):
     def _requires_rocm_alignment_fallback(layer: nn.Module) -> bool:
         """Keep unsupported ROCm FP8 projections in their original precision.
 
-        PyTorch's ROCm ``torch._scaled_mm`` path requires the contracted
-        dimension to be divisible by 16. CUDA can route the same online-FP8
-        layer through kernels that pad or otherwise accept a non-aligned K, but
-        the ROCm fallback fails at runtime. Inspect the local shard width when
-        available so tensor-parallel row projections are handled correctly.
+        PyTorch's ROCm ``torch._scaled_mm`` path requires both local matrix
+        dimensions to be divisible by 16. CUDA can route the same online-FP8
+        layer through kernels that pad or otherwise accept a non-aligned shape,
+        but the ROCm fallback fails at runtime. Inspect local shard dimensions
+        when available so tensor-parallel projections are handled correctly.
         """
         if not current_platform.is_rocm() or not isinstance(layer, LinearBase):
             return False
         input_size = getattr(layer, "input_size_per_partition", None)
         if input_size is None:
             input_size = getattr(layer, "input_size", None)
-        return isinstance(input_size, int) and input_size % 16 != 0
+        output_size = getattr(layer, "output_size_per_partition", None)
+        if output_size is None:
+            output_size = getattr(layer, "output_size", None)
+        return any(isinstance(size, int) and size % 16 != 0 for size in (input_size, output_size))
 
     def get_quant_method(self, layer: nn.Module, prefix: str) -> QuantizeMethodBase | None:
         if self._skips_layer(prefix):
@@ -206,12 +209,14 @@ class DiffusionFp8Config(OnlineQuantizationConfig):
         if self._requires_rocm_alignment_fallback(layer):
             if not self._reported_rocm_alignment_fallback:
                 input_size = getattr(layer, "input_size_per_partition", getattr(layer, "input_size", None))
+                output_size = getattr(layer, "output_size_per_partition", getattr(layer, "output_size", None))
                 logger.warning(
-                    "ROCm online FP8 requires a contracted dimension divisible by 16; "
+                    "ROCm online FP8 requires local matrix dimensions divisible by 16; "
                     "keeping non-aligned linear layers in their original precision "
-                    "(first layer: %s, K=%s).",
+                    "(first layer: %s, K=%s, N=%s).",
                     prefix,
                     input_size,
+                    output_size,
                 )
                 self._reported_rocm_alignment_fallback = True
             return UnquantizedLinearMethod()

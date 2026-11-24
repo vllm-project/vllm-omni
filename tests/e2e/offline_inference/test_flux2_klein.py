@@ -11,7 +11,7 @@ Inpainting uses ``offline_client.send_diffusion_request`` with
 
 import pytest
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import DiffusionResponse, OfflineOmniClient
@@ -54,6 +54,13 @@ def _images_from_response(response: DiffusionResponse) -> list[Image.Image]:
     return list(images)
 
 
+def _image_difference_bbox(first: Image.Image, second: Image.Image) -> tuple[int, int, int, int] | None:
+    """Compare generated images without materializing every pixel as Python objects."""
+    assert first.mode == second.mode, f"Image modes differ: {first.mode} != {second.mode}"
+    assert first.size == second.size, f"Image sizes differ: {first.size} != {second.size}"
+    return ImageChops.difference(first, second).getbbox(alpha_only=False)
+
+
 def _send_inpaint_with_generator(
     offline_client: OfflineOmniClient, prompt: str, input_image, mask_image, generator: torch.Generator
 ) -> DiffusionResponse:
@@ -91,7 +98,7 @@ def test_flux2_klein_inpaint_deterministic(offline_client: OfflineOmniClient):
     images1 = _images_from_response(r1)
     images2 = _images_from_response(r2)
 
-    assert list(images1[0].getdata()) == list(images2[0].getdata()), (
+    assert _image_difference_bbox(images1[0], images2[0]) is None, (
         "Same input with same seed should produce identical output. This is critical for offline/online consistency."
     )
 
@@ -112,5 +119,6 @@ def test_flux2_klein_inpaint_different_seeds_different_output(offline_client: Of
     images1 = _images_from_response(r1)
     images2 = _images_from_response(r2)
 
-    different_pixel_count = sum(1 for p1, p2 in zip(images1[0].getdata(), images2[0].getdata()) if p1 != p2)
-    assert different_pixel_count > 0, "Different seeds should produce different outputs"
+    assert _image_difference_bbox(images1[0], images2[0]) is not None, (
+        "Different seeds should produce different outputs"
+    )

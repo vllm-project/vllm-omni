@@ -229,6 +229,45 @@ def test_build_vllm_config_forwards_text_watermark_config(
     assert forwarded == ([expected] if use_v2_model_runner else [])
 
 
+def test_build_vllm_config_upgrades_inc_quant_config_in_place(monkeypatch):
+    original_quant_config = object()
+    upgraded_quant_config = object()
+    fake_config = types.SimpleNamespace(
+        quant_config=original_quant_config,
+        model_config=types.SimpleNamespace(hf_config=types.SimpleNamespace()),
+    )
+    sentinel_executor = object()
+
+    monkeypatch.setattr(
+        stage_init_utils.OmniEngineArgs,
+        "create_engine_config",
+        lambda _self, **_kwargs: fake_config,
+    )
+    monkeypatch.setattr(stage_init_utils.Executor, "get_class", lambda _config: sentinel_executor)
+    monkeypatch.setattr(
+        stage_init_utils.OmniINCConfig,
+        "maybe_upgrade",
+        lambda quant_config: upgraded_quant_config if quant_config is original_quant_config else quant_config,
+    )
+    stage = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        final_output_type=None,
+        engine_args={},
+        runtime=types.SimpleNamespace(devices="0", num_replicas=1),
+    )
+
+    vllm_config, executor_class = build_vllm_config(
+        stage,
+        "dummy-model",
+        engine_args_dict={"tensor_parallel_size": 1, "use_v2_model_runner": True},
+    )
+
+    assert vllm_config is fake_config
+    assert vllm_config.quant_config is upgraded_quant_config
+    assert executor_class is sentinel_executor
+
+
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
     engine = object.__new__(AsyncOmniEngine)
     engine.orchestrator_thread = types.SimpleNamespace(is_alive=lambda: True)
