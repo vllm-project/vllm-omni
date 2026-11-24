@@ -1,46 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import ast
 import weakref
 from contextlib import contextmanager
-from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
+from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
 from vllm_omni.diffusion.models.minimax_h3.encoder_config import EncoderWeightTransfer
+from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
-ROOT = Path(__file__).resolve().parents[4]
 
 
-class MiniMaxH3Qwen3VLEncoder:
-    """Typed name required by the extracted pipeline method."""
-
-
-def method(file, owner, name, **globals_):
-    """Exercise actual lightweight methods without loading model/runtime dependencies."""
-    source = ROOT / "vllm_omni/diffusion/models/minimax_h3" / file
-    tree = ast.parse(source.read_text(encoding="utf-8"))
-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == owner)
-    fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
-    module = ast.Module(body=ast.parse("from __future__ import annotations").body + [fn], type_ignores=[])
-    scope = {
-        "torch": torch,
-        "EncoderWeightTransfer": EncoderWeightTransfer,
-        "contextmanager": contextmanager,
-        "MiniMaxH3Qwen3VLEncoder": MiniMaxH3Qwen3VLEncoder,
-    }
-    scope.update(globals_)
-    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), scope)
-    return scope[name]
+def _bare_encoder():
+    encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
+    torch.nn.Module.__init__(encoder)
+    return encoder
 
 
 @pytest.mark.parametrize("device_output", [False, True])
 def test_return_placement_and_sdp_restore(mocker, device_output):
-    encode = method("encoder.py", "MiniMaxH3Qwen3VLEncoder", "encode_ids")
+    encode = MiniMaxH3Qwen3VLEncoder.encode_ids
     raw = mocker.Mock(cpu=mocker.Mock(return_value="host result"))
     obj = mocker.Mock(
         is_loaded=True,
@@ -58,7 +42,7 @@ def test_return_placement_and_sdp_restore(mocker, device_output):
 
 @pytest.mark.parametrize("device_output", [False, True])
 def test_exception_restores_sdp(mocker, device_output):
-    encode = method("encoder.py", "MiniMaxH3Qwen3VLEncoder", "encode_ids")
+    encode = MiniMaxH3Qwen3VLEncoder.encode_ids
     obj = mocker.Mock(
         is_loaded=True,
         cudnn_sdp=True,
@@ -73,7 +57,7 @@ def test_exception_restores_sdp(mocker, device_output):
 
 
 def test_forward_keeps_default_call_and_forwards_opt_in(mocker):
-    forward = method("encoder.py", "MiniMaxH3Qwen3VLEncoder", "forward")
+    forward = MiniMaxH3Qwen3VLEncoder.forward
     obj = mocker.Mock(encode_ids=mocker.Mock(return_value="result"))
     ids = torch.tensor([1])
     assert forward(obj, ids) == "result"
@@ -84,8 +68,9 @@ def test_forward_keeps_default_call_and_forwards_opt_in(mocker):
 
 @pytest.mark.parametrize("branch", ["resident", "manual", "sequential"])
 @pytest.mark.parametrize("fail", [False, True])
-def test_pipeline_routing_lifetime_and_input_ownership(mocker, branch, fail):
-    call = method("pipeline_minimax_h3.py", "MiniMaxH3Pipeline", "_encode_text_hidden")
+@pytest.mark.parametrize("device_type", ["npu", "cuda", "cpu"])
+def test_pipeline_routing_lifetime_and_input_ownership(mocker, branch, fail, device_type):
+    call = MiniMaxH3Pipeline._encode_text_hidden
     events: list[object] = []
     hidden = torch.arange(12).reshape(3, 4).to(torch.bfloat16)
 
@@ -107,6 +92,7 @@ def test_pipeline_routing_lifetime_and_input_ownership(mocker, branch, fail):
             events.append("offload")
 
     obj = mocker.Mock(
+        device=SimpleNamespace(type=device_type),
         text_encoder=encoder,
         _model_cpu_offload_modules=["module"] if branch == "sequential" else [],
         _uses_manual_component_offload=lambda c: branch == "manual",
@@ -121,7 +107,10 @@ def test_pipeline_routing_lifetime_and_input_ownership(mocker, branch, fail):
         assert call(obj, torch.tensor([1]), kwargs) is hidden
         assert torch.equal(hidden, torch.arange(12).reshape(3, 4).to(torch.bfloat16))
     passed = next(e[1] for e in events if isinstance(e, tuple))
-    assert passed["return_on_device"] is True
+    if device_type == "npu":
+        assert passed["return_on_device"] is True
+    else:
+        assert "return_on_device" not in passed
     assert set(kwargs) == {"pixel_values"}
     if branch == "manual":
         assert events[0] == "load" and events[-1] == "offload"
@@ -133,10 +122,10 @@ def test_pipeline_routing_lifetime_and_input_ownership(mocker, branch, fail):
 
 
 def test_packed_transfer_prepares_on_normal_encoder_path(mocker):
-    call = method("pipeline_minimax_h3.py", "MiniMaxH3Pipeline", "_encode_text_hidden")
+    call = MiniMaxH3Pipeline._encode_text_hidden
     events = []
     hidden = torch.ones(2, 4, dtype=torch.bfloat16)
-    encoder = MiniMaxH3Qwen3VLEncoder()
+    encoder = _bare_encoder()
     prepare_packed_offload = mocker.Mock(side_effect=lambda: events.append("prepare"))
 
     def encode_ids(input_ids, *, return_on_device=False):
@@ -158,6 +147,7 @@ def test_packed_transfer_prepares_on_normal_encoder_path(mocker):
             events.append("offload")
 
     obj = mocker.Mock(
+        device=SimpleNamespace(type="npu"),
         text_encoder=encoder,
         _model_cpu_offload_modules=[],
         _uses_manual_component_offload=lambda component: True,
@@ -176,16 +166,13 @@ def test_packed_transfer_prepares_on_normal_encoder_path(mocker):
 def test_real_module_hooks_and_component_cleanup(mocker, branch, fail):
     events = []
 
-    class Encoder(torch.nn.Module):
+    class Encoder(MiniMaxH3Qwen3VLEncoder):
         cudnn_sdp = True
 
-        forward = method("encoder.py", "MiniMaxH3Qwen3VLEncoder", "forward")
-        encode_ids = method("encoder.py", "MiniMaxH3Qwen3VLEncoder", "encode_ids")
-
         def __init__(self):
-            super().__init__()
+            torch.nn.Module.__init__(self)
             self.weight = torch.nn.Parameter(torch.ones(4))
-            self.is_loaded = True
+            self.text_model = torch.nn.Identity()
             self.device_target = torch.device("cpu")
 
         def load_to_device(self):
@@ -202,18 +189,17 @@ def test_real_module_hooks_and_component_cleanup(mocker, branch, fail):
 
     enc = Encoder()
     obj = mocker.Mock(
+        device=SimpleNamespace(type="npu"),
         text_encoder=enc,
         _model_cpu_offload_modules=[enc] if branch == "sequential" else [],
         _uses_manual_component_offload=lambda c: True,
         _encoder_weight_transfer=EncoderWeightTransfer.OFF,
     )
-    obj._component_on_device = MethodType(
-        method("pipeline_minimax_h3.py", "MiniMaxH3Pipeline", "_component_on_device"), obj
-    )
+    obj._component_on_device = MethodType(MiniMaxH3Pipeline._component_on_device, obj)
     if branch == "sequential":
         enc.register_forward_pre_hook(lambda m, args: m.load_to_device())
         enc.register_forward_hook(lambda m, args, out: m.offload_to_cpu(), always_call=True)
-    call = method("pipeline_minimax_h3.py", "MiniMaxH3Pipeline", "_encode_text_hidden")
+    call = MiniMaxH3Pipeline._encode_text_hidden
     if fail:
         with pytest.raises(RuntimeError, match="failure"):
             call(obj, torch.arange(4), {})
@@ -228,11 +214,13 @@ def test_real_module_hooks_and_component_cleanup(mocker, branch, fail):
 
 @pytest.mark.parametrize("mode", list(EncoderWeightTransfer))
 @pytest.mark.parametrize("rank,tp_size,world_size", [(0, 1, 1), (0, 8, 8), (1, 8, 8), (7, 8, 8), (1, 1, 8)])
-def test_encode_prompt_releases_non_source_hidden_before_receive(mocker, mode, rank, tp_size, world_size):
+@pytest.mark.parametrize("device_type", ["npu", "cuda"])
+def test_encode_prompt_preserves_backend_hidden_lifetime(mocker, mode, rank, tp_size, world_size, device_type):
     expected_hidden = torch.arange(12).reshape(3, 4).to(torch.bfloat16)
     expected_tags = torch.tensor([0, 1, 2])
     output_ref: weakref.ReferenceType[torch.Tensor] | None = None
     events = []
+    target = SimpleNamespace(type=device_type)
 
     def encode(input_ids, vision_kwargs):
         nonlocal output_ref
@@ -243,28 +231,31 @@ def test_encode_prompt_releases_non_source_hidden_before_receive(mocker, mode, r
         return hidden
 
     def broadcast(tensor, *, dtype, device):
-        assert device == torch.device("cpu")
+        assert device is target
         if dtype == torch.bfloat16:
             if rank == 0:
                 assert output_ref is not None
                 assert tensor is output_ref()
-            else:
+            elif device_type == "npu" or rank >= tp_size:
                 assert tensor is None
                 # Check lifetime at receive allocation, not just the argument.
                 assert output_ref is None or output_ref() is None
+            else:
+                assert output_ref is not None
+                assert tensor is output_ref()
             events.append("receive")
             expected = expected_hidden
         else:
             assert dtype == torch.long
             assert tensor is None if rank != 0 else torch.equal(tensor, expected_tags)
             expected = expected_tags
-        return tensor if rank == 0 else torch.empty_like(expected).copy_(expected)
+        return tensor if rank == 0 else expected.clone()
 
     distribute = mocker.Mock(return_value=torch.tensor([1, 2, 3]))
     encoder = mocker.Mock(side_effect=encode)
     pipeline = SimpleNamespace(
         text_encoder_tp_size=tp_size,
-        device=torch.device("cpu"),
+        device=target,
         _encoder_weight_transfer=mode,
         _distribute_encode_inputs=distribute,
         _encode_text_hidden=encoder,
@@ -279,17 +270,13 @@ def test_encode_prompt_releases_non_source_hidden_before_receive(mocker, mode, r
         condition_labels=[],
         video_timestamps=[],
     )
-    check_error = mocker.Mock()
-    call = method(
-        "pipeline_minimax_h3.py",
-        "MiniMaxH3Pipeline",
-        "encode_prompt",
-        _dit_rank_world=lambda: (None, rank, world_size),
-        _broadcast_rank0_exception=check_error,
-        _broadcast_tensor=broadcast,
-        build_minimax_h3_presentation=lambda *args, **kwargs: (torch.tensor([1, 2, 3]), expected_tags),
+    check_error = mocker.patch.object(pipeline_minimax_h3, "_broadcast_rank0_exception")
+    mocker.patch.object(pipeline_minimax_h3, "_dit_rank_world", return_value=(None, rank, world_size))
+    mocker.patch.object(pipeline_minimax_h3, "_broadcast_tensor", side_effect=broadcast)
+    mocker.patch.object(
+        pipeline_minimax_h3, "build_minimax_h3_presentation", return_value=(torch.tensor([1, 2, 3]), expected_tags)
     )
-    hidden, tags = call(pipeline, prepared if rank == 0 else None)
+    hidden, tags = MiniMaxH3Pipeline.encode_prompt(pipeline, prepared if rank == 0 else None)
     assert torch.equal(hidden.view(torch.uint8), expected_hidden.view(torch.uint8))
     assert torch.equal(tags, expected_tags)
     check_error.assert_called_once_with(None)

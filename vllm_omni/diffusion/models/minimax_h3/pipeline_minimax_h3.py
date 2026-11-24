@@ -1740,7 +1740,9 @@ class MiniMaxH3Pipeline(
         input_ids: torch.Tensor,
         vision_kwargs: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        encode_kwargs = {**vision_kwargs, "return_on_device": True}
+        encode_kwargs = dict(vision_kwargs)
+        if self.device.type == "npu":
+            encode_kwargs["return_on_device"] = True
         if getattr(self, "_model_cpu_offload_modules", None):
             # Invoke nn.Module.__call__ so the generic model-level offloader
             # swaps the resident DiT and encoder.
@@ -2883,7 +2885,7 @@ class MiniMaxH3Pipeline(
             hidden = self._encode_text_hidden(ids, vision_kwargs)
         # Only rank 0 supplies the broadcast. Drop other TP ranks' local
         # outputs before allocating their receive buffers.
-        if rank != 0:
+        if self.device.type == "npu" and rank != 0:
             hidden = None
         return (
             _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),

@@ -2359,6 +2359,7 @@ def test_no_offload_keeps_text_encoder_resident():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
     pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
@@ -2380,6 +2381,7 @@ def test_model_offload_uses_hooked_text_encoder_call():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
     pipeline.od_config = _pipeline_config(
         enable_cpu_offload=True,
         enable_layerwise_offload=False,
@@ -2393,7 +2395,7 @@ def test_model_offload_uses_hooked_text_encoder_call():
     actual = pipeline._encode_text_hidden(input_ids, vision_kwargs)
 
     assert actual is expected
-    pipeline.text_encoder.assert_called_once_with(input_ids, **vision_kwargs, return_on_device=True)
+    pipeline.text_encoder.assert_called_once_with(input_ids, **vision_kwargs)
     pipeline.text_encoder.load_to_device.assert_not_called()
 
 
@@ -2406,6 +2408,7 @@ def test_legacy_layer_offload_preserves_minimax_stage_lifecycle(enable_layerwise
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
     pipeline.od_config = _pipeline_config(
         diffusion_offload_config=None,
         enable_cpu_offload=False,
@@ -2434,6 +2437,7 @@ def test_layerwise_encoder_selection_releases_text_encoder():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
     pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
@@ -2459,6 +2463,7 @@ def test_layerwise_dit_only_keeps_text_encoder_resident():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
     pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,

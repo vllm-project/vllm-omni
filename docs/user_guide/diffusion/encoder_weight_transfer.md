@@ -49,5 +49,6 @@ can remain in the allocator cache after fallback to separate CPU masters.
 
 ## Hidden states
 
-The video pipeline keeps encoder hidden states on the device for broadcast
-in both modes. Standalone encoder calls return CPU tensors by default.
+On Ascend NPU, the video pipeline keeps encoder hidden states on the device
+for broadcast in both modes. Other backends retain the existing CPU return
+path. Standalone encoder calls return CPU tensors by default.
