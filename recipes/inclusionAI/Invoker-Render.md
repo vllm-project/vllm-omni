@@ -40,7 +40,7 @@ try:
         },
         OmniDiffusionSamplingParams(seed=42),
     )
-    print(outputs[0].multimodal_output["video"].shape)
+    print(outputs[0].images[0].shape)
 finally:
     omni.close()
 ```
