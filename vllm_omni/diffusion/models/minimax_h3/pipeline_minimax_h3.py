@@ -381,6 +381,15 @@ _STEP_TRANSFORMER = "minimax_h3_transformer"
 _STEP_VIDEO_EDIT = "minimax_h3_video_edit"
 _STEP_AUDIO_EDIT = "minimax_h3_audio_edit"
 
+# Raised by every generation entry point of a worker started without a DiT. Such a
+# worker serves the text encoder stage only; the standalone encoder path never
+# reaches these entry points.
+_TRANSFORMER_REQUIRED_MESSAGE = (
+    "MiniMax H3 generation requires the transformer, but this worker was started with "
+    "model_loaded.transformer=false and serves the text encoder stage only; "
+    "send generation requests to a diffusion-stage worker"
+)
+
 
 def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
     """Read a partition's distilled schedule. An absent key means legacy uniform."""
@@ -1750,9 +1759,12 @@ class MiniMaxH3Pipeline(
             self._adaln_adapter_identity = identity
 
     def _transformer_for_task(self, task: str) -> MiniMaxH3DiTModel:
-        if task == "ref2va" and hasattr(self, "transformers_ref"):
-            return self.transformers_ref
-        return self.transformer
+        transformer = (
+            self.transformers_ref if task == "ref2va" and hasattr(self, "transformers_ref") else self.transformer
+        )
+        if transformer is None:
+            raise OmniClientError(_TRANSFORMER_REQUIRED_MESSAGE)
+        return transformer
 
     def _resolve_sigma_positions(self, task: str, sampling: Any) -> tuple[tuple[float, ...] | None, int]:
         """Pick the rectified-flow positions this request denoises on.
@@ -3642,6 +3654,11 @@ class MiniMaxH3Pipeline(
                 executor.shutdown(wait=True, cancel_futures=True)
 
     def _prepare_request_inputs(self, raw_prompt: Any, sampling: Any) -> dict[str, Any]:
+        # Request mode and step mode both come through here before any encoder forward
+        # and both go on to denoise, so a worker without a transformer rejects the
+        # request up front rather than after paying for conditioning.
+        if self.transformer is None:
+            raise OmniClientError(_TRANSFORMER_REQUIRED_MESSAGE)
         if (getattr(sampling, "extra_args", None) or {}).get(
             "continuation_prompts"
         ) is not None and not self.load_text_encoder:

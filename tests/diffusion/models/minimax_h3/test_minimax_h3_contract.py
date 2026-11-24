@@ -428,6 +428,7 @@ def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expecte
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
     pipeline.text_encoder = object()
+    pipeline.transformer = object()
     pipeline.encode_prompt = Mock(return_value=(torch.ones(1, 2), torch.ones(1, dtype=torch.long)))
     pipeline._quality_policy = Mock()
     pipeline._cache_dit_runtime = Mock()
@@ -471,6 +472,7 @@ def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = object()
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
     pipeline.partition = "fl2va"
@@ -1564,6 +1566,9 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     pipeline.device = torch.device("cpu")
     pipeline.od_config = _pipeline_config(diffusion_attention_schedule=None)
     pipeline._base_schedule_by_partition = schedules
+    # Generation admission requires a transformer; diffuse is stubbed below so a
+    # stand-in is enough, and the no-transformer case sets this to None itself.
+    pipeline.transformer = object()
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
     pipeline._quality_policy = Mock()
@@ -1704,6 +1709,35 @@ def test_prepare_encode_checks_the_attention_schedule_before_any_step():
 
     with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=4"):
         pipeline.prepare_encode(state)
+
+
+@pytest.mark.parametrize("mode", ["request", "step"])
+def test_pipeline_without_a_transformer_rejects_text_only_generation(mode):
+    """An encoder-stage worker fails closed on generation before it touches the DiT.
+
+    ``model_loaded.transformer=false`` leaves the pipeline with no DiT (RFC #10943
+    Phase 2). Both execution modes prepare a request's inputs before denoising, so
+    a text-only generation request must surface there as an OmniClientError naming
+    the missing component, instead of handing ``None`` to the denoiser in request
+    mode or storing it as step state in step mode.
+    """
+    from vllm_omni.errors import OmniClientError
+
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+    pipeline.transformer = None
+    batch = _t2va_batch()
+    expected = "MiniMax H3 generation requires the transformer"
+
+    if mode == "request":
+        with pytest.raises(OmniClientError, match=expected):
+            pipeline.forward(batch)
+    else:
+        state = StepRequestState(request_id="no-transformer", prompt=batch.prompts[0], sampling=batch.sampling_params)
+        with pytest.raises(OmniClientError, match=expected):
+            pipeline.prepare_encode(state)
+        assert "minimax_h3_transformer" not in state.extra
+    assert diffuse_calls == []
 
 
 def test_inherited_default_range_past_the_sequence_end_is_not_rejected(monkeypatch):

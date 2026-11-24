@@ -193,6 +193,7 @@ def test_request_encodes_only_window_prompts_and_prepares_references_once(monkey
 
     pipeline = object.__new__(module.MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = object()
     pipeline.load_text_encoder = True
     pipeline.device = torch.device("cpu")
     pipeline.od_config = SimpleNamespace(step_execution=False)
