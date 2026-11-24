@@ -113,9 +113,10 @@ def sp_gather_padded(
     ``all_gather`` needs one shape per rank, while :func:`sp_shard` uses
     ``torch.chunk``: when ``global_size`` is not divisible by the SP world
     size, every chunk is full (``ceil(global_size / world_size)`` rows) except
-    the last one. Pad each shard to that largest chunk, gather, then drop each
-    rank's padding so the result holds exactly ``global_size`` rows in global
-    order.
+    the last one. Pad each shard to that largest chunk, gather, then keep the
+    first ``global_size`` rows: only the last rank's shard is short, so its
+    padding sits at the very end of the gathered tensor and a prefix narrow
+    drops exactly the padding, in global order.
 
     This is the gather counterpart of the strict-mode-friendly
     :func:`sp_shard_with_padding`, for callers that shard without padding
@@ -156,12 +157,7 @@ def sp_gather_padded(
     gathered = cast(torch.Tensor, get_sp_group().all_gather(padded, dim=dim))
     if chunk * world_size == global_size:
         return gathered
-
-    sizes = [min(chunk, max(0, global_size - rank * chunk)) for rank in range(world_size)]
-    index = torch.cat(
-        [torch.arange(rank * chunk, rank * chunk + size, device=gathered.device) for rank, size in enumerate(sizes)]
-    )
-    return gathered.index_select(dim, index)
+    return gathered.narrow(dim, 0, global_size)
 
 
 def sp_shard_with_padding(

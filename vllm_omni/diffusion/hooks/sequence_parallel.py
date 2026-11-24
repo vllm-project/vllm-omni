@@ -615,15 +615,18 @@ class SequenceParallelGatherHook(ModelHook):
                         raise RuntimeError(f"No SP shard metadata was registered for shard_group={spm.shard_group!r}.")
             if global_rows is not None:
                 # Uneven shards are allowed: pad to the largest chunk, gather,
-                # then drop each rank's padding again.
+                # then drop the padding again. The module's exact row count is
+                # authoritative, so no further trimming applies.
                 gathered = sp_gather_padded(x, spm.gather_dim, int(global_rows))
             else:
                 # auto_pad boundaries are already equally long; gather and
                 # remove the padding below.
                 gathered = sp_gather(x, spm.gather_dim, validate=False)
-            if original_seq_len is not None and gathered.size(spm.gather_dim) > original_seq_len:
-                gathered = gathered.narrow(spm.gather_dim, 0, original_seq_len)
-                logger.debug(f"Removed padding: gathered shape {gathered.shape} (original_seq_len={original_seq_len})")
+                if original_seq_len is not None and gathered.size(spm.gather_dim) > original_seq_len:
+                    gathered = gathered.narrow(spm.gather_dim, 0, original_seq_len)
+                    logger.debug(
+                        f"Removed padding: gathered shape {gathered.shape} (original_seq_len={original_seq_len})"
+                    )
 
             output[i] = gathered
             actually_gathered = True

@@ -12,8 +12,16 @@
 #     padding costs ~14% extra attention FLOPs and is numerically lossless.
 #     Ulysses is also the only topology the RainFusion sparse attention backend
 #     accepts (it rejects allgather_degree > 1), so this configuration is the
-#     only way to combine 16-way sequence parallelism with sparsity; see
-#     minimax_h3_disaggregated_16card_uaa_sparse.yaml.
+#     only way to combine 16-way sequence parallelism with sparsity.  Enable
+#     sparsity with a stage override instead of a second preset, e.g.
+#
+#       vllm-omni serve ... --deploy-config minimax_h3_disaggregated_16card_uaa.yaml \
+#         --stage-overrides '{"1": {"diffusion_attention_config": {"default": \
+#           {"backend": "RAINFUSION_ATTN", "block_sparse": {"sparsity": 0.8, "start_step": 0}}}}}'
+#
+#     start_step=0 makes the very first denoising step sparse, so a 2-step
+#     smoke request exercises the sparse kernel; RAINFUSION_ATTN needs the
+#     whole key sequence on every rank (hence pure Ulysses).
 #   * Stage 2 decodes on 8 dies with tile (patch) parallelism.  The native VAE
 #     only supports a patch parallel size of 1 or the full group size, so it
 #     must equal the stage world size.

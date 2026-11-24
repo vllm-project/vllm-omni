@@ -175,14 +175,15 @@ def _local_compact_positions(
     seq_len: int,
     local_start: int,
     local_len: int,
-) -> torch.Tensor:
-    """Select this SP rank's chunk from the compact global row order.
+) -> torch.Tensor | None:
+    """Select this SP rank's equal shard from the compact global row order.
 
-    The compact row count is not necessarily divisible by the SP size (a
-    960x544 reference contributes 510 rows, for example), so the selection
-    follows ``torch.chunk`` exactly: every chunk is full except the last one.
-    The matching gather pads those unequal shards and trims the padding again
-    (``sp_gather_padded``).
+    This is the strict-mode layout: the split hook validates divisibility for
+    every tensor it shards, so a compact row count that does not divide the SP
+    size is rejected before the gather rather than split unevenly.  Return
+    ``None`` in that case and let the caller fail with a clear message; the
+    ``advanced_uaa`` layout never reaches here (it keeps the full row set and
+    is trimmed by the padded gather).
     """
     if local_len == seq_len:
         return active_positions
@@ -191,12 +192,12 @@ def _local_compact_positions(
     world_size = seq_len // local_len
     if local_start % local_len or not 0 <= local_start < seq_len:
         raise ValueError(f"invalid original SP span start={local_start}, length={local_len}")
-    if int(active_positions.numel()) < world_size:
-        raise ValueError(
-            f"reference-KV compaction left {int(active_positions.numel())} rows, fewer than the SP size {world_size}"
-        )
+    compact_total = int(active_positions.numel())
+    if compact_total % world_size:
+        return None
+    compact_local_len = compact_total // world_size
     rank = local_start // local_len
-    return active_positions.chunk(world_size, dim=0)[rank]
+    return active_positions.narrow(0, rank * compact_local_len, compact_local_len)
 
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
@@ -1435,6 +1436,13 @@ class MiniMaxH3DiTModel(nn.Module):
                     local_start=local_start,
                     local_len=local_len,
                 )
+                if compact_local_positions is None:
+                    raise ValueError(
+                        "MiniMax H3 reference-KV target rows cannot form an equal SP shard: "
+                        f"{int(active_positions.numel())} compact rows do not divide the SP size "
+                        f"{seq_len // local_len}. Use advanced_uaa (which keeps the full row set and "
+                        "trims the padded gather) or disable kv_offload_config."
+                    )
 
         rope_table = kwargs.get("rope_table")
         if compact_reference and local_len != seq_len:

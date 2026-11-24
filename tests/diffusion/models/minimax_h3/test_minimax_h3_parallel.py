@@ -621,13 +621,13 @@ def test_advanced_uaa_is_platform_independent(monkeypatch):
     _validate_ulysses_head_divisibility(56, tp_size=1, ulysses_degree=8, ulysses_mode="advanced_uaa")
 
 
-def test_local_compact_positions_follow_chunk_semantics():
-    """Reference-KV compaction may leave a non-divisible row count.
+def test_local_compact_positions_rejects_a_non_divisible_row_count():
+    """Strict SP rejects uneven compact rows before the gather.
 
-    A 960x544 reference contributes 510 rows; removing them from a 64-aligned
-    packed length leaves 2 rows modulo 16 for the SP split. The per-rank
-    selection must follow ``torch.chunk`` exactly so the padded gather can
-    reassemble the compact rows in global order.
+    Under ``advanced_uaa`` this helper returns early (``local_len == seq_len``)
+    and the padded gather trims uneven rows; under strict SP the split hook
+    would reject uneven ``block_combined`` anyway, so the helper must report
+    the layout as unusable instead of splitting it unevenly.
     """
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         _local_compact_positions,
@@ -636,20 +636,22 @@ def test_local_compact_positions_follow_chunk_semantics():
     world_size = 16
     seq_len = 203776
     local_len = seq_len // world_size
-    compact_total = seq_len - 510
-    assert compact_total % world_size == 2  # the uneven case from the review
 
+    # Divisible: each rank takes an equal contiguous slice, in rank order.
+    compact_total = seq_len - 512
+    assert compact_total % world_size == 0
     active = torch.arange(compact_total)
     pieces = [
         _local_compact_positions(active, seq_len=seq_len, local_start=rank * local_len, local_len=local_len)
         for rank in range(world_size)
     ]
-    expected_sizes = [len(chunk) for chunk in torch.chunk(active, world_size)]
-    assert [piece.numel() for piece in pieces] == expected_sizes
-    # torch.chunk keeps every chunk full except the last one.
-    assert sum(expected_sizes) == compact_total
-    assert expected_sizes[-1] < expected_sizes[0]
+    assert all(piece is not None and piece.numel() == compact_total // world_size for piece in pieces)
     assert torch.equal(torch.cat(pieces), active)
+
+    # A 960x544 reference contributes 510 rows, which leaves 2 rows modulo 16.
+    uneven = seq_len - 510
+    assert uneven % world_size == 2
+    assert _local_compact_positions(torch.arange(uneven), seq_len=seq_len, local_start=0, local_len=local_len) is None
 
     # A single-rank layout owns the compact rows unchanged.
     assert torch.equal(
