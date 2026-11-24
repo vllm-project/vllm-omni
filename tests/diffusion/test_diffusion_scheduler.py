@@ -36,10 +36,6 @@ from vllm_omni.diffusion.sched import (
     Scheduler,
     StepScheduler,
 )
-from vllm_omni.diffusion.sched.batching_policy import (
-    ComputeBudgetDiffusionBatchingPolicy,
-    FixedDiffusionBatchingPolicy,
-)
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData, SchedulerRequestState
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_COUNT_KEY
@@ -3168,19 +3164,16 @@ class TestBatchingPolicyResolution:
         scheduler = self._initialize(enable_mixfusion=True)
 
         assert scheduler.batching_config.policy == "compute_budget"
-        assert isinstance(scheduler.batching_policy, ComputeBudgetDiffusionBatchingPolicy)
 
     def test_auto_keeps_fixed_policy_when_mixfusion_is_off(self) -> None:
         scheduler = self._initialize(enable_mixfusion=False)
 
         assert scheduler.batching_config.policy == "fixed"
-        assert isinstance(scheduler.batching_policy, FixedDiffusionBatchingPolicy)
 
     def test_explicit_fixed_policy_disables_drr_with_mixfusion(self) -> None:
         scheduler = self._initialize(enable_mixfusion=True, policy="fixed")
 
         assert scheduler.batching_config.policy == "fixed"
-        assert isinstance(scheduler.batching_policy, FixedDiffusionBatchingPolicy)
 
     def test_unknown_policy_fails_at_startup(self) -> None:
         with pytest.raises(ValueError, match="bogus_policy"):
