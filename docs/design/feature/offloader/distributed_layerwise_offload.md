@@ -164,6 +164,16 @@ For DLO, `cast` converts each streamed weight on the NPU after upload.
 `reactor` packs the padded NZ bytes on the CPU and binds an NZ view over the
 transfer buffer on the NPU. Disabling DLO restores the ordinary CPU weights.
 
+DLO `reactor` requires `torch.npu.config.allow_internal_format=True` and
+TorchNPU APIs that can create storage from a device pointer and bind an NZ
+tensor view to that storage. If either prerequisite is missing, startup
+raises an error. Use `off` to keep ND, or `cast` on a runtime where DLO
+`cast` has been validated.
+
+Both DLO modes have been validated on Ascend 910B4-1 (A2) with CANN 9.2.1
+and TorchNPU `2.10.0.post7`. On Ascend 950 (A5), validation covered
+resident INT8 weights with DLO disabled.
+
 With sleep mode enabled, NPU startup rejects `cast` and `reactor` before
 loading weights. Ordinary model-level and layer-wise CPU offload also reject
 either mode when the model contains eligible INT8 weights.
