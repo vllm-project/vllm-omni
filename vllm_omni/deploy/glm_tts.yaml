@@ -31,10 +31,12 @@ stages:
   - stage_id: 0
     max_num_seqs: 1
     gpu_memory_utilization: 0.55
-    # BF16 for AR decode: memory-bandwidth bound on single-batch decode,
-    # bf16 halves HBM reads per step (~1.7x throughput on L4/A40).
+    # Keep stage 0 eager until the compiled/CUDA-graph path has hardware
+    # speech-quality parity. AMD weekly produced corrupted online voice-clone
+    # output on that path while the same seeded MRv2 RAS workload passed in
+    # eager offline execution.
     dtype: bfloat16
-    enforce_eager: false
+    enforce_eager: true
     async_scheduling: true
     enable_prefix_caching: false
     max_num_batched_tokens: 512

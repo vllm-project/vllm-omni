@@ -10,13 +10,11 @@ Inpainting uses ``offline_client.send_diffusion_request`` with
 """
 
 import pytest
-import torch
 from PIL import Image, ImageChops, ImageDraw
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import DiffusionResponse, OfflineOmniClient
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.platforms import current_omni_platform
 
 # NOTE: Most of the flux2klein tests have migrated to the common diffusion tests.
 # This model will also use the tiny model builder when run at the core model level.
@@ -61,9 +59,10 @@ def _image_difference_bbox(first: Image.Image, second: Image.Image) -> tuple[int
     return ImageChops.difference(first, second).getbbox(alpha_only=False)
 
 
-def _send_inpaint_with_generator(
-    offline_client: OfflineOmniClient, prompt: str, input_image, mask_image, generator: torch.Generator
+def _send_inpaint_with_seed(
+    offline_client: OfflineOmniClient, prompt: str, input_image, mask_image, seed: int
 ) -> DiffusionResponse:
+    """Exercise the serializable request seed contract across the worker boundary."""
     return offline_client.send_diffusion_request(
         {
             "model": MODEL,
@@ -74,7 +73,7 @@ def _send_inpaint_with_generator(
                 width=_WIDTH,
                 num_inference_steps=_NUM_INFERENCE_STEPS,
                 guidance_scale=0.0,
-                generator=generator,
+                seed=seed,
                 num_outputs_per_prompt=1,
             ),
         }
@@ -89,11 +88,8 @@ def test_flux2_klein_inpaint_deterministic(offline_client: OfflineOmniClient):
     input_image, mask_image = _create_test_inputs()
     seed = 12345
 
-    gen1 = torch.Generator(current_omni_platform.device_type).manual_seed(seed)
-    gen2 = torch.Generator(current_omni_platform.device_type).manual_seed(seed)
-
-    r1 = _send_inpaint_with_generator(offline_client, "A red flower in a field", input_image, mask_image, gen1)
-    r2 = _send_inpaint_with_generator(offline_client, "A red flower in a field", input_image, mask_image, gen2)
+    r1 = _send_inpaint_with_seed(offline_client, "A red flower in a field", input_image, mask_image, seed)
+    r2 = _send_inpaint_with_seed(offline_client, "A red flower in a field", input_image, mask_image, seed)
 
     images1 = _images_from_response(r1)
     images2 = _images_from_response(r2)
@@ -110,11 +106,8 @@ def test_flux2_klein_inpaint_deterministic(offline_client: OfflineOmniClient):
 def test_flux2_klein_inpaint_different_seeds_different_output(offline_client: OfflineOmniClient):
     input_image, mask_image = _create_test_inputs()
 
-    gen1 = torch.Generator(current_omni_platform.device_type).manual_seed(42)
-    gen2 = torch.Generator(current_omni_platform.device_type).manual_seed(99999)
-
-    r1 = _send_inpaint_with_generator(offline_client, "A beautiful landscape", input_image, mask_image, gen1)
-    r2 = _send_inpaint_with_generator(offline_client, "A beautiful landscape", input_image, mask_image, gen2)
+    r1 = _send_inpaint_with_seed(offline_client, "A beautiful landscape", input_image, mask_image, 42)
+    r2 = _send_inpaint_with_seed(offline_client, "A beautiful landscape", input_image, mask_image, 99999)
 
     images1 = _images_from_response(r1)
     images2 = _images_from_response(r2)
