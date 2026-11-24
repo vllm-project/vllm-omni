@@ -61,6 +61,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import MiniCPMO45PcmAppendBuffer
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
+    APPEND_TEXT_TOKEN_IDS_KEY,
     MiniCPMO45DuplexPolicy,
     MiniCPMO45DuplexWindowConfig,
 )
@@ -116,6 +117,7 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "ref_audio_format",
         "ref_audio_sample_rate_hz",
         "initial_user_text",
+        APPEND_TEXT_TOKEN_IDS_KEY,
         "duplex_window_config",
         "duplex_window_prefix_tokens",
         "duplex_window_suffix_token_ids",
@@ -331,6 +333,11 @@ def build_duplex_data_plane_prompt(
         token_budget += 1
         # Serving already pads the final residual audio. Stage0 does not
         # append another silent unit, so final must not reserve extra slots.
+    # Server-owned text (for example a delegated result) follows this unit's
+    # media embeddings. Reserve every token or the worker would truncate it.
+    append_text_ids = runtime_config.get(APPEND_TEXT_TOKEN_IDS_KEY)
+    if isinstance(append_text_ids, list):
+        token_budget += len(append_text_ids)
     extra_body = session_config.get("extra_body")
     raw_token_id = runtime_config.get("duplex_scheduler_token_id")
     try:

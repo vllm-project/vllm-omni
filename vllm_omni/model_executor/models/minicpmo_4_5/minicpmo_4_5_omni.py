@@ -37,7 +37,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import APPEND_TEXT_TOKEN_IDS_KEY, MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMForConditionalGeneration,
@@ -748,11 +748,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _optional_int
 
         window = duplex.get("stage0_window")
+        runtime_config = duplex.get("runtime_config")
+        text_token_ids = runtime_config.get(APPEND_TEXT_TOKEN_IDS_KEY) if isinstance(runtime_config, dict) else None
         return {
             "epoch": _optional_int(duplex.get("epoch")),
             "seq": _optional_int(duplex.get("seq")),
             "is_speech": bool(payload.get("is_speech", False)),
             "stage0_window": window if isinstance(window, dict) else None,
+            "text_token_ids": text_token_ids if isinstance(text_token_ids, list) else None,
         }
 
     def _duplex_data_plane_helper(self):
