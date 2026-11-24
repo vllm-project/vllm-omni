@@ -232,6 +232,11 @@ class _FakeGenericQuantConfig:
 
 
 @dataclass
+class _FakeTextConfig:
+    num_hidden_layers: int | None = None
+
+
+@dataclass
 class _FakeHFConfig:
     pass
 
@@ -239,6 +244,7 @@ class _FakeHFConfig:
 @dataclass
 class _FakeStageModelConfig:
     hf_config: _FakeHFConfig = field(default_factory=_FakeHFConfig)
+    hf_text_config: _FakeTextConfig | None = None
 
 
 @dataclass
@@ -287,6 +293,14 @@ def test_qwen3_omni_skips_triton_default_for_generation_and_explicit_quant():
         # ModelOpt exclude_modules excludes Talker but quantizes Thinker.
         (_FakeModelOptQuantConfig(exclude_modules=["talker*", "code2wav*", "thinker.visual*"]), "thinker", "auto"),
         (_FakeModelOptQuantConfig(exclude_modules=["talker*", "code2wav*", "thinker.visual*"]), "talker", "triton"),
+        # Whole-stage MoE wildcard excludes all Talker MoE layers but leaves Thinker quantized.
+        (_FakeModelOptQuantConfig(exclude_modules=["talker.model.layers.*.mlp.experts"]), "thinker", "auto"),
+        (_FakeModelOptQuantConfig(exclude_modules=["talker.model.layers.*.mlp.experts"]), "talker", "triton"),
+        # Partial exclusions (e.g., layer 0 or a subset of layers) still leave later layers quantized -> auto.
+        (_FakeModelOptQuantConfig(exclude_modules=["*layers.0.mlp.experts*"]), "thinker", "auto"),
+        (_FakeModelOptQuantConfig(exclude_modules=["thinker.model.layers.0.*"]), "thinker", "auto"),
+        (_FakeModelOptQuantConfig(exclude_modules=["*layers.[0-9].mlp.experts*"]), "thinker", "auto"),
+        (_FakeCompressedTensorsQuantConfig(ignore=["re:.*layers\\.0\\.mlp\\.experts.*"]), "thinker", "auto"),
         # CompressedTensors ignore regex excludes Talker.
         (_FakeCompressedTensorsQuantConfig(ignore=["re:.*talker.*", "lm_head"]), "thinker", "auto"),
         (_FakeCompressedTensorsQuantConfig(ignore=["re:.*talker.*", "lm_head"]), "talker", "triton"),
@@ -308,6 +322,38 @@ def test_qwen3_omni_reset_default_triton_for_quantized_stages(quant_config, mode
     )
 
     assert vllm_config.kernel_config.moe_backend == expected_backend
+
+
+def test_qwen3_omni_partial_vs_full_layer_exclusions_with_stage_layer_count():
+    partial_cfg = _FakeVllmConfig(
+        kernel_config=KernelConfig(moe_backend="triton"),
+        quant_config=_FakeModelOptQuantConfig(
+            exclude_modules=[f"thinker.model.layers.{i}.mlp.experts" for i in range(3)],
+        ),
+        model_config=_FakeStageModelConfig(hf_text_config=_FakeTextConfig(num_hidden_layers=4)),
+    )
+    stage_init_utils._maybe_reset_qwen3_omni_quantized_moe_backend(
+        partial_cfg,  # type: ignore[arg-type]
+        model_arch="Qwen3OmniMoeForConditionalGeneration",
+        model_stage="thinker",
+        moe_backend_is_explicit=False,
+    )
+    assert partial_cfg.kernel_config.moe_backend == "auto"
+
+    full_cfg = _FakeVllmConfig(
+        kernel_config=KernelConfig(moe_backend="triton"),
+        quant_config=_FakeModelOptQuantConfig(
+            exclude_modules=[f"talker.model.layers.{i}.mlp.experts" for i in range(4)],
+        ),
+        model_config=_FakeStageModelConfig(hf_text_config=_FakeTextConfig(num_hidden_layers=4)),
+    )
+    stage_init_utils._maybe_reset_qwen3_omni_quantized_moe_backend(
+        full_cfg,  # type: ignore[arg-type]
+        model_arch="Qwen3OmniMoeForConditionalGeneration",
+        model_stage="talker",
+        moe_backend_is_explicit=False,
+    )
+    assert full_cfg.kernel_config.moe_backend == "triton"
 
 
 def test_qwen3_omni_quantized_stage_preserves_explicit_triton_override():

@@ -798,6 +798,7 @@ def prepare_engine_environment() -> None:
 _QWEN3_OMNI_MODEL_ARCH = "Qwen3OmniMoeForConditionalGeneration"
 _QWEN3_OMNI_STAGE_NAMES = ("thinker", "talker", "code2wav")
 _QWEN3_OMNI_STAGE_PREFIXES = tuple(f"{name}." for name in _QWEN3_OMNI_STAGE_NAMES)
+_QWEN3_OMNI_FALLBACK_LAYER_PROBES = (0, 1, 2, 10, 47, 99)
 
 
 def _is_stage_moe_backend_explicit(stage_config: object) -> bool:
@@ -810,31 +811,65 @@ def _is_stage_moe_backend_explicit(stage_config: object) -> bool:
     return False
 
 
-def _is_stage_excluded_by_patterns(patterns: object, model_stage: str) -> bool:
+def _get_stage_num_hidden_layers(vllm_config: object, model_stage: str) -> int | None:
+    """Return the stage text hidden layer count when available on *vllm_config*."""
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None:
+        return None
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    num_layers = getattr(hf_text_config, "num_hidden_layers", None)
+    if isinstance(num_layers, int) and not isinstance(num_layers, bool) and num_layers > 0:
+        return num_layers
+    hf_config = getattr(model_config, "hf_config", None)
+    stage_cfg = getattr(hf_config, f"{model_stage}_config", None)
+    stage_text_cfg = getattr(stage_cfg, "text_config", None)
+    num_layers = getattr(stage_text_cfg, "num_hidden_layers", None)
+    if isinstance(num_layers, int) and not isinstance(num_layers, bool) and num_layers > 0:
+        return num_layers
+    return None
+
+
+def _pattern_excludes_stage_probe(pat: str, probe: str, model_stage: str, stage_prefix: str) -> bool:
+    if pat == model_stage or pat == stage_prefix or pat == f"{model_stage}.*":
+        return True
+    if probe.startswith(f"{pat}."):
+        return True
+    if pat.startswith("re:"):
+        try:
+            return re.search(pat[3:], probe) is not None
+        except re.error:
+            return False
+    return fnmatch.fnmatchcase(probe, pat)
+
+
+def _is_stage_excluded_by_patterns(
+    patterns: object,
+    model_stage: str,
+    *,
+    num_hidden_layers: int | None = None,
+) -> bool:
+    """Return True only when *patterns* exclude every MoE layer of *model_stage*."""
     if not isinstance(patterns, (list, tuple, set, frozenset)):
         return False
-    probe = f"{model_stage}.model.layers.0.mlp.experts"
+    cleaned = [raw.strip() for raw in patterns if isinstance(raw, str) and raw.strip()]
+    if not cleaned:
+        return False
+
     stage_prefix = f"{model_stage}."
-    for raw in patterns:
-        if not isinstance(raw, str):
-            continue
-        pat = raw.strip()
-        if not pat:
-            continue
-        if pat == model_stage or pat == stage_prefix or pat == f"{model_stage}.*":
-            return True
-        if pat.startswith("re:"):
-            try:
-                if re.search(pat[3:], probe):
-                    return True
-            except re.error:
-                continue
-        elif fnmatch.fnmatchcase(probe, pat) or fnmatch.fnmatchcase(model_stage, pat):
-            return True
-    return False
+    layer_indices = range(num_hidden_layers) if num_hidden_layers is not None else _QWEN3_OMNI_FALLBACK_LAYER_PROBES
+    for layer_idx in layer_indices:
+        probe = f"{model_stage}.model.layers.{layer_idx}.mlp.experts"
+        if not any(_pattern_excludes_stage_probe(pat, probe, model_stage, stage_prefix) for pat in cleaned):
+            return False
+    return True
 
 
-def _stage_has_quantized_moe(quant_config: object, model_stage: str | None) -> bool:
+def _stage_has_quantized_moe(
+    quant_config: object,
+    model_stage: str | None,
+    *,
+    num_hidden_layers: int | None = None,
+) -> bool:
     """Return True if *quant_config* applies to MoE layers on *model_stage*."""
     if quant_config is None:
         return False
@@ -858,7 +893,11 @@ def _stage_has_quantized_moe(quant_config: object, model_stage: str | None) -> b
             return False
 
         for attr in ("exclude_modules", "ignore"):
-            if _is_stage_excluded_by_patterns(getattr(quant_config, attr, None), model_stage):
+            if _is_stage_excluded_by_patterns(
+                getattr(quant_config, attr, None),
+                model_stage,
+                num_hidden_layers=num_hidden_layers,
+            ):
                 return False
 
     return True
@@ -910,7 +949,12 @@ def _maybe_reset_qwen3_omni_quantized_moe_backend(
         or getattr(getattr(vllm_config, "kernel_config", None), "moe_backend", None) != "triton"
     ):
         return
-    if not _stage_has_quantized_moe(getattr(vllm_config, "quant_config", None), model_stage):
+    num_hidden_layers = _get_stage_num_hidden_layers(vllm_config, model_stage) if model_stage else None
+    if not _stage_has_quantized_moe(
+        getattr(vllm_config, "quant_config", None),
+        model_stage,
+        num_hidden_layers=num_hidden_layers,
+    ):
         return
     vllm_config.kernel_config.moe_backend = "auto"
     logger.info(
