@@ -729,8 +729,28 @@ def _preprocess_realtime_video_args(args: argparse.Namespace) -> None:
             raise ValueError("Semantic evaluation requires evaluator root, Python and requirements lock")
 
 
+def add_split_accuracy_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Write dataset accuracy scores to a sidecar JSON after ``--save-result``."""
+    group = parser.add_argument_group("Accuracy Result Split Options")
+    group.add_argument(
+        "--split-accuracy",
+        action="store_true",
+        default=False,
+        help=(
+            "After the serving result is assembled, copy date-through-failed metadata "
+            "and dataset accuracy fields (daily_omni_*, seed_tts_*, "
+            "omniinteract.accuracy, omni_duplex_eval.accuracy) into a separate "
+            "result_acc_*.json. The original --save-result JSON is unchanged. "
+            "The sidecar directory is ACC_BENCH_RESULT_DIR when set, else --result-dir, "
+            "else the current directory. Also applies when calling "
+            "vllm_omni.benchmarks.serve.main / main_async with split_accuracy=True."
+        ),
+    )
+
+
 def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
+    add_split_accuracy_cli_args(parser)
     add_daily_omni_cli_args(parser)
     add_videomme_cli_args(parser)
     add_omniinteract_cli_args(parser)

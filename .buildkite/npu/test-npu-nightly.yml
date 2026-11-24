@@ -157,8 +157,10 @@ steps:
           HF_TOKEN: "${HF_TOKEN}"
         artifact_paths:
           - tests/dfx/perf/results/*.json
+          - tests/e2e/accuracy/seed_tts/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/seed_tts/results
           - export SEED_TTS_WER_EVAL=1
           - export SEED_TTS_SIM_EVAL=1
           - export SEED_TTS_UTMOS_EVAL=0
@@ -172,6 +174,7 @@ steps:
               -m "full_model and npu and A3 and omni and cards_2" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            buildkite-agent artifact upload "tests/e2e/accuracy/seed_tts/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Async Duplex Omni-DuplexEval Accuracy and Perf Test"
         source_file_dependencies: omni_duplex_eval_ci
@@ -200,6 +203,7 @@ steps:
               -m "full_model and npu and A3 and omni and cards_2" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            buildkite-agent artifact upload "tests/e2e/accuracy/omni_duplex_eval/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Async Prefix Seed-TTS Accuracy and Perf Test"
         source_file_dependencies: omni_minicpmo_4_5_perf
@@ -212,8 +216,10 @@ steps:
           HF_TOKEN: "${HF_TOKEN}"
         artifact_paths:
           - tests/dfx/perf/results/*.json
+          - tests/e2e/accuracy/seed_tts/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/seed_tts/results
           - export SEED_TTS_WER_EVAL=1
           - export SEED_TTS_SIM_EVAL=1
           - export SEED_TTS_UTMOS_EVAL=0
@@ -227,6 +233,7 @@ steps:
               -m "full_model and npu and A3 and omni and cards_2" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            buildkite-agent artifact upload "tests/e2e/accuracy/seed_tts/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test (A3, 2 cards)"
         source_file_dependencies: [omni_minicpmo_4_5_a3_2card_perf, ci_npu]

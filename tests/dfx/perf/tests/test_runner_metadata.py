@@ -1454,6 +1454,7 @@ def test_minicpmo_duplex_eval_config_replays_pr_correction_ids_at_c8(monkeypatch
     assert "duplex_eval_accuracy_config" not in params
     assert config["judge_server_params"]["model"] == params["duplex_eval_judge_model"]
     assert params["duplex_eval_evaluate"]
+    assert params["split_accuracy"] is True
     assert "duplex_eval_score_floor_hardware" not in params
     assert config["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5.yaml"
     assert config["server_params"]["update"] == {
@@ -1507,6 +1508,7 @@ def test_minicpmo_duplex_eval_config_replays_pr_correction_ids_at_c8(monkeypatch
     assert args.ready_check_timeout_sec == 0
     assert args.trust_remote_code
     assert args.duplex_eval_evaluate
+    assert args.split_accuracy
     assert args.duplex_eval_judge_base_url == "http://localhost:8001"
     assert "--duplex-eval-require-score-floors" not in call["args"]
     assert "--duplex-eval-accuracy-config" not in call["args"]
@@ -1868,6 +1870,220 @@ def test_omniinteract_run_benchmark_writes_result_acc(tmp_path, monkeypatch):
     assert perf_saved["omniinteract"]["total"] == 4
     # The in-memory copy stays nested so floor assertions still see it.
     assert result["omniinteract"]["accuracy"]["summary"]["IA_QTF1"] == 0.25
+
+
+def _stub_run_benchmark_payload(monkeypatch, payload: dict[str, object]) -> None:
+    import io
+
+    from tests.dfx import conftest as dfx
+
+    class BenchmarkProcess:
+        def __class_getitem__(cls, item):
+            return cls
+
+        def __init__(self, command, **_kwargs):
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
+            path = Path(command[command.index("--result-dir") + 1]) / command[command.index("--result-filename") + 1]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload))
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
+
+
+def test_daily_omni_run_benchmark_writes_result_acc_when_acc_dir_set(tmp_path, monkeypatch):
+    from tests.dfx import conftest as dfx
+
+    perf_dir = tmp_path / "perf"
+    acc_dir = tmp_path / "acc"
+    perf_dir.mkdir()
+    acc_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(perf_dir))
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(acc_dir))
+    monkeypatch.setenv("BUILDKITE_BRANCH", "acc-branch")
+    _stub_run_benchmark_payload(
+        monkeypatch,
+        {
+            "date": "20261027-120000",
+            "model_id": "openbmb/MiniCPM-o-4_5",
+            "completed": 8,
+            "failed": 0,
+            "daily_omni_accuracy": 0.8,
+            "daily_omni_evaluated_ok": 8,
+        },
+    )
+    result = dfx.run_benchmark(
+        ["--model", "openbmb/MiniCPM-o-4_5", "--dataset-path", "liarliar/Daily-Omni", "--max-concurrency", "8"],
+        test_name="test_minicpmo_4_5_async_prefix_daily_omni",
+        flow=8,
+        dataset_name="daily-omni",
+        num_prompt=8,
+        resource_label="H100",
+        accuracy_baseline={"min_daily_omni_accuracy": 0.77},
+    )
+    acc_paths = list(acc_dir.glob("result_acc_*.json"))
+    assert len(acc_paths) == 1
+    assert "daily_omni" in acc_paths[0].name
+    saved = json.loads(acc_paths[0].read_text())
+    assert saved["dataset"] == "daily_omni"
+    assert saved["test_name"] == "test_minicpmo_4_5_async_prefix_daily_omni"
+    assert saved["accuracy"]["daily_omni_accuracy"] == 0.8
+    assert saved["baseline"] == {"min_daily_omni_accuracy": 0.77}
+    assert saved["branch"] == "acc-branch"
+    assert not list(perf_dir.glob("result_acc_*.json"))
+    perf_saved = json.loads(next(perf_dir.glob("result_*.json")).read_text())
+    assert perf_saved["daily_omni_accuracy"] == 0.8
+    assert result["daily_omni_accuracy"] == 0.8
+
+
+def test_daily_omni_run_benchmark_skips_result_acc_without_acc_dir(tmp_path, monkeypatch):
+    from tests.dfx import conftest as dfx
+
+    perf_dir = tmp_path / "perf"
+    perf_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(perf_dir))
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    _stub_run_benchmark_payload(
+        monkeypatch,
+        {
+            "date": "20261027-120000",
+            "model_id": "openbmb/MiniCPM-o-4_5",
+            "completed": 8,
+            "failed": 0,
+            "daily_omni_accuracy": 0.8,
+        },
+    )
+    dfx.run_benchmark(
+        ["--model", "openbmb/MiniCPM-o-4_5", "--dataset-path", "liarliar/Daily-Omni"],
+        test_name="test_minicpmo_4_5_async_prefix_daily_omni",
+        flow=8,
+        dataset_name="daily-omni",
+        num_prompt=8,
+        resource_label="H100",
+    )
+    assert not list(perf_dir.glob("result_acc_*.json"))
+    assert json.loads(next(perf_dir.glob("result_*.json")).read_text())["daily_omni_accuracy"] == 0.8
+
+
+def test_run_benchmark_skips_dfx_result_acc_when_split_accuracy(tmp_path, monkeypatch):
+    from tests.dfx import conftest as dfx
+
+    perf_dir = tmp_path / "perf"
+    acc_dir = tmp_path / "acc"
+    perf_dir.mkdir()
+    acc_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(perf_dir))
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(acc_dir))
+    _stub_run_benchmark_payload(
+        monkeypatch,
+        {
+            "date": "20261027-120000",
+            "model_id": "openbmb/MiniCPM-o-4_5",
+            "completed": 8,
+            "failed": 0,
+            "daily_omni_accuracy": 0.8,
+        },
+    )
+    dfx.run_benchmark(
+        [
+            "--model",
+            "openbmb/MiniCPM-o-4_5",
+            "--dataset-path",
+            "liarliar/Daily-Omni",
+            "--split-accuracy",
+        ],
+        test_name="test_minicpmo_4_5_async_prefix_daily_omni",
+        flow=8,
+        dataset_name="daily-omni",
+        num_prompt=8,
+        resource_label="H100",
+        accuracy_baseline={"min_daily_omni_accuracy": 0.77},
+    )
+    assert list(acc_dir.glob("result_acc_*.json")) == []
+    assert json.loads(next(perf_dir.glob("result_*.json")).read_text())["daily_omni_accuracy"] == 0.8
+
+
+def test_seed_tts_run_benchmark_writes_result_acc_when_eval_and_acc_dir_set(tmp_path, monkeypatch):
+    from tests.dfx import conftest as dfx
+
+    perf_dir = tmp_path / "perf"
+    acc_dir = tmp_path / "acc"
+    perf_dir.mkdir()
+    acc_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(perf_dir))
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(acc_dir))
+    _stub_run_benchmark_payload(
+        monkeypatch,
+        {
+            "date": "20261027-120000",
+            "model_id": "openbmb/MiniCPM-o-4_5",
+            "completed": 32,
+            "failed": 0,
+            "seed_tts_content_error_mean": 0.02,
+            "seed_tts_sim_mean": 0.85,
+        },
+    )
+    result = dfx.run_benchmark(
+        [
+            "--model",
+            "openbmb/MiniCPM-o-4_5",
+            "--dataset-path",
+            "zhaochenyang20/seed-tts-eval",
+            "--seed-tts-wer-eval",
+            "--max-concurrency",
+            "64",
+        ],
+        test_name="test_minicpmo_4_5_default",
+        flow=64,
+        dataset_name="seed-tts",
+        num_prompt=32,
+        resource_label="H100",
+        accuracy_baseline={"max_seed_tts_mean_wer": 0.05, "min_seed_tts_mean_sim": 0.8},
+    )
+    acc_paths = list(acc_dir.glob("result_acc_*.json"))
+    assert len(acc_paths) == 1
+    assert "seed_tts" in acc_paths[0].name
+    saved = json.loads(acc_paths[0].read_text())
+    assert saved["dataset"] == "seed_tts"
+    assert saved["accuracy"]["seed_tts_content_error_mean"] == 0.02
+    assert saved["accuracy"]["seed_tts_sim_mean"] == 0.85
+    assert saved["baseline"] == {"max_seed_tts_mean_wer": 0.05, "min_seed_tts_mean_sim": 0.8}
+    assert not list(perf_dir.glob("result_acc_*.json"))
+    assert json.loads(next(perf_dir.glob("result_*.json")).read_text())["seed_tts_content_error_mean"] == 0.02
+    assert result["seed_tts_content_error_mean"] == 0.02
+
+
+def test_seed_tts_run_benchmark_skips_result_acc_without_wer_eval(tmp_path, monkeypatch):
+    from tests.dfx import conftest as dfx
+
+    perf_dir = tmp_path / "perf"
+    acc_dir = tmp_path / "acc"
+    perf_dir.mkdir()
+    acc_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(perf_dir))
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(acc_dir))
+    _stub_run_benchmark_payload(
+        monkeypatch,
+        {
+            "date": "20261027-120000",
+            "model_id": "openbmb/MiniCPM-o-4_5",
+            "completed": 32,
+            "failed": 0,
+        },
+    )
+    dfx.run_benchmark(
+        ["--model", "openbmb/MiniCPM-o-4_5", "--dataset-path", "zhaochenyang20/seed-tts-eval"],
+        test_name="test_minicpmo_4_5_async_prefix",
+        flow=1,
+        dataset_name="seed-tts",
+        num_prompt=32,
+        resource_label="H100",
+    )
+    assert list(acc_dir.glob("result_acc_*.json")) == []
+    assert not list(perf_dir.glob("result_acc_*.json"))
 
 
 def test_omniinteract_ephemeral_artifacts_override_output_dir(tmp_path, monkeypatch, pytestconfig):
@@ -2509,6 +2725,8 @@ def test_minicpmo_omniinteract_local_config_uses_c8_and_ephemeral_artifacts():
     assert params["omniinteract_subsets"] == "1q1a_math"
     assert params["num_prompts"] == [60]
     assert params["omniinteract_evaluate"] is True
+    assert params["split_accuracy"] is True
+    assert params["benchmark_env"]["ACC_BENCH_RESULT_DIR"] == "tests/e2e/accuracy/omniinteract/results"
     assert "omniinteract_min_ia_qtf1" not in params
     assert all(update["duplex_session.max_sessions"] >= concurrency for concurrency in params["max_concurrency"])
     assert params["omniinteract_persist_artifacts"] is False
@@ -2676,6 +2894,7 @@ def test_minicpmo_nightly_default_and_async_prefix_seed_tts_matrix():
     assert default_params["max_concurrency"] == [64]
     assert default_params["num_prompts"] == [1088]
     assert default_params["seed_tts_wer_eval"] is True
+    assert default_params["split_accuracy"] is True
     assert default_params["max_seed_tts_mean_wer"] == 0.05
     assert default_params["min_seed_tts_mean_sim"] == 0.80
     assert "tpot" in default_params["percentile-metrics"]
@@ -2684,9 +2903,11 @@ def test_minicpmo_nightly_default_and_async_prefix_seed_tts_matrix():
     assert prefix_perf["max_concurrency"] == [1, 16, 32]
     assert prefix_perf["num_prompts"] == [32, 256, 512]
     assert "seed_tts_wer_eval" not in prefix_perf
+    assert "split_accuracy" not in prefix_perf
     assert prefix_acc["max_concurrency"] == [64]
     assert prefix_acc["num_prompts"] == [1088]
     assert prefix_acc["seed_tts_wer_eval"] is True
+    assert prefix_acc["split_accuracy"] is True
     assert prefix_acc["min_seed_tts_mean_sim"] == 0.80
     assert "test_minicpmo_4_5_nightly_seed_c1" not in by_name
     daily = by_name["test_minicpmo_4_5_async_prefix_daily_omni"]
@@ -2698,6 +2919,7 @@ def test_minicpmo_nightly_default_and_async_prefix_seed_tts_matrix():
     assert daily_params["temperature"] == 0
     assert daily_params["output_len"] == 512
     assert daily_params["min_daily_omni_accuracy"] == 0.77
+    assert daily_params["split_accuracy"] is True
     assert "tpot" in daily_params["percentile-metrics"]
     assert daily["server_params"]["update"]["session_mode"] == "turn"
     assert daily["server_params"]["update"]["stages"]["0"]["enable_prefix_caching"] is True
@@ -2730,6 +2952,7 @@ def test_minicpmo_npu_nightly_seed_tts_matrix():
     assert default_params["max_concurrency"] == [16]
     assert default_params["num_prompts"] == [1088]
     assert default_params["seed_tts_wer_eval"] is True
+    assert default_params["split_accuracy"] is True
     assert default_params["max_seed_tts_mean_wer"] == 0.05
     assert default_params["min_seed_tts_mean_sim"] == 0.80
     assert "tpot" in default_params["percentile-metrics"]
@@ -2745,9 +2968,11 @@ def test_minicpmo_npu_nightly_seed_tts_matrix():
     assert prefix_by_name["async-prefix-seed-tts-c1"]["max_concurrency"] == [1]
     assert prefix_by_name["async-prefix-seed-tts-c1"]["num_prompts"] == [32]
     assert "seed_tts_wer_eval" not in prefix_by_name["async-prefix-seed-tts-c1"]
+    assert "split_accuracy" not in prefix_by_name["async-prefix-seed-tts-c1"]
     assert prefix_by_name["async-prefix-seed-tts-c16"]["max_concurrency"] == [16]
     assert prefix_by_name["async-prefix-seed-tts-c16"]["num_prompts"] == [1088]
     assert prefix_by_name["async-prefix-seed-tts-c16"]["seed_tts_wer_eval"] is True
+    assert prefix_by_name["async-prefix-seed-tts-c16"]["split_accuracy"] is True
     assert prefix_by_name["async-prefix-seed-tts-c16"]["max_seed_tts_mean_wer"] == 0.05
     assert prefix_by_name["async-prefix-seed-tts-c16"]["min_seed_tts_mean_sim"] == 0.80
 
@@ -2762,6 +2987,7 @@ def test_minicpmo_daily_omni_nightly_config_uses_c8_and_minicpm_recipe():
     assert params["temperature"] == 0
     assert params["output_len"] == 512
     assert params["min_daily_omni_accuracy"] == 0.77
+    assert params["split_accuracy"] is True
     assert "tpot" in params["percentile-metrics"]
     assert config["server_params"]["update"]["session_mode"] == "turn"
     assert config["server_params"]["update"]["stages"]["0"]["enable_prefix_caching"] is True

@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import math
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,91 @@ _ENDPOINT_BACKEND_KEYS = {
     "/v1/images/edits",
     "/v1/videos",
 }
+
+# Header copied into the accuracy sidecar; matches upstream result_json from
+# ``date`` through serving ``failed`` (optional ramp-up keys included when present).
+_SPLIT_ACCURACY_HEADER_KEYS = (
+    "date",
+    "endpoint_type",
+    "backend",
+    "label",
+    "model_id",
+    "tokenizer_id",
+    "num_prompts",
+    "request_rate",
+    "burstiness",
+    "max_concurrency",
+    "ramp_up_strategy",
+    "ramp_up_start_rps",
+    "ramp_up_end_rps",
+    "duration",
+    "completed",
+    "failed",
+)
+_SPLIT_ACCURACY_PREFIXES = ("daily_omni_", "seed_tts_")
+_SPLIT_ACCURACY_NESTED_KEYS = ("omniinteract", "omni_duplex_eval")
+_ACC_BENCH_RESULT_DIR_ENV = "ACC_BENCH_RESULT_DIR"
+
+
+def _split_accuracy_header(result: Mapping[str, object]) -> dict[str, object]:
+    return {key: result[key] for key in _SPLIT_ACCURACY_HEADER_KEYS if key in result}
+
+
+def _split_accuracy_metrics(result: Mapping[str, object]) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key, value in result.items():
+        if isinstance(key, str) and key.startswith(_SPLIT_ACCURACY_PREFIXES):
+            payload[key] = value
+    for nested_key in _SPLIT_ACCURACY_NESTED_KEYS:
+        nested = result.get(nested_key)
+        if isinstance(nested, Mapping) and "accuracy" in nested:
+            payload[nested_key] = {"accuracy": nested["accuracy"]}
+    return payload
+
+
+def _split_accuracy_suite(args: argparse.Namespace) -> str:
+    dataset = getattr(args, "dataset_name", None)
+    if isinstance(dataset, str) and dataset:
+        return dataset.replace("-", "_")
+    return "accuracy"
+
+
+def _split_accuracy_model_token(model_id: object) -> str:
+    name = str(model_id).rsplit("/", 1)[-1]
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name).strip("._-")
+    return safe or "model"
+
+
+def _split_accuracy_dir(args: argparse.Namespace) -> Path:
+    explicit = os.environ.get(_ACC_BENCH_RESULT_DIR_ENV)
+    if explicit:
+        return Path(explicit)
+    result_dir = getattr(args, "result_dir", None)
+    if isinstance(result_dir, str) and result_dir:
+        return Path(result_dir)
+    if isinstance(result_dir, Path):
+        return result_dir
+    return Path(".")
+
+
+def write_split_accuracy_result(result: Mapping[str, object], args: argparse.Namespace) -> Path | None:
+    """Copy header plus dataset accuracy fields into ``result_acc_*.json`` when opted in."""
+    if not getattr(args, "split_accuracy", False):
+        return None
+    metrics = _split_accuracy_metrics(result)
+    if not metrics:
+        return None
+    date = str(result.get("date") or "").replace("-", "_")
+    stamp = date if date else "unknown"
+    filename = (
+        f"result_acc_{_split_accuracy_model_token(result.get('model_id'))}_{_split_accuracy_suite(args)}_{stamp}.json"
+    )
+    path = _split_accuracy_dir(args) / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {**_split_accuracy_header(result), **metrics}
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"Accuracy result saved to {path}")
+    return path
 
 
 def _normalize_endpoint(endpoint: str | None) -> str | None:
@@ -112,9 +199,11 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     token = CAPTURE_AUDIO_STREAM_DETAILS.set(bool(getattr(args, "save_detailed", False)))
     try:
         with lock:
-            return await vllm_main_async(args)
+            result = await vllm_main_async(args)
     finally:
         CAPTURE_AUDIO_STREAM_DETAILS.reset(token)
+    write_split_accuracy_result(result, args)
+    return result
 
 
 def main(args: argparse.Namespace) -> dict[str, Any]:

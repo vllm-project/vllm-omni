@@ -53,6 +53,7 @@
         "duplex_eval_split": "PR_correction",
         "duplex_eval_mix": "question",
         "duplex_eval_evaluate": true,
+        "split_accuracy": true,
         "duplex_eval_judge_model": "Qwen/Qwen2.5-VL-7B-Instruct",
         "duplex_eval_judge_video_mode": "video_url",
         "duplex_eval_judge_fps": 2,
