@@ -49,6 +49,9 @@ cancelled. Text shares the audio/video append tail and epoch fencing, without
 flushing partial PCM or advancing the first audio-encoder window. Before queuing
 text, the runner submits any complete buffered media units through that same
 append tail, preserving their input flags and leaving incomplete PCM buffered.
+Eligible audio appends also submit every complete buffered unit on either
+clock, including appends arriving after text has opened the response. An
+overlap policy that defers an append still keeps its media buffered.
 
 The MiniCPM plugin tokenizes off the owner loop and reserves exactly the
 context/previous-unit closure, `<unit>`, and text tokens. Stage 0 embeds these

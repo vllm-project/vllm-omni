@@ -2070,9 +2070,10 @@ class DuplexSessionRunner:
             session.release_input_bytes(raw_audio_bytes)
         append_payload = pcm_reservation.payload
         await self._start_append(append_payload, final=False, pcm_reservation=pcm_reservation)
-        if self._input_clock is not None and allow_emit:
-            # Input-clocked sessions: submit every whole unit this append
-            # completed, so its acknowledgement covers all of them.
+        if allow_emit:
+            # Submit every eligible whole unit on either clock. Leaving a
+            # complete unit buffered can block a text reply's continuation
+            # after the client has stopped sending input.
             await self._submit_buffered_media()
         await self._maybe_commit_vad_turn(vad_result)
 

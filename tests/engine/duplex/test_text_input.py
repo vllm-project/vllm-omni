@@ -63,8 +63,8 @@ async def test_text_fragments_prefill_in_order_with_audio_without_flushing_parti
         events = await h.settle()
         assert "error" not in types(events)
         inputs = [s.prompt["model_intermediate_buffer"]["duplex"] for s in h.port.submissions]
-        assert [p["seq"] for p in inputs] == [1, 2, 3]
-        assert [p["payload"].get("text") for p in inputs] == ["记住", "蓝色", None]
+        assert [p["seq"] for p in inputs] == [1, 2, 3, 4]
+        assert [p["payload"].get("text") for p in inputs] == ["记住", "蓝色", None, None]
         assert inputs[0]["payload"]["text_token_ids"] == [ord(c) for c in "记住"]
         assert inputs[1]["payload"]["force_listen"] is True
         assert len(h.port.submissions[1].prompt["prompt_token_ids"]) == 2 + 1 + len("蓝色")
@@ -72,7 +72,7 @@ async def test_text_fragments_prefill_in_order_with_audio_without_flushing_parti
         # 1035 ms audio unit, despite its append sequence being 3.
         assert len(h.port.submissions[2].prompt["prompt_token_ids"]) == 2 + 12 - 1
         assert h.runner.model_state.audio_buffer._audio_window_started
-        assert h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == 64000
+        assert h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == 0
         await h.run(commands.ClearInput())
         assert h.session.pending_input_bytes == 0
     finally:
@@ -213,6 +213,52 @@ async def test_text_drains_complete_buffered_audio_and_finishes_without_more_inp
             await h.run(tail)
             payload = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
             assert base64.b64decode(payload["audio"]) == audio.audio[48000 * 4 :] + tail.audio
+            assert h.session.pending_input_bytes == 0
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_samples", [0, 8000])
+@pytest.mark.parametrize("text_confirmed_before_audio", [False, True])
+async def test_text_reply_drains_later_complete_audio_without_more_client_input(
+    partial_samples, text_confirmed_before_audio
+):
+    h = await open_harness()
+    try:
+        await h.run(commands.AppendText(text="Answer now."))
+        response_id = h.session.active_response_id
+        if text_confirmed_before_audio:
+            await h.deliver_and_settle(_text_output(h.stage0_request_id()), stage_id=0, model_turn_id=0)
+        audio = replace(append_audio(samples=32000 + partial_samples), hints={"force_listen": True})
+        await h.run(audio)
+        if not text_confirmed_before_audio:
+            await h.deliver_and_settle(_text_output(h.stage0_request_id()), stage_id=0, model_turn_id=0)
+        inputs = [s.prompt["model_intermediate_buffer"]["duplex"]["payload"] for s in h.port.submissions]
+        assert [p["type"] for p in inputs] == ["text", "audio", "audio"]
+        assert b"".join(base64.b64decode(p["audio"]) for p in inputs[1:]) == audio.audio[: 32000 * 4]
+        assert all(p["force_listen"] is True for p in inputs[1:])
+        assert h.session.pending_input_bytes == partial_samples * 4
+        # No client input follows until this reply has completed.
+        await h.deliver_and_settle(
+            tts_output(h.stage0_request_id(), text="Answer", tts_is_last_chunk=True, finished=True)
+        )
+        assert len(h.port.submissions) == 4
+        assert h.runner.model_state.continuation_units == 1
+        await h.deliver_and_settle(
+            tts_output(h.stage0_request_id(), tts_is_last_chunk=True, turn_end=True, finished=True)
+        )
+        done = [e for e in h.events if e.type == "response.done"]
+        assert len(done) == 1 and done[0].response_id == response_id
+        assert done[0].status == "completed"
+        assert (
+            h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == partial_samples * 4
+        )
+        if partial_samples:
+            tail = append_audio(samples=16000 - partial_samples, value=0.1)
+            await h.run(tail)
+            payload = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
+            assert base64.b64decode(payload["audio"]) == audio.audio[32000 * 4 :] + tail.audio
             assert h.session.pending_input_bytes == 0
     finally:
         await close_harness(h)

@@ -2245,7 +2245,9 @@ and audio events, then release it on the final text fragment. The low-level
 `client.send` method can set this hint on an audio event.
 
 Text and completed media units use the same ordered append queue. Complete
-buffered media units are submitted before the next text fragment. A partial
+buffered media units are submitted before the next text fragment. Audio appends
+that are eligible to run also submit all complete units on the default wall
+clock, even after text has opened the reply. A partial
 microphone unit stays buffered while a text unit is prefilled; text does not
 advance the audio clock or consume the partial PCM. With the default silence
 continuation enabled, that partial unit does not block the text-triggered

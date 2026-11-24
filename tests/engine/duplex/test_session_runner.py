@@ -466,7 +466,9 @@ async def test_a_retried_append_does_not_take_the_failed_submits_spans() -> None
         # A late span of the failed submit still carries the old id.
         h.runner.on_stage_work([(0, 0, 1, ledger.now_ns(), 1_000_000)])
         (turn,) = ledger.snapshot()["turns"]
-        assert [(chunk["seq"], chunk["stage_work"]) for chunk in turn["chunks"]] == [(1, [])]
+        # The retry drains both the rolled-back audio and the fresh unit;
+        # neither may inherit the failed submission's stage work.
+        assert [(chunk["seq"], chunk["stage_work"]) for chunk in turn["chunks"]] == [(1, []), (2, [])]
     finally:
         await close_harness(h)
 
