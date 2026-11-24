@@ -80,32 +80,28 @@ def _write_eagle_kernel(kernels, soc, op, inputs, *, binary=True):
     return {"binaryList": [{"jsonPath": path.as_posix(), "binPath": path.with_suffix(".o").as_posix()}]}
 
 
-def _qkv_inputs(*, head_dim=128, rot_dim=96, eps=1e-6):
+def _qkv_inputs():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3Attention
 
     attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
     nn.Module.__init__(attention)
     attention.num_heads = attention.num_kv_heads = 2
-    attention.head_dim = head_dim
-    attention.rot_dim = rot_dim
+    attention.head_dim = 128
+    attention.rot_dim = 96
     attention.vdn = None
     attention.qkv_proj = lambda x: (x, None)
     for name in ("q_norm", "k_norm"):
-        norm = nn.RMSNorm(head_dim, eps=eps, dtype=torch.bfloat16)
+        norm = nn.RMSNorm(attention.head_dim, eps=1e-5, dtype=torch.bfloat16)
         norm.variance_epsilon = norm.eps
         setattr(attention, name, norm)
-    packed = torch.randn(7, 3 * attention.num_heads * head_dim, dtype=torch.bfloat16)
-    table = torch.arange(7 * rot_dim).reshape(7, rot_dim).to(packed.dtype)
+    packed = torch.randn(7, 3 * attention.num_heads * attention.head_dim, dtype=torch.bfloat16)
+    table = torch.arange(7 * attention.rot_dim).reshape(7, attention.rot_dim).to(packed.dtype)
     return attention, packed, table
 
 
 def _install_npu_qkv(attention):
     from vllm_omni.platforms.npu.models.minimax_h3 import _npu_project_qkv
 
-    def project(x):
-        return Mock(wraps=x, shape=x.shape, device=SimpleNamespace(type="npu")), None
-
-    attention.qkv_proj = Mock(side_effect=project)
     attention._project_qkv = MethodType(_npu_project_qkv, attention)
 
 
@@ -166,20 +162,16 @@ class TestMiniMaxH3Fusions:
         monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
         pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
         nn.Module.__init__(pipeline)
-        attention, _, _ = _qkv_inputs()
-        unsupported = [_qkv_inputs(**config)[0] for config in ({"head_dim": 96}, {"rot_dim": 48}, {"eps": 0.0})]
-        mismatched_eps, _, _ = _qkv_inputs()
-        mismatched_eps.k_norm.variance_epsilon = 1e-5
+        attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
+        nn.Module.__init__(attention)
         mlp = MiniMaxH3MLP.__new__(MiniMaxH3MLP)
         nn.Module.__init__(mlp)
-        pipeline.transformer = nn.ModuleList([attention, mlp, *unsupported, mismatched_eps])
+        pipeline.transformer = nn.ModuleList([attention, mlp])
 
         platform.apply_diffusion_model_patches(pipeline, SimpleNamespace(model_class_name="MiniMaxH3Pipeline"))
 
         use_qkv, use_swiglu = expected
         assert attention._project_qkv.__func__ is (h3._npu_project_qkv if use_qkv else MiniMaxH3Attention._project_qkv)
-        for block in (*unsupported, mismatched_eps):
-            assert block._project_qkv.__func__ is MiniMaxH3Attention._project_qkv
         assert mlp.forward.__func__ is (h3.forward_h3_mlp if use_swiglu else MiniMaxH3MLP.forward)
 
     def test_project_qkv_calls_eagle_with_local_rope_halves(self, eagle_qkv):
@@ -201,7 +193,7 @@ class TestMiniMaxH3Fusions:
         torch.testing.assert_close(cos, table[:, :48], atol=0, rtol=0)
         torch.testing.assert_close(sin, table[:, 48:], atol=0, rtol=0)
         assert eagle_qkv.call_args.kwargs == dict(
-            norm_type=3, rope_mode=1, rotary_dim=96, epsilon=1e-6, output_bnsd=False
+            norm_type=3, rope_mode=1, rotary_dim=96, epsilon=1e-5, output_bnsd=False
         )
         assert (actual_q, actual_k, actual_v) == outputs
         for actual, expected in ((raw_q, q), (raw_k, k)):
@@ -226,6 +218,7 @@ class TestMiniMaxH3Fusions:
     def test_qkv_missing_native_uses_projected_values(self, eagle_qkv):
         attention, packed, table = _qkv_inputs()
         expected = attention._project_qkv(packed, table)
+        attention.qkv_proj = Mock(wraps=attention.qkv_proj)
         eagle_qkv.side_effect = ImportError("native QKV unavailable")
         _install_npu_qkv(attention)
 
@@ -250,7 +243,7 @@ class TestMiniMaxH3Fusions:
         eagle = Mock(return_value=hidden)
         monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_dynamic_quant=quantize))
         monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_quant_batch_matmul_swiglu=eagle))
-        x = Mock(shape=(2, 3, 4), device=SimpleNamespace(type="npu"), dtype=torch.bfloat16)
+        x = torch.zeros(2, 3, 4, dtype=torch.bfloat16)
         mlp = SimpleNamespace(fc1=fc1, fc2=Mock(return_value=(hidden, None)))
 
         assert forward_h3_mlp(mlp, x) is hidden

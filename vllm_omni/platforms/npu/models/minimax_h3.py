@@ -22,7 +22,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_FP32_INFO = torch.finfo(torch.float32)
 _QKV = "EagleSplitNormRopeConcat"
 _SWIGLU = "EagleQuantBatchMatmulSwiglu"
 
@@ -172,32 +171,28 @@ def _npu_project_qkv(
     qkv, _ = self.qkv_proj(x)
     packed = qkv.view(rows, sum(heads), self.head_dim)
     q_raw, k_raw, v = packed.split(heads, dim=1)
-    if qkv.device.type == "npu":
-        try:
-            from mindiesd.fused_ops import eagle_split_norm_rope_concat
+    try:
+        from mindiesd.fused_ops import eagle_split_norm_rope_concat
 
-            # Eagle takes contiguous cosine and sine halves of H3's packed RoPE table.
-            cos, sin = rope_table.reshape(rows, 2, self.rot_dim // 2).transpose(0, 1).contiguous().unbind(0)
-            q, k, v = eagle_split_norm_rope_concat(
-                packed.contiguous(),
-                self.q_norm.weight.contiguous(),
-                self.k_norm.weight.contiguous(),
-                cos,
-                sin,
-                heads,
-                norm_type=3,  # weighted RMSNorm
-                rope_mode=1,  # HALF (NeoX)
-                rotary_dim=self.rot_dim,
-                epsilon=eps,
-                output_bnsd=False,
-            )
-            return q, k, v, q_raw, k_raw
-        except ImportError:
-            pass
+        # Eagle takes contiguous cosine and sine halves of H3's packed RoPE table.
+        cos, sin = rope_table.reshape(rows, 2, self.rot_dim // 2).transpose(0, 1).contiguous().unbind(0)
+        q, k, v = eagle_split_norm_rope_concat(
+            packed.contiguous(),
+            self.q_norm.weight.contiguous(),
+            self.k_norm.weight.contiguous(),
+            cos,
+            sin,
+            heads,
+            norm_type=3,  # weighted RMSNorm
+            rope_mode=1,  # HALF (NeoX)
+            rotary_dim=self.rot_dim,
+            epsilon=eps,
+            output_bnsd=False,
+        )
+    except ImportError:
+        from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
-
-    q, k = fused_qk_norm_rope(q_raw, k_raw, self.q_norm.weight, self.k_norm.weight, rope_table, eps)
+        q, k = fused_qk_norm_rope(q_raw, k_raw, self.q_norm.weight, self.k_norm.weight, rope_table, eps)
     return q, k, v, q_raw, k_raw
 
 
@@ -208,8 +203,7 @@ def forward_h3_mlp(self: MiniMaxH3MLP, x: torch.Tensor) -> torch.Tensor:
 
     # LoRA can wrap fc1 after the platform installs this forward.
     if (
-        x.device.type != "npu"
-        or x.dtype != torch.bfloat16
+        x.dtype != torch.bfloat16
         or type(self.fc1) is not MergedColumnParallelLinear
         or not isinstance(self.fc1.quant_method, NPUInt8LinearMethod)
     ):
@@ -237,10 +231,10 @@ def apply_minimax_h3_dit_fusions(model: torch.nn.Module, early_opp_paths: frozen
     try:
         from vllm_ascend.utils import get_ascend_device_type
 
-        device_name = get_ascend_device_type().name
+        soc = {"A2": "ascend910b", "A5": "ascend950"}.get(get_ascend_device_type().name)
     except (ImportError, KeyError, RuntimeError):
         return
-    if device_name not in ("A2", "A5") or not early_opp_paths:
+    if soc is None or not early_opp_paths:
         return
     sdk = find_spec("mindiesd")
     if sdk is None or sdk.origin is None:
@@ -251,7 +245,6 @@ def apply_minimax_h3_dit_fusions(model: torch.nn.Module, early_opp_paths: frozen
         return
     tbe = vendor / "op_impl/ai_core/tbe"
     kernels = tbe / "kernel"
-    soc = "ascend910b" if device_name == "A2" else "ascend950"
     try:
         op_info = json.loads((tbe / "config" / soc / f"aic-{soc}-ops-info.json").read_text(encoding="utf-8"))
         index = json.loads((kernels / "config" / soc / "binary_info_config.json").read_text(encoding="utf-8"))
@@ -260,16 +253,9 @@ def apply_minimax_h3_dit_fusions(model: torch.nn.Module, early_opp_paths: frozen
     if not isinstance(index, dict) or not isinstance(op_info, dict):
         return
     use_qkv = _QKV in op_info and _has_eagle_kernel(kernels, _QKV, index.get(_QKV))
-    use_swiglu = device_name == "A2" and _SWIGLU in op_info and _has_eagle_kernel(kernels, _SWIGLU, index.get(_SWIGLU))
+    use_swiglu = soc == "ascend910b" and _SWIGLU in op_info and _has_eagle_kernel(kernels, _SWIGLU, index.get(_SWIGLU))
     for module in model.modules():
-        if (
-            use_qkv
-            and isinstance(module, MiniMaxH3Attention)
-            and module.head_dim == 128
-            and module.rot_dim in (32, 64, 96, 128)
-            and _FP32_INFO.tiny <= module.q_norm.variance_epsilon <= _FP32_INFO.max
-            and module.q_norm.variance_epsilon == module.k_norm.variance_epsilon
-        ):
+        if use_qkv and isinstance(module, MiniMaxH3Attention):
             module._project_qkv = MethodType(_npu_project_qkv, module)  # type: ignore[method-assign]
         elif use_swiglu and isinstance(module, MiniMaxH3MLP):
             module.forward = MethodType(forward_h3_mlp, module)  # type: ignore[method-assign]
