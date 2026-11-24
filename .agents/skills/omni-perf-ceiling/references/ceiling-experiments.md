@@ -80,7 +80,7 @@ throughput bound from `--stage-util`.
 Build the ledger:
 
 ```bash
-python .claude/skills/omni-perf-ceiling/scripts/ceiling_report.py \
+python .agents/skills/omni-perf-ceiling/scripts/ceiling_report.py \
   --cell c1=$OUT/c1.json:$OUT/c1_bench.log:$OUT/c1_gpu.csv \
   --cell c64=$OUT/c64.json:$OUT/c64_bench.log:$OUT/c64_gpu.csv \
   --json $OUT/ledger.json
@@ -97,7 +97,7 @@ by a recipe that runs the reference streaming path on CPU. The workload
 result JSON:
 
 ```bash
-python .claude/skills/omni-perf-ceiling/scripts/count_reference_work.py \
+python .agents/skills/omni-perf-ceiling/scripts/count_reference_work.py \
   --model $CKPT --config-override init_vision=false --config-override init_audio=false \
   --decoder thinker@0=llm --decoder talker@1=tts.model+tts.head_code \
   --prompt-tokens <mean input tokens> --context thinker=<mean context> --context talker=<mean context> \
@@ -312,7 +312,7 @@ the low-concurrency bound and for spotting the slowest stage, not for `g_i`.
 ## Device peaks
 
 ```bash
-python .claude/skills/omni-perf-ceiling/scripts/measure_peaks.py --json $OUT/peaks.json
+python .agents/skills/omni-perf-ceiling/scripts/measure_peaks.py --json $OUT/peaks.json
 ```
 
 Run it on an otherwise idle device. It reports copy bandwidth and dense matmul

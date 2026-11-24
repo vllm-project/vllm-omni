@@ -68,7 +68,7 @@ Ask for anything not already known:
    per-stage `profiler_config` through `--stage-overrides`, warm up, then
    `POST /start_profile` and `POST /stop_profile` with `{"stages": [...]}`.
    Keep operator/shape traces and host-stack traces separate. For timelines,
-   reuse `.claude/skills/diffusion-perf-opt/scripts/trace_analyzer.py`.
+   reuse `.agents/skills/diffusion-perf-opt/scripts/trace_analyzer.py`.
 
 8. **Write the plan.** Classify candidates P0/P1/P2, tie each to evidence,
    and let the user choose before implementing anything above P0.
@@ -194,14 +194,14 @@ Isolation: [metric that stayed unchanged, isolating the gain to <stage>]
   command templates, metric definitions, diagnostics, A/B rules
 - [references/optimization-playbook.md](references/optimization-playbook.md):
   levers by layer with knobs, evidence, and validation
-- `.claude/skills/vllm-omni/references/models/qwen3-omni.md`,
-  `.claude/skills/vllm-omni/references/models/minicpm-o.md`: model profiles
+- `.agents/skills/vllm-omni/references/models/qwen3-omni.md`,
+  `.agents/skills/vllm-omni/references/models/minicpm-o.md`: model profiles
 - `docs/design/qwen3_omni_tts_performance_optimization.md`,
   `docs/design/qwen3_omni_mrv2_performance.md`,
   `docs/design/minicpm_o45_mrv2_performance.md`: design evidence
 - `docs/contributing/profiling.md` (sections on Omni AR/TTS stages and the
   orchestrator monitor), `docs/contributing/metrics.md`
-- `.claude/skills/review-pr/references/checks/perf-verification.md`: what
+- `.agents/skills/review-pr/references/checks/perf-verification.md`: what
   reviewers will ask for
 - `omni-perf-ceiling`: reachable ceiling and per-stage headroom before
   choosing levers

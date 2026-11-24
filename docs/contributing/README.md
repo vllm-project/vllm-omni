@@ -224,25 +224,25 @@ Please refer to the [test instructions](./ci/test_execution_guide.md) for detail
 ### Using repository skills with coding agents
 
 Before implementing a contribution, complete the human
-[contributor intent gate](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md#contributor-intent-gate).
+[contributor intent gate](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/precheck-pr/SKILL.md#contributor-intent-gate).
 Reuse explicit human answers already provided; ask for missing answers and wait.
 The gate also checks whether the outcome needs a PR and requires actual failure
 evidence for bug fixes. It does not gate independent PR reviews.
 
-vLLM-Omni maintains [repository-scale skills](https://github.com/vllm-project/vllm-omni/tree/main/.claude/skills) for common coding, testing, performance, and review workflows. These skills capture repository-specific structure, validation requirements, and evidence standards that a general coding agent may not know.
+vLLM-Omni maintains a [shared skill catalog](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/README.md) for coding, testing, performance, review, and MiniMax H3 workflows. Codex discovers the skills under `.agents/skills/`. Claude Code discovers the same skills through directory symlinks under `.claude/skills/`.
 
 If your coding agent discovers repository skills automatically, ask it to use the relevant skill by name. Otherwise, point it to the linked `SKILL.md` and ask it to read the file before changing code. Skills can be combined: use a domain skill for the implementation, `vllm-omni-test` for test and CI decisions, and `precheck-pr` before opening the pull request.
 
 | Task | Repository skill |
 | --- | --- |
-| Add or extend a diffusion model | [`add-diffusion-model`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/add-diffusion-model/SKILL.md) |
-| Add or extend a text-to-speech model | [`add-tts-model`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/add-tts-model/SKILL.md) |
-| Add, select, or debug quantization | [`quantization`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/quantization/SKILL.md) |
-| Diagnose or optimize diffusion performance | [`diffusion-perf-opt`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/diffusion-perf-opt/SKILL.md) |
-| Upgrade an NPU model runner | [`vllm-omni-npu-model-runner-upgrade`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/vllm-omni-npu-upgrade/SKILL.md) |
-| Add a regression test, choose L1-L4 coverage, or wire Buildkite | [`vllm-omni-test`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/vllm-omni-test/SKILL.md) |
-| Self-check a branch before opening a pull request | [`precheck-pr`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) |
-| Perform a maintainer or reviewer review of an existing pull request or local branch | [`review-pr`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/review-pr/SKILL.md) |
+| Add or extend a diffusion model | [`add-diffusion-model`](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/add-diffusion-model/SKILL.md) |
+| Add or extend a text-to-speech model | [`add-tts-model`](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/add-tts-model/SKILL.md) |
+| Add, select, or debug quantization | [`quantization`](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/quantization/SKILL.md) |
+| Diagnose or optimize diffusion performance | [`diffusion-perf-opt`](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/diffusion-perf-opt/SKILL.md) |
+| Upgrade an NPU model runner | [`vllm-omni-npu-model-runner-upgrade`](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/vllm-omni-npu-upgrade/SKILL.md) |
+| Add a regression test, choose L1-L4 coverage, or wire Buildkite | [`vllm-omni-test`](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/vllm-omni-test/SKILL.md) |
+| Self-check a branch before opening a pull request | [`precheck-pr`](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/precheck-pr/SKILL.md) |
+| Perform a maintainer or reviewer review of an existing pull request or local branch | [`review-pr`](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/review-pr/SKILL.md) |
 
 Use the following workflow when collaborating with a coding agent:
 
@@ -338,14 +338,14 @@ Only specific types of PRs will be reviewed. The PR title is prefixed appropriat
 
 ### Pre-Check Before Submitting
 
-Before submitting a PR, run the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) with the code agent for a self-review against project conventions:
+Before submitting a PR, run the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/precheck-pr/SKILL.md) with the code agent for a self-review against project conventions:
 
 The skill offers two modes:
 
 - **Quick (~3 min):** catches showstoppers — PR title format, missing benchmark claims, rebase status
 - **Full (~10 min):** thorough maintainer-grade review — dead code scan, copy-paste detection, import hygiene
 
-The precheck covers five PR types: Bug Fix, Performance, New Model, Diffusion Model, and General. Each type has a tailored checklist that validates evidence quality (repro steps, A/B benchmarks, registry entries, etc.). See the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) for the full checklist.
+The precheck covers five PR types: Bug Fix, Performance, New Model, Diffusion Model, and General. Each type has a tailored checklist that validates evidence quality (repro steps, A/B benchmarks, registry entries, etc.). See the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.agents/skills/precheck-pr/SKILL.md) for the full checklist.
 
 ### Local Test
 

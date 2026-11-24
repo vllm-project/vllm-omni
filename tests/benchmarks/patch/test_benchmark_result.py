@@ -124,7 +124,7 @@ def test_last_audio_survives_benchmark_export(monkeypatch, tmp_path, backend, in
     saved.update(max_concurrency=1, failed=int(include_failed))
     result_path, ledger_path = tmp_path / "result.json", tmp_path / "ledger.json"
     result_path.write_text(json.dumps(saved))
-    report = Path(__file__).resolve().parents[3] / ".claude/skills/omni-perf-ceiling/scripts/ceiling_report.py"
+    report = Path(__file__).resolve().parents[3] / ".agents/skills/omni-perf-ceiling/scripts/ceiling_report.py"
     proc = subprocess.run(
         [sys.executable, str(report), "--cell", f"audio={result_path}", "--json", str(ledger_path)],
         capture_output=True,

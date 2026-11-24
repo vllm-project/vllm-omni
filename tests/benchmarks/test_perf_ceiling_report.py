@@ -14,7 +14,7 @@ import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-SCRIPT = Path(__file__).resolve().parents[2] / ".claude/skills/omni-perf-ceiling/scripts/ceiling_report.py"
+SCRIPT = Path(__file__).resolve().parents[2] / ".agents/skills/omni-perf-ceiling/scripts/ceiling_report.py"
 END = dt.datetime(2026, 11, 11, 12, 0, 10)
 
 

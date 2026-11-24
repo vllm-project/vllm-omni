@@ -74,7 +74,7 @@ npu-smi info watch -i $CARD -c $CHIP -d 1 -s abmn \
 the file in the cell's third slot exactly like the CUDA CSV:
 
 ```bash
-python .claude/skills/omni-perf-ceiling/scripts/ceiling_report.py \
+python .agents/skills/omni-perf-ceiling/scripts/ceiling_report.py \
   --cell c64=$OUT/c64.json:$OUT/c64_bench.log:$OUT/c64_npu.txt
 ```
 
@@ -112,7 +112,7 @@ the `g_i(B)` curve. Profiler-based attribution uses `msprof` or
 ## Device peaks and bound terms
 
 ```bash
-python .claude/skills/omni-perf-ceiling/scripts/measure_peaks.py \
+python .agents/skills/omni-perf-ceiling/scripts/measure_peaks.py \
   --device npu --json $OUT/peaks.json
 ```
 

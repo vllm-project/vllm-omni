@@ -149,7 +149,7 @@ verified hardware. Start conservative and correct:
 - Talker `default_sampling_params` with a fixed `seed` for reproducible speech.
 - `platforms:` sections only for platforms you actually ran.
 
-Schema and layering: `.claude/skills/vllm-omni/references/stage-config.md`.
+Schema and layering: `.agents/skills/vllm-omni/references/stage-config.md`.
 Performance profiles (MRv2, graph tuning, replicas) are a later step; use the
 `omni-perf-opt` skill once parity passes.
 
@@ -188,13 +188,13 @@ comparison methods: [references/parity-and-validation.md](references/parity-and-
   via the `add-recipe` skill.
 - Row in `docs/models/supported_models.md` listing only validated backends.
 - No new model-specific Python under `examples/`
-  (`.claude/skills/precheck-pr/references/examples-policy.md`).
+  (`.agents/skills/precheck-pr/references/examples-policy.md`).
 
 ## Phase 9: Pre-PR
 
 Run the `precheck-pr` skill. The PR must include a head-versus-reference
 accuracy and performance comparison with pinned revisions
-(`.claude/skills/review-pr/references/checks/model-addition-checklist.md`).
+(`.agents/skills/review-pr/references/checks/model-addition-checklist.md`).
 
 ## Integration checklist
 
@@ -225,7 +225,7 @@ Phases
   `StagePipelineConfig` fields, processor hook contracts, skeletons
 - [references/parity-and-validation.md](references/parity-and-validation.md):
   parity ladder methods, common failure causes, evidence to attach
-- `.claude/skills/vllm-omni/references/models/qwen3-omni.md`,
-  `.claude/skills/vllm-omni/references/models/minicpm-o.md`: worked examples
-- `.claude/skills/vllm-omni/references/debugging.md`: symptom table
+- `.agents/skills/vllm-omni/references/models/qwen3-omni.md`,
+  `.agents/skills/vllm-omni/references/models/minicpm-o.md`: worked examples
+- `.agents/skills/vllm-omni/references/debugging.md`: symptom table
 - `omni-perf-opt` skill: tuning after parity

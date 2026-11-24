@@ -493,7 +493,7 @@ PyTorch profiler traces are Chrome/Perfetto-compatible JSON files, usually
 Use the checked-in analyzer from the repository root:
 
 ```bash
-python3 .claude/skills/diffusion-perf-opt/scripts/trace_analyzer.py \
+python3 .agents/skills/diffusion-perf-opt/scripts/trace_analyzer.py \
   vllm_profile/.../trace_rank0.json.gz \
   --min-gap-ms 5 \
   --topn 20

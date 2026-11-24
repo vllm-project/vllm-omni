@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Summarize torch profiler Chrome traces for vLLM Omni diffusion optimization."""
 
 from __future__ import annotations
