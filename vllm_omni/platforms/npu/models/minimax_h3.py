@@ -10,15 +10,11 @@ import os
 from importlib.util import find_spec
 from pathlib import Path
 from types import MethodType
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from vllm.logger import init_logger
-
-if TYPE_CHECKING:
-    from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
-    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3Attention, MiniMaxH3MLP
 
 logger = init_logger(__name__)
 
@@ -154,7 +150,7 @@ def _has_eagle_kernel(kernels: Path, op: str, registration: object) -> bool:
 
 
 def _npu_project_qkv(
-    self: MiniMaxH3Attention, x: torch.Tensor, rope_table: torch.Tensor | None, vdn_window: VDNLayout | None = None
+    self: Any, x: torch.Tensor, rope_table: torch.Tensor | None, vdn_window=None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     heads = [self.num_heads, self.num_kv_heads, self.num_kv_heads]
     rows = x.shape[0]
@@ -196,7 +192,7 @@ def _npu_project_qkv(
     return q, k, v, q_raw, k_raw
 
 
-def forward_h3_mlp(self: MiniMaxH3MLP, x: torch.Tensor) -> torch.Tensor:
+def forward_h3_mlp(self: Any, x: torch.Tensor) -> torch.Tensor:
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 
     from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
