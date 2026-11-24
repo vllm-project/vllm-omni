@@ -29,6 +29,14 @@ connectors:
       latent_chunk_size: 25
       initial_latent_chunk_size: 4
       latent_left_context: 0
+      # Stage-2 batched VAE decode: every active stream's new latents in one
+      # packed decoder pass with CUDA graphs, per-stream KV in a bounded paged
+      # ring instead of a growing DynamicCache. Measured on the
+      # Ming-omni-tts-0.5B decoder geometry (H100, bf16): ~11x faster
+      # per-stream decode at max_num_seqs=1, ~25x at 4 streams. One stream is
+      # limited to ~1024 patches (~82 s of audio). Default off; flip after
+      # validating quality on your checkpoint:
+      # vae_batched_decode: true
 
 stages:
   - stage_id: 0
