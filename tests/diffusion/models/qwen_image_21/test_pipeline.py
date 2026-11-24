@@ -429,8 +429,9 @@ def test_online_fp8_ignored_layers_become_name_patterns() -> None:
 def _decode_latents_pipeline(decoded: torch.Tensor) -> tuple[QwenImage21Pipeline, list[torch.Tensor]]:
     """A pipeline stub with just what `_decode_latents` touches.
 
-    `_vae_decode` records what it was handed, so a test can assert the normalisation was
-    applied and that the resolved decode callable - compiled or not - is the one used.
+    `vae.decode` records what it was handed, because going through it rather than a callable
+    captured at construction is what keeps the pipeline profiler's wrapper and the VAE fast
+    path's replaced forwards in the call path.
     """
     pipeline = QwenImage21Pipeline.__new__(QwenImage21Pipeline)
     seen: list[torch.Tensor] = []
@@ -442,23 +443,26 @@ def _decode_latents_pipeline(decoded: torch.Tensor) -> tuple[QwenImage21Pipeline
     pipeline.vae = SimpleNamespace(
         dtype=torch.float32,
         config=SimpleNamespace(z_dim=4, latents_mean=[0.0, 1.0, 2.0, 3.0], latents_std=[1.0, 2.0, 4.0, 8.0]),
-        decode=lambda *args, **kwargs: pytest.fail("the raw vae.decode must not be called directly"),
+        decode=decode,
+        decoder=SimpleNamespace(forward=lambda *args, **kwargs: decoded),
     )
-    pipeline._vae_decode = decode
     pipeline._latent_stats = None
+    pipeline._decoder_compile_allowed = False
+    pipeline._decoder_compiled = False
     pipeline.vae_scale_factor = 16
     pipeline._unpack_latents = lambda latents, *args: latents
     return pipeline, seen
 
 
-def test_decode_latents_uses_the_resolved_decode_callable() -> None:
-    """`_decode_latents` must go through `_vae_decode`, which is where the compiled decode lands."""
+def test_decode_latents_goes_through_vae_decode() -> None:
+    """The profiler wraps `vae.decode` and the fast path replaces decoder forwards, both after
+    construction, so the decode must be resolved through the attribute at call time."""
     decoded = torch.zeros(1, 4, 1, 8, 8)
     pipeline, seen = _decode_latents_pipeline(decoded)
 
     out = pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
 
-    assert len(seen) == 1
+    assert len(seen) == 1, "vae.decode was not called; a captured callable would bypass the profiler"
     assert out.output.shape == (1, 4, 8, 8)
 
 
@@ -472,7 +476,6 @@ def test_decode_latents_builds_the_latent_statistics_once() -> None:
     pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
 
     assert pipeline._latent_stats is first, "the statistics were rebuilt on the second request"
-    # and they are applied: latents of zero come back as the mean, broadcast over the grid
     assert torch.equal(seen[0][0, :, 0, 0, 0], torch.tensor([0.0, 1.0, 2.0, 3.0]))
 
 
@@ -488,3 +491,50 @@ def test_decode_latents_rebuilds_the_statistics_for_a_new_dtype() -> None:
 
     assert pipeline._latent_stats is not first
     assert pipeline._latent_stats[1].dtype == torch.float64
+
+
+def test_decoder_compile_is_skipped_when_not_allowed() -> None:
+    """`--enforce-eager`, or a platform without inductor, must leave the reference forward."""
+    pipeline, _ = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
+    original = pipeline.vae.decoder.forward
+
+    pipeline._maybe_compile_decoder()
+
+    assert pipeline.vae.decoder.forward is original
+
+
+def test_decoder_compile_happens_once(monkeypatch) -> None:
+    """Compiled on first use and never again, so later decodes do not re-enter torch.compile."""
+    pipeline, _ = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
+    pipeline._decoder_compile_allowed = True
+    calls: list[object] = []
+
+    def fake_compile(fn, **kwargs):
+        calls.append(fn)
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    pipeline._maybe_compile_decoder()
+    pipeline._maybe_compile_decoder()
+
+    assert len(calls) == 1, "torch.compile ran more than once"
+
+
+def test_decoder_compile_failure_falls_back(monkeypatch) -> None:
+    """A compile failure must leave the reference forward rather than break the request."""
+    pipeline, seen = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
+    pipeline._decoder_compile_allowed = True
+    original = pipeline.vae.decoder.forward
+
+    def boom(fn, **kwargs):
+        raise RuntimeError("inductor said no")
+
+    monkeypatch.setattr(torch, "compile", boom)
+
+    pipeline._maybe_compile_decoder()
+
+    assert pipeline.vae.decoder.forward is original
+    # and decoding still works
+    pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
+    assert len(seen) == 1

@@ -469,19 +469,13 @@ class QwenImage21Pipeline(
         self._img_token_id = self.processor.tokenizer.encode("<|image_pad|>")[0]
         self._max_length = 8192
 
-        # Decoding runs once per request, after the denoise loop. Compiling it lets
-        # Inductor fuse the elementwise and layout work between the convolutions while
-        # each convolution stays an extern kernel. Gated like the other pipelines that
-        # compile their VAE: `--enforce-eager` vetoes it and the platform must support
-        # inductor. `dynamic=False` because a deployment serves a fixed resolution; a new
-        # size recompiles rather than failing.
+        # Whether the decoder may be compiled. The compile itself is deferred to the first
+        # decode, see `_maybe_compile_decoder`. Same gate as the other pipelines that compile
+        # their VAE: `--enforce-eager` vetoes it and the platform must support inductor.
         from vllm_omni.platforms import current_omni_platform
 
-        vae = getattr(self, "vae", None)
-        self._vae_decode = vae.decode if vae is not None else None
-        if vae is not None and vae_compile_allowed(bool(self.od_config.enforce_eager), current_omni_platform):
-            self._vae_decode = torch.compile(vae.decode, mode="default", fullgraph=False, dynamic=False)
-            logger.info("Qwen-Image-2.1: VAE decode is compiled")
+        self._decoder_compile_allowed = vae_compile_allowed(bool(self.od_config.enforce_eager), current_omni_platform)
+        self._decoder_compiled = False
 
         # `latents_mean` / `latents_std` are checkpoint constants, so they are built once
         # per (device, dtype) instead of on every request.
@@ -1136,6 +1130,35 @@ class QwenImage21Pipeline(
             "do_true_cfg": do_true_cfg,
         }
 
+    def _maybe_compile_decoder(self) -> None:
+        """Compile the decoder's forward once, on first use.
+
+        Deferred rather than done at construction because two things rebind the decode path
+        after ``__init__``: the pipeline profiler wraps ``vae.decode``, and the VAE fast path
+        replaces the decoder's submodule forwards. A callable captured earlier would pin the
+        pre-rebind version and silently bypass both.
+
+        ``self.decoder`` is the target rather than ``vae.decode``, so the profiler's wrapper
+        still runs, the tiled and OOM-recovery paths stay outside the compiled region - they
+        mutate the tile sizes the traced frame reads - and the shapes seen are the fixed-size
+        frame chunks and tiles rather than the per-request output size.
+        """
+        if self._decoder_compiled or not self._decoder_compile_allowed:
+            return
+        self._decoder_compiled = True
+        decoder = getattr(getattr(self, "vae", None), "decoder", None)
+        if decoder is None:
+            return
+        try:
+            decoder.forward = torch.compile(decoder.forward, mode="default", fullgraph=False, dynamic=False)
+        except Exception:
+            logger.warning(
+                "Qwen-Image-2.1: compiling the VAE decoder failed; using the reference forward",
+                exc_info=True,
+            )
+            return
+        logger.info("Qwen-Image-2.1: VAE decoder forward is compiled")
+
     def _decode_latents(
         self,
         latents: torch.Tensor,
@@ -1162,7 +1185,8 @@ class QwenImage21Pipeline(
             )
         _, latents_mean, latents_std = self._latent_stats
         latents = latents * latents_std + latents_mean
-        image = self._vae_decode(latents, return_dict=False)[0][:, :, 0]
+        self._maybe_compile_decoder()
+        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
         return DiffusionOutput(
             output=image,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
