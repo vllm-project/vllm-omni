@@ -27,7 +27,9 @@ PUBLISHED = [
     ("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_768P),
     ("minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_768P),
     ("minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_768P),
-    # v1.3 4-step and v1.1 8-step follow the 768p default of 6.0.
+    # v1.3 4-step and v1.1 8-step follow the 768p default of 6.0; the official
+    # release note recommends video flow shift 6:
+    # https://huggingface.co/lightx2v/Minimax-h3-Turbo/discussions/57
     ("minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_768P),
     ("minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors", "fl2v", 8, _TURBO_VIDEO_SHIFT_544P),
     ("minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors", "fl2v", 8, _TURBO_VIDEO_SHIFT_768P),
