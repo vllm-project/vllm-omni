@@ -48,7 +48,7 @@ test_params = [
         stage_config_path=STAGE_CONFIGS_PATH,
         # Cold ROCm AITER compilation has now exhausted the former 1800-second
         # stage deadline in both the online and offline weekly owners. Keep the
-        # same bounded headroom for every BAGEL fixture that can run on MI325.
+        # same bounded headroom for every BAGEL fixture that can run on MI300.
         stage_init_timeout=2400,
         init_timeout=2700,
     ),
@@ -83,7 +83,7 @@ def _build_img2img_messages(prompt: str, image_b64: str) -> list[dict]:
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_bagel_text2img_online(omni_server, online_client) -> None:
     """Test Bagel text2img via OpenAI-compatible chat completions API."""
@@ -105,7 +105,7 @@ def test_bagel_text2img_online(omni_server, online_client) -> None:
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_bagel_img2img_online(omni_server, online_client) -> None:
     """Test Bagel img2img via OpenAI-compatible chat completions API."""
@@ -152,7 +152,7 @@ def _build_edit_request(size: str) -> dict:
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_bagel_image_edit_honors_explicit_size_two_stage(omni_server, online_client) -> None:
     """An explicit ``size`` wins over the AR stage's source-derived KV image shape (#7283)."""
@@ -167,7 +167,7 @@ def test_bagel_image_edit_honors_explicit_size_two_stage(omni_server, online_cli
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_bagel_image_edit_floors_unaligned_size_two_stage(omni_server, online_client) -> None:
     """A side that is not a multiple of the latent stride is floored to one (1000x700 -> 992x688)."""
