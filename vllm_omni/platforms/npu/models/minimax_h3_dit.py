@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 
+from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3Attention, MiniMaxH3MLP
 
 _FP32_INFO = torch.finfo(torch.float32)
@@ -51,26 +53,35 @@ def _ascend_device_name() -> str | None:
         return None
 
 
-def _npu_split_norm_rope(
-    self: MiniMaxH3Attention, qkv: torch.Tensor, rope_table: torch.Tensor | None
+def _npu_project_qkv(
+    self: MiniMaxH3Attention, x: torch.Tensor, rope_table: torch.Tensor | None, vdn_window: VDNLayout | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    heads = [self.num_heads, self.num_kv_heads, self.num_kv_heads]
+    rows = x.shape[0]
+    qkv_numel = rows * sum(heads) * self.head_dim
     eps = self.q_norm.variance_epsilon
     if (
-        qkv.device.type == "npu"
-        and rope_table is not None
-        and self.head_dim == 128
-        and self.rot_dim in (32, 64, 96, 128)
-        and eps == self.k_norm.variance_epsilon
-        and _FP32_INFO.tiny <= eps <= _FP32_INFO.max
-        and 0 < qkv.numel() <= torch.iinfo(torch.int32).max
+        rope_table is None
+        or (self.vdn is not None and vdn_window is None)
+        or self.head_dim != 128
+        or self.rot_dim not in (32, 64, 96, 128)
+        or eps != self.k_norm.variance_epsilon
+        or not _FP32_INFO.tiny <= eps <= _FP32_INFO.max
+        or not 0 < qkv_numel <= torch.iinfo(torch.int32).max
     ):
-        try:
-            from mindiesd.fused_ops import eagle_split_norm_rope_concat
+        return type(self)._project_qkv(self, x, rope_table, vdn_window)
+    try:
+        from mindiesd.fused_ops import eagle_split_norm_rope_concat
+    except ImportError:
+        return type(self)._project_qkv(self, x, rope_table, vdn_window)
 
-            heads = [self.num_heads, self.num_kv_heads, self.num_kv_heads]
-            packed = qkv.view(qkv.shape[0], sum(heads), self.head_dim)
-            # H3 packs half-width cos and sin side by side; Eagle takes contiguous halves.
-            cos, sin = rope_table.reshape(qkv.shape[0], 2, self.rot_dim // 2).transpose(0, 1).contiguous().unbind(0)
+    qkv, _ = self.qkv_proj(x)
+    packed = qkv.view(rows, sum(heads), self.head_dim)
+    q_raw, k_raw, v = packed.split(heads, dim=1)
+    if qkv.device.type == "npu":
+        # H3 packs half-width cos and sin side by side; Eagle takes contiguous halves.
+        cos, sin = rope_table.reshape(rows, 2, self.rot_dim // 2).transpose(0, 1).contiguous().unbind(0)
+        try:
             q, k, v = eagle_split_norm_rope_concat(
                 packed.contiguous(),
                 self.q_norm.weight.contiguous(),
@@ -85,12 +96,12 @@ def _npu_split_norm_rope(
                 output_bnsd=False,
             )
         except ImportError:
-            # The facade imports the optional native operator on first use.
+            # The facade can discover a missing native symbol after projection.
             pass
         else:
-            q_raw, k_raw, _ = packed.split(heads, dim=1)
             return q, k, v, q_raw, k_raw
-    return type(self)._split_norm_rope(self, qkv, rope_table)
+    q, k = fused_qk_norm_rope(q_raw, k_raw, self.q_norm.weight, self.k_norm.weight, rope_table, eps)
+    return q, k, v, q_raw, k_raw
 
 
 def forward_h3_mlp(self: MiniMaxH3MLP, x: torch.Tensor) -> torch.Tensor:
@@ -125,6 +136,6 @@ def apply_minimax_h3_dit_fusions(model: nn.Module) -> None:
         return
     for module in model.modules():
         if isinstance(module, MiniMaxH3Attention):
-            module._split_norm_rope = MethodType(_npu_split_norm_rope, module)  # type: ignore[method-assign]
+            module._project_qkv = MethodType(_npu_project_qkv, module)  # type: ignore[method-assign]
         elif isinstance(module, MiniMaxH3MLP) and device_name == "A2":
             module.forward = MethodType(forward_h3_mlp, module)  # type: ignore[method-assign]

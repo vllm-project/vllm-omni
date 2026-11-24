@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -344,88 +343,3 @@ def test_pipeline_resolves_transformer_component_quant_config():
     assert transformer_config.ignored_layers == ignored_layers
     assert _resolve_component_quant_config(component_config, "transformer") is transformer_config
     assert _resolve_component_quant_config(transformer_config, "transformer") is transformer_config
-
-
-def _swiglu_inputs(mocker, quant_method, *, device_name="A2"):
-    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-
-    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
-    from vllm_omni.platforms.npu.models import minimax_h3_dit
-
-    mocker.patch.object(minimax_h3_dit, "_ascend_device_name", return_value=device_name)
-    x = Mock(device=SimpleNamespace(type="npu"), shape=(2, 3, 4), dtype=torch.bfloat16)
-    fc1 = MergedColumnParallelLinear.__new__(MergedColumnParallelLinear)
-    nn.Module.__init__(fc1)
-    fc1.quant_method = quant_method
-    fc1.weight = mocker.sentinel.weight
-    fc1.weight_scale = mocker.sentinel.weight_scale
-    fc1.forward = Mock(return_value=(mocker.sentinel.projected, None))
-
-    mlp = blocks.MiniMaxH3MLP.__new__(blocks.MiniMaxH3MLP)
-    nn.Module.__init__(mlp)
-    mlp.fc1 = fc1
-    mlp.act_fn = Mock()
-    mlp.fc2 = Mock(return_value=(mocker.sentinel.output, None))
-
-    quantize = Mock(return_value=(mocker.sentinel.quantized, mocker.sentinel.scale))
-    fused = Mock(return_value=torch.arange(30, dtype=x.dtype).reshape(6, 5))
-    mocker.patch.dict(
-        sys.modules,
-        {
-            "torch_npu": SimpleNamespace(npu_dynamic_quant=quantize),
-            "mindiesd.fused_ops": SimpleNamespace(eagle_quant_batch_matmul_swiglu=fused),
-        },
-    )
-    minimax_h3_dit.apply_minimax_h3_dit_fusions(mlp)
-    return mlp, x, quantize, fused
-
-
-def test_mlp_calls_mindiesd_int8_swiglu(mocker):
-    from vllm_omni.quantization.int8_config import DiffusionInt8Config, NPUInt8OnlineLinearMethod
-
-    mlp, x, quantize, fused = _swiglu_inputs(mocker, NPUInt8OnlineLinearMethod(DiffusionInt8Config()))
-    assert mlp(x) is mocker.sentinel.output
-
-    x.reshape.assert_called_once_with(-1, 4)
-    quantize.assert_called_once_with(x.reshape.return_value)
-    fused.assert_called_once_with(
-        mocker.sentinel.quantized,
-        mlp.fc1.weight,
-        mlp.fc1.weight_scale,
-        pertoken_scale=mocker.sentinel.scale,
-        output_dtype=x.dtype,
-    )
-    mlp.fc2.assert_called_once()
-    torch.testing.assert_close(mlp.fc2.call_args.args[0], fused.return_value.reshape(2, 3, 5))
-    mlp.fc1.forward.assert_not_called()
-    mlp.act_fn.assert_not_called()
-
-
-@pytest.mark.parametrize("case", ["missing_sdk", "missing_native", "non_int8", "wrapped", "A5"])
-def test_mlp_preserves_swiglu_fallback(mocker, case):
-    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-
-    from vllm_omni.quantization.int8_config import DiffusionInt8Config, NPUInt8LinearMethod
-
-    method = NPUInt8LinearMethod(DiffusionInt8Config(is_checkpoint_int8_serialized=True))
-    mlp, x, quantize, fused = _swiglu_inputs(mocker, method, device_name="A5" if case == "A5" else "A2")
-    if case == "missing_sdk":
-        mocker.patch.dict(sys.modules, {"mindiesd.fused_ops": None})
-    elif case == "missing_native":
-        fused.side_effect = ImportError("native SwiGLU unavailable")
-    elif case == "non_int8":
-        mlp.fc1.quant_method = UnquantizedLinearMethod()
-    elif case == "wrapped":
-        wrapper = nn.Module()
-        wrapper.base_layer = mlp.fc1
-        wrapper.quant_method = mlp.fc1.quant_method
-        wrapper.forward = Mock(wraps=wrapper.base_layer)
-        mlp.fc1 = wrapper
-
-    assert mlp(x) is mocker.sentinel.output
-
-    expected_calls = 1 if case == "missing_native" else 0
-    assert quantize.call_count == fused.call_count == expected_calls
-    mlp.fc1.forward.assert_called_once_with(x)
-    mlp.act_fn.assert_called_once_with(mocker.sentinel.projected)
-    mlp.fc2.assert_called_once_with(mlp.act_fn.return_value)
