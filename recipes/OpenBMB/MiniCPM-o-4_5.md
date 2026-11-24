@@ -171,7 +171,7 @@ video. Use the two-GPU profile for production throughput.
 - OS: Linux
 - Python: 3.10+
 - vLLM / vLLM-Omni: >= 0.21.0 (or current `main`)
-- Optional Talker dep: `stepaudio2-minicpmo` (see Notes for why this is
+- Code2Wav dep: `step-audio2==1.0.0` (see Notes for why this is
   required and how to install it)
 
 #### Command
@@ -392,18 +392,20 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 
 ## Notes (applies to all layouts)
 
-- **Code2Wav dependency**: Stage 2 loads `Token2wav` from the
-  MiniCPM-o-flavored
-  vocoder (PyPI package `stepaudio2-minicpmo` — NOT the upstream
-  `stepfun-ai/Step-Audio2`, whose `Token2wav.__init__` signature
-  rejects `n_timesteps`). Install via the published extra:
+- **Code2Wav dependency**: Stage 2 runs the in-tree Step-Audio2 Token2Wav
+  core, whose checkpoint `flow.yaml` instantiates `cosyvoice2.*` classes. The
+  top-level `cosyvoice2` package comes from PyPI `step-audio2` (the version
+  pinned in `pyproject.toml`):
 
   ```bash
-  pip install stepaudio2-minicpmo
+  pip install step-audio2==1.0.0
   ```
 
-  A missing dep raises `ImportError` at first request with the same
-  install hint instead of silently emitting empty audio.
+  The previously documented `stepaudio2-minicpmo` package is not a
+  substitute: it ships `cosyvoice2` only as `stepaudio2.cosyvoice2`, so with
+  that package alone Stage 2 fails at load with
+  `ImportError: There is no such class as cosyvoice2.flow.flow.CausalMaskedDiffWithXvec`.
+  Do not co-install the two; both provide a top-level `stepaudio2` package.
 
 - **TTS conditioning**: the MiniCPM stage bridge can condition speech from
   the generated assistant span without changing shared serving code.
