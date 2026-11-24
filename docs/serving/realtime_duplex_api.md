@@ -1646,8 +1646,10 @@ model reports it:
 what it generated, every id included (a viewer collapses repeated audio
 placeholders). Text is the raw tokenizer piece (`convert_ids_to_tokens`), so
 special tokens stay visible; ids outside the text vocabulary (codec codes)
-carry a model-defined label. `special_ids` lists the tokenizer's special and
-added ids among them. Stages that did not run for the unit, or did not end a
+carry a model-defined label, and so do scheduler placeholders a model reports
+when the ids its stage actually consumed are unavailable (`placeholder:<id>`),
+so a recorded trace never passes placeholders off as consumed tokens.
+`special_ids` lists the tokenizer's special and added ids among them. Stages that did not run for the unit, or did not end a
 segment for it, are omitted. `end_ms` is the unit's `units[].end_ms` in the
 acknowledgement that reports it. A unit settled without its model output
 (`cancelled`, `aborted`, `timed_out`, ...; see the `units[].decision` table
