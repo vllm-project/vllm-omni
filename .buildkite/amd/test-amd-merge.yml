@@ -814,7 +814,9 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
-      timeout_in_minutes: 50
+      # The existing Base suite can use 40 minutes; leave margin for the
+      # additional eight-minute decoder parity phase and cleanup.
+      timeout_in_minutes: 60
       artifact_paths:
         - artifacts/rocm-qwen3-tts-eager-warmup/**/*
       commands:
