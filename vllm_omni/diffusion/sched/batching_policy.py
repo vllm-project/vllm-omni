@@ -58,10 +58,10 @@ class DiffusionBatchingPolicy(ABC):
                 break
             if not scheduler._can_schedule_waiting(state):
                 break
-            result = scheduler._admit_state(state, scheduled_new_reqs, scheduled_cached_request_ids)
+            result = scheduler._admission_scan_outcome(state, scheduled_new_reqs, scheduled_cached_request_ids)
             if result == "deferred":
                 deferred.append(scheduler._waiting.popleft())
-            elif result in ("stalled", "gated"):
+            elif result == "stop":
                 break
             # "admitted" / "error": continue with the next waiting request.
         scheduler._waiting.extendleft(reversed(deferred))
@@ -137,12 +137,13 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
         # single frame) than the ones the server actually serves.
         if not scheduler._running and candidates:
             head = candidates[0]
-            if (
-                not scheduler._can_schedule_waiting(head)
-                or scheduler._admit_state(head, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled"
-            ):
+            if not scheduler._can_schedule_waiting(head):
                 return
-            running_units += self.request_units(head)
+            outcome = scheduler._admission_scan_outcome(head, scheduled_new_reqs, scheduled_cached_request_ids)
+            if outcome == "stop":
+                return
+            if outcome == "admitted":
+                running_units += self.request_units(head)
             candidates = candidates[1:]
 
         # Anti-starvation: an aged waiting request gets the head slot even when
@@ -181,9 +182,11 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
                         continue
                     if len(scheduler._running) >= self.max_admissions(scheduler.max_num_running_reqs):
                         break
-                    if scheduler._admit_state(state, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
+                    outcome = scheduler._admission_scan_outcome(state, scheduled_new_reqs, scheduled_cached_request_ids)
+                    if outcome == "stop":
                         break
-                    gap -= cost
+                    if outcome == "admitted":
+                        gap -= cost
                 return
             # The aged request fits the budget, but the explicit max_num_seqs
             # count cap still binds: do not push the running count past it.
@@ -194,9 +197,11 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
             # score order for whatever budget is left. Without this, cheaper
             # younger requests in score order would consume the freed slot and
             # the aged request would miss it again.
-            if scheduler._admit_state(reserve_state, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
+            outcome = scheduler._admission_scan_outcome(reserve_state, scheduled_new_reqs, scheduled_cached_request_ids)
+            if outcome == "stop":
                 return
-            running_units += reserved_cost
+            if outcome == "admitted":
+                running_units += reserved_cost
             candidates = [state for state in candidates if state is not reserve_state]
 
         # No aged request is blocked: admit in score order, skipping requests
@@ -210,9 +215,11 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
                 and len(scheduler._running) < self.max_admissions(scheduler.max_num_running_reqs)
                 and scheduler._can_schedule_waiting(head)
             ):
-                if scheduler._admit_state(head, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
+                outcome = scheduler._admission_scan_outcome(head, scheduled_new_reqs, scheduled_cached_request_ids)
+                if outcome == "stop":
                     break
-                running_units += head_cost
+                if outcome == "admitted":
+                    running_units += head_cost
             index += 1
 
     def sorted_waiting_states(self, scheduler: BaseScheduler) -> list[SchedulerRequestState]:

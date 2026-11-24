@@ -127,6 +127,7 @@ def _initialize_paged_scheduler(
     num_blocks: int = 64,
     max_num_seqs: int = 1,
     enable_prefix_caching: bool = False,
+    **config_fields,
 ) -> None:
     native_kv_managers.register_all_kvcache_specs(None)
     spec = FullAttentionSpec(
@@ -145,6 +146,7 @@ def _initialize_paged_scheduler(
             diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
             max_model_len=64,
             max_num_seqs=max_num_seqs,
+            **config_fields,
         ),
         kv_cache_config=config,
         scheduler_block_size=4,
@@ -1051,6 +1053,53 @@ class TestRequestScheduler:
         assert output.finished_req_ids == {"native-error"}
         assert _new_ids(output) == ["after-error"]
         assert not manager.has_request("native-error")
+
+    @pytest.mark.parametrize("head_outcome", ["error", "deferred"])
+    def test_drr_does_not_charge_budget_for_unadmitted_head(self, mocker: MockerFixture, head_outcome: str) -> None:
+        _initialize_paged_scheduler(
+            self.scheduler,
+            num_blocks=2,
+            max_num_seqs=1,
+            diffusion_batching_config={
+                "policy": "compute_budget",
+                "compute_unit_budget": 4096,
+            },
+        )
+        slow = _make_request("slow")
+        _attach_diffusion_kv(slow, seq_len=8)
+        ready = OmniDiffusionRequest(
+            prompt="prompt_ready",
+            sampling_params=OmniDiffusionSamplingParams(height=512, width=512),
+            request_id="ready",
+        )
+        _attach_diffusion_kv(ready, seq_len=4, prefix_len=0)
+        if head_outcome == "deferred":
+            connector = mocker.Mock()
+            connector.get_num_new_matched_tokens.side_effect = lambda request, _num_computed: (
+                (None, False) if request.request_id.startswith("slow/") else (0, False)
+            )
+            connector.request_finished.return_value = (False, None)
+            self.scheduler._kv_connector = connector
+        self.scheduler.add_request(slow)
+        self.scheduler.add_request(ready)
+
+        # Give slow the highest DRR score so the budgeted loop tries it first
+        # regardless of how admission resolves it.
+        slow_state = self.scheduler.get_request_state("slow")
+        assert slow_state is not None
+        slow_state.queued_at = time.perf_counter() - 1.0
+
+        output = self.scheduler.schedule()
+
+        # slow never entered the batch, so it must not consume the budget:
+        # ready (1024 units) still fits the 4096-unit budget.
+        assert _new_ids(output) == ["ready"]
+        if head_outcome == "error":
+            assert slow_state.status == DiffusionRequestStatus.FINISHED_ERROR
+            assert output.finished_req_ids == {"slow"}
+        else:
+            assert slow_state.status == DiffusionRequestStatus.WAITING
+            assert output.finished_req_ids == set()
 
     @pytest.mark.parametrize("action", ["abort", "timeout", "preempt"])
     def test_diffusion_kv_loading_defers_free_and_blocks_preempt(self, mocker: MockerFixture, action: str) -> None:

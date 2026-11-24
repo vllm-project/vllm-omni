@@ -486,6 +486,28 @@ class BaseScheduler(ABC):
             scheduled_cached_request_ids.append(request_id)
         return "admitted"
 
+    def _admission_scan_outcome(
+        self,
+        state: SchedulerRequestState,
+        scheduled_new_reqs: list[NewRequestData],
+        scheduled_cached_request_ids: list[str],
+    ) -> str:
+        """Run ``_admit_state`` and normalize its result for admission loops.
+
+        Returns one of:
+        - "admitted": the request joined this step's batch; callers may charge
+          its budget and count it against the request cap.
+        - "deferred": the KV connector is not ready; the request stays waiting.
+        - "error": the request was finished with FINISHED_ERROR.
+        - "stop": admission must stop for this step: the KV manager is out of
+          blocks ("stalled") or a post-reservation gate rejected the request
+          ("gated").
+        """
+        outcome = self._admit_state(state, scheduled_new_reqs, scheduled_cached_request_ids)
+        if outcome in ("gated", "stalled"):
+            return "stop"
+        return outcome
+
     def has_requests(self) -> bool:
         return bool(
             self._waiting
