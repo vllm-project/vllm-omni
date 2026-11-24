@@ -11,6 +11,7 @@ from typing import Any, Literal, cast
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
+from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.config.watermarking import WatermarkConfig
@@ -34,6 +35,7 @@ def is_frontend_only(single_stage_id_filter: int | None) -> bool:
 # Maps model architecture names to their HuggingFace model_type values.
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
+    "ChatterboxForConditionalGeneration": "chatterbox",
     "Confucius4TTSS2ADecoder": "confucius4_tts",
     "Confucius4TTSTalkerForConditionalGeneration": "confucius4_tts",
     "CosyVoice3Model": "cosyvoice3",
@@ -55,6 +57,15 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
+
+# Model types whose official Hub repo ships no config.json, so
+# ``_patch_empty_hf_config`` writes one for a Hub id as well as for a local
+# directory instead of letting transformers fail on the missing file.
+_CONFIG_LESS_MODEL_TYPES: frozenset[str] = frozenset({"chatterbox"})
+
+# Model types whose local bundles may hold only checkpoint files; a missing
+# config.json is patched for a local directory only.
+_LOCAL_BUNDLE_MODEL_TYPES: frozenset[str] = frozenset({"indextts2_5", "confucius4_tts"})
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
 _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
@@ -100,6 +111,7 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.ming3_audio import (
@@ -140,6 +152,7 @@ def _register_omni_hf_configs() -> None:
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
+        ("chatterbox", ChatterboxConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -527,13 +540,19 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            # Some local native TTS bundles only contain checkpoint files.
-            # Keep this exception model-scoped so remote resolution and other
-            # loader failures retain vLLM's normal error path.
-            missing_local_config = os.path.isdir(self.model) and not os.path.lexists(
-                os.path.join(self.model, "config.json")
-            )
-            if model_type not in {"indextts2_5", "confucius4_tts"} or not missing_local_config:
+            # Some local native TTS bundles (IndexTTS 2.5, Confucius4-TTS) only
+            # contain checkpoint files and no HuggingFace config.json. Keep this
+            # exception model-scoped so other loader failures retain vLLM's
+            # normal error path.
+            # Chatterbox's Hub repo ships none either, so its Hub id is patched
+            # too, but only when the file is absent: a failure to load an
+            # existing one stays on that error path.
+            if model_type in _CONFIG_LESS_MODEL_TYPES:
+                if file_or_path_exists(self.model, "config.json", revision=self.revision):
+                    return
+            elif model_type not in _LOCAL_BUNDLE_MODEL_TYPES or not os.path.isdir(self.model):
+                return
+            elif os.path.lexists(os.path.join(self.model, "config.json")):
                 return
             config_dict = {}
 

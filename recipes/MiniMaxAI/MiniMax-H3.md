@@ -910,9 +910,10 @@ vllm serve "$MODEL" --omni --task-type fl2va --trust-remote-code \
 ```
 
 The initial control path uses resident BF16 weights and tensor parallelism.
-Reference/keyframe conditioning, visual timeline guides, sequence parallelism, approximate cache acceleration and
-quantized control execution require separate support; do not combine them with
-this configuration. Control/Turbo combinations need their own validation and
+Keyframe conditioning, visual timeline guides, continuation (`continue_from` and long-video), sequence parallelism,
+approximate cache acceleration and quantized control execution require separate support; do not combine them with
+this configuration. On base H3 weights control also takes no references. The FastH3 Omni checkpoint takes control as
+Ref2VA with its reference images; see [FastH3 Omni control](../FastVideo/FastH3-Omni.md#controlnet). Control/Turbo combinations need their own validation and
 are not established by ordinary H3 Turbo results.
 
 Active control conditioning cannot be reused in a `latent_refine` pass at a
@@ -1585,6 +1586,11 @@ evaluations.
 
 ### FlashGen native LoRA
 
+FlashGen native adapters require `--lora-application runtime` (the default).
+`--lora-application merged` is rejected during loading because the adapter's
+schedule and request validation require runtime activation. An active native
+adapter cannot be stacked with other adapters.
+
 The FlashGen 4-step T2VA artifact uses the native MiniMax-H3 module layout and
 declares its distilled sigma schedule in safetensors metadata. It is published on
 [ModelScope](https://modelscope.cn/models/FlashGen/Minimax-H3-4step-lora-flashgen):
@@ -1615,7 +1621,7 @@ Each request must use T2VA and the distilled interval-count contract:
 -F "lora={\"name\":\"h3-flashgen-v1.0\",\"path\":\"${FLASHGEN_LORA}\",\"scale\":1.0}"
 ```
 
-This path rejects Ref2VA and checkpoints that already pin `base_schedule` in
+The T2VA v1 artifact rejects Ref2VA and checkpoints that already pin `base_schedule` in
 `model_index.json`. The adapter metadata carries
 `base_schedule=1.0,0.7,0.4,0.15,0.0`, so `num_inference_steps=4` means four
 denoiser evaluations, not five sigma points. Request-mode generation may omit
@@ -1639,6 +1645,44 @@ To validate a deployment, post the same fixed-seed T2VA request twice with the
 adapter and twice without it, then compare the four output digests. The adapter
 is bound and deterministic when each pair matches internally and the two pairs
 differ from each other.
+
+#### FlashGen native LoRA v2 for I2VA and Ref2VA
+
+Use the published v2 safetensors file exported for the matching official base
+partition. For I2VA, start a FL2VA server with `--task-type fl2va` and send a
+single first frame in `input_reference`. Set `task=fl2va` and
+`frame_indices=[0]` in `extra_params`. For Ref2VA, start a dedicated Ref2VA
+server with `--task-type ref2va`; set `task=ref2va` and send the reference
+image in `input_reference`. Both services use `--lora-backend peft` and may
+preload the published file with `--lora-path`. Select it in the request with
+the usual `lora` field and `scale=1.0`. FL2VA exports also load on a
+`--task-type combined` server; requests using that adapter must still select
+`task=fl2va`.
+
+The [four-A5 conditioning validation](https://github.com/vllm-project/vllm-omni/pull/10596#discussion_r4623182377)
+also completed four-step FL2VA requests with a last frame, first and last
+frames, and `continue_from`. First/last output frames matched their input
+images with SSIM 0.982/0.979 in the tested two-frame case. Three keyframes
+and timeline guides were rejected by existing validation. Ref2VA requests
+with a video, image plus audio, and image plus video also completed with
+fully decodable video and audio. Reference audio/video adherence remains
+unverified; these results establish completion for the tested inputs.
+
+The artifact supplies a four-interval base sigma schedule. Omit `sampler`
+to use the H3 default Euler sampler. The adapter requires `flow_shift=12`
+and `audio_flow_shift=3`. If the base model defaults differ, pass these
+values explicitly in `extra_params`. Send `num_inference_steps=4` when using
+step execution.
+
+Ref2VA uses rank 384 for packed QKV and rank 128 for the other projections.
+The runtime LoRA manager uses a shared buffer rank across wrapped layers. It
+rounds 384 up to the next supported rank, 512, so rank-128 projections reserve
+four times the LoRA buffer capacity they would need at rank 128. The actual
+per-device memory overhead depends on tensor parallelism and the backend.
+The exported factors already carry their effective scale. An active v2
+adapter requires request `scale=1.0`; other nonzero scales are rejected.
+`scale=0` disables the adapter and its sampling constraints. Legacy T2VA v1
+request scaling is unchanged.
 
 ### FastH3 adapter
 

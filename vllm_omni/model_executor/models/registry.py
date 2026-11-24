@@ -88,6 +88,12 @@ _OMNI_MODELS = {
         "step_audio2_token2wav",
         "StepAudio2Token2WavForConditionalGeneration",
     ),
+    ## chatterbox
+    "ChatterboxForConditionalGeneration": (
+        "chatterbox",
+        "chatterbox",
+        "ChatterboxForConditionalGeneration",
+    ),
     "CosyVoice3Model": (
         "cosyvoice3",
         "cosyvoice3",
@@ -383,6 +389,7 @@ _OMNI_MODELS = {
         "vibevoice",
         "VibeVoiceForConditionalGeneration",
     ),
+    "PhononTalkerForConditionalGeneration": ("phonon", "phonon_talker", "PhononTalkerForConditionalGeneration"),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
         "voxcpm2",

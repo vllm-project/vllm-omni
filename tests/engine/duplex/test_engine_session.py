@@ -23,6 +23,7 @@ from vllm_omni.engine.duplex.config import (
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import TurnEvent
+from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.engine_session import (
     RESPONSE_REQUEST_MEASUREMENT_ORIGIN,
     DuplexEngineSession,
@@ -668,6 +669,21 @@ def test_accept_fence_rejects_stale_or_foreign_fences():
 
     session.accept_fence(DuplexFence("sid-fence", epoch=1, turn_id=0))
     assert session.accepted_fence == DuplexFence("sid-fence", epoch=1, turn_id=0)
+
+
+def test_append_fence_never_falls_behind_the_accepted_fence():
+    """The user talks over a reply: the reply's turn still owns the response
+    slot, but the accepted fence has moved on. Input must still be accepted."""
+    session = _session("sid-overlap")
+    session.complete_model_turn(0)
+    session.complete_model_turn(1)
+    session.begin_response(turn_id=1)
+    assert session.active_response_turn_id < session.accepted_fence.turn_id
+
+    fence = helpers.append_fence(session, None)
+
+    assert fence == session.accepted_fence
+    session.commit_append(session.prepare_append(fence))  # no DuplexFenceMismatchError
 
 
 def test_prepare_and_commit_append_sequence_chunks_per_turn_and_epoch():

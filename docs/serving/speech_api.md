@@ -50,6 +50,9 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
 vllm-omni serve nineninesix/gepard-1.0 --omni --port 8091 --trust-remote-code \
     --stage-init-timeout 900 \
     --deploy-config vllm_omni/deploy/gepard.yaml
+
+# Chatterbox Turbo (built-in voice or one reference recording; `pip install 'vllm-omni[chatterbox]'`)
+vllm serve ResembleAI/chatterbox-turbo --omni --port 8091
 ```
 
 ### Generate Speech
@@ -155,6 +158,10 @@ Content-Type: application/json
 | `stream` | bool | false | When true, stream OpenAI `speech.audio.*` SSE events (requires `response_format="pcm"` or `"wav"`). For raw PCM/WAV byte streaming, set `stream_format="audio"`. |
 | `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
 | `cache_salt` | string | null | Caller-supplied prefix-cache salt namespace. Composed with the server-derived conditioning identity (adapter-computed or the derived default), so callers narrow sharing (tenants, sessions) without dropping voice/input isolation. |
+
+For Step-Audio2, `max_new_tokens` overrides the first (Thinker) stage's token
+budget. Omitting it preserves deployment defaults; later stages keep their
+configured budgets. This is a token limit, not an audio-duration limit.
 
 **Supported languages:** Only applicable to Qwen3-TTS. Derived from the model configuration (`talker_config.codec_language_id` in the checkpoint's `config.json`), plus `Auto`, which is always accepted. Official Qwen3-TTS checkpoints support: Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 
@@ -383,10 +390,18 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 ## Streaming Text Input (WebSocket)
 
 The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally.
-Its default `buffered` mode synthesizes all text received before `input.done` as
-one request. For the supported Qwen3-TTS Chinese/English scope, M1
-`commitment` mode can instead start an independent request whenever the
-semantic-readiness policy marks a boundary after accumulated raw text.
+Choose the input policy according to when synthesis should start:
+
+| `text_input_mode` | `split_granularity` | When a TTS request starts | Handling more text during synthesis |
+| --- | --- | --- | --- |
+| `buffered` (default) | `none` (default) | After `input.done`, using all accumulated text. | The handler waits for generation before processing another input message. |
+| `buffered` | `sentence` or `clause` | At each linguistic boundary, before `input.done`; remaining text is flushed at `input.done`. | The handler waits for each segment's generation before processing another input message. |
+| `commitment` | `none` (required) | Queued at each semantic-readiness boundary and synthesized in order; `input.done` closes and flushes the policy. | The reader can accept and queue later segments while the synthesis worker runs. M1 supports the documented Qwen3-TTS Chinese/English scope. |
+
+All three configurations submit independent TTS requests. None appends later
+text to the prompt of a model request that is already generating, or preserves
+acoustic/model state between segments. Reusing the WebSocket connection after
+`session.done` also does not imply reuse of a model generation session.
 
 !!! important
     Commitment mode is not a general sentence detector. Its strong-terminator
@@ -412,10 +427,15 @@ new stream with its own header. Do not feed all binary frames from a connection
 into a single WAV parser. Strict WAV readers that require finalized sizes
 should use a non-streaming response.
 
-In buffered mode, `split_granularity="sentence"` or `"clause"` enables the
-linguistic splitter and emits requests before EOF. Commitment mode requires
-`split_granularity="none"` because only the readiness policy may decide its
-irreversible boundaries.
+Enabling `stream_audio` changes audio delivery, not the input policy: with the
+default buffered configuration, the first synthesis request still waits for
+`input.done`. Commitment mode requires `split_granularity="none"` because only
+the readiness policy may decide its irreversible boundaries.
+
+For the separate turn-based audio input/output protocol, see the
+[`/v1/realtime` Realtime Audio API](realtime_openai_duplex_api.md). Its model-specific
+support does not make an arbitrary TTS backend support incremental prompt
+extension through `/v1/audio/speech/stream`.
 
 ### WebSocket Protocol
 
@@ -1069,6 +1089,10 @@ OmniVoice processes voice-cloning audio after decoding. It removes middle gaps o
 OmniVoice uses packed variable-length attention for batched generator execution. The attention operator accepts FP16 and BF16 inputs, so its query,
 key, and value tensors are evaluated in BF16 even when the stage is configured with `dtype: float32`; the attention output is converted back to the model's
 hidden-state dtype before the output projection. Consequently, a float32 stage configuration does not imply FP32 attention arithmetic.
+When the selected diffusion attention backend cannot run packed variable-length attention, as with the cuDNN default on sm_12x Blackwell
+GPUs, OmniVoice runs vLLM's FlashAttention 2 varlen kernel when the device supports it and otherwise uses SDPA with a block mask.
+On those GPUs the FlashAttention 2 kernels are compiled from PTX at first use, which adds about 16 seconds to the first server start on an
+RTX 5070; the CUDA compute cache keeps them for later starts.
 
 OmniVoice splits long input into smaller text chunks and joins the decoded audio. You can change the split behavior for one request through `extra_params`:
 
@@ -1155,6 +1179,39 @@ parity should be checked against the upstream adapter on your deployment.
 | Model | Description |
 | ------- | ------------- |
 | `BreezeBlue/Breeze-TTS-2` | Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder, bundled Qwen3-TTS codec) at 24 kHz. Four modes are selected from the request fields: plain (`input` + speaker tag `voice`, `S0`..`S9`), voice design (`instructions`), voice clone (`ref_audio` + `ref_text`, exactly one clip), and voice direction (reference + `instructions`). Greedy decoding only: `sample_rate` must be `24000`, `speed` must be `1.0`, and `guidance_scale`/`cfg_scale` other than `1.0`, `negative_prompt`, `temperature`/`top_p`/`top_k` overrides, `language`, and `speaker_embedding` are rejected. Streaming returns PCM `speech.audio.delta` events. See [`recipes/BreezeBlue/Breeze-TTS-2.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/BreezeBlue/Breeze-TTS-2.md). |
+
+### Chatterbox Turbo and Original
+
+| Model | Description |
+| ------- | ------------- |
+| `ResembleAI/chatterbox-turbo` | GPT-2 T3 with the two-step meanflow S3Gen decoder; English, built-in voice or voice cloning from one reference recording |
+| `ResembleAI/chatterbox` | Llama T3 with paired classifier-free guidance and the ten-step S3Gen decoder; adds `exaggeration` and `cfg_weight` controls |
+
+`ResembleAI/chatterbox-turbo` and `ResembleAI/chatterbox` serve English speech
+at 24 kHz through `/v1/audio/speech` and the shared sentence-segmented WebSocket
+frontend. Use `voice: "default"` for the built-in voice, or one `ref_audio`
+recording (URL or data URL) without `ref_text`. Both use the shared one-second
+minimum; Turbo repeats a clip of five seconds or less until it is longer, where
+upstream refuses it.
+
+Non-streaming formats are WAV, PCM, MP3 and FLAC. Streaming uses
+`stream: true`, `stream_format: "audio"` and `response_format: "pcm"` or `"wav"`.
+PCM is mono signed 16-bit little-endian at 24 kHz. Other output sample rates
+are unsupported by this adapter.
+
+Original accepts nonnegative finite `extra_params.exaggeration` and
+`extra_params.cfg_weight`; a request without them gets the deploy file's stage 0
+`additional_config` values (0.5 each, upstream's defaults). Turbo rejects those fields.
+Both reject VoiceDesign, free-form instructions and multilingual synthesis.
+`max_new_tokens` accepts 1 to 1000 speech tokens, upstream's generation cap,
+and defaults to 1000. Admission capacity does not guarantee real-time playback.
+References queued together are encoded as one batch, and a reference evicted from
+the speaker cache is encoded again in whatever batch is current, so cloned-voice
+output can vary slightly with concurrency and cache state; see the
+[H100 recipe](https://github.com/vllm-project/vllm-omni/tree/main/recipes/ResembleAI/Chatterbox-H100.md#reference-conditioning-batch).
+
+See the [online examples](../user_guide/examples/online_serving/text_to_speech.md#chatterbox-turbo-and-original)
+and the [H100 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ResembleAI/Chatterbox-H100.md).
 
 ## Error Responses
 
@@ -1321,6 +1378,20 @@ MOSS-TTS Local uses a reference transcript for continuation conditioning; omitti
 it uses reference-audio conditioning instead. Keep this choice consistent when
 comparing benchmarks. Supplying inline `ref_audio` overrides the uploaded voice
 and does not use the named-voice cache shortcut.
+
+Ming-TTS (dense) can reuse a worker-cached speaker embedding for a single inline
+`ref_audio` when the resolver provides the same decoded-audio content key, even
+if the request text or audio locator changes. This avoids repeated speaker
+embedding extraction; the waveform is still resolved and sent to the worker.
+If the resolver provides no content key or the worker entry is evicted, the
+embedding is extracted again. Multi-reference requests retain their existing
+extraction behavior.
+
+Remote URLs are keyed by their raw URL string in the separate waveform resolve
+cache. A hit returns the cached waveform without fetching or decoding it again;
+the server does not check whether content at the same URL has changed. Ming's
+speaker cache uses the content key of the waveform returned by that resolver.
+It does not change remote URL refresh behavior.
 
 The separate decoded-waveform resolve cache defaults to **4 GiB and 2048 entries
 per speech server instance**. These are LRU limits, not preallocated memory or a

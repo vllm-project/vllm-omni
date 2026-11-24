@@ -57,6 +57,7 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
 )
 from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
 from vllm_omni.model_executor.models.causvid_wan.pipeline import CAUSVID_WAN_PIPELINE
+from vllm_omni.model_executor.models.chatterbox.pipeline import CHATTERBOX_ORIGINAL_PIPELINE, CHATTERBOX_TURBO_PIPELINE
 from vllm_omni.model_executor.models.confucius4_tts.pipeline import CONFUCIUS4_TTS_PIPELINE
 from vllm_omni.model_executor.models.cosmos3.pipeline import (
     COSMOS3_OMNI_DEPLOY_PIPELINE,
@@ -129,11 +130,13 @@ from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import (
 )
 from vllm_omni.model_executor.models.omnivoice.pipeline import OMNIVOICE_PIPELINE
 from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
+from vllm_omni.model_executor.models.phonon.pipeline import resolve_phonon_pipeline
 from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
     QWEN2_5_OMNI_PIPELINE,
     QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
 )
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
+    QWEN3_OMNI_RESUMABLE_PIPELINE,
     QWEN3_OMNI_THINKER_ONLY_PIPELINE,
     resolve_qwen3_omni_pipeline,
 )
@@ -176,6 +179,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bailing_moe_v3_audio_thinker_only": MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE,
     "breeze": BREEZE_TTS_2_PIPELINE,
     "causvid_wan": CAUSVID_WAN_PIPELINE,
+    "chatterbox": CHATTERBOX_ORIGINAL_PIPELINE,
+    "chatterbox_turbo": CHATTERBOX_TURBO_PIPELINE,
     "confucius4": CONFUCIUS4_TTS_PIPELINE,
     "confucius4_tts": CONFUCIUS4_TTS_PIPELINE,
     "cosmos3_nano_sim_bimanual": COSMOS3_NANO_SIM_BIMANUAL_PIPELINE,
@@ -194,6 +199,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "glm_image": GLM_IMAGE_PIPELINE,
     "glm_tts": GLM_TTS_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
+    "gradium_phonon_tts": resolve_phonon_pipeline,
     "haru": HARU_PIPELINE,
     "higgs_audio_v2": HIGGS_AUDIO_V2_PIPELINE,
     "higgs_multimodal_qwen3": HIGGS_AUDIO_V3_PIPELINE,
@@ -253,6 +259,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,
+    "qwen3_omni_moe_resumable": QWEN3_OMNI_RESUMABLE_PIPELINE,
     "qwen3_omni_moe_thinker_only": QWEN3_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_tts": QWEN3_TTS_PIPELINE,
     "qwen3_tts_fused": QWEN3_TTS_FUSED_PIPELINE,
