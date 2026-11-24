@@ -219,13 +219,6 @@ def indexed_gate(
     rows, hidden_size = x.shape
     if rows == 0:
         return output
-    if x.device.type == "npu":
-        try:
-            from mindiesd.layers.index_modulation import indexed_gate as mindiesd_indexed_gate
-        except ImportError:
-            pass
-        else:
-            return mindiesd_indexed_gate(output, x, gate, other, indices)
     _launch_row_chunks(
         _indexed_gate_kernel,
         rows,
@@ -263,13 +256,6 @@ def rms_norm_indexed_scale_shift(
         normalized = normalized * torch.rsqrt(variance + eps)
         normalized = (weight.float() * normalized).to(input_dtype)
         return (normalized * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(input_dtype)
-    if x.device.type == "npu":
-        try:
-            from mindiesd import rms_norm_indexed_scale_shift as mindiesd_rms_norm_indexed_scale_shift
-        except ImportError:
-            pass
-        else:
-            return mindiesd_rms_norm_indexed_scale_shift(x, weight, shift, scale, indices, eps)
     output = torch.empty_like(x)
     rows, hidden_size = x.shape
     if rows:

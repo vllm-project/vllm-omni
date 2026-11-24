@@ -752,6 +752,9 @@ class MiniMaxH3AdalnProj(nn.Module):
 
 
 class MiniMaxH3DiTBlock(nn.Module):
+    _indexed_gate = staticmethod(indexed_gate)
+    _rms_norm_indexed_scale_shift = staticmethod(rms_norm_indexed_scale_shift)
+
     def __init__(
         self,
         arch: MiniMaxH3DiTArchConfig,
@@ -832,7 +835,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         ) = self.adaln_proj(t_emb)
 
         residual = x
-        h = rms_norm_indexed_scale_shift(
+        h = self._rms_norm_indexed_scale_shift(
             x,
             self.norm1.weight,
             shift_msa,
@@ -867,4 +870,4 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
         residual = x
         h = self.mlp(h)
-        return indexed_gate(residual, gate_mlp, h, combined_indices)
+        return self._indexed_gate(residual, gate_mlp, h, combined_indices)

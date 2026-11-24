@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import sys
-from types import ModuleType
-
 import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
@@ -67,66 +64,6 @@ def test_launch_row_chunks_is_npu_only(device_type, expected_grids_and_offsets):
         ((grid,), (first_arg, second_arg, row_offset), {"block_n": 16})
         for grid, row_offset in expected_grids_and_offsets
     ]
-
-
-@pytest.mark.cpu
-@pytest.mark.parametrize(
-    ("kind", "available", "rows"),
-    [
-        ("rms", True, 3),
-        ("rms", False, 3),
-        ("gate", True, 3),
-        ("gate", False, 3),
-        ("gate", True, 0),
-    ],
-)
-def test_mindiesd_modulation_dispatch(monkeypatch, mocker, kind, available, rows):
-    from vllm_omni.diffusion.layers import indexed_modulation as modulation
-
-    x = mocker.Mock(is_cpu=False, device=mocker.Mock(type="npu"), shape=(rows, 128))
-    gate, branch, weight, shift, scale, indices = (mocker.Mock() for _ in range(6))
-    output = mocker.Mock()
-    allocate = mocker.patch.object(modulation.torch, "empty_like", return_value=output)
-    launch = mocker.patch.object(modulation, "_launch_row_chunks")
-    mocker.patch.object(modulation, "triton", mocker.Mock(next_power_of_2=lambda width: 128))
-    eps = 1e-5
-    args: tuple[object, ...]
-    sd_args: tuple[object, ...]
-    if kind == "rms":
-        call = rms_norm_indexed_scale_shift
-        args = sd_args = (x, weight, shift, scale, indices, eps)
-        module, symbol = "mindiesd", "rms_norm_indexed_scale_shift"
-        sd_result = mocker.sentinel.normalized
-    else:
-        call = indexed_gate
-        args = (x, gate, branch, indices)
-        sd_args = (output, *args)
-        module, symbol = "mindiesd.layers.index_modulation", "indexed_gate"
-        sd_result = output
-    op = mocker.Mock(return_value=sd_result)
-    interface = ModuleType(module)
-    if available:
-        setattr(interface, symbol, op)
-    monkeypatch.setitem(sys.modules, module, interface)
-
-    actual = call(*args)
-
-    if available and rows:
-        op.assert_called_once_with(*sd_args)
-        launch.assert_not_called()
-        assert actual == sd_result
-        if kind == "gate":
-            allocate.assert_called_once_with(x)
-        else:
-            allocate.assert_not_called()
-    else:
-        op.assert_not_called()
-        assert actual == output
-        allocate.assert_called_once_with(x)
-        if rows:
-            launch.assert_called_once()
-        else:
-            launch.assert_not_called()
 
 
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
