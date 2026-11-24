@@ -2623,10 +2623,11 @@ class TestStepScheduler:
         assert second.num_waiting_reqs == expected_waiting
 
     def test_drr_aged_admission_respects_explicit_max_num_seqs_count_cap(self) -> None:
+        """max_num_seqs=1 is a literal count cap, not the "unset" sentinel."""
         scheduler = StepScheduler()
         scheduler.initialize(
             _scheduler_config(
-                max_num_seqs=2,
+                max_num_seqs=1,
                 max_num_batched_tokens=2048,
                 diffusion_batching_config={
                     "policy": "compute_budget",
@@ -2648,21 +2649,22 @@ class TestStepScheduler:
             for i in range(3)
         ]
 
-        # Budget 2 * 1024 units would admit all three 256x256 requests by cost;
-        # the explicit max_num_seqs=2 count cap must still bind.
+        # The 2048-token budget alone would admit all three 256x256 requests
+        # (768 tokens); the explicit max_num_seqs=1 count cap must still admit
+        # exactly one.
         first = scheduler.schedule()
-        assert _new_ids(first) == req_ids[:2]
-        assert first.num_running_reqs == 2
-        assert first.num_waiting_reqs == 1
+        assert _new_ids(first) == req_ids[:1]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 2
 
-        self._age_request(scheduler, req_ids[2], 120.0)
+        self._age_request(scheduler, req_ids[1], 120.0)
 
-        # The aged request fits the remaining budget, but admitting it here
-        # would push the running count past the explicit cap.
+        # The aged request has budget headroom, but admitting it here would
+        # push the running count past the explicit cap.
         second = scheduler.schedule()
         assert _new_ids(second) == []
-        assert second.num_running_reqs == 2
-        assert second.num_waiting_reqs == 1
+        assert second.num_running_reqs == 1
+        assert second.num_waiting_reqs == 2
 
     def test_drr_aging_promotes_waiting_request_over_new_arrivals(self) -> None:
         scheduler = StepScheduler()
@@ -2764,40 +2766,6 @@ class TestStepScheduler:
 
         assert _new_ids(second) == [req_cheap]
         assert second.num_waiting_reqs == 1
-
-    def test_explicit_max_num_seqs_is_a_literal_count_cap(self) -> None:
-        """max_num_seqs=1 is a literal cap, not the "unset" sentinel."""
-        scheduler = StepScheduler()
-        scheduler.initialize(
-            _scheduler_config(
-                max_num_seqs=1,
-                diffusion_batching_config={
-                    "policy": "compute_budget",
-                },
-            )
-        )
-
-        req_ids = [
-            scheduler.add_request(
-                _make_step_request(
-                    f"req-{i}",
-                    sampling_params=OmniDiffusionSamplingParams(
-                        height=512,
-                        width=512,
-                        num_inference_steps=4,
-                    ),
-                )
-            )
-            for i in range(3)
-        ]
-
-        sched_output = scheduler.schedule()
-
-        # The default token budget would fit three 512x512 requests, but the
-        # explicit count cap allows exactly one.
-        assert _new_ids(sched_output) == req_ids[:1]
-        assert sched_output.num_running_reqs == 1
-        assert sched_output.num_waiting_reqs == 2
 
     def test_unset_max_num_seqs_is_bounded_by_token_budget(self) -> None:
         """The None sentinel applies no count cap; the token budget bounds the batch."""

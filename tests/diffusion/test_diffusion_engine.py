@@ -787,46 +787,19 @@ class TestMixFusionCapability:
         with pytest.raises(ValueError, match="requires enable_mixfusion=True"):
             engine._resolve_execution_mode(od_config)
 
-    def test_engine_allows_compute_budget_policy_with_mixfusion(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        od_config = SimpleNamespace(
-            model_class_name="MixfusionPipeline",
-            custom_pipeline_args=None,
-            enable_mixfusion=True,
-            diffusion_batching_config=DiffusionBatchingConfig(policy="compute_budget"),
-            streaming_output=False,
-            max_num_seqs=1,
-        )
-        monkeypatch.setattr(
-            diffusion_engine_module.DiffusionModelRegistry,
-            "_try_load_model_cls",
-            lambda model_class_name: _MixfusionCapablePipeline,
-        )
-
-        engine = DiffusionEngine.__new__(DiffusionEngine)
-        # MixFusion implies step execution on the current base, so the
-        # allowed policy resolves to STEP_BATCH rather than REQUEST_BATCH.
-        assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.STEP_BATCH
-        assert od_config.step_execution is True
-
-    def test_engine_allows_fixed_policy_with_mixfusion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("policy", ["compute_budget", "fixed"])
+    def test_engine_allows_batching_policy_with_mixfusion(self, monkeypatch: pytest.MonkeyPatch, policy: str) -> None:
         # policy="fixed" keeps MixFusion but disables DRR; the startup guard
         # must reject only policy="compute_budget", not MixFusion itself.
-        od_config = SimpleNamespace(
-            model_class_name="MixfusionPipeline",
-            custom_pipeline_args=None,
+        # MixFusion implies step execution on the current base, so both
+        # policies resolve to STEP_BATCH rather than REQUEST_BATCH.
+        _, od_config, mode = self._resolve(
+            monkeypatch,
+            _MixfusionCapablePipeline,
             enable_mixfusion=True,
-            diffusion_batching_config=DiffusionBatchingConfig(policy="fixed"),
-            streaming_output=False,
-            max_num_seqs=1,
+            diffusion_batching_config=DiffusionBatchingConfig(policy=policy),
         )
-        monkeypatch.setattr(
-            diffusion_engine_module.DiffusionModelRegistry,
-            "_try_load_model_cls",
-            lambda model_class_name: _MixfusionCapablePipeline,
-        )
-
-        engine = DiffusionEngine.__new__(DiffusionEngine)
-        assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.STEP_BATCH
+        assert mode is DiffusionExecutionMode.STEP_BATCH
         assert od_config.step_execution is True
 
 
