@@ -120,6 +120,7 @@ class CausalVideoDecoder(nn.Module):
         with torch.autocast(device_type=values.device.type, dtype=torch.bfloat16, enabled=values.device.type != "cpu"):
             pixels = [self._decode_pair(values[:, index : index + 2], state) for index in range(0, stop, 2)]
             tail = values[:, stop:]
+            # Clone the unpaired carry latent so the full chunk tensor can be freed between calls.
             state.pending = tail.clone() if tail.shape[1] else None
             if eos and state.pending is not None:
                 count = 1 if state.position % 5 == 0 else 4
@@ -216,6 +217,7 @@ class CausalVideoDecoder(nn.Module):
             suffix = suffix + block.attn.to_out(suffix_out.flatten(-2)) * block.scale1
             hidden = hidden + block.ff(block.norm2(hidden.float()).to(dtype)) * block.scale2
             suffix = suffix + block.ff(block.norm2(suffix.float()).to(dtype)) * block.scale2
+            # Clone only the 4-frame tail window so previous concatenated KV buffers are released.
             state.keys[i], state.values[i] = k[:, -4:].clone(), v[:, -4:].clone()
         hidden = self.norm_out(hidden)
         with torch.autocast(device_type=device.type, enabled=False):

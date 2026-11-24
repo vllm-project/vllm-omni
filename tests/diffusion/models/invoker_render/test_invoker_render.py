@@ -22,7 +22,10 @@ from vllm_omni.diffusion.models.invoker_render.codec import CausalVideoDecoder
 from vllm_omni.diffusion.models.invoker_render.pipeline import get_invoker_render_pre_process_func
 from vllm_omni.diffusion.models.invoker_render.schedule import WindowPlanner
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.entrypoints.openai.video.generation.helpers import _persist_uploaded_media_references
+from vllm_omni.entrypoints.openai.video.generation.helpers import (
+    VideoRequestResources,
+    _persist_uploaded_media_references,
+)
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -175,15 +178,22 @@ def test_mixed_matroska_upload_preserves_full_proxy(bundle, monkeypatch):
         ]
 
     monkeypatch.setattr(tempfile, "tempdir", str(bundle))
+    rejected_resources = VideoRequestResources()
     with pytest.raises(HTTPException, match="MP4 or MOV"):
-        asyncio.run(_persist_uploaded_media_references(uploads()))
-    images, videos, audios = asyncio.run(_persist_uploaded_media_references(uploads(), proxy_video=True))
-    assert len(images) == len(videos) == 1 and not audios
-    pre_process = get_invoker_render_pre_process_func(OmniDiffusionConfig.from_kwargs(model=str(bundle)))
-    request = OmniDiffusionRequest(
-        {"prompt": "Render the road", "multi_modal_data": {"image": images[0], "video": videos}},
-        OmniDiffusionSamplingParams(seed=42),
-        "upload",
-    )
-    proxy = pre_process(request).prompt["multi_modal_data"]["video"]
-    np.testing.assert_array_equal(proxy[:, 0, 0, 0], np.arange(39))
+        asyncio.run(_persist_uploaded_media_references(uploads(), rejected_resources))
+    assert not rejected_resources.paths
+    resources = VideoRequestResources()
+    try:
+        images, videos, audios = asyncio.run(_persist_uploaded_media_references(uploads(), resources, proxy_video=True))
+        assert len(images) == len(videos) == 1 and not audios
+        assert resources.paths == videos
+        pre_process = get_invoker_render_pre_process_func(OmniDiffusionConfig.from_kwargs(model=str(bundle)))
+        request = OmniDiffusionRequest(
+            {"prompt": "Render the road", "multi_modal_data": {"image": images[0], "video": videos}},
+            OmniDiffusionSamplingParams(seed=42),
+            "upload",
+        )
+        proxy = pre_process(request).prompt["multi_modal_data"]["video"]
+        np.testing.assert_array_equal(proxy[:, 0, 0, 0], np.arange(39))
+    finally:
+        resources.cleanup()

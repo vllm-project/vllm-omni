@@ -4,7 +4,8 @@
 import asyncio
 import io
 from collections import deque
-from types import SimpleNamespace
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 import av
 import numpy as np
@@ -62,6 +63,24 @@ def test_credit_wait_and_unknown_length():
     assert state.request_denoise_completed
 
 
+@dataclass
+class _FakeCausal:
+    prepare: Callable[[object, Window], torch.Tensor]
+
+
+@dataclass
+class _FakeSession:
+    windows: deque[Window]
+    causal: _FakeCausal
+    active: Window | None = None
+
+
+@dataclass
+class _FakeEngine:
+    abort: Callable[..., object]
+    submit_interaction_async: Callable[..., object] | None = field(default=None)
+
+
 def test_resume_starts_each_window_at_first_timestep(monkeypatch):
     pipeline = object.__new__(InvokerRenderPipeline)
     torch.nn.Module.__init__(pipeline)
@@ -85,7 +104,7 @@ def test_resume_starts_each_window_at_first_timestep(monkeypatch):
         chunk_num_steps=4,
     )
     state.extra[PROXY_MODALITY] = ProxyQueue((32, 32))
-    state.extra["invoker_session"] = SimpleNamespace(windows=deque([window]), causal=SimpleNamespace(prepare=prepare))
+    state.extra["invoker_session"] = _FakeSession(windows=deque([window]), causal=_FakeCausal(prepare=prepare))
 
     pipeline.ar_diffusion_resume_step(state, "interaction")
 
@@ -106,7 +125,7 @@ def test_websocket_uses_bootstrap_and_muxes_eos(monkeypatch):
         return None
 
     handler = OmniStreamingVideoOutputHandler(
-        SimpleNamespace(submit_interaction_async=submit, abort=abort),
+        _FakeEngine(submit_interaction_async=submit, abort=abort),
         proxy_size=(32, 32),
         stall_timeout=4,
     )
@@ -171,7 +190,7 @@ def test_websocket_can_stop_during_bootstrap():
     async def abort(request_id, *, timeout):
         aborted.append(request_id)
 
-    handler = OmniStreamingVideoOutputHandler(SimpleNamespace(abort=abort), proxy_size=(32, 32), stall_timeout=4)
+    handler = OmniStreamingVideoOutputHandler(_FakeEngine(abort=abort), proxy_size=(32, 32), stall_timeout=4)
     app = FastAPI()
     app.add_api_websocket_route("/v1/realtime/video", handler.handle_session)
     with TestClient(app) as client, client.websocket_connect("/v1/realtime/video") as ws:

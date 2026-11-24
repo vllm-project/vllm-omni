@@ -165,6 +165,7 @@ class CausalSession:
             raise RuntimeError("Invoker-Render generated nonfinite latents")
         positions = tuple(range(window.start, window.stop))
         for i, index in enumerate(positions):
+            # Detach a contiguous single-latent copy so retained history does not pin the whole window tensor.
             self.frames[index].clean = latents[:, i : i + 1].detach().clone()
         if window.start and not window.eos:
             start = max(1, window.stop - 12)
