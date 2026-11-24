@@ -270,7 +270,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         from vllm_omni.platforms.npu.models.minimax_h3_image import apply_minimax_h3_image_graphs
 
         if isinstance(model, (MiniMaxH3Pipeline, MiniMaxH3ImagePipeline)):
-            from vllm_omni.platforms.npu.models.minimax_h3_dit import apply_minimax_h3_dit_fusions
+            from vllm_omni.platforms.npu.models.minimax_h3 import apply_minimax_h3_dit_fusions
 
             apply_minimax_h3_dit_fusions(model, cls._early_diffusion_opp_paths or _STARTUP_OPP_PATHS)
         apply_minimax_h3_image_graphs(model, od_config)

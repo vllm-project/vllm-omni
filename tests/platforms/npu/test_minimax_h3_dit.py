@@ -43,7 +43,7 @@ def test_h3_platform_installs_registered_fusions(
 ):
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3Attention, MiniMaxH3MLP
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-    from vllm_omni.platforms.npu.models import minimax_h3_dit as h3
+    from vllm_omni.platforms.npu.models import minimax_h3 as h3
 
     sdk = tmp_path / "mindiesd"
     vendor = sdk / "ops/vendors/aie_ascendc"
@@ -73,19 +73,24 @@ def test_h3_platform_installs_registered_fusions(
         assert "mindiesd" not in sys.modules
         importlib.import_module("mindiesd")
         platform.get_diffusion_attn_backend_cls("FLASH_ATTN", 128)
-    monkeypatch.setattr(h3, "_ascend_device_name", lambda: device)
+    utils = SimpleNamespace(get_ascend_device_type=lambda: SimpleNamespace(name=device))
+    monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
     pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
     nn.Module.__init__(pipeline)
-    attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
+    attention, _, _ = _qkv_inputs()
+    unsupported = [_qkv_inputs(**config)[0] for config in ({"head_dim": 96}, {"rot_dim": 48}, {"eps": 0.0})]
+    mismatched_eps, _, _ = _qkv_inputs()
+    mismatched_eps.k_norm.variance_epsilon = 1e-5
     mlp = MiniMaxH3MLP.__new__(MiniMaxH3MLP)
-    nn.Module.__init__(attention)
     nn.Module.__init__(mlp)
-    pipeline.transformer = nn.ModuleList([attention, mlp])
+    pipeline.transformer = nn.ModuleList([attention, mlp, *unsupported, mismatched_eps])
 
     platform.apply_diffusion_model_patches(pipeline, SimpleNamespace(model_class_name="MiniMaxH3Pipeline"))
 
     use_qkv, use_swiglu = expected
     assert attention._project_qkv.__func__ is (h3._npu_project_qkv if use_qkv else MiniMaxH3Attention._project_qkv)
+    for block in (*unsupported, mismatched_eps):
+        assert block._project_qkv.__func__ is MiniMaxH3Attention._project_qkv
     assert mlp.forward.__func__ is (h3.forward_h3_mlp if use_swiglu else MiniMaxH3MLP.forward)
     if registration == "startup":
         assert "mindiesd" not in sys.modules
@@ -113,7 +118,7 @@ def _qkv_inputs(*, head_dim=128, rot_dim=96, eps=1e-6):
 
 
 def _install_npu_qkv(attention):
-    from vllm_omni.platforms.npu.models.minimax_h3_dit import _npu_project_qkv
+    from vllm_omni.platforms.npu.models.minimax_h3 import _npu_project_qkv
 
     def project(x):
         return Mock(wraps=x, shape=x.shape, device=SimpleNamespace(type="npu")), None
@@ -170,18 +175,9 @@ def test_project_qkv_eagle_numel_limit(eagle_qkv, rows, use_eagle):
         assert q.shape == (rows, attention.num_heads, attention.head_dim)
 
 
-@pytest.mark.parametrize(
-    ("head_dim", "rot_dim", "eps", "has_rope", "calls"),
-    [
-        pytest.param(128, 96, 1e-6, True, 1, id="missing-native"),
-        pytest.param(128, 96, 1e-6, False, 0, id="no-rope"),
-        pytest.param(128, 48, 1e-6, True, 0, id="rotary-width"),
-        pytest.param(96, 96, 1e-6, True, 0, id="head-width"),
-        pytest.param(128, 96, 0.0, True, 0, id="epsilon"),
-    ],
-)
-def test_project_qkv_preserves_fallback(eagle_qkv, head_dim, rot_dim, eps, has_rope, calls):
-    attention, packed, table = _qkv_inputs(head_dim=head_dim, rot_dim=rot_dim, eps=eps)
+@pytest.mark.parametrize("has_rope", [True, False], ids=["missing-native", "no-rope"])
+def test_project_qkv_preserves_fallback(eagle_qkv, has_rope):
+    attention, packed, table = _qkv_inputs()
     table = table if has_rope else None
     expected = attention._project_qkv(packed, table)
     eagle_qkv.side_effect = ImportError("native QKV unavailable")
@@ -190,7 +186,7 @@ def test_project_qkv_preserves_fallback(eagle_qkv, head_dim, rot_dim, eps, has_r
     actual = attention._project_qkv(packed, table)
 
     attention.qkv_proj.assert_called_once_with(packed)
-    assert eagle_qkv.call_count == calls
+    assert eagle_qkv.call_count == int(has_rope)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
@@ -198,7 +194,7 @@ def _swiglu_inputs(mocker, quant_method):
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
-    from vllm_omni.platforms.npu.models import minimax_h3_dit
+    from vllm_omni.platforms.npu.models.minimax_h3 import forward_h3_mlp
 
     x = Mock(device=SimpleNamespace(type="npu"), shape=(2, 3, 4), dtype=torch.bfloat16)
     fc1 = MergedColumnParallelLinear.__new__(MergedColumnParallelLinear)
@@ -223,7 +219,7 @@ def _swiglu_inputs(mocker, quant_method):
             "mindiesd.fused_ops": SimpleNamespace(eagle_quant_batch_matmul_swiglu=fused),
         },
     )
-    mlp.forward = MethodType(minimax_h3_dit.forward_h3_mlp, mlp)
+    mlp.forward = MethodType(forward_h3_mlp, mlp)
     return mlp, x, quantize, fused
 
 
