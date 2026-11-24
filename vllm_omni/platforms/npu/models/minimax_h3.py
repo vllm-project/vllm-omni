@@ -124,25 +124,15 @@ def apply_minimax_h3_qwen3vl_swiglu_patch() -> None:
     _SWIGLU_PATCHED = True
 
 
-def _has_eagle_kernel(
-    kernels: Path, registration: object, *input_dtypes: str, weight_format: str | None = None
-) -> bool:
+def _has_eagle_kernel(kernels: Path, registration: object) -> bool:
     binaries = registration.get("binaryList") if isinstance(registration, dict) else None
     if not isinstance(binaries, list):
         return False
     for entry in binaries:
         try:
-            if not (kernels / entry["binPath"]).is_file():
-                continue
-            descriptor = json.loads((kernels / entry["jsonPath"]).read_text(encoding="utf-8"))["supportInfo"]
-            inputs = descriptor["inputs"]
-            if (
-                descriptor["outputs"][0]["dtype"] == "bfloat16"
-                and all(inputs[i]["dtype"] == dtype for i, dtype in enumerate(input_dtypes))
-                and (weight_format is None or inputs[1]["format"] == weight_format)
-            ):
+            if (kernels / entry["binPath"]).is_file():
                 return True
-        except (OSError, ValueError, TypeError, KeyError, IndexError):
+        except (OSError, ValueError, TypeError, KeyError):
             continue
     return False
 
@@ -245,12 +235,8 @@ def apply_minimax_h3_dit_fusions(model: torch.nn.Module, early_opp_paths: frozen
         return
     if not isinstance(index, dict) or not isinstance(op_info, dict):
         return
-    use_qkv = _QKV in op_info and _has_eagle_kernel(kernels, index.get(_QKV), "bfloat16")
-    use_swiglu = (
-        soc == "ascend910b"
-        and _SWIGLU in op_info
-        and _has_eagle_kernel(kernels, index.get(_SWIGLU), "int8", "int8", "float32", weight_format="ND")
-    )
+    use_qkv = _QKV in op_info and _has_eagle_kernel(kernels, index.get(_QKV))
+    use_swiglu = soc == "ascend910b" and _SWIGLU in op_info and _has_eagle_kernel(kernels, index.get(_SWIGLU))
     fp32 = torch.finfo(torch.float32)
     for module in model.modules():
         if use_qkv and isinstance(module, MiniMaxH3DiTBlock):

@@ -70,14 +70,12 @@ def test_strict_ulysses_paged_backend_bypasses_ascend_pcp() -> None:
     assert backend.get_builder_cls() is AscendAttentionMetadataBuilder
 
 
-def _write_eagle_kernel(kernels, soc, op, inputs, *, binary=True):
-    descriptor = kernels / soc / op / "kernel.json"
-    descriptor.parent.mkdir(parents=True)
-    descriptor.write_text(json.dumps({"supportInfo": {"inputs": inputs, "outputs": [{"dtype": "bfloat16"}]}}))
+def _write_eagle_kernel(kernels, soc, op, *, binary=True):
+    path = kernels / soc / op / "kernel.o"
     if binary:
-        descriptor.with_suffix(".o").touch()
-    path = descriptor.relative_to(kernels)
-    return {"binaryList": [{"jsonPath": path.as_posix(), "binPath": path.with_suffix(".o").as_posix()}]}
+        path.parent.mkdir(parents=True)
+        path.touch()
+    return {"binaryList": [{"binPath": path.relative_to(kernels).as_posix()}]}
 
 
 def _qkv_inputs():
@@ -138,10 +136,9 @@ class TestMiniMaxH3Fusions:
         sdk = tmp_path / "mindiesd"
         vendor = sdk / "ops/vendors/aie_ascendc"
         kernels = vendor / "op_impl/ai_core/tbe/kernel"
-        int8_inputs = [{"dtype": "int8"}, {"dtype": "int8", "format": "ND"}, {"dtype": "float32"}]
         index = {
-            h3._QKV: _write_eagle_kernel(kernels, soc, h3._QKV, [{"dtype": "bfloat16"}], binary=registered != "swiglu"),
-            h3._SWIGLU: _write_eagle_kernel(kernels, soc, h3._SWIGLU, int8_inputs),
+            h3._QKV: _write_eagle_kernel(kernels, soc, h3._QKV, binary=registered != "swiglu"),
+            h3._SWIGLU: _write_eagle_kernel(kernels, soc, h3._SWIGLU),
         }
         config = kernels / "config" / soc
         config.mkdir(parents=True)
