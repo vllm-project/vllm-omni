@@ -104,8 +104,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             hf_config = getattr(self._get_model_config(), "hf_config", None)
             prewarm_len = getattr(hf_config, "async_chunk_prewarm_prompt_len", None)
             if prewarm_len is not None and int(prewarm_len) > 1:
-                # A declared initial prefill owns the placeholder size. Chunk
-                # increments must not shrink it before the first sampled token.
+                # The declared prefill owns placeholder sizing; resumable request updates extend the prompt.
                 update = replace(update, resize_prompt_to=None)
         if self._payload_finished(payload):
             update = replace(update or SchedulingMetadataUpdate(), input_terminal=True)
