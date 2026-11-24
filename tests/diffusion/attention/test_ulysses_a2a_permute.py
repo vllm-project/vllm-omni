@@ -20,8 +20,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("npu", [False, True])
 @pytest.mark.parametrize("joint", [None, "front", "rear"])
 @pytest.mark.parametrize("use_sync", [False, True])
-@pytest.mark.parametrize("zero_copy", [False, True])
-def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_sync, zero_copy):
+def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_sync):
     """Both platforms share attention routing, including joint slicing."""
     calls = []
     platform = SimpleNamespace(is_npu=lambda: npu, synchronize=lambda: calls.append("sync"))
@@ -36,17 +35,16 @@ def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_syn
         allgather_world_size=1,
     )
     monkeypatch.setattr(ulysses.dist, "get_world_size", lambda pg: 2)
-    strategy = ulysses.UlyssesParallelAttention(
-        group, 2, 1, use_sync, ulysses_a2a_permute=True, ulysses_a2a_zero_copy=zero_copy
-    )
+    strategy = ulysses.UlyssesParallelAttention(group, 2, 1, use_sync, ulysses_a2a_permute=True)
     query = torch.randn(1, 3, 4, 16)
     key = torch.randn(1, 3, 2, 16)
     value = torch.randn_like(key)
     gate = torch.randn_like(query)
 
-    def qkv(q, k, v, group_name, world_size, zero_copy_arg):
+    def qkv(q, k, v, group_name, world_size, zero_copy=False):
         assert q is query and k is key and v is value
-        assert (group_name, world_size, zero_copy_arg) == ("ulysses", 2, zero_copy)
+        # Q/K/V stay inside the attention layer, so they are exchanged in place.
+        assert (group_name, world_size, zero_copy) == ("ulysses", 2, True)
         calls.append("qkv")
         return tuple(t[:, :, : t.shape[2] // 2].repeat(1, 2, 1, 1) for t in (q, k, v))
 
@@ -55,8 +53,7 @@ def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_syn
         assert tensor is gate
         return tensor[:, :, :2].repeat(1, 2, 1, 1)
 
-    def reverse(tensor, group_name, world_size, zero_copy_arg):
-        assert zero_copy_arg is zero_copy
+    def reverse(tensor, group_name, world_size):
         calls.append("reverse")
         assert tensor.shape == (1, 6, 2, 16)
         return tensor[:, :3].repeat(1, 1, 2, 1)
@@ -86,13 +83,13 @@ def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_syn
     assert calls == (["gate", "qkv", "sync", "reverse", "sync"] if use_sync else ["gate", "qkv", "reverse"])
 
 
-@pytest.mark.parametrize("zero_copy", [False, True])
-def test_zero_copy_qkv_survive_gate_exchange_in_shared_workspace(monkeypatch, zero_copy):
-    """Two ranks exchange Q/K/V and the gate through real shared buffers.
+def test_qkv_views_survive_gate_exchange_and_output_is_copied_out(monkeypatch):
+    """Two ranks exchange Q/K/V, the gate and the output through real shared buffers.
 
     The copy-engine transport runs on CPU threads, one per rank, writing peer
-    buffers with memmove. Zero-copy Q/K/V are views of the rank's workspace,
-    so they must still hold their exchanged values after the gate exchange.
+    buffers with memmove. Q/K/V are views of the rank's workspace, so they must
+    still hold their exchanged values after the gate exchange; the output leaves
+    the attention layer and must not alias the workspace.
     """
     world_size = 2
     barrier = threading.Barrier(world_size, timeout=30)
@@ -128,16 +125,14 @@ def test_zero_copy_qkv_survive_gate_exchange_in_shared_workspace(monkeypatch, ze
     monkeypatch.setattr(ulysses.dist, "get_world_size", lambda pg: world_size)
     monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "strict")
 
-    # The registered ops are CUDA-only; call the same transport they wrap.
-    def qkv_ce(query, key, value, group_name, world_size, zero_copy=False):
-        return a2a_permute._exchange_ce((query, key, value), group_name, world_size, zero_copy=zero_copy)
-
+    # The registered ops are CUDA-only; call the Python bodies they wrap.
     def qkv_fwd(x, group_name, world_size):
         b, s, h, d = x.shape
         return a2a_permute._exchange_ce((x,), group_name, world_size).view(b, s * world_size, h // world_size, d)
 
-    monkeypatch.setattr(a2a_permute, "ulysses_qkv_ce", qkv_ce)
+    monkeypatch.setattr(a2a_permute, "ulysses_qkv_ce", a2a_permute.ulysses_qkv_ce._init_fn)
     monkeypatch.setattr(a2a_permute, "ulysses_qkv_fwd", qkv_fwd)
+    monkeypatch.setattr(a2a_permute, "ulysses_o_rev", a2a_permute.ulysses_o_rev._init_fn)
 
     shape = (1, 3, 4, 8)
     inputs = [
@@ -176,15 +171,22 @@ def test_zero_copy_qkv_survive_gate_exchange_in_shared_workspace(monkeypatch, ze
                 ring_world_size=1,
                 allgather_world_size=1,
             )
-            strategy = ulysses.UlyssesParallelAttention(
-                group, 2, 1, False, ulysses_a2a_permute=True, ulysses_a2a_zero_copy=zero_copy
-            )
+            strategy = ulysses.UlyssesParallelAttention(group, 2, 1, False, ulysses_a2a_permute=True)
             local = inputs[rank]
             metadata = AttentionMetadata(extra={"gate_compress": local["gate"]})
-            q, k, v, metadata, _ = strategy.pre_attention(local["query"], local["key"], local["value"], metadata)
+            q, k, v, metadata, ctx = strategy.pre_attention(local["query"], local["key"], local["value"], metadata)
             # Every rank finishes both exchanges before anyone checks its views.
             barrier.wait()
-            results[rank] = (q.clone(), k.clone(), v.clone(), metadata.extra["gate_compress"].clone())
+            workspace = shared[rank]
+            start, end = workspace.data_ptr(), workspace.data_ptr() + workspace.nbytes
+            assert all(start <= t.data_ptr() < end for t in (q, k, v))
+            assert not start <= metadata.extra["gate_compress"].data_ptr() < end
+            exchanged = (q.clone(), k.clone(), v.clone(), metadata.extra["gate_compress"].clone())
+            # Reversing the exchanged query must return this rank's query, in
+            # its own storage rather than in the reused workspace.
+            output = strategy.post_attention(exchanged[0], ctx)
+            assert not start <= output.data_ptr() < end
+            results[rank] = (*exchanged, output)
         except BaseException as error:
             errors.append(error)
             barrier.abort()
@@ -201,6 +203,7 @@ def test_zero_copy_qkv_survive_gate_exchange_in_shared_workspace(monkeypatch, ze
         for output, name in zip(outputs, ("query", "key", "value", "gate")):
             expected = torch.cat([x[name][:, :, rank * heads : (rank + 1) * heads] for x in inputs], dim=1)
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        torch.testing.assert_close(outputs[4], inputs[rank]["query"], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -302,11 +305,3 @@ def test_disabled_optimization_does_not_load_backend(monkeypatch):
     group = SimpleNamespace(ulysses_group=object(), ulysses_world_size=2, ring_world_size=1)
     strategy = ulysses.UlyssesParallelAttention(group, 2, 1, False)
     assert strategy.name == "ulysses"
-
-
-def test_zero_copy_requires_a2a_permute():
-    from vllm_omni.diffusion.data import DiffusionParallelConfig
-
-    assert DiffusionParallelConfig(ulysses_a2a_permute=True, ulysses_a2a_zero_copy=True).ulysses_a2a_zero_copy
-    with pytest.raises(ValueError, match="ulysses_a2a_zero_copy requires ulysses_a2a_permute"):
-        DiffusionParallelConfig(ulysses_a2a_zero_copy=True)
