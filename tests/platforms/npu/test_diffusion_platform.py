@@ -127,7 +127,6 @@ class TestMiniMaxH3Fusions:
     def test_h3_platform_installs_registered_fusions(
         self, tmp_path, monkeypatch, device, soc, registered, late, expected
     ):
-        from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3Attention, MiniMaxH3MLP
         from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
         from vllm_omni.platforms.npu.models import minimax_h3 as h3
 
@@ -162,17 +161,27 @@ class TestMiniMaxH3Fusions:
         monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
         pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
         nn.Module.__init__(pipeline)
-        attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
-        nn.Module.__init__(attention)
-        mlp = MiniMaxH3MLP.__new__(MiniMaxH3MLP)
-        nn.Module.__init__(mlp)
-        pipeline.transformer = nn.ModuleList([attention, mlp])
+        for name in pipeline._dit_modules:
+            blocks = [
+                SimpleNamespace(attn=SimpleNamespace(head_dim=128, rot_dim=rot_dim), mlp=nn.Module())
+                for rot_dim in (96, 48)
+            ]
+            refiner = SimpleNamespace(attn=nn.Module(), mlp=nn.Module())
+            setattr(pipeline, name, SimpleNamespace(blocks=blocks, token_refiner=SimpleNamespace(blocks=[refiner])))
 
         platform.apply_diffusion_model_patches(pipeline, SimpleNamespace(model_class_name="MiniMaxH3Pipeline"))
 
         use_qkv, use_swiglu = expected
-        assert attention._project_qkv.__func__ is (h3._npu_project_qkv if use_qkv else MiniMaxH3Attention._project_qkv)
-        assert mlp.forward.__func__ is (h3.forward_h3_mlp if use_swiglu else MiniMaxH3MLP.forward)
+        for name in pipeline._dit_modules:
+            dit = getattr(pipeline, name)
+            main, short_rope = dit.blocks
+            refiner = dit.token_refiner.blocks[0]
+            expected_qkv = MethodType(h3._npu_project_qkv, main.attn) if use_qkv else None
+            assert getattr(main.attn, "_project_qkv", None) == expected_qkv
+            assert not hasattr(short_rope.attn, "_project_qkv")
+            assert not hasattr(refiner.attn, "_project_qkv")
+            for block in (*dit.blocks, refiner):
+                assert block.mlp.forward.__func__ is (h3.forward_h3_mlp if use_swiglu else nn.Module.forward)
 
     def test_project_qkv_calls_eagle_with_local_rope_halves(self, eagle_qkv):
         attention, packed, table = _qkv_inputs()

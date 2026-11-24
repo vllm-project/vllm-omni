@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from importlib.util import find_spec
+from itertools import chain
 from pathlib import Path
 from types import MethodType
 from typing import Any
@@ -123,7 +125,17 @@ def apply_minimax_h3_qwen3vl_swiglu_patch() -> None:
     _SWIGLU_PATCHED = True
 
 
-def _has_eagle_kernel(kernels: Path, op: str, registration: object) -> bool:
+def _matches_int8_swiglu_inputs(inputs: list[dict[str, object]]) -> bool:
+    return (
+        inputs[0]["dtype"] == inputs[1]["dtype"] == "int8"
+        and inputs[1]["format"] == "ND"
+        and inputs[2]["dtype"] == "float32"
+    )
+
+
+def _has_eagle_kernel(
+    kernels: Path, registration: object, matches_inputs: Callable[[list[dict[str, object]]], bool]
+) -> bool:
     binaries = registration.get("binaryList") if isinstance(registration, dict) else None
     if not isinstance(binaries, list):
         return False
@@ -132,17 +144,7 @@ def _has_eagle_kernel(kernels: Path, op: str, registration: object) -> bool:
             if not (kernels / entry["binPath"]).is_file():
                 continue
             descriptor = json.loads((kernels / entry["jsonPath"]).read_text(encoding="utf-8"))["supportInfo"]
-            inputs = descriptor["inputs"]
-            if descriptor["outputs"][0]["dtype"] != "bfloat16":
-                continue
-            if op == _QKV and inputs[0]["dtype"] == "bfloat16":
-                return True
-            if (
-                op == _SWIGLU
-                and inputs[0]["dtype"] == inputs[1]["dtype"] == "int8"
-                and inputs[1]["format"] == "ND"
-                and inputs[2]["dtype"] == "float32"
-            ):
+            if descriptor["outputs"][0]["dtype"] == "bfloat16" and matches_inputs(descriptor["inputs"]):
                 return True
         except (OSError, ValueError, TypeError, KeyError, IndexError):
             continue
@@ -222,8 +224,6 @@ def forward_h3_mlp(self: Any, x: torch.Tensor) -> torch.Tensor:
 
 def apply_minimax_h3_dit_fusions(model: torch.nn.Module, early_opp_paths: frozenset[str]) -> None:
     """Bind eligible H3 blocks without changing classes or loading MindIE-SD on other platforms."""
-    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3Attention, MiniMaxH3MLP
-
     try:
         from vllm_ascend.utils import get_ascend_device_type
 
@@ -248,10 +248,21 @@ def apply_minimax_h3_dit_fusions(model: torch.nn.Module, early_opp_paths: frozen
         return
     if not isinstance(index, dict) or not isinstance(op_info, dict):
         return
-    use_qkv = _QKV in op_info and _has_eagle_kernel(kernels, _QKV, index.get(_QKV))
-    use_swiglu = soc == "ascend910b" and _SWIGLU in op_info and _has_eagle_kernel(kernels, _SWIGLU, index.get(_SWIGLU))
-    for module in model.modules():
-        if use_qkv and isinstance(module, MiniMaxH3Attention):
-            module._project_qkv = MethodType(_npu_project_qkv, module)  # type: ignore[method-assign]
-        elif use_swiglu and isinstance(module, MiniMaxH3MLP):
-            module.forward = MethodType(forward_h3_mlp, module)  # type: ignore[method-assign]
+    use_qkv = _QKV in op_info and _has_eagle_kernel(
+        kernels, index.get(_QKV), lambda inputs: inputs[0]["dtype"] == "bfloat16"
+    )
+    use_swiglu = (
+        soc == "ascend910b"
+        and _SWIGLU in op_info
+        and _has_eagle_kernel(kernels, index.get(_SWIGLU), _matches_int8_swiglu_inputs)
+    )
+    for name in model._dit_modules:
+        dit = getattr(model, name)
+        if use_qkv:
+            for block in dit.blocks:
+                attn = block.attn
+                if (attn.head_dim, attn.rot_dim) == (128, 96):
+                    attn._project_qkv = MethodType(_npu_project_qkv, attn)
+        if use_swiglu:
+            for block in chain(dit.blocks, dit.token_refiner.blocks):
+                block.mlp.forward = MethodType(forward_h3_mlp, block.mlp)
