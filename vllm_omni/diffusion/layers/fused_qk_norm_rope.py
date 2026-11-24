@@ -24,9 +24,9 @@ The CUDA fast path fuses RMSNorm and RoPE without materializing normalized Q/K
 or rotary-product intermediates. The interleaved mode supports any even
 ``rotary_dim <= head_dim <= 256`` (``tl.arange`` padding to the next power of
 two); the half-split mode keeps the pre-existing kernel and its MiniMax-H3
-geometry contract (``head_dim == 128``, ``rotary_dim == 96``). Ascend
-composes its RMSNorm and rotary fused primitives on the MiniMax-H3 geometry;
-unsupported inputs use the eager reference.
+geometry contract (``head_dim == 128``, ``rotary_dim == 96``). On Ascend,
+MiniMax-H3 can use MindIE-SD's EagleSplitNormRopeConcat for this geometry.
+The default NPU path composes RMSNorm and rotary primitives.
 
 ``cuda_rms_norm=True`` (single-stream and joint ops) reproduces the vLLM CUDA
 RMSNorm reduction order and keeps the rotation free of FMA contraction, so for
@@ -601,8 +601,43 @@ def _npu_qk_norm_rope(
     eps: float,
     rotary_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Use Ascend RMSNorm and RoPE fused primitives for MiniMax-H3 DiT."""
+    """Apply weighted RMSNorm and partial RoPE on Ascend."""
     import torch_npu
+
+    from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+    config = get_forward_context().omni_diffusion_config if is_forward_context_available() else None
+    q_heads, kv_heads = q.shape[1], k.shape[1]
+    if (
+        getattr(config, "_minimax_h3_eagle_qkv", False)
+        and q_weight.dtype == k_weight.dtype == rope_table.dtype == q.dtype
+        and 0 < kv_heads <= q_heads <= 128
+        and q_heads % kv_heads == 0
+        and 0 < q.numel() + 2 * k.numel() <= torch.iinfo(torch.int32).max
+        and torch.finfo(torch.float32).tiny <= eps <= torch.finfo(torch.float32).max
+    ):
+        try:
+            from mindiesd.fused_ops import eagle_split_norm_rope_concat
+
+            # Eagle copies V independently. The caller already owns V, so fill its slot with K.
+            packed = torch.cat((q, k, k), dim=1)
+            cos, sin = rope_table.reshape(q.shape[0], 2, rotary_dim // 2).transpose(0, 1).contiguous().unbind(0)
+            q_out, k_out, _ = eagle_split_norm_rope_concat(
+                packed,
+                q_weight,
+                k_weight,
+                cos,
+                sin,
+                [q_heads, kv_heads, kv_heads],
+                norm_type=3,  # weighted RMSNorm
+                rope_mode=1,  # half-split RoPE
+                rotary_dim=rotary_dim,
+                epsilon=eps,
+                output_bnsd=False,
+            )
+            return q_out, k_out
+        except ImportError:
+            pass  # The SDK facade loads its native symbol on first call.
 
     q_norm = torch_npu.npu_rms_norm(q, q_weight, epsilon=eps)[0]
     k_norm = torch_npu.npu_rms_norm(k, k_weight, epsilon=eps)[0]
@@ -1217,16 +1252,6 @@ def fused_qk_norm_rope(
     q_weight = q_weight.contiguous()
     k_weight = k_weight.contiguous()
     rope_table = rope_table.contiguous()
-    if _fused_npu_supported(q, k, head_dim, rotary_dim, interleaved):
-        return _npu_qk_norm_rope(
-            q,
-            k,
-            q_weight,
-            k_weight,
-            rope_table,
-            eps,
-            rotary_dim,
-        )
     if not _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved):
         return _fused_qk_norm_rope_impl(
             q,

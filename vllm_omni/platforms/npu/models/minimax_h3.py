@@ -9,7 +9,6 @@ import json
 import os
 from importlib.util import find_spec
 from pathlib import Path
-from types import MethodType
 from typing import Any
 
 import torch
@@ -24,7 +23,6 @@ from vllm_omni.platforms.npu.layers.rotary_embedding import (
 logger = init_logger(__name__)
 
 _QKV = "EagleSplitNormRopeConcat"
-_SWIGLU = "EagleQuantBatchMatmulSwiglu"
 
 _ROPE_PATCHED = False
 _SDPA_PATCHED = False
@@ -124,129 +122,46 @@ def apply_minimax_h3_qwen3vl_swiglu_patch() -> None:
     _SWIGLU_PATCHED = True
 
 
-def _has_eagle_kernel(kernels: Path, registration: object) -> bool:
-    binaries = registration.get("binaryList") if isinstance(registration, dict) else None
-    if not isinstance(binaries, list):
+def supports_minimax_h3_eagle_qkv(early_opp_paths: frozenset[str]) -> bool:
+    """Check for an early-registered EagleSplitNormRopeConcat BF16 kernel on this SoC."""
+    if not early_opp_paths:
         return False
-    for entry in binaries:
-        try:
-            if (kernels / entry["binPath"]).is_file():
-                return True
-        except (OSError, ValueError, TypeError, KeyError):
-            continue
-    return False
-
-
-def _npu_project_qkv(
-    self: Any, x: torch.Tensor, rope_table: torch.Tensor | None, vdn_window=None
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    heads = [self.num_heads, self.num_kv_heads, self.num_kv_heads]
-    rows = x.shape[0]
-    qkv_numel = rows * sum(heads) * self.head_dim
-    eps = self.q_norm.variance_epsilon
-    if (
-        x.dtype != torch.bfloat16
-        or rope_table is None
-        or (self.vdn is not None and vdn_window is None)
-        or not 0 < qkv_numel <= torch.iinfo(torch.int32).max
-    ):
-        return type(self)._project_qkv(self, x, rope_table, vdn_window)
-
-    qkv, _ = self.qkv_proj(x)
-    packed = qkv.view(rows, sum(heads), self.head_dim)
-    q_raw, k_raw, v = packed.split(heads, dim=1)
-    try:
-        from mindiesd.fused_ops import eagle_split_norm_rope_concat
-
-        # Eagle takes contiguous cosine and sine halves of H3's packed RoPE table.
-        cos, sin = rope_table.reshape(rows, 2, self.rot_dim // 2).transpose(0, 1).contiguous().unbind(0)
-        q, k, v = eagle_split_norm_rope_concat(
-            packed.contiguous(),
-            self.q_norm.weight.contiguous(),
-            self.k_norm.weight.contiguous(),
-            cos,
-            sin,
-            heads,
-            norm_type=3,  # weighted RMSNorm
-            rope_mode=1,  # HALF (NeoX)
-            rotary_dim=self.rot_dim,
-            epsilon=eps,
-            output_bnsd=False,
-        )
-    except ImportError:
-        from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
-
-        q, k = fused_qk_norm_rope(q_raw, k_raw, self.q_norm.weight, self.k_norm.weight, rope_table, eps)
-    return q, k, v, q_raw, k_raw
-
-
-def forward_h3_mlp(self: Any, x: torch.Tensor) -> torch.Tensor:
-    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-
-    from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
-
-    # LoRA can wrap fc1 after the platform installs this forward.
-    if (
-        x.dtype != torch.bfloat16
-        or type(self.fc1) is not MergedColumnParallelLinear
-        or not isinstance(self.fc1.quant_method, NPUInt8LinearMethod)
-    ):
-        return type(self).forward(self, x)
-
-    try:
-        from mindiesd.fused_ops import eagle_quant_batch_matmul_swiglu
-
-        quantized_x, scale = torch_npu.npu_dynamic_quant(x.reshape(-1, x.shape[-1]))
-        hidden = eagle_quant_batch_matmul_swiglu(
-            quantized_x, self.fc1.weight, self.fc1.weight_scale, pertoken_scale=scale, output_dtype=x.dtype
-        )
-    except ImportError:
-        return type(self).forward(self, x)
-
-    out, _ = self.fc2(hidden.reshape(*x.shape[:-1], -1))
-    return out
-
-
-def apply_minimax_h3_dit_fusions(model: torch.nn.Module, early_opp_paths: frozenset[str]) -> None:
-    """Bind eligible H3 blocks without changing classes or loading MindIE-SD on other platforms."""
-    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3DiTBlock, MiniMaxH3MLP
-
     try:
         from vllm_ascend.utils import get_ascend_device_type
 
         soc = {"A2": "ascend910b", "A5": "ascend950"}.get(get_ascend_device_type().name)
     except (ImportError, KeyError, RuntimeError):
-        return
-    if soc is None or not early_opp_paths:
-        return
+        return False
+    if soc is None:
+        return False
+
     sdk = find_spec("mindiesd")
     if sdk is None or sdk.origin is None:
-        return
+        return False
     vendor = (Path(sdk.origin).parent / "ops/vendors/aie_ascendc").resolve()
     active_paths = early_opp_paths.intersection(os.getenv("ASCEND_CUSTOM_OPP_PATH", "").split(os.pathsep))
     if not any(Path(path).resolve() == vendor for path in active_paths):
-        return
+        return False
+
     tbe = vendor / "op_impl/ai_core/tbe"
     kernels = tbe / "kernel"
     try:
         op_info = json.loads((tbe / "config" / soc / f"aic-{soc}-ops-info.json").read_text(encoding="utf-8"))
+        if not isinstance(op_info, dict) or _QKV not in op_info:
+            return False
         index = json.loads((kernels / "config" / soc / "binary_info_config.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
-    if not isinstance(index, dict) or not isinstance(op_info, dict):
-        return
-    use_qkv = _QKV in op_info and _has_eagle_kernel(kernels, index.get(_QKV))
-    use_swiglu = soc == "ascend910b" and _SWIGLU in op_info and _has_eagle_kernel(kernels, index.get(_SWIGLU))
-    fp32 = torch.finfo(torch.float32)
-    for module in model.modules():
-        if use_qkv and isinstance(module, MiniMaxH3DiTBlock):
-            attn = module.attn
-            eps = attn.q_norm.variance_epsilon
-            if (
-                (attn.head_dim, attn.rot_dim) == (128, 96)
-                and fp32.tiny <= eps <= fp32.max
-                and eps == attn.k_norm.variance_epsilon
-            ):
-                attn._project_qkv = MethodType(_npu_project_qkv, attn)  # type: ignore[method-assign]
-        elif use_swiglu and isinstance(module, MiniMaxH3MLP):
-            module.forward = MethodType(forward_h3_mlp, module)  # type: ignore[method-assign]
+        binaries = index[_QKV]["binaryList"]
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    if not isinstance(binaries, list):
+        return False
+    for entry in binaries:
+        try:
+            if not (kernels / entry["binPath"]).is_file():
+                continue
+            info = json.loads((kernels / entry["jsonPath"]).read_text(encoding="utf-8"))["supportInfo"]
+            if info["inputs"][0]["dtype"] == info["outputs"][0]["dtype"] == "bfloat16":
+                return True
+        except (OSError, ValueError, TypeError, KeyError, IndexError):
+            continue
+    return False

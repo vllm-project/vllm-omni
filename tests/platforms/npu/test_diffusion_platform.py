@@ -5,7 +5,7 @@ import importlib.util
 import json
 import runpy
 import sys
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -70,33 +70,6 @@ def test_strict_ulysses_paged_backend_bypasses_ascend_pcp() -> None:
     assert backend.get_builder_cls() is AscendAttentionMetadataBuilder
 
 
-def _write_eagle_kernel(kernels, soc, op, *, binary=True):
-    path = kernels / soc / op / "kernel.o"
-    if binary:
-        path.parent.mkdir(parents=True)
-        path.touch()
-    return {"binaryList": [{"binPath": path.relative_to(kernels).as_posix()}]}
-
-
-def _qkv_inputs():
-    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3Attention
-
-    attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
-    nn.Module.__init__(attention)
-    attention.num_heads = attention.num_kv_heads = 2
-    attention.head_dim = 128
-    attention.rot_dim = 96
-    attention.vdn = None
-    attention.qkv_proj = lambda x: (x, None)
-    for name in ("q_norm", "k_norm"):
-        norm = nn.RMSNorm(attention.head_dim, eps=1e-5, dtype=torch.bfloat16)
-        norm.variance_epsilon = norm.eps
-        setattr(attention, name, norm)
-    packed = torch.randn(7, 3 * attention.num_heads * attention.head_dim, dtype=torch.bfloat16)
-    table = torch.arange(7 * attention.rot_dim).reshape(7, attention.rot_dim).to(packed.dtype)
-    return attention, packed, table
-
-
 @pytest.fixture(scope="module")
 def h3():
     with pytest.MonkeyPatch.context() as patch:
@@ -107,46 +80,50 @@ def h3():
 
 @pytest.fixture
 def eagle_qkv(monkeypatch):
+    from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
+
     op = Mock()
     monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_split_norm_rope_concat=op))
+    monkeypatch.setattr(fused, "_fused_npu_supported", lambda *args: True)
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(npu_rms_norm=lambda x, weight, epsilon: (x,), npu_rotary_mul=lambda x, cos, sin: x),
+    )
     return op
 
 
 @pytest.mark.diffusion
-class TestMiniMaxH3Fusions:
+class TestEagleSplitNormRopeConcat:
     @pytest.mark.parametrize(
-        ("device", "soc", "registered", "late", "expected"),
+        ("device", "soc", "kernel", "late", "expected"),
         [
-            ("A2", "ascend910b", "both", False, (True, True)),
-            ("A2", "ascend910b", "qkv", False, (True, False)),
-            ("A2", "ascend910b", "swiglu", False, (False, True)),
-            ("A2", "ascend910b", "both", True, (False, False)),
-            ("A5", "ascend950", "both", False, (True, False)),
-            ("A5", "ascend910b", "both", False, (False, False)),
+            ("A2", "ascend910b", "bfloat16", False, True),
+            ("A2", "ascend910b", "float16", False, False),
+            ("A2", "ascend910b", None, False, False),
+            ("A2", "ascend910b", "bfloat16", True, False),
+            ("A5", "ascend950", "bfloat16", False, True),
+            ("A5", "ascend910b", "bfloat16", False, False),
         ],
     )
-    def test_h3_platform_installs_registered_fusions(
-        self, tmp_path, monkeypatch, h3, device, soc, registered, late, expected
-    ):
-        from vllm_omni.diffusion.models.minimax_h3.controlnet import MiniMaxH3ControlBlock
-        from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3DiTBlock, MiniMaxH3MLP
-        from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3TokenRefinerBlock
+    def test_h3_platform_enables_registered_qkv(self, tmp_path, monkeypatch, h3, device, soc, kernel, late, expected):
         from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
         sdk = tmp_path / "mindiesd"
         vendor = sdk / "ops/vendors/aie_ascendc"
-        kernels = vendor / "op_impl/ai_core/tbe/kernel"
-        index = {
-            h3._QKV: _write_eagle_kernel(kernels, soc, h3._QKV, binary=registered != "swiglu"),
-            h3._SWIGLU: _write_eagle_kernel(kernels, soc, h3._SWIGLU),
-        }
+        tbe = vendor / "op_impl/ai_core/tbe"
+        kernels = tbe / "kernel"
         config = kernels / "config" / soc
         config.mkdir(parents=True)
-        (config / "binary_info_config.json").write_text(json.dumps(index))
-        op_info = {h3._QKV: {}} if registered == "qkv" else dict.fromkeys(index, {})
-        config = kernels.parent / "config" / soc
+        entry = {"binPath": "qkv.o", "jsonPath": "qkv.json"}
+        if kernel is not None:
+            (kernels / "qkv.o").touch()
+            support = {"inputs": [{"dtype": kernel}], "outputs": [{"dtype": kernel}]}
+            (kernels / "qkv.json").write_text(json.dumps({"supportInfo": support}))
+        (config / "binary_info_config.json").write_text(json.dumps({h3._QKV: {"binaryList": [entry]}}))
+        config = tbe / "config" / soc
         config.mkdir(parents=True)
-        (config / f"aic-{soc}-ops-info.json").write_text(json.dumps(op_info))
+        (config / f"aic-{soc}-ops-info.json").write_text(json.dumps({h3._QKV: {}}))
         (sdk / "__init__.py").write_text(f"import os\nos.environ['ASCEND_CUSTOM_OPP_PATH'] = {str(vendor)!r}\n")
         monkeypatch.syspath_prepend(str(tmp_path))
         monkeypatch.setitem(sys.modules, "mindiesd", None)
@@ -163,112 +140,70 @@ class TestMiniMaxH3Fusions:
         monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
         pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
         nn.Module.__init__(pipeline)
+        od_config = SimpleNamespace(model_class_name="MiniMaxH3Pipeline")
 
-        def make_block(cls):
-            block = cls.__new__(cls)
-            nn.Module.__init__(block)
-            block.attn, _, _ = _qkv_inputs()
-            block.mlp = MiniMaxH3MLP.__new__(MiniMaxH3MLP)
-            nn.Module.__init__(block.mlp)
-            return block
+        platform.apply_diffusion_model_patches(pipeline, od_config)
 
-        main, short_rope, zero_eps, unequal_eps = [make_block(MiniMaxH3DiTBlock) for _ in range(4)]
-        short_rope.attn.rot_dim = 48
-        zero_eps.attn.q_norm.variance_epsilon = zero_eps.attn.k_norm.variance_epsilon = 0
-        unequal_eps.attn.k_norm.variance_epsilon = 1e-4
-        refiner = make_block(MiniMaxH3TokenRefinerBlock)
-        control = make_block(MiniMaxH3ControlBlock)
-        pipeline.transformer = nn.Module()
-        pipeline.transformer.blocks = nn.ModuleList([main, short_rope, zero_eps, unequal_eps])
-        pipeline.transformer.token_refiner = nn.Module()
-        pipeline.transformer.token_refiner.blocks = nn.ModuleList([refiner])
-        pipeline.transformer.controlnet = nn.Module()
-        pipeline.transformer.controlnet.control_blocks = nn.ModuleList([control])
+        assert od_config._minimax_h3_eagle_qkv is expected
 
-        platform.apply_diffusion_model_patches(pipeline, SimpleNamespace(model_class_name="MiniMaxH3Pipeline"))
+    def test_qkv_reuses_k_for_value_and_packs_rope(self, eagle_qkv):
+        from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
+        from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 
-        use_qkv, use_swiglu = expected
-        for block in (main, control):
-            assert (block.attn._project_qkv.__func__ is h3._npu_project_qkv) == use_qkv
-        for block in (short_rope, zero_eps, unequal_eps, refiner):
-            assert "_project_qkv" not in vars(block.attn)
-        for block in (main, refiner):
-            assert block.mlp.forward.__func__ is (h3.forward_h3_mlp if use_swiglu else MiniMaxH3MLP.forward)
-
-    def test_project_qkv_calls_eagle_with_local_rope_halves(self, h3, eagle_qkv):
-        attention, packed, table = _qkv_inputs()
-        attention.vdn = nn.Identity()
-        q, k, _ = packed.view(7, 6, 128).split(2, dim=1)
+        q = torch.randn(7, 4, 128, dtype=torch.bfloat16)
+        k = torch.randn(7, 2, 128, dtype=q.dtype)
+        qw, kw = torch.randn(2, 128, dtype=q.dtype).unbind()
+        table = torch.arange(7 * 96).reshape(7, 96).to(q.dtype)
         outputs = (object(), object(), object())
         eagle_qkv.return_value = outputs
-        attention._project_qkv = MethodType(h3._npu_project_qkv, attention)
-
-        actual_q, actual_k, actual_v, raw_q, raw_k = attention._project_qkv(packed, table, vdn_window=object())
+        ctx = ForwardContext(omni_diffusion_config=SimpleNamespace(_minimax_h3_eagle_qkv=True))
+        with override_forward_context(ctx):
+            assert fused_qk_norm_rope(q, k, qw, kw, table, 1e-5) == outputs[:2]
 
         eagle_qkv.assert_called_once()
-        qkv, qw, kw, cos, sin, heads = eagle_qkv.call_args.args
-        assert qkv.is_contiguous() and list(heads) == [2, 2, 2]
-        torch.testing.assert_close(qkv, packed.view(7, 6, 128), atol=0, rtol=0)
-        assert qw is attention.q_norm.weight and kw is attention.k_norm.weight
+        packed, q_weight, k_weight, cos, sin, heads = eagle_qkv.call_args.args
+        assert packed.is_contiguous() and list(heads) == [4, 2, 2]
+        torch.testing.assert_close(packed, torch.cat((q, k, k), dim=1), atol=0, rtol=0)
+        assert qw is q_weight and kw is k_weight
         assert cos.is_contiguous() and sin.is_contiguous()
         torch.testing.assert_close(cos, table[:, :48], atol=0, rtol=0)
         torch.testing.assert_close(sin, table[:, 48:], atol=0, rtol=0)
         assert eagle_qkv.call_args.kwargs == dict(
             norm_type=3, rope_mode=1, rotary_dim=96, epsilon=1e-5, output_bnsd=False
         )
-        assert (actual_q, actual_k, actual_v) == outputs
-        for actual, expected in ((raw_q, q), (raw_k, k)):
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("mode", ["other_pipeline", "fp32_rope", "missing_native"])
+    def test_qkv_falls_back_to_npu_primitives(self, eagle_qkv, mode):
+        from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
+        from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
+
+        q, k = torch.randn(2, 7, 2, 128, dtype=torch.bfloat16).unbind()
+        weight = torch.ones(128, dtype=q.dtype)
+        table = torch.ones(7, 96, dtype=torch.float32 if mode == "fp32_rope" else q.dtype)
+        config = SimpleNamespace() if mode == "other_pipeline" else SimpleNamespace(_minimax_h3_eagle_qkv=True)
+        eagle_qkv.side_effect = ImportError("native QKV unavailable")
+
+        with override_forward_context(ForwardContext(omni_diffusion_config=config)):
+            actual_q, actual_k = fused_qk_norm_rope(q, k, weight, weight, table, 1e-5)
+
+        assert eagle_qkv.called == (mode == "missing_native")
+        torch.testing.assert_close(actual_q, q, atol=0, rtol=0)
+        torch.testing.assert_close(actual_k, k, atol=0, rtol=0)
 
     @pytest.mark.parametrize(("rows", "use_eagle"), [(99_864, True), (99_865, False)])
-    def test_project_qkv_eagle_numel_limit(self, h3, eagle_qkv, rows, use_eagle):
-        attention, _, _ = _qkv_inputs()
-        attention.to("meta")
-        attention.num_heads = attention.num_kv_heads = 56
-        packed = torch.empty(rows, 3 * attention.num_heads * attention.head_dim, device="meta", dtype=torch.bfloat16)
-        table = packed.new_empty((rows, attention.rot_dim))
-        eagle_qkv.return_value = (None, None, None)
-        attention._project_qkv = MethodType(h3._npu_project_qkv, attention)
+    def test_packed_qkv_numel_limit(self, eagle_qkv, rows, use_eagle):
+        from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
+        from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 
-        q, *_ = attention._project_qkv(packed, table)
+        q = torch.empty(rows, 56, 128, device="meta", dtype=torch.bfloat16)
+        k = torch.empty_like(q)
+        weight = q.new_empty((128,))
+        table = q.new_empty((rows, 96))
+        eagle_qkv.return_value = (q, k, None)
+
+        ctx = ForwardContext(omni_diffusion_config=SimpleNamespace(_minimax_h3_eagle_qkv=True))
+        with override_forward_context(ctx):
+            actual_q, actual_k = fused_qk_norm_rope(q, k, weight, weight, table, 1e-5)
 
         assert eagle_qkv.called == use_eagle
-        if not use_eagle:
-            assert q.shape == (rows, attention.num_heads, attention.head_dim)
-
-    def test_qkv_missing_native_uses_projected_values(self, h3, eagle_qkv):
-        attention, packed, table = _qkv_inputs()
-        expected = attention._project_qkv(packed, table)
-        attention.qkv_proj = Mock(wraps=attention.qkv_proj)
-        eagle_qkv.side_effect = ImportError("native QKV unavailable")
-        attention._project_qkv = MethodType(h3._npu_project_qkv, attention)
-
-        actual = attention._project_qkv(packed, table)
-
-        attention.qkv_proj.assert_called_once_with(packed)
-        eagle_qkv.assert_called_once()
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-    def test_int8_swiglu_feeds_fc2(self, monkeypatch, h3):
-        from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-
-        from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
-
-        fc1 = MergedColumnParallelLinear.__new__(MergedColumnParallelLinear)
-        nn.Module.__init__(fc1)
-        fc1.quant_method = Mock(spec=NPUInt8LinearMethod)
-        fc1.weight, fc1.weight_scale = object(), object()
-        hidden = torch.arange(30).reshape(6, 5)
-        quantize = Mock(return_value=(object(), object()))
-        eagle = Mock(return_value=hidden)
-        monkeypatch.setattr(h3, "torch_npu", SimpleNamespace(npu_dynamic_quant=quantize))
-        monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_quant_batch_matmul_swiglu=eagle))
-        x = torch.zeros(2, 3, 4, dtype=torch.bfloat16)
-        mlp = SimpleNamespace(fc1=fc1, fc2=Mock(return_value=(hidden, None)))
-
-        assert h3.forward_h3_mlp(mlp, x) is hidden
-        quantized, scale = quantize.return_value
-        eagle.assert_called_once_with(
-            quantized, fc1.weight, fc1.weight_scale, pertoken_scale=scale, output_dtype=x.dtype
-        )
-        torch.testing.assert_close(mlp.fc2.call_args.args[0], hidden.reshape(2, 3, 5))
+        assert actual_q.shape == q.shape and actual_k.shape == k.shape
