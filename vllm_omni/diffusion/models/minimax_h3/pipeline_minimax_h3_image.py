@@ -354,6 +354,13 @@ class MiniMaxH3ImagePipeline(
         if getattr(parallel, "use_hsdp", False):
             raise ValueError("MiniMax-H3-Image does not support HSDP")
 
+        additional = od_config.additional_config or {}
+        retain = additional.get("minimax_h3_retain_resident_cores", False)
+        if type(retain) is not bool:
+            raise ValueError("minimax_h3_retain_resident_cores must be a bool")
+        if retain and od_config.enable_sleep_mode:
+            raise ValueError("minimax_h3_retain_resident_cores is incompatible with sleep mode")
+
         root = self._resolve_model_root(str(od_config.model), od_config.revision)
         self.model_root = root
         model_index = json.loads((root / "model_index.json").read_text(encoding="utf-8"))
@@ -373,7 +380,6 @@ class MiniMaxH3ImagePipeline(
             json.loads((self.pdd_heads_path.parent / "pdd_config.json").read_text(encoding="utf-8"))
         )
         self.num_steps = len(self.pdd_sigmas) - 1
-        additional = od_config.additional_config or {}
         self.min_generation_area: int | None = additional.get(
             "min_generation_area", MINIMAX_H3_IMAGE_DEFAULT_MIN_GENERATION_AREA
         )
@@ -426,9 +432,6 @@ class MiniMaxH3ImagePipeline(
                     "Text reuse requires native unquantized CUDA Flash TP2/USP1/DP1",
                 )
         independent = self.transformer.independently_managed_offload_paths()
-        retain = additional.get("minimax_h3_retain_resident_cores", False)
-        if type(retain) is not bool:
-            raise ValueError("minimax_h3_retain_resident_cores must be a bool")
         if retain:
             from vllm_omni.diffusion.offloader.config import resolve_offload
 

@@ -428,6 +428,19 @@ def test_rope_follows_position_device_when_buffer_is_offloaded():
     assert freqs.device.type == "meta" and freqs.shape == (4, 96)
 
 
+def test_retained_cores_reject_sleep_before_loading_weights(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    monkeypatch.setattr(h3i, "get_local_device", lambda: torch.device("cpu"))
+    config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        enable_sleep_mode=True,
+        additional_config={"minimax_h3_retain_resident_cores": True},
+    )
+    with pytest.raises(ValueError, match="minimax_h3_retain_resident_cores.*sleep"):
+        h3i.MiniMaxH3ImagePipeline(od_config=config)
+
+
 def test_offload_plan_streams_encoder_and_keeps_graph_replayed_vae_resident():
     plan = h3i.MiniMaxH3ImagePipeline._offload_plan
     assert plan.encoder_block_attrs == {"text_encoder": ("vision.blocks", "text_model.layers")}

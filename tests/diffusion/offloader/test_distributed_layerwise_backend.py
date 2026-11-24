@@ -7,6 +7,7 @@ import gc
 import json
 import weakref
 from dataclasses import replace
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -238,6 +239,64 @@ def test_independent_cpu_weights_survive_dlo_and_reenable(
             assert restored.keys() == state.keys()
             for name, value in state.items():
                 torch.testing.assert_close(restored[name], value, atol=0, rtol=0)
+
+
+def _run_tp_resident_retry(rank, rendezvous):
+    from vllm.distributed import parallel_state
+
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_image import MiniMaxH3ImagePipeline
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            tp = SimpleNamespace(world_size=2, cpu_group=dist.group.WORLD)
+            patch.setattr(parallel_state, "_TP", tp)
+            patch.setattr(parallel_state, "_PP", SimpleNamespace(world_size=1))
+            patch_offload_runtime(patch, current_omni_platform, synchronize=True)
+            pipeline = _independent_projection_pipeline()
+            pipeline._offload_plan = replace(pipeline._offload_plan, retain_resident_storage=True)
+            backend = DistributedLayerwiseOffloadBackend(
+                OffloadConfig(
+                    strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                    pin_cpu_memory=False,
+                    dlo_use_allgather=False,
+                    dlo_resident_layers=5,
+                    components=frozenset({"dit"}),
+                ),
+                torch.device("cpu"),
+            )
+            x = torch.ones(1, 2)
+            with torch.no_grad():
+                expected = pipeline.transformer(x)
+                backend.enable(pipeline)
+
+                def fail(*args):
+                    raise torch.OutOfMemoryError("injected resident OOM")
+
+                denoise_scope = MiniMaxH3ImagePipeline._resident_dit_layers_on_device
+                with pytest.MonkeyPatch.context() as fault:
+                    if rank == 1:
+                        fault.setattr(backend._resident_layer_group, "_bind_device_buffers", fail)
+                    with pytest.raises(torch.OutOfMemoryError):
+                        with denoise_scope(pipeline):
+                            pytest.fail(f"Rank {rank} entered denoise after its peer failed")
+
+                assert pipeline.transformer.blocks[0].core.weight.numel() == 0
+                assert not backend._resident_layer_group._gpu_buffers
+                with denoise_scope(pipeline):
+                    actual = pipeline.transformer(x)
+                    peers = [torch.empty_like(actual) for _ in range(2)]
+                    dist.all_gather(peers, actual)
+                    torch.testing.assert_close(peers[rank], expected)
+                backend.disable()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_tp_resident_load_failure_allows_next_request(tmp_path):
+    torch.multiprocessing.spawn(_run_tp_resident_retry, args=(str(tmp_path / "rendezvous"),), nprocs=2)
 
 
 @pytest.mark.parametrize("shared_storage", [False, True])
@@ -2157,6 +2216,28 @@ class TestCrossGroupSharedBuffer:
     buffers, the first block of each group must always sync-prefetch on
     entry, because another group may have overwritten the shared slot.
     """
+
+    def test_reenter_streamed_group_after_explicit_offload(self, patched_offload_runtime):
+        pipeline = _independent_projection_pipeline()
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE, pin_cpu_memory=False, dlo_use_allgather=False
+            ),
+            torch.device("cpu"),
+        )
+        refiner = pipeline.transformer.token_refiner
+        x = torch.ones(1, 2)
+        with torch.no_grad():
+            expected = refiner(x)
+            backend.enable(pipeline)
+            torch.testing.assert_close(refiner(x), expected)
+            # Encoder scope exit drops the bindings even if its tail still owns
+            # the first block's slot when the request aborts before denoise.
+            for hooks in backend._all_hook_groups:
+                for hook in hooks:
+                    hook.offload_layer()
+            torch.testing.assert_close(refiner(x), expected)
+            backend.disable()
 
     def test_group_first_hook_forces_sync_prefetch(self, dist_group, patched_offload_runtime):
         """Verify _is_group_first=True forces sync-prefetch in pre_forward

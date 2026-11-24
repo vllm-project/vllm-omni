@@ -217,9 +217,11 @@ keeping the backing allocations. The next scope rebinds those allocations
 without another H2D copy.
 
 Retained backing stays allocated during subsequent encoder and VAE stages.
-It consumes physical device memory and is separate from the free allocator
-cache policy below. A failed load drains pending transfers, restores placeholders,
-and discards partial backing so the next request can retry. If rollback fails,
+The request-time allocations sit outside the sleep allocator's pools, so
+H3-Image rejects retention when sleep mode is enabled. A failed load drains pending transfers, restores placeholders,
+and discards partial backing. TP ranks agree on the load result on their CPU
+group before denoising. If any rank fails, its peers release their loaded
+backing so the next request can retry. If local rollback fails,
 disable restores ordinary CPU tensors, releases the backing, and clears the
 failure state. Base weights must stay immutable
 until this disable, update, and re-enable cycle completes.

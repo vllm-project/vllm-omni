@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import torch
+import torch.distributed as dist
 
 from vllm_omni.platforms import current_omni_platform
 
@@ -14,6 +17,32 @@ def get_local_device() -> torch.device:
         return current_omni_platform.get_torch_device(current_omni_platform.current_device())
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     return current_omni_platform.get_torch_device(local_rank)
+
+
+@contextmanager
+def sync_stage_errors(stage: str, cpu_group: dist.ProcessGroup, status_tensor: torch.Tensor) -> Iterator[None]:
+    """Agree on local-stage failures before entering the next collective."""
+    status = 0
+    message = ""
+    try:
+        yield
+    except torch.OutOfMemoryError as error:
+        status = 1
+        message = str(error)
+    except Exception as error:
+        # A non-retryable error takes precedence over OOM on another rank.
+        status = 2
+        message = f"{type(error).__name__}: {error}"
+
+    status_tensor.fill_(status)
+    dist.all_reduce(status_tensor, op=dist.ReduceOp.MAX, group=cpu_group)
+    global_status = status_tensor.item()
+    if global_status == 2:
+        detail = message if status == 2 else "another rank failed"
+        raise RuntimeError(f"{stage} failed: {detail}")
+    if global_status == 1:
+        detail = message if status == 1 else "another rank ran out of memory"
+        raise torch.OutOfMemoryError(f"{stage} failed: {detail}")
 
 
 def build_local_sp_padding_mask(

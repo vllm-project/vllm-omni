@@ -169,7 +169,8 @@ can also avoid its H2D load on subsequent requests:
 --additional-config '{"minimax_h3_retain_resident_cores":true}'
 ```
 
-This option defaults to false and requires a positive `resident_layers` count.
+This option defaults to false and requires a positive `resident_layers` count
+and sleep mode disabled.
 It keeps those core allocations live during later text encoding and VAE
 decoding, including graph capture. Validate cold and warmed memory headroom
 before enabling it. The parameter bindings remain placeholders outside the

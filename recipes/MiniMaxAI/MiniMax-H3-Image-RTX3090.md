@@ -59,13 +59,12 @@ of that measurement.
 
 ## Prepare the source and runtime
 
-Use the `codex/h3-image-3090-opt` branch of the `barkly1te/vllm-omni` fork.
-Its optimizations are required by the options below. Record the exact source
-commit with the runtime versions when reproducing a result.
+Use an upstream checkout that includes this recipe and its runtime options.
+The [paired comparison](#reproduce-the-paired-six-prompt-comparison) gives
+exact revisions for reproducing the earlier measurements.
 
 ```bash
-git clone --branch codex/h3-image-3090-opt \
-  https://github.com/barkly1te/vllm-omni.git
+git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 git rev-parse HEAD
 uv venv --python 3.12 --seed
@@ -75,8 +74,7 @@ source .venv/bin/activate
 Follow the [CUDA source installation guide](../../docs/getting_started/installation/gpu.md#build-from-source)
 for the vLLM, PyTorch, driver, and cuDNN versions required by your checkout.
 Install Omni from this checkout with `uv pip install -e .`, and keep the
-guide's cuDNN library exports in the server shell. Do not use the published
-Omni 0.32.0 installation commands for this branch. Finish with:
+guide's cuDNN library exports in the server shell. Verify the installation:
 
 ```bash
 uv pip check
@@ -147,7 +145,8 @@ decode. Text refinement reuse keeps the first result only within one denoise
 invocation. All six steps and every main DiT block still run.
 
 Keep base weights immutable while offload is enabled. Disable offload before
-changing weights, then enable it again. This combination requires native CUDA
+changing weights, then enable it again. Leave sleep mode disabled when
+retaining cores. This combination requires native CUDA
 Flash Attention, TP2, USP1, DP1, and unquantized weights. HWR, AllGather, and
 HSDP are outside this profile. See [exact AdaLN staging](../../docs/user_guide/diffusion/offloader/distributed_layerwise_offload.md#minimax-h3-image-exact-adaln-staging)
 for the compatibility rules.
@@ -199,6 +198,31 @@ decode. For example, in a separate terminal:
 ```bash
 nvidia-smi --query-gpu=timestamp,index,memory.used,memory.total \
   --format=csv --loop=1
+```
+
+## Reproduce the paired six-prompt comparison
+
+The [PR test results](https://github.com/vllm-project/vllm-omni/pull/10243)
+record a comparison with vLLM 0.34.0 and PyTorch 2.14.0+cu130. From the
+upstream checkout, create a worktree for each tested revision:
+
+```bash
+baseline=e5f80c9480f6f1765825052a88cdc9717ffe8f78
+optimized=b5ca5574f9387139cda4408a04968bf1e68d9917
+git fetch origin "$baseline" "$optimized"
+git worktree add --detach ../vllm-omni-3090-baseline "$baseline"
+git worktree add --detach ../vllm-omni-3090-optimized "$optimized"
+```
+
+Install each checkout into its own environment. Run the services in turn on
+the same GPUs with the same weights, prompts, and seeds. Set
+`--host-weight-runtime-mode disabled` on both. Use the server command above
+for the optimized checkout. On the baseline, omit `--cache-config` and use
+these two configuration arguments:
+
+```bash
+--diffusion-offload-config '{"mode":"layer","components":["dit","text_encoder"]}' \
+  --additional-config '{"min_generation_area":4194304}'
 ```
 
 ## Historical qualification

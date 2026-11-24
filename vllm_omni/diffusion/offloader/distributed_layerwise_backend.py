@@ -29,8 +29,10 @@ from typing import Any
 import torch
 import torch.distributed
 from torch import nn
+from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_initialized
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.distributed.utils import sync_stage_errors
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
@@ -730,7 +732,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         if self._shared_slot_owner is not None:
             self._shared_slot_owner[slot] = id(self)
 
-        # Re-point using cached metadata (avoids per-layer dict lookups).
+        self._bind_next_block(gpu_weights)
+
+    def _bind_next_block(self, gpu_weights: dict[torch.dtype, torch.Tensor]) -> None:
         for target, dtype, offset, numel, shape, stride in self._cached_repoint:
             set_tensor_storage(
                 target,
@@ -842,6 +846,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             if slot_contaminated:
                 # Another group (or no group) wrote to our slot — re-fetch
                 self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
+            elif not self.is_materialized:
+                # Component offload can clear the bindings while the tail's
+                # prefetch still owns this slot (e.g. a retry before denoise).
+                weights = self._prev_hook.gpu_buffers[self.current_slot]
+                assert weights is not None
+                self._prev_hook._bind_next_block(weights)
             # Always wait for data to be ready (handles both sync and async paths)
             self._prev_hook._wait_for_weights(self.current_slot)
         elif (not self.is_materialized or weights_overwritten) and self._prev_hook is not None:
@@ -1122,7 +1132,7 @@ class PinnedResidentLayerGroup:
 
         current_omni_platform.current_stream().wait_event(ready)
 
-    def offload(self) -> None:
+    def offload(self, *, release_storage: bool = False) -> None:
         if not self.loaded:
             return
 
@@ -1133,7 +1143,7 @@ class PinnedResidentLayerGroup:
         for state in self._states:
             for target in state["targets"].values():
                 set_tensor_storage(target, make_offload_placeholder(target))
-        if not self.retain_device_storage:
+        if release_storage or not self.retain_device_storage:
             self._gpu_buffers.clear()
         self.loaded = False
 
@@ -1219,8 +1229,23 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
     def load_resident_layers(self) -> None:
         """Load the model-declared leading blocks for the denoise stage."""
-        if self._resident_layer_group is not None:
-            self._resident_layer_group.load()
+        resident = self._resident_layer_group
+        if resident is None:
+            return
+        tp = get_tp_group() if model_parallel_is_initialized() else None
+        if tp is None or tp.world_size == 1:
+            resident.load()
+            return
+
+        # A peer may have no device memory left. Agree on the CPU group before
+        # any rank enters the DiT's first tensor-parallel collective.
+        status = torch.empty((), dtype=torch.int32, device="cpu")
+        try:
+            with sync_stage_errors("Resident DiT load", tp.cpu_group, status):
+                resident.load()
+        except Exception:
+            resident.offload(release_storage=True)
+            raise
 
     def offload_resident_layers(self) -> None:
         """Release leading blocks before VAE decode to bound peak HBM."""

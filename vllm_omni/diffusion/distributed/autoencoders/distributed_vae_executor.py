@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import torch
@@ -12,6 +11,7 @@ import torch.distributed as dist
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+from vllm_omni.diffusion.distributed.utils import sync_stage_errors
 
 logger = init_logger(__name__)
 
@@ -62,30 +62,8 @@ class DistributedVaeExecutor:
         self.parallel_size = parallel_size
         self.parallel_mode = mode
 
-    @contextmanager
     def _sync_errors(self, stage: str):
-        """Agree on local-stage failures before entering the next collective."""
-        status = 0
-        message = ""
-        try:
-            yield
-        except torch.OutOfMemoryError as error:
-            status = 1
-            message = str(error)
-        except Exception as error:
-            # A non-retryable error takes precedence over OOM on another rank.
-            status = 2
-            message = f"{type(error).__name__}: {error}"
-
-        self._error_status.fill_(status)
-        dist.all_reduce(self._error_status, op=dist.ReduceOp.MAX, group=self._error_group)
-        global_status = self._error_status.item()
-        if global_status == 2:
-            detail = message if status == 2 else "another rank failed"
-            raise RuntimeError(f"Distributed VAE {stage} failed: {detail}")
-        if global_status == 1:
-            detail = message if status == 1 else "another rank ran out of memory"
-            raise torch.OutOfMemoryError(f"Distributed VAE {stage} failed: {detail}")
+        return sync_stage_errors(f"Distributed VAE {stage}", self._error_group, self._error_status)
 
     def gather_tensors(self, tensor: torch.Tensor):
         """Gather tile data to WORLD rank zero with guarded receive allocations."""
