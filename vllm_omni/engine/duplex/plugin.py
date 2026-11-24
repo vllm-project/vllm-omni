@@ -61,6 +61,10 @@ class DuplexRuntimeConfigError(ValueError):
         self.code = code
 
 
+class DuplexContextChangedError(DuplexRuntimeConfigError):
+    """Reject a stale prepared prompt before admission, permitting a client retry."""
+
+
 def validate_session_tools(capabilities: DuplexCapabilities, extra_body: Mapping[str, object]) -> None:
     """Refuse tool settings this model would otherwise silently ignore.
 
@@ -644,6 +648,18 @@ class DuplexModelPlugin(ABC):
     ) -> dict[str, object]:
         """Add model-owned context before planning an append on the session loop."""
         return config
+
+    uses_context_ledger: bool = False
+
+    def observe_history_context(
+        self,
+        *,
+        snapshot: DuplexHistorySnapshot,
+        ledger: DuplexContextLedger,
+        state: DuplexModelSessionState,
+        runtime_config: Mapping[str, object],
+    ) -> None:
+        """Observe versioned sources on the session owner loop, never a worker thread."""
 
     async def prepare_auxiliary_request(
         self,

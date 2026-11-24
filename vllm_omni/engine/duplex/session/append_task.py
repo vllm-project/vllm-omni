@@ -31,7 +31,12 @@ from dataclasses import dataclass
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexSessionState, DuplexTurnEventType
-from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError, PcmAppendReservation, settle_response_runtime
+from vllm_omni.engine.duplex.plugin import (
+    DuplexContextChangedError,
+    DuplexInputCapacityError,
+    PcmAppendReservation,
+    settle_response_runtime,
+)
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
@@ -76,7 +81,7 @@ class AppendAttempt:
     on_append_prepared: Callable[[], None] | None = None
     #: Last chance to call the append off, checked once the predecessor is done.
     before_append: Callable[[], bool] | None = None
-    #: Input eligibility consumed before this append; restored only on capacity rejection.
+    #: Input eligibility consumed before this append; restored on retryable admission rejection.
     unanswered_source_ids: tuple[int, ...] = ()
 
     # ------------------------------------------------------------------ #
@@ -243,7 +248,7 @@ class AppendAttempt:
             return append_ok
         except asyncio.CancelledError:
             raise
-        except DuplexInputCapacityError as exc:
+        except (DuplexInputCapacityError, DuplexContextChangedError) as exc:
             self.abandon(reason=exc.code)
             if not self.ctx.run.closing and session.state == DuplexSessionState.OPEN and session.epoch == self.epoch:
                 session.restore_unanswered_user_sources(self.unanswered_source_ids)
