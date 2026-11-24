@@ -191,9 +191,11 @@ def _apply_contiguous_kv_patch() -> None:
 
     if runner_module is None:
         logger.error(
-            "[npu] contiguous KV patch NOT applied: no vllm-ascend consumer module exposes "
-            "requires_contiguous_pa_kv_cache (%s). The KV cache stays strided, and the one-query "
-            "FIA graph pays for the stride indirection on every frame.",
+            "[npu] contiguous KV patch could not be bound: no vllm-ascend consumer module exposes "
+            "requires_contiguous_pa_kv_cache (%s). The K-step Talker override is not applied through "
+            "this path. This does not establish the effective layout: apply_contiguous_kv_patch() "
+            "runs earlier and transplants the platform-level override onto "
+            "vllm_ascend.attention.utils, so check the live layout separately.",
             "; ".join(import_errors),
         )
         return

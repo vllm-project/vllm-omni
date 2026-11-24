@@ -51,8 +51,12 @@ def test_error_when_no_candidate_imports(monkeypatch, caplog):
     records = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert records, "a failed binding must not be silent"
     message = " ".join(r.getMessage() for r in records)
-    assert "contiguous KV patch NOT applied" in message
-    assert "strided" in message
+    assert "could not be bound" in message
+    # The consumer lookup failing does not establish the effective layout: the
+    # platform-level patch runs earlier and may still be in effect.
+    assert "does not establish the effective layout" in message
+    assert "apply_contiguous_kv_patch()" in message
+    assert "strided" not in message
 
 
 def test_error_when_the_symbol_is_missing(monkeypatch, caplog):
