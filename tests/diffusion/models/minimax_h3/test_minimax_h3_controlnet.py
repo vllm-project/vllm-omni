@@ -29,6 +29,7 @@ class CPUAttention(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
         self.attn_backend = SimpleNamespace(
+            get_name=lambda: "FLASH_ATTN",
             supports_packed_mask_free=lambda: False,
             supports_prefix_kv_slicing=False,
         )

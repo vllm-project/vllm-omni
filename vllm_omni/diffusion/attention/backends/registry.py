@@ -65,6 +65,7 @@ class DiffusionAttentionBackendEnum(Enum, metaclass=_DiffusionBackendEnumMeta):
     FLASHINFER_ATTN = "vllm_omni.diffusion.attention.backends.flashinfer_attn.FlashInferAttentionBackend"
     FASTVIDEO_VSA = "vllm_omni.diffusion.attention.backends.fastvideo_vsa.FastVideoVSABackend"
     VDNH3_ATTN = "vllm_omni.diffusion.attention.backends.vdnh3_attn.VDNAttentionBackend"
+    SLA_ATTN = "vllm_omni.diffusion.attention.backends.sla_attn.SLAAttentionBackend"
     FLASH_ATTN_HUB = "vllm_omni.diffusion.attention.backends.flash_attn_hub.FlashAttentionHubBackend"
     FLASH_ATTN_3_HUB = "vllm_omni.diffusion.attention.backends.flash_attn_hub.FlashAttention3HubBackend"
     TRTLLM_ATTN = "vllm_omni.diffusion.attention.backends.trtllm_attn.TrtllmAttentionBackend"
