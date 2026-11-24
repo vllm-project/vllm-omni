@@ -13,6 +13,43 @@ pytestmark = pytest.mark.core_model
 
 
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+def test_precomputed_rope_uses_spatial_decode_positions_per_slot():
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu.mm.rope import get_rope_state
+
+    from vllm_omni.worker_v2.model_states.omni_model_state import _make_safe_get_rope
+
+    device = torch.device(DEVICE_TYPE, 0)
+    grid = torch.tensor([[0, 1, 2, 2, 2, 2], [0, 1, 2, 2, 3, 3], [0, 1, 2, 3, 2, 3]])
+    model = SimpleNamespace(precomputed_mrope_decode=True, get_mrope_input_positions=lambda *_: (grid, 7))
+    rope = _make_safe_get_rope(get_rope_state)(
+        SimpleNamespace(uses_mrope=True, mrope_num_dims=3),
+        model,
+        max_num_reqs=2,
+        max_num_tokens=8,
+        max_model_len=5,
+        device=device,
+    )
+    # The grid for slot 1 exceeds capacity. Slot 0 is reused with a shorter grid.
+    for slot in (0, 1):
+        rope.init_prefill_positions(slot, model, [11, 22], [])
+    rope.apply_staged_writes()
+    model.get_mrope_input_positions = lambda *_: (grid[:, :3], 7)
+    rope.init_prefill_positions(0, model, [11, 22], [])
+    rope.apply_staged_writes()
+
+    def ids(values):
+        return torch.tensor(values, device=device, dtype=torch.int32)
+
+    # Slot 1 decodes two spatial positions after the prompt. Slot 0 crosses the end
+    # of its new table in the same query and must ignore the old row's tail.
+    rope.prepare_positions(ids([1, 0]), ids([0, 2, 5]), ids([2, 2]), ids([2, 3]))
+    expected = torch.cat((grid[:, 3:5], grid[:, 2:3], torch.tensor([[10, 11]]).expand(3, -1)), dim=1)
+    torch.testing.assert_close(rope.get_positions(5).cpu(), expected)
+
+
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
 @pytest.mark.parametrize("uva", [False, True])
 def test_staged_writes_match_a_host_model(dtype, uva):

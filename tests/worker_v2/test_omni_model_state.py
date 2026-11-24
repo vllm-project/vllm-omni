@@ -865,6 +865,28 @@ def test_rope_shim_propagates_type_error():
         _make_safe_get_rope(broken_get_rope)(SimpleNamespace(uses_mrope=False), object())
 
 
+def test_precomputed_rope_resume_builds_grid_from_original_prompt():
+    from vllm.v1.core.sched.output import NewRequestData
+
+    state = _make_state()
+    state.model.precomputed_mrope_decode = True
+    req = NewRequestData(
+        req_id="resumed",
+        prompt_token_ids=[11, 22],
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=([],),
+        num_computed_tokens=2,
+        lora_request=None,
+        prefill_token_ids=[11, 22, 33, 44],
+    )
+    with patch.object(DefaultModelState, "add_request") as add:
+        state.add_request(0, req)
+    assert add.call_args.args[1].prefill_token_ids == [11, 22]
+    assert req.prefill_token_ids == [11, 22, 33, 44]
+
+
 def test_rope_shim_constructs_sequential_mrope_state():
     from vllm.platforms.cpu import CpuPlatform
     from vllm.v1.worker.gpu.mm.rope import RopeState, get_rope_state
