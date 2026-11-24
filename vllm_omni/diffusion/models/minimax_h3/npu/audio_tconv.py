@@ -105,7 +105,8 @@ def _depthwise_upsample_as_conv1d(
     """
     batch, channels, _ = x.shape
     kernel = filter_.expand(channels, -1, -1) if filter_.shape[0] == 1 else filter_
-    kernel_size = kernel.shape[-1]
+    original_kernel_size = kernel.shape[-1]
+    kernel_size = original_kernel_size
     if kernel_size % stride:
         kernel = F.pad(kernel, (0, -kernel_size % stride))
     phase_taps = kernel.shape[-1] // stride
@@ -119,25 +120,30 @@ def _depthwise_upsample_as_conv1d(
     out = F.conv1d(x, phase_weight, padding=phase_taps - 1, groups=channels)
     out = out.reshape(batch, channels, stride, -1).transpose(2, 3).reshape(batch, channels, -1)
     out = out * ratio
-    return out[..., pad_left : out.shape[-1] - pad_right]
+    # The zero-padded kernel makes the phase decomposition ``-K % stride``
+    # samples longer than the stock transposed convolution (those taps only
+    # produce the zero tail). Crop against the stock length so the right edge
+    # matches the original module for ``K % stride != 0`` as well.
+    stock_length = out.shape[-1] - (-original_kernel_size % stride)
+    return out[..., pad_left : stock_length - pad_right]
 
 
 def _patched_conv_transpose_forward(
     self: nn.ConvTranspose1d, x: torch.Tensor, output_size: list[int] | None = None
 ) -> torch.Tensor:
-    del output_size
-    if _tconv_enabled_on_input(x) and self.weight.dtype == x.dtype and self.groups == 1 and self.dilation[0] == 1:
+    # ``output_padding`` and an explicit ``output_size`` change the output
+    # length in ways the phase decomposition does not model, so both stay on
+    # the module's own forward (BigVGAN's ``ups`` use neither).
+    if (
+        _tconv_enabled_on_input(x)
+        and self.weight.dtype == x.dtype
+        and self.groups == 1
+        and self.dilation[0] == 1
+        and self.output_padding[0] == 0
+        and output_size is None
+    ):
         return _conv_transpose1d_as_conv1d(x, self.weight, self.bias, self.stride[0], self.padding[0])
-    return F.conv_transpose1d(
-        x,
-        self.weight,
-        self.bias,
-        self.stride,
-        self.padding,
-        self.output_padding,
-        self.groups,
-        self.dilation,
-    )
+    return self._h3_orig_forward(x, output_size)
 
 
 def _patched_upsample1d_forward(self: Any, x: torch.Tensor) -> torch.Tensor:
@@ -151,12 +157,10 @@ def _patched_upsample1d_forward(self: Any, x: torch.Tensor) -> torch.Tensor:
             self.pad_right,
             self.ratio,
         )
-    channels = x.shape[1]
-    out = F.pad(x, (self.pad, self.pad), mode="replicate")
-    out = self.ratio * F.conv_transpose1d(
-        out, self.filter.expand(channels, -1, -1), stride=self.stride, groups=channels
-    )
-    return out[..., self.pad_left : out.shape[-1] - self.pad_right]
+    # The checkpoint's ``UpSample1d.forward`` comes from remote code; keep using
+    # the exact bound method captured at install time instead of re-implementing
+    # it, so a checkpoint revision can never silently diverge from stock.
+    return self._h3_orig_forward(x)
 
 
 def _is_remote_upsample1d(module: nn.Module) -> bool:
@@ -168,6 +172,12 @@ def _is_remote_upsample1d(module: nn.Module) -> bool:
         and hasattr(module, "pad_left")
         and hasattr(module, "ratio")
     )
+
+
+def _capture_original_forward(module: nn.Module) -> None:
+    """Record the module's own forward once, for the non-fast-path fallback."""
+    if not hasattr(module, "_h3_orig_forward"):
+        module._h3_orig_forward = module.forward
 
 
 def _audio_tconv_disabled() -> bool:
@@ -192,15 +202,17 @@ def install_audio_vae_tconv_conv1d(model: nn.Module) -> tuple[int, int]:
     upsample_patched = transpose_patched = 0
     for module in model.modules():
         if isinstance(module, nn.ConvTranspose1d):
+            _capture_original_forward(module)
             module.forward = types.MethodType(_patched_conv_transpose_forward, module)
             transpose_patched += 1
         elif _is_remote_upsample1d(module):
+            _capture_original_forward(module)
             module.forward = types.MethodType(_patched_upsample1d_forward, module)
             upsample_patched += 1
     logger.info(
         "MiniMax-H3 audio VAE transposed-conv replacement installed "
         "(default, kill switch %s): %d stage ConvTranspose1d + %d UpSample1d "
-        "resamplers now evaluate as phase-decomposed conv1d on NPU FP32",
+        "resamplers now evaluate as phase-decomposed conv1d on NPU FP32/BF16",
         AUDIO_TCONV_CONV1D_DISABLE_ENV,
         transpose_patched,
         upsample_patched,

@@ -48,6 +48,8 @@ def test_full_transpose_matches_native(in_ch, out_ch, kernel, stride, padding, b
         (7, 2, 12),  # the Activation1d default used across the BigVGAN decoder
         (3, 4, 8),
         (5, 2, 6),
+        (3, 2, 7),  # K % stride != 0: the zero-padded tail must be cropped off
+        (3, 3, 8),  # K % stride != 0, larger remainder (K=8, stride=3)
     ],
 )
 def test_depthwise_upsample_matches_native(channels, ratio, kernel):
@@ -107,6 +109,9 @@ def test_install_is_enabled_by_default(monkeypatch):
     assert install_audio_vae_tconv_conv1d(root) == (1, 1)
     assert root.stage.forward.__func__ is audio_tconv._patched_conv_transpose_forward
     assert root.act.forward.__func__ is audio_tconv._patched_upsample1d_forward
+    # The fallback keeps the module's own forward, not a re-implementation.
+    assert root.stage._h3_orig_forward.__func__ is nn.ConvTranspose1d.forward
+    assert root.act._h3_orig_forward.__func__ is UpSample1d.forward
 
 
 def test_install_kill_switch_keeps_native_forwards(monkeypatch):
@@ -135,6 +140,69 @@ def test_install_patches_both_families_and_cpu_output_is_unchanged(monkeypatch):
     torch.testing.assert_close(root.act(x_act), ref_act, rtol=0, atol=0)
     assert root.stage.forward.__func__ is audio_tconv._patched_conv_transpose_forward
     assert root.act.forward.__func__ is audio_tconv._patched_upsample1d_forward
+
+
+def test_conv_transpose_fast_path_skips_output_padding(monkeypatch):
+    """output_padding changes the output length, so it must stay on stock."""
+    monkeypatch.setattr(audio_tconv, "_tconv_enabled_on_input", lambda x: True)
+    torch.manual_seed(0)
+    layer = nn.ConvTranspose1d(4, 3, 4, stride=2, padding=1, output_padding=1)
+    x = torch.randn(1, 4, 5)
+    expected = layer(x).clone()
+    root = nn.Module()
+    root.layer = layer
+
+    assert install_audio_vae_tconv_conv1d(root) == (0, 1)
+    torch.testing.assert_close(layer(x), expected, rtol=0, atol=0)
+
+
+def test_conv_transpose_fast_path_skips_explicit_output_size(monkeypatch):
+    """An explicit output_size is forwarded to the module's own forward."""
+    monkeypatch.setattr(audio_tconv, "_tconv_enabled_on_input", lambda x: True)
+    torch.manual_seed(0)
+    layer = nn.ConvTranspose1d(4, 3, 4, stride=2, padding=1)
+    x = torch.randn(1, 4, 5)
+    expected = layer(x, output_size=[11]).clone()
+    root = nn.Module()
+    root.layer = layer
+
+    assert install_audio_vae_tconv_conv1d(root) == (0, 1)
+    value = layer(x, output_size=[11])
+    assert value.shape == expected.shape == (1, 3, 11)
+    torch.testing.assert_close(value, expected, rtol=0, atol=0)
+
+
+class _CountingUpSample1d(UpSample1d):
+    """Remote-shaped module that records whether its own forward ran."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return super().forward(x)
+
+
+_CountingUpSample1d.__name__ = "UpSample1d"
+
+
+def test_upsample_fallback_calls_the_original_forward():
+    """The non-fast path must call the checkpoint's own forward, not a copy."""
+    module = _CountingUpSample1d()
+    torch.manual_seed(0)
+    x = torch.randn(2, 3, 33)
+    expected = module(x).clone()
+    root = nn.Module()
+    root.act = module
+
+    assert install_audio_vae_tconv_conv1d(root) == (1, 0)
+    module.calls = 0
+    value = module(x)
+
+    assert module.calls == 1
+    assert module._h3_orig_forward.__func__ is _CountingUpSample1d.forward
+    torch.testing.assert_close(value, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
