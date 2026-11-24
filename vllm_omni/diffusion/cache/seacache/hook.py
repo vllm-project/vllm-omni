@@ -73,6 +73,8 @@ class SeaCacheRootHook(ModelHook):
         self.extractor_fn = extractor_fn
         self._parameter_sharded = False
         self._collective_skip_groups: list[torch.distributed.ProcessGroup] = []
+        self._active_branches: tuple[str, ...] = ()
+        self._last_evaluation_step: int | None = None
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         if self.extractor_fn is None:
@@ -99,8 +101,44 @@ class SeaCacheRootHook(ModelHook):
         self.state_manager.set_context(name)
         try:
             yield
+        except BaseException:
+            # A failed branch must not leave partially advanced trajectory state.
+            self.state_manager.reset()
+            self._active_branches = ()
+            self._last_evaluation_step = None
+            raise
         finally:
             self.state_manager.set_context(previous_context)
+
+    def _step_metadata(self) -> tuple[int, float, int]:
+        callbacks = (self.current_step_callback, self.current_sigma_callback, self.num_inference_steps_callback)
+        if any(callback is None for callback in callbacks):
+            raise ValueError("scheduler callbacks are unavailable")
+        values = [callback() for callback in callbacks if callback is not None]
+        values = [value.item() if isinstance(value, torch.Tensor) else value for value in values]
+        step_value, sigma_value, num_steps_value = values
+        if step_value is None or sigma_value is None or num_steps_value is None:
+            raise ValueError("scheduler metadata is unavailable")
+        step, sigma, num_steps = int(step_value), float(sigma_value), int(num_steps_value)
+        if step < 0 or num_steps <= 0 or step >= num_steps or not math.isfinite(sigma) or not 0 <= sigma <= 1:
+            raise ValueError("expected a valid step index and exact sigma in [0, 1]")
+        return step, sigma, num_steps
+
+    def begin_step(self, branches: tuple[str, ...]) -> None:
+        """Register one velocity evaluation without precomputing branch decisions.
+
+        All CFG ranks register the global branch tuple, including idle ranks.
+        Changes in ownership/active guidance reset every local history together.
+        Repeated evaluations at one solver index also restart extrapolation.
+        Each forward computes a target-only indicator and retains its own residual.
+        """
+        if not branches or any(not name for name in branches) or len(set(branches)) != len(branches):
+            raise ValueError("SeaCache requires unique, nonempty branch names")
+        step, _, _ = self._step_metadata()
+        if branches != self._active_branches or self._last_evaluation_step != step - 1:
+            self.state_manager.reset()
+        self._active_branches = branches
+        self._last_evaluation_step = step
 
     def _build_indicator(
         self,
@@ -113,8 +151,8 @@ class SeaCacheRootHook(ModelHook):
         if not isinstance(hidden_states, torch.Tensor) or hidden_states.ndim != 5:
             return None
 
-        # Controls precede the denoised target in packed vision-token order,
-        # and each vision item is filtered independently.
+        # The extractor supplies only denoised targets, not fully conditioned
+        # control hints. Keep partially conditioned I2V/V2V targets intact.
         if any(
             not isinstance(item, torch.Tensor)
             or item.ndim != 5
@@ -179,9 +217,13 @@ class SeaCacheRootHook(ModelHook):
         return True
 
     def _synchronize_compute(self, compute: bool, device: torch.device) -> bool:
+        return bool(self._synchronize_decision(int(compute), device))
+
+    def _synchronize_decision(self, decision_value: int, device: torch.device) -> int:
+        """MAX of skip=0, compute=1, bypass=2 across transformer collective peers."""
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            return True if self._parameter_sharded else compute
-        decision = torch.tensor(int(compute), dtype=torch.int32, device=device)
+            return max(1, decision_value) if self._parameter_sharded else decision_value
+        decision = torch.tensor(decision_value, dtype=torch.int32, device=device)
         if self._parameter_sharded:
             from vllm_omni.diffusion.distributed.parallel_state import (
                 get_fs_group,
@@ -202,7 +244,7 @@ class SeaCacheRootHook(ModelHook):
                     op=torch.distributed.ReduceOp.MAX,
                     group=get_sp_group().device_group,
                 )
-            return bool(decision.item())
+            return int(decision.item())
 
         for group in self._collective_skip_groups:
             torch.distributed.all_reduce(
@@ -221,7 +263,7 @@ class SeaCacheRootHook(ModelHook):
                 op=torch.distributed.ReduceOp.MAX,
                 group=get_sp_group().device_group,
             )
-        return bool(decision.item())
+        return int(decision.item())
 
     @torch.compiler.disable
     def new_forward(
@@ -234,77 +276,53 @@ class SeaCacheRootHook(ModelHook):
             raise RuntimeError("SeaCache extractor was not initialized")
         ctx = self.extractor_fn(module, *args, **kwargs)
 
-        if torch.is_grad_enabled():
-            self._warn_once("SeaCache is inference-only; autograd-enabled calls run in full.")
-            return self._run_uncached(ctx)
-        if self.state_manager._current_context is None:
-            self._warn_once("SeaCache requires an explicit cache context; running full.")
-            return self._run_uncached(ctx)
-        callbacks = (
-            self.current_step_callback,
-            self.current_sigma_callback,
-            self.num_inference_steps_callback,
-        )
-        if any(callback is None for callback in callbacks):
-            self._warn_once("SeaCache requires scheduler step, sigma, and step-count callbacks; running full.")
-            return self._run_uncached(ctx)
-        assert self.current_step_callback is not None
-        assert self.current_sigma_callback is not None
-        assert self.num_inference_steps_callback is not None
-
+        state: SeaCacheState | None = None
+        indicator = None
+        eligible = True
+        step = num_inference_steps = 0
         try:
+            if torch.is_grad_enabled():
+                raise ValueError("autograd-enabled call")
+            if self.state_manager._current_context is None:
+                raise ValueError("missing explicit cache context")
             extra_states = ctx.extra_states or {}
             vision_items = extra_states.get("sea_cache_latents")
             if not isinstance(vision_items, list):
                 raise ValueError("extractor did not provide SeaCache vision inputs")
             noisy_frame_mask = extra_states.get("sea_cache_noisy_frame_mask")
-            conditioning_only = isinstance(noisy_frame_mask, torch.Tensor) and not bool(
-                torch.any(noisy_frame_mask != 0).item()
-            )
-
-            step = self.current_step_callback()
-            sigma = self.current_sigma_callback()
-            num_inference_steps = self.num_inference_steps_callback()
-            if isinstance(step, torch.Tensor):
-                step = step.item()
-            if isinstance(sigma, torch.Tensor):
-                sigma = sigma.item()
-            if isinstance(num_inference_steps, torch.Tensor):
-                num_inference_steps = num_inference_steps.item()
-            if step is None or sigma is None or num_inference_steps is None:
-                raise ValueError("scheduler metadata is unavailable")
-            step = int(step)
-            sigma = float(sigma)
-            num_inference_steps = int(num_inference_steps)
-            if (
-                step < 0
-                or num_inference_steps <= 0
-                or step >= num_inference_steps
-                or not math.isfinite(sigma)
-                or not 0.0 <= sigma <= 1.0
+            if isinstance(noisy_frame_mask, torch.Tensor) and not bool(torch.any(noisy_frame_mask != 0).item()):
+                raise ValueError("conditioning-only input")
+            step, sigma, num_inference_steps = self._step_metadata()
+            state = self.state_manager.get_state()
+            assert state is not None
+            # Validate before collective agreement, never after a shared skip.
+            if state.history and any(
+                residual.shape != ctx.hidden_states.shape
+                or residual.device != ctx.hidden_states.device
+                or residual.dtype != ctx.hidden_states.dtype
+                for _, residual in state.history
             ):
-                raise ValueError("expected a valid step index and exact sigma in [0, 1]")
-        except (IndexError, TypeError, ValueError, RuntimeError) as error:
-            self._warn_once(f"SeaCache metadata is invalid; running full: {error}")
-            return self._run_uncached(ctx)
-
-        if conditioning_only:
-            self._warn_once("SeaCache requires noisy vision; conditioning-only calls run in full.")
-            return self._run_uncached(ctx)
-
-        state: SeaCacheState = self.state_manager.get_state()
-        try:
+                state.reset()
             indicator = self._build_indicator(vision_items, sigma)
-        except (TypeError, ValueError, RuntimeError) as error:
-            self._warn_once(f"SeaCache could not construct its vision indicator; running full: {error}")
-            indicator = None
+            if indicator is None:
+                raise ValueError("invalid noisy-target indicator")
+        except (IndexError, TypeError, ValueError, RuntimeError) as error:
+            self._warn_once(f"SeaCache input is ineligible; running full: {error}")
+            eligible = False
 
-        local_compute = self._resolve_gate(state, indicator, step, num_inference_steps)
-        should_compute = self._synchronize_compute(local_compute, ctx.hidden_states.device)
-        if should_compute and not local_compute:
-            state.accumulated_distance = 0.0
+        local_decision = 2
+        if eligible:
+            assert state is not None
+            local_decision = int(self._resolve_gate(state, indicator, step, num_inference_steps))
+        decision = self._synchronize_decision(local_decision, ctx.hidden_states.device)
+        if decision == 2:
+            self.state_manager.reset()
+            return self._run_uncached(ctx)
+        assert state is not None
+        should_compute = bool(decision)
 
         if should_compute:
+            state.accumulated_distance = 0.0
             self.full_count += 1
             output = self._run_full_stack(ctx)
             result = ctx.postprocess(output)
@@ -316,23 +334,10 @@ class SeaCacheRootHook(ModelHook):
             step,
             self.config.residual_order,
         )
-        if residual.device != ctx.hidden_states.device:
-            residual = residual.to(ctx.hidden_states.device)
         state.consecutive_cached += 1
         self.skip_count += 1
 
-        can_reuse = (
-            residual.shape == ctx.hidden_states.shape
-            and residual.device == ctx.hidden_states.device
-            and residual.dtype == ctx.hidden_states.dtype
-        )
-        if can_reuse:
-            return ctx.postprocess(ctx.hidden_states + residual)
-
-        output = self._run_full_stack(ctx)
-        result = ctx.postprocess(output)
-        self._record_execution(state, step, ctx.hidden_states, output)
-        return result
+        return ctx.postprocess(ctx.hidden_states + residual)
 
     @staticmethod
     def _run_full_stack(ctx: CacheContext) -> torch.Tensor:
@@ -368,6 +373,8 @@ class SeaCacheRootHook(ModelHook):
 
     def reset_state(self, module: torch.nn.Module) -> torch.nn.Module:
         self.state_manager.reset()
+        self._active_branches = ()
+        self._last_evaluation_step = None
         self.full_count = 0
         self.skip_count = 0
         return module

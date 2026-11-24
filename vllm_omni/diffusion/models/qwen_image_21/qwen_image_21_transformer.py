@@ -37,6 +37,7 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwise_eligible
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
+from vllm_omni.diffusion.layers.exact_bf16_rope_musa import musa_qk_rotary, musa_rotary
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
 from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
@@ -100,13 +101,14 @@ def _apply_qwen_image21_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torc
     """Rotate interleaved pairs with complex FP32 multiplication.
 
     Same contract as the reference `apply_rotary_emb_qwen(..., use_real=False)`:
-    `x` is [B, S, H, D], `freqs` is the complex frequency tensor [S, D // 2].
+    `x` is [B, S, H, D]; `freqs` is [S, D // 2] or [B, S, D // 2].
     """
     fused = rotary(x, freqs)
     if fused is not None:
         return fused
     paired = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
+    freqs = freqs.unsqueeze(1) if freqs.ndim == 2 else freqs.unsqueeze(2)
+    return torch.view_as_real(paired * freqs).flatten(3).to(x.dtype)
 
 
 # Hold the freqs object so its id cannot be recycled into a different table.
@@ -116,8 +118,10 @@ _NPU_ROPE: dict[str, object] = {"freqs": None, "tables": None}
 def _npu_rope_tables(freqs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if _NPU_ROPE["freqs"] is freqs:
         return _NPU_ROPE["tables"]  # type: ignore[return-value]
-    cos = torch.real(freqs).float().repeat_interleave(2, dim=-1).unsqueeze(0).unsqueeze(2)
-    sin = torch.imag(freqs).float().repeat_interleave(2, dim=-1).unsqueeze(0).unsqueeze(2)
+    # Interleaved npu_rotary_mul requires [1, tokens, 1, D] tables.
+    table_freqs = freqs.reshape(1, -1, 1, freqs.shape[-1])
+    cos = torch.real(table_freqs).float().repeat_interleave(2, dim=-1)
+    sin = torch.imag(table_freqs).float().repeat_interleave(2, dim=-1)
     tables = (cos, sin)
     _NPU_ROPE["freqs"] = freqs
     _NPU_ROPE["tables"] = tables
@@ -133,8 +137,23 @@ def _apply_qwen_image21_rotary_emb_npu(x: torch.Tensor, freqs: torch.Tensor) -> 
     import torch_npu
 
     rot_cos, rot_sin = _npu_rope_tables(freqs)
-    rotated = torch_npu.npu_rotary_mul(x.float(), rot_cos, rot_sin, rotary_mode="interleave")
-    return rotated.to(dtype=x.dtype)
+    values = x.float()
+    if freqs.ndim == 3:
+        # Fold batch and sequence together so each token uses its own row's frequencies.
+        values = values.reshape(1, -1, *x.shape[2:])
+    rotated = torch_npu.npu_rotary_mul(values, rot_cos, rot_sin, rotary_mode="interleave")
+    return rotated.reshape_as(x).to(dtype=x.dtype)
+
+
+def _apply_qwen_image21_rotary_emb_musa(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Interleaved RoPE through a Triton kernel with the native rotation's rounding.
+
+    Inputs the kernel does not take use ``_apply_qwen_image21_rotary_emb_native``.
+    """
+    rotated = musa_rotary(x, freqs)
+    if rotated is not None:
+        return rotated
+    return _apply_qwen_image21_rotary_emb_native(x, freqs)
 
 
 def _apply_qwen_image21_rotary_emb_native(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -143,8 +162,9 @@ def _apply_qwen_image21_rotary_emb_native(x: torch.Tensor, freqs: torch.Tensor) 
     Algebraically identical to the complex multiplication, computed in fp32:
     (x1 + i x2)(cos + i sin) interleaved back as [x1 cos - x2 sin, x1 sin + x2 cos, ...].
     """
-    cos = torch.real(freqs).float().unsqueeze(1)
-    sin = torch.imag(freqs).float().unsqueeze(1)
+    head_dim = 1 if freqs.ndim == 2 else 2
+    cos = torch.real(freqs).float().unsqueeze(head_dim)
+    sin = torch.imag(freqs).float().unsqueeze(head_dim)
     x_pairs = x.float().unflatten(-1, (-1, 2))
     x1, x2 = x_pairs.unbind(-1)
     out = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
@@ -416,7 +436,11 @@ class QwenImage21Rope(nn.Module):
         return torch.polar(torch.ones_like(freqs), freqs)
 
     def forward(
-        self, img_shapes: list[tuple[int, int, int]], image_pad_mask: torch.Tensor, device: torch.device
+        self,
+        img_shapes: list[tuple[int, int, int]],
+        image_pad_mask: torch.Tensor,
+        device: torch.device,
+        text_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.freqs = [freq.to(device) for freq in self.freqs]
 
@@ -450,11 +474,22 @@ class QwenImage21Rope(nn.Module):
 
         height_index = torch.where(height_index < 0, height_index + self.freqs[1].shape[0], height_index)
         width_index = torch.where(width_index < 0, width_index + self.freqs[2].shape[0], width_index)
+        height_freqs = self.freqs[1].index_select(0, height_index)
+        width_freqs = self.freqs[2].index_select(0, width_index)
+        if text_valid_mask is None:
+            return torch.cat([self.freqs[0].index_select(0, frame_index), height_freqs, width_freqs], dim=-1)
+
+        # Text padding can precede valid tokens. Each request's frame position
+        # must exclude its own padded text positions; padded slots are masked.
+        padded_text = ~text_valid_mask.bool() & ~image_pad_mask.unsqueeze(0)
+        frame_by_request = (frame_index.unsqueeze(0) - padded_text.long().cumsum(dim=1)).clamp_min_(0)
+        batch_size = text_valid_mask.shape[0]
+        frame_freqs = self.freqs[0].index_select(0, frame_by_request.flatten()).view(batch_size, total_len, -1)
         return torch.cat(
             [
-                self.freqs[0].index_select(0, frame_index),
-                self.freqs[1].index_select(0, height_index),
-                self.freqs[2].index_select(0, width_index),
+                frame_freqs,
+                height_freqs.unsqueeze(0).expand(batch_size, -1, -1),
+                width_freqs.unsqueeze(0).expand(batch_size, -1, -1),
             ],
             dim=-1,
         )
@@ -542,15 +577,78 @@ class QwenImage21Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             impl_overrides={"SDPA": QwenImage21SDPAImpl} if quant_config is None else None,
         )
+        # Ring SP prefill (_ring_prefill) attends the replicated prefix rows locally: the same backend
+        # selection, never sharded. No weights; built only when ring is active.
+        self.prefix_attn = (
+            Attention(
+                num_heads=self.num_heads,
+                head_size=dim_head,
+                softmax_scale=1.0 / (dim_head**0.5),
+                causal=False,
+                num_kv_heads=self.num_kv_heads,
+                impl_overrides={"SDPA": QwenImage21SDPAImpl} if quant_config is None else None,
+                skip_sequence_parallel=True,
+            )
+            if getattr(self.attn, "use_ring", False)
+            else None
+        )
 
     def _apply_rotary_emb(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         if x.device.type == "cuda":
             return _apply_qwen_image21_rotary_emb(x, freqs)
         if x.device.type == "npu":
             return _apply_qwen_image21_rotary_emb_npu(x, freqs)
+        if x.device.type == "musa":
+            return _apply_qwen_image21_rotary_emb_musa(x, freqs)
         # Platform fallback without complex-tensor kernels (the CustomOp rope layer
         # dispatches by platform, not tensor device, so it cannot serve CPU tensors).
         return _apply_qwen_image21_rotary_emb_native(x, freqs)
+
+    def _ring_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        prefix_len: int,
+    ) -> torch.Tensor:
+        r"""Block-causal prefill under ring SP. The local layout is `[replicated prefix P, target shard T]`.
+
+        Block-causal attention gives P rows causal attention over P alone (full within each condition-image
+        block) and T rows full attention over P and every T shard. The ring takes no mask, and its joint-query
+        path would let P rows attend to T as well; their hidden states feed the prefix KV cache of every later
+        step. So P is attended locally (it is replicated: every rank computes the same rows) with P's own spans,
+        and only the T rows go round the ring, with P as joint K/V prepended once.
+        """
+        if attn_metadata.full_attn_spans is not None:
+            prefix_metadata = AttentionMetadata(
+                full_attn_spans=[
+                    [span for span in spans if span[1] <= prefix_len] for spans in attn_metadata.full_attn_spans
+                ],
+                extra=dict(attn_metadata.extra),
+            )
+        else:
+            # Dense block-causal mask `(B, 1, S_pad, S_pad)` in global coordinates: the replicated prefix is
+            # the first `prefix_len` rows/cols on every rank, so its local mask is a slice.
+            prefix_metadata = AttentionMetadata(
+                attn_mask=attn_metadata.attn_mask[:, :, :prefix_len, :prefix_len],
+                extra=dict(attn_metadata.extra),
+            )
+        prefix_output = self.prefix_attn(
+            query[:, :prefix_len], key[:, :prefix_len], value[:, :prefix_len], prefix_metadata
+        )
+        target_output = self.attn(
+            query[:, prefix_len:],
+            key[:, prefix_len:],
+            value[:, prefix_len:],
+            AttentionMetadata(
+                joint_key=key[:, :prefix_len],
+                joint_value=value[:, :prefix_len],
+                joint_strategy="front",
+                extra=dict(attn_metadata.extra),
+            ),
+        )
+        return torch.cat([prefix_output, target_output], dim=1)
 
     def forward(
         self,
@@ -596,7 +694,10 @@ class QwenImage21Attention(nn.Module):
 
         fused_qk = None
         if self.norm_q.bias is None and self.norm_k.bias is None and self.norm_q.eps == self.norm_k.eps:
-            fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
+            if query.device.type == "musa":
+                fused_qk = musa_qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
+            else:
+                fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
         if fused_qk is not None:
             query, key = fused_qk
         else:
@@ -638,7 +739,14 @@ class QwenImage21Attention(nn.Module):
                         cached_value = _dequantize_prefix_kv_fp8(cached_value, branch_cache["value_scale"], value.dtype)
 
         metadata = copy.copy(attn_metadata) if attn_metadata is not None else None
-        if sp_prefix_len > 0:
+        # Ring prefill with block-causal structure (piecewise spans or a dense 4D mask). Without it
+        # (`causal_block=False`) prefix rows attend everything, which the joint path below already does.
+        block_causal = metadata is not None and (
+            metadata.full_attn_spans is not None or (metadata.attn_mask is not None and metadata.attn_mask.dim() == 4)
+        )
+        if sp_prefix_len > 0 and self.prefix_attn is not None and block_causal:
+            attn_output = self._ring_prefill(query, key, value, metadata, sp_prefix_len)
+        elif sp_prefix_len > 0:
             # Ulysses joint attention: the prefix is replicated across SP ranks, so it is
             # concatenated (front) after the all-to-all instead of being sharded.
             if metadata is None:
@@ -819,6 +927,7 @@ class QwenImage21SequencePrepare(nn.Module):
         img_shapes: list[tuple[int, int, int]],
         img_mask: torch.Tensor,
         is_decode: bool,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""
         Returns:
@@ -833,7 +942,17 @@ class QwenImage21SequencePrepare(nn.Module):
             rotary_emb = geometry["rotary_emb"]
         else:
             image_pad_mask = self.expand_image_pad_mask(img_mask[0])
-            rotary_emb = self.pos_embed(img_shapes, image_pad_mask, device=hidden_states.device)
+            text_valid_mask = None
+            if encoder_hidden_states_mask is not None and not bool(encoder_hidden_states_mask.all()):
+                text_valid_mask = torch.ones(
+                    batch_size, image_pad_mask.shape[0], dtype=torch.bool, device=hidden_states.device
+                )
+                text_positions = (~image_pad_mask).nonzero(as_tuple=True)[0]
+                vlm_text_positions = ~img_mask[0][: encoder_hidden_states_mask.shape[1]]
+                text_valid_mask[:, text_positions] = encoder_hidden_states_mask.bool()[:, vlm_text_positions]
+            rotary_emb = self.pos_embed(
+                img_shapes, image_pad_mask, device=hidden_states.device, text_valid_mask=text_valid_mask
+            )
             if geometry is not None:
                 geometry.update(image_pad_mask=image_pad_mask, rotary_emb=rotary_emb)
 
@@ -845,7 +964,7 @@ class QwenImage21SequencePrepare(nn.Module):
             target_hidden_states = self.img_in(hidden_states[:, -target_tokens:])
             dim = target_hidden_states.shape[-1]
             prefix_hidden_states = target_hidden_states.new_zeros(batch_size, 0, dim)
-            return prefix_hidden_states, target_hidden_states, rotary_emb[:0], rotary_emb[prefix_len:]
+            return prefix_hidden_states, target_hidden_states, rotary_emb[..., :0, :], rotary_emb[..., prefix_len:, :]
 
         hidden_states = self.img_in(hidden_states)
 
@@ -863,9 +982,24 @@ class QwenImage21SequencePrepare(nn.Module):
         return (
             joint_hidden_states[:, :prefix_len],
             joint_hidden_states[:, prefix_len:],
-            rotary_emb[:prefix_len],
-            rotary_emb[prefix_len:],
+            rotary_emb[..., :prefix_len, :],
+            rotary_emb[..., prefix_len:, :],
         )
+
+
+def _qwen_image21_rope_text_mask(
+    text_mask: torch.Tensor | None, device: torch.device, sp_active: bool
+) -> torch.Tensor | None:
+    if text_mask is None:
+        return None
+    if sp_active or device.type not in ("cuda", "npu"):
+        if not bool(text_mask.all()):
+            raise ValueError(
+                "Qwen-Image-2.1 mixed-length text padding requires CUDA or NPU without sequence parallelism "
+                "for per-request image RoPE."
+            )
+        return None
+    return text_mask
 
 
 class QwenImage21Transformer2DModel(CachedTransformer):
@@ -944,6 +1078,18 @@ class QwenImage21Transformer2DModel(CachedTransformer):
     ):
         super().__init__()
         self.parallel_config = od_config.parallel_config
+        if (
+            self.parallel_config is not None
+            and getattr(self.parallel_config, "ring_degree", 1) > 1
+            and getattr(self.parallel_config, "ulysses_degree", 1) > 1
+        ):
+            # Ring prefill attends the replicated prefix locally with all heads (QwenImage21Attention._ring_prefill);
+            # under Ulysses x ring the heads are split first, and that path is not implemented.
+            raise NotImplementedError(
+                "Qwen-Image-2.1 supports Ulysses SP (--usp) or ring SP (--ring), not both at once: got "
+                f"ulysses_degree={self.parallel_config.ulysses_degree}, "
+                f"ring_degree={self.parallel_config.ring_degree}."
+            )
         self._nz_weights_supported = self._nz_weights_supported_for(od_config, quant_config)
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
@@ -1245,8 +1391,14 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             )
             geometry = self._geometry_for_request(kv_cache, img_mask, signature)
         self.sequence_prepare._request_geometry = geometry
+        per_request_mask = _qwen_image21_rope_text_mask(encoder_hidden_states_mask, hidden_states.device, sp_active)
         prefix_hidden_states, target_hidden_states, prefix_freqs, target_freqs = self.sequence_prepare(
-            hidden_states, txt_hidden_states, layout, img_mask, is_decode
+            hidden_states,
+            txt_hidden_states,
+            layout,
+            img_mask,
+            is_decode,
+            per_request_mask,
         )
         # Read SP pad size after sequence_prepare: the auto-pad hook only writes
         # ctx.sp_padding_size during the split inside that call (and once per
@@ -1263,7 +1415,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             sp_padding = int(ctx.sp_padding_size)
         # Local layout is always [prefix, target (shard)]: full sequence when SP is off.
         joint_hidden_states = torch.cat([prefix_hidden_states, target_hidden_states], dim=1)
-        freqs = torch.cat([prefix_freqs, target_freqs], dim=0)
+        freqs = torch.cat([prefix_freqs, target_freqs], dim=-2)
         prefix_len = prefix_hidden_states.shape[1]
         sp_prefix_len = prefix_len if sp_active and not is_decode else 0
 
@@ -1351,6 +1503,17 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
         else:
             attn_path = self._resolve_attn_path(attn_path_hint, has_padding, sp_padding > 0)
+            if (
+                sp_active
+                and getattr(self.parallel_config, "ring_degree", 1) > 1
+                and attn_path == "mask"
+                and (has_padding or sp_padding > 0)
+            ):
+                # Ring attention takes no mask: target rows would attend padded text / SP keys.
+                raise NotImplementedError(
+                    "Qwen-Image-2.1 ring SP prefill cannot mask padded keys (text padding or SP padding); "
+                    "use Ulysses SP (--usp) or a batch without padding."
+                )
             if kv_cache is not None:
                 cache_write_len = prefix_len
             if attn_path == "piecewise":
@@ -1368,7 +1531,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         prepared_modulation = None
         pointwise_validated = False
         if (
-            joint_hidden_states.device.type in {"cuda", "npu"}
+            joint_hidden_states.device.type in {"cuda", "npu", "musa"}
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
         ):
@@ -1378,7 +1541,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             # its token selection/scale/tanh once per step, using the same ops.
             scale1, gate1, scale2, gate2 = modulation.chunk(4, dim=-1)
             decode_broadcast = (
-                joint_hidden_states.device.type == "npu"
+                joint_hidden_states.device.type in ("npu", "musa")
                 and joint_hidden_states.dtype == torch.bfloat16
                 and batch_size == 1
                 and is_decode

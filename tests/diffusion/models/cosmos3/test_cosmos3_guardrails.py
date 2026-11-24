@@ -86,3 +86,65 @@ def test_check_video_safety_still_round_trips_the_vae_range(monkeypatch: pytest.
     assert checked.shape == video.shape
     assert checked.dtype == torch.float32
     torch.testing.assert_close(checked, video, atol=1 / 127.5, rtol=0)
+
+
+@pytest.mark.parametrize(("batch_size", "num_frames"), [(2, 1), (3, 4)], ids=["t2i_n2", "video_b3_t4"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_check_video_safety_checks_every_sample_of_a_batch(
+    monkeypatch: pytest.MonkeyPatch, batch_size: int, num_frames: int, dtype: torch.dtype, device: str
+) -> None:
+    """Every sample of a [B, C, T, H, W] batch is checked once, in order (#10648)."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    # Give every (sample, frame) its own value so a dropped, duplicated or
+    # swapped sample changes the bytes the guardrail receives.
+    values = torch.linspace(-1, 1, batch_size * num_frames).to(dtype).view(batch_size, 1, num_frames, 1, 1)
+    video = values.expand(batch_size, 3, num_frames, 4, 4).clone().to(device)
+    original = video.clone()
+    captured: list[np.ndarray] = []
+
+    def check(frames: np.ndarray) -> np.ndarray:
+        captured.append(frames.copy())
+        # Stamp the call order so each output sample traces back to one call.
+        return np.full_like(frames, 50 * len(captured))
+
+    monkeypatch.setattr(guardrails, "_video_guardrail", check)
+    checked = guardrails.check_video_safety(video)
+
+    assert len(captured) == batch_size
+    assert len({frames.tobytes() for frames in captured}) == batch_size
+    for index, frames in enumerate(captured):
+        sample = video[index].detach().cpu().float().clamp(-1, 1)
+        expected_input = ((sample * 0.5 + 0.5).permute(1, 2, 3, 0).numpy() * 255).round().astype(np.uint8)
+        np.testing.assert_array_equal(frames, expected_input)
+    assert checked.shape == video.shape
+    assert checked.dtype == torch.float32
+    assert checked.device == video.device
+    for index in range(batch_size):
+        expected = torch.full(video.shape[1:], 50 * (index + 1), dtype=torch.float32) / 127.5 - 1.0
+        torch.testing.assert_close(checked[index], expected.to(video.device), rtol=0, atol=0)
+    assert torch.equal(video, original)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_check_video_safety_checks_a_4d_video_once(monkeypatch: pytest.MonkeyPatch, device: str) -> None:
+    """A single [C, T, H, W] video is checked once and keeps its 4-D shape."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    video = torch.linspace(-1, 1, 3).view(1, 3, 1, 1).expand(3, 3, 4, 4).clone().to(device)
+    captured: list[np.ndarray] = []
+
+    def check(frames: np.ndarray) -> np.ndarray:
+        captured.append(frames.copy())
+        return frames
+
+    monkeypatch.setattr(guardrails, "_video_guardrail", check)
+    checked = guardrails.check_video_safety(video)
+
+    assert len(captured) == 1
+    assert captured[0].shape == (3, 4, 4, 3)
+    assert checked.shape == (3, 3, 4, 4)
+    assert checked.dtype == torch.float32
+    assert checked.device == video.device
+    torch.testing.assert_close(checked, video, atol=1 / 127.5, rtol=0)

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import gc
 import json
+import weakref
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -104,7 +106,10 @@ class PipelineWithCPUComponents(HyNomasPipeline):
         self.fail_clean = False
         self.device = torch.device("cpu")
         self.sp_size = 1
+        self._sp_error_status = torch.empty(1, dtype=torch.int32)
+        self.decoder_parallel_mode = "none"
         self._cpu_offload = False
+        self._vae_offloaded = False
 
     def _encode_prompt(self, text, *args, **kwargs):
         self.encoded.append(text)
@@ -124,7 +129,7 @@ class PipelineWithCPUComponents(HyNomasPipeline):
     def transformer_forward(self, **kwargs):
         hidden = kwargs["hidden_states"]
         start = kwargs["cache_valid_len"]
-        image = hidden.shape[2]
+        image = hidden.shape[2] * hidden.shape[3] * hidden.shape[4]
         count = image + (kwargs["text_states"].shape[1] if kwargs["cache_txt"] else 0)
         history = None
         for layer in range(self.num_double_blocks):
@@ -157,6 +162,8 @@ class PipelineWithCPUComponents(HyNomasPipeline):
                 "commit": kwargs["update_cache"],
                 "position": kwargs["global_frame_counter"],
                 "mask": kwargs["cache_mask_list"][0][:, :start].clone(),
+                "mask_id": id(kwargs["cache_mask_list"][0]),
+                "mask_list_id": id(kwargs["cache_mask_list"]),
                 "text_length": kwargs["text_states"].shape[1],
                 "timestep_dtype": kwargs["timestep"].dtype,
                 "cache_txt": kwargs["cache_txt"],
@@ -533,7 +540,10 @@ def test_empty_decoder_chunk_preserves_tick_metadata(runner):
     assert len(execute(runner, batch(index=1, close=True)).output["payload"]["video"]) == 18
 
 
-def test_public_deploy_resolution_preserves_ar_configuration(tmp_path):
+@pytest.mark.parametrize(
+    ("decoder_mode", "sp_size"), [(None, 2), ("window", 2), ("window", 4), ("window", 8), ("window", 16)]
+)
+def test_public_deploy_resolution_preserves_ar_configuration(tmp_path, decoder_mode, sp_size):
     for relative in REQUIRED_FILES:
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -545,18 +555,29 @@ def test_public_deploy_resolution_preserves_ar_configuration(tmp_path):
         str(tmp_path),
         trust_remote_code=None,
         deploy_config_path=str(deployment),
-        cli_overrides={},
-        stage_overrides=None,
+        cli_overrides=(
+            {}
+            if decoder_mode is None
+            else {"ulysses_degree": sp_size, "custom_pipeline_args": {"decoder_parallel_mode": decoder_mode}}
+        ),
+        stage_overrides=None
+        if decoder_mode is None
+        else {"0": {"devices": ",".join(str(rank) for rank in range(sp_size))}},
         strategy_config_path=None,
     )
     [stage] = resolution.stage_configs
     assert stage.diffusion_config.engine_backend == "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
     assert stage.diffusion_config.step_execution and stage.diffusion_config.streaming_output
-    assert stage.parallel_config.ulysses_degree == 2
+    assert stage.parallel_config.ulysses_degree == sp_size
+    assert stage.parallel_config.sequence_parallel_size == sp_size
+    if decoder_mode is not None:
+        assert stage.runtime_config.devices == ",".join(str(rank) for rank in range(sp_size))
+        assert stage.diffusion_config.custom_pipeline_args["decoder_parallel_mode"] == decoder_mode
     assert stage.diffusion_config.custom_pipeline_args["ar_max_latent_frames"] == 120
 
 
-def test_offline_deploy_selects_isolated_executor(tmp_path):
+@pytest.mark.parametrize("sp_size", [1, 2, 4, 8, 16])
+def test_offline_deploy_selects_isolated_executor(tmp_path, sp_size):
     for relative in REQUIRED_FILES:
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -568,14 +589,22 @@ def test_offline_deploy_selects_isolated_executor(tmp_path):
         str(tmp_path),
         trust_remote_code=None,
         deploy_config_path=str(deployment),
-        cli_overrides={},
-        stage_overrides=None,
+        cli_overrides=(
+            {}
+            if sp_size == 1
+            else {"ulysses_degree": sp_size, "custom_pipeline_args": {"decoder_parallel_mode": "window"}}
+        ),
+        stage_overrides=None if sp_size == 1 else {"0": {"devices": ",".join(str(rank) for rank in range(sp_size))}},
         strategy_config_path=None,
     )
     [stage] = resolution.stage_configs
     assert stage.diffusion_config.distributed_executor_backend == "mp"
     assert stage.model_config.enforce_eager
     assert not stage.diffusion_config.step_execution
+    assert stage.parallel_config.ulysses_degree == sp_size
+    if sp_size > 1:
+        assert stage.runtime_config.devices == ",".join(str(rank) for rank in range(sp_size))
+        assert stage.diffusion_config.custom_pipeline_args["decoder_parallel_mode"] == "window"
 
 
 @pytest.mark.parametrize("local_failure", [False, True])
@@ -695,10 +724,14 @@ def test_recent_total_limits_fail_closed_and_allow_fresh_generation(recent_runne
     runner.close_session("s")
 
 
-@pytest.mark.parametrize("phase", ["allocation", "stage", "peer_stage"])
+@pytest.mark.parametrize("phase", ["allocation", "stage", "archive", "peer_stage"])
 def test_recent_failed_commit_preserves_published_history(recent_runner, monkeypatch, phase):
     runner = recent_runner
+    runner.pipeline.ar_config = replace(runner.pipeline.ar_config, history_archive_max_bytes=1 << 20)
     execute(runner, batch())
+    archive = runner.pipeline._ar_sessions["s"].history_archive
+    records = archive.records
+    archive_bytes = archive.payload_bytes
     cache = runner._sessions["s"].segmented("cond")
     handles = cache.handles
     masks = runner.pipeline._ar_sessions["s"].history_mask.clone()
@@ -709,6 +742,8 @@ def test_recent_failed_commit_preserves_published_history(recent_runner, monkeyp
 
     if phase == "allocation":
         monkeypatch.setattr(cache, "begin_commit", fail)
+    elif phase == "archive":
+        monkeypatch.setattr(archive, "stage", fail)
     elif phase == "stage":
         original = cache.stage
 
@@ -735,6 +770,214 @@ def test_recent_failed_commit_preserves_published_history(recent_runner, monkeyp
         with pytest.raises(RuntimeError, match="commit failure|another SP rank"):
             runner.pipeline.forward(batch(index=1))
         assert cache.handles == handles and not cache.commit_active
+        assert archive.records is records and archive.payload_bytes == archive_bytes
+        with pytest.raises(RuntimeError, match="no pending"):
+            archive.publish()
         torch.testing.assert_close(runner.pipeline._ar_sessions["s"].history_mask, masks)
         assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
+    runner.close_session("s")
+
+
+def test_recent_archive_preserves_evicted_rows_and_generation(recent_runner):
+    runner = recent_runner
+    reference = [execute(runner, batch(index=index)).output["payload"]["video"] for index in range(4)]
+    assert runner.pipeline._ar_sessions["s"].history_archive is None
+    runner.reset_session("s")
+    runner.pipeline.ar_config = replace(runner.pipeline.ar_config, history_archive_max_bytes=1 << 20)
+    for index, expected in enumerate(reference):
+        output = execute(runner, batch(index=index))
+        np.testing.assert_array_equal(output.output["payload"]["video"], expected)
+    session = runner.pipeline._ar_sessions["s"]
+    archive = session.history_archive
+    assert [record.frame_start for record in archive.records] == [0, 3, 6, 9]
+    assert session.history_frames[0].position > archive.records[0].frame_start
+    for index, record in enumerate(archive.records):
+        assert record.mask.tolist() == [[True] * 6 + [False]]
+        assert record.frame_rows(index * 3 + 2) == slice(2, 3)
+        assert (record.segment, record.text_tokens, record.action_start) == (index + 1, 4, 2)
+        for layer, (key, value) in enumerate(record.layers):
+            assert key.device.type == value.device.type == "cpu"
+            torch.testing.assert_close(key, torch.full((7, 2, 4), index * 3 + layer + 1.0))
+            torch.testing.assert_close(value, -key)
+    assert archive.payload_bytes == 4 * (7 * 2 * 4 * 4 * 2 * 2 + 7)
+    assert output.output["metadata"]["hy_nomas"]["archive_latent_frames"] == 12
+    assert output.output["metadata"]["hy_nomas"]["archive_payload_bytes"] == archive.payload_bytes
+    runner.close_session("s")
+    assert archive.records == () and archive.payload_bytes == 0
+
+
+def test_archive_excludes_transient_conditioning_and_isolates_sessions(recent_runner):
+    runner = recent_runner
+    runner.pipeline.ar_config = replace(runner.pipeline.ar_config, history_archive_max_bytes=1 << 20)
+    state = StepRequestState(request_id="live", sampling=sampling(frames=21), prompt="forest")
+    with runner._bound_ar_session("live", description="test"):
+        runner.pipeline.prepare_encode(state)
+        step_chunk(runner.pipeline, state)
+        step_chunk(runner.pipeline, state)
+        archive = runner.pipeline._session().history_archive
+        assert [record.text_tokens for record in archive.records] == [4, 0]
+        assert [record.layers[0][0].shape[0] for record in archive.records] == [7, 3]
+        assert archive.records[1].mask.tolist() == [[True, True, True]]
+    execute(runner, batch(session="other", seed=19), "other")
+    other = runner.pipeline._ar_sessions["other"].history_archive
+    assert other is not archive and other.frames == 3 and archive.frames == 6
+    runner.reset_session("live")
+    assert archive.records == () and other.frames == 3
+    runner.release_step_requests(["other"])
+    assert other.records == () and not runner.pipeline._ar_sessions
+
+
+@pytest.mark.parametrize("limit", ["history_archive_max_bytes", "history_archive_max_frames"])
+def test_archive_limit_reclaims_session_and_allows_fresh_generation(recent_runner, limit):
+    runner = recent_runner
+    runner.pipeline.ar_config = replace(
+        runner.pipeline.ar_config,
+        history_archive_max_bytes=903 if limit.endswith("bytes") else 1 << 20,
+        history_archive_max_frames=3 if limit.endswith("frames") else 4096,
+    )
+    free = runner.kv_cache.manager.block_pool.get_num_free_blocks()
+    expected = execute(runner, batch()).output["payload"]["video"]
+    archive = runner.pipeline._ar_sessions["s"].history_archive
+    with pytest.raises(OmniClientError, match="archive quota"):
+        execute(runner, batch(index=1))
+    assert archive.records == () and archive.payload_bytes == 0
+    assert not runner._sessions and not runner.pipeline._ar_sessions
+    assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
+    np.testing.assert_array_equal(execute(runner, batch()).output["payload"]["video"], expected)
+    runner.close_session("s")
+
+
+@pytest.mark.parametrize("limit", ["history_archive_max_bytes", "history_archive_max_frames"])
+def test_archive_client_error_response_reclaims_runner_session(recent_runner, monkeypatch, limit):
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+
+    runner = recent_runner
+    runner.pipeline.ar_config = replace(
+        runner.pipeline.ar_config,
+        history_archive_max_bytes=903 if limit.endswith("bytes") else 1 << 20,
+        history_archive_max_frames=3 if limit.endswith("frames") else 4096,
+    )
+
+    def serialized_forward(self, req, **kwargs):
+        # The base runner converts client exceptions before the AR wrapper sees them.
+        try:
+            return self.pipeline.forward(DiffusionRequestBatch([req]))
+        except OmniClientError as exc:
+            return DiffusionOutput.from_exception(exc)
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_model", serialized_forward)
+    free = runner.kv_cache.manager.block_pool.get_num_free_blocks()
+    expected = runner.execute_model(batch().requests[0]).output["payload"]["video"]
+    archive = runner.pipeline._ar_sessions["s"].history_archive
+    error = runner.execute_model(batch(index=1).requests[0])
+    assert "archive quota" in error.error
+    assert error.error_status_code == 400
+    assert archive.records == () and archive.payload_bytes == 0
+    assert not runner._sessions and not runner.pipeline._ar_sessions
+    assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
+    actual = runner.execute_model(batch().requests[0]).output["payload"]["video"]
+    np.testing.assert_array_equal(actual, expected)
+    runner.close_session("s")
+
+
+def test_worker_cancellation_reclaims_committed_and_pending_archive_tensors(recent_runner):
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    runner = recent_runner
+    runner.pipeline.ar_config = replace(runner.pipeline.ar_config, history_archive_max_bytes=1 << 20)
+    worker = object.__new__(DiffusionWorker)
+    worker.model_runner = runner
+    worker._step_lora_state = {}
+    free = runner.kv_cache.manager.block_pool.get_num_free_blocks()
+
+    def stage_pending_and_observe(archive):
+        record = archive.records[-1]
+        archive.stage(
+            record.layers,
+            record.mask,
+            frame_start=archive.frames,
+            frame_count=record.frame_count,
+            tokens_per_frame=record.tokens_per_frame,
+            segment=record.segment + 1,
+            text_tokens=record.text_tokens,
+            action_start=record.action_start,
+        )
+        return [
+            weakref.ref(tensor)
+            for chunk in archive._pending
+            for tensor in (chunk.mask, *(tensor for pair in chunk.layers for tensor in pair))
+        ]
+
+    expected = None
+    for _ in range(3):
+        video = execute(runner, batch()).output["payload"]["video"]
+        if expected is None:
+            expected = video.copy()
+        np.testing.assert_array_equal(video, expected)
+        archive = runner.pipeline._ar_sessions["s"].history_archive
+        refs = stage_pending_and_observe(archive)
+        # The last held request may never see another scheduling wave.
+        worker.release_step_requests(["s"])
+        worker.release_step_requests(["s"])
+        gc.collect()
+        assert all(ref() is None for ref in refs)
+        assert archive.records == () and archive.frames == archive.payload_bytes == 0
+        with pytest.raises(RuntimeError, match="no pending"):
+            archive.publish()
+        assert not runner._sessions and not runner.pipeline._ar_sessions
+        assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
+
+
+def test_chunk_reuses_mask_across_denoise_steps_and_clears_after_commit(runner):
+    pipeline = runner.pipeline
+    state = StepRequestState(request_id="live", sampling=sampling(frames=21), prompt="forest")
+    with runner._bound_ar_session("live", description="test"):
+        pipeline.prepare_encode(state)
+        pipeline.prepare_next_chunk(state)
+        assert state.extra["hy_nomas_chunk_masks"] is None
+        inputs = InputBatch.make_batch([state], cached_batch=None)
+        for _ in range(state.chunk_num_steps):
+            prediction = pipeline.denoise_step(inputs, states=[state])
+            cm = state.extra.get("hy_nomas_chunk_masks")
+            assert cm is not None and cm[0] is not None and cm[1] == [cm[0]] * pipeline.num_double_blocks
+            pipeline.step_scheduler(state, prediction)
+        pipeline.post_decode(state)
+        assert state.extra["hy_nomas_chunk_masks"] is None
+        chunk0_calls = pipeline.calls[: state.chunk_num_steps + 1]
+        assert len({call["mask_id"] for call in chunk0_calls}) == 1
+        assert len({call["mask_list_id"] for call in chunk0_calls}) == 1
+        step_chunk(pipeline, state, inputs)
+        chunk1_calls = pipeline.calls[state.chunk_num_steps + 1 :]
+        assert len({call["mask_id"] for call in chunk1_calls}) == 1
+        assert len({call["mask_list_id"] for call in chunk1_calls}) == 1
+    runner.close_session("live")
+
+
+def test_inference_mode_boundary_preserves_versioned_masks_and_plan_cache(runner):
+    from tests.diffusion.models.hy_nomas.test_native_runtime import _small_transformer
+
+    pipeline, probe, plan_ids = runner.pipeline, _small_transformer(num_layers=runner.pipeline.num_double_blocks), []
+    orig_fwd, orig_res, calls = pipeline.transformer_forward, probe.attention.resolve_masks, [0]
+    probe.attention.resolve_masks = lambda *a, **kw: (calls.__setitem__(0, calls[0] + 1), orig_res(*a, **kw))[1]
+
+    def wrapped_forward(**kw):
+        vl, tm, cms, hs = kw["cache_valid_len"], kw["text_mask"], kw["cache_mask_list"], kw["hidden_states"]
+        assert not tm.is_inference() and all(not m.is_inference() for m in cms)
+        if vl > 0:
+            shape = (hs.shape[0], hs.shape[2], hs.shape[3], hs.shape[4])
+            img = hs.reshape(hs.shape[0], -1, hs.shape[1])
+            act = (kw["intra_seg_txt_offsets"], kw["intra_seg_vid_windows"])
+            probe._last = (shape, img, tm, cms, vl, kw["update_cache"], kw["cache_txt"], act)
+            plan_ids.append(id(probe._resolve_step_attention_plan(*probe._last)[0][0]))
+        return orig_fwd(**{**kw, "cache_mask_list": [m.clone() for m in cms]})
+
+    pipeline.transformer.forward_with_cache = wrapped_forward
+    with torch.inference_mode():
+        assert execute(runner, batch(index=0)).error is None and execute(runner, batch(index=1)).error is None
+        assert not pipeline._ar_sessions["s"].history_mask.is_inference()
+        assert len(plan_ids) == 5 and len(set(plan_ids)) == 1 and calls[0] == 1
+        probe._last[3][0][0, 0] = not probe._last[3][0][0, 0]
+        probe._resolve_step_attention_plan(*probe._last[:5], False, *probe._last[6:])
+        assert calls[0] == 2
     runner.close_session("s")

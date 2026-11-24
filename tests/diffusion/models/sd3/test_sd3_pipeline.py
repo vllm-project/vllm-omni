@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 
 import pytest
@@ -153,3 +156,51 @@ def test_encode_prompt_preserves_direct_pooled_prompt_embeds():
 
     assert actual_prompt_embeds is prompt_embeds
     assert actual_pooled_prompt_embeds is pooled_prompt_embeds
+
+
+@pytest.mark.parametrize(
+    ("guidance_scale", "expected"),
+    [
+        pytest.param(4.0, True, id="cfg"),
+        pytest.param(1.0, False, id="no-cfg"),
+    ],
+)
+def test_forward_tells_cache_dit_whether_the_request_runs_cfg(
+    monkeypatch: pytest.MonkeyPatch,
+    guidance_scale: float,
+    expected: bool,
+):
+    """Regression test for https://github.com/vllm-project/vllm-omni/issues/8734."""
+    pipeline = _make_sd3_pipeline()
+
+    class StopAfterDiffuseError(Exception):
+        pass
+
+    def _fake_diffuse(**kwargs):
+        raise StopAfterDiffuseError
+
+    pipeline.encode_prompt = lambda **kwargs: (torch.empty(1, 2, 3), torch.empty(1, 4))
+    pipeline.prepare_latents = lambda *args, **kwargs: torch.zeros(1, 1, 1, 1)
+    pipeline.prepare_timesteps = lambda *args, **kwargs: (torch.tensor([1.0]), 1)
+    pipeline.diffuse = _fake_diffuse
+
+    calls = []
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.sd3.pipeline_sd3.set_separate_cfg",
+        lambda transformer, do_true_cfg: calls.append((transformer, do_true_cfg)),
+    )
+
+    batch = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="sd3-cache-dit-cfg",
+                prompt="a prompt",
+                sampling_params=_make_sd3_sampling(guidance_scale=guidance_scale),
+            )
+        ]
+    )
+
+    with pytest.raises(StopAfterDiffuseError):
+        pipeline.forward(batch)
+
+    assert calls == [(pipeline.transformer, expected)]

@@ -299,3 +299,12 @@ def test_fp8_adapter_skips_other_modelopt_specs():
     assert prepare_fp8_layers_for_fsdp(layer) == 0
     assert layer.weight is original_weight
     assert layer.quant_method.kernel._get_layer_params == original_accessor
+
+
+def test_fp8_adapter_rejects_unvalidated_online_block_layout():
+    from vllm_omni.quantization.fp8_config import OnlineBlockFp8LinearMethod
+
+    layer = nn.Module()
+    layer.quant_method = object.__new__(OnlineBlockFp8LinearMethod)
+    with pytest.raises(ValueError, match="does not yet support configurable online FP8 block scaling"):
+        prepare_fp8_layers_for_fsdp(layer)

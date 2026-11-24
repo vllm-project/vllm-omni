@@ -7,7 +7,7 @@ One song is one or two engine requests against the single-stage pipeline:
 tokens only), then the semantic phase generates codec tokens and the model
 solves the acoustic ODE + decodes 48 kHz stereo as the request finishes.
 ``cot=off`` and a user-supplied ``--abc-file`` skip the first request.
-Prefix caching lets the second request reuse the first one's blocks.
+Prefix caching is disabled; each request prefills its own prompt.
 
 Example:
     python end2end.py --model /models/YuE2-3B --vae /models/YuE2-Vae \
@@ -43,7 +43,6 @@ from vllm_omni.model_executor.models.yue2.yue2 import (
     KEY_TOP_P,
     SEMANTIC_SAMPLING,
     STOP_TOKEN_IDS,
-    SYNTHESIS_HOLD_STEPS,
 )
 from vllm_omni.tokenizers.yue2_prompt import (
     abc_ids_from_generated,
@@ -70,18 +69,15 @@ def sampling_params(engine, *, phase, seed, max_frames, prompt_ids):
         KEY_MIN_TOKENS: preset["min_tokens"],
         KEY_MAX_AUDIO_FRAMES: max_frames,
         KEY_SKIP_SYNTHESIS: phase == "abc",
-        # Full prompt ids: under a KV prefix-cache hit the engine schedules
-        # only the uncached tail, so the model cannot rebuild its NAR
-        # conditioning prefix from the scheduled tokens alone.
+        # NAR conditioning needs the full prompt ids.
         KEY_PREFIX_IDS: list(prompt_ids),
     }
     if phase == "abc":
         params.max_tokens = preset["max_tokens"]
     else:
-        # The song is synthesized on a side stream while the request is held;
-        # leave max_tokens headroom for the hold tokens.
-        params.max_tokens = min(max_frames + 1 + SYNTHESIS_HOLD_STEPS, CONTEXT - len(prompt_ids))
-        params.extra_args[KEY_MAX_HOLD_STEPS] = max(0, params.max_tokens - max_frames - 1)
+        # Acoustic completion no longer consumes AR tokens.
+        params.max_tokens = min(max_frames + 2, CONTEXT - len(prompt_ids))
+        params.extra_args[KEY_MAX_HOLD_STEPS] = 0
     params.stop_token_ids = list(STOP_TOKEN_IDS)
     params.detokenize = False
     return params
@@ -90,7 +86,10 @@ def sampling_params(engine, *, phase, seed, max_frames, prompt_ids):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="m-a-p/YuE2-3B checkpoint dir or repo id")
-    parser.add_argument("--vae", default=None, help="m-a-p/YuE2-Vae dir or repo id (or $YUE2_VAE)")
+    parser.add_argument("--revision", default=None, help="main model and tokenizer revision")
+    parser.add_argument("--vae", default=None, help="m-a-p/YuE2-Vae directory or repo id")
+    parser.add_argument("--vae-revision", default=None, help="independent VAE revision")
+    parser.add_argument("--deploy-config", default=None, help="deployment YAML")
     parser.add_argument("--style", required=True)
     parser.add_argument("--lyrics", required=True)
     parser.add_argument("--cot", choices=["off", "melody", "full"], default="full")
@@ -114,16 +113,28 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    vae_overrides = {}
+    if args.vae_revision:
+        vae_overrides["yue2_vae_revision"] = args.vae_revision
     if args.vae:
-        import os
-
-        os.environ["YUE2_VAE"] = args.vae
-
-    tokenizer = YuE2TextTokenizer(Path(args.model) / "qwen.tiktoken")
-    engine_kwargs: dict = {}
+        vae_overrides["yue2_vae_path"] = args.vae
+    engine_kwargs: dict = {
+        "revision": args.revision,
+        "stage_overrides": {"0": {"hf_overrides": vae_overrides}},
+    }
+    if args.deploy_config:
+        engine_kwargs["deploy_config"] = args.deploy_config
     if args.gpu_memory_utilization is not None:
         engine_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
     engine = Omni(model=args.model, **engine_kwargs)
+    vllm_config = engine.engine.stage_vllm_configs[0]
+    config = vllm_config.model_config
+    tokenizer = YuE2TextTokenizer.from_pretrained(
+        config.model,
+        revision=config.revision,
+        token=config.hf_token,
+        cache_dir=vllm_config.load_config.download_dir,
+    )
 
     abc_ids = None
     if args.abc_file is not None:

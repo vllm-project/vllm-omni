@@ -375,7 +375,8 @@ def test_model_level_persistent_staging_gated_on_decode_graph(
     backend.enable(pipeline)
 
     hook = pipeline.transformer._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
-    assert (hook._stager is not None) is expect_stager
+    expected_stager = expect_stager and accelerator_device.type == "cuda"
+    assert (hook._stager is not None) is expected_stager
 
     backend.disable()
 
@@ -460,12 +461,10 @@ class TestMoveParamsPinMemory:
         )
         assert not tracker["called"], "pin_memory should not be called for DTensor"
 
-    def test_regular_tensor_calls_pin_memory(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
-        """Regular tensor should call pin_memory when moving to CPU."""
+    def test_regular_tensor_is_pinned(self, accelerator_device):
+        """Regular tensors remain pinned regardless of allocation strategy."""
         module = _create_simple_module().to(accelerator_device)
-        tracker, mock_pin = _track_pin_memory_calls()
 
-        monkeypatch.setattr(torch.Tensor, "pin_memory", mock_pin)
         hook = SequentialOffloadHook(
             offload_targets=[],
             device=accelerator_device,
@@ -478,7 +477,7 @@ class TestMoveParamsPinMemory:
             non_blocking=False,
             pin_memory=True,
         )
-        assert tracker["called"], "pin_memory should be called for regular tensors"
+        assert all(tensor.is_pinned() for tensor in module.parameters())
 
     def test_pin_memory_skipped_when_disabled(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
         """pin_memory should not be called when pin_memory=False."""
@@ -514,3 +513,44 @@ class TestMoveParamsPinMemory:
         )
         hook._move_params(module, accelerator_device, non_blocking=False, pin_memory=True)
         assert not tracker["called"], "pin_memory should not be called for non-CPU target"
+
+    def test_host_built_module_is_pinned_on_first_offload(self, accelerator_device):
+        """A module constructed on host starts pageable and must be pinned by the first offload."""
+        module = _create_simple_module().to("cpu")
+        assert not any(p.is_pinned() for p in module.parameters())
+
+        moved = SequentialOffloadHook._move_params(module, torch.device("cpu"), pin_memory=True)
+
+        assert moved
+        assert all(t.is_pinned() for t in (*module.parameters(), *module.buffers()))
+        assert not SequentialOffloadHook._move_params(module, torch.device("cpu"), pin_memory=True)
+
+    def test_rocm_packs_host_built_module_on_first_offload(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
+        """On ROCm a host-built module is packed into shared pinned slabs on its first offload."""
+        monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: True)
+        module = nn.Module()
+        for index in range(3):
+            module.register_buffer(f"state_{index}", torch.full((1_100_000,), index, dtype=torch.uint8))
+
+        assert SequentialOffloadHook._move_params(module, torch.device("cpu"), pin_memory=True)
+
+        buffers = list(module.buffers())
+        assert all(buffer.is_pinned() for buffer in buffers)
+        assert len({buffer.untyped_storage().data_ptr() for buffer in buffers}) == 1
+        assert [buffer[0].item() for buffer in buffers] == [0, 1, 2]
+        assert not SequentialOffloadHook._move_params(module, torch.device("cpu"), pin_memory=True)
+
+    @pytest.mark.parametrize("rocm", [False, True], ids=["default", "rocm"])
+    def test_host_module_stays_pageable_without_pin_support(self, monkeypatch: pytest.MonkeyPatch, rocm: bool):
+        """Hosts without pinned memory must not try to re-pin a host-built module."""
+        from vllm_omni.diffusion.offloader import sequential_backend
+
+        module = _create_simple_module().to("cpu")
+        tracker, mock_pin = _track_pin_memory_calls()
+        monkeypatch.setattr(torch.Tensor, "pin_memory", mock_pin)
+        monkeypatch.setattr(sequential_backend, "is_pin_memory_available", lambda: False)
+        monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: rocm)
+
+        assert not SequentialOffloadHook._move_params(module, torch.device("cpu"), pin_memory=True)
+        assert not tracker["called"]
+        assert not any(t.is_pinned() for t in (*module.parameters(), *module.buffers()))

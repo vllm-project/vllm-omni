@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
@@ -51,6 +53,7 @@ class _StagePort:
 
 class _Manager:
     stage_request_id = staticmethod(DuplexSessionManager.stage_request_id)
+    runtime_config = DuplexSessionRuntimeConfig()
 
     def ensure_stage_request(self, session, *, stage_id: int, fence, final_stage_id: int | None = None):
         request_id = self.stage_request_id(
@@ -77,6 +80,8 @@ def _channel(session: DuplexEngineSession, port: _StagePort, run: DuplexRunState
         draining_stage_ids=lambda *, stage_count: frozenset({2, 3}) if stage_count >= 4 else frozenset(),
         input_stage_id=lambda payload: 0,
         prepare_prompt_config=lambda config, **kwargs: config,
+        context_view_policy=lambda **kwargs: None,
+        uses_history_context=False,
         extra_prompt_config=lambda runtime_config: {},
         runtime_patch_for_submitted_prompt=lambda prompt: None,
         commit_append_plan=lambda request_id: None,
@@ -270,7 +275,11 @@ async def test_finished_stage1_handoff_submit_path(monkeypatch: pytest.MonkeyPat
     assert kind == "initial"
     assert getattr(request, "resumable", None) is False
     assert OmniStreamingUpdate.from_request(request) is None
-    prompt_ids = list(getattr(request, "prompt_token_ids", []) or [])
+    # v0.34 packs prompt token ids as an int32 ndarray (see
+    # build_engine_core_request_from_tokens); compare in list space without
+    # truth-testing the array itself.
+    raw_ids = getattr(request, "prompt_token_ids", None)
+    prompt_ids = np.asarray([] if raw_ids is None else raw_ids).tolist()
     assert prompt_ids, "submit_initial carried an empty prompt"
 
 

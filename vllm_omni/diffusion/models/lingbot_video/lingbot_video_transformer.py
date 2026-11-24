@@ -699,7 +699,7 @@ class LingBotVideoBlock(nn.Module):
 class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = False
     _repeated_blocks = ["LingBotVideoBlock"]
-    _layerwise_offload_blocks_attr = "blocks"
+    _layerwise_offload_blocks_attrs = ["blocks"]
     _no_split_modules = ["LingBotVideoBlock"]
     _keep_in_fp32_modules = list(LINGBOT_VIDEO_FP32_MODULES)
 

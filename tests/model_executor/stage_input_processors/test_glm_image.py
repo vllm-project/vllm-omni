@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.preprocess import OmniRenderer
 from vllm_omni.model_executor.models.glm_image.pipeline import GLM_IMAGE_PIPELINE
 from vllm_omni.model_executor.stage_input_processors.glm_image import (
     _first_source_image,
@@ -17,6 +19,7 @@ from vllm_omni.model_executor.stage_input_processors.glm_image import (
     _upsample_token_ids,
     ar2diffusion,
     compute_max_tokens,
+    prepare_ar_prompt,
 )
 from vllm_omni.outputs.mm_outputs import MultimodalPayload
 
@@ -180,10 +183,82 @@ class TestComputeMaxTokens:
         result = compute_max_tokens(512, 512, factor=16, is_i2i=False)
         assert result == 1089
 
+    def test_sizeless_resolves_to_default_grid(self):
+        # The builder owns the size-less default: None resolves to the
+        # processor's DEFAULT_TARGET_SIZE (1024x1024 -> 256 + 1024 + 1).
+        # Fails with a TypeError before the builder resolved absent sizes.
+        assert compute_max_tokens(None, None, is_i2i=False) == 1281
+        assert compute_max_tokens(None, None, is_i2i=True) == 1025
+
     def test_i2i_smaller_than_t2i(self):
         t2i = compute_max_tokens(1024, 1024, is_i2i=False)
         i2i = compute_max_tokens(1024, 1024, is_i2i=True)
         assert i2i < t2i
+
+
+class TestComputeMaxTokensMatchesParser:
+    """The serving budget and the ar2diffusion parser share one grid contract.
+
+    Serving sets the AR stage's per-request max_tokens from compute_max_tokens;
+    these tests pin that budget to exactly what _parse_generated_tokens
+    requires, so the two offsets cannot drift apart.
+    """
+
+    @pytest.mark.parametrize(
+        "height,width",
+        [
+            (1024, 1024),
+            (768, 768),
+            (1536, 1536),
+            (2048, 2048),
+            (1024, 512),
+            (1280, 720),
+        ],
+    )
+    def test_t2i_budget_stream_parses_exactly(self, height, width):
+        budget = compute_max_tokens(height, width, is_i2i=False)
+        stream = list(range(budget))
+
+        prior, out_h, out_w = _parse_generated_tokens(stream, height, width, is_i2i=False)
+        assert (out_h, out_w) == (height, width)
+        assert prior.shape[0] == (height // 32) * (width // 32) * 4
+
+        # budget-1 (small+large, no EOS slot) still parses, but one token
+        # below the small+large minimum must fail: the budget is exact.
+        _parse_generated_tokens(stream[:-1], height, width, is_i2i=False)
+        with pytest.raises(ValueError):
+            _parse_generated_tokens(stream[:-2], height, width, is_i2i=False)
+
+    @pytest.mark.parametrize(
+        "height,width",
+        [
+            (1024, 1024),
+            (768, 768),
+            (1536, 1536),
+        ],
+    )
+    def test_i2i_budget_stream_parses_exactly(self, height, width):
+        budget = compute_max_tokens(height, width, is_i2i=True)
+        stream = list(range(budget))
+
+        prior, out_h, out_w = _parse_generated_tokens(stream, height, width, is_i2i=True)
+        assert (out_h, out_w) == (height, width)
+        assert prior.shape[0] == (height // 32) * (width // 32) * 4
+
+        _parse_generated_tokens(stream[:-1], height, width, is_i2i=True)
+        with pytest.raises(ValueError):
+            _parse_generated_tokens(stream[:-2], height, width, is_i2i=True)
+
+
+class TestArMaxTokensRegistry:
+    """The serving path resolves GLM-Image's AR budget through the registry."""
+
+    def test_glm_image_pipeline_declares_builder(self):
+        from vllm_omni.model_extras.registry import get_ar_max_tokens_builder
+
+        assert get_ar_max_tokens_builder("GlmImagePipeline") is compute_max_tokens
+        # AR-only deploys surface the wrapper architecture name.
+        assert get_ar_max_tokens_builder("GlmImageForConditionalGeneration") is compute_max_tokens
 
 
 # =============================================================================
@@ -465,3 +540,68 @@ class TestAr2Diffusion:
         assert result["prompt"] == "first"
         assert result["height"] == 1024
         assert result["width"] == 1024
+
+
+# =============================================================================
+# Tests for prepare_ar_prompt (offline / size-less prompts, #7952)
+# =============================================================================
+
+
+def _t2i_64_tokens():
+    # 64x64 target: 16x16 preview + 2x2 target + EOS.
+    return [9] * 256 + [1, 2, 3, 4] + [16385]
+
+
+class TestPrepareArPrompt:
+    def test_stage0_registers_transform(self):
+        assert GLM_IMAGE_PIPELINE.stages[0].prompt_transform_func.endswith("glm_image.prepare_ar_prompt")
+
+    def test_bare_str_gets_size_from_diffusion_params(self):
+        sp_list = [object(), OmniDiffusionSamplingParams(height=768, width=512)]
+        out = prepare_ar_prompt("a cat", sp_list)
+        assert out == {"prompt": "a cat", "mm_processor_kwargs": {"target_h": 768, "target_w": 512}}
+        assert OmniRenderer._routes_no_media_kwargs(out)
+
+    def test_bare_str_mirrors_size_into_ar_extra_args(self):
+        # Decode M-RoPE positions read the AR params' extra_args (propagate_target_size).
+        from vllm import SamplingParams
+
+        sp_list = [SamplingParams(), OmniDiffusionSamplingParams(height=768, width=512)]
+        prepare_ar_prompt("a cat", sp_list)
+        assert sp_list[0].extra_args == {"target_h": 768, "target_w": 512}
+
+    def test_defaults_to_1024_without_diffusion_params(self):
+        out = prepare_ar_prompt({"prompt": "a cat"}, [object()])
+        assert out["mm_processor_kwargs"] == {"target_h": 1024, "target_w": 1024}
+
+    def test_explicit_target_kwargs_untouched(self):
+        prompt = {"prompt": "a cat", "mm_processor_kwargs": {"target_h": 512, "target_w": 512}}
+        sp_list = [object(), OmniDiffusionSamplingParams(height=768, width=768)]
+        assert prepare_ar_prompt(prompt, sp_list) is prompt
+
+    def test_does_not_mutate_input(self):
+        prompt = {"prompt": "a cat", "mm_processor_kwargs": {"foo": 1}}
+        out = prepare_ar_prompt(prompt, [])
+        assert prompt == {"prompt": "a cat", "mm_processor_kwargs": {"foo": 1}}
+        assert out["mm_processor_kwargs"] == {"foo": 1, "target_h": 1024, "target_w": 1024}
+
+    @pytest.mark.parametrize("prompt", [{"prompt_embeds": torch.zeros(1)}, ["a", "b"], None])
+    def test_passthrough(self, prompt):
+        assert prepare_ar_prompt(prompt, []) is prompt
+
+    def test_ar2diffusion_accepts_sampling_params_probe(self):
+        import inspect
+
+        # The orchestrator only passes the diffusion params when this name exists.
+        assert "sampling_params" in inspect.signature(ar2diffusion).parameters
+
+    def test_ar2diffusion_matches_transformed_size_for_bare_str(self):
+        sp = OmniDiffusionSamplingParams(height=64, width=64)
+        stamped = prepare_ar_prompt("a cat", [object(), sp])["mm_processor_kwargs"]
+
+        # ar2diffusion sees the untransformed prompt; it must resolve the same size.
+        result = ar2diffusion([_source_output(_t2i_64_tokens())], prompt="a cat", sampling_params=sp)
+
+        assert result is not None
+        assert (result["height"], result["width"]) == (stamped["target_h"], stamped["target_w"])
+        assert result["prompt"] == "a cat"

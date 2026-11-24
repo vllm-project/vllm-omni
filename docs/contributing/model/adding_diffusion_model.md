@@ -436,7 +436,7 @@ def get_your_model_post_process_func(
     # Load VAE config to get scale factor
     model_path = od_config.model
     if not os.path.exists(model_path):
-        from vllm_omni.diffusion.model_loader.utils import download_weights_from_hf_specific
+        from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
         model_path = download_weights_from_hf_specific(model_path, None, ["*"])
 
     vae_config_path = os.path.join(model_path, "vae/config.json")

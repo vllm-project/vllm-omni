@@ -53,6 +53,7 @@ This extension offers the following nodes based on the output modalities (at **C
   see the [standalone and H3 chaining guide](docs/seedvr2-restoration.md).
 - **Latent Mask Editing** for MiniMax-H3 latent-mask editing (source media plus video/audio noise masks)
 - **MiniMax H3 Add Guide** for anchoring images, clips, and audio at chosen frames of a MiniMax-H3 video (timeline guides)
+- **MiniMax-H3 Control** for conditioning MiniMax-H3 on a prepared control video with Fun ControlNet Union (canny, depth, hed, mlsd, pose, inpaint)
 - **FastH3 Deployment** for routing text-to-video requests to a MiniMax-H3 server with FastH3 fused at startup
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
@@ -147,6 +148,34 @@ You can configure per-stage sampling parameters for multi-stage models.
 >
 > Do not combine `frame` with `first_frame` or `last_frame`, and do not combine any frame input with
 > `references`. Task routing is automatic from which inputs you connect.
+>
+> For MiniMax-H3 Fun ControlNet Union, connect a **MiniMax-H3 Control** node. It cannot be combined with `frame`, `first_frame`/`last_frame`, `references`, or `latent_edit` either.
+
+#### MiniMax-H3 Fun ControlNet Union
+
+The **MiniMax-H3 Control** node conditions generation on a prepared control video, and supports `canny`, `depth`, `hed`, `mlsd`, `pose` and `inpaint`. Connect its `control` output to **Generate Video**.
+
+| Input | Type | Notes |
+| --- | --- | --- |
+| `control_type` | enum | Which conditioning mode to request |
+| `strength` | `FLOAT` | Conditioning strength for the selected mode, 0-10, default 1 |
+| `control_video` | `VIDEO` | Required for the five structure modes, optional for `inpaint` |
+| `source_video` | `VIDEO` | Optional original video; requires a mask |
+| `mask` | `MASK` | Static mask for the whole clip; white/1 marks what to regenerate |
+| `mask_video` | `VIDEO` | Per-frame mask; mutually exclusive with `mask` |
+
+The server must be started with the Fun ControlNet checkpoint (`--controlnet-model-path`); otherwise it rejects control requests.
+
+Control videos are re-encoded as lossless H.264 (CRF 0) and uploaded whole, so each must stay under the server's 512 MiB limit; trim long clips to the generated length first. The encode needs a ComfyUI whose video `save_to` accepts `crf`; this was tested on ComfyUI 0.35.0.
+
+> [!TIP]
+> The node does not run any preprocessor. Build the control video in the workflow, for example `SDPose Keypoint Extractor` -> `SDPose Draw Keypoints` -> `Create Video` for `pose`, and pass an `IMAGE` batch through **Create Video** before connecting it.
+>
+> `inpaint` needs a mask. `source_video` without a mask, a structure mode without `control_video`, or `mask` together with `mask_video` are rejected before the request is sent.
+>
+> Control requires a MiniMax-H3 model. With a custom `--served-model-name`, connect **MiniMax-H3 Video Params** so the request is recognised as MiniMax-H3; this is not needed when **FastH3 Deployment** is connected.
+
+Load [MiniMax-H3 ControlNet Canny](example_workflows/vLLM-Omni%20MiniMax-H3%20ControlNet%20Canny.json) for a complete `canny` example. It builds the control video inside the workflow: **Load Video** -> fit to 1344x768 -> first 124 frames -> **Canny** -> **Create Video** at 24 FPS. It also saves the control video so you can check the edges. The **Load Video** filename is a placeholder; put your source clip in `ComfyUI/input`.
 
 For MiniMax-H3 Ref2VA, **Video References** accepts up to 9 images (`image_1`–`image_9`),
 3 videos (`video_1`–`video_3`), and 3 audio clips (`audio_1`–`audio_3`), with at most
@@ -224,6 +253,26 @@ also play the result to assess reference conditioning and audio/video synchroniz
 Record the server commit, model/adapter, input assets, prompt, settings, and output
 alongside the result. Local schema or mocked-server checks do not establish H3
 generation quality or replace this real-model validation.
+
+#### MiniMax H3 Character Replacement
+
+Download [Character Swap V1.5](https://huggingface.co/akatz-ai/MiniMax-H3-Character-Swap-LoRA) on the machine running vLLM-Omni:
+
+```bash
+hf download akatz-ai/MiniMax-H3-Character-Swap-LoRA h3_character_swap_v1.5.safetensors --local-dir /models
+```
+
+In **LoRA(Character Swap)**, set `local_path` to `/models/h3_character_swap_v1.5.safetensors`, enable the adapter and start with `scale=1.0`. Leave `int_id=0` for automatic identification. Start the service with `--lora-backend peft`; for Swap + Turbo composition, use `--max-cpu-loras 3`. The target image supplies appearance, the video supplies motion and scene structure, and the prompt identifies which person to replace. FastH3-Omni + Swap requires a server that supports request-level LoRA for that checkpoint.
+
+Load [MiniMax-H3 Character Replacement](example_workflows/vLLM-Omni%20MiniMax-H3%20Character%20Replacement.json),
+select your own target image and motion video, and replace both `/models/...`
+adapter paths with server-local files. This template uses reference conditioning,
+not pixel-locked editing, and saves generated audio. Supply the complete reference
+video and target duration. Enable long_video and select continuation for the existing
+latent-tail continuation mode. Adjust continuation_window_frames and
+continuation_overlap_frames to set the window length and overlap. Reference video
+and audio are reused across windows, rather than sliced to each source interval.
+Inspect continuity and source action timing; output may include frame-alignment padding.
 
 ### MiniMax H3 Text to Video
 
@@ -344,10 +393,7 @@ A guided request:
 - keeps the usual routing: guides alone are T2VA, with `first_frame` /
   `last_frame` FL2VA, with **Video References** Ref2VA. References keep their
   `<Picture N>` / `<Video N>` / `<Audio N>` numbering;
-- needs base H3 weights: **FastH3 Deployment**, a request **LoRA** with a
-  non-zero scale (including Turbo), and **Latent Mask Editing** are rejected
-  before upload. Other server-side restrictions (cache acceleration, distilled
-  schedules, continuation, `audio_mode=lock_source`) are reported by the server.
+- requires base H3 weights and rejects FastH3 (Preview and Omni) or active request-level LoRA before upload; set every LoRA scale to zero or disconnect it. Server-side restrictions remain authoritative.
 
 Use a vLLM-Omni server that includes timeline guides
 ([#8838](https://github.com/vllm-project/vllm-omni/pull/8838)). Older servers
@@ -357,6 +403,8 @@ guide support, so the node cannot detect this for you.
 The served model name must match the H3 model spec (for example, start the
 server with `--served-model-name MiniMaxAI/MiniMax-H3`); otherwise the node
 refuses to send guides, for example to a server named only by its model path.
+
+The [Agentic Continuation](example_workflows/vLLM-Omni%20MiniMax-H3%20Character%20Replacement%20Continuation%20(Agentic).json) example uses two boundary images at frames 0 and 21, ordinary Generate Video requests, and native crop/concatenation nodes. **Reverse Image Batch** reverses the frame order of any `IMAGE` batch; it has no model, VAE, request, or queue logic. The supplied segment lengths reproduce a 27-second example; another source needs matching contexts, prompts, and cut values. Loader filenames are placeholders. Guided segments require base H3 weights with all request-level LoRAs disabled; FastH3 + Swap + guides is unsupported.
 
 Validate the node and the request contract locally with:
 
@@ -447,6 +495,8 @@ Node tints and the title-bar mark are applied in `web/main.js`, keyed off each n
 ## Limitation and Non-Goals
 
 - Single server mode only. No automatic load balancing or failover.
+- Control conditioning is prepared client-side. The nodes upload prepared control, source and mask media; they neither run preprocessors nor load ControlNet weights in the ComfyUI process.
+- MiniMax-H3 control cannot be combined with image or clip timeline guides. The client does not check this; with a nonzero control strength the server rejects the job when generation starts. Audio-only guides work with control.
 - Features set is bounded to vLLM-Omni's online service capability, including
     - The types of models supported in online mode,
     - The types of sampling parameters supported in the online mode,

@@ -161,9 +161,14 @@ def _pcm_sine(*, sample_rate: int = 24_000, frequency_hz: float = 220.0, duratio
     return np.rint(waveform * np.iinfo(np.int16).max).astype("<i2").tobytes()
 
 
-def _assert_wav_wraps_pcm(wav_bytes: bytes, pcm_bytes: bytes, sample_rate: int) -> None:
+def _interleave_stereo(pcm_bytes: bytes) -> bytes:
+    mono = np.frombuffer(pcm_bytes, dtype="<i2")
+    return np.repeat(mono, 2).astype("<i2").tobytes()
+
+
+def _assert_wav_wraps_pcm(wav_bytes: bytes, pcm_bytes: bytes, sample_rate: int, channels: int = 1) -> None:
     with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
-        assert wav_file.getnchannels() == 1
+        assert wav_file.getnchannels() == channels
         assert wav_file.getsampwidth() == 2
         assert wav_file.getframerate() == sample_rate
         assert wav_file.readframes(wav_file.getnframes()) == pcm_bytes
@@ -342,8 +347,8 @@ def test_failed_pcm_capture_preserves_bytes_rate_and_original_hnr_failure(monkey
         directory.write_text("not a directory")
     original_error = AssertionError("PCM speech HNR is below the configured floor")
 
-    def fail_hnr(audio_bytes, min_hnr_db, sr):
-        assert (audio_bytes, min_hnr_db, sr) == (b"\x00\x00" * 100, -1.0, 24_000)
+    def fail_hnr(audio_bytes, min_hnr_db, sr, channels):
+        assert (audio_bytes, min_hnr_db, sr, channels) == (b"\x00\x00" * 100, -1.0, 24_000, 1)
         raise original_error
 
     monkeypatch.setattr(assertions, "_assert_pcm_int16_speech_hnr", fail_hnr)
@@ -402,6 +407,37 @@ def test_pcm_voiced_signal_passes_the_default_speech_hnr_gate():
     )
 
 
+@pytest.mark.parametrize("sample_rate", [16_000, 24_000, 48_000])
+@pytest.mark.parametrize("frequency", [80, 100, 200, 400])
+@pytest.mark.parametrize("snr_db", [10, 20])
+def test_pcm_hnr_recovers_known_noise_ratio_across_pitch(sample_rate, frequency, snr_db):
+    time = np.arange(sample_rate) / sample_rate
+    tone = 0.4 * np.sin(2 * np.pi * frequency * time + 0.31)
+    noise_std = 0.4 / np.sqrt(2) * 10 ** (-snr_db / 20)
+    signal = tone + np.random.default_rng(0).normal(0, noise_std, sample_rate)
+
+    # The ratio is set by the signal powers, independently of the estimator.
+    # Finite-window normalization must not penalize low-pitched voices.
+    measured = assertions._compute_pcm_hnr_db(signal, sr=sample_rate)
+    assert measured == pytest.approx(snr_db, abs=1.0)
+
+
+@pytest.mark.parametrize("corruption", ["noise_dominant", "shuffled"])
+def test_pcm_hnr_rejects_corrupted_periodic_audio(corruption):
+    sample_rate = 24_000
+    time = np.arange(sample_rate) / sample_rate
+    signal = 0.1 * np.sin(2 * np.pi * 100 * time)
+    rng = np.random.default_rng(0)
+    if corruption == "noise_dominant":
+        signal += rng.normal(0, 0.1 / np.sqrt(2) * 10 ** (6 / 20), sample_rate)
+    else:
+        rng.shuffle(signal)
+    pcm = (signal * 32767).astype("<i2").tobytes()
+
+    with pytest.raises(AssertionError, match="HNR"):
+        assertions._assert_pcm_int16_speech_hnr(pcm, min_hnr_db=-2.0, sr=sample_rate)
+
+
 @pytest.mark.parametrize("sample_rate", [None, 0, -1, True, 24000.5, "not-a-rate"])
 def test_pcm_transcript_opt_in_rejects_invalid_declared_sample_rate(sample_rate):
     with pytest.raises(AssertionError, match="transcript_pcm_sample_rate"):
@@ -411,6 +447,97 @@ def test_pcm_transcript_opt_in_rejects_invalid_declared_sample_rate(sample_rate)
                 "input": "hello",
                 "response_format": "pcm",
                 "transcript_pcm_sample_rate": sample_rate,
+            },
+            "advanced_model",
+        )
+
+
+def test_stereo_pcm_transcript_wraps_interleaved_frames_as_two_channel_wav(monkeypatch):
+    pcm_bytes = _interleave_stereo(_pcm_sine(sample_rate=48_000))
+    transcriptions: list[bytes] = []
+
+    def transcribe(audio_bytes, model_size="small", language=None):
+        transcriptions.append(audio_bytes)
+        return "hello from stereo pcm"
+
+    monkeypatch.setattr(assertions, "convert_audio_bytes_to_text", transcribe)
+
+    assert_audio_speech_response(
+        OmniResponse(success=True, audio_bytes=pcm_bytes, audio_format="audio/pcm"),
+        {
+            "input": "hello from stereo pcm",
+            "response_format": "pcm",
+            "expected_sample_rate": 48_000,
+            "transcript_pcm_sample_rate": 48_000,
+            "transcript_pcm_channels": 2,
+        },
+        "advanced_model",
+    )
+
+    assert len(transcriptions) == 1
+    _assert_wav_wraps_pcm(transcriptions[0], pcm_bytes, 48_000, channels=2)
+
+
+def test_stereo_pcm_hnr_matches_the_mono_signal(capsys):
+    mono = _pcm_sine(sample_rate=48_000)
+    for audio_bytes, channels in ((mono, 1), (_interleave_stereo(mono), 2)):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=audio_bytes, audio_format="audio/pcm"),
+            {"response_format": "pcm", "expected_sample_rate": 48_000, "transcript_pcm_channels": channels},
+            "advanced_model",
+        )
+    hnr_lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("PCM speech HNR")]
+    assert len(hnr_lines) == 2
+    assert hnr_lines[0] == hnr_lines[1]
+
+
+@pytest.mark.parametrize("channels", [0, -1, True, 2.0, "2"])
+def test_pcm_rejects_invalid_channel_count(channels, monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(tmp_path))
+    with pytest.raises(AssertionError, match="transcript_pcm_channels"):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=_pcm_sine(), audio_format="audio/pcm"),
+            {"input": "hello", "response_format": "pcm", "transcript_pcm_channels": channels},
+            "advanced_model",
+        )
+    assert not list(tmp_path.iterdir())
+
+
+def test_stereo_pcm_hnr_rejects_partial_frame():
+    pcm_bytes = _interleave_stereo(_pcm_sine(sample_rate=48_000)) + bytes(2)
+    with pytest.raises(AssertionError, match="aligned to int16 frames"):
+        assertions._assert_pcm_int16_speech_hnr(pcm_bytes, sr=48_000, channels=2)
+
+
+def test_stereo_pcm_frame_failure_retains_original_audio(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(tmp_path))
+    pcm_bytes = _interleave_stereo(_pcm_sine(sample_rate=48_000)) + bytes(2)
+    response = OmniResponse(success=True, audio_bytes=pcm_bytes, audio_format="audio/pcm")
+
+    with pytest.raises(AssertionError, match="aligned to int16 frames"):
+        assert_audio_speech_response(
+            response,
+            {"response_format": "pcm", "expected_sample_rate": 48_000, "transcript_pcm_channels": 2},
+            "advanced_model",
+        )
+
+    (retained_audio,) = tmp_path.glob("*.pcm")
+    assert retained_audio.read_bytes() == pcm_bytes
+    metadata = json.loads(retained_audio.with_suffix(".json").read_text())
+    assert metadata["sample_rate"] == 48_000
+    assert metadata["audio_format"] == "pcm"
+    assert "aligned to int16 frames" in metadata["assertion"]
+
+
+def test_stereo_pcm_transcript_rejects_partial_frame():
+    with pytest.raises(AssertionError, match="aligned to int16 frames"):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=_pcm_sine()[:-2], audio_format="audio/pcm"),
+            {
+                "input": "hello",
+                "response_format": "pcm",
+                "transcript_pcm_sample_rate": 24_000,
+                "transcript_pcm_channels": 2,
             },
             "advanced_model",
         )

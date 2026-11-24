@@ -5,11 +5,128 @@
 
 import json
 from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@dataclass
+class ServerEndpoint:
+    """Stand-in for the launched Omni server used by ``test_performance_benchmark``."""
+
+    host: str = "localhost"
+    port: int = 8000
+    model: str = "model"
+    judge_base_url: str | None = None
+
+
+@dataclass(frozen=True)
+class PytestOptions:
+    """Typed option reader for direct benchmark-runner unit tests."""
+
+    assert_baseline: bool = True
+    require_baseline: bool = False
+    require_duplex_eval_score_floors: bool = False
+
+    def getoption(self, name: str) -> bool:
+        return bool(getattr(self, name))
+
+
+def test_request_failure_assertion_shows_the_underlying_error():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="server_vad_unavailable: missing Silero") as caught:
+        assert_result({"completed": 0, "errors": ["", "server_vad_unavailable: missing Silero"]}, {}, 120)
+    assert "0/120 completed" in str(caught.value)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_server_vad_preflight_checks_only_enabled_vad_workloads(monkeypatch, enabled):
+    from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.engine.duplex.vad import ServerVADUnavailableError, SileroVADBackendProvider
+
+    monkeypatch.setattr(
+        run_benchmark,
+        "BENCHMARK_CONFIGS",
+        [
+            {
+                "test_name": "offline-vad",
+                "benchmark_params": [{"enabled": enabled, "duplex_eval_turn_detection": "server_vad"}],
+            }
+        ],
+    )
+    calls = []
+
+    def unavailable(self):
+        calls.append(self.model_path)
+        raise ServerVADUnavailableError("server_vad needs a local Silero artifact")
+
+    monkeypatch.setattr(SileroVADBackendProvider, "get", unavailable)
+    if enabled:
+        with pytest.raises(ServerVADUnavailableError, match="local Silero artifact"):
+            run_benchmark._preflight_server_vad("offline-vad", [])
+        assert calls == [None]
+    else:
+        run_benchmark._preflight_server_vad("offline-vad", [])
+        assert calls == []
+
+
+@pytest.mark.parametrize(
+    "deploy_args",
+    [
+        ("--deploy-config", "offline.yaml"),
+        ("--deploy-config=offline.yaml",),
+        ("--deploy-config", "unused.yaml", "--deploy-config", "offline.yaml"),
+        ("--deploy-config=unused.yaml", "--deploy-config=offline.yaml"),
+        ("--deploy-config", "unused.yaml", "--deploy-config=offline.yaml"),
+        ("--deploy-config=unused.yaml", "--deploy-config", "offline.yaml"),
+    ],
+)
+def test_server_vad_preflight_fails_before_model_resolution_or_server_start(monkeypatch, deploy_args):
+    from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.config import stage_config
+    from vllm_omni.engine.duplex.vad import ServerVADUnavailableError, SileroVADBackendProvider
+
+    monkeypatch.setattr(
+        run_benchmark,
+        "BENCHMARK_CONFIGS",
+        [
+            {
+                "test_name": "offline-vad",
+                "benchmark_params": [{"duplex_eval_turn_detection": "server_vad"}],
+            }
+        ],
+    )
+    deploy_paths = []
+
+    def resolve_deploy(path):
+        deploy_paths.append(path)
+        return {"duplex_session": {"server_vad_model_path": f"/models/{Path(path).stem}/silero.onnx"}}
+
+    monkeypatch.setattr(stage_config, "resolve_deploy_yaml", resolve_deploy)
+    selected = []
+
+    def unavailable(self):
+        selected.append(self.model_path)
+        raise ServerVADUnavailableError("Configured Silero VAD model does not exist")
+
+    def must_not_start(*args, **kwargs):
+        pytest.fail("model startup ran before VAD validation")
+
+    monkeypatch.setattr(SileroVADBackendProvider, "get", unavailable)
+    monkeypatch.setattr(run_benchmark, "_resolve_offline_model", must_not_start)
+    monkeypatch.setattr(run_benchmark, "OmniServer", must_not_start)
+    server = ("offline-vad", "model", None, None, deploy_args, True)
+    with pytest.raises(ServerVADUnavailableError, match="does not exist"):
+        with run_benchmark._start_omni_server(server):
+            pytest.fail("unavailable VAD yielded a server")
+    # Match the serving CLI: the final flag overrides any earlier default.
+    assert deploy_paths == ["offline.yaml"]
+    assert selected == ["/models/offline/silero.onnx"]
 
 
 def test_task_excluded_from_cli_args():
@@ -301,7 +418,7 @@ def test_merge_omni_default_server_args_respects_json():
     ]
 
 
-def test_prefix_benchmark_uses_unified_runner(monkeypatch):
+def test_prefix_benchmark_uses_unified_runner(monkeypatch, pytestconfig):
     from pathlib import Path
 
     from tests.dfx.conftest import is_diffusion_perf_config, load_benchmark_configs
@@ -318,6 +435,7 @@ def test_prefix_benchmark_uses_unified_runner(monkeypatch):
     def benchmark(**kwargs):
         calls.append(kwargs)
         assert "--name" not in kwargs["args"]
+        assert "--required-duplex-metrics" not in kwargs["args"]
         assert "--warmup-dataset-path" not in kwargs["args"]
         assert "tests/assets/hunyuan_image3/it2i.jsonl" in kwargs["args"]
         assert kwargs["num_warmups"] == 2
@@ -329,6 +447,7 @@ def test_prefix_benchmark_uses_unified_runner(monkeypatch):
             run_benchmark.test_performance_benchmark(
                 SimpleNamespace(host="localhost", port=8000, model="test-model"),
                 {"test_name": config["test_name"], "params": params},
+                pytestconfig=pytestconfig,
             )
     assert len(calls) == 3
 
@@ -616,6 +735,22 @@ def test_resolve_baseline_value_errors():
         resolve_baseline_value({"1": 0.4}, sweep_index=0)
 
 
+def test_diffusion_benchmark_module_is_preloaded_by_name():
+    """Leave ``run_diffusion_benchmark`` bound on its parent package.
+
+    ``test_baseline_gate.py`` imports the submodule by name first, which also
+    sets the attribute on ``tests.dfx.perf.scripts``. The next test pops the
+    submodule from ``sys.modules`` and imports it again; that fresh import must
+    not reuse this stale package attribute. Definition order is what exercises
+    the regression, so keep this test directly above it.
+    """
+    import sys
+
+    from tests.dfx.perf.scripts import run_diffusion_benchmark
+
+    assert run_diffusion_benchmark is sys.modules["tests.dfx.perf.scripts.run_diffusion_benchmark"]
+
+
 def test_diffusion_build_run_params_resolves_baseline_per_sweep(tmp_path, monkeypatch):
     """``_build_run_params`` / ``_iter_sweep_runs`` narrow list baselines per concurrency."""
     import importlib
@@ -642,9 +777,11 @@ def test_diffusion_build_run_params_resolves_baseline_per_sweep(tmp_path, monkey
     )
     monkeypatch.setattr(sys, "argv", ["pytest", "--test-config-file", str(cfg)])
     sys.modules.pop("tests.dfx.perf.scripts.run_diffusion_benchmark", None)
-    from tests.dfx.perf.scripts import run_diffusion_benchmark as rdb
-
-    importlib.reload(rdb)
+    # Import the module object instead of the attribute bound on the parent
+    # package: a prior ``from ... import run_diffusion_benchmark`` leaves that
+    # attribute pointing at the module we just popped, and reloading it then
+    # fails with "module ... not in sys.modules".
+    rdb = importlib.import_module("tests.dfx.perf.scripts.run_diffusion_benchmark")
 
     params = {
         "name": "c_sweep",
@@ -712,6 +849,412 @@ def test_num_warmups_preserves_explicit_zero():
     assert _resolve_num_warmups({"num_warmups": 0}, default=4) == 0
 
 
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+def test_qwen3_duplex_c8_measures_and_judges_distinct_samples(monkeypatch, dataset, pytestconfig):
+    from dataclasses import dataclass
+    from pathlib import Path
+
+    from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
+
+    config_path = Path(__file__).with_name(f"test_qwen3_omni_duplex_{dataset}.json")
+    config = json.loads(config_path.read_text())[0]
+    params = dict(config["benchmark_params"][0])
+    count = 60 if dataset == "omniinteract" else 120
+    prefix = "omniinteract" if dataset == "omniinteract" else "duplex_eval"
+    assert not params.get("duplex_performance_only")
+
+    @dataclass
+    class ServerEndpoint:
+        host: str = "localhost"
+        port: int = 8000
+        model: str = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+        judge_base_url: str = "http://localhost:8001"
+
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        assert "--num-warmups" not in kwargs["args"]
+        assert "--name" not in kwargs["args"]
+        return {"completed": kwargs["num_prompt"]}
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
+    run_benchmark.test_performance_benchmark(
+        ServerEndpoint(), {"test_name": config["test_name"], "params": params}, pytestconfig=pytestconfig
+    )
+    assert len(calls) == 1
+    call = calls[0]
+    assert (call["flow"], call["num_prompt"], call["num_warmups"]) == (8, count, 8)
+    parser = TrackingArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(call["args"])
+    assert args.num_prompts == count and args.max_concurrency == 8
+    assert args.duplex_metric_aggregation == "response"
+    assert args.duplex_sample_pool_size is None
+    assert args.disable_shuffle and args.save_detailed
+    assert args.ready_check_timeout_sec == 0
+    assert getattr(args, f"{prefix}_evaluate")
+    assert getattr(args, f"{prefix}_judge_base_url") == ServerEndpoint.judge_base_url
+    assert getattr(args, f"{prefix}_judge_model") == params[f"{prefix}_judge_model"]
+    if dataset == "omniinteract":
+        assert args.omniinteract_subsets == params["omniinteract_subsets"].split()
+        assert args.omniinteract_require_response
+    else:
+        assert len(set(args.duplex_eval_ids)) == count
+        assert args.duplex_eval_split == params["duplex_eval_split"]
+        assert args.duplex_eval_mix == params["duplex_eval_mix"]
+
+
+def test_num_warmups_resolves_each_sweep_point():
+    from tests.dfx.perf.scripts.run_benchmark import _resolve_num_warmups
+
+    assert [
+        _resolve_num_warmups({"num_warmups": [1, 8, 16]}, default=4, sweep_index=i, sweep_size=3) for i in range(3)
+    ] == [1, 8, 16]
+
+
+def test_perf_sweep_collects_all_baseline_regressions(monkeypatch, pytestconfig):
+    from tests.dfx.conftest import PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts import run_benchmark
+
+    config = {
+        "test_name": "test_collect_baselines",
+        "server_params": {"model": "test-model"},
+        "benchmark_params": [],
+    }
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs["flow"])
+        return {"completed": kwargs["num_prompt"], "flow": kwargs["flow"]}
+
+    def assert_regression(result, _params, _num_prompt, *, check_baseline=False, require_baseline=False):
+        raise PerformanceBaselineRegressionError(f"performance baseline regression:\nflow={result['flow']}")
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(run_benchmark, "assert_result", assert_regression)
+    case = {
+        "test_name": config["test_name"],
+        "params": {"num_prompts": [2, 4], "max_concurrency": [1, 4]},
+    }
+
+    with pytest.raises(PerformanceBaselineRegressionError) as exc_info:
+        run_benchmark.test_performance_benchmark(
+            ServerEndpoint(model="test-model"),
+            case,
+            pytestconfig=pytestconfig,
+        )
+
+    assert calls == [1, 4]
+    message = str(exc_info.value)
+    assert "across 2 sweep(s)" in message
+    assert "max_concurrency=1 num_prompts=2" in message
+    assert "max_concurrency=4 num_prompts=4" in message
+
+
+@pytest.mark.parametrize(
+    "ttfp_values,passes",
+    [
+        ([167.096, 141.569, 151.8997], True),
+        ([167.096, 155.2, 156.0], False),
+    ],
+)
+def test_perf_sweep_confirms_h100_ttfp_with_median(monkeypatch, tmp_path, ttfp_values, passes):
+    from tests.dfx.conftest import BENCHMARK_RESULT_PATH_KEY, PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts import run_benchmark
+
+    config = {
+        "test_name": "test_confirm_h100_ttfp",
+        "server_params": {"model": "test-model"},
+        "benchmark_params": [],
+    }
+    calls = []
+    results = [
+        {
+            "completed": 4,
+            "Hardware": "H100",
+            "median_audio_ttfp_ms": value,
+            "mean_audio_ttfp_ms": value,
+            "request_throughput": 1.0,
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": 129.2319,
+                    "mean_audio_ttfp_ms": 129.2319,
+                    "request_throughput": 1.0,
+                }
+            },
+        }
+        for value in ttfp_values
+    ]
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        result = dict(results[len(calls) - 1])
+        result_path = tmp_path / f"attempt-{len(calls)}.json"
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        result[BENCHMARK_RESULT_PATH_KEY] = str(result_path)
+        return result
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    case = {
+        "test_name": config["test_name"],
+        "params": {
+            "num_prompts": [4],
+            "max_concurrency": [64],
+            "baseline_confirmation": {
+                "H100": {
+                    "metrics": ["median_audio_ttfp_ms", "mean_audio_ttfp_ms"],
+                    "attempts": 3,
+                    "tolerance": 0.20,
+                }
+            },
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": [129.2319],
+                    "mean_audio_ttfp_ms": [129.2319],
+                    "request_throughput": [1.0],
+                }
+            },
+        },
+    }
+    pytestconfig = PytestOptions()
+
+    if passes:
+        run_benchmark.test_performance_benchmark(ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig)
+    else:
+        with pytest.raises(PerformanceBaselineRegressionError, match="confirmed_median_of=3"):
+            run_benchmark.test_performance_benchmark(
+                ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig
+            )
+
+    assert len(calls) == 3
+    assert all("--baseline-confirmation" not in call["args"] for call in calls)
+    assert [call.get("result_filename_suffix") for call in calls] == [None, "confirmation-2", "confirmation-3"]
+    result_paths = list(tmp_path.glob("attempt-*.json"))
+    assert result_paths == [tmp_path / "attempt-1.json"]
+    persisted = json.loads(result_paths[0].read_text(encoding="utf-8"))
+    assert BENCHMARK_RESULT_PATH_KEY not in persisted
+    assert persisted["median_audio_ttfp_ms"] == sorted(ttfp_values)[1]
+    assert persisted["mean_audio_ttfp_ms"] == sorted(ttfp_values)[1]
+    assert persisted["baseline_confirmation_result"] == {
+        "status": "passed" if passes else "failed",
+        "attempts_completed": 3,
+        "attempts_configured": 3,
+        "tolerance": 0.20,
+        "metrics": {
+            "mean_audio_ttfp_ms": {"values": ttfp_values, "median": sorted(ttfp_values)[1]},
+            "median_audio_ttfp_ms": {"values": ttfp_values, "median": sorted(ttfp_values)[1]},
+        },
+    }
+
+
+def test_h100_confirmation_tolerance_resolves_per_sweep():
+    from tests.dfx.conftest import PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts.run_benchmark import _baseline_confirmation_policy
+
+    params = {
+        "baseline_confirmation": {
+            "H100": {
+                "metrics": ["median_audio_ttfp_ms", "mean_audio_ttfp_ms"],
+                "attempts": 3,
+                "tolerance": [0.10, 0.10, 0.20],
+            }
+        }
+    }
+    result = {"Hardware": "H100"}
+    regression = PerformanceBaselineRegressionError(
+        "TTFP regression",
+        failed_metrics={"median_audio_ttfp_ms"},
+        threshold_metrics={"median_audio_ttfp_ms"},
+    )
+
+    policies = [
+        _baseline_confirmation_policy(params, result, regression, sweep_index=index, sweep_size=3) for index in range(3)
+    ]
+
+    assert [policy[2] for policy in policies if policy is not None] == [0.10, 0.10, 0.20]
+
+
+def test_perf_sweep_does_not_retry_a_hard_throughput_regression(monkeypatch):
+    from tests.dfx.conftest import PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts import run_benchmark
+
+    config = {
+        "test_name": "test_hard_h100_regression",
+        "server_params": {"model": "test-model"},
+        "benchmark_params": [],
+    }
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {
+            "completed": 4,
+            "Hardware": "H100",
+            "median_audio_ttfp_ms": 120.0,
+            "mean_audio_ttfp_ms": 120.0,
+            "request_throughput": 0.8,
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": 100.0,
+                    "mean_audio_ttfp_ms": 100.0,
+                    "request_throughput": 1.0,
+                }
+            },
+        }
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    case = {
+        "test_name": config["test_name"],
+        "params": {
+            "num_prompts": [4],
+            "max_concurrency": [64],
+            "baseline_confirmation": {
+                "H100": {
+                    "metrics": ["median_audio_ttfp_ms", "mean_audio_ttfp_ms"],
+                    "attempts": 3,
+                    "tolerance": 0.20,
+                }
+            },
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": [100.0],
+                    "mean_audio_ttfp_ms": [100.0],
+                    "request_throughput": [1.0],
+                }
+            },
+        },
+    }
+    pytestconfig = PytestOptions()
+
+    with pytest.raises(PerformanceBaselineRegressionError, match="request_throughput"):
+        run_benchmark.test_performance_benchmark(ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig)
+
+    assert len(calls) == 1
+
+
+def test_perf_sweep_consolidates_confirmation_aborted_by_hard_retry(monkeypatch, tmp_path):
+    from tests.dfx.conftest import BENCHMARK_RESULT_PATH_KEY, PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts import run_benchmark
+
+    config = {
+        "test_name": "test_confirmation_hard_retry_regression",
+        "server_params": {"model": "test-model"},
+        "benchmark_params": [],
+    }
+    calls = []
+    results = [
+        {
+            "completed": 4,
+            "Hardware": "H100",
+            "median_audio_ttfp_ms": 120.0,
+            "mean_audio_ttfp_ms": 120.0,
+            "request_throughput": 1.0,
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": 100.0,
+                    "mean_audio_ttfp_ms": 100.0,
+                    "request_throughput": 1.0,
+                }
+            },
+        },
+        {
+            "completed": 4,
+            "Hardware": "H100",
+            "median_audio_ttfp_ms": 105.0,
+            "mean_audio_ttfp_ms": 105.0,
+            "request_throughput": 0.8,
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": 100.0,
+                    "mean_audio_ttfp_ms": 100.0,
+                    "request_throughput": 1.0,
+                }
+            },
+        },
+    ]
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        result = dict(results[len(calls) - 1])
+        result_path = tmp_path / f"attempt-{len(calls)}.json"
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        result[BENCHMARK_RESULT_PATH_KEY] = str(result_path)
+        return result
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    case = {
+        "test_name": config["test_name"],
+        "params": {
+            "num_prompts": [4],
+            "max_concurrency": [64],
+            "baseline_confirmation": {
+                "H100": {
+                    "metrics": ["median_audio_ttfp_ms", "mean_audio_ttfp_ms"],
+                    "attempts": 3,
+                    "tolerance": 0.20,
+                }
+            },
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": [100.0],
+                    "mean_audio_ttfp_ms": [100.0],
+                    "request_throughput": [1.0],
+                }
+            },
+        },
+    }
+    pytestconfig = PytestOptions()
+
+    with pytest.raises(PerformanceBaselineRegressionError, match="request_throughput"):
+        run_benchmark.test_performance_benchmark(ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig)
+
+    assert [call.get("result_filename_suffix") for call in calls] == [None, "confirmation-2"]
+    result_paths = list(tmp_path.glob("attempt-*.json"))
+    assert result_paths == [tmp_path / "attempt-1.json"]
+    persisted = json.loads(result_paths[0].read_text(encoding="utf-8"))
+    assert persisted["request_throughput"] == 0.8
+    assert persisted["baseline_confirmation_result"] == {
+        "status": "aborted_hard_regression",
+        "attempts_completed": 2,
+        "attempts_configured": 3,
+        "tolerance": 0.20,
+        "metrics": {
+            "mean_audio_ttfp_ms": {"values": [120.0, 105.0], "median": 112.5},
+            "median_audio_ttfp_ms": {"values": [120.0, 105.0], "median": 112.5},
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "warmups,message",
+    [
+        ([], "one value per sweep point"),
+        ([1, 8], "one value per sweep point"),
+        ([1, -1], "one value per sweep point"),
+        ([1, 8, False], "a non-negative integer or a list of them"),
+        ([1, 8, -1], "a non-negative integer or a list of them"),
+        ([1, 8, 1.5], "a non-negative integer or a list of them"),
+    ],
+)
+def test_num_warmups_rejects_invalid_sweep(warmups, message):
+    from tests.dfx.perf.scripts.run_benchmark import _resolve_num_warmups
+
+    with pytest.raises(ValueError, match=message):
+        _resolve_num_warmups({"num_warmups": warmups}, default=16, sweep_index=0, sweep_size=3)
+
+
 def test_omniinteract_result_accepts_complete_artifacts():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
@@ -770,13 +1313,33 @@ def test_duplex_eval_result_rejects_incomplete_artifacts_or_judging(field, value
         assert_result(result, {"dataset_name": "omni-duplex-eval", "duplex_eval_evaluate": True}, 1)
 
 
-@pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", False)])
-def test_duplex_eval_score_floor_hardware_controls_enforcement(monkeypatch, hardware, enforce_score_floors):
+_CALIBRATED_DUPLEX_EVAL_FLOORS = {
+    "min_rtd_mean_content_score": 1.8,
+    "min_rtd_mean_temporal_score": 1.4,
+    "min_pr_mean_all_success": 0.28,
+}
+
+
+@pytest.mark.parametrize(
+    ("hardware", "enforce_score_floors"),
+    [("H100", True), ("MI300", False)],
+)
+def test_duplex_eval_score_floors_follow_configured_baseline(monkeypatch, hardware, enforce_score_floors):
     from tests.dfx.perf.scripts import run_benchmark
     from tests.e2e.accuracy.omni_duplex_eval import validation
 
     observed = []
-    monkeypatch.setattr(validation, "load_accuracy_config", lambda *args: {"baseline": {}})
+    monkeypatch.setattr(
+        validation,
+        "load_accuracy_config",
+        lambda *args: {
+            "baseline": {
+                "H100": dict(_CALIBRATED_DUPLEX_EVAL_FLOORS),
+                "B200": dict(_CALIBRATED_DUPLEX_EVAL_FLOORS),
+                "A3": dict(_CALIBRATED_DUPLEX_EVAL_FLOORS),
+            }
+        },
+    )
     monkeypatch.setattr(
         validation,
         "assert_accuracy_result",
@@ -789,11 +1352,30 @@ def test_duplex_eval_score_floor_hardware_controls_enforcement(monkeypatch, hard
         {
             "dataset_name": "omni-duplex-eval",
             "duplex_eval_accuracy_config": "config.json",
-            "duplex_eval_score_floor_hardware": ["H100", "B200", "A3"],
         },
         1,
     )
     assert observed == [enforce_score_floors]
+
+
+def test_duplex_eval_nested_baseline_requires_hardware_label(monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark
+    from tests.e2e.accuracy.omni_duplex_eval import validation
+
+    monkeypatch.setattr(
+        validation,
+        "load_accuracy_config",
+        lambda *args: {"baseline": {"H100": dict(_CALIBRATED_DUPLEX_EVAL_FLOORS)}},
+    )
+    with pytest.raises(ValueError, match="requires a runtime hardware label"):
+        run_benchmark.assert_result(
+            _duplex_eval_result(),
+            {
+                "dataset_name": "omni-duplex-eval",
+                "duplex_eval_accuracy_config": "config.json",
+            },
+            1,
+        )
 
 
 @pytest.mark.parametrize("field", ["client_ttft_ms", "client_ttfp_ms"])
@@ -807,9 +1389,23 @@ def test_duplex_eval_result_rejects_missing_measurements(field, metric):
         assert_result(result, {"dataset_name": "omni-duplex-eval"}, 1)
 
 
+def test_minicpmo_duplex_eval_skips_per_session_client_latency():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, _, count, _ = _qwen3_joint_result("omni_duplex_eval")
+    params = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0][
+        "benchmark_params"
+    ][0]
+    result["test_name"] = "test_minicpmo_4_5_omni_duplex_eval"
+    for session in result["duplex_session_metrics"]:
+        session["client_ttft_ms"] = {"count": 0, "mean": 0.0}
+        session["client_ttfp_ms"] = {"count": 0, "mean": 0.0}
+    assert_result(result, params, count)
+
+
 @pytest.mark.parametrize("prefix", ["omniinteract", "duplex_eval"])
 @pytest.mark.parametrize("judge_url", [None, "http://127.0.0.1:8001"])
-def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url):
+def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url, pytestconfig):
     from tests.dfx.perf.scripts import run_benchmark
 
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
@@ -822,92 +1418,129 @@ def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url):
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
     # The result contract is covered above; exercise actual CLI assembly here.
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
-    server = SimpleNamespace(host="localhost", port=8000, model="model", judge_base_url=judge_url)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
+    server = ServerEndpoint(judge_base_url=judge_url)
     case = {
         "test_name": "test_duplex",
         "params": {f"{prefix}_evaluate": True, "num_prompts": [1], "max_concurrency": [1]},
     }
     if judge_url is None:
         with pytest.raises(ValueError, match="requires top-level judge_server_params"):
-            run_benchmark.test_performance_benchmark(server, case)
+            run_benchmark.test_performance_benchmark(server, case, pytestconfig=pytestconfig)
         assert not calls
     else:
-        run_benchmark.test_performance_benchmark(server, case)
+        run_benchmark.test_performance_benchmark(server, case, pytestconfig=pytestconfig)
         args = calls[0]["args"]
         assert args[args.index(f"--{prefix.replace('_', '-')}-judge-base-url") + 1] == judge_url
 
 
-@pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", False)])
-def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch, hardware, enforce_score_floors):
-    from dataclasses import dataclass
+def test_minicpmo_duplex_eval_config_replays_pr_correction_ids_at_c8(monkeypatch, pytestconfig):
     from pathlib import Path
 
     from tests.dfx.perf.scripts import run_benchmark
     from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
     from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
-    test_root = Path(__file__).resolve().parents[3]
     config = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
-    accuracy = json.loads((test_root / "e2e/accuracy/omni_duplex_eval/omni_duplex_eval_ci_config.json").read_text())
-    ids = {str(sample_id) for values in accuracy["sample_ids_per_split"].values() for sample_id in values}
+    qwen3 = json.loads((Path(__file__).parent / "test_qwen3_omni_duplex_omni_duplex_eval.json").read_text())[0]
     params = config["benchmark_params"][0]
-    assert len(params["duplex_eval_ids"]) == len(ids) == 66
-    assert set(params["duplex_eval_ids"]) == ids
+    qwen3_ids = qwen3["benchmark_params"][0]["duplex_eval_ids"]
+    assert params["duplex_eval_ids"] == qwen3_ids
+    assert len(set(params["duplex_eval_ids"])) == params["num_prompts"][0] == 120
+    assert params["duplex_eval_split"] == "PR_correction"
+    assert params["duplex_eval_mix"] == qwen3["benchmark_params"][0]["duplex_eval_mix"] == "question"
+    assert "duplex_eval_accuracy_config" not in params
     assert config["judge_server_params"]["model"] == params["duplex_eval_judge_model"]
     assert params["duplex_eval_evaluate"]
-    assert params["duplex_eval_score_floor_hardware"] == ["H100", "B200", "A3"]
-
-    @dataclass
-    class ServerEndpoint:
-        host: str = "localhost"
-        port: int = 8000
-        model: str = "openbmb/MiniCPM-o-4_5"
-        judge_base_url: str = "http://localhost:8001"
+    assert "duplex_eval_score_floor_hardware" not in params
+    assert config["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5.yaml"
+    assert config["server_params"]["update"] == {
+        "duplex_session.max_sessions": 8,
+        "duplex_session.collect_stats": True,
+        "platforms.npu.stages.2.num_replicas": 2,
+        "platforms.npu.stages.2.devices": "0,0",
+        "platforms.npu.stages.2.gpu_memory_utilization": 0.11,
+    }
+    assert params["percentile-metrics"] == "ttft,audio_ttfp,audio_rtf,e2el,audio_duration"
+    assert params["metric-percentiles"] == "50,95"
+    assert params["duplex_metric_aggregation"] == "response"
+    assert params["required_duplex_metrics"] == [
+        "duplex_client_rtf",
+        "duplex_client_ttfp_ms",
+        "duplex_client_ttft_ms",
+        "duplex_busy_rtf",
+        "duplex_stall_ratio",
+    ]
 
     calls = []
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
-    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: hardware)
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
 
     def benchmark(**kwargs):
         calls.append(kwargs)
-        return {"completed": 66}
+        return {"completed": 120}
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
-    run_benchmark.test_performance_benchmark(ServerEndpoint(), {"test_name": config["test_name"], "params": params})
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
+    run_benchmark.test_performance_benchmark(
+        ServerEndpoint(model="openbmb/MiniCPM-o-4_5", judge_base_url="http://localhost:8001"),
+        {"test_name": config["test_name"], "params": params},
+        pytestconfig=pytestconfig,
+    )
     assert len(calls) == 1
     call = calls[0]
     parser = TrackingArgumentParser()
     OmniBenchmarkServingSubcommand.add_cli_args(parser)
     args = parser.parse_args(call["args"])
     assert args.duplex_eval_ids == params["duplex_eval_ids"]
-    assert args.num_prompts == 66
+    assert args.num_prompts == 120
     assert args.max_concurrency == 8
     assert args.save_detailed
-    assert args.duplex_eval_split == "all"
+    assert args.duplex_eval_split == "PR_correction"
+    assert args.duplex_eval_mix == "question"
     assert args.disable_shuffle
     assert call["num_warmups"] == 0
     assert args.ready_check_timeout_sec == 0
     assert args.trust_remote_code
     assert args.duplex_eval_evaluate
     assert args.duplex_eval_judge_base_url == "http://localhost:8001"
+    assert "--duplex-eval-require-score-floors" not in call["args"]
     assert "--duplex-eval-accuracy-config" not in call["args"]
     assert "--duplex-eval-score-floor-hardware" not in call["args"]
-    assert call["accuracy_baseline"] == (accuracy["baseline"] if enforce_score_floors else {})
+    assert "--required-duplex-metrics" not in call["args"]
+    assert args.duplex_metric_aggregation == "response"
+    assert call["accuracy_baseline"] is None
 
 
-@pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
-def test_judge_uses_allocated_second_device(monkeypatch, device_env):
+def test_minicpmo_pr_correction_accepts_zero_success_without_floor():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, _, count, accuracy = _qwen3_joint_result("omni_duplex_eval")
+    params = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0][
+        "benchmark_params"
+    ][0]
+    accuracy["pr"]["mean_all_success"] = 0.0
+    assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
+@pytest.mark.parametrize(("devices", "judge_index", "expected"), [("4,7", "1", "7"), ("4,7,3", "2", "3")])
+def test_judge_uses_allocated_device(monkeypatch, device_env, devices, judge_index, expected):
     from tests.dfx.perf.scripts import run_benchmark as runner
     from vllm_omni.platforms import current_omni_platform
 
-    monkeypatch.setenv(device_env, "4,7")
+    monkeypatch.setenv(device_env, devices)
     monkeypatch.setattr(current_omni_platform, "device_control_env_var", device_env)
     seen = []
 
     @contextmanager
     def server(model, args, **kwargs):
+        assert kwargs["wait_for_device_memory"] is False
+        assert kwargs["defer_stderr"] is True
         seen.append(kwargs["env_dict"])
 
         class Endpoint:
@@ -917,13 +1550,33 @@ def test_judge_uses_allocated_second_device(monkeypatch, device_env):
         yield Endpoint()
 
     monkeypatch.setattr(runner, "OmniServer", server)
-    with runner._start_judge_server({"model": "judge", "device_index": "1"}):
+    with runner._start_judge_server({"model": "judge", "device_index": judge_index}):
         pass
-    assert seen == [{device_env: "7"}]
+    assert seen == [{device_env: expected}]
     assert runner._resolve_judge_visible_devices("0", device_env) == "4"
-    assert __import__("os").environ[device_env] == "4,7"
+    assert __import__("os").environ[device_env] == devices
     with pytest.raises(ValueError, match="outside"):
-        runner._resolve_judge_visible_devices("2", device_env)
+        runner._resolve_judge_visible_devices(str(len(devices.split(","))), device_env)
+
+
+def test_performance_server_defers_stderr_replay(monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark as runner
+
+    seen = []
+
+    @contextmanager
+    def server(model, args, **kwargs):
+        seen.append(kwargs)
+        yield ServerEndpoint(model=model)
+
+    monkeypatch.setattr(runner, "OmniServer", server)
+    monkeypatch.setattr(runner, "_resolve_offline_model", lambda model, revision=None: model)
+    monkeypatch.setattr(runner, "_judge_server_params_for_test", lambda test_name: None)
+    monkeypatch.setattr(runner, "_omni_server_env", lambda: {})
+    with runner._start_omni_server(("perf-case", "model", None, None, (), False)):
+        pass
+    assert len(seen) == 1
+    assert seen[0]["defer_stderr"] is True
 
 
 def test_omniinteract_result_rejects_incomplete_artifacts():
@@ -1121,6 +1774,258 @@ def test_omniinteract_aggregate_rejects_pooled_ia_qtf1_below_floor():
         )
 
 
+def test_omniinteract_run_benchmark_writes_result_acc(tmp_path, monkeypatch):
+    import io
+
+    from tests.dfx import conftest as dfx
+
+    perf_dir = tmp_path / "perf"
+    perf_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(perf_dir))
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    monkeypatch.setenv("BUILDKITE_BRANCH", "acc-branch")
+    payload = {
+        "date": "20261027-120000",
+        "model_id": "openbmb/MiniCPM-o-4_5",
+        "completed": 4,
+        "failed": 0,
+        "num_prompts": 4,
+        "max_concurrency": 8,
+        "omniinteract": {
+            "total": 4,
+            "success": 4,
+            "failed": 0,
+            "artifacts_complete": True,
+            "accuracy": {
+                "status": "ok",
+                "failed": 0,
+                "evaluated": 4,
+                "summary": {
+                    "IA_QTF1": 0.25,
+                    "Precision": 0.5,
+                    "Recall": 0.2,
+                    "Global_TP": 1.0,
+                    "Global_FP": 1,
+                    "Global_FN": 4,
+                },
+            },
+        },
+    }
+
+    class BenchmarkProcess:
+        def __class_getitem__(cls, item):
+            return cls
+
+        def __init__(self, command, **kwargs):
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
+            path = Path(command[command.index("--result-dir") + 1]) / command[command.index("--result-filename") + 1]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload))
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
+    result = dfx.run_benchmark(
+        [
+            "--model",
+            "openbmb/MiniCPM-o-4_5",
+            "--dataset-path",
+            "lucky-lance/OmniInteract",
+            "--omniinteract-evaluate",
+            "--omniinteract-subsets",
+            "1q1a",
+            "--max-concurrency",
+            "8",
+        ],
+        test_name="test_minicpmo_4_5_omniinteract",
+        flow=8,
+        dataset_name="omniinteract",
+        num_prompt=4,
+        resource_label="H100",
+        accuracy_baseline={"omniinteract_aggregate_min_ia_qtf1": 0.2},
+    )
+    acc_paths = list(perf_dir.glob("result_acc_*.json"))
+    assert len(acc_paths) == 1
+    assert "omniinteract_1q1a" in acc_paths[0].name
+    saved = json.loads(acc_paths[0].read_text())
+    assert saved["dataset"] == "omniinteract"
+    assert saved["name"] == "1q1a"
+    assert saved["test_name"] == "test_minicpmo_4_5_omniinteract"
+    assert saved["Hardware"] == result["Hardware"]
+    assert saved["accuracy"]["IA_QTF1"] == 0.25
+    assert saved["accuracy"]["status"] == "ok"
+    assert saved["max_concurrency"] == 8
+    assert saved["baseline"] == {"omniinteract_aggregate_min_ia_qtf1": 0.2}
+    assert saved["branch"] == "acc-branch"
+
+    # Accuracy lives only in ``result_acc_*.json``; the perf JSON keeps the rest.
+    perf_jsons = [path for path in perf_dir.glob("result_*.json") if not path.name.startswith("result_acc_")]
+    assert len(perf_jsons) == 1
+    perf_saved = json.loads(perf_jsons[0].read_text())
+    assert "accuracy" not in perf_saved["omniinteract"]
+    assert perf_saved["omniinteract"]["total"] == 4
+    # The in-memory copy stays nested so floor assertions still see it.
+    assert result["omniinteract"]["accuracy"]["summary"]["IA_QTF1"] == 0.25
+
+
+def test_omniinteract_ephemeral_artifacts_override_output_dir(tmp_path, monkeypatch, pytestconfig):
+    from tests.dfx.perf.scripts import run_benchmark
+
+    persistent = tmp_path / "should-not-use"
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {"completed": 4}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+    server = ServerEndpoint(judge_base_url="http://127.0.0.1:8001")
+    run_benchmark.test_performance_benchmark(
+        server,
+        {
+            "test_name": "test_minicpmo_4_5_omniinteract",
+            "params": {
+                "dataset_name": "omniinteract",
+                "omniinteract_evaluate": True,
+                "omniinteract_persist_artifacts": False,
+                "omniinteract_output_dir": str(persistent),
+                "num_prompts": [4],
+                "max_concurrency": [8],
+            },
+        },
+        pytestconfig=pytestconfig,
+    )
+    args = calls[0]["args"]
+    assert "--omniinteract-persist-artifacts" not in args
+    output_dir = Path(args[args.index("--omniinteract-output-dir") + 1])
+    assert output_dir != persistent
+    assert not output_dir.exists()
+    assert not persistent.exists()
+
+
+def test_omniinteract_persisted_artifacts_keep_configured_output_dir(tmp_path, monkeypatch, pytestconfig):
+    from tests.dfx.perf.scripts import run_benchmark
+
+    persistent = tmp_path / "keep"
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {"completed": 4}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+    server = ServerEndpoint(judge_base_url="http://127.0.0.1:8001")
+    run_benchmark.test_performance_benchmark(
+        server,
+        {
+            "test_name": "test_minicpmo_4_5_omniinteract",
+            "params": {
+                "dataset_name": "omniinteract",
+                "omniinteract_evaluate": True,
+                "omniinteract_persist_artifacts": True,
+                "omniinteract_output_dir": str(persistent),
+                "num_prompts": [4],
+                "max_concurrency": [8],
+            },
+        },
+        pytestconfig=pytestconfig,
+    )
+    args = calls[0]["args"]
+    assert args[args.index("--omniinteract-output-dir") + 1] == str(persistent)
+
+
+def test_omniinteract_aggregate_writes_result_acc(tmp_path, monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark as runner
+
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    runner._reset_omniinteract_aggregate_counts()
+    result = _omniinteract_accuracy_result(tp=6.157502, fp=9, fn=8)
+    result["model_id"] = "openbmb/MiniCPM-o-4_5"
+    result["test_name"] = "test_minicpmo_4_5_omniinteract"
+    result["Hardware"] = "H100"
+    result["date"] = "20261027-120000"
+    result["num_prompts"] = 4
+    result["max_concurrency"] = 8
+    runner.assert_result(result, _omniinteract_aggregate_params("1q1a", group="write-acc"), 4)
+    assert list(tmp_path.glob("result_acc_*omniinteract_aggregate_*.json")) == []
+    runner.assert_result(
+        _omniinteract_accuracy_result(tp=1.133541, fp=2, fn=2),
+        _omniinteract_aggregate_params("1q1a_math", group="write-acc"),
+        4,
+    )
+    last = _omniinteract_accuracy_result(tp=0.0, fp=11, fn=18, ia_qtf1=0.0)
+    for key in ("model_id", "test_name", "Hardware", "date", "num_prompts", "max_concurrency"):
+        last[key] = result[key]
+    runner.assert_result(last, _omniinteract_aggregate_params("1qna", group="write-acc"), 4)
+    written = runner._maybe_write_omniinteract_aggregate_accuracy_result(
+        last,
+        _omniinteract_aggregate_params("1qna", group="write-acc"),
+    )
+    assert written is not None
+    saved = json.loads(written.read_text())
+    assert saved["name"] == "aggregate"
+    assert saved["dataset"] == "omniinteract"
+    assert saved["num_prompts"] == 12
+    assert saved["generation"]["completed"] == 12
+    assert saved["generation"]["failed"] == 0
+    assert saved["generation"]["subsets"] == ["1q1a", "1q1a_math", "1qna"]
+    assert saved["accuracy"]["status"] == "ok"
+    assert saved["benchmark_exit_code"] == 0
+    assert saved["accuracy"]["IA_QTF1"] == runner._ia_qtf1_from_counts(7.291043, 22, 28)
+    assert saved["accuracy"]["Global_TP"] == 7.291043
+    assert saved["max_concurrency"] == 8
+
+
+def test_omniinteract_aggregate_writes_failed_result_acc_when_floor_missed(tmp_path, monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark as runner
+
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    runner._reset_omniinteract_aggregate_counts()
+    first = _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0)
+    first["model_id"] = "openbmb/MiniCPM-o-4_5"
+    first["test_name"] = "test_minicpmo_4_5_omniinteract"
+    first["Hardware"] = "H100"
+    first["date"] = "20261027-120000"
+    first["max_concurrency"] = 8
+    runner.assert_result(first, _omniinteract_aggregate_params("1q1a", group="write-fail"), 4)
+    runner.assert_result(
+        _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0),
+        _omniinteract_aggregate_params("1q1a_math", group="write-fail"),
+        4,
+    )
+    last = _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0)
+    for key in ("model_id", "test_name", "Hardware", "date", "max_concurrency"):
+        last[key] = first[key]
+    with pytest.raises(AssertionError, match="aggregate All Global IA-QTF1"):
+        runner.assert_result(last, _omniinteract_aggregate_params("1qna", group="write-fail"), 4)
+    written = runner._maybe_write_omniinteract_aggregate_accuracy_result(
+        last,
+        _omniinteract_aggregate_params("1qna", group="write-fail"),
+    )
+    assert written is not None
+    saved = json.loads(written.read_text())
+    assert saved["name"] == "aggregate"
+    assert saved["num_prompts"] == 12
+    assert saved["generation"]["completed"] == 12
+    assert saved["generation"]["failed"] == 0
+    assert saved["accuracy"]["status"] == "failed"
+    assert saved["benchmark_exit_code"] == 1
+
+
 def test_omniinteract_aggregate_rejects_entirely_skipped_subset():
     from tests.dfx.perf.scripts.run_benchmark import _reset_omniinteract_aggregate_counts, assert_result
 
@@ -1233,3 +2138,686 @@ def test_variable_stage_workload_does_not_require_stage_metrics(extra_body):
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
     assert_result({"completed": 2}, {"extra_body": extra_body}, 2)
+
+
+def _realtime_video_perf_record():
+    return {
+        "completed": 3,
+        "mean_e2el_ms": 1000.0,
+        "request_throughput": 1.0,
+        "mean_video_ttfc_ms": 100.0,
+        "min_video_fps": 20.0,
+        "mean_video_steady_interval_ms": 500.0,
+        "p95_video_steady_interval_ms": 600.0,
+        "mean_video_rtf": 0.5,
+        "realtime_video": {
+            "passed": True,
+            "finalization_errors": [],
+            "sessions": [{"success": True, "error": ""} for _ in range(3)],
+            "warmups": [{"success": True, "error": ""}],
+        },
+    }
+
+
+def test_realtime_video_json_uses_standard_candidate_runner_with_hardware_baselines(monkeypatch, pytestconfig):
+    from pathlib import Path
+
+    from tests.dfx.conftest import is_diffusion_perf_config, load_benchmark_configs
+    from tests.dfx.perf.scripts import run_benchmark as runner
+    from vllm_omni.benchmarks.realtime_video.serving import build_serve_args
+
+    configs = load_benchmark_configs(str(Path(__file__).with_name("test_lingbot_world_realtime.json")))
+    assert len(configs) == 2 and all(not is_diffusion_perf_config(row) for row in configs)
+    monkeypatch.setattr(runner, "BENCHMARK_CONFIGS", configs)
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        args = build_serve_args([*kwargs["args"], "--num-warmups", str(kwargs["num_warmups"])])
+        assert (args.num_prompts, args.max_concurrency, args.num_warmups) == (3, 1, 1)
+        assert args.realtime_video_num_chunks == 40 and args.realtime_video_warmup_num_chunks == 8
+        assert args.realtime_video_warmup_chunks == 6 and args.ready_check_timeout_sec == 0
+        assert args.realtime_video_image == (
+            "https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/"
+            "2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
+        )
+        assert f"workload_image={args.realtime_video_image}" in args.metadata
+        assert "model_revision=59cccf49f2d2dd27418ae7a04b82b10868d455c2" in args.metadata
+        assert kwargs["baseline_config"] == configs[len(calls) - 1]["benchmark_params"][0]["baseline"]
+        assert args.backend == args.dataset_name == "realtime-video"
+        return _realtime_video_perf_record()
+
+    monkeypatch.setattr(runner, "run_benchmark", benchmark)
+    expected = [("cuda", "H100", 2, "usp2_compiled.yaml"), ("npu", "A2", 4, "npu_usp4_offload.yaml")]
+    for config, (platform, resource, cards, deploy) in zip(configs, expected, strict=True):
+        assert config["mark"][0]["hardware_marks"] == {"res": {platform: resource}, "num_cards": cards}
+        assert config["server_params"]["serve_args"]["deploy-config"].endswith(deploy)
+        params = config["benchmark_params"][0]
+        assert set(params["baseline"]) == {resource}
+        monkeypatch.setattr(runner, "get_runtime_resource_label", lambda resource=resource: resource)
+        runner.test_performance_benchmark(
+            SimpleNamespace(host="localhost", port=8000, model="fixture-model"),
+            {"test_name": config["test_name"], "params": params},
+            pytestconfig=pytestconfig,
+        )
+    assert len(calls) == 2  # One candidate recipe per hardware, with no reference loop.
+
+
+@pytest.mark.parametrize("failure", ["warmup", "session", "finalization", "missing_scalar", "nonfinite"])
+def test_realtime_video_perf_cannot_pass_an_invalid_record(failure):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = _realtime_video_perf_record()
+    video = result["realtime_video"]
+    if failure in {"warmup", "session"}:
+        key = "warmups" if failure == "warmup" else "sessions"
+        video[key][0]["success"] = False
+    elif failure == "finalization":
+        video["finalization_errors"] = ["media save failed"]
+    elif failure == "missing_scalar":
+        del result["min_video_fps"]
+    else:
+        result["mean_video_steady_interval_ms"] = float("nan")
+    with pytest.raises(AssertionError, match="Realtime video"):
+        assert_result(result, {"dataset_name": "realtime-video", "num_warmups": 1}, 3)
+
+
+def test_recorded_video_json_keeps_raw_metrics_hardware_and_recipe(tmp_path, monkeypatch):
+    """Only the CLI subprocess is stubbed; exercise the shared JSON postprocessor."""
+    import io
+    from pathlib import Path
+
+    from tests.dfx import conftest as dfx
+
+    record = _realtime_video_perf_record()
+    record.update(dataset_name="realtime-video", model_revision="fixture-model-revision", recipe="fixture-recipe")
+    record["realtime_video"]["raw_marker"] = ["synthetic subprocess payload"]
+
+    class BenchmarkProcess:
+        def __init__(self, command, **kwargs):
+            self.stdout, self.stderr = io.StringIO(""), io.StringIO("")
+            assert command[:4] == ["vllm", "bench", "serve", "--omni"]
+            out = Path(command[command.index("--result-dir") + 1]) / command[command.index("--result-filename") + 1]
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(record))
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
+    actual = dfx.run_benchmark(
+        args=["--backend", "realtime-video", "--dataset-name", "realtime-video"],
+        test_name="test_lingbot_world_realtime_cuda",
+        flow=1,
+        dataset_name="realtime-video",
+        num_prompt=3,
+        num_warmups=1,
+        resource_label="H100",
+        benchmark_params_name="fixture-recipe",
+    )
+    [saved_path] = tmp_path.glob("result_*.json")
+    saved = json.loads(saved_path.read_text())
+    assert saved == actual
+    assert saved["realtime_video"] == record["realtime_video"]
+    assert saved["Hardware"] == "H100" and saved["baseline"] == {}
+    assert saved["model_revision"] == "fixture-model-revision" and saved["recipe"] == "fixture-recipe"
+    for key in (
+        "mean_e2el_ms",
+        "request_throughput",
+        "mean_video_ttfc_ms",
+        "min_video_fps",
+        "mean_video_steady_interval_ms",
+        "p95_video_steady_interval_ms",
+        "mean_video_rtf",
+    ):
+        assert saved[key] == record[key]
+
+
+@pytest.mark.parametrize("exit_code,write_result", [(0, True), (1, True), (1, False)])
+def test_result_transform_persists_failure_diagnostics(tmp_path, monkeypatch, exit_code, write_result):
+    """A failed CLI must still publish the callback's annotations for review."""
+    import io
+
+    from tests.dfx import conftest as dfx
+
+    class BenchmarkProcess:
+        def __init__(self, command, **kwargs):
+            self.stdout, self.stderr = io.StringIO(""), io.StringIO("")
+            if write_result:
+                path = (
+                    Path(command[command.index("--result-dir") + 1]) / command[command.index("--result-filename") + 1]
+                )
+                path.write_text(json.dumps({"completed": 1, "raw_marker": "retained"}))
+
+        def wait(self):
+            return exit_code
+
+    def annotate(result, returncode):
+        assert result["Hardware"] == "H200"
+        assert returncode == exit_code
+        return {
+            **result,
+            "benchmark_exit_code": returncode,
+            "validation_errors": ["incomplete workload"],
+            "qualification_scope": "smoke",
+        }
+
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
+    result = dfx.run_benchmark(
+        [], "test_dataset_callback", 1, "seed-tts", 4, resource_label="H200", result_transform=annotate
+    )
+    [saved_path] = tmp_path.glob("result_*.json")
+    saved = json.loads(saved_path.read_text())
+    assert saved == result
+    assert saved["validation_errors"] == ["incomplete workload"]
+    assert saved["benchmark_exit_code"] == exit_code
+    if write_result:
+        assert saved["raw_marker"] == "retained"
+
+
+def _response_performance_result(dataset_name):
+    result = {"completed": 16, "duplex_metric_aggregation": "response"}
+    if dataset_name == "omni-duplex-eval":
+        result["omni_duplex_eval"] = {"published": 16, "artifact_errors": []}
+    else:
+        result["omniinteract"] = {"total": 16, "success": 16, "failed": 0, "artifacts_complete": True}
+    for metric in ("ttft", "audio_ttfp", "audio_rtf"):
+        result[f"num_{metric}_samples"] = 16
+        suffix = "" if metric == "audio_rtf" else "_ms"
+        for percentile in (50, 95):
+            result[f"p{percentile}_{metric}{suffix}"] = 1.0
+    return result
+
+
+@pytest.mark.parametrize("dataset_name", ["omni-duplex-eval", "omniinteract"])
+def test_response_performance_requires_measurements_not_accuracy(dataset_name):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    params = {"dataset_name": dataset_name, "duplex_performance_only": True}
+    result = _response_performance_result(dataset_name)
+    assert_result(result, params, 16)
+    result["num_audio_ttfp_samples"] = 0
+    with pytest.raises(AssertionError, match="No measured audio_ttfp"):
+        assert_result(result, params, 16)
+
+
+def _qwen3_joint_result(dataset):
+    from pathlib import Path
+
+    config = json.loads(Path(__file__).with_name(f"test_qwen3_omni_duplex_{dataset}.json").read_text())[0]
+    params = config["benchmark_params"][0]
+    count = params["num_prompts"][0]
+    result = _response_performance_result(params["dataset_name"])
+    result["completed"] = count
+    for metric in params.get("required_duplex_metrics", []):
+        result[f"num_{metric}_samples"] = count
+        for stat in ("mean", "median", "p99"):
+            result[f"{stat}_{metric}"] = 0.1
+    if dataset == "omniinteract":
+        summary = result["omniinteract"]
+        summary.update(total=count, success=count)
+        summary["accuracy"] = {
+            "status": "ok",
+            "total": count,
+            "evaluated": count - 1,
+            "skipped": 1,
+            "failed": 0,
+            "summary": {"IA_QTF1": 0.5},
+        }
+    else:
+        summary = result["omni_duplex_eval"]
+        summary.update(published=count, published_with_unfinished_responses=0)
+        summary["accuracy"] = {
+            "status": "completed",
+            "total": count,
+            "evaluated": count,
+            "skipped": 0,
+            "failed": 0,
+            "pr": {"samples": count, "mean_all_success": 0.5},
+        }
+        result["duplex_session_metrics"] = [
+            {"client_ttft_ms": {"count": 1, "mean": 100.0}, "client_ttfp_ms": {"count": 1, "mean": 200.0}}
+            for _ in range(count)
+        ]
+    return result, params, count, summary["accuracy"]
+
+
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+def test_qwen3_joint_run_requires_both_metrics_and_judging(dataset):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result(dataset)
+    assert_result(result, params, count)
+    result["p95_audio_ttfp_ms"] = float("nan")
+    with pytest.raises(AssertionError, match="Missing or invalid P95 audio_ttfp"):
+        assert_result(result, params, count)
+    result["p95_audio_ttfp_ms"] = 1.0
+    accuracy["status"] = "failed"
+    with pytest.raises(AssertionError, match="accuracy did not complete"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+def test_qwen3_joint_run_rejects_incomplete_accuracy_coverage(dataset):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result(dataset)
+    accuracy["evaluated"] -= 1
+    with pytest.raises(AssertionError, match="accuracy coverage is incomplete"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize(
+    "field,message",
+    [("evaluated", "evaluated count is missing"), ("skipped", "accuracy coverage is incomplete")],
+)
+@pytest.mark.parametrize("value", [False, True])
+def test_qwen3_math_run_rejects_boolean_coverage_count(field, message, value):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result("omniinteract")
+    other_field = "skipped" if field == "evaluated" else "evaluated"
+    # Keep the total consistent so rejection must come from the type check.
+    accuracy.update({field: value, other_field: count - int(value)})
+    with pytest.raises(AssertionError, match=message):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("field", ["failed", "skipped"])
+def test_qwen3_correction_run_rejects_boolean_coverage_count(field):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result("omni_duplex_eval")
+    accuracy[field] = False
+    with pytest.raises(AssertionError, match="accuracy coverage is incomplete"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize(("case_index", "hardware"), [(0, "H100"), (1, "910"), (0, "B200")])
+def test_qwen3_correction_score_floor(case_index, hardware, monkeypatch, pytestconfig):
+    from tests.dfx.perf.scripts import run_benchmark as runner
+
+    configs = json.loads(Path(__file__).with_name("test_qwen3_omni_duplex_omni_duplex_eval.json").read_text())
+    config = configs[case_index]
+    result, _, count, accuracy = _qwen3_joint_result("omni_duplex_eval")
+    expected_label = "A3" if hardware == "910" else hardware
+
+    def benchmark(**kwargs):
+        assert kwargs["resource_label"] == expected_label
+        assert "--runtime-resource-aliases" not in kwargs["args"]
+        result["Hardware"] = kwargs["resource_label"]
+        return result
+
+    monkeypatch.setattr(runner, "get_runtime_resource_label", lambda: hardware)
+    monkeypatch.setattr(runner, "run_benchmark", benchmark)
+    server = ServerEndpoint(judge_base_url="http://localhost:8001")
+    case = {"test_name": config["test_name"], "params": config["benchmark_params"][0]}
+    accuracy["pr"]["mean_all_success"] = 84 / count
+    runner.test_performance_benchmark(server, case, pytestconfig)
+    accuracy["pr"]["mean_all_success"] = 83 / count
+    if hardware == "B200":
+        runner.test_performance_benchmark(server, case, pytestconfig)
+    else:
+        with pytest.raises(AssertionError, match="PR correction mean_all_success"):
+            runner.test_performance_benchmark(server, case, pytestconfig)
+
+
+@pytest.mark.parametrize("value", [None, float("nan"), float("inf"), True, -0.1, 1.1])
+def test_qwen3_correction_run_requires_valid_accuracy_score(value):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result("omni_duplex_eval")
+    accuracy["pr"]["mean_all_success"] = value
+    with pytest.raises(AssertionError, match="correction score is invalid"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize(
+    "dataset_name, field, value, message",
+    [
+        ("omni-duplex-eval", None, None, "summary is missing"),
+        ("omniinteract", None, None, "summary is missing"),
+        ("omniinteract", "success", 15, "requests did not all succeed"),
+    ],
+)
+def test_response_performance_rejects_missing_artifacts(dataset_name, field, value, message):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = _response_performance_result(dataset_name)
+    summary_key = dataset_name.replace("-", "_")
+    if field is None:
+        del result[summary_key]
+    else:
+        result[summary_key][field] = value
+    with pytest.raises(AssertionError, match=message):
+        assert_result(result, {"dataset_name": dataset_name, "duplex_performance_only": True}, 16)
+
+
+def test_minicpmo_omniinteract_local_config_uses_c8_and_ephemeral_artifacts():
+    config = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omniinteract.json").read_text())[0]
+    assert "omniinteract_aggregate_min_ia_qtf1" not in config
+    assert config["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5.yaml"
+    update = config["server_params"]["update"]
+    assert update == {
+        "duplex_session.max_sessions": 8,
+        "duplex_session.collect_stats": True,
+    }
+    assert len(config["benchmark_params"]) == 1
+    params = config["benchmark_params"][0]
+    assert params["omniinteract_subsets"] == "1q1a_math"
+    assert params["num_prompts"] == [60]
+    assert params["omniinteract_evaluate"] is True
+    assert "omniinteract_min_ia_qtf1" not in params
+    assert all(update["duplex_session.max_sessions"] >= concurrency for concurrency in params["max_concurrency"])
+    assert params["omniinteract_persist_artifacts"] is False
+    assert "omniinteract_output_dir" not in params
+    assert params["percentile-metrics"] == "ttft,audio_ttfp,audio_rtf,e2el,audio_duration"
+    assert "tpot" not in params["percentile-metrics"]
+    assert "itl" not in params["percentile-metrics"]
+    assert params["required_duplex_metrics"] == [
+        "duplex_client_rtf",
+        "duplex_client_ttfp_ms",
+        "duplex_client_ttft_ms",
+        "duplex_busy_rtf",
+        "duplex_stall_ratio",
+    ]
+
+
+def test_minicpmo_omniinteract_records_ia_qtf1_without_floor():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, _, count, _ = _qwen3_joint_result("omniinteract")
+    params = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omniinteract.json").read_text())[0][
+        "benchmark_params"
+    ][0]
+    assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+@pytest.mark.parametrize("equals_syntax", [False, True])
+@pytest.mark.parametrize(
+    "config_prefix, pipeline_name",
+    [
+        ("test_qwen3_omni_duplex", "qwen3"),
+        ("test_minicpmo_4_5", "minicpm"),
+    ],
+)
+def test_duplex_inline_deploy_updates_reach_runtime(monkeypatch, dataset, equals_syntax, config_prefix, pipeline_name):
+    from tests.dfx.conftest import _create_unique_server_params
+    from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
+    from vllm_omni.platforms import current_omni_platform
+
+    if pipeline_name == "qwen3":
+        from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE as PIPELINE
+    else:
+        from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE as PIPELINE
+
+    config = json.loads(Path(__file__).with_name(f"{config_prefix}_{dataset}.json").read_text())[0]
+    source = Path(config["server_params"]["extra_cli_args"][1])
+    original = source.read_bytes()
+    # extra_cli_args overrides an earlier serve_args default, as in the CLI.
+    config["server_params"]["serve_args"] = {"deploy-config": "unused.yaml"}
+    if equals_syntax:
+        config["server_params"]["extra_cli_args"] = [f"--deploy-config={source}"]
+    row = _create_unique_server_params([config], Path("unused"))[0]
+    args = list(row[4])
+    deploy_path = None
+    for index in range(len(args) - 1, -1, -1):
+        arg = args[index]
+        if arg == "--deploy-config" and index + 1 < len(args):
+            deploy_path = Path(args[index + 1])
+            break
+        if arg.startswith("--deploy-config="):
+            deploy_path = Path(arg.split("=", 1)[1])
+            break
+    assert deploy_path is not None
+    try:
+        assert deploy_path != source.resolve()
+        assert source.read_bytes() == original
+        monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        stages = merge_pipeline_deploy(PIPELINE, deploy)
+        assert [stage.stage_id for stage in deploy.stages] == [0, 1, 2]
+        assert all(stage.yaml_engine_args["duplex_max_sessions"] == 8 for stage in stages)
+        assert deploy.duplex_session.collect_stats is True
+        assert deploy.duplex_session.max_sessions == 8
+        if pipeline_name == "qwen3":
+            assert [stage.yaml_engine_args["enable_prefix_caching"] for stage in stages] == [True, False, False]
+            assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+            assert all(stage.yaml_engine_args["async_chunk"] for stage in stages)
+            assert all(stage.yaml_engine_args["session_mode"] == "duplex" for stage in stages)
+    finally:
+        deploy_path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+@pytest.mark.parametrize("metric", ["duplex_busy_rtf", "duplex_stall_ratio"])
+def test_joint_run_requires_measured_server_stats(dataset, metric):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, _ = _qwen3_joint_result(dataset)
+    assert_result(result, params, count)
+    result[f"num_{metric}_samples"] = 0
+    with pytest.raises(AssertionError, match=f"No measured {metric}"):
+        assert_result(result, params, count)
+    result[f"num_{metric}_samples"] = count
+    result[f"mean_{metric}"] = float("nan")
+    with pytest.raises(AssertionError, match=f"Missing or invalid mean {metric}"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("field", ["update", "delete"])
+def test_inline_deploy_modifications_require_a_deploy_path(tmp_path, field):
+    from tests.dfx.conftest import _create_unique_server_params
+
+    config = {"test_name": "missing-deploy", "server_params": {"model": "mock", field: {"async_chunk": True}}}
+    with pytest.raises(ValueError, match="requires stage_config_name or --deploy-config"):
+        _create_unique_server_params([config], tmp_path)
+
+
+def test_qwen3_omni_async_perf_uses_default_deploy_and_preserves_cold_start_timeout():
+    from tests.dfx.conftest import _create_unique_server_params
+    from tests.dfx.perf.scripts.run_benchmark import (
+        DEPLOY_CONFIGS_DIR,
+        _cli_flag_value,
+        _merge_omni_default_server_args,
+    )
+
+    config_path = Path(__file__).with_name("test_qwen3_omni_async_chunk.json")
+    config = json.loads(config_path.read_text(encoding="utf-8"))[0]
+    deploy_dir = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
+    assert DEPLOY_CONFIGS_DIR == deploy_dir
+
+    row = _create_unique_server_params([config], DEPLOY_CONFIGS_DIR)[0]
+    assert row[2] is None
+
+    extra_cli_args = list(row[4])
+    effective_args = extra_cli_args + _merge_omni_default_server_args(
+        extra_cli_args,
+        use_omni=row[5],
+    )
+    assert effective_args.count("--stage-init-timeout") == 1
+    assert _cli_flag_value(effective_args, "--stage-init-timeout") == "900"
+    assert _cli_flag_value(effective_args, "--init-timeout") == "900"
+
+
+@pytest.mark.parametrize("extra", [("--revision", "a" * 40), (f"--revision={'a' * 40}",), ()])
+def test_offline_model_resolution_uses_the_pinned_revision(monkeypatch, extra):
+    import huggingface_hub
+
+    from tests.dfx.perf.scripts import run_benchmark as runner
+    from vllm_omni.transformers_utils import repo_utils
+
+    calls = []
+
+    class Api:
+        def snapshot_download(self, repo_id, **kwargs):
+            calls.append((repo_id, kwargs))
+            return "/cache/snapshot"
+
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+    monkeypatch.setattr(repo_utils, "hf_api", Api)
+    revision = runner._cli_flag_value(extra, "--revision")
+    assert runner._resolve_offline_model("org/model", revision=revision) == "/cache/snapshot"
+    assert calls == [("org/model", {"revision": "a" * 40 if extra else None, "local_files_only": True})]
+
+
+def test_minicpmo_nightly_default_and_async_prefix_seed_tts_matrix():
+    configs = json.loads((Path(__file__).parent / "test_minicpmo_4_5.json").read_text())
+    by_name = {config["test_name"]: config for config in configs}
+    default = by_name["test_minicpmo_4_5_default"]
+    prefix = by_name["test_minicpmo_4_5_async_prefix"]
+    default_params = default["benchmark_params"][0]
+    prefix_perf, prefix_acc = prefix["benchmark_params"]
+    assert default["server_params"]["update"]["async_chunk"] is False
+    assert "--no-async-chunk" in default["server_params"]["extra_cli_args"]
+    assert default_params["max_concurrency"] == [64]
+    assert default_params["num_prompts"] == [1088]
+    assert default_params["seed_tts_wer_eval"] is True
+    assert default_params["max_seed_tts_mean_wer"] == 0.05
+    assert default_params["min_seed_tts_mean_sim"] == 0.80
+    assert "tpot" in default_params["percentile-metrics"]
+    assert prefix["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5_turn.yaml"
+    assert prefix["server_params"]["update"]["stages"]["0"]["enable_prefix_caching"] is True
+    assert prefix_perf["max_concurrency"] == [1, 16, 32]
+    assert prefix_perf["num_prompts"] == [32, 256, 512]
+    assert "seed_tts_wer_eval" not in prefix_perf
+    assert prefix_acc["max_concurrency"] == [64]
+    assert prefix_acc["num_prompts"] == [1088]
+    assert prefix_acc["seed_tts_wer_eval"] is True
+    assert prefix_acc["min_seed_tts_mean_sim"] == 0.80
+    assert "test_minicpmo_4_5_nightly_seed_c1" not in by_name
+    daily = by_name["test_minicpmo_4_5_async_prefix_daily_omni"]
+    daily_params = daily["benchmark_params"][0]
+    assert daily["mark"][0]["hardware_marks"]["num_cards"] == 2
+    assert daily_params["max_concurrency"] == [8]
+    assert daily_params["num_prompts"] == [1197]
+    assert daily_params["daily_omni_pack_mode"] == "minicpm-interleave"
+    assert daily_params["temperature"] == 0
+    assert daily_params["output_len"] == 512
+    assert daily_params["min_daily_omni_accuracy"] == 0.77
+    assert "tpot" in daily_params["percentile-metrics"]
+    assert daily["server_params"]["update"]["session_mode"] == "turn"
+    assert daily["server_params"]["update"]["stages"]["0"]["enable_prefix_caching"] is True
+
+
+def test_minicpmo_npu_nightly_seed_tts_matrix():
+    configs = json.loads((Path(__file__).parent / "test_minicpmo_4_5.json").read_text())
+    by_name = {config["test_name"]: config for config in configs}
+    default = by_name["test_minicpmo_4_5_npu_default"]
+    prefix = by_name["test_minicpmo_4_5_npu_async_prefix"]
+    default_params = default["benchmark_params"][0]
+    prefix_by_name = {item["name"]: item for item in prefix["benchmark_params"]}
+    npu_stage2 = {
+        "platforms.npu.stages.2.num_replicas": 2,
+        "platforms.npu.stages.2.devices": "0,0",
+        "platforms.npu.stages.2.gpu_memory_utilization": 0.11,
+    }
+    topology_1card = "1 card · 3-stage · stage2: 2 replicas"
+    assert default["description"].startswith(topology_1card)
+    assert prefix["description"].startswith(topology_1card)
+    assert "test_minicpmo_4_5_npu_nightly_async_prefix_c32" not in by_name
+    assert "test_minicpmo_4_5_npu_nightly_async_prefix_c64" not in by_name
+    assert default["mark"][0]["hardware_marks"] == {"res": {"npu": "A3"}, "num_cards": 2}
+    assert default["server_params"]["update"]["async_chunk"] is False
+    assert "--no-async-chunk" in default["server_params"]["extra_cli_args"]
+    assert default["server_params"]["update"]["duplex_session.max_sessions"] == 16
+    assert default["server_params"]["update"]["platforms.npu.stages.2.num_replicas"] == 2
+    assert {key: default["server_params"]["update"][key] for key in npu_stage2} == npu_stage2
+    assert default_params["name"] == "default-seed-tts-c16"
+    assert default_params["max_concurrency"] == [16]
+    assert default_params["num_prompts"] == [1088]
+    assert default_params["seed_tts_wer_eval"] is True
+    assert default_params["max_seed_tts_mean_wer"] == 0.05
+    assert default_params["min_seed_tts_mean_sim"] == 0.80
+    assert "tpot" in default_params["percentile-metrics"]
+    assert prefix["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5_turn.yaml"
+    assert prefix["server_params"]["update"]["stages"]["0"]["enable_prefix_caching"] is True
+    assert prefix["server_params"]["update"]["platforms.npu.stages.0.enable_prefix_caching"] is True
+    assert prefix["server_params"]["update"]["platforms.npu.stages.0.max_num_seqs"] == 16
+    assert {key: prefix["server_params"]["update"][key] for key in npu_stage2} == npu_stage2
+    assert list(prefix_by_name) == [
+        "async-prefix-seed-tts-c1",
+        "async-prefix-seed-tts-c16",
+    ]
+    assert prefix_by_name["async-prefix-seed-tts-c1"]["max_concurrency"] == [1]
+    assert prefix_by_name["async-prefix-seed-tts-c1"]["num_prompts"] == [32]
+    assert "seed_tts_wer_eval" not in prefix_by_name["async-prefix-seed-tts-c1"]
+    assert prefix_by_name["async-prefix-seed-tts-c16"]["max_concurrency"] == [16]
+    assert prefix_by_name["async-prefix-seed-tts-c16"]["num_prompts"] == [1088]
+    assert prefix_by_name["async-prefix-seed-tts-c16"]["seed_tts_wer_eval"] is True
+    assert prefix_by_name["async-prefix-seed-tts-c16"]["max_seed_tts_mean_wer"] == 0.05
+    assert prefix_by_name["async-prefix-seed-tts-c16"]["min_seed_tts_mean_sim"] == 0.80
+
+
+def test_minicpmo_daily_omni_nightly_config_uses_c8_and_minicpm_recipe():
+    configs = json.loads((Path(__file__).parent / "test_minicpmo_4_5.json").read_text())
+    config = next(item for item in configs if item["test_name"] == "test_minicpmo_4_5_async_prefix_daily_omni")
+    params = config["benchmark_params"][0]
+    assert params["max_concurrency"] == [8]
+    assert params["num_prompts"] == [1197]
+    assert params["daily_omni_pack_mode"] == "minicpm-interleave"
+    assert params["temperature"] == 0
+    assert params["output_len"] == 512
+    assert params["min_daily_omni_accuracy"] == 0.77
+    assert "tpot" in params["percentile-metrics"]
+    assert config["server_params"]["update"]["session_mode"] == "turn"
+    assert config["server_params"]["update"]["stages"]["0"]["enable_prefix_caching"] is True
+
+
+def test_chat_accuracy_gates_daily_omni_and_seed_tts():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    daily = {
+        "completed": 1,
+        "daily_omni_accuracy": 0.5,
+        "daily_omni_evaluated_ok": 1,
+    }
+    with pytest.raises(AssertionError, match="daily_omni_accuracy"):
+        assert_result(daily, {"dataset_name": "daily-omni", "min_daily_omni_accuracy": 0.77}, 1)
+    daily["daily_omni_accuracy"] = 0.8
+    assert_result(daily, {"dataset_name": "daily-omni", "min_daily_omni_accuracy": 0.77}, 1)
+
+    seed = {
+        "completed": 1,
+        "seed_tts_content_evaluated": 1,
+        "seed_tts_content_error_mean": 0.2,
+        "seed_tts_sim_evaluated": 1,
+        "seed_tts_sim_mean": 0.9,
+        "timed_out_requests": 0,
+        "cancelled_after_timeout_requests": 0,
+    }
+    with pytest.raises(AssertionError, match="WER"):
+        assert_result(
+            seed,
+            {
+                "dataset_name": "seed-tts",
+                "seed_tts_wer_eval": True,
+                "max_seed_tts_mean_wer": 0.05,
+                "min_seed_tts_mean_sim": 0.80,
+            },
+            1,
+        )
+    seed["seed_tts_content_error_mean"] = 0.02
+    assert_result(
+        seed,
+        {
+            "dataset_name": "seed-tts",
+            "seed_tts_wer_eval": True,
+            "max_seed_tts_mean_wer": 0.05,
+            "min_seed_tts_mean_sim": 0.80,
+        },
+        1,
+    )
+
+
+def test_tpot_in_percentile_metrics_requires_samples():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = {"completed": 1, "num_tpot_samples": 0, "mean_tpot_ms": 1.0}
+    with pytest.raises(AssertionError, match="No measured tpot samples"):
+        assert_result(result, {"percentile-metrics": "ttft,tpot,e2el"}, 1)
+    result["num_tpot_samples"] = 1
+    assert_result(result, {"percentile-metrics": "ttft,tpot,e2el"}, 1)

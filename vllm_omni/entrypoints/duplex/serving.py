@@ -48,6 +48,7 @@ from vllm_omni.engine.duplex.messages import (
     DuplexSessionFallbackCancelMessage,
     DuplexSessionFallbackRequestMessage,
 )
+from vllm_omni.engine.duplex.process_engine import ProcessDuplexEngineClient
 from vllm_omni.entrypoints.duplex.chat_fallback import (
     _TOOL_CALL_FRAGMENT_KEY,
     _TOOL_CALL_INDEX_KEY,
@@ -245,8 +246,11 @@ class OmniDuplexSessionHandler:
         return str(message), str(code)
 
     async def _submit_fallback_failure(self, request: DuplexFallbackRequest, error: str, code: str) -> None:
+        engine = self._omni.engine
+        if isinstance(engine, ProcessDuplexEngineClient):
+            return
         with suppress(Exception):
-            await self._omni.engine.submit_fallback_failed_async(
+            await engine.submit_fallback_failed_async(
                 request.session_id,
                 request.request_id,
                 request.response_id,
@@ -256,6 +260,9 @@ class OmniDuplexSessionHandler:
             )
 
     async def _run_fallback(self, request: DuplexFallbackRequest) -> None:
+        engine = self._omni.engine
+        if isinstance(engine, ProcessDuplexEngineClient):
+            return
         if self._chat_service is None:
             await self._submit_fallback_failure(request, "chat fallback is unavailable", "fallback_unavailable")
             return
@@ -275,7 +282,7 @@ class OmniDuplexSessionHandler:
                 )
                 return
 
-            await self._omni.engine.submit_fallback_started_async(
+            await engine.submit_fallback_started_async(
                 request.session_id,
                 request.request_id,
                 request.response_id,
@@ -326,7 +333,7 @@ class OmniDuplexSessionHandler:
                     ):
                         raise ChatFallbackStreamError("chat fallback tool call was incomplete")
                 for output in buffered_calls:
-                    await self._omni.engine.submit_fallback_output_async(
+                    await engine.submit_fallback_output_async(
                         request.session_id,
                         request.request_id,
                         request.response_id,
@@ -367,7 +374,7 @@ class OmniDuplexSessionHandler:
                                 output["audio_complete"] = True
                         if output.get("end_of_turn") is True:
                             await submit_buffered_tool_calls()
-                        await self._omni.engine.submit_fallback_output_async(
+                        await engine.submit_fallback_output_async(
                             request.session_id,
                             request.request_id,
                             request.response_id,
