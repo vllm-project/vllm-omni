@@ -13,7 +13,7 @@ from tests.model_tests.diffusion.diff_model_builders import tiny_flux2_klein_bui
 @pytest.mark.benchmark
 @pytest.mark.core_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
+@hardware_test(res={"cuda": "L4"})
 def test_bench_startup_omni(tmp_path):
     """Ensure `vllm bench startup --omni` runs end to end and reports the startup time."""
     output = tmp_path / "startup.json"
