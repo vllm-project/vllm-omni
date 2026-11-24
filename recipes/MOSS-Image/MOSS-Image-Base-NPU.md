@@ -51,7 +51,7 @@ modelscope download --model openmoss/MOSS-Image-Base \
 
 Use `quay.io/ascend/vllm-omni:v0.34.0-a3`. The container command mounts
 `MODEL_ROOT` at `/models` and sets `NPU_DIES` from the selected logical IDs.
-[A3 container setup](../Qwen/Qwen-Image-2.1-A3-NPU.md#start-the-container)
+[A3 container setup](../Qwen/Qwen-Image-2.1-NPU.md#start-the-container)
 
 ## Command
 
