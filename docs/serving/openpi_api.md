@@ -172,7 +172,9 @@ frames are not observation messages.
   reference LIBERO evaluator's seed), so unseeded FastWAM requests use the
   same noise. "Same chunk" holds up to run-to-run GPU kernel variation (for
   FastWAM on ROCm, one non-deterministic convolution in the Wan VAE encoder;
-  bitwise with `torch.use_deterministic_algorithms(True)`). The API layer
+  bitwise with `torch.use_deterministic_algorithms(True)`, which on ROCm needs
+  `MIOPEN_DEBUG_CONV_DIRECT` and `MIOPEN_DEBUG_CONV_GEMM` unset; the
+  `vllm/vllm-openai-rocm:v0.34.0` image sets both to 0). The API layer
   consumes `seed`; it is not forwarded inside the observation.
 
 ## Limits and Errors

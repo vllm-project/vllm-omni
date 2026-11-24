@@ -17,7 +17,8 @@ reference evaluator's seed). The chunk is repeatable up to run-to-run GPU kernel
 variation: on ROCm one convolution of the Wan VAE encoder is not deterministic by
 default (the reference implementation behaves the same way), so repeated chunks
 can differ by a few 1e-2. With ``torch.use_deterministic_algorithms(True)`` they
-are bitwise repeatable.
+are bitwise repeatable; on ROCm that needs MIOpen's direct and GEMM convolution
+solvers (``MIOPEN_DEBUG_CONV_DIRECT`` / ``MIOPEN_DEBUG_CONV_GEMM`` not set to 0).
 """
 
 from __future__ import annotations

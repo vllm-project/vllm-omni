@@ -40,7 +40,7 @@ validated variant. The original FastWAM LIBERO checkpoint (`yuanty/fastwam`,
 | Steps | 10 by default (CAE-FastWAM was also published at 4) |
 | Batch | One observation per request (`max_num_seqs: 1`) |
 | State | None across requests; `session_id` and `reset` are accepted and ignored |
-| Determinism | The request seed seeds a CPU generator for the initial noise, as the reference evaluator does (deploy default `seed: 42`). On MI355X, one convolution of the Wan VAE encoder (MIOpen) is not run-to-run deterministic by default, in the reference implementation as well; repeated chunks for the same seed differ by up to about 4e-2 (normalised) / 3e-2 (env units). With `torch.use_deterministic_algorithms(True)` they are bitwise repeatable |
+| Determinism | The request seed seeds a CPU generator for the initial noise, as the reference evaluator does (deploy default `seed: 42`). On MI355X, one convolution of the Wan VAE encoder (MIOpen) is not run-to-run deterministic by default, in the reference implementation as well; repeated chunks for the same seed differ by up to about 4e-2 (normalised) / 3e-2 (env units). With `torch.use_deterministic_algorithms(True)` they are bitwise repeatable; this needs MIOpen's direct and GEMM convolution solvers, so unset `MIOPEN_DEBUG_CONV_DIRECT` and `MIOPEN_DEBUG_CONV_GEMM` first (the `vllm/vllm-openai-rocm:v0.34.0` image sets both to 0, and MIOpen then finds no deterministic solver for the VAE encoder convolution) |
 
 | Profile | Deploy config | Status |
 | --- | --- | --- |
@@ -83,11 +83,15 @@ output head in `policy.pt` is not loaded (action-only inference never uses it).
 
 ## Software environment
 
-- OS: Ubuntu 22.04.5 (`vllm/vllm-openai-rocm:v0.32.0` image), host kernel 6.8.0
-- Python: 3.12.15
-- Driver / runtime: amdgpu 6.14.14, ROCm 7.2.3 (HIP 7.2.53211), PyTorch 2.13.0
-- vLLM version: 0.32.0
-- vLLM-Omni version or commit: `cbf35fb` plus this change
+- OS: Ubuntu 22.04.5 (`vllm/vllm-openai-rocm:v0.34.0` image)
+- Python: 3.12.16
+- Runtime: ROCm SDK 10.0.0 (HIP 7.15), PyTorch 2.13.0+rocm10.0.0
+- vLLM version: 0.34.0
+- vLLM-Omni version or commit: `e71053ae` plus this change
+- The 2000-episode LIBERO results and the latency numbers below were measured
+  before the rebase, on `vllm/vllm-openai-rocm:v0.32.0` (ROCm 7.2.3, vLLM 0.32.0,
+  vLLM-Omni `cbf35fb`). Parity, the GPU tests and a 400-episode LIBERO check
+  were repeated on the v0.34.0 image (see Qualification evidence)
 
 ## Command
 
@@ -139,6 +143,8 @@ values in `{-1.0, 1.0}`.
 | Latency, B=1, `infer_action` with cached prompt context, median of 7 interleaved rounds x 20 calls | Eager 240 ms (10 steps) / 113 ms (4 steps); regional `torch.compile` 128 ms / 61 ms; reference eager 271 ms / 128 ms |
 | OpenPI round trip, one client, idle server (256x256 frames) | Eager 263 ms (10 steps) / 136 ms (4 steps); regional `torch.compile` 148 ms / 82 ms |
 | Peak device memory (allocated, one policy incl. umT5) | 20.4 GiB |
+| Re-check on `vllm/vllm-openai-rocm:v0.34.0` after the rebase: parity (deterministic, MIOpen convolution variables unset on both sides) | Bitwise equal (32/32 chunks) |
+| Same image: LIBERO success rate, 400 episodes per setting (4 suites x 10 tasks x 10 trials, init states 0-9, seed 42) | Eager 10 steps 97.75 % (391/400), eager 4 steps 97.00 % (388/400), regional `torch.compile` 10 steps 96.50 % (386/400); each within one standard error (about 0.85 pp) of the 2000-episode result above |
 
 ## Notes
 
