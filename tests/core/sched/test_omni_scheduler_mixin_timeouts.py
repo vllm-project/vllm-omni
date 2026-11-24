@@ -507,9 +507,11 @@ def test_idle_producer_stays_runnable_until_send_failure_is_emitted():
 
     assert scheduler.has_requests() is True
     scheduler._process_pending_omni_inputs("ar")
-    assert scheduler.has_requests() is False
+    # The ERROR stays in _pending_input_timeout_outputs until attach emits it.
+    assert scheduler.has_requests() is True
     outputs: dict[int, EngineCoreOutputs] = {}
     scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    assert scheduler.has_requests() is False
     eco = outputs[7].outputs[0]
     assert eco.finish_reason == FinishReason.ERROR
     assert eco.stop_reason == reason
@@ -524,9 +526,10 @@ def test_give_up_enqueued_from_the_runner_keeps_idle_producer_runnable():
     scheduler.enqueue_omni_connector_output(OmniConnectorOutput(permanent_send_failures={"req-late": (4, reason)}))
     assert scheduler.has_requests() is True
     scheduler._process_pending_omni_inputs("ar")
-    assert scheduler.has_requests() is False
+    assert scheduler.has_requests() is True
     outputs: dict[int, EngineCoreOutputs] = {}
     scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    assert scheduler.has_requests() is False
     assert outputs[4].outputs[0].stop_reason == reason
 
 

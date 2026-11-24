@@ -9,6 +9,7 @@ import queue
 import threading
 import time
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -37,8 +38,10 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
     uses_native_mrv2_data_plane,
+    uses_native_qwen3_omni_resumable,
 )
 from vllm_omni.core.sched.output import (
+    OmniChunkCommit,
     OmniChunkRecvHandle,
     OmniNewRequestData,
     OmniRequestPrewarm,
@@ -382,6 +385,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             model_config,
             use_v2_model_runner=self.use_v2_model_runner,
         )
+        self._native_resumable = uses_native_qwen3_omni_resumable(model_config)
+        self._pending_chunk_commits: list[OmniChunkCommit] = []
+        self._resume_chunk_receivers: set[str] = set()
         self.chunk_transfer_adapter = (
             OmniChunkTransferAdapter(self.vllm_config)
             if getattr(model_config, "async_chunk", False) and not self._native_data_plane
@@ -624,7 +630,11 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         chunk_finished_req_ids: set[str] = set()
         stage_recv_req_ids: set[str] = set()
         for output in connector_outputs:
-            request_metadata.update(output.request_metadata)
+            for req_id, update in output.request_metadata.items():
+                previous = request_metadata.get(req_id)
+                if previous is not None and previous.replace_prompt:
+                    update = replace(update, replace_prompt=True, resize_prompt_to=previous.resize_prompt_to)
+                request_metadata[req_id] = update
             chunk_ready_req_ids.update(output.chunk_ready_req_ids)
             chunk_finished_req_ids.update(output.chunk_finished_req_ids)
             stage_recv_req_ids.update(output.stage_recv_req_ids)
@@ -635,6 +645,64 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         chunk_ready_req_ids.intersection_update(live_request_ids)
         chunk_finished_req_ids.intersection_update(live_request_ids)
         stage_recv_req_ids.intersection_update(live_request_ids)
+        max_model_len = getattr(self, "max_model_len", 0)
+        if model_mode == "ar" and max_model_len:
+            for req_id in chunk_ready_req_ids | stage_recv_req_ids:
+                request = self.requests[req_id]
+                input_update = request_metadata.get(req_id)
+                prompt_length = request.num_prompt_tokens
+                if input_update is not None:
+                    if input_update.prompt_token_ids is not None:
+                        prompt_length = len(input_update.prompt_token_ids)
+                    elif input_update.resize_prompt_to is not None:
+                        prompt_length = input_update.resize_prompt_to
+                if prompt_length + max(1, int(getattr(self, "num_sampled_tokens_per_step", 1) or 1)) > max_model_len:
+                    self._finish_oversized_prompt(request, prompt_length)
+                    request_metadata.pop(req_id, None)
+                    chunk_ready_req_ids.discard(req_id)
+                    chunk_finished_req_ids.discard(req_id)
+                    stage_recv_req_ids.discard(req_id)
+        if getattr(self, "_native_resumable", False) and input_coordinator.receives_chunks:
+            for req_id, update in list(request_metadata.items()):
+                request = self.requests.get(req_id)
+                if request is None or not request.resumable:
+                    continue
+                # A delivered replacement may still be waiting for admission.
+                # Its explicit False survives until the prompt is consumed.
+                waiting_for_prompt = getattr(request, "_omni_waiting_native_prompt", request.num_computed_tokens == 0)
+                if update.replace_prompt and update.resize_prompt_to is not None:
+                    self._release_replaced_streaming_prompt_cache(request)
+                    self._reset_streaming_session_replacement_state(request)
+                    request._output_token_ids.clear()
+                    del request._all_token_ids[:]
+                    request.block_hashes.clear()
+                    request.prompt_token_ids = []
+                    request.num_computed_tokens = 0
+                    request._omni_waiting_native_prompt = False
+                elif model_mode == "ar" and waiting_for_prompt and (update.input_terminal or update.segment_finished):
+                    # After the Talker stopped, a closing Thinker may only
+                    # send a marker. There is no prompt or codec step to run.
+                    request_metadata.pop(req_id)
+                    chunk_ready_req_ids.discard(req_id)
+                    chunk_finished_req_ids.discard(req_id)
+                    if update.input_terminal:
+                        self._pending_data_plane_terminal_req_ids.add(req_id)
+                        request.resumable = False
+                        self.finish_requests(req_id, RequestStatus.FINISHED_STOPPED)
+                    else:
+                        self._resume_chunk_receivers.add(req_id)
+                    continue
+                if update.input_terminal:
+                    request.resumable = False
+        if model_mode == "ar" and getattr(self, "_native_resumable", False):
+            # A codec may reach EOS before the upstream segment marker
+            # arrives. Only a new prompt can wake its next decode.
+            chunk_ready_req_ids = {
+                req_id
+                for req_id in chunk_ready_req_ids
+                if (request := self.requests.get(req_id)) is not None
+                and not getattr(request, "_omni_waiting_native_prompt", False)
+            }
         if request_metadata:
             input_coordinator.update_request_metadata(
                 self.requests,
@@ -1049,9 +1117,18 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             pending_input_registrations=pending_input_registrations,
             data_plane_terminal_req_ids=data_plane_terminal_req_ids,
             input_terminal_req_ids=input_terminal_req_ids or set(),
+            input_segment_finished_req_ids=(
+                input_coordinator.segment_finished_req_ids.intersection(input_coordinator._scheduled_request_ids(base))
+                if input_coordinator is not None
+                else set()
+            ),
             pending_request_prewarms=request_prewarms,
+            chunk_commits=getattr(self, "_pending_chunk_commits", []),
+            resume_chunk_receivers=getattr(self, "_resume_chunk_receivers", set()),
             discarded_req_ids=finished_discarded_req_ids,
         )
+        self._pending_chunk_commits = []
+        self._resume_chunk_receivers = set()
         OmniSchedulerMixin._duplex_stage_work_recorder(self).step_begin(scheduler_output, getattr(self, "requests", {}))
         return scheduler_output
 
@@ -1208,7 +1285,13 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
 
     def has_requests(self) -> bool:
         """Keep stepping while a finished run request's output waits for its stage payload."""
-        if bool(self._outputs_awaiting_stage_payload) or self._has_connector_transfer_work():
+        if (
+            bool(self._outputs_awaiting_stage_payload)
+            or bool(getattr(self, "_pending_chunk_commits", ()))
+            or bool(getattr(self, "_pending_input_timeout_outputs", ()))
+            or bool(getattr(self, "_resume_chunk_receivers", ()))
+            or self._has_connector_transfer_work()
+        ):
             return True
         parent = getattr(super(), "has_requests", None)
         return bool(parent()) if callable(parent) else False
@@ -1369,6 +1452,23 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             self.kv_holding_waiting.remove_requests(removable)
             self.deferred_waiting.difference_update(removable)
 
+    def _resume_native_chunk_receiver(self, request: Request) -> bool:
+        coordinator = getattr(self, "input_coordinator", None)
+        if (
+            not getattr(self, "_native_resumable", False)
+            or coordinator is None
+            or not coordinator.receives_chunks
+            or not request.resumable
+        ):
+            return False
+        coordinator.segment_finished_req_ids.discard(request.request_id)
+        coordinator.requests_with_ready_chunks.discard(request.request_id)
+        self._resume_chunk_receivers.add(request.request_id)
+        request._omni_waiting_native_prompt = True
+        request.status = RequestStatus.WAITING
+        self._enqueue_waiting_request(request)
+        return True
+
     def _resume_downstream_chunk_receiver(self, request: Request) -> None:
         """Resume duplex connector polling without an external update."""
         adapter = self.chunk_transfer_adapter
@@ -1498,7 +1598,35 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 if adapter is not None:
                     self._finish_parked_streaming_session(existing, adapter)
                     return
+                if getattr(self, "_native_resumable", False) and not request.resumable:
+                    self._pending_data_plane_terminal_req_ids.add(existing.request_id)
+                    existing.resumable = False
+                    self.finish_requests(existing.request_id, RequestStatus.FINISHED_STOPPED)
+                    return
         super().add_request(request)
+
+    def _finish_oversized_prompt(self, request: Request, prompt_length: int) -> None:
+        """Emit a request-local error when a stage cannot accommodate its input."""
+        reason = (
+            f"Stage input prompt has {prompt_length} tokens and cannot fit sampling room "
+            f"within max_model_len={self.max_model_len}. "
+            "Increase this stage's max_model_len to accommodate the upstream payload."
+        )
+        logger.error("Rejecting request %s: %s", request.request_id, reason)
+        request.stop_reason = reason
+        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        if pending is None:
+            pending = self._pending_input_timeout_outputs = {}
+        pending[request.request_id] = (
+            request.client_index,
+            OmniEngineCoreOutput(
+                request_id=request.request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                stop_reason=reason,
+            ),
+        )
+        self.finish_requests([request.request_id], RequestStatus.FINISHED_ERROR)
 
     def _take_async_chunk_prewarm(self, request: Request) -> None:
         """Pop the ``ASYNC_CHUNK_PREWARM_NS.*`` entries off a new request.

@@ -195,6 +195,7 @@ from .packed_tokens import (
     minimax_h3_unpatchify_video_tokens,
 )
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
+from .reference_isolation import reference_isolation_enabled
 from .regenerate import (
     REGENERATE_DEFAULT_UPSCALE,
     REGENERATE_SUPPORTED_TASKS,
@@ -3194,6 +3195,8 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax H3 keep_steps does not support pad_seq_len")
         if bool(getattr(self.od_config, "step_execution", False)):
             raise OmniClientError("MiniMax H3 keep_steps does not support step execution")
+        if reference_isolation_enabled(self.od_config):
+            raise OmniClientError("MiniMax H3 keep_steps does not support --kv-isolate")
         if getattr(self.od_config, "kv_offload_config", None):
             # The Tier-2 reference KV state is sized per branch at loop
             # start; the mid-loop switch changes the reference row count.
@@ -3764,6 +3767,11 @@ class MiniMaxH3Pipeline(
         service = self.od_config.diffusion_attention_schedule
         attention_schedule = require_request_attention_schedule_fits(sampling, service, num_steps)
         sigma_schedule = resolve_request_attention_sigma_schedule(sampling, service)
+        if (attention_schedule or sigma_schedule) and reference_isolation_enabled(self.od_config):
+            raise InvalidAttentionScheduleError(
+                "--kv-isolate requires a fixed attention backend; "
+                "send attention_schedule=[] and attention_sigma_schedule=[]"
+            )
         transformer = getattr(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
         )

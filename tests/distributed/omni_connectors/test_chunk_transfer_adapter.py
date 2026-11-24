@@ -2989,6 +2989,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     adapter_mock.save_async = lambda *a, **kw: save_calls.append((a, kw))
 
     scheduler = mocker.MagicMock()
+    scheduler._native_resumable = False
     scheduler.grammar_compile_error_reqs = {}
     scheduler.aux_output_connector = None
     scheduler.chunk_transfer_adapter = adapter_mock
@@ -3012,6 +3013,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
         request_id="req-ar",
         external_req_id="ext-ar",
         status=RequestStatus.RUNNING,
+        resumable=False,
         is_finished=lambda: False,
         num_computed_tokens=1,
         num_prompt_tokens=1,
