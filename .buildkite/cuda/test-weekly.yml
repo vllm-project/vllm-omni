@@ -190,8 +190,7 @@ steps:
         env:
           VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: .
         artifact_paths:
-          - failed_speech_*.wav
-          - failed_speech_*.json
+          - failed_speech_*
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -213,8 +212,7 @@ steps:
         env:
           VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: .
         artifact_paths:
-          - failed_speech_*.wav
-          - failed_speech_*.json
+          - failed_speech_*
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -238,8 +236,7 @@ steps:
           VLLM_OMNI_CI_MODEL_RUNNER: "v2"
           VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: .
         artifact_paths:
-          - failed_speech_*.wav
-          - failed_speech_*.json
+          - failed_speech_*
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -262,8 +259,7 @@ steps:
           VLLM_OMNI_CI_MODEL_RUNNER: "v2"
           VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: .
         artifact_paths:
-          - failed_speech_*.wav
-          - failed_speech_*.json
+          - failed_speech_*
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -326,8 +322,7 @@ steps:
           VLLM_OMNI_CI_MODEL_RUNNER: "v2"
           VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: .
         artifact_paths:
-          - failed_speech_*.wav
-          - failed_speech_*.json
+          - failed_speech_*
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
