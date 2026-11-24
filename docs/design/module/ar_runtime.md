@@ -111,9 +111,13 @@ been masked, their upstream call disables repeated masking and fused sampling.
 Residual codebooks use a second request-owned generator that persists across
 frames and is independent of batch ordering. An explicit `tts_local_seed`
 takes precedence; otherwise the Talker stage seed is domain-separated from
-codebook 0. Seedless requests retain global-RNG sampling. Qwen3-Omni keeps the
-outer MTP uniform buffer disabled, so explicitly seeded rows execute that
-wrapper eagerly while the code predictor's inner device graphs remain usable.
+codebook 0. Seedless requests retain global-RNG sampling. Qwen3-Omni prepares
+the outer MTP graph's uniform input with the eager predictor's exact draw
+shapes: one request-local row at a time for seeded or mixed batches, and one
+contiguous batch tensor per residual step for entirely unseeded batches. Graph
+padding uses a constant and consumes no RNG. This preserves generated values
+and post-draw generator states while keeping the whole-MTP graph available;
+the Qwen3-Omni CUDA and ROCm predictors do not have compensating inner graphs.
 
 Custom samplers register their selected JIT kernels while the runner's startup
 registry is active. The Talker's seeded stream uses native top-k/top-p
