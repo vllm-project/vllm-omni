@@ -942,6 +942,7 @@ It never contains client text.
 | Qwen3-Omni | As a tool message on the next prompt, for every reason except a suppressed repeat. A notice does not start a response by itself. |
 | Nemotron VoiceChat | On the function channel of the open request. After an epoch cancellation the model is told only if it repeats the call. |
 | JoyAI-VL-Interaction | As a delegated result on the next observation. After an epoch cancellation the question does not resurface, and the model is told only if it asks again. |
+| Realtime-Venus Omni | As a `<backend>` result on the next native input unit. After epoch cancellation, the notice is sent only if the model repeats the call. |
 
 **Interruptions.** `extra_body.function_call_interrupt_policy` sets what an epoch advance
 does to pending calls. It is fixed at session open. With `cancel` (the default),
@@ -965,14 +966,14 @@ model sets them; a client only reads them.
 | --- | --- | --- |
 | `none` | The model has no tool support. Non-empty `tools` is refused with `tools_unsupported`. | MiniCPM-o, PersonaPlex, Aura |
 | `declared` | The client defines the tools. The model reads their name, description and parameters in its prompt and calls them by name. | Qwen3-Omni, Nemotron VoiceChat |
-| `delegate_only` | The model has one built-in function, `delegate`, which hands a plain-language question to the application. Other tools are refused. | JoyAI-VL-Interaction |
+| `delegate_only` | The model has one built-in function, `delegate`, which hands a plain-language question to the application. Other tools are refused. | JoyAI-VL-Interaction, Realtime-Venus Omni |
 
 `function_call_output_continuation` values:
 
 | Value | What the client does after `function_call_output` | Models |
 | --- | --- | --- |
 | `client_response_create` | Send `response.create`. The model is turn-based, and the result is used in the response that event opens. Without it, the result waits for the next user turn. | Qwen3-Omni |
-| `automatic` | Nothing more. The result is fed into a later frame of the running request, and the model continues by itself. | Nemotron VoiceChat |
+| `automatic` | No `response.create`. The result is fed into a later frame of the running request. Keep streaming input or silence for native model time. | Nemotron VoiceChat, Realtime-Venus Omni |
 | `next_observation` | Nothing more. The next camera commit carries the result. To have it spoken, send a short user turn such as "Answer now with the result you received." | JoyAI-VL-Interaction |
 | `none` | Not applicable: the model has no tool support. | MiniCPM-o, PersonaPlex, Aura |
 
@@ -1061,6 +1062,17 @@ so audio playback and ACKs are not needed. List all flags with:
 ```bash
 python -m vllm_omni.clients.tool_calls --help
 ```
+
+For native input, replace `--prompt` with `--input-wav` (mono PCM16, 16 kHz),
+or `--initial-user-text` on a model that supports initial text seeding. These
+modes stream silence after the supplied input until the timeout, so tools run
+alongside incoming audio and native models can continue their answer. Native
+input requests text and audio; use `--output-wav answer.wav` to save the speech.
+For offline probes, `--ack-collected-audio` explicitly simulates immediate
+playback of received audio. Interactive applications must acknowledge audio
+actually played. See the
+[Venus tool examples](gh-file:recipes/inclusionAI/Realtime-Venus.md#tool-execution)
+for local arithmetic, inventory lookup and voice requests.
 
 Deployment setting `duplex_session.max_tool_calls_per_session` (default 4096)
 bounds the records one session may track, pending calls and settled tombstones
@@ -1397,9 +1409,36 @@ Input clocking is available only for models whose plugin declares it
 model's real unit boundaries to know when a unit's output is complete. On any
 other model, a session with `clock: "input"` is refused with error
 `input_clock_unsupported` — at session creation, or on a `session.update`
-that sets it. No model shipped with vLLM-Omni declares it yet: the option is
-for plugins that opt in once their unit boundaries are mapped (see
-*Input-clocked sessions* in the model's entry when it does).
+that sets it.
+
+Models that support input-clocked sessions, and how each maps onto units:
+
+| Model | Unit | Decision | A speaking unit is complete when | Input |
+| --- | --- | --- | --- | --- |
+| MiniCPM-o 4.5 | 1 s audio chunk (an append submits every whole chunk it completes) | Stage 0 `listen` ends the unit; any other Stage-0 segment end makes it a speaking unit | its Talker segment has ended and Code2Wav has emitted the chunk that flushes the unit's remaining codes (`tts_is_last_chunk`) | audio only |
+
+For a speaking MiniCPM-o 4.5 unit, the acknowledgement guarantees that the
+unit's text (unless the unit has 5 or fewer codec frames in all, whose text
+can follow with the next unit's audio) and all of its audio that the
+vocoder could synthesise by then have been emitted. The last codec frames
+of a speaking unit that does not end the turn are synthesised together with
+the next unit's codes, because of the vocoder's lookahead and because a
+remainder shorter than 5 frames is carried into the next unit's first
+chunk, so that audio goes out after the unit's acknowledgement, exactly
+when real-time operation emits it: usually 200–440 ms (p10–p90), measured
+up to about 0.76 s, and it can exceed 1 s under concurrent load. There is
+no structural bound on it. The next unit is a speaking unit of the same
+turn because the model rewrites a `<|listen|>` sampled while the turn is
+open to `<|tts_bos|>`; a model change that allowed a listen mid-turn would
+let the tail wait across listen units. The unit that ends the turn is
+flushed completely before its acknowledgement.
+
+An input-clocked MiniCPM-o 4.5 session takes audio only: its capabilities
+list no `video` input modality, and an `input_audio_buffer.append` with
+`video_frames` is refused with `invalid_input_modality` and acknowledged as
+`rejected`. A committed turn with video frames is split into separate vision
+units, which the clock does not account for when the commit is deferred
+behind a response. Sessions without the clock are unchanged.
 
 An input-clocked session never overlaps turns: a commit during a response
 waits for that response, also on a model that otherwise runs concurrent turn
