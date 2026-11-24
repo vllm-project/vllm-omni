@@ -7271,7 +7271,7 @@ def test_weekly_final_diffusion_parity_qualifiers_are_blocking() -> None:
         "Bagel online · 2-GPU",
         "Bagel multi-replica · 4-GPU",
     }
-    assert len(steps) == 67
+    assert len(steps) == 72
     assert len(promoted_labels) == 13
     assert {step["label"] for step in steps if step["label"] in promoted_labels} == promoted_labels
     assert all(step["grade"] == "Blocking" for step in steps)
