@@ -23,6 +23,7 @@ from vllm_omni.benchmarks.patch.patch import (
     maybe_enable_stage_metrics,
     set_duplex_metric_aggregation,
     set_fail_fast_on_timeout,
+    set_isolate_prefix_cache,
     set_print_stage,
     set_request_timeout_s,
     should_request_stage_metrics,
@@ -96,6 +97,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     _use_endpoint_backend_when_implicit(args)
     _validate_fail_fast_on_timeout(args)
     set_fail_fast_on_timeout(getattr(args, "omni_fail_fast_on_timeout", False))
+    set_isolate_prefix_cache(getattr(args, "omni_isolate_prefix_cache", False))
     set_print_stage(getattr(args, "print_stage", False))
     set_duplex_metric_aggregation(getattr(args, "duplex_metric_aggregation", "session"))
     args.extra_body = maybe_enable_stage_metrics(

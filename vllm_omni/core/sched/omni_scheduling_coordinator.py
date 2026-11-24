@@ -30,6 +30,17 @@ def uses_native_mrv2_data_plane(
     return bool(use_v2_model_runner and getattr(model_config, "supports_native_mrv2_data_plane", False))
 
 
+def uses_native_qwen3_omni_resumable(model_config: Any) -> bool:
+    return (
+        uses_native_mrv2_data_plane(
+            model_config, use_v2_model_runner=getattr(model_config, "use_v2_model_runner", False)
+        )
+        and getattr(model_config, "async_chunk", False)
+        and getattr(model_config, "session_mode", "turn") == "turn"
+        and getattr(getattr(model_config, "hf_config", None), "model_type", None) == "qwen3_omni_moe"
+    )
+
+
 def uses_full_payload_input_coordinator(model_config: Any) -> bool:
     """Returns True if this stage parks pending requests in
     WAITING_FOR_INPUT awaiting a full_payload delivery on the worker connector.
@@ -67,6 +78,7 @@ class OmniSchedulingCoordinator:
         self.finished_requests: set[str] = set()
         self.requests_with_ready_chunks: set[str] = set()
         self.input_terminal_req_ids: set[str] = set()
+        self.segment_finished_req_ids: set[str] = set()
         self._full_payload_input_received: set[str] = set()
 
         self._waiting_for_chunk_waiting: deque[Any] = deque()
@@ -219,6 +231,7 @@ class OmniSchedulingCoordinator:
         self.finished_requests.discard(request_id)
         self.requests_with_ready_chunks.discard(request_id)
         self.input_terminal_req_ids.discard(request_id)
+        self.segment_finished_req_ids.discard(request_id)
         self._waiting_since.pop(request_id, None)
         for queue_attr in (
             "_waiting_for_chunk_waiting",
@@ -315,6 +328,8 @@ class OmniSchedulingCoordinator:
             request = requests.get(req_id)
             if request is None:
                 continue
+            if update.segment_finished:
+                self.segment_finished_req_ids.add(req_id)
             if update.input_terminal:
                 self.input_terminal_req_ids.add(req_id)
             self._apply_scheduling_update(request, update)
@@ -329,7 +344,8 @@ class OmniSchedulingCoordinator:
                     new_prompt = [0] * next_len
                     request.prompt_token_ids = new_prompt
                     request.num_prompt_tokens = next_len
-                    request._all_token_ids.clear()
+                    # TokenBuffer (array) has no .clear(); del-slice like the pin.
+                    del request._all_token_ids[:]
                     request._all_token_ids.extend(new_prompt)
                     request._output_token_ids.clear()
                     request.num_computed_tokens = 0
@@ -338,7 +354,8 @@ class OmniSchedulingCoordinator:
             prompt_token_ids = list(update.prompt_token_ids)
             request.prompt_token_ids = prompt_token_ids
             request.num_prompt_tokens = len(prompt_token_ids)
-            request._all_token_ids.clear()
+            # TokenBuffer (array) has no .clear(); del-slice like the pin.
+            del request._all_token_ids[:]
             request._all_token_ids.extend(prompt_token_ids)
             request._output_token_ids.clear()
             request.num_computed_tokens = 0
@@ -469,7 +486,7 @@ class OmniSchedulingCoordinator:
         chunk_ready_req_ids: set[str],
     ) -> bool:
         req_id = request.request_id
-        if req_id in self.finished_requests:
+        if req_id in self.finished_requests or req_id in self.segment_finished_req_ids:
             # Admit the final payload or terminal marker for cleanup.
             return True
 

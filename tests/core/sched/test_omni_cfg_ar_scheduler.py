@@ -17,8 +17,8 @@ def _request(name: str, prompt_length: int) -> Request:
     return Request(name, [0] * prompt_length, SamplingParams(max_tokens=100), None)
 
 
-def _scheduler(monkeypatch, waiting, running=()):
-    scheduler = OmniCFGARScheduler.__new__(OmniCFGARScheduler)
+def _scheduler(monkeypatch, waiting, running=(), *, scheduler_cls=OmniCFGARScheduler):
+    scheduler = object.__new__(scheduler_cls)
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.waiting = create_request_queue(scheduler.policy)
     for request in waiting:

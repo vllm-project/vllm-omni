@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
@@ -14,6 +14,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMForConditionalGeneration,
 )
+from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -27,7 +28,7 @@ def test_multimodal_runner_preserves_forwarded_token_identities(monkeypatch):
         lambda **kwargs: stage_model,
     )
     monkeypatch.setattr(
-        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat.patch_minicpmo_remote_config",
+        "vllm_omni.model_executor.models.minicpmo_4_5.config.patch_minicpmo_remote_config",
         lambda config: None,
     )
     config = SimpleNamespace(
@@ -41,14 +42,24 @@ def test_multimodal_runner_preserves_forwarded_token_identities(monkeypatch):
     embed_buffer = torch.randn(4, 4)
     runner = SimpleNamespace(
         model=wrapper,
-        input_ids=SimpleNamespace(gpu=token_buffer),
-        inputs_embeds=SimpleNamespace(gpu=embed_buffer),
+        supports_mm_inputs=True,
+        is_first_pp_rank=True,
+        lora_config=None,
+        ec_connector=SimpleNamespace(maybe_get_output=lambda _: nullcontext(None)),
+        _get_mm_embeddings=lambda scheduled, batch: embed_buffer[: batch.num_tokens],
     )
+    batch = SimpleNamespace(input_ids=token_buffer[:2], num_tokens=2)
+    scheduler = SimpleNamespace(scheduled_encoder_inputs={})
 
     # This same upstream path prepares normal multimodal forwards and graph
     # capture inputs. Embeddings must not replace the real token identities.
-    input_ids, inputs_embeds = GPUModelRunner._prepare_mm_inputs(runner, 2)
-    out = wrapper.forward(input_ids=input_ids, positions=torch.tensor([10, 11]), inputs_embeds=inputs_embeds)
+    input_ids, inputs_embeds, _ = OmniGPUModelRunner._prepare_mm_inputs(runner, scheduler, batch, dummy_run=False)
+    batch.positions = torch.tensor([10, 11])
+    forward_output = wrapper.forward(input_ids=input_ids, positions=batch.positions, inputs_embeds=inputs_embeds)
+    torch.testing.assert_close(forward_output, hidden)
+    out = wrapper.make_omni_output_mrv2(
+        forward_output, input_batch=batch, req_states=None, model_intermediate_buffer=[]
+    )
 
     torch.testing.assert_close(out.multimodal_outputs["latent_input_ids"], token_buffer[:2, None])
     torch.testing.assert_close(out.multimodal_outputs["latent_positions"], torch.tensor([[10], [11]]))
@@ -59,7 +70,7 @@ def test_multimodal_runner_preserves_forwarded_token_identities(monkeypatch):
     config.model_config.model_stage = "tts"
     runner.model = MiniCPMO45OmniForConditionalGeneration(vllm_config=config)
     assert not runner.model.omni_pooler_payload_include_hidden
-    talker_ids, talker_embeds = GPUModelRunner._prepare_mm_inputs(runner, 2)
+    talker_ids, talker_embeds, _ = OmniGPUModelRunner._prepare_mm_inputs(runner, scheduler, batch, dummy_run=False)
     assert talker_ids is None
     torch.testing.assert_close(talker_embeds, embed_buffer[:2])
 
@@ -150,12 +161,8 @@ def test_wrapper_shape_normalization(thinker_shape, expected_shape):
         positions=torch.tensor([0]),
     )
 
-    assert out.text_hidden_states.shape == expected_shape, (
-        f"Expected text_hidden_states shape {expected_shape}, got {out.text_hidden_states.shape}"
-    )
-    assert out.multimodal_outputs["latent"].shape == expected_shape, (
-        f"Expected latent shape {expected_shape}, got {out.multimodal_outputs['latent'].shape}"
-    )
+    assert out.shape == expected_shape, f"Expected hidden states shape {expected_shape}, got {out.shape}"
+    torch.testing.assert_close(out, mock_hidden.reshape(expected_shape))
 
 
 if __name__ == "__main__":
@@ -169,3 +176,26 @@ if __name__ == "__main__":
     ]:
         test_wrapper_shape_normalization(shape, exp)
     print("ALL TESTS PASSED SUCCESSFULLY!")
+
+
+def test_embed_multimodal_delegates_to_get_multimodal_embeddings(monkeypatch):
+    """vLLM encoder profiling calls embed_multimodal; without an override the
+    SupportsMultiModal protocol stub returns None and startup fails downstream."""
+    sentinel = (object(),)
+    seen: dict[str, object] = {}
+
+    def fake_get_multimodal_embeddings(self, **kwargs):
+        seen.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        MiniCPMO45OmniLLMForConditionalGeneration,
+        "get_multimodal_embeddings",
+        fake_get_multimodal_embeddings,
+    )
+    model = object.__new__(MiniCPMO45OmniLLMForConditionalGeneration)
+
+    out = model.embed_multimodal(pixel_values="pv", audio_features="af")
+
+    assert out is sentinel
+    assert seen == {"pixel_values": "pv", "audio_features": "af"}

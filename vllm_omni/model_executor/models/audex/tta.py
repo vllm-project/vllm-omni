@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Adapted from nvidia/Nemotron-Labs-Audex-2B (Apache-2.0):
 #   inference_scripts_vllm/audiogen_scripts/tta_rvq_logits_processor.py
@@ -35,11 +35,8 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.v1.sample.logits_processor import (
-    BatchUpdate,
-    LogitsProcessor,
-    MoveDirectionality,
-)
+from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor, LogitsProcRequestState
 
 logger = init_logger(__name__)
 
@@ -114,94 +111,61 @@ def validate_rvq_phase(
 class TTARVQPhaseMaskLogitsProcessor(LogitsProcessor):
     """Mask logits to the RVQ-phase-valid token set for Audex TTA requests.
 
-    Per batch row:
-      ``_req[idx]``           -> {"start_tid", "end_tid", "codec_cap", "start_in_prompt"}
-      ``_output_tokens[idx]`` -> live reference to the request's output ids
-      ``_start_pos[idx]``     -> cached index of <audiogen_start> once seen;
-                                 -1 means the prompt already ended with it.
+    Per-request parameters and absolute start positions are keyed by native
+    persistent slots. The current context maps these slots to logits rows.
 
     The disallow masks are vocab-sized boolean tensors built once on the
     first ``apply`` (using the real ``logits.shape[-1]`` so vocab padding is
     also forbidden).
     """
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool) -> None:
-        self.device = device
+    def __init__(self, vllm_config: VllmConfig, req_states: LogitsProcRequestState) -> None:
+        self.device = req_states.device
+        self._req_states = req_states
+        self._speculative = vllm_config.speculative_config is not None
         self._req: dict[int, dict[str, Any]] = {}
-        self._output_tokens: dict[int, list[int]] = {}
-        self._start_pos: dict[int, int] = {}
-
+        self._pending: set[int] = set()
+        self._not_started = torch.iinfo(torch.int64).max
+        self._start_pos = torch.full((req_states.max_num_reqs,), self._not_started, device=self.device)
         self._phase_token_ids: list[list[int]] | None = None
         self._mask_end_tid: int | None = None
-
         self._disallow_phase: torch.Tensor | None = None
         self._disallow_phase0_end: torch.Tensor | None = None
         self._disallow_except_end: torch.Tensor | None = None
 
-    def is_argmax_invariant(self) -> bool:
-        return False
+    def add_request(self, req_idx: int, params: SamplingParams) -> bool:
+        self._req.pop(req_idx, None)
+        self._pending.discard(req_idx)
+        self._start_pos[req_idx] = self._not_started
+        tta = (params.extra_args or {}).get("tta_rvq")
+        if not tta:
+            return False
+        if self._speculative:
+            raise ValueError("Audex TTA requires non-speculative decoding")
+        self._req[req_idx] = tta
+        self._pending.add(req_idx)
+        if self._phase_token_ids is None:
+            self._phase_token_ids = tta["phase_token_ids"]
+            self._mask_end_tid = tta["end_tid"]
+        return True
 
-    def _reset(self) -> None:
-        self._req.clear()
-        self._output_tokens.clear()
-        self._start_pos.clear()
-
-    def update_state(self, batch_update: BatchUpdate | None) -> None:
-        if batch_update is None:
-            return
-
-        for idx in batch_update.removed:
-            self._req.pop(idx, None)
-            self._output_tokens.pop(idx, None)
-            self._start_pos.pop(idx, None)
-
-        if not self._req and batch_update.added:
-            self._reset()
-
-        for idx, params, _, output_token_ids in batch_update.added:
-            extra_args = params.extra_args if params else None
-            tta = extra_args.get("tta_rvq") if extra_args else None
-            if tta:
-                self._req[idx] = {
-                    "start_tid": tta["start_tid"],
-                    "end_tid": tta["end_tid"],
-                    "codec_cap": tta.get("codec_cap"),
-                    "start_in_prompt": bool(tta.get("start_in_prompt", False)),
-                }
-                self._output_tokens[idx] = output_token_ids
-                if self._req[idx]["start_in_prompt"]:
-                    self._start_pos[idx] = -1
-                else:
-                    self._start_pos.pop(idx, None)
-                if self._phase_token_ids is None:
-                    self._phase_token_ids = tta["phase_token_ids"]
-                    self._mask_end_tid = tta["end_tid"]
+    def apply_staged_writes(self) -> None:
+        # Native has now flushed the full prompt/resumption history. Search
+        # generated history once per admission, rather than copying it each step.
+        for slot in self._pending:
+            state = self._req[slot]
+            prompt_len = int(self._req_states.prompt_len.np[slot])
+            if state.get("start_in_prompt", False):
+                self._start_pos[slot] = prompt_len - 1
             else:
-                self._req.pop(idx, None)
-                self._output_tokens.pop(idx, None)
-                self._start_pos.pop(idx, None)
-
-        if self._req:
-            for src, dst, direction in batch_update.moved:
-                src_req = self._req.pop(src, None)
-                dst_req = self._req.pop(dst, None)
-                src_tokens = self._output_tokens.pop(src, None)
-                dst_tokens = self._output_tokens.pop(dst, None)
-                src_pos = self._start_pos.pop(src, None)
-                dst_pos = self._start_pos.pop(dst, None)
-                if src_req is not None:
-                    self._req[dst] = src_req
-                if src_tokens is not None:
-                    self._output_tokens[dst] = src_tokens
-                if src_pos is not None:
-                    self._start_pos[dst] = src_pos
-                if direction == MoveDirectionality.SWAP:
-                    if dst_req is not None:
-                        self._req[src] = dst_req
-                    if dst_tokens is not None:
-                        self._output_tokens[src] = dst_tokens
-                    if dst_pos is not None:
-                        self._start_pos[src] = dst_pos
+                end = int(self._req_states.prefill_len.np[slot])
+                history = self._req_states.all_token_ids.gpu[slot, prompt_len:end]
+                positions = torch.arange(prompt_len, end, device=self.device)
+                if end > prompt_len:
+                    self._start_pos[slot] = torch.where(
+                        history == state["start_tid"], positions, self._not_started
+                    ).min()
+        self._pending.clear()
 
     def _build_masks(self, vocab_size: int) -> None:
         if self._phase_token_ids is None or self._mask_end_tid is None:
@@ -244,50 +208,26 @@ class TTARVQPhaseMaskLogitsProcessor(LogitsProcessor):
             os.getpid(),
         )
 
-    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+    def apply(self, logits: torch.Tensor, ctx: LogitsContext) -> torch.Tensor:
         if not self._req:
             return logits
-
         if self._disallow_phase is None:
             self._build_masks(logits.shape[-1])
-
-        num_rows = logits.shape[0]
-        for idx, state in self._req.items():
-            # Rows beyond this step's logits (pure-prefill / partially
-            # scheduled steps) have nothing to mask; the persistent-batch
-            # index re-enters range on the decode steps that sample.
-            if idx >= num_rows:
+        for row, slot_value in enumerate(ctx.idx_mapping_np):
+            slot = int(slot_value)
+            state = self._req.get(slot)
+            if state is None:
                 continue
-            tokens = self._output_tokens.get(idx)
-            if tokens is None:
-                continue
-            n = len(tokens)
-
-            start_pos = self._start_pos.get(idx)
-            if start_pos is None:
-                start_tid = state["start_tid"]
-                for i in range(n):
-                    if tokens[i] == start_tid:
-                        start_pos = i
-                        self._start_pos[idx] = i
-                        break
-                if start_pos is None:
-                    continue
-
-            position = n - start_pos - 1
-            if position < 0:
-                continue
-
-            cap = state["codec_cap"]
-            if cap is not None and position >= cap:
-                disallow = self._disallow_except_end
-            else:
-                phase = position & (XCODEC1_NUM_CODEBOOKS - 1)
-                if phase == 0:
-                    disallow = self._disallow_phase0_end if position > 0 else self._disallow_phase[0]
-                else:
-                    disallow = self._disallow_phase[phase]
-
-            logits[idx].masked_fill_(disallow, NEG_INF)
-
+            # The current input can be the newly sampled start marker, not yet
+            # present in committed history. Positions are absolute sequence ids.
+            candidate = torch.where(ctx.input_ids[row] == state["start_tid"], ctx.pos[row], self._not_started)
+            self._start_pos[slot] = torch.minimum(self._start_pos[slot], candidate)
+            position = ctx.pos[row] - self._start_pos[slot]
+            phase = position.clamp_min(0).remainder(XCODEC1_NUM_CODEBOOKS)
+            disallow = self._disallow_phase[phase]
+            disallow = torch.where((phase == 0) & (position > 0), self._disallow_phase0_end, disallow)
+            cap = state.get("codec_cap")
+            if cap is not None:
+                disallow = torch.where(position >= cap, self._disallow_except_end, disallow)
+            logits[row].masked_fill_(disallow & (position >= 0), NEG_INF)
         return logits

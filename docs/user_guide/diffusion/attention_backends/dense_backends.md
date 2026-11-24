@@ -77,7 +77,7 @@ for mask-heavy DiTs and is automatically preferred on Blackwell when cuDNN
 9.5 or newer is available and the higher-priority TRTLLM route is not
 compatible.
 
-For this checkout's vLLM 0.33 / Torch 2.14 CUDA environment, use the pinned
+For this checkout's vLLM 0.34 / Torch 2.14 CUDA environment, use the pinned
 cuDNN 9.25.1 runtime in the [CUDA source installation instructions](../../../getting_started/installation/gpu.md).
 The CUDA Docker and CI images configure that runtime at process startup.
 

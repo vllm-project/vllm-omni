@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from threading import Event
@@ -25,7 +25,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -33,7 +33,13 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARS
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
-from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import has_tts_text_conditioning
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    PRECOMPUTED_TEXT_IDS_KEY,
+    check_text_prompt,
+    check_text_update,
+    has_tts_text_conditioning,
+)
+from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -65,6 +71,10 @@ def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARS
     # target truncates session.block_hashes with it.
     sched.hash_block_size = 16
     sched.chunk_transfer_adapter = None
+    # vLLM 0.34 Scheduler state reached via the inherited upstream requeue /
+    # cleanup paths; __new__ bypasses the __init__ that creates them.
+    sched.connector = None
+    sched.async_kv_waiting = create_request_queue(SchedulingPolicy.FCFS)
     sched.kv_holding_waiting = set()
     sched.deferred_waiting = set()
     sched._free_request_blocks = MagicMock()
@@ -83,6 +93,98 @@ def _make_request() -> Request:
         arrival_time=100.0,
         block_hasher=None,
     )
+
+
+@pytest.mark.parametrize("request_finished", [False, True])
+def test_native_talker_waiting_for_prompt_consumes_boundary_without_decode(request_finished):
+    from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
+    from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
+
+    sched = _make_scheduler(stage_id=1)
+    req = _make_request()
+    req.resumable = True
+    req._omni_waiting_native_prompt = True
+    req.num_computed_tokens = 4
+    req_id = req.request_id
+    sched._native_resumable = True
+    sched.requests = {req_id: req}
+    sched.waiting = []
+    sched.running = []
+    sched._pending_data_plane_terminal_req_ids = set()
+    sched._resume_chunk_receivers = set()
+    sched.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
+    sched.finish_requests = MagicMock()
+    sched._latest_omni_connector_output = OmniConnectorOutput(
+        chunk_ready_req_ids={req_id},
+        chunk_finished_req_ids={req_id} if request_finished else set(),
+        request_metadata={
+            req_id: SchedulingMetadataUpdate(input_terminal=request_finished, segment_finished=not request_finished)
+        },
+    )
+
+    sched._consume_pending_connector_output("ar")
+
+    assert req_id not in sched.input_coordinator.requests_with_ready_chunks
+    assert req_id not in sched.input_coordinator.finished_requests
+    if request_finished:
+        sched.finish_requests.assert_called_once_with(req_id, RequestStatus.FINISHED_STOPPED)
+        assert sched._pending_data_plane_terminal_req_ids == {req_id}
+    else:
+        sched.finish_requests.assert_not_called()
+        assert sched._resume_chunk_receivers == {req_id}
+
+
+def test_ordinary_native_talker_prefills_when_first_chunk_and_terminal_coalesce():
+    from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
+    from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
+
+    sched = _make_scheduler(stage_id=1)
+    req = _make_request()
+    req_id = req.request_id
+    sched._native_resumable = True
+    sched.requests = {req_id: req}
+    sched.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    sched.waiting.add_request(req)
+    sched.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    sched.running = []
+    sched._pending_data_plane_terminal_req_ids = set()
+    sched.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
+    sched.finish_requests = MagicMock()
+    sched._latest_omni_connector_output = OmniConnectorOutput(
+        chunk_ready_req_ids={req_id},
+        chunk_finished_req_ids={req_id},
+        request_metadata={req_id: SchedulingMetadataUpdate(input_terminal=True)},
+    )
+
+    sched._consume_pending_connector_output("ar")
+
+    sched.finish_requests.assert_not_called()
+    assert list(sched.waiting) == [req]
+    assert sched.input_coordinator.requests_with_ready_chunks == {req_id}
+    assert sched.input_coordinator.finished_requests == {req_id}
+
+
+@pytest.mark.parametrize(
+    ("status", "computed", "expected"),
+    [
+        (RequestStatus.WAITING_FOR_STREAMING_REQ, 3, []),
+        (RequestStatus.WAITING, 2, []),
+        (RequestStatus.RUNNING, 3, [40, 41]),
+    ],
+)
+def test_post_step_drafts_do_not_cross_streaming_segment(status, computed, expected):
+    sched = _make_scheduler()
+    request = _make_request()
+    request.resumable = True
+    request.status = status
+    request.num_computed_tokens = computed
+    sched.requests = {request.request_id: request}
+    sched.structured_output_manager = SimpleNamespace(trim_spec_tokens=lambda req, tokens: tokens)
+    sched._talker_kstep_armed = lambda: False
+
+    sched.update_draft_token_ids(DraftTokenIds([request.request_id], [[40, 41]]))
+
+    assert request.spec_token_ids == expected
 
 
 def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
@@ -227,7 +329,8 @@ def _run_resumable_segment_stop(
     model_runner_output.num_nans_in_logits = None
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
-    model_runner_output.req_id_to_index = {session.request_id: 0}
+    # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+    model_runner_output.req_ids = [session.request_id]
     model_runner_output.routed_experts = None
     model_runner_output.inter_stage_outputs = [inter_stage_output] if inter_stage_output is not None else None
 
@@ -323,6 +426,35 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
     )
 
 
+def test_dflash_boundary_send_keeps_the_previous_prompt():
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.append_output_token_ids([7, 8])
+    adapter = MagicMock()
+    adapter.uses_dflash = True
+    adapter._confirmed_num_computed_tokens.return_value = 3
+    adapter._snapshot_processor_request.side_effect = OmniChunkTransferAdapter._snapshot_processor_request
+
+    def install_next_prompt(request):
+        request.prompt_token_ids.extend([8, 9])
+        request._output_token_ids.clear()
+        return False
+
+    _run_resumable_segment_stop(
+        session,
+        handle_stopped=install_next_prompt,
+        chunk_transfer_adapter=adapter,
+        inter_stage_output={"meta": {"decode_span": True}},
+    )
+
+    _, snapshot, segment_finished = adapter.save_async.call_args.args
+    assert segment_finished
+    assert snapshot.prompt_token_ids == [1, 2, 3]
+    assert list(snapshot.output_token_ids) == [7, 8]
+    assert session.prompt_token_ids == [1, 2, 3, 8, 9]
+
+
 @pytest.mark.parametrize(
     "processor",
     [None, talker2code2wav_async_chunk, SimpleNamespace(_requires_full_token_history=True)],
@@ -378,7 +510,8 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise(
     model_runner_output.num_nans_in_logits = None
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
-    model_runner_output.req_id_to_index = {session.request_id: 0}
+    # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+    model_runner_output.req_ids = [session.request_id]
     model_runner_output.routed_experts = None
     model_runner_output.inter_stage_outputs = None
 
@@ -479,7 +612,8 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     model_runner_output.num_nans_in_logits = None
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
-    model_runner_output.req_id_to_index = {session.request_id: 0}
+    # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+    model_runner_output.req_ids = [session.request_id]
     model_runner_output.routed_experts = None
 
     OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
@@ -555,7 +689,8 @@ def test_legacy_stale_async_marker_bypasses_real_placeholder_accounting() -> Non
     model_runner_output.num_nans_in_logits = None
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
-    model_runner_output.req_id_to_index = {request.request_id: 0}
+    # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+    model_runner_output.req_ids = [request.request_id]
     model_runner_output.routed_experts = None
 
     OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
@@ -608,9 +743,9 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
 
 
 def test_stage0_plain_streaming_update_keeps_the_first_chunk_text() -> None:
-    # Qwen3-TTS skips its stage-0 text check on streaming updates, so a plain
-    # stage-0 extension must keep the first chunk's additional_information:
-    # the re-admitted request carries it to the Talker's preprocess.
+    # Qwen3-TTS's stage-0 update check ignores a plain update's
+    # additional_information, so a plain stage-0 extension must keep the first
+    # chunk's: the re-admitted request carries it to the Talker's preprocess.
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
@@ -627,6 +762,88 @@ def test_stage0_plain_streaming_update_keeps_the_first_chunk_text() -> None:
     info = deserialize_additional_information(readmitted.additional_information)
     assert info["text"] == ["Hello there."]
     assert has_tts_text_conditioning(info, allow_blank_text=False)
+
+
+@pytest.mark.parametrize(
+    "replace_flag",
+    [{"meta": {"replace_streaming_prompt": True}}, {"meta.replace_streaming_prompt": True}],
+    ids=["nested", "wire-key"],
+)
+@pytest.mark.parametrize("text", [["Next sentence."], [""]], ids=["text", "blank-text"])
+def test_stage0_replace_flag_in_additional_information_replaces_the_prompt(replace_flag, text) -> None:
+    # The scheduler reads the replace flag from additional_information too, so
+    # such an update installs its own text. Qwen3-TTS's update check must then
+    # accept exactly the updates whose text the Talker can still use.
+    sched = _make_scheduler(stage_id=0)
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.additional_information = serialize_additional_information(
+        {"task_type": ["CustomVoice"], "text": ["Hello there."]}
+    )
+    update_prompt = {
+        "prompt_token_ids": [10, 20],
+        "additional_information": {"task_type": ["CustomVoice"], "text": text, **replace_flag},
+    }
+    try:
+        check_text_update(update_prompt, [])
+        accepted = True
+    except ValueError:
+        accepted = False
+    update = _make_update([10, 20])
+    update.additional_information = serialize_additional_information(update_prompt["additional_information"])
+    update.model_intermediate_buffer = None
+
+    sched._update_request_as_session(session, update)
+
+    assert session.additional_information is update.additional_information
+    assert list(session.prompt_token_ids) == [10, 20]
+    readmitted = OmniNewRequestData.from_request(session, block_ids=([],))
+    info = deserialize_additional_information(readmitted.additional_information)
+    assert info["text"] == text
+    assert accepted == has_tts_text_conditioning(info, allow_blank_text=False)
+
+
+_QWEN3_TTS_FIRST_CHUNKS = {
+    "info-text": ({"text": ["Hello."]}, None),
+    "info-text-ids": ({"text": [""], PRECOMPUTED_TEXT_IDS_KEY: [[1, 2, 3]]}, None),
+    "info-and-buffer-text": ({"text": ["Hello."]}, {"text": ["Hi."]}),
+    # A plain update drops this buffer, so the re-admitted request has no text.
+    "buffer-only-text": ({}, {"text": ["Hello."]}),
+}
+
+
+@pytest.mark.parametrize(("info", "buffer"), list(_QWEN3_TTS_FIRST_CHUNKS.values()), ids=list(_QWEN3_TTS_FIRST_CHUNKS))
+def test_qwen3_tts_stage0_check_accepts_only_text_a_plain_update_keeps(info, buffer) -> None:
+    # A text-less plain stage-0 update passes Qwen3-TTS's update check, and
+    # Model Runner V2 then re-admits the request from the session's payloads.
+    # The first-chunk check must accept exactly the text that survives that.
+    first_chunk = {
+        "prompt_token_ids": [1, 2, 3],
+        "additional_information": {"global_request_id": ["r"], "task_type": ["CustomVoice"], **info},
+        "model_intermediate_buffer": buffer,
+    }
+    update_prompt = {"prompt_token_ids": [10, 20], "additional_information": {"global_request_id": ["r"]}}
+    assert check_text_update(update_prompt, []) is update_prompt
+    try:
+        check_text_prompt(first_chunk, [])
+        accepted = True
+    except ValueError:
+        accepted = False
+
+    sched = _make_scheduler(stage_id=0)
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.additional_information = serialize_additional_information(first_chunk["additional_information"])
+    session.model_intermediate_buffer = buffer
+    update = _make_update([10, 20])
+    update.additional_information = serialize_additional_information(update_prompt["additional_information"])
+    update.model_intermediate_buffer = None
+    sched._update_request_as_session(session, update)
+    intermediate_buffer = OmniIntermediateBuffer(1)
+    intermediate_buffer.add_request(0, OmniNewRequestData.from_request(session, block_ids=([],)))
+    talker_info = intermediate_buffer.buffers[0]
+
+    assert accepted == has_tts_text_conditioning(talker_info, talker_info.get("hidden_states"))
 
 
 def test_stage0_streaming_update_keeps_full_hash_block() -> None:
@@ -667,7 +884,7 @@ def test_stage0_basic_window_rebuilds_below_low_watermark() -> None:
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
     session.prompt_token_ids = [0] * 9
-    session._all_token_ids.clear()
+    del session._all_token_ids[:]
     session._all_token_ids.extend(session.prompt_token_ids)
     session.num_prompt_tokens = 9
     session.append_output_token_ids([40])
@@ -698,7 +915,7 @@ def test_stage0_context_window_compacts_dropped_speech() -> None:
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
     session.prompt_token_ids = [0] * 9
-    session._all_token_ids.clear()
+    del session._all_token_ids[:]
     session._all_token_ids.extend(session.prompt_token_ids)
     session.num_prompt_tokens = 9
     session.append_output_token_ids([40])
@@ -735,7 +952,8 @@ def test_stage0_window_uses_confirmed_span_and_terminator(cleared_outputs, in_fl
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
     session.prompt_token_ids = [0] * 9
-    session._all_token_ids[:] = session.prompt_token_ids
+    del session._all_token_ids[:]
+    session._all_token_ids.extend(session.prompt_token_ids)
     session.num_prompt_tokens = 9
     session.append_output_token_ids([40, 99])
     session.num_computed_tokens = 10 + in_flight
@@ -769,7 +987,8 @@ def test_stage0_window_rebuild_that_overflows_max_model_len_finishes_the_session
     sched = _make_live_session_scheduler(max_model_len=21)
     session = _make_request()
     session.prompt_token_ids = [0] * 9
-    session._all_token_ids[:] = [0] * 9
+    del session._all_token_ids[:]
+    session._all_token_ids.extend([0] * 9)
     session.num_prompt_tokens = 9
     session._output_token_ids[:] = [40]
     session._all_token_ids.append(40)
@@ -779,7 +998,8 @@ def test_stage0_window_rebuild_that_overflows_max_model_len_finishes_the_session
     # The parked append state above is the frame before this update: one
     # confirmed output token, fully computed.
     session._output_token_ids[:] = [40]
-    session._all_token_ids[:] = [*session.prompt_token_ids, 40]
+    del session._all_token_ids[:]
+    session._all_token_ids.extend([*session.prompt_token_ids, 40])
     session.num_computed_tokens = 10
     session.num_in_flight_tokens = 0
     sched.num_sampled_tokens_per_step = 1
@@ -819,7 +1039,8 @@ def test_stage0_window_rebuild_that_leaves_room_to_sample_replaces_the_prompt() 
     sched.num_sampled_tokens_per_step = 1
     session = _make_request()
     session.prompt_token_ids = [0] * 9
-    session._all_token_ids[:] = session.prompt_token_ids
+    del session._all_token_ids[:]
+    session._all_token_ids.extend(session.prompt_token_ids)
     session.num_prompt_tokens = 9
     session.append_output_token_ids([40])
     session.num_computed_tokens = 10
@@ -915,7 +1136,7 @@ def _parked_talker_after_first_sentence() -> Request:
     session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     session.prompt_token_ids = [0] * 40
-    session._all_token_ids.clear()
+    del session._all_token_ids[:]
     session._all_token_ids.extend(session.prompt_token_ids)
     session._output_token_ids.clear()
     session.append_output_token_ids([100, 101, 2150])
@@ -1008,7 +1229,7 @@ def test_explicit_model_intermediate_prompt_replacement_releases_cache_and_water
     )
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     session.prompt_token_ids = [0] * 59
-    session._all_token_ids.clear()
+    del session._all_token_ids[:]
     session._all_token_ids.extend(session.prompt_token_ids)
     session.num_prompt_tokens = 59
     session.num_computed_tokens = 59
@@ -1046,7 +1267,7 @@ def test_talker_capacity_exact_fit_extends_from_declared_length_without_ids_prom
     session = _make_request()
     session.external_req_id = "external-capacity-exact-fit"
     session.prompt_token_ids = [0] * 70
-    session._all_token_ids.clear()
+    del session._all_token_ids[:]
     session._all_token_ids.extend(session.prompt_token_ids)
     session._output_token_ids.clear()
     session.append_output_token_ids([7, 8, 9, 10])
@@ -1086,7 +1307,7 @@ def test_talker_first_update_seeds_sender_condition_tracking() -> None:
     session = _make_request()
     session.external_req_id = "external-capacity-first-update"
     session.prompt_token_ids = [0] * 20
-    session._all_token_ids.clear()
+    del session._all_token_ids[:]
     session._all_token_ids.extend(session.prompt_token_ids)
     session._output_token_ids.clear()
     session.append_output_token_ids([7, 8, 9])
@@ -1123,7 +1344,7 @@ def test_talker_first_sliding_update_recomputes_from_seeded_condition() -> None:
     session = _make_request()
     session.external_req_id = "external-sliding-first-update"
     session.prompt_token_ids = [0] * 20
-    session._all_token_ids.clear()
+    del session._all_token_ids[:]
     session._all_token_ids.extend(session.prompt_token_ids)
     session._output_token_ids.clear()
     previous_codes = [7, 8, 9]
@@ -1191,7 +1412,7 @@ def test_talker_first_update_that_cannot_fit_window_is_request_local(mocker) -> 
     sched.chunk_transfer_adapter = adapter
     session = _make_request()
     session.prompt_token_ids = [0] * 20
-    session._all_token_ids.clear()
+    del session._all_token_ids[:]
     session._all_token_ids.extend(session.prompt_token_ids)
     session._output_token_ids.clear()
     session.append_output_token_ids(list(range(9)))
@@ -1226,7 +1447,7 @@ def test_talker_capacity_overflow_recomputes_then_resumes_accumulation() -> None
     session = _make_request()
     session.external_req_id = "external-capacity-rollover"
     session.prompt_token_ids = [0] * 70
-    session._all_token_ids.clear()
+    del session._all_token_ids[:]
     session._all_token_ids.extend(session.prompt_token_ids)
     session._output_token_ids.clear()
     previous_codes = [7, 8, 9, 10]
@@ -1358,6 +1579,7 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
     session = _make_request()
     session.resumable = True
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session._omni_segment_generation = 0
 
     def queue(*requests):
         result = MagicMock()
@@ -1371,6 +1593,10 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
     sched.running = []
     sched.waiting = queue()
     sched.kv_holding_waiting = queue(session)
+    # vLLM 0.34 Scheduler state reached via the inherited upstream requeue /
+    # cleanup paths; __new__ bypasses the __init__ that creates them.
+    sched.connector = None
+    sched.async_kv_waiting = queue()
     sched.deferred_waiting = set()
     sched.num_waiting_for_streaming_input = 1
     sched.chunk_transfer_adapter = _make_talker_adapter(
@@ -1383,6 +1609,7 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
 
     assert session.status == RequestStatus.WAITING
     assert session in sched.waiting.requests
+    assert session._omni_segment_generation == 1
     assert session not in sched.kv_holding_waiting.requests
     assert sched.num_waiting_for_streaming_input == 0
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
@@ -1402,6 +1629,7 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     """Only duplex connector-driven receivers resume without an update."""
     session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session._omni_segment_generation = 0
 
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(session_mode=session_mode))
@@ -1417,6 +1645,7 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     sched._resume_downstream_chunk_receiver(session)
 
     assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert session._omni_segment_generation == 0
     assert sched.num_waiting_for_streaming_input == 1
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
     sched.kv_holding_waiting.remove_requests.assert_not_called()
@@ -1461,7 +1690,8 @@ def _run_idle_step(sched: OmniARScheduler):
         num_nans_in_logits=None,
         kv_connector_output=None,
         cudagraph_stats=None,
-        req_id_to_index={},
+        # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+        req_ids=[],
         routed_experts=None,
     )
     return OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
@@ -1569,6 +1799,9 @@ def test_overflow_guard_survives_eager_abort_until_fifo_cleanup(mocker, fifo_pub
     engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
     # EngineCore.__init__ sets this; __new__ skips it. False is the unpaused default.
     engine.reject_new_requests = False
+    # Upstream EngineCoreProc defers inputs received mid-step here; the empty
+    # deque is the real __init__ default.
+    engine._deferred_inputs = deque()
     engine.scheduler = sched
     engine.engines_running = False
     engine.batch_queue = None
@@ -1964,7 +2197,7 @@ def test_mrv2_talker_reuses_confirmed_prompt_window(attention_type, prompt_len, 
     session = _make_request()
     session.external_req_id = "native-talker"
     session.prompt_token_ids = [0] * prompt_len
-    session._all_token_ids.clear()
+    del session._all_token_ids[:]
     session._all_token_ids.extend(session.prompt_token_ids)
     session.append_output_token_ids([7, 8, 9, 6561])
     session.num_prompt_tokens = prompt_len

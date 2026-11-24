@@ -470,7 +470,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
         batch_descriptor = BatchDescriptor(
             num_tokens=input_batch.num_tokens_after_padding,
-            has_lora=self.lora_config is not None,
+            # vLLM 0.34 dropped BatchDescriptor.has_lora; num_active_loras
+            # carries the lora state.
             num_active_loras=batch_desc.num_active_loras,
         )
         with self._forward_context(
@@ -572,7 +573,6 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         sampled_token_ids: list[list[int]] = [[] for _ in range(len(req_ids))]
         output = OmniModelRunnerOutput(
             req_ids=req_ids,
-            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
             sampled_token_ids=sampled_token_ids,
             # Match the V1 generation runner contract: final generation stages
             # publish audio only through multimodal_outputs.  If the same

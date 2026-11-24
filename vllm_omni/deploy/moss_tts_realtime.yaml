@@ -56,13 +56,3 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
-
-platforms:
-  rocm:
-    model_runner: v1
-  npu:
-    model_runner: v1
-  xpu:
-    model_runner: v1
-  musa:
-    model_runner: v1

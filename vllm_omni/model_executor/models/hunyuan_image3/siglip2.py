@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Licensed under the TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -41,6 +44,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.linear import (
@@ -51,6 +55,8 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
+
+logger = init_logger(__name__)
 
 
 class Config:
@@ -318,6 +324,14 @@ class Siglip2Encoder(nn.Module):
         return hidden_states
 
 
+def _linear_scale_block_size(quant_config: QuantizationConfig | None) -> int | None:
+    """Block size of an online config's linear weight scales, or None if unblocked."""
+    spec = getattr(getattr(quant_config, "args", None), "linear", None)
+    group_shape = getattr(getattr(getattr(spec, "weight", None), "scale", None), "group_shape", None)
+    col = getattr(group_shape, "col", None)
+    return col if isinstance(col, int) and col > 1 else None
+
+
 class Siglip2VisionTransformer(nn.Module):
     def __init__(
         self,
@@ -329,6 +343,21 @@ class Siglip2VisionTransformer(nn.Module):
         config = Config(config)
         self.config = config
         self.embed_dim = config.hidden_size
+
+        # Block-scaled weight quantisation needs the contracted dims to be multiples of
+        # the scale block; fc2 contracts over 4304 (4304 % 32 == 16), so online MXFP8
+        # fails at init. Keep the ~0.4B tower in the checkpoint dtype instead.
+        block = _linear_scale_block_size(quant_config)
+        if block is not None and any(size % block != 0 for size in (config.hidden_size, config.intermediate_size)):
+            logger.info_once(
+                "SigLIP2 dims (hidden=%d, intermediate=%d) are not %d-element aligned; "
+                "running the vision tower unquantised instead of %s.",
+                config.hidden_size,
+                config.intermediate_size,
+                block,
+                quant_config.get_name(),
+            )
+            quant_config = None
 
         self.embeddings = Siglip2VisionEmbeddings(config)
         self.encoder = Siglip2Encoder(

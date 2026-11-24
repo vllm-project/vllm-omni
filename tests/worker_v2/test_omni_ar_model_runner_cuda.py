@@ -39,7 +39,6 @@ def test_chunked_fixed_token_scores_are_copied_from_cuda() -> None:
     scores = worker.compute_prompt_token_id_logprobs(lambda hidden: hidden, hidden[2:], batch, np.array([4]))
     mro = omni_ar_model_runner.OmniModelRunnerOutput(
         req_ids=["req"],
-        req_id_to_index={"req": 0},
         sampled_token_ids=None,
         prompt_logprobs_dict={},
         prompt_token_id_logprobs_dict=scores,

@@ -49,7 +49,10 @@ from vllm_omni.model_executor.models.audex.pipeline import (
 )
 from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPELINE
 from vllm_omni.model_executor.models.auk.pipeline import AUK_PIPELINE
-from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
+from vllm_omni.model_executor.models.aura_omni.pipeline import (
+    AURA_OMNI_JUDGED_PIPELINE,
+    AURA_OMNI_PIPELINE,
+)
 from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_PIPELINE,
     BAGEL_SINGLE_STAGE_PIPELINE,
@@ -57,10 +60,12 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
 )
 from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
 from vllm_omni.model_executor.models.causvid_wan.pipeline import CAUSVID_WAN_PIPELINE
+from vllm_omni.model_executor.models.chatterbox.pipeline import CHATTERBOX_ORIGINAL_PIPELINE, CHATTERBOX_TURBO_PIPELINE
 from vllm_omni.model_executor.models.cosmos3.pipeline import (
     COSMOS3_OMNI_DEPLOY_PIPELINE,
     COSMOS3_POLICY_PIPELINE,
 )
+from vllm_omni.model_executor.models.cosmos3_nano_sim_bimanual.pipeline import COSMOS3_NANO_SIM_BIMANUAL_PIPELINE
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import resolve_cosyvoice3_pipeline
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
@@ -127,11 +132,13 @@ from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import (
 )
 from vllm_omni.model_executor.models.omnivoice.pipeline import OMNIVOICE_PIPELINE
 from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
+from vllm_omni.model_executor.models.phonon.pipeline import resolve_phonon_pipeline
 from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
     QWEN2_5_OMNI_PIPELINE,
     QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
 )
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
+    QWEN3_OMNI_RESUMABLE_PIPELINE,
     QWEN3_OMNI_THINKER_ONLY_PIPELINE,
     resolve_qwen3_omni_pipeline,
 )
@@ -167,6 +174,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "audex_tts": AUDEX_TTS_PIPELINE,
     "auk": AUK_PIPELINE,
     "aura_omni": AURA_OMNI_PIPELINE,
+    # Opt-in: only reachable through deploy/aura_omni_judged.yaml (``pipeline:`` key).
+    "aura_omni_judged": AURA_OMNI_JUDGED_PIPELINE,
     "bagel": BAGEL_PIPELINE,
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "bagel_think": BAGEL_THINK_PIPELINE,
@@ -174,6 +183,9 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bailing_moe_v3_audio_thinker_only": MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE,
     "breeze": BREEZE_TTS_2_PIPELINE,
     "causvid_wan": CAUSVID_WAN_PIPELINE,
+    "chatterbox": CHATTERBOX_ORIGINAL_PIPELINE,
+    "chatterbox_turbo": CHATTERBOX_TURBO_PIPELINE,
+    "cosmos3_nano_sim_bimanual": COSMOS3_NANO_SIM_BIMANUAL_PIPELINE,
     # Cosmos3 policy / omni-deploy topologies share HF metadata with video
     # Cosmos3 checkpoints (which stay on the single-stage diffusion fallback),
     # so these entries are only reachable through a deploy yaml's ``pipeline:``
@@ -189,6 +201,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "glm_image": GLM_IMAGE_PIPELINE,
     "glm_tts": GLM_TTS_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
+    "gradium_phonon_tts": resolve_phonon_pipeline,
     "haru": HARU_PIPELINE,
     "higgs_audio_v2": HIGGS_AUDIO_V2_PIPELINE,
     "higgs_multimodal_qwen3": HIGGS_AUDIO_V3_PIPELINE,
@@ -248,6 +261,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,
+    "qwen3_omni_moe_resumable": QWEN3_OMNI_RESUMABLE_PIPELINE,
     "qwen3_omni_moe_thinker_only": QWEN3_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_tts": QWEN3_TTS_PIPELINE,
     "qwen3_tts_fused": QWEN3_TTS_FUSED_PIPELINE,

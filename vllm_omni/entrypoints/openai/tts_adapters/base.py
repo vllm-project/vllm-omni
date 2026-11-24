@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_codec_frame_rate, load_supported_speakers
+from vllm_omni.model_extras import get_extra_body_params
 
 logger = init_logger(__name__)
 
@@ -397,14 +398,41 @@ class TTSModelAdapter(ABC):
     def collect_response_metadata(self, audio_output: Mapping[str, Any], collect: dict) -> None:
         """Fold engine-side metadata from the mm payload into ``collect``.
 
-        Non-streaming only. The orchestrator surfaces select ``collect``
-        entries as response headers (precedent: ``word_timestamps`` ->
-        ``X-Word-Timestamps``, ``audio_truncated`` -> ``X-Audio-Truncated``);
-        adapters opt in by setting the keys it knows. Default: no-op.
+        Called for the final non-streaming audio output and for each
+        audio-bearing streaming output, including partial or empty audio.
+        When the caller omits its metadata collector, serving supplies a
+        temporary dictionary for each call; adapters must not assume that
+        ``collect`` persists across streaming outputs.
+
+        Set ``audio_synthesis_error=True`` to reject a failed synthesis.
+        Serving also surfaces selected entries as non-streaming response
+        headers, such as ``audio_truncated`` -> ``X-Audio-Truncated``.
+        Default: no-op.
         """
 
     async def warmup(self) -> None:
         return
+
+    def stage_setting(self, section: str, name: str) -> Any:
+        """The serving stage's deploy setting ``name``, or None when it is unset.
+
+        A typed stage config keeps the setting in one of its sections; a
+        legacy one keeps every setting flat under ``engine_args``. A section
+        the typed config lacks is a caller bug and raises ``AttributeError``;
+        only an unset setting returns None.
+
+        Args:
+            section: The typed config's section that holds the setting, such
+                as ``runtime_config`` for ``additional_config`` or
+                ``scheduler_config`` for ``max_num_seqs``.
+            name: The deploy file's key.
+        """
+        stage = self.ctx.server._tts_stage
+        engine_args = getattr(stage, "engine_args", None)
+        return getattr(getattr(stage, section) if engine_args is None else engine_args, name, None)
+
+    def shutdown(self) -> None:
+        """Release model-specific serving work before the executor shuts down."""
 
     def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
         return None
@@ -458,19 +486,13 @@ class DiffusionTTSAdapter(TTSModelAdapter):
 
     backend: ClassVar[str] = "diffusion"
 
-    #: Backing diffusion pipeline class (for EXTRA_BODY_PARAMS lookup).
-    pipeline_cls: ClassVar[type | None] = None
-
     @classmethod
     def extra_body_params(cls) -> frozenset[str]:
-        """Fallback-safe access to the pipeline's declared body params.
-
-        Returns the pipeline's ``EXTRA_BODY_PARAMS`` if the #3572 contract is
-        present, else an empty frozenset (the adapter then uses its own inline
-        parameter logic).
-        """
-        params = getattr(cls.pipeline_cls, "EXTRA_BODY_PARAMS", None)
-        return frozenset(params) if params is not None else frozenset()
+        """Return body parameters declared for this adapter's model arches."""
+        params: set[str] = set()
+        for model_arch in cls.model_archs:
+            params.update(get_extra_body_params(model_arch))
+        return frozenset(params)
 
 
 # Re-exported here to avoid import cycles at call sites.

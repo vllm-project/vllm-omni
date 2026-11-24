@@ -17,17 +17,25 @@ from typing import Any
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS
 from vllm_omni.engine.duplex.contracts import DuplexFence, DuplexStageRequestContext, DuplexStageSubmission
+from vllm_omni.engine.duplex.plugin import DuplexModelPlugin
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrchestratorRequestState
 from vllm_omni.engine.messages import StageSubmissionMessage
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
     _attach_async_chunk_prewarm_payload,
+    build_engine_core_request_from_tokens,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
+from vllm_omni.model_executor.models.nemotron_voicechat.duplex.plugin import NemotronVoiceChatDuplexPlugin
+from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import code2wav_prewarm_payload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -218,9 +226,70 @@ async def test_prewarm_submits_plain_placeholder(case: dict[str, Any], expected_
     (placeholder,) = orchestrator.stage_pools[2].submitted
     assert _entry_keys(placeholder) == _PLAIN_KEYS
     entry_request = _stage0(**stage0_kwargs)
-    assert placeholder.resumable is bool(
-        getattr(entry_request, "resumable", streaming) or case.get("session_owned", False)
+    assert placeholder.resumable is bool(getattr(entry_request, "resumable", streaming))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("plugin_cls", "joyai_stage_id", "async_chunk", "entry_resumable", "session_owned", "persistent_stages"),
+    [
+        pytest.param(Qwen3OmniDuplexPlugin, None, True, False, True, (), id="qwen-per-utterance"),
+        pytest.param(JoyAIDuplexPlugin, 0, True, False, True, (1, 2), id="joyai-sentence-tts"),
+        pytest.param(JoyAIDuplexPlugin, 1, True, False, True, (2, 3), id="joyai-asr-sentence-tts"),
+        pytest.param(JoyAIDuplexPlugin, 0, False, False, True, (), id="joyai-one-shot"),
+        pytest.param(NemotronVoiceChatDuplexPlugin, None, True, True, True, (1, 2), id="nemotron-streaming"),
+        pytest.param(MiniCPMO45DuplexPlugin, None, True, True, True, (1, 2), id="minicpm-streaming"),
+        pytest.param(JoyAIDuplexPlugin, 0, True, False, False, (), id="non-session-turn"),
+    ],
+)
+async def test_prewarmed_native_stop_keeps_only_required_downstream_requests_open(
+    plugin_cls, joyai_stage_id, async_chunk, entry_resumable, session_owned, persistent_stages
+) -> None:
+    plugin = plugin_cls(lambda *args, **kwargs: "")
+    stage_count = 4 if joyai_stage_id == 1 else 3
+    if isinstance(plugin, JoyAIDuplexPlugin):
+        roles = ["asr", "joyvl", "talker", "code2wav"] if joyai_stage_id == 1 else ["joyvl", "talker", "code2wav"]
+        plugin.configure_pipeline(
+            SimpleNamespace(stages=[SimpleNamespace(stage_id=i, model_stage=role) for i, role in enumerate(roles)])
+        )
+    plugin.configure_async_chunk(enabled=async_chunk)
+    assert plugin.capabilities(max_sessions=1).supports_core_resumable_request is entry_resumable
+    orchestrator = _orchestrator(cls=DuplexOrchestrator)
+    orchestrator.plugin = plugin
+    orchestrator.replica_placement = None
+    if stage_count == 4:
+        orchestrator.stage_pools.append(_FakePool("receiver"))
+    params = [SamplingParams(max_tokens=8, temperature=0, stop_token_ids=[7]) for _ in range(stage_count)]
+    entry_request = build_engine_core_request_from_tokens(
+        "req", {"prompt_token_ids": list(_TOKENS)}, params[0], resumable=entry_resumable
     )
+    state = OrchestratorRequestState(
+        request_id="req",
+        prompt=_prompt(None),
+        sampling_params_list=params,
+        final_stage_id=stage_count - 1,
+        session_owned=session_owned,
+    )
+
+    assert await orchestrator._prewarm_async_chunk_stages("req", entry_request, state)
+
+    for stage_id in range(1, stage_count):
+        (placeholder,) = orchestrator.stage_pools[stage_id].submitted
+        persistent = stage_id in persistent_stages
+        assert placeholder.resumable is persistent
+        request = Request.from_engine_core_request(placeholder, block_hasher=None)
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = request.num_prompt_tokens + 1
+        scheduler = object.__new__(Scheduler)
+        scheduler.max_model_len = 64
+        scheduler.num_waiting_for_streaming_input = 0
+        _, stopped = Scheduler._update_request_with_output(scheduler, request, [7])
+        assert stopped
+        assert Scheduler._handle_stopped_request(scheduler, request) is (not persistent)
+        assert request.status == (
+            RequestStatus.WAITING_FOR_STREAMING_REQ if persistent else RequestStatus.FINISHED_STOPPED
+        )
+        assert scheduler.num_waiting_for_streaming_input == int(persistent)
 
 
 @pytest.mark.asyncio
@@ -260,6 +329,10 @@ async def test_add_request_attaches_payload_once_and_streaming_update_does_not(m
 async def test_duplex_session_submit_does_not_request_payload(mocker) -> None:
     orchestrator = _orchestrator(cls=DuplexOrchestrator)
     orchestrator.replica_placement = None
+    # The default plugin answer: a Stage0 request prewarms its downstream stages.
+    plugin = mocker.create_autospec(DuplexModelPlugin, instance=True)
+    plugin.prewarms_downstream_stages.return_value = True
+    orchestrator.plugin = plugin
     prewarm = mocker.AsyncMock(return_value=True)
     orchestrator._prewarm_async_chunk_stages = prewarm  # type: ignore[method-assign]
     sampling_params = tuple(_sampling_params())
@@ -284,3 +357,74 @@ async def test_duplex_session_submit_does_not_request_payload(mocker) -> None:
 
     prewarm.assert_awaited_once()
     assert prewarm.await_args.kwargs.get("attach_prewarm_payload", False) is False
+
+
+@pytest.mark.asyncio
+async def test_prewarm_drops_deferred_multimodal_data_from_wire_payload() -> None:
+    """Deferred PIL images stay on req_state.prompt for stage handoff and stay off prewarm wire payloads."""
+    from PIL import Image
+
+    orchestrator = _orchestrator()
+    image = Image.new("RGB", (4, 4), color=(12, 34, 56))
+    prompt = {
+        "prompt": "Please transcribe this speech.",
+        "additional_information": {
+            "tts_speaker": "vivian",
+            "deferred_multi_modal_data": {"image": [image]},
+        },
+    }
+    req_state = OrchestratorRequestState(
+        request_id="asr-req",
+        prompt=prompt,
+        sampling_params_list=_sampling_params(),
+        final_stage_id=2,
+        session_owned=True,
+    )
+
+    prewarmed = await orchestrator._prewarm_async_chunk_stages("asr-req", _stage0(resumable=False), req_state)
+
+    assert prewarmed is True
+    (placeholder,) = orchestrator.stage_pools[2].submitted
+    wire_info = deserialize_additional_information(placeholder.additional_information)
+    assert "deferred_multi_modal_data" not in wire_info
+    assert wire_info["tts_speaker"] == "vivian"
+    # The raw prompt keeps its deferred PIL image untouched for asr_to_joyai.
+    assert prompt["additional_information"]["deferred_multi_modal_data"]["image"] == [image]
+
+
+@pytest.mark.asyncio
+async def test_duplex_session_submit_prewarms_bypassed_nonzero_entry_stage(mocker) -> None:
+    """Bypassed turns entering at stage 1 (e.g. text/video on ASR duplex) still prewarm downstream stages."""
+    orchestrator = _orchestrator(cls=DuplexOrchestrator)
+    orchestrator.replica_placement = None
+    plugin = mocker.create_autospec(DuplexModelPlugin, instance=True)
+    plugin.prewarms_downstream_stages.return_value = True
+    orchestrator.plugin = plugin
+    prewarm = mocker.AsyncMock(return_value=True)
+    orchestrator._prewarm_async_chunk_stages = prewarm  # type: ignore[method-assign]
+    sampling_params = tuple(_sampling_params())
+    orchestrator.request_states["bypass-req"] = DuplexOrchestratorRequestState(
+        request_id="bypass-req",
+        entry_stage_id=1,
+        final_stage_id=2,
+        session_owned=True,
+        sampling_params_list=list(sampling_params),
+    )
+    context = DuplexStageRequestContext(
+        request_id="bypass-req",
+        session_id="sess",
+        fence=DuplexFence(session_id="sess"),
+        stage_id=1,
+        final_stage_id=2,
+        config_generation=0,
+        sampling_params=sampling_params,
+    )
+
+    await orchestrator.submit(
+        DuplexStageSubmission(
+            context=context, prompt={"prompt_token_ids": list(_TOKENS)}, already_submitted=False, resumable=True
+        )
+    )
+
+    prewarm.assert_awaited_once()
+    assert prewarm.await_args.args[0] == "bypass-req"

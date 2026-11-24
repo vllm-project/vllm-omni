@@ -255,10 +255,7 @@ def _generate(client, model: str, concurrency: int, urls: dict[str, str], source
     return {"requests": requests, "audio": audio, "wall_s": time.perf_counter() - t0}
 
 
-@pytest.fixture(
-    scope="module",
-    params=[ASYNC_CHUNK, NO_ASYNC_CHUNK],
-)
+@pytest.fixture(scope="module")
 def generated(request, run_level, reference_audio_urls) -> str:
     """Start one server for this mode, generate every run of the mode, then shut it down.
 

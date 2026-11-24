@@ -26,6 +26,31 @@ ROOT = Path(__file__).resolve().parents[2]
 # AMD coverage lives in test_amd_cpu_timing.py with main's shared CPU runner.
 
 
+@pytest.mark.parametrize(
+    "platform,packages",
+    [
+        pytest.param("cuda", {"vllm": "0.35.0.dev1", "torch": "2.15.0+cu130"}, id="cuda"),
+        pytest.param(
+            "npu",
+            {"vllm": "0.35.0+empty", "torch": "2.11.0", "torch-npu": "2.11.0.post1", "vllm-ascend": "0.35.0rc1"},
+            id="npu",
+        ),
+    ],
+)
+def test_capture_records_installed_package_versions(monkeypatch, platform, packages):
+    from tests.e2e.accuracy.lingbot_world import prepare
+
+    monkeypatch.setattr(prepare.importlib.metadata, "version", packages.__getitem__)
+    assert prepare.inference_runtime_metadata(platform) == {"packages": packages}
+
+
+def test_capture_rejects_unsupported_platform():
+    from tests.e2e.accuracy.lingbot_world.prepare import inference_runtime_metadata
+
+    with pytest.raises(RegressionError, match="Unsupported platform: rocm"):
+        inference_runtime_metadata("rocm")
+
+
 class _DeviceProperties(NamedTuple):
     uuid: str
 

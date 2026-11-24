@@ -58,6 +58,14 @@ def _parse_response_json(r: requests.Response) -> dict[str, Any] | list[Any] | N
     return None
 
 
+def _data_url_upload(data_url: str, stem: str) -> tuple[str, BytesIO, str]:
+    """Decode a base64 ``data:`` URL into a multipart ``(filename, file, content_type)`` tuple."""
+    header, encoded = data_url.split(",", 1)
+    content_type = header.split(";")[0].removeprefix("data:")
+    extension = content_type.split("/")[-1]
+    return f"{stem}.{extension}", BytesIO(base64.b64decode(encoded)), content_type
+
+
 def _split_request_config_by_per_output_sizes(cfg: dict[str, Any]) -> list[dict[str, Any]] | None:
     """If ``extra_body`` has list ``height``/``width``, return one config per index (scalar h/w, ``num_outputs_per_prompt=1``)."""
     eb = cfg.get("extra_body")
@@ -1811,6 +1819,9 @@ class OnlineOmniClient:
         """
         Send native /v1/videos requests: multipart ``form_data`` job create, poll until done, download content.
 
+        ``input_references`` is a list of ``data:`` URLs uploaded as repeated ``input_references``
+        parts, in order, for models whose ``extra_params`` refer to uploads by index.
+
         For raw HTTP to video routes without polling, use ``send_videos_create_http_request``, etc.
         """
         if request_num != 1:
@@ -1820,29 +1831,26 @@ class OnlineOmniClient:
         if not isinstance(form_data, dict):
             raise ValueError("Video request_config must contain 'form_data'")
         normalized_form_data = {key: str(value) for key, value in form_data.items() if value is not None}
-        files: dict[str, tuple[str, BytesIO, str]] = {}
+        files: list[tuple[str, tuple[str, BytesIO, str]]] = []
         image_reference = request_config.get("image_reference")
         video_reference = request_config.get("video_reference")
-        if image_reference and video_reference:
-            raise ValueError("Only one of image_reference or video_reference can be provided")
+        input_references = request_config.get("input_references") or []
+        if sum(bool(reference) for reference in (image_reference, video_reference, input_references)) > 1:
+            raise ValueError("Only one of image_reference, video_reference or input_references can be provided")
         if image_reference:
             if image_reference.startswith("data:image"):
-                header, encoded = image_reference.split(",", 1)
-                content_type = header.split(";")[0].removeprefix("data:")
-                extension = content_type.split("/")[-1]
-                file_data = base64.b64decode(encoded)
-                files["input_reference"] = (f"reference.{extension}", BytesIO(file_data), content_type)
+                files.append(("input_reference", _data_url_upload(image_reference, "reference")))
             else:
                 normalized_form_data["image_reference"] = json.dumps({"image_url": image_reference})
         if video_reference:
             if video_reference.startswith("data:video"):
-                header, encoded = video_reference.split(",", 1)
-                content_type = header.split(";")[0].removeprefix("data:")
-                extension = content_type.split("/")[-1]
-                file_data = base64.b64decode(encoded)
-                files["input_reference"] = (f"reference.{extension}", BytesIO(file_data), content_type)
+                files.append(("input_reference", _data_url_upload(video_reference, "reference")))
             else:
                 normalized_form_data["video_reference"] = json.dumps({"video_url": video_reference})
+        for index, reference in enumerate(input_references):
+            if not reference.startswith("data:"):
+                raise ValueError(f"input_references[{index}] must be a data: URL")
+            files.append(("input_references", _data_url_upload(reference, f"reference_{index}")))
 
         result = DiffusionResponse()
         create_url = self._build_url("/v1/videos")
@@ -2296,6 +2304,8 @@ class OfflineOmniClient:
                 audio = torch.cat(chunks, dim=0)
             wav = torch.as_tensor(audio).float().cpu().reshape(-1)
             assert wav.numel() > 0, f"Request {index}: decoded audio is empty"
+            assert torch.isfinite(wav).all(), f"Request {index}: decoded audio has non-finite samples"
+            assert wav.abs().max().item() > 0, f"Request {index}: decoded audio is silent"
             wavs.append(wav)
 
             sr_raw = multimodal_output.get("sr")
@@ -2331,13 +2341,12 @@ class OfflineOmniClient:
         if request_config.get("assert_distinct_outputs") and len(wavs) > 1:
             # Distinct inputs must decode to distinct audio. Leaked per-request
             # codec state shows up as two requests producing (near-)identical
-            # waveforms; different lengths already prove distinctness.
+            # waveforms; unequal lengths are compared over their common prefix.
             for i in range(len(wavs)):
                 for j in range(i + 1, len(wavs)):
                     a, b = wavs[i], wavs[j]
-                    if a.numel() != b.numel():
-                        continue
-                    max_diff = (a - b).abs().max().item()
+                    common = min(a.numel(), b.numel())
+                    max_diff = (a[:common] - b[:common]).abs().max().item()
                     assert max_diff > 1e-3, (
                         f"Requests {i} and {j} produced near-identical audio "
                         f"(max sample diff {max_diff:.2e}); possible codec-state crosstalk"
