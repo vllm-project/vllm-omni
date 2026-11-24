@@ -157,7 +157,7 @@ return a non-empty `choices[0].message.content`.
   | `think_mode` | text | `"think"` | `"think"` opens a reasoning block, `"empty"` prefills an empty one, `"none"` adds nothing |
   | `max_new_tokens` | text | 1024 | Generated token budget |
   | `temperature` / `top_k` / `top_p` | text | greedy | Sampling; `temperature <= 0` is greedy |
-  | `return_raw` | text | `false` | Return the decoded text without stripping the reasoning block |
+  | `return_raw` | text | `false` | Return the full decoded text; by default only the text after the last `</think>` is returned |
 
 - Text generation keeps a per-request KV cache inside the pipeline; it is
   intended for single-request understanding and chat, not high-throughput

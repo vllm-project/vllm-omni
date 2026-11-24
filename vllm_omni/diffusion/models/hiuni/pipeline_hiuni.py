@@ -579,7 +579,8 @@ class HiUniPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
             )[0]
 
         raw = prefill + self.tokenizer.decode(new_tokens, skip_special_tokens=False)
-        answer = (raw.split("</think>", 1)[1] if "</think>" in raw else raw).strip()
+        # The model may reason again after an empty think block, so keep only the text after the last </think>.
+        answer = raw.rsplit("</think>", 1)[-1].strip()
         text_output = raw if extra_args.get("return_raw") else answer
         logger.info("HiUni text generation: %d new tokens", len(new_tokens))
         return DiffusionOutput(
