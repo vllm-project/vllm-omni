@@ -5740,7 +5740,12 @@ def test_qwen3_tts_ready_pins_selected_customvoice_core_nodes() -> None:
 
     assert step["grade"] == "Blocking"
     assert "timeout 30m" in command
-    assert _marker_expressions(step) == [_QWEN3_TTS_READY_MARKER, _QWEN3_TTS_READY_MARKER]
+    assert _marker_expressions(step) == [
+        _QWEN3_TTS_READY_MARKER,
+        _QWEN3_TTS_READY_MARKER,
+        "core_model and rocm and cards_1",
+        "core_model and rocm and cards_1",
+    ]
     for node in _QWEN3_TTS_READY_NODES:
         assert command.count(node) == 1
     assert "diff -u /tmp/qwen3-tts-ready-expected.txt" in command
