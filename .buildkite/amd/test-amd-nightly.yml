@@ -1643,6 +1643,23 @@ steps:
             tests/diffusion/distributed/test_pipeline_parallel.py
             -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
 
+      - label: "Diffusion Pipeline Parallel and CFG Parity · 4 GPUs"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 45
+        source_file_dependencies: [diffusion_pipeline_parallel_parity, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-diffusion-pp2-cfg2-4gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 2 30m rocm-diffusion-pp2-cfg2-4gpu
+            'tests/diffusion/distributed/test_pipeline_parallel.py::test_predict_noise_parity[pp2-cfg2-bfloat16]'
+            'tests/diffusion/distributed/test_pipeline_parallel.py::test_scheduler_step_parity[pp2-cfg2-true_cfg]'
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_4"
+
       - label: "Diffusion Exchange and Ring Parity · 4 GPUs"
         agent_pool: mi300_4
         depends_on: amd-build
