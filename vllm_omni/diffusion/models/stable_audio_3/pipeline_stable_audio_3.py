@@ -78,13 +78,17 @@ def resolve_checkpoint_root(model: str, revision: str | None = None) -> str:
     """Return a local directory holding the native SA3 checkpoint.
 
     SA3 ships ``model_config.json``, the weights and the T5Gemma encoder in one
-    Hub repo, so a Hub ID is resolved to its (cached) snapshot.
+    Hub repo, so a Hub ID is resolved to its (cached) snapshot. Accepted
+    spellings of the official ID download the canonical repo; local paths and
+    other IDs (e.g. forks selected with ``--model-class-name``) are unchanged.
     """
     if os.path.isdir(model):
         return model
+    from vllm_omni.diffusion.utils.hf_utils import canonical_stable_audio_3_hub_id
     from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    return hf_api().snapshot_download(repo_id=model, revision=revision)
+    repo_id = canonical_stable_audio_3_hub_id(model) or model
+    return hf_api().snapshot_download(repo_id=repo_id, revision=revision)
 
 
 def get_stable_audio_3_post_process_func(od_config: OmniDiffusionConfig):

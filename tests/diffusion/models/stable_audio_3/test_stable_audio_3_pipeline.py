@@ -58,14 +58,34 @@ def _write_model_config(directory, conditioner_type):
     (directory / "model_config.json").write_text(json.dumps(config))
 
 
-@pytest.mark.parametrize(
-    "model",
-    ["stabilityai/stable-audio-3-medium", "StabilityAI/Stable-Audio-3-Medium/"],
-)
-def test_bare_hub_id_resolves_without_index_files(model):
-    """The Hub repo has no model_index.json / config.json (#11018); the ID alone must resolve."""
+_ACCEPTED_HUB_IDS = [
+    "stabilityai/stable-audio-3-medium",
+    "StabilityAI/Stable-Audio-3-Medium/",
+    " stabilityai/stable-audio-3-medium ",
+]
+
+
+@pytest.fixture
+def snapshot_calls(tmp_path, monkeypatch):
+    calls = []
+
+    class _FakeApi:
+        def snapshot_download(self, *, repo_id, revision):
+            calls.append((repo_id, revision))
+            return str(tmp_path / "snapshot")
+
+    monkeypatch.setattr("vllm_omni.transformers_utils.repo_utils.hf_api", lambda: _FakeApi())
+    return calls
+
+
+@pytest.mark.parametrize("model", _ACCEPTED_HUB_IDS)
+def test_bare_hub_id_resolves_and_loads_without_index_files(model, snapshot_calls, tmp_path):
+    """The Hub repo has no model_index.json / config.json (#11018); every accepted
+    spelling must resolve and download the canonical repo at the requested revision."""
     assert resolve_native_diffusion_model_class(model) == "StableAudio3Pipeline"
     assert resolve_model_class_name(model) == "StableAudio3Pipeline"
+    assert resolve_checkpoint_root(model, "abc123") == str(tmp_path / "snapshot")
+    assert snapshot_calls == [("stabilityai/stable-audio-3-medium", "abc123")]
 
 
 def test_local_native_checkpoint_is_detected_by_its_t5gemma_conditioner(tmp_path):
@@ -82,17 +102,10 @@ def test_other_native_stability_checkpoints_are_not_claimed(tmp_path):
     assert resolve_native_diffusion_model_class("stabilityai/stable-audio-open-1.0") is None
 
 
-def test_checkpoint_root_keeps_local_dirs_and_downloads_hub_ids(tmp_path, monkeypatch):
-    calls = []
-
-    class _FakeApi:
-        def snapshot_download(self, *, repo_id, revision):
-            calls.append((repo_id, revision))
-            return str(tmp_path / "snapshot")
-
-    monkeypatch.setattr("vllm_omni.transformers_utils.repo_utils.hf_api", lambda: _FakeApi())
-
-    assert resolve_checkpoint_root(str(tmp_path)) == str(tmp_path)
-    assert calls == []
-    assert resolve_checkpoint_root("stabilityai/stable-audio-3-medium", "main") == str(tmp_path / "snapshot")
-    assert calls == [("stabilityai/stable-audio-3-medium", "main")]
+def test_checkpoint_root_keeps_local_dirs_and_other_ids_unchanged(snapshot_calls, tmp_path):
+    local = str(tmp_path) + "/"
+    assert resolve_checkpoint_root(local) == local
+    assert snapshot_calls == []
+    # A fork selected with --model-class-name is passed through as given.
+    resolve_checkpoint_root("someone/sa3-finetune", None)
+    assert snapshot_calls == [("someone/sa3-finetune", None)]

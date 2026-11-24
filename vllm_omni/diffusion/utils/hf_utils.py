@@ -76,16 +76,25 @@ def _looks_like_magi2(model_name: str) -> bool:
     )
 
 
+def canonical_stable_audio_3_hub_id(model_name: str) -> str | None:
+    """Return the canonical SA3 Hub ID for an accepted spelling, else ``None``.
+
+    Detection and checkpoint download share this so every accepted form
+    (case, surrounding whitespace, trailing slash) also loads.
+    """
+    normalized = str(model_name).strip().rstrip("/").lower()
+    return normalized if normalized in _STABLE_AUDIO_3_MODEL_IDS else None
+
+
 def _looks_like_stable_audio_3(model_name: str) -> bool:
     """Detect the official SA3 Hub ID or a local copy of its native checkpoint.
 
     A local directory is matched by its ``model_config.json`` declaring a
     T5Gemma text conditioner, which Stable Audio Open (``t5``) does not use.
     """
-    normalized = str(model_name).strip().rstrip("/")
-    if normalized.lower() in _STABLE_AUDIO_3_MODEL_IDS:
+    if canonical_stable_audio_3_hub_id(model_name) is not None:
         return True
-    config_path = os.path.join(normalized, "model_config.json")
+    config_path = os.path.join(str(model_name).strip(), "model_config.json")
     if not os.path.isfile(config_path):
         return False
     try:
