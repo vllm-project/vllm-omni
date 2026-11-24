@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -27,6 +28,7 @@ from vllm_omni.diffusion.models.physis.common import (
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_post_process_func as get_wan22_post_process_func,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 
 from .sampler import WAN21_1_3B, WAN21_14B, WAN22_5B, WanFourStepSampler
 
@@ -234,6 +236,11 @@ class PhysisWanPipeline(CausVidWanPipeline):
             blocks_per_rank=self.transformer.local_num_layers,
         )
         return plan, extra, 4
+
+    def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec:
+        # S=D places each layer's matching-step history on a single rank.
+        # The permanent clean sink is stored separately in transformer.sink_pages.
+        return replace(super().ar_diffusion_noisy_kv_spec(), max_history_versions=self.max_history_chunks)
 
     def _sink_forward(self, latent, timestep, *, step, pp):
         tf = self.transformer

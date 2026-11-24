@@ -568,10 +568,9 @@ def clean_history_cells(schedule: CellSchedule, *, num_blocks: int) -> set[Cell]
     Keeps the trailing ``H`` window ``[chunk_end-H, chunk_end)``. The diagonal
     orderings read the clean KV of each retained chunk, so one version per chunk
     is enough; a Same-Step consumer reads the version matching its own denoise
-    step, so every denoise step of the window has to survive. Same-Step
-    additionally keeps absolute chunk-0 clean sink cells for the whole session —
-    later plans still demand ``(0, D, *)`` even after the trailing window has
-    moved past chunk 0.
+    step, so every denoise step of the window has to survive. For a planner-owned
+    Same-Step sink, retain absolute chunk-0 clean sink cells for the whole session.
+    Later plans still demand ``(0, D, *)`` after the trailing window moves past chunk 0.
     """
     if num_blocks < 1:
         return set()
@@ -583,7 +582,7 @@ def clean_history_cells(schedule: CellSchedule, *, num_blocks: int) -> set[Cell]
         start = max(0, end - h)
         steps = range(schedule.num_denoise_steps) if schedule.ordering is Ordering.SAME_STEP else (t_clean,)
         cells |= {(chunk, step, block) for chunk in range(start, end) for step in steps for block in range(num_blocks)}
-    if schedule.ordering is Ordering.SAME_STEP:
+    if schedule.ordering is Ordering.SAME_STEP and not schedule.same_step_external_sink:
         cells |= {(0, t_clean, block) for block in range(num_blocks)}
     return cells
 

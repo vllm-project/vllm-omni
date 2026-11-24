@@ -237,6 +237,14 @@ context.
 Per-tick KV traffic ≈ history depth × one block × tokens × heads × dim per
 remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`.
 
+Physis pipelines supply their own clean sink through transformer-owned
+`sink_pages`. Their cell schedules set `same_step_external_sink=True`: every
+scheduled chunk runs only the four noisy steps and reads matching-step recent
+history, including scheduled chunk 0. The generic planner must not generate a
+second clean sink or retain scheduled chunk 0 permanently. Physis Wan sizes its
+per-rank KV pool for one step version per history chunk, since S=D fixes each
+layer/step to one rank; its external sink is stored separately.
+
 ### Same-Step with a first-chunk clean sink
 
 `Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests and

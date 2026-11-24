@@ -27,6 +27,7 @@ from vllm_omni.diffusion.models.physis.common import (
     validate_physis_request,
 )
 from vllm_omni.diffusion.postprocess.device_reduction import reduce_video_to_uint8_frames
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import clean_history_cells
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.cpu, pytest.mark.core_model, pytest.mark.diffusion]
@@ -113,6 +114,7 @@ def test_shared_plan_preserves_model_schedule_and_task_order(chunks, groups):
             step_replicas=4,
             layer_groups=groups,
             ordering=Ordering.SAME_STEP,
+            same_step_external_sink=True,
             kv_history_chunks=18,
             blocks=8,
             blocks_per_rank=8 // groups,
@@ -164,3 +166,30 @@ def test_video_output_preserves_legacy_values(dtype, output_type):
     floats = VideoProcessor(vae_scale_factor=8).postprocess_video(video, output_type="np")
     expected = np.rint(np.clip(floats, 0, 1) * 255).astype(np.uint8)
     np.testing.assert_array_equal(actual.numpy(), expected)
+
+
+@pytest.mark.parametrize("groups", [1, 2])
+def test_physis_plan_has_only_noisy_steps_and_matching_step_history(groups):
+    plan = build_physis_cell_plan(
+        chunks=24, step_replicas=4, layer_groups=groups, blocks=8, blocks_per_rank=8 // groups
+    )
+    cells = [
+        plan.task(slot, rank)
+        for slot in range(plan.num_slots)
+        for rank in range(plan.world)
+        if plan.task(slot, rank) is not None
+    ]
+    assert len(cells) == 23 * 4 * 8
+    assert {step for _, step, _ in cells} == {0, 1, 2, 3}
+    assert not plan.schedule.same_step_has_sink
+    assert clean_history_cells(plan.schedule, num_blocks=8) == {cell for cell in cells if cell[0] >= 23 - 18}
+    for slot in range(plan.num_slots):
+        assert not plan.transfers(slot)
+        for rank in range(plan.world):
+            task = plan.task(slot, rank)
+            if task is None:
+                continue
+            chunk, step, block = task
+            assert [source.version for source in plan.sources(task, rank)] == [
+                (previous, step, block) for previous in range(max(0, chunk - 18), chunk)
+            ]

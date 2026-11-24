@@ -91,12 +91,16 @@ class CellSchedule:
     chunk_base: int = 0
     #: Whether a one-chunk Same-Step request must publish chunk 0's clean sink for a persistent session.
     same_step_session: bool = False
+    #: The model supplies its own clean sink outside the scheduled KV pool.
+    same_step_external_sink: bool = False
 
     @property
     def same_step_has_sink(self) -> bool:
         """Whether this plan reads or produces the Same-Step clean sink."""
-        return self.ordering is Ordering.SAME_STEP and (
-            self.chunk_base > 0 or self.chunks > 1 or self.same_step_session
+        return (
+            self.ordering is Ordering.SAME_STEP
+            and not self.same_step_external_sink
+            and (self.chunk_base > 0 or self.chunks > 1 or self.same_step_session)
         )
 
     def __post_init__(self) -> None:
@@ -162,6 +166,7 @@ class CellSchedule:
             self.kv_history_chunks,
             self.num_blocks,
             self.blocks_per_rank,
+            self.same_step_external_sink,
         )
 
     @property
@@ -437,7 +442,7 @@ def _history_step(
     """Pick history step for ``prev`` at ``task``'s block, or ``None`` if unread."""
     _chunk, step, block = task
     prior = prior_history or frozenset()
-    if schedule.ordering is Ordering.SAME_STEP and prev == 0:
+    if schedule.same_step_has_sink and prev == 0:
         return schedule.num_denoise_steps
     if schedule.ordering is Ordering.SAME_STEP:
         # Matching step only; producer shares the consumer rank (no KV P2P).
@@ -480,7 +485,7 @@ def _sources_and_transfers(
             chunk, _step, block = task
             found: list[KVSource] = []
             history = list(range(max(0, chunk - h), chunk))
-            if schedule.ordering is Ordering.SAME_STEP and chunk > 0 and 0 not in history:
+            if schedule.same_step_has_sink and chunk > 0 and 0 not in history:
                 history.insert(0, 0)
             for prev in history:
                 s_star = _history_step(schedule, task, prev, completions, t, prior)
@@ -617,6 +622,8 @@ def _offset_chunk_ids(
 
 def _cell_slots(schedule: CellSchedule) -> tuple[tuple[Cell | None, ...], ...]:
     if schedule.ordering is Ordering.SAME_STEP:
+        if schedule.same_step_external_sink:
+            return _offset_chunk_ids(_base_cell_slots(schedule), schedule.chunk_base)
         if schedule.chunk_base > 0:
             # Continuation: only noisy steps; clean sink lives in prior history at chunk 0.
             return _offset_chunk_ids(_base_cell_slots(schedule), schedule.chunk_base)
