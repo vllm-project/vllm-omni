@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -46,6 +47,46 @@ def test_image_weight_cache_is_released_before_residency_offload(whole, part, mo
         else:
             vae._offload_part_to_cpu(part)
     stager.offload.assert_called_once_with()
+
+
+@pytest.mark.parametrize("encode_fails", [False, True])
+def test_image_weight_cache_is_released_before_sequential_offload(encode_fails, monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+    from vllm_omni.diffusion.models.minimax_h3.ops.vae.npu_image_conv import _weight
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE, _VideoVAEPartProxy
+
+    vae = object.__new__(MiniMaxH3VideoVAE)
+    torch.nn.Module.__init__(vae)
+    vae.model = torch.nn.Module()
+    conv = torch.nn.Conv3d(2, 3, 3)
+    vae.model.encoder = conv
+    conv._omni_image_conv_cache_enabled = True
+    conv._omni_image_conv_weight = None
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._model_cpu_offload_modules = [vae]
+    events = []
+
+    @contextmanager
+    def hooked(target):
+        # Stands in for the hook's _to_cpu(), which rebinds p.data on exit
+        # of both the success and the failure path.
+        assert target is vae
+        try:
+            yield
+        finally:
+            events.append(("to_cpu", conv._omni_image_conv_weight))
+
+    monkeypatch.setattr(module, "sequential_offload_component", hooked)
+    with pytest.raises(RuntimeError) if encode_fails else nullcontext():
+        with pipeline._component_on_device(_VideoVAEPartProxy(vae, "encoder")):
+            first = _weight(conv)
+            # Several images in one encode scope reuse the derived weight.
+            assert _weight(conv) is first
+            if encode_fails:
+                raise RuntimeError("encode failed")
+    assert events == [("to_cpu", None)]
 
 
 def _legacy_distributed_offload_config() -> SimpleNamespace:

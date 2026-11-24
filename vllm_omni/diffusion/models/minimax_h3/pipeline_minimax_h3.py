@@ -179,6 +179,7 @@ from .npu.lora import (
     MINIMAX_H3_NATIVE_INFERENCE_STEPS,
     load_minimax_h3_native_lora,
 )
+from .ops.vae.npu_image_conv import clear_npu_image_conv_cache
 from .packed_sequence import (
     MINIMAX_H3_MAX_PAD_SEQ_LEN,
     MINIMAX_H3_SEQ_ALIGN,
@@ -1803,7 +1804,13 @@ class MiniMaxH3Pipeline(
             if isinstance(component, _VideoVAEPartProxy):
                 component = component.sequential_offload_target
             with sequential_offload_component(component):
-                yield
+                try:
+                    yield
+                finally:
+                    # The hook rebinds p.data and bypasses Module._apply, so
+                    # drop derived encoder weights before it evicts the VAE.
+                    if isinstance(component, MiniMaxH3VideoVAE):
+                        clear_npu_image_conv_cache(component.model)
             return
         staged = self._uses_manual_component_offload(component)
         try:
