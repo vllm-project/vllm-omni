@@ -515,7 +515,8 @@ def test_qwen3_omni_seed_tts_reads_questions_verbatim(omni_server, online_client
     )
     assert response.choices[0].finish_reason == "stop"
     assert response.choices[0].message.content == target
-    
+
+
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_to_audio(omni_server, online_client, run_level: str) -> None:
