@@ -990,12 +990,17 @@ class BaseScheduler(ABC):
         # DiffusionKVRequest objects are mutable Scheduler/native-KVCacheManager
         # state and must never ride the normal request payload to a Worker.
         request.diffusion_kv_requests = None
-        return SchedulerRequestState(
+        state = SchedulerRequestState(
             request_id=request_id,
             req=request,
             sampling_params_key=self._build_sampling_params_key(request),
             diffusion_kv_requests=kv_requests,
         )
+        if self.batching_policy.consumes_token_budget:
+            # Fail a request with an unaccountable shape at submission instead
+            # of aborting a later schedule cycle.
+            self.batching_policy.request_tokens(state)
+        return state
 
     @staticmethod
     def _reject_legacy_dense_kv(request: OmniDiffusionRequest) -> None:

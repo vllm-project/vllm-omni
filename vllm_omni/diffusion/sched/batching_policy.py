@@ -114,22 +114,29 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
 
     def request_tokens(self, state: SchedulerRequestState) -> int:
         """Packed patch tokens the request occupies against the admission budget."""
-        config = self.config
+        info = getattr(state.req, "mixfusion_info", None)
+        if info is not None:
+            # Prepared image requests already carry the model-resolved grid.
+            return max(1, int(info.num_images)) * max(1, int(info.image_tokens))
+        sampling = state.req.sampling_params
         key = state.sampling_params_key
         if key is None:
-            sampling = state.req.sampling_params
-            return config.spatial_tokens(
-                getattr(sampling, "height", None),
-                getattr(sampling, "width", None),
-                getattr(sampling, "num_frames", 1),
+            height = getattr(sampling, "height", None)
+            width = getattr(sampling, "width", None)
+            num_frames = getattr(sampling, "num_frames", None)
+        else:
+            # Mixfusion shape relaxation nulls the key's resolution so mixed
+            # sizes can share a batch; fall back to the request's own one.
+            height = key.height if key.height is not None else getattr(sampling, "height", None)
+            width = key.width if key.width is not None else getattr(sampling, "width", None)
+            num_frames = key.num_frames
+        if height is None or width is None:
+            raise ValueError(
+                f"Request {state.request_id!r} has no resolved output size; DRR admission needs "
+                "sampling_params.height/width or a MixFusion-enabled image request."
             )
-        # Mixfusion shape relaxation nulls the key's resolution so mixed sizes
-        # can share a batch; fall back to the request's own resolution instead
-        # of the config default, which would overcost smaller requests.
-        sampling = state.req.sampling_params
-        height = key.height if key.height is not None else getattr(sampling, "height", None)
-        width = key.width if key.width is not None else getattr(sampling, "width", None)
-        return config.spatial_tokens(height, width, key.num_frames)
+        num_images = getattr(sampling, "num_outputs_per_prompt", None) or 1
+        return self.config.spatial_tokens(height, width, num_frames, num_images)
 
     def request_cost(self, state: SchedulerRequestState) -> int:
         """Token cost weighted by CFG, used only to score admission order."""

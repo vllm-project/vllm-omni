@@ -931,9 +931,9 @@ class DiffusionBatchingConfig:
 
     The DRR admission budget counts packed patch tokens: one token per
     ``(vae_scale_factor * latent_patch_size)`` latent patch, multiplied by the
-    frame count (``512x512`` is 1024 tokens). This is the same unit as the
-    MixFusion chunk envelope, and it deliberately excludes the CFG weight: the
-    CFG multiplier only scales the DRR ordering score.
+    frame and output-image counts (``512x512`` is 1024 tokens). This is the
+    same unit as the MixFusion chunk envelope, and it deliberately excludes the
+    CFG weight: the CFG multiplier only scales the DRR ordering score.
 
     How the DRR budget is chosen:
     - Explicit ``od_config.max_num_batched_tokens``: used as the admission
@@ -963,9 +963,6 @@ class DiffusionBatchingConfig:
     # Weight of true CFG / negative-branch execution in the DRR ordering score.
     # It never inflates the admission capacity of a request.
     cfg_compute_multiplier: float = 2.0
-
-    default_height: int = 1024
-    default_width: int = 1024
 
     profiler_interval: int = 20
     log_stats: bool = False
@@ -1040,15 +1037,24 @@ class DiffusionBatchingConfig:
         height: int | None,
         width: int | None,
         num_frames: int | None = None,
+        num_images: int | None = None,
     ) -> int:
-        """Packed patch tokens one request of this shape occupies."""
-        h = int(height or self.default_height)
-        w = int(width or self.default_width)
+        """Packed patch tokens one request of this shape occupies.
+
+        The shape must be resolved by the model (sampling params or the
+        MixFusion request metadata); this config has no default resolution
+        to stand in for it.
+        """
+        if height is None or width is None:
+            raise ValueError("Diffusion token accounting requires a resolved height and width.")
+        h = int(height)
+        w = int(width)
         frames = max(1, int(num_frames or 1))
+        images = max(1, int(num_images or 1))
         divisor = self.latent_divisor
         latent_h = max(1, h // divisor)
         latent_w = max(1, w // divisor)
-        return latent_h * latent_w * frames
+        return latent_h * latent_w * frames * images
 
     @staticmethod
     def uses_true_cfg(sampling_params: Any, prompts: list[Any]) -> bool:

@@ -1495,16 +1495,27 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if not states:
             return
 
-        request_tokens = batching_config.spatial_tokens(
-            getattr(states[0].sampling, "height", None),
-            getattr(states[0].sampling, "width", None),
-            getattr(states[0].sampling, "num_frames", None),
-        )
+        info = states[0].mixfusion_info
+        request_tokens = None
+        if info is not None:
+            request_tokens = max(1, info.num_images) * max(1, info.image_tokens)
+        else:
+            try:
+                request_tokens = batching_config.spatial_tokens(
+                    getattr(states[0].sampling, "height", None),
+                    getattr(states[0].sampling, "width", None),
+                    getattr(states[0].sampling, "num_frames", None),
+                    getattr(states[0].sampling, "num_outputs_per_prompt", None),
+                )
+            except ValueError:
+                # Diagnostic logging must not fail the step for an unresolved
+                # shape; admission rejects those requests before this point.
+                request_tokens = None
         logger.info(
             "[DiffusionBatchProfiler] batch_size=%s request_tokens=%s total_tokens=%s denoise_step_time=%.6f",
             len(states),
             request_tokens,
-            request_tokens * len(states),
+            request_tokens * len(states) if request_tokens is not None else None,
             elapsed,
         )
 

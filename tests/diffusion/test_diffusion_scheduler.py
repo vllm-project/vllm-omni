@@ -28,6 +28,7 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import (
     BaseScheduler,
@@ -1066,7 +1067,11 @@ class TestRequestScheduler:
                 "policy": "compute_budget",
             },
         )
-        slow = _make_request("slow")
+        slow = OmniDiffusionRequest(
+            prompt="prompt_slow",
+            sampling_params=OmniDiffusionSamplingParams(height=512, width=512, num_inference_steps=1),
+            request_id="slow",
+        )
         _attach_diffusion_kv(slow, seq_len=8)
         ready = OmniDiffusionRequest(
             prompt="prompt_ready",
@@ -1690,15 +1695,27 @@ class TestRequestScheduler:
             )
         )
 
-        req_id_a = scheduler.add_request(_make_request("a"))
+        req_id_a = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompt="prompt_a",
+                sampling_params=OmniDiffusionSamplingParams(height=1024, width=1024),
+                request_id="a",
+            )
+        )
         req_id_b = scheduler.add_request(
             OmniDiffusionRequest(
                 prompt="prompt_b",
-                sampling_params=OmniDiffusionSamplingParams(width=768),
+                sampling_params=OmniDiffusionSamplingParams(height=1024, width=768),
                 request_id="b",
             )
         )
-        req_id_c = scheduler.add_request(_make_request("c"))
+        req_id_c = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompt="prompt_c",
+                sampling_params=OmniDiffusionSamplingParams(height=1024, width=1024),
+                request_id="c",
+            )
+        )
 
         # Age b so its DRR score dominates the microsecond-scale ages of the
         # fresh requests; otherwise the ordering would be timing-dependent.
@@ -1743,21 +1760,21 @@ class TestRequestScheduler:
         scheduler.add_request(
             OmniDiffusionRequest(
                 prompt="prompt_a",
-                sampling_params=OmniDiffusionSamplingParams(width=1024),
+                sampling_params=OmniDiffusionSamplingParams(height=1024, width=1024),
                 request_id="a",
             )
         )
         req_id_b = scheduler.add_request(
             OmniDiffusionRequest(
                 prompt="prompt_b",
-                sampling_params=OmniDiffusionSamplingParams(width=768),
+                sampling_params=OmniDiffusionSamplingParams(height=1024, width=768),
                 request_id="b",
             )
         )
         req_id_c = scheduler.add_request(
             OmniDiffusionRequest(
                 prompt="prompt_c",
-                sampling_params=OmniDiffusionSamplingParams(width=768),
+                sampling_params=OmniDiffusionSamplingParams(height=1024, width=768),
                 request_id="c",
             )
         )
@@ -1779,6 +1796,135 @@ class TestRequestScheduler:
 
         assert _new_ids(second) == ["a"]
         assert second.num_waiting_reqs == 0
+
+    def test_drr_charges_mixfusion_metadata_tokens_not_sampling_shape(self) -> None:
+        """The prepared MixFusion grid is the admitted cost, not the raw sampling shape."""
+        scheduler = RequestScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_batched_tokens=4096,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
+
+        for req_id in ("first", "second"):
+            request = OmniDiffusionRequest(
+                prompt=f"prompt_{req_id}",
+                # Sampling says 1024x1024 (4096 tokens each); the prepared
+                # request reports a 256-token grid instead.
+                sampling_params=OmniDiffusionSamplingParams(height=1024, width=1024),
+                request_id=req_id,
+            )
+            request.mixfusion_info = MixFusionRequestInfo(
+                num_images=1,
+                image_tokens=256,
+                min_chunk_tokens=1,
+                max_chunks=16,
+            )
+            scheduler.add_request(request)
+
+        output = scheduler.schedule()
+
+        assert _new_ids(output) == ["first", "second"]
+        assert output.num_running_reqs == 2
+
+    def test_drr_charges_each_output_of_a_prompt(self) -> None:
+        """A prompt asking for two outputs occupies twice the admission budget."""
+        scheduler = RequestScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_batched_tokens=2560,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
+
+        req_multi = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompt="prompt_multi",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=512,
+                    width=512,
+                    num_outputs_per_prompt=2,
+                ),
+                request_id="multi",
+            )
+        )
+        req_single = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompt="prompt_single",
+                sampling_params=OmniDiffusionSamplingParams(height=512, width=512),
+                request_id="single",
+            )
+        )
+
+        first = scheduler.schedule()
+
+        # multi needs 2048 tokens; single's 1024 would exceed the 2560 budget.
+        assert _new_ids(first) == [req_multi]
+        assert first.num_waiting_reqs == 1
+
+        scheduler.update_from_output(first, _make_request_output(req_multi))
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [req_single]
+
+    def test_drr_charges_every_frame_of_a_request(self) -> None:
+        """A multi-frame request occupies the admission budget per frame."""
+        scheduler = RequestScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_batched_tokens=4096,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
+
+        req_video = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompt="prompt_video",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=512,
+                    width=512,
+                    num_frames=4,
+                ),
+                request_id="video",
+            )
+        )
+        scheduler.add_request(
+            OmniDiffusionRequest(
+                prompt="prompt_image",
+                sampling_params=OmniDiffusionSamplingParams(height=512, width=512),
+                request_id="image",
+            )
+        )
+
+        output = scheduler.schedule()
+
+        # video needs 4096 tokens (4 frames x 1024), so image waits.
+        assert _new_ids(output) == [req_video]
+        assert output.num_waiting_reqs == 1
+
+    def test_drr_rejects_request_without_resolved_shape_at_submission(self) -> None:
+        """An unaccountable request fails when submitted, not mid-schedule."""
+        scheduler = RequestScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_batched_tokens=4096,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
+
+        with pytest.raises(ValueError, match="no resolved output size"):
+            scheduler.add_request(_make_request("no-shape"))
+
+        assert scheduler.get_request_state("no-shape") is None
 
     def test_abort_request_for_waiting_and_running(self) -> None:
         req_id_a = self.scheduler.add_request(_make_request("a"))
@@ -2608,7 +2754,16 @@ class TestStepScheduler:
             )
         )
 
-        req_first = scheduler.add_request(_make_step_request("first"))
+        req_first = scheduler.add_request(
+            _make_step_request(
+                "first",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=512,
+                    width=512,
+                    num_inference_steps=4,
+                ),
+            )
+        )
         first = scheduler.schedule()
         assert _new_ids(first) == [req_first]
 
