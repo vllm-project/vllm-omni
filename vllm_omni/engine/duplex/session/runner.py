@@ -131,6 +131,7 @@ from vllm_omni.engine.duplex.turn_detection import (
 )
 from vllm_omni.metrics.stats import StageRequestStats
 from vllm_omni.protocol.duplex import CONVERTIBLE_INPUT_FORMATS, convert_input_audio_with_rate
+from vllm_omni.protocol.duplex.action_records import STATUS_TRUNCATED_CLOSE, STATUS_TRUNCATED_INTERRUPTION
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -577,7 +578,7 @@ class DuplexSessionRunner:
         self.tasks.active_response_task = None
         if session.active_response_id is not None:
             closing_response_id = session.active_response_id
-            session.end_response(commit_text=False)
+            session.end_response(commit_text=False, seal_status=STATUS_TRUNCATED_CLOSE)
             settle_response_runtime(self.plugin, session, committed=False, response_id=closing_response_id)
         self._cleanup_duplex_session_state()
         session.close()
@@ -845,9 +846,6 @@ class DuplexSessionRunner:
                 normalized: dict[str, object] = dict(inner) if isinstance(inner, Mapping) else {}
                 normalized.update(payload)
                 normalized["type"] = command.event
-                # Cancels seal ``truncated_cancel``; other epoch advances interrupt.
-                if command.event == "response.cancel":
-                    self.session.capture_epoch_cause = "truncated_cancel"
                 await self._on_cancel(normalized)
             else:
                 await self.control.on_turn_signal(payload)
@@ -2128,6 +2126,10 @@ class DuplexSessionRunner:
                     event_id=event.get("realtime_event_id"),
                 )
                 return
+        # A client cancel seals ``truncated_cancel``; other epoch advances interrupt.
+        # Set only once the cancel is accepted: a rejected cancel seals nothing.
+        if event_type == "response.cancel":
+            session.capture_epoch_cause = "truncated_cancel"
         had_unbuffered_append = model_state.input_since_commit and not model_state.audio_buffer.has_pending()
         self.memory.cancel_interaction()
         playback_was_active = helpers.assistant_playback_active(self.session)
@@ -2285,9 +2287,17 @@ class DuplexSessionRunner:
         # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
         self.run.concurrent_turn_requests_released = False
         should_commit = self.model.should_commit_response_to_history(session, old_response_id)
+        # The terminating funnel owns the scope's terminal status: a close cuts
+        # the response, a client cancel cancels it, any other epoch advance
+        # interrupts it. ``barge_in``'s own seal below finds no open scope then.
+        if self.run.closing:
+            seal_status = STATUS_TRUNCATED_CLOSE
+        else:
+            seal_status = session.capture_epoch_cause or STATUS_TRUNCATED_INTERRUPTION
         committed_message = session.end_response(
             commit_text=should_commit,
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
+            seal_status=seal_status,
         )
         committed = committed_message is not None
         if old_response_id is not None:

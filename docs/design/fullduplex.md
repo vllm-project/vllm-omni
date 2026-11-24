@@ -1642,12 +1642,18 @@ what forcing* — the two surfaces this contract adds.
   taxonomy (`sampled` / `forced` with reason / `reemit`), input origins
   (`client` / engine-injected silence), effective sampling parameters, and
   the derived seed `f(session_seed, epoch, response_index)`. Validation
-  failure is session-fatal (`action_capture_invalid`); retention is one open
-  plus one sealed scope, collection is draining
-  (`action_capture_retention_overflow` on a consumer that falls behind);
-  close/interrupt/cancel seal partial sets (`truncated_close` /
-  `truncated_interruption` / `truncated_cancel`), retrievable for a bounded
-  window after close through the manager's terminal cache.
+  failure is session-fatal (`action_capture_invalid`). The ledger retains
+  one open plus one sealed scope and collection is draining; before every
+  non-forced seal the session spills sealed sets past that window into the
+  manager's terminal cache, so a live multi-turn episode never overflows and
+  consumers need no in-flight collects — TTL eviction stays the cache's only
+  bound, and a ledger without a spill sink still fails loudly
+  (`action_capture_retention_overflow`). The funnel that terminates a scope
+  owns its sealed status: natural end `completed`, client cancel
+  `truncated_cancel`, interruption `truncated_interruption`, close
+  `truncated_close`. Post-close the terminal cache merges mid-session spills
+  with the final stash, so a drain returns every sealed set, most recent
+  first.
 - **Retrieval.** In-process: `DuplexSessionHandle.collect_action_records()`
   (request/reply on the session's outbox, so a concurrent `events()` consumer
   is unaffected) and `DuplexOmni.collect_action_records(session_id)` after

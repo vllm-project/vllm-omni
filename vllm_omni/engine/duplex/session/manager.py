@@ -675,6 +675,9 @@ class DuplexSessionManager:
                 log_stats=self.log_stats,
                 perf=self._session_perf_ledger() if collect_stats else None,
                 actions=SessionActionLedger(session_id=session_id) if config.action_capture else None,
+                # Spill target for the retention window; a mid-session ledger
+                # (session.update turn-on) reuses the same sink.
+                capture_retention_sink=self._capture_retention_sink(session_id),
             )
             # Validates the plugin's sampling policy for this runtime config before admission.
             self.sampling_params_for(session)
@@ -918,6 +921,22 @@ class DuplexSessionManager:
         with self._appended_sessions_lock:
             return [sid for sid in self._appended_session_ids if sid in self.runners]
 
+    def _capture_retention_sink(self, session_id: str) -> Callable[[DuplexActionRecordSet], None]:
+        """A live session's spill target: the manager's terminal cache.
+
+        The ledger retains one sealed set; before the next seal the session
+        spills older ones here, so a multi-turn episode never overflows and
+        consumers need no in-flight collects. TTL eviction stays the only bound.
+        """
+
+        def spill(set_: DuplexActionRecordSet) -> None:
+            with self._terminal_action_records_lock:
+                entry = self._terminal_action_records.get(session_id)
+                sets = [*entry[1], set_] if entry is not None else [set_]
+                self._terminal_action_records[session_id] = (self._clock() + TERMINAL_ACTION_RECORDS_TTL_S, sets)
+
+        return spill
+
     def _stash_terminal_action_records(self, session: DuplexEngineSession) -> None:
         actions = session.actions
         if actions is None:
@@ -926,15 +945,23 @@ class DuplexSessionManager:
         if not sets:
             return
         with self._terminal_action_records_lock:
-            self._terminal_action_records[session.session_id] = (self._clock() + TERMINAL_ACTION_RECORDS_TTL_S, sets)
+            # Merge with mid-session spills; a replace would drop sets the
+            # retention window already moved here before the close.
+            entry = self._terminal_action_records.get(session.session_id)
+            merged = [*entry[1], *sets] if entry is not None else sets
+            self._terminal_action_records[session.session_id] = (
+                self._clock() + TERMINAL_ACTION_RECORDS_TTL_S,
+                merged,
+            )
 
     def take_terminal_action_records(
         self, session_id: str, response_id: str | None = None
     ) -> DuplexActionRecordSet | None:
         """Post-close retrieval from the terminal cache; None when absent/expired.
 
-        ``response_id=None`` takes the most recently sealed set. The caller
-        (the engine surface) reports absence loudly instead of silently.
+        The cache holds mid-session retention spills merged with the terminal
+        stash. ``response_id=None`` takes the most recently sealed set. The
+        caller (the engine surface) reports absence loudly instead of silently.
         """
         with self._terminal_action_records_lock:
             entry = self._terminal_action_records.get(session_id)

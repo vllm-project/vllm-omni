@@ -270,6 +270,22 @@ def test_record_set_wire_roundtrip() -> None:
     assert restored.unit_offsets == set_.unit_offsets
 
 
+def test_pop_oldest_sealed_spills_in_seal_order_until_the_window_has_room() -> None:
+    ledger = SessionActionLedger(session_id="s1")
+    assert ledger.pop_oldest_sealed() is None
+    ledger.bind_listening(epoch=0, turn_id=1)
+    ledger.ingest(_payload(seq=1), epoch=0, turn_id=1, response_id=None, stage_id=0, input_modality="")
+    ledger.bind_response("r1", epoch=0, turn_id=2)  # seals the listening period: window full
+    spilled = ledger.pop_oldest_sealed()
+    assert (spilled.response_id, spilled.num_units()) == (None, 1)
+    ledger.ingest(_payload(seq=2), epoch=0, turn_id=2, response_id="r1", stage_id=0, input_modality="")
+    ledger.seal_active_response("r1")
+    next_ = ledger.pop_oldest_sealed()
+    assert (next_.response_id, next_.num_units()) == ("r1", 1)
+    # The window is empty again; there is nothing more to spill.
+    assert ledger.pop_oldest_sealed() is None
+
+
 def test_take_terminal_sets_drains_everything() -> None:
     ledger = SessionActionLedger(session_id="s1")
     ledger.bind_listening(epoch=0, turn_id=1)

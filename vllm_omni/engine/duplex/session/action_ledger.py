@@ -331,6 +331,18 @@ class SessionActionLedger:
         scope.units = []
         return snapshot
 
+    def pop_oldest_sealed(self) -> DuplexActionRecordSet | None:
+        """Spill support: pop the oldest sealed set once the window is full.
+
+        ``None`` means the window has room for the next seal; the session's
+        retention sink moves non-``None`` sets into the manager's terminal
+        cache. Spilled scope keys stay sealed — their payloads remain invalid.
+        """
+        if len(self._sealed) < RETAINED_SEALED_SETS:
+            return None
+        key = next(iter(self._sealed))
+        return self._sealed.pop(key)
+
     def take_terminal_sets(self) -> list[DuplexActionRecordSet]:
         """Drain every sealed set for the manager's terminal cache (post-close)."""
         sets = list(self._sealed.values())
@@ -341,6 +353,10 @@ class SessionActionLedger:
     @property
     def open_scope_response_id(self) -> str | None:
         return self._open.response_id if self._open is not None else None
+
+    @property
+    def has_open_scope(self) -> bool:
+        return self._open is not None
 
 
 __all__ = [

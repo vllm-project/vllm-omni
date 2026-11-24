@@ -8,11 +8,14 @@ plugin with capture declared); only the stage port is fake and stage outputs are
 scripted, exactly like the session-stats suite beside it. These tests pin the
 Engine-contract criteria: complete, ordered, schema-valid records including
 forced kinds; capture off stamps nothing; validation failure closes the session;
-retention overflow errors; close mid-response returns the partial set sealed.
+retention spills into the terminal cache so a multi-turn episode never overflows;
+the terminating funnel seals its status (close/cancel/interruption) and close
+mid-response returns the partial set sealed.
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -31,6 +34,7 @@ from tests.engine.duplex.test_session_runner import (
     types,
 )
 from vllm_omni.engine.duplex import commands
+from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 from vllm_omni.protocol.duplex.action_records import (
@@ -100,6 +104,28 @@ async def open_capture_harness(**kwargs: Any) -> Harness:
     assert harness.session.capabilities.supports_action_capture is True
     assert harness.session.actions is not None
     return harness
+
+
+async def open_response_scope_with_units(h: Harness) -> str:
+    """Arrange one listening unit pre-bind plus a bound response scope with one unit."""
+    await h.run(append_audio())
+    request_id = h.stage0_request_id()
+    await h.deliver_and_settle(
+        listen_output(request_id),
+        stage_id=0,
+        segment_finished=True,
+        capture_payload=_unit_payload(seq=1),
+    )
+    response_id = h.session.begin_response(turn_id=h.session.turn_id)
+    h.session.actions.ingest(
+        _unit_payload(seq=2, token_ids=(12,)),
+        epoch=h.session.epoch,
+        turn_id=h.session.turn_id,
+        response_id=response_id,
+        stage_id=0,
+        input_modality="audio",
+    )
+    return response_id
 
 
 # --------------------------------------------------------------------------- #
@@ -437,12 +463,20 @@ async def test_barge_in_seals_interruption_and_cancel_seals_truncated_cancel() -
 
 
 @pytest.mark.asyncio
-async def test_retention_overflow_errors_the_session() -> None:
+async def test_multi_turn_scopes_spill_into_the_terminal_cache_and_close_drains_every_set() -> None:
+    """A live episode seals the next scope before any client collect can land.
+
+    The engine spills sealed sets past the retention window into the manager's
+    terminal cache (no `action_capture_retention_overflow`), and the terminal
+    stash merges with the spills, so the post-close drain returns every set.
+    """
     h = await open_capture_harness()
     try:
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         all_events = []
+        response_ids = []
+        turn = 0
         for seq in (1, 2, 3):
             all_events += await h.deliver_and_settle(
                 listen_output(request_id),
@@ -450,12 +484,145 @@ async def test_retention_overflow_errors_the_session() -> None:
                 segment_finished=True,
                 capture_payload=_unit_payload(seq=seq, token_ids=(10 + seq, LISTEN_TOKEN_ID)),
             )
-            h.session.begin_response(turn_id=h.session.turn_id)
+            response_ids.append(h.session.begin_response(turn_id=turn))
+            h.session.complete_model_turn(turn)
             h.session.end_response(commit_text=False)
-        # Two scopes completed uncollected: the overflow is deferred by the
-        # synchronous end_response and fails the session on the next delivery.
-        codes = [event.code for event in all_events if types([event]) == ["error"]]
-        assert "action_capture_retention_overflow" in codes
+            turn += 1
+        # Three listen→response scope pairs sealed inside one session, no
+        # collect in between: the engine spilled instead of erroring.
+        assert "error" not in types(all_events)
+        assert h.session.state.name == "OPEN"
+
+        await h.manager.shutdown()
+        drained: list[DuplexActionRecordSet] = []
+        while (set_ := h.manager.take_terminal_action_records(SESSION_ID)) is not None:
+            drained.append(set_)
+        # Most recent first: per turn the listening scope spills at the
+        # response's seal and the response scope spills at the next bind; the
+        # terminal stash merged r3 with the mid-session spills instead of
+        # replacing them.
+        assert [set_.response_id for set_ in drained] == [
+            response_ids[2],
+            None,
+            response_ids[1],
+            None,
+            response_ids[0],
+            None,
+        ]
+        assert all(set_.status == "completed" for set_ in drained)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_in_flight_get_never_removes_spilled_sets_from_the_post_close_drain() -> None:
+    """The in-flight ledger collect only drains the ledger's retained window;
+
+    sets spilled mid-session stay in the manager's terminal cache for the
+    post-close drain.
+    """
+    h = await open_capture_harness()
+    try:
+        await open_response_scope_with_units(h)
+        response_id = h.session.active_response_id
+        # Ending the response spills the pre-bind listening scope and seals
+        # the response scope as the one retained set.
+        h.session.end_response(commit_text=False)
+        # The in-flight get drains the retained response set only.
+        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_collect"))
+        assert types(reply_events) == ["session.action.records"], types(reply_events)
+        collected = DuplexActionRecordSet.from_wire(reply_events[0].records)
+        assert collected.status == "completed"
+        assert collected.response_id == response_id
+        assert collected.num_units() == 1
+        # The mid-session spill is untouched in the terminal cache.
+        spilled = h.manager.take_terminal_action_records(SESSION_ID)
+        assert spilled is not None
+        assert spilled.response_id is None
+        assert spilled.num_units() == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_barge_in_through_the_cancel_funnel_seals_truncated_interruption() -> None:
+    """The runner's cancel funnel — not ``barge_in`` directly — terminates the
+
+    response mid-speech, so its ``end_response`` seal carries the funnel's
+    status; the later ``barge_in`` seal finds no open scope and cannot double-seal.
+    """
+    h = await open_capture_harness()
+    try:
+        await open_response_scope_with_units(h)
+        events = await h.run(commands.BargeIn())
+        assert "error" not in types(events)
+        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_read"))
+        assert types(reply_events) == ["session.action.records"], types(reply_events)
+        record_set = DuplexActionRecordSet.from_wire(reply_events[0].records)
+        assert record_set.status == "truncated_interruption"
+        assert record_set.num_units() == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_response_cancel_through_the_cancel_funnel_seals_truncated_cancel() -> None:
+    h = await open_capture_harness()
+    try:
+        await open_response_scope_with_units(h)
+        events = await h.run(commands.CancelResponse(event_id="evt_cancel"))
+        assert "error" not in types(events)
+        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_read"))
+        assert types(reply_events) == ["session.action.records"], types(reply_events)
+        record_set = DuplexActionRecordSet.from_wire(reply_events[0].records)
+        assert record_set.status == "truncated_cancel"
+        assert record_set.num_units() == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_rejected_cancel_leaves_no_cause_for_the_next_interruption() -> None:
+    """A cancel with no active response is rejected and seals nothing; the
+    next barge-in must still seal ``truncated_interruption``."""
+    h = await open_capture_harness()
+    try:
+        events = await h.run(commands.CancelResponse(event_id="evt_stray"))
+        assert types(events) == ["error"]
+        assert events[0].code == "response_not_active"
+        await open_response_scope_with_units(h)
+        events = await h.run(commands.BargeIn())
+        assert "error" not in types(events)
+        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_read"))
+        assert types(reply_events) == ["session.action.records"], types(reply_events)
+        record_set = DuplexActionRecordSet.from_wire(reply_events[0].records)
+        assert record_set.status == "truncated_interruption"
+        assert record_set.num_units() == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_client_close_mid_response_seals_truncated_close_via_terminal_cache() -> None:
+    """The client-close funnel cuts the response (`truncated_close`) and the
+
+    pre-bind listening scope it spilled arrives `completed` after it.
+    """
+    h = await open_capture_harness()
+    try:
+        response_id = await open_response_scope_with_units(h)
+        await h.manager.handle(
+            CloseDuplexSessionMessage(control_id="c-close-capture", session_id=SESSION_ID, reason="client_close")
+        )
+        await asyncio.wait_for(h.results.get(), timeout=2.0)
+        await h.settle()
+        drained: list[DuplexActionRecordSet] = []
+        while (set_ := h.manager.take_terminal_action_records(SESSION_ID)) is not None:
+            drained.append(set_)
+        assert [set_.response_id is None for set_ in drained] == [False, True]
+        assert (drained[0].response_id, drained[0].status) == (response_id, "truncated_close")
+        assert drained[0].num_units() == 1
+        assert (drained[1].response_id, drained[1].status) == (None, "completed")
     finally:
         await close_harness(h)
 

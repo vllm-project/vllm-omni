@@ -59,6 +59,7 @@ from vllm_omni.metrics.stats import (
     _tpot_interval_weight,
 )
 from vllm_omni.metrics.utils import _as_int, _as_optional_int
+from vllm_omni.protocol.duplex.action_records import STATUS_COMPLETED, DuplexActionRecordSet
 
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.plugin import DuplexModelSessionState
@@ -267,6 +268,9 @@ class DuplexEngineSession:
     perf: SessionPerfLedger | None = field(default=None, repr=False)
     # Per-session capture ledger; a mid-session turn-on creates it lazily.
     actions: SessionActionLedger | None = field(default=None, repr=False)
+    # Manager-installed spill target for sealed sets the retention window must
+    # drop before the next seal; None keeps the ledger's loud overflow.
+    capture_retention_sink: Callable[[DuplexActionRecordSet], None] | None = field(default=None, repr=False)
     # Responses begun in this session (monotone); mixed into the capture seed.
     capture_response_count: int = field(default=0)
     # One-shot seal status for the next epoch advance (default: interruption).
@@ -1167,6 +1171,10 @@ class DuplexEngineSession:
         if self.actions is not None:
             self.capture_response_count += 1
             try:
+                # Binding the response seals the listening scope; make retention
+                # room first. A re-bind of the same response seals nothing.
+                if self.actions.open_scope_response_id != response_id:
+                    self.ensure_capture_retention_room()
                 self.actions.bind_response(
                     response_id, epoch=self.epoch, turn_id=self._response.active_response_turn_id
                 )
@@ -1676,16 +1684,21 @@ class DuplexEngineSession:
         commit_text: bool = True,
         playback_commit_policy: str | None = None,
         preserve_request: bool = False,
+        seal_status: str = STATUS_COMPLETED,
     ) -> dict[str, object] | None:
         self._log_response_aggregator()
         response_id = self._response.active_response_id
         if self.perf is not None and response_id is not None:
             self.perf.end_response(response_id)
         if self.actions is not None and response_id is not None:
-            # the response boundary seals the record set; the
-            # completeness of its ingest accounting was enforced per delivery.
+            # the response boundary seals the record set with the terminating
+            # funnel's status; the completeness of its ingest accounting was
+            # enforced per delivery. A scope that is not this response's
+            # seals nothing, so it needs no retention room either.
             try:
-                self.actions.seal_active_response(response_id)
+                if self.actions.open_scope_response_id == response_id:
+                    self.ensure_capture_retention_room()
+                self.actions.seal_active_response(response_id, seal_status)
             except ActionLedgerError as exc:
                 self._defer_capture_failure(exc)
         response_input_commit_seq = self._response.active_response_input_commit_seq
@@ -2142,6 +2155,24 @@ class DuplexEngineSession:
             self.capture_pending_error = str(exc)
             self.capture_pending_error_code = exc.code
 
+    def ensure_capture_retention_room(self) -> None:
+        """Spill sealed sets past the retention window into the terminal cache.
+
+        A live episode seals the next scope before any client collect can
+        land, so the engine — not the client — makes room before every
+        non-forced seal. Without a manager-installed sink the ledger's loud
+        ``action_capture_retention_overflow`` stays the contract.
+        """
+        actions = self.actions
+        sink = self.capture_retention_sink
+        if actions is None or sink is None:
+            return
+        while True:
+            oldest = actions.pop_oldest_sealed()
+            if oldest is None:
+                return
+            sink(oldest)
+
     def barge_in(self) -> int:
         self._log_response_aggregator()
         if self.perf is not None:
@@ -2151,6 +2182,10 @@ class DuplexEngineSession:
             cause = self.capture_epoch_cause
             self.capture_epoch_cause = None
             try:
+                # A seal only happens when a scope is open; the just-sealed set
+                # must stay retained for the in-flight collect otherwise.
+                if self.actions.has_open_scope:
+                    self.ensure_capture_retention_room()
                 if cause is not None:
                     (
                         self.actions.seal_for_cancel()
