@@ -202,8 +202,8 @@ def test_serve_parser_exposes_parallel_stage_init() -> None:
     assert _parse_serve_args([*argv, "--parallel-stage-init"]).parallel_stage_init is True
 
 
-def test_serve_validate_rejects_parallel_stage_init_with_headless() -> None:
-    """A headless process runs one stage, so the flag would be silently ignored."""
+def test_serve_validate_accepts_parallel_stage_init_with_headless() -> None:
+    """The engine decides what the flag means for a single-stage process."""
     args = _parse_serve_args(
         [
             "serve",
@@ -219,8 +219,8 @@ def test_serve_validate_rejects_parallel_stage_init_with_headless() -> None:
             "20000",
         ]
     )
-    with pytest.raises(ValueError, match="--parallel-stage-init cannot be used with --headless"):
-        OmniServeCommand().validate(args)
+    OmniServeCommand().validate(args)
+    assert args.parallel_stage_init is True
 
 
 def test_video_output_warmup_cli_options() -> None:

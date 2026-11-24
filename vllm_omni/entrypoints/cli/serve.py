@@ -267,10 +267,6 @@ class OmniServeCommand(CLISubcommand):
             raise ValueError("--api-server-count must be >= 1 unless --headless is set")
         if args.headless and api_server_count is not None and api_server_count > 0:
             raise ValueError("--api-server-count cannot be used with --headless")
-        # A headless process launches one stage; overlapping same-GPU stage
-        # initialization is coordinated only inside one stage runtime.
-        if args.headless and getattr(args, "parallel_stage_init", False):
-            raise ValueError("--parallel-stage-init cannot be used with --headless")
         if api_server_count is not None and api_server_count > 1:
             distributed_args = (
                 "stage_id",

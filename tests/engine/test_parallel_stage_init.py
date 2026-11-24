@@ -30,6 +30,7 @@ import pytest
 from vllm.config.kv_transfer import KVCacheAccess
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
+from vllm_omni.engine.omni_engine_base import OmniEngineBase
 from vllm_omni.engine.stage_admission import (
     ADMISSION_EXEMPT,
     DeviceLedger,
@@ -187,6 +188,18 @@ def _stage_plans(*devices: str) -> list[LogicalStageInitPlan]:
         LogicalStageInitPlan(stage_idx=i, stage_id=i, replicas=[_llm_replica(i, 0, dev)])
         for i, dev in enumerate(devices)
     ]
+
+
+@pytest.mark.parametrize(
+    ("requested", "single_stage_mode", "expected"),
+    [(True, False, True), (False, True, False), (True, True, False)],
+)
+def test_single_stage_process_keeps_serial_init(caplog, requested, single_stage_mode, expected):
+    # --stage-id / --headless launch one stage: nothing to overlap, and admission
+    # only sees this process, so the serial cross-process device lock stays.
+    with caplog.at_level("WARNING"):
+        assert OmniEngineBase._resolve_parallel_stage_init(requested, single_stage_mode) is expected
+    assert ("no effect in single-stage mode" in caplog.text) is (requested and single_stage_mode)
 
 
 def test_overlapping_device_stages_initialize_sequentially(monkeypatch):

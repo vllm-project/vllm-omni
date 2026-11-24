@@ -139,7 +139,10 @@ to the deployment, `vllm serve --omni --parallel-stage-init` (or
 - Before any stage starts, each GPU must fit the sum of `gpu_memory_utilization`
   times its capacity, plus 2 GiB per stage that captures CUDA graphs, plus 1 GiB
   external reserve and 1 GiB safety margin. Otherwise startup fails with
-  `StageAdmissionError`.
+  `StageAdmissionError`. The reserve and margin are per GPU, but each stage
+  process also holds memory outside its share (about 0.75 GiB for Qwen3-Omni:
+  CUDA context, kernel modules, stream pool), so leave more headroom as more
+  stages share a GPU.
 - Each stage measures its KV cache budget under an exclusive device lock, over
   that profiling window only, so memory its peers allocate before or after the
   window is not charged to it. Neither is non-torch memory the stage itself
@@ -156,9 +159,12 @@ to the deployment, `vllm serve --omni --parallel-stage-init` (or
   memory: "Free memory on device ... on startup", the CUDA graph capture size
   and the `--kv-cache-memory` suggestion. Start the stages one after another to
   read them.
-- It is not supported with `--headless`, with Ray executors or across nodes,
-  and it disables NVIDIA MPS. Platforms whose workers size the KV cache their
-  own way log a warning; put their stages on separate GPUs.
+- A process started with `--stage-id` (including `--headless`) launches one
+  stage, so the flag has no effect there and logs a warning; stages that
+  separate processes launch on one GPU still initialize one after another.
+- It is not supported with Ray executors or across nodes, and it disables
+  NVIDIA MPS. Platforms whose workers size the KV cache their own way log a
+  warning; put their stages on separate GPUs.
 
 ### Step 4: Account for Tensor Parallelism
 
