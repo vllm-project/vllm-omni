@@ -3399,14 +3399,12 @@ class TestPlatformOverrides:
             "higgs_multimodal_qwen3_low_latency.yaml",
         ],
     )
-    def test_higgs_audio_v3_legacy_profiles_fail_at_config_load(self, filename):
-        """Historical V1 profiles fail before worker initialization on vLLM 0.34."""
+    def test_higgs_audio_v3_graph_profiles_use_mrv2(self, filename):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
-        assert deploy.model_runner == "v1"
+        assert deploy.model_runner == "v2"
 
-        pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
-        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-            merge_pipeline_deploy(pipeline, deploy)
+        stages = merge_pipeline_deploy(resolve_pipeline_config("higgs_multimodal_qwen3"), deploy)
+        assert stages[0].yaml_engine_args["use_v2_model_runner"] is True
 
     def test_platform_connector_overrides_merge_with_base_config(self):
         from vllm_omni.config.stage_config import _merge_platforms
