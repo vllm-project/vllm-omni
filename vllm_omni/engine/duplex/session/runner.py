@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, TypeVar, cast
 
 import pybase64 as base64
 from vllm.logger import init_logger
+from vllm.tokenizers import TokenizerLike
 
 from vllm_omni.engine.duplex.commands import (
     AckPlayback,
@@ -130,6 +131,7 @@ from vllm_omni.engine.duplex.session.input_clock import (
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.memory_runtime import SessionMemoryRuntime
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+from vllm_omni.engine.duplex.session.token_trace import TokenTracer, token_trace_enabled
 from vllm_omni.engine.duplex.session.tool_calls import (
     LoopTimerScheduler,
     ToolCallAbandonment,
@@ -374,6 +376,17 @@ class DuplexSessionRunner:
                 unit_max_age_s=unit_max_age_s(session.config.extra_body),
                 clock=session._clock,
             )
+            # The per-unit token trace rides on the clock's units (fixed at creation, like the clock).
+            if token_trace_enabled(session.config.extra_body) and manager.runtime_config.enable_debug_events:
+                self._input_clock.tracer = TokenTracer(
+                    plugin=plugin,
+                    tokenizer_loader=self._trace_tokenizer,
+                    emit=self._emit_events,
+                    runtime_config=self._input_clock_runtime_config,
+                )
+                plugin.token_trace_started(session_id=session.session_id)
+        #: Tokenizer that names the ids of a token-traced session (set by the manager at open).
+        self.trace_tokenizer: TokenizerLike | None = None
         #: Acknowledgement owed for the client input being handled right now.
         self._current_input_ack: PendingAck | None = None
         #: Acknowledgements of the clocked inputs on the mailbox, in admission order.
@@ -675,6 +688,15 @@ class DuplexSessionRunner:
             if response_cancelled or turn is None or turn != live_turn:
                 clock.release_placeholder(turn, reason)
 
+    @property
+    def token_traced(self) -> bool:
+        """Whether the session sends per-unit token traces (``extra_body.trace_tokens``)."""
+        return self._input_clock is not None and self._input_clock.tracer is not None
+
+    def _trace_tokenizer(self) -> TokenizerLike | None:
+        # Loaded by the manager off the event loop when the session opened.
+        return self.trace_tokenizer
+
     def _close_input_clock(self, reason: str) -> None:
         """Teardown: acknowledge every owed input (``aborted`` units) before the terminal event."""
         clock = self._input_clock
@@ -750,6 +772,9 @@ class DuplexSessionRunner:
             return None
         # A decision, or a segment end of a stage before the final one: the plugin may classify it.
         classified = decision is not None or (context.segment_finished and not final)
+        # The final stage's output feeds ``unit_output_complete``; the token
+        # trace also reads every stage's segment ends.
+        carries_output = final or (clock.tracer is not None and context.segment_finished)
         return StageProgress(
             stage_id=stage_id,
             final_stage_id=final_stage_id,
@@ -760,8 +785,8 @@ class DuplexSessionRunner:
                 if classified
                 else None
             ),
-            output=output if final else None,
-            context=context if final else None,
+            output=(TokenTracer.on_arrival(output) if clock.tracer is not None else output) if carries_output else None,
+            context=context if carries_output else None,
         )
 
     def _stash_stage_metrics(self, stage_id: int, metrics: StageRequestStats | None, output: object) -> None:
@@ -1642,6 +1667,8 @@ class DuplexSessionRunner:
         session = self.session
         self.plugin.data_plane.close_session(session.session_id, active_request_id=session.active_request_id)
         self.model.cancel_data_plane_stream()
+        if self.token_traced:
+            self.plugin.token_trace_stopped(session_id=session.session_id)
 
     # ------------------------------------------------------------------ #
     # Append path (was the audio-append branch + start_native_append)    #

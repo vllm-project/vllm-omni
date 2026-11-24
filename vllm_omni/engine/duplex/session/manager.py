@@ -68,6 +68,11 @@ from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, 
 from vllm_omni.engine.duplex.session.input_clock import check_input_clock_supported
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.session.perf_ledger import SessionPerfLedger
+from vllm_omni.engine.duplex.session.token_trace import (
+    check_token_trace_allowed,
+    load_trace_tokenizer,
+    token_trace_enabled,
+)
 from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider, SmartTurnBackendProvider
 from vllm_omni.engine.duplex.vad_batcher import TurnDetectionBatcher
 from vllm_omni.inputs.data import disable_watermarking
@@ -644,6 +649,16 @@ class DuplexSessionManager:
             config = message.session_config
             self.plugin.validate_client_extra_body(config.extra_body)
             check_input_clock_supported(self.plugin, config.extra_body)
+            check_token_trace_allowed(
+                config.extra_body, debug_events_enabled=bool(self.runtime_config.enable_debug_events)
+            )
+            trace_tokenizer = None
+            if token_trace_enabled(config.extra_body) and self.model_config is not None:
+                # Off the event loop and before the session exists: loaded on the
+                # first traced unit instead, a cold load would block every session on this loop.
+                trace_tokenizer = await asyncio.get_running_loop().run_in_executor(
+                    self.executor, load_trace_tokenizer, self.model_config
+                )
             try:
                 runtime_config = await self.plugin.prepare_runtime_config(config, model_config=self.model_config)
             except DuplexRuntimeConfigError:
@@ -678,6 +693,7 @@ class DuplexSessionManager:
                 manager=self,
                 model_config=self.model_config,
             )
+            runner.trace_tokenizer = trace_tokenizer
             self.runners[session_id] = runner
             self._outputs[session_id] = message.output_buffer
             # Reserve the Stage0 request resource atomically with admission.
@@ -744,6 +760,9 @@ class DuplexSessionManager:
         if owned_runner:
             self.runners.pop(session_id, None)
             self._outputs.pop(session_id, None)
+        if runner is not None and runner.token_traced:
+            # The runner started the plugin's trace when it was built; nothing else will stop it.
+            self.plugin.token_trace_stopped(session_id=session_id)
         pending: _PendingRequestCleanup | None = None
         key: tuple[str, int] | None = None
         if session is not None:

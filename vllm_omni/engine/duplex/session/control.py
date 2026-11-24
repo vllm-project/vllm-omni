@@ -33,6 +33,7 @@ from vllm_omni.engine.duplex.session.emitter import SessionEmitter, session_auto
 from vllm_omni.engine.duplex.session.input_clock import check_input_clock_supported, check_input_clock_unchanged
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+from vllm_omni.engine.duplex.session.token_trace import check_token_trace_allowed, check_token_trace_unchanged
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallRejection, ToolCallState
 from vllm_omni.engine.duplex.turn_detection import (
     PendingTurnDetectionUpdate,
@@ -352,6 +353,12 @@ class SessionControl:
             # The clock mode and its timeouts are fixed at creation, like the
             # acknowledgements they decide.
             check_input_clock_unchanged(session.config.extra_body, candidate_config.extra_body)
+            # So is the token trace, which rides on the clock's units.
+            check_token_trace_allowed(
+                candidate_config.extra_body,
+                debug_events_enabled=bool(self._ctx.manager.runtime_config.enable_debug_events),
+            )
+            check_token_trace_unchanged(session.config.extra_body, candidate_config.extra_body)
         except DuplexRuntimeConfigError as exc:
             self._out.emit_error(exc.code, str(exc), event_id=realtime_event_id)
             return

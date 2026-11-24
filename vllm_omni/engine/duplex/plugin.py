@@ -957,6 +957,45 @@ class DuplexModelPlugin(ABC):
         del final_stage_id, new_output, new_context, state, runtime_config
         return unit.final_segment_finished
 
+    # ---- token trace (extra_body.trace_tokens) ----
+
+    def unit_token_trace(
+        self,
+        *,
+        stage_id: int,
+        output: object,
+        context: DuplexOutputContext | None,
+        cursor: dict[str, object],
+        runtime_config: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """The token ids one stage consumed and produced for one model unit.
+
+        Called on the stage's segment end for each unit, in order (traced
+        input-clocked sessions only). ``cursor``
+        is a per-session, per-stage dict the hook may keep state in (e.g.
+        cumulative lengths). Return ``{"stage": name, "input": [...],
+        "output": [...]}`` whose items are token ids (the engine adds the
+        tokenizer piece) or ready ``[id, text]`` pairs (ids outside the text
+        vocabulary, e.g. codec codes). A Stage-0 result may add
+        ``"prompt_input"``: the initial context folded into the first unit,
+        reported once as unit -1.
+
+        Default: the deltas of the stage output's ``prompt_token_ids`` and of
+        its first completion's ``token_ids`` since the previous segment end. A
+        model whose stage builds its prompt from embeddings (placeholder ids in
+        the scheduler) overrides this to report the real ids.
+        """
+        del context, runtime_config
+        return default_unit_token_trace(stage_id=stage_id, output=output, cursor=cursor)
+
+    def token_trace_started(self, *, session_id: str) -> None:
+        """A traced session was created (lets a plugin start recording what only it sees)."""
+        del session_id
+
+    def token_trace_stopped(self, *, session_id: str) -> None:
+        """The traced session closed: drop anything recorded for it."""
+        del session_id
+
     # ---- session policy (was ServingRuntimeAdapter) ----
 
     @abstractmethod
@@ -1342,6 +1381,50 @@ def _silence_pcm_f32le_base64(samples: int) -> str:
     return base64.b64encode(bytes(max(0, samples) * 4)).decode("ascii")
 
 
+def token_id_list(value: object) -> list[int]:
+    """Token ids from a list / tuple / tensor / ndarray (anything else gives ``[]``)."""
+    if value is None:
+        return []
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        try:
+            value = tolist()
+        except (TypeError, ValueError, RuntimeError):
+            return []
+    if not isinstance(value, list | tuple):
+        return []
+    ids: list[int] = []
+    for item in value:
+        try:
+            ids.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
+def default_unit_token_trace(*, stage_id: int, output: object, cursor: dict[str, object]) -> dict[str, object]:
+    """Engine-visible deltas of ``prompt_token_ids`` and first-completion ``token_ids`` since the last segment.
+
+    The deltas are taken within one stage request: a model that opens a new
+    request per turn (Qwen3-Omni, AURA) starts both offsets over at 0.
+    """
+    prompt = token_id_list(getattr(output, "prompt_token_ids", None))
+    outputs = getattr(output, "outputs", None)
+    completion = outputs[0] if isinstance(outputs, list) and outputs else None
+    generated = token_id_list(getattr(completion, "token_ids", None)) if completion is not None else []
+    request_id = getattr(output, "request_id", None)
+    if cursor.get("request_id") != request_id:
+        cursor.clear()
+        cursor["request_id"] = request_id
+    prompt_start = cursor.get("prompt_len", 0)
+    output_start = cursor.get("output_len", 0)
+    prompt_start = prompt_start if isinstance(prompt_start, int) and prompt_start <= len(prompt) else 0
+    output_start = output_start if isinstance(output_start, int) and output_start <= len(generated) else 0
+    cursor["prompt_len"] = len(prompt)
+    cursor["output_len"] = len(generated)
+    return {"stage": f"stage{stage_id}", "input": prompt[prompt_start:], "output": generated[output_start:]}
+
+
 def payload_turn_id(payload: object) -> int | None:
     if not isinstance(payload, Mapping):
         return None
@@ -1374,10 +1457,12 @@ __all__ = [
     "PcmAppendBuffer",
     "PcmAppendReservation",
     "coerce_int",
+    "default_unit_token_trace",
     "load_duplex_plugin",
     "payload_turn_id",
     "reject_changed_runtime_value",
     "settle_response_runtime",
+    "token_id_list",
     "validate_duplex_plugin_sampling",
     "validate_duplex_replica_policy",
 ]

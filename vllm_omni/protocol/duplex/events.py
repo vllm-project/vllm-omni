@@ -390,6 +390,34 @@ class InputProcessed(RealtimeEvent):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class UnitTokens(RealtimeEvent):
+    """Opt-in debug trace (``extra_body.trace_tokens``): token ids one model unit consumed and produced.
+
+    ``stages`` items are ``{"stage": name, "input": [[id, piece], ...], "output": [[id, piece], ...]}``
+    with absent lists omitted; ``special_ids`` are the tokenizer's special / added ids among them.
+    ``unit_index`` -1 with ``decision`` ``"prompt"`` is the initial context, sent once.
+    """
+
+    wire_type = "debug.unit_tokens"
+
+    unit_index: int = 0
+    end_ms: int = 0
+    decision: str = ""
+    stages: tuple[Mapping[str, object], ...] = ()
+    special_ids: tuple[int, ...] = ()
+
+    def _wire_fields(self) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "unit_index": self.unit_index,
+            "end_ms": self.end_ms,
+            "decision": self.decision,
+            "stages": [wire_value(stage) for stage in self.stages],
+            "special_ids": list(self.special_ids),
+        }
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class DuplexRawEvent(RealtimeEvent):
     """A session-internal event with no dedicated Realtime type (``duplex.<internal type>``)."""
 
@@ -476,6 +504,7 @@ __all__ = [
     "SessionStats",
     "Speak",
     "TurnEvent",
+    "UnitTokens",
     # Bases and helpers shared with the Tier 1 surface.
     "DuplexEvent",
     "REALTIME_ERROR_TYPES_BY_CODE",

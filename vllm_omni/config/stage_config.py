@@ -810,6 +810,11 @@ class DuplexSessionRuntimeConfig:
     # ``session.stats.get`` (RFC #8325). Off: nothing is recorded or attached.
     # Single-host only: stage and API timestamps share one CLOCK_MONOTONIC.
     collect_stats: bool = False
+    # Debug events that expose model internals to clients (``debug.unit_tokens``,
+    # requested per session with ``extra_body.trace_tokens``). The token trace
+    # carries the full model context, including server-side prompts and
+    # templates a client cannot otherwise see, so operators opt in here.
+    enable_debug_events: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_custom_options, dict):

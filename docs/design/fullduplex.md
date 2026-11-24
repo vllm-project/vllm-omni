@@ -660,6 +660,7 @@ vllm_omni/
 │           ├── control.py           SessionControl: server VAD and the events that reconfigure it
 │           ├── append_task.py       AppendAttempt: one append in flight and the rollback its failure owes
 │           ├── input_clock.py       InputClock: model units and input acknowledgements of input-clocked sessions
+│           ├── token_trace.py       TokenTracer: the opt-in per-unit token trace (debug.unit_tokens)
 │           ├── helpers.py           pure reads and payload builders over a session
 │           ├── lease.py             DuplexLeaseState (idle TTL, disconnect grace, resume generation)
 │           └── overlap_policy.py / commit_policy.py / playback_ledger.py
@@ -1446,6 +1447,22 @@ epoch (an overlap barge-in does so too, where a session without the clock
 keeps its epoch when nothing else was running), so a called-off submission
 that already reached Stage0 has its output dropped instead of shifting the
 count.
+
+The opt-in token trace (`extra_body.trace_tokens`, `session/token_trace.py`)
+rides on the input clock's units, so it exists only for input-clocked
+sessions (`token_trace_requires_input_clock` otherwise) and is fixed at
+creation. When a session is traced, the `StageProgress` of every segment end
+also carries its output; the clock hands it to the `TokenTracer`, which asks
+the plugin's `unit_token_trace(stage_id, output, context, cursor,
+runtime_config)` for the ids one stage consumed and produced for the unit
+(default: the deltas of the stage output's `prompt_token_ids` / `token_ids`
+within one stage request; a model whose stage prompt is built from
+embeddings reports the real ids it has), and emits one `debug.unit_tokens`
+when the unit completes, before the acknowledgement that covers it.
+`token_trace_started` / `token_trace_stopped` bracket a traced session. The
+trace is refused unless the deploy config sets
+`duplex_session.enable_debug_events: true` (error `token_trace_disabled`),
+because it exposes the full model context.
 
 Frame-based plugins use `engine/duplex/intermediate.py::build_duplex_append_prompt`
 for the shared request identity, sequencing and config snapshots. Token budgets,
