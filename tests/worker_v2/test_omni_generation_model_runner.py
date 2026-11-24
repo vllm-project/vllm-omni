@@ -189,7 +189,7 @@ def test_cached_chunk_updates_request_and_model_state_with_or_without_slot(slot_
         runner.req_states.all_token_ids.stage_write.assert_called_once_with(0, 0, [1])
         runner.req_states.num_computed_tokens.stage_write_elem.assert_called_once_with(0, 0)
         runner._remove_request.assert_not_called()
-        runner.model_state.remove_request.assert_called_once_with(0)
+        runner.model_state.remove_request.assert_called_once_with("req")
         runner.add_requests.assert_not_called()
         runner.model_state.add_request.assert_called_once()
         added = runner.model_state.add_request.call_args.args[1]
