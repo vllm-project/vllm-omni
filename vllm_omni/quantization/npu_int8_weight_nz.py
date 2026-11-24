@@ -19,6 +19,7 @@ _NZ_FORMAT = 29
 _ROW_BLOCK = 16
 _COL_BLOCK = 32
 _verified_view_devices: set[torch.device] = set()
+_verified_a5_reactor_devices: set[torch.device] = set()
 
 
 def configured_weight_nz_mode() -> str:
@@ -55,10 +56,14 @@ def cast_weight_to_nz(weight: torch.Tensor, *, resident: bool = False) -> torch.
 
     if torch_npu.get_npu_format(weight) == _NZ_FORMAT:
         return weight
-    if resident and torch_npu.npu.get_device_name(weight.device).startswith("Ascend950"):
-        # Ascend 950 supports this explicit cast with ALLOW_INTERNAL_FORMAT disabled.
+    if torch_npu.npu.get_device_name(weight.device).startswith("Ascend950"):
+        # A DLO weight can be a view at a nonzero offset into its transfer slot.
+        # The A5 cast requires owned ND storage for such inputs.
+        if not resident:
+            weight = weight.clone(memory_format=torch.contiguous_format)
         result = torch_npu.npu_format_cast(weight, _NZ_FORMAT)
-        torch_npu.npu.current_stream(weight.device).synchronize()
+        if resident:
+            torch_npu.npu.current_stream(weight.device).synchronize()
     else:
         result = torch_npu.empty_with_format(
             tuple(weight.shape), dtype=weight.dtype, device=weight.device, acl_format=_NZ_FORMAT
@@ -141,15 +146,54 @@ def nz_view(buffer: torch.Tensor, offset: int, shape: Sequence[int]) -> torch.Te
     return view
 
 
+def _probe_a5_reactor(device: torch.device) -> None:
+    """Verify a borrowed, padded NZ weight with the actual INT8 matmul once per device."""
+    import torch_npu
+
+    if device in _verified_a5_reactor_devices:
+        return
+
+    rows, cols = 17, 33
+    offset = 256
+    weight = (torch.arange(rows * cols, dtype=torch.int32) % 251 - 125).to(torch.int8).reshape(rows, cols)
+    packed = pack_nz_weight(weight)
+    slot = torch.empty(offset + packed.numel(), device=device, dtype=torch.int8)
+    slot[offset:].copy_(packed)
+    try:
+        view = nz_view(slot, offset, weight.shape)
+        if torch_npu.get_npu_format(view) != _NZ_FORMAT or view.data_ptr() != slot.data_ptr() + offset:
+            raise RuntimeError("the weight does not borrow the expected FRACTAL_NZ storage")
+        if not torch.equal(view.cpu(), weight):
+            raise RuntimeError("the NZ view changed the logical INT8 weight")
+
+        activation = (torch.arange(16 * rows, dtype=torch.int32) % 253 - 126).to(torch.int8).reshape(16, rows)
+        activation = activation.to(device)
+        weight_scale = torch.full((cols,), 0.00625, device=device, dtype=torch.float32)
+        token_scale = torch.full((16,), 0.0078125, device=device, dtype=torch.float32)
+        options = dict(pertoken_scale=token_scale, output_dtype=torch.bfloat16)
+        reference = torch_npu.npu_quant_matmul(activation, weight.to(device), weight_scale, **options)
+        actual = torch_npu.npu_quant_matmul(activation, view, weight_scale, **options)
+        if not torch.equal(actual.cpu(), reference.cpu()):
+            raise RuntimeError("the NZ matmul differs from the ND matmul")
+    except RuntimeError as exc:
+        raise RuntimeError("INT8 NZ reactor failed the Ascend 950 borrowed-storage probe") from exc
+
+    _verified_a5_reactor_devices.add(device)
+
+
 def check_reactor_support() -> None:
     """Check the runtime prerequisites before packing weights on the host."""
     import torch_npu
 
     get_option = getattr(torch_npu._C, "_npu_getOption", None)
-    if get_option is None or get_option("ALLOW_INTERNAL_FORMAT") != b"enable":
+    option = get_option("ALLOW_INTERNAL_FORMAT") if get_option is not None else None
+    a5_probe = option == b"disable" and torch_npu.npu.get_device_name().startswith("Ascend950")
+    if option != b"enable" and not a5_probe:
         raise RuntimeError("INT8 NZ reactor requires torch.npu.config.allow_internal_format=True")
     if not all(
         callable(getattr(torch_npu._C, name, None))
         for name in ("_construct_storage_from_data_pointer", "_construct_NPU_Tensor_From_Storage_And_Metadata")
     ):
         raise RuntimeError("INT8 NZ reactor is unavailable on this torch_npu; select NZ mode 'cast'")
+    if a5_probe:
+        _probe_a5_reactor(torch.device("npu", torch_npu.npu.current_device()))
