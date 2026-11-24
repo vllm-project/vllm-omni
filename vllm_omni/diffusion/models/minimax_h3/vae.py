@@ -366,6 +366,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         load_device: torch.device | None = None,
         encode_only: bool = False,
         decode_only: bool = False,
+        pin_memory: bool = True,
         trust_remote_code: bool = False,
         decoder_source: str | Mapping[str, str] | None = None,
         lightvae_decoder_path: str | None = None,
@@ -375,6 +376,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         super().__init__()
         self._device_target = device
         self.stack_decode_tiles = bool(stack_decode_tiles)
+        self._pin_memory = pin_memory
         self.encode_only = bool(encode_only)
         self.decode_only = bool(decode_only)
         if self.encode_only and self.decode_only:
@@ -513,18 +515,18 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self._encoder_stager = PinnedModuleStager(
                 [self.model.encoder, self.model.quant_conv],
                 device,
-                pin_memory=True,
+                pin_memory=getattr(self, "_pin_memory", True),
             )
             self._decoder_stager = PinnedModuleStager(
                 [self.model.post_quant_conv, self.model.decoder],
                 device,
-                pin_memory=True,
+                pin_memory=getattr(self, "_pin_memory", True),
             )
             return
         self._stager = PinnedModuleStager(
             self.remote,
             device,
-            pin_memory=True,
+            pin_memory=getattr(self, "_pin_memory", True),
         )
 
     def _part_stager(self, part: str) -> PinnedModuleStager | None:
@@ -1418,6 +1420,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         load_device: torch.device | None = None,
         encode_only: bool = False,
         decode_only: bool = False,
+        pin_memory: bool = True,
         trust_remote_code: bool = False,
     ) -> None:
         super().__init__()
@@ -1443,7 +1446,7 @@ class MiniMaxH3AudioVAE(nn.Module):
             self._stager = PinnedModuleStager(
                 self.remote,
                 device,
-                pin_memory=True,
+                pin_memory=pin_memory,
             )
         self.model = self.remote.model
         self.sample_rate = int(self.config_dict["sample_rate"])
