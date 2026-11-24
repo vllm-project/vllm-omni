@@ -57,6 +57,7 @@ class _FakeVllmConfig:
 @dataclass
 class _FakeRuntimeConfig:
     devices: str
+    num_replicas: int = 1
 
 
 @dataclass
@@ -65,6 +66,18 @@ class _FakeStageConfig:
     stage_type: str
     engine_args: dict[str, object]
     runtime: _FakeRuntimeConfig
+    final_output_type: str | None = None
+
+
+@dataclass
+class _FakeModelConfig:
+    hf_config: object = field(default_factory=object)
+
+
+@dataclass
+class _FakeEngineConfig:
+    quant_config: object
+    model_config: _FakeModelConfig = field(default_factory=_FakeModelConfig)
 
 
 def test_stage_runtime_env_accepts_typed_runtime_config(monkeypatch):
@@ -232,10 +245,7 @@ def test_build_vllm_config_forwards_text_watermark_config(
 def test_build_vllm_config_upgrades_inc_quant_config_in_place(monkeypatch):
     original_quant_config = object()
     upgraded_quant_config = object()
-    fake_config = types.SimpleNamespace(
-        quant_config=original_quant_config,
-        model_config=types.SimpleNamespace(hf_config=types.SimpleNamespace()),
-    )
+    fake_config = _FakeEngineConfig(quant_config=original_quant_config)
     sentinel_executor = object()
 
     monkeypatch.setattr(
@@ -249,12 +259,11 @@ def test_build_vllm_config_upgrades_inc_quant_config_in_place(monkeypatch):
         "maybe_upgrade",
         lambda quant_config: upgraded_quant_config if quant_config is original_quant_config else quant_config,
     )
-    stage = types.SimpleNamespace(
+    stage = _FakeStageConfig(
         stage_id=0,
         stage_type="llm",
-        final_output_type=None,
         engine_args={},
-        runtime=types.SimpleNamespace(devices="0", num_replicas=1),
+        runtime=_FakeRuntimeConfig(devices="0"),
     )
 
     vllm_config, executor_class = build_vllm_config(
