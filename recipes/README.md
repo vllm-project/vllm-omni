@@ -114,6 +114,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`NVIDIA/SANA-Video-2B.md`](./NVIDIA/SANA-Video-2B.md) | Native and Diffusers-adapter 480p/720p T2V+I2V | 1x RTX 5090 32GB |
 | [`meituan-longcat/LongCat-Video-Avatar-1.5.md`](./meituan-longcat/LongCat-Video-Avatar-1.5.md) | Audio-driven avatar video generation (AT2V / AI2V, single- and multi-speaker, AVC continuation) | 1x H100 80GB |
 | [`mistralai/Voxtral-TTS.md`](./mistralai/Voxtral-TTS.md) | Online serving for TTS | 1x RTX 4090 24GB |
+| [`MOSS-Image/MOSS-Image-Base-NPU.md`](./MOSS-Image/MOSS-Image-Base-NPU.md) | MOSS-Image-Base text-to-image serving with DiT tensor parallelism | 1, 2, 4, or 8 Ascend A3 dies |
 | [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) or 1x RTX 5090 32GB with layerwise offload |
 | [`Runway/Praxis-1.md`](./Runway/Praxis-1.md) | Closed-loop video/action robot policy (DROID single arm, YAM two arms): offline, OpenPI and Positronic serving | 1x NVIDIA H100 80GB |
 | [`SandAI/MAGI-2-preview-L20X.md`](./SandAI/MAGI-2-preview-L20X.md) | Native Preview-stage text/image-to-video-and-audio generation | 1x/4x NVIDIA L20X 140 GiB qualified |
@@ -138,6 +139,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Qwen/Qwen-Image.md`](./Qwen/Qwen-Image.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt mixed FP8/NVFP4; offline text-to-image on XPU | 1x A100 80GB / 2x B200 / 1x Intel Arc Pro B70 32GB |
 | [`Qwen/Qwen-Image-2.1.md`](./Qwen/Qwen-Image-2.1.md) | Text-to-image and image-conditioned generation (editing) with prefix KV cache and CUDA graph decode | 1x GPU with CPU offload / 1x H200 |
 | [`Qwen/Qwen-Image-2.1-NPU.md`](./Qwen/Qwen-Image-2.1-NPU.md) | Low-latency text-to-image and image-conditioned generation (editing) serving with Ulysses sequence parallelism | 1x Ascend 910B1 64GB / up to 8x data parallel |
+| [`Qwen/Qwen-Image-2.1-A3.md`](./Qwen/Qwen-Image-2.1-A3.md) | Qwen-Image-2.1 and Turbo text-to-image serving with Ulysses sequence parallelism | 1, 2, 4, or 8 Ascend A3 dies |
 | [`Qwen/Qwen-Image-2512.md`](./Qwen/Qwen-Image-2512.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt FP8 / mixed FP8/NVFP4 | 1x A800 80GB / 2x B200 |
 | [`Qwen/Qwen-Image-Edit.md`](./Qwen/Qwen-Image-Edit.md) | Text-guided single-image editing | 1x or 2x H200 141GB |
 | [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md) | Online serving for multimodal chat; offline end-to-end text-to-speech on XPU | 1x A100 80GB / 5x Intel Arc Pro B70 32GB |
