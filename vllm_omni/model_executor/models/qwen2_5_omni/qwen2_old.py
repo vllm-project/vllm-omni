@@ -275,10 +275,7 @@ class Qwen2Model(nn.Module):
         # LM width. Keep this projection inside the compiled region: outside it, its freshly allocated
         # output would be the first PIECEWISE CUDA graph's input, and graph replay does not check or
         # copy inputs, so an address that changed since capture silently reads stale memory.
-        embedding_size = getattr(config, "embedding_size", config.hidden_size)
-        self.thinker_to_talker_proj: nn.Linear | None = (
-            nn.Linear(embedding_size, config.hidden_size) if embedding_size != config.hidden_size else None
-        )
+        self.thinker_to_talker_proj = nn.Linear(config.embedding_size, config.hidden_size)
 
         if get_pp_group().is_first_rank or (config.tie_word_embeddings and get_pp_group().is_last_rank):
             self.embed_tokens = VocabParallelEmbedding(
@@ -326,8 +323,7 @@ class Qwen2Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            if self.thinker_to_talker_proj is not None:
-                hidden_states = self.thinker_to_talker_proj(hidden_states)
+            hidden_states = self.thinker_to_talker_proj(hidden_states)
             residual = None
         else:
             assert intermediate_tensors is not None
