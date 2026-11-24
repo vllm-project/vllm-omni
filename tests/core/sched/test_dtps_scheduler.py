@@ -14,6 +14,8 @@ Covers review-requested scenarios:
 - production ``_free_request`` hook wiring (classify before evict, aborted
   requests never register, registration independent of the KV-transfer
   predicate)
+- deploy-config wiring for the ``dit_load_aware`` YAML switch (parse,
+  engine-override isolation, OmniStageModelConfig construction)
 """
 
 from __future__ import annotations
@@ -690,6 +692,104 @@ class TestStageIsolation:
         assert paired_snap["num_replicas"] == 1
         # The unrelated stage's load must not appear
         assert paired_snap["total_waiting"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Deploy-config wiring tests (dit_load_aware YAML switch)
+# ---------------------------------------------------------------------------
+
+
+class TestDeployConfigWiring:
+    """Guard the ``dit_load_aware`` deploy-field wiring end to end.
+
+    Regression origin (PR #9634 final verification round): deleting
+    ``OmniStageModelConfig.dit_load_aware`` without reserving the deploy
+    field made every ``dit_load_aware: true`` deploy fail at server boot
+    with ``pydantic ValidationError: Unexpected keyword argument`` — the
+    raw YAML bool leaked through two generic copies
+    (``_stage_engine_overrides`` / ``_build_engine_args``) into the pydantic
+    constructor. These tests pin the contract at each hop so neither
+    direction of regressions can land silently:
+
+    - the YAML switch must reach ``StageDeployConfig`` (DTPS silently off
+      otherwise), and
+    - the raw bool must never reach ``OmniStageModelConfig`` kwargs (boot
+      crash otherwise).
+    """
+
+    def test_parse_stage_deploy_reads_dit_load_aware(self):
+        """The reserved deploy field must be explicitly parsed: reserved
+        fields are excluded from _STAGE_DEPLOY_FIELDS, so a missing
+        explicit parse silently disables DTPS."""
+        from vllm_omni.config.stage_config import _parse_stage_deploy
+
+        sd = _parse_stage_deploy({"stage_id": 0, "dit_load_aware": True})
+        assert sd.dit_load_aware is True
+        # Must not ride along engine_extras either.
+        assert "dit_load_aware" not in (sd.engine_extras or {})
+
+    def test_stage_engine_overrides_isolate_raw_bool(self):
+        """The structured config path (the boot-crash leak site): the raw
+        ``dit_load_aware`` bool must not be forwarded as an engine
+        override."""
+        from vllm_omni.config.omni_config import _stage_engine_overrides
+        from vllm_omni.config.stage_config import (
+            _STAGE_DEPLOY_FIELDS,
+            _STAGE_RESERVED_KEYS,
+            _parse_stage_deploy,
+        )
+
+        # The field is consumed exclusively by derive_dtps_config.
+        assert "dit_load_aware" in _STAGE_RESERVED_KEYS
+        assert "dit_load_aware" not in _STAGE_DEPLOY_FIELDS
+
+        sd = _parse_stage_deploy({"stage_id": 0, "dit_load_aware": True})
+        overrides = _stage_engine_overrides(sd)
+        assert "dit_load_aware" not in overrides
+
+    def test_engine_overrides_construct_model_config(self):
+        """Full replay of the boot crash sink: deploy YAML → engine
+        overrides → ``OmniStageModelConfig(**kwargs)``. On the pre-fix code
+        this raised ValidationError (raw bool in kwargs); it must instead
+        resolve cleanly with the derived ``dit_load_aware_config``."""
+        from vllm_omni.config.omni_config import (
+            _MODEL_ENGINE_FIELDS,
+            OmniStageModelConfig,
+            _config_kwargs,
+            _select_engine_overrides,
+            _stage_engine_overrides,
+        )
+        from vllm_omni.config.stage_config import _parse_stage_deploy
+
+        dtps_pair = {"ar_stage_id": 0, "dit_stage_id": 1, "threshold": 3}
+        sd = _parse_stage_deploy({"stage_id": 0, "dit_load_aware": True})
+
+        # Production chain: flatten deploy → select engine overrides →
+        # attach the derived pair (as _build_ar_stage_config does).
+        engine_model = _select_engine_overrides(_stage_engine_overrides(sd), _MODEL_ENGINE_FIELDS)
+        engine_model["dit_load_aware_config"] = dict(dtps_pair)
+
+        # The pydantic sink must accept the kwargs.
+        model_config = OmniStageModelConfig(**_config_kwargs(engine_model))
+        assert model_config.dit_load_aware_config == dtps_pair
+
+    def test_reserved_deploy_fields_roundtrip(self):
+        """Class guard: every reserved StageDeployConfig field must survive
+        _parse_stage_deploy via its explicit parse (reserved fields are
+        excluded from the generic _STAGE_DEPLOY_FIELDS copy)."""
+        from vllm_omni.config.stage_config import _parse_stage_deploy
+
+        sd = _parse_stage_deploy(
+            {
+                "stage_id": 0,
+                "async_chunk": False,
+                "model_runner": "v1",
+                "dit_load_aware": True,
+            }
+        )
+        assert sd.async_chunk is False
+        assert sd.model_runner == "v1"
+        assert sd.dit_load_aware is True
 
 
 # ---------------------------------------------------------------------------

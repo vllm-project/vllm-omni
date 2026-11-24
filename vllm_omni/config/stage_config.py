@@ -981,9 +981,6 @@ _STAGE_RESERVED_KEYS = frozenset(
         "engine_extras",
         "engine_args",
         "runtime",
-        # DTPS deploy switch: consumed by derive_dtps_config() to emit
-        # ``dit_load_aware_config`` for the AR stage; the raw bool must not
-        # propagate into engine args (OmniStageModelConfig has no such field).
         "dit_load_aware",
     }
 )
