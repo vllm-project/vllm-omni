@@ -1153,11 +1153,9 @@ class OrchestratorBase:
                     finished=segment_finished,
                     token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
                     output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
-                    capture_payload=(
-                        bytes(capture_payload)
-                        if capture_payload is not None and (segment_finished or bool(getattr(eco, "finished", False)))
-                        else None
-                    ),
+                    # The payload is part of the delivery contract: per-unit
+                    # deliveries are non-finished by design and must keep theirs.
+                    capture_payload=bytes(capture_payload) if capture_payload is not None else None,
                 )
                 req_state.streaming.new_prompt_len_snapshot = getattr(
                     eco,

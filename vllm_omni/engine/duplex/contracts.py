@@ -117,7 +117,8 @@ class DuplexOutputContext:
     # handling for. Their spans reach the ledger directly (``on_stage_work``).
     perf_chunks: frozenset[tuple[int, int]] = frozenset()
     # Serialized per-unit capture payload (validated at ledger ingest);
-    # ``None`` on deliveries from non-capture stages.
+    # ``None`` on deliveries from non-capture stages and on a closure whose
+    # final step sampled no unit.
     segment_capture_payload: bytes | None = None
 
     def __post_init__(self) -> None:

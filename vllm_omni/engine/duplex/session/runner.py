@@ -391,6 +391,9 @@ class DuplexSessionRunner:
         consume = decision is not None or stage_id >= context.final_stage_id
         project_intermediate = self.plugin.projects_intermediate_outputs and stage_id == 0
         project_output = consume or project or project_intermediate
+        # Every capture-stage delivery must reach the mailbox: the ledger ingests
+        # there and a missing payload is only detectable there.
+        ingest_capture = self.session.config.action_capture and stage_id in self.plugin.action_capture_stage_ids()
         if not project_output:
             # Stage0 text without a direct decision feeds the TTS stage as before.
             # Its metrics still have to reach the client: before sessions moved
@@ -399,7 +402,7 @@ class DuplexSessionRunner:
             # take. Hand them to the session instead of dropping them, on the
             # mailbox so they stay ordered with this session's other work.
             self._stash_stage_metrics(stage_id, metrics, output)
-            if not input_transcript:
+            if not input_transcript and not ingest_capture:
                 return False
         if project and not consume:
             # Stage1 thinker text is projected to the client, but that event

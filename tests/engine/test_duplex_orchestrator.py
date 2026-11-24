@@ -41,6 +41,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
+    CollectActionRecordsMessage,
     DuplexControlResultMessage,
     DuplexSessionCommandMessage,
     DuplexSessionEventMessage,
@@ -311,6 +312,32 @@ async def test_duplex_messages_are_dispatched_and_generic_ones_are_not() -> None
     assert await orchestrator._dispatch_message(_open_message()) is True
     assert (await asyncio.wait_for(rpc_q.get(), timeout=2.0)).ok is True
     await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_collect_action_records_on_the_request_queue_is_answered() -> None:
+    """The request handler routes ``collect_action_records`` like every other control RPC.
+
+    A control message the manager handles but does not accept falls through to
+    the base handler's "Unknown message type" branch, so the caller's
+    ``engine.collect_action_records`` times out every time.
+    """
+    orchestrator, _, rpc_q, _ = _build()
+    handler = asyncio.create_task(orchestrator._request_handler())
+    try:
+        orchestrator.request_async_queue.put_nowait(
+            CollectActionRecordsMessage(control_id="collect-1", session_id=SESSION_ID)
+        )
+        result = await asyncio.wait_for(rpc_q.get(), timeout=2.0)
+        assert isinstance(result, DuplexControlResultMessage)
+        assert (result.control_id, result.operation) == ("collect-1", "collect_action_records")
+        # No session was ever opened, so the terminal cache has nothing to return.
+        assert result.ok is False
+        assert result.error_code == "action_capture_not_retained"
+    finally:
+        handler.cancel()
+        await asyncio.gather(handler, return_exceptions=True)
+        await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -736,6 +763,51 @@ async def test_streaming_segment_stop_keeps_response_open_until_real_terminal(mo
         assert session.active_response_id is None
         assert 1 in request_state.finished_stage_ids
         assert 1 in request_state.finished_final_output_stage_ids
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_non_finished_capture_delivery_keeps_its_payload_in_the_segment_snapshot(mocker) -> None:
+    """Per-unit capture deliveries are non-finished by design; the snapshot must keep their payload.
+
+    Zeroing it for every non-finished poll drops each unit's records before the
+    session can ingest them, so a capture session yields an empty ledger.
+    """
+    orchestrator, _, rpc_q, _ = _build(stages=2)
+    await _open(orchestrator, rpc_q)
+    request_id = _stage0_request_id()
+    await _submit(orchestrator, _append_audio())
+    request_state = orchestrator.request_states[request_id]
+    runner = orchestrator.session_manager.runner_for_request_id(request_id)
+    assert runner is not None and request_state.streaming.enabled
+    mocker.patch.object(orchestrator, "_handle_kv_ready_raw_outputs", new_callable=mocker.AsyncMock)
+    mocker.patch.object(
+        orchestrator.stage_pools[0], "process_llm_raw_outputs", new_callable=mocker.AsyncMock, return_value=[]
+    )
+    payload = b'{"schema_version":1}'
+    output = OmniEngineCoreOutput(
+        request_id=request_id,
+        new_token_ids=[11],
+        is_segment_finished=False,
+        action_capture_payload=payload,
+    )
+    try:
+        await orchestrator._process_llm_stage_outputs(0, 0, OmniEngineCoreOutputs(outputs=[output]), set())
+        segment = request_state.streaming.segment(0)
+        assert segment.finished is False
+        assert segment.capture_payload == payload
+        # The same bytes ride the duplex context handed to the session.
+        on_stage_output = mocker.patch.object(runner, "on_stage_output", return_value=False)
+        assert (
+            await orchestrator._intercept_stage_output(
+                0, 0, _audio_request_output(request_id, samples=0, finished=False), request_state, None, None
+            )
+            is False
+        )
+        context = on_stage_output.call_args.kwargs["context"]
+        assert context.segment_finished is False
+        assert context.segment_capture_payload == payload
     finally:
         await orchestrator.session_manager.shutdown()
 

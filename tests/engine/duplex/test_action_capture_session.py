@@ -25,11 +25,13 @@ from tests.engine.duplex.test_session_runner import (
     Harness,
     append_audio,
     close_harness,
+    find,
     listen_output,
     open_harness,
     types,
 )
 from vllm_omni.engine.duplex import commands
+from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 from vllm_omni.protocol.duplex.action_records import (
     DuplexActionRecordSet,
@@ -77,6 +79,16 @@ def _unit_payload(
             effective_seed=seed,
             model={"rep_penalty": 1.05},
         )
+    )
+
+
+def _turn_end_output(request_id: str) -> SimpleNamespace:
+    """A finished Stage0 segment that ends the turn with no listen decision: the response ends."""
+    return SimpleNamespace(
+        request_id=request_id,
+        finished=True,
+        outputs=[SimpleNamespace(text="", token_ids=[11, 12], stop_reason=None, multimodal_output={})],
+        multimodal_output={"turn_end": True},
     )
 
 
@@ -176,6 +188,67 @@ async def test_records_reach_retrieval_with_forced_kinds_and_origin() -> None:
         await close_harness(h)
 
 
+@pytest.mark.asyncio
+async def test_decisionless_unit_delivery_reaches_the_ledger_and_still_forwards() -> None:
+    """A mid-response per-unit delivery is not finished, so the plugin has no decision for it.
+
+    It must still reach the mailbox for ingest while the output forwards to the
+    next stage exactly as before; returning early dropped every per-unit
+    delivery of a multi-stage pipeline.
+    """
+    h = await open_capture_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        unit = SimpleNamespace(
+            request_id=request_id,
+            finished=False,
+            outputs=[SimpleNamespace(text="", token_ids=[11, 12], multimodal_output={})],
+            multimodal_output={},
+        )
+        forwards = h.deliver(
+            unit, stage_id=0, segment_finished=False, capture_payload=_unit_payload(seq=1, token_ids=(11, 12))
+        )
+        assert forwards is False
+        events = await h.settle()
+        assert "error" not in types(events)
+        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_collect"))
+        assert types(reply_events) == ["session.action.records"], types(reply_events)
+        record_set = DuplexActionRecordSet.from_wire(reply_events[0].records)
+        assert (record_set.token_ids, record_set.num_units()) == ((11, 12), 1)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_still_ingests_its_capture_payload() -> None:
+    """The data plane marks a request terminal at turn end or drain; the stage's
+    terminal poll can still deliver that response's final unit."""
+    h = await open_capture_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        h.session.begin_response(turn_id=h.session.turn_id)
+        response_id = h.session.active_response_id
+        # What the turn-end and drain paths do once a request's stream is closed.
+        h.manager.plugin.data_plane.mark_terminal(request_id)
+        assert h.manager.plugin.data_plane.is_terminal(request_id)
+        events = await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            capture_payload=_unit_payload(seq=1),
+        )
+        assert "error" not in types(events)
+        h.session.end_response(commit_text=False)
+        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_collect", response_id=response_id))
+        assert types(reply_events) == ["session.action.records"], types(reply_events)
+        record_set = DuplexActionRecordSet.from_wire(reply_events[0].records)
+        assert (record_set.status, record_set.token_ids) == ("completed", (11, LISTEN_TOKEN_ID))
+    finally:
+        await close_harness(h)
+
+
 # --------------------------------------------------------------------------- #
 # Validation failure is session-fatal and loud                               #
 # --------------------------------------------------------------------------- #
@@ -204,21 +277,57 @@ async def test_invalid_payload_closes_the_session_with_typed_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_capture_delivery_without_payload_is_fatal() -> None:
+async def test_unit_delivery_without_payload_is_fatal() -> None:
+    """A non-finished delivery of a capture stage is a sampled unit: no payload is a transit loss."""
     h = await open_capture_harness()
     try:
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         events = await h.deliver_and_settle(
-            listen_output(request_id),
+            SimpleNamespace(
+                request_id=request_id,
+                finished=False,
+                outputs=[SimpleNamespace(text="", token_ids=[11, 12], multimodal_output={})],
+                multimodal_output={},
+            ),
             stage_id=0,
-            segment_finished=True,
+            segment_finished=False,
             capture_payload=None,
         )
         assert "error" in types(events)
         error = next(event for event in events if types([event]) == ["error"])
         assert error.code == "action_capture_invalid"
         assert "without payload" in error.message
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_closure_without_payload_is_skipped_and_the_response_seals_completed() -> None:
+    """A natural turn end samples no unit, so the closure legitimately carries no payload.
+
+    Treating that as a transit loss killed every episode of a thinker-only
+    capture session, where a response closes within seconds of its commit.
+    """
+    h = await open_capture_harness(auto_response=False, stage_count=1)
+    try:
+        await h.run(append_audio())
+        events = await h.run(commands.Commit(create_response=True))
+        assert "response.created" in types(events), types(events)
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        events = await h.deliver_and_settle(
+            _turn_end_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            capture_payload=None,
+        )
+        assert "error" not in types(events)
+        assert h.session.state.name == "OPEN"
+        assert find(events, "response.done").status == "completed"
+        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_collect", response_id=response_id))
+        assert types(reply_events) == ["session.action.records"], types(reply_events)
+        assert DuplexActionRecordSet.from_wire(reply_events[0].records).status == "completed"
     finally:
         await close_harness(h)
 
@@ -284,15 +393,13 @@ async def test_close_mid_response_returns_partial_set_via_terminal_cache() -> No
 
 @pytest.mark.asyncio
 async def test_barge_in_seals_interruption_and_cancel_seals_truncated_cancel() -> None:
+    def cancel_then_barge_in(session: DuplexEngineSession) -> int:
+        session.capture_epoch_cause = "truncated_cancel"
+        return session.barge_in()
+
     for seal, expected in (
         (lambda session: session.barge_in(), "truncated_interruption"),
-        (
-            lambda session: (
-                setattr(session, "capture_epoch_cause", "truncated_cancel"),
-                session.barge_in(),
-            ),
-            "truncated_cancel",
-        ),
+        (cancel_then_barge_in, "truncated_cancel"),
     ):
         h = await open_capture_harness()
         try:

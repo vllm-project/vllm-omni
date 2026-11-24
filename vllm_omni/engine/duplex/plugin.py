@@ -546,13 +546,15 @@ class DuplexModelPlugin(ABC):
     def action_capture_stage_ids(self) -> frozenset[int]:
         """Stages whose per-unit segment deliveries carry action-capture payloads.
 
-        With per-session ``action_capture`` on, every segment
-        delivery of these stages must carry a capture payload; a delivery
-        without one is the session-fatal ``action_capture_invalid``. Models
-        that never set ``supports_action_capture`` keep the empty default.
-        The guarantee is per delivery: a model whose unit spans multiple
-        segment polls must emit one payload per unit keyed by the model-side
-        ``seq``, or the mid-segment polls surface as missing-payload failures.
+        With per-session ``action_capture`` on, every unit-bearing (not
+        finished) segment delivery of these stages must carry a capture
+        payload; one without it is the session-fatal ``action_capture_invalid``.
+        A finished delivery closes its segment and carries a payload only when
+        its final step sampled a unit. Models that never set
+        ``supports_action_capture`` keep the empty default. The guarantee is
+        per delivery: a model whose unit spans multiple segment polls must emit
+        one payload per unit keyed by the model-side ``seq``, or the
+        mid-segment polls surface as missing-payload failures.
         """
         return frozenset()
 

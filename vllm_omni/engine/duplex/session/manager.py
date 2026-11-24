@@ -24,7 +24,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from opentelemetry import trace
 from vllm.logger import init_logger
@@ -89,6 +89,18 @@ logger = init_logger(__name__)
 # How long sealed action records of a closed session stay collectable.
 TERMINAL_ACTION_RECORDS_TTL_S = 300.0
 
+#: Every correlated control RPC the manager routes. ``accepts`` and the handler
+#: table in ``__init__`` share it, so a handled control message can never be
+#: unroutable (the base orchestrator drops whatever ``accepts`` rejects).
+_ControlMessage = (
+    OpenDuplexSessionMessage
+    | CloseDuplexSessionMessage
+    | ResumeDuplexSessionMessage
+    | TouchDuplexSessionMessage
+    | CollectActionRecordsMessage
+)
+_ControlHandler = Callable[[Any], Awaitable[None]]
+
 
 @dataclass(frozen=True)
 class _PendingRequestCleanup:
@@ -112,14 +124,6 @@ class _PendingSessionCleanup:
 
 
 class DuplexSessionManager:
-    _CONTROL_TYPES = (
-        OpenDuplexSessionMessage,
-        CloseDuplexSessionMessage,
-        ResumeDuplexSessionMessage,
-        TouchDuplexSessionMessage,
-    )
-    _MESSAGE_TYPES = (*_CONTROL_TYPES, DuplexSessionCommandMessage)
-
     def __init__(
         self,
         *,
@@ -144,6 +148,13 @@ class DuplexSessionManager:
         self.model_config = model_config
         self.log_stats = bool(log_stats)
         self.runtime_config = runtime_config
+        self._control_handlers: dict[type[_ControlMessage], _ControlHandler] = {
+            OpenDuplexSessionMessage: self.open,
+            CloseDuplexSessionMessage: self.close,
+            ResumeDuplexSessionMessage: self.resume,
+            TouchDuplexSessionMessage: self.touch,
+            CollectActionRecordsMessage: self.collect_terminal_records,
+        }
         if admission_limit is not None and (type(admission_limit) is not int or admission_limit < 0):
             raise ValueError("admission_limit must be a non-negative integer")
         self._admission_limit = admission_limit
@@ -241,15 +252,18 @@ class DuplexSessionManager:
     # Message routing                                                    #
     # ------------------------------------------------------------------ #
 
+    def _is_control(self, message: object) -> TypeGuard[_ControlMessage]:
+        return type(message) in self._control_handlers
+
     def accepts(self, message: object) -> bool:
-        return isinstance(message, self._MESSAGE_TYPES)
+        return isinstance(message, DuplexSessionCommandMessage) or self._is_control(message)
 
     def dispatch(self, message: object) -> None:
         """Route one engine request-queue message without blocking the request handler."""
         if isinstance(message, DuplexSessionCommandMessage):
             self._dispatch_command(message)
             return
-        if not isinstance(message, self._CONTROL_TYPES):
+        if not self._is_control(message):
             raise TypeError(f"Unsupported duplex control message: {type(message).__name__}")
         session_id = message.session_id
 
@@ -297,16 +311,8 @@ class DuplexSessionManager:
         task.add_done_callback(done)
 
     async def handle(self, message: object) -> None:
-        if isinstance(message, OpenDuplexSessionMessage):
-            await self.open(message)
-        elif isinstance(message, CloseDuplexSessionMessage):
-            await self.close(message)
-        elif isinstance(message, ResumeDuplexSessionMessage):
-            await self.resume(message)
-        elif isinstance(message, TouchDuplexSessionMessage):
-            await self.touch(message)
-        elif isinstance(message, CollectActionRecordsMessage):
-            await self.collect_terminal_records(message)
+        if self._is_control(message):
+            await self._control_handlers[type(message)](message)
         elif isinstance(message, DuplexSessionCommandMessage):
             self._dispatch_command(message)
         else:

@@ -15,6 +15,7 @@ import pytest
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.engine.duplex import messages as duplex_messages_module
 from vllm_omni.engine.duplex.commands import AppendAudio, CloseSession, Commit, DuplexCommand, Heartbeat
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig, DuplexSessionState
 from vllm_omni.engine.duplex.contracts import (
@@ -40,6 +41,7 @@ from vllm_omni.engine.duplex.events import (
 )
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
+    CollectActionRecordsMessage,
     DuplexControlResultMessage,
     DuplexSessionCommandMessage,
     DuplexSessionEventMessage,
@@ -62,6 +64,7 @@ from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import _Internal
+from vllm_omni.engine.messages import EngineQueueMessage
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -808,6 +811,7 @@ def test_accepts_only_duplex_message_types() -> None:
         assert manager.accepts(CloseDuplexSessionMessage(control_id="c", session_id="s"))
         assert manager.accepts(ResumeDuplexSessionMessage(control_id="c", session_id="s", expected_lease_generation=0))
         assert manager.accepts(TouchDuplexSessionMessage(control_id="c", session_id="s", activity="heartbeat"))
+        assert manager.accepts(CollectActionRecordsMessage(control_id="c", session_id="s"))
         assert manager.accepts(DuplexSessionCommandMessage(session_id="s", command=Heartbeat()))
         assert manager.accepts(type("Lookalike", (), {"type": "open_duplex_session", "session_id": "s"})()) is False
         assert (
@@ -819,6 +823,78 @@ def test_accepts_only_duplex_message_types() -> None:
             manager.dispatch(object())
     finally:
         manager.executor.shutdown(wait=False)
+
+
+def _inbound_control_message_types() -> list[type[EngineQueueMessage]]:
+    """Every correlated control RPC the wire module defines, read independently of the manager."""
+    return [
+        member
+        for member in vars(duplex_messages_module).values()
+        if isinstance(member, type)
+        and issubclass(member, EngineQueueMessage)
+        and member is not DuplexControlResultMessage  # results flow the other way
+        and "control_id" in getattr(member, "__annotations__", {})
+    ]
+
+
+def _control_message(message_type: type[EngineQueueMessage], *, session_id: str) -> EngineQueueMessage:
+    """A minimal valid instance of one inbound control message type."""
+    factories: dict[type[EngineQueueMessage], Any] = {
+        OpenDuplexSessionMessage: lambda: OpenDuplexSessionMessage(
+            control_id="c",
+            session_id=session_id,
+            session_config=DuplexSessionConfig(model="fake-model"),
+            output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
+        ),
+        CloseDuplexSessionMessage: lambda: CloseDuplexSessionMessage(control_id="c", session_id=session_id),
+        ResumeDuplexSessionMessage: lambda: ResumeDuplexSessionMessage(
+            control_id="c", session_id=session_id, expected_lease_generation=0
+        ),
+        TouchDuplexSessionMessage: lambda: TouchDuplexSessionMessage(
+            control_id="c", session_id=session_id, activity="heartbeat"
+        ),
+        CollectActionRecordsMessage: lambda: CollectActionRecordsMessage(control_id="c", session_id=session_id),
+    }
+    factory = factories.get(message_type)
+    assert factory is not None, f"no control-message factory for {message_type.__name__}; add one"
+    return factory()
+
+
+@pytest.mark.asyncio
+async def test_every_control_message_type_is_routable_and_answered() -> None:
+    """Route/accept parity over the wire module's whole control vocabulary.
+
+    The base orchestrator drops whatever ``accepts`` rejects, so a control message
+    ``handle`` knows but ``accepts`` does not is an RPC that only ever times out
+    (as ``collect_action_records`` did).
+    """
+    message_types = _inbound_control_message_types()
+    assert CollectActionRecordsMessage in message_types
+    results: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
+    manager = DuplexSessionManager(
+        plugin=FakePlugin(),
+        stage_port=FakeStagePort(),
+        output_sink=asyncio.Queue(),
+        result_sink=results,
+        runtime_config=_runtime_config(),
+        model_config=None,
+        clock=FakeClock(),
+    )
+    try:
+        for message_type in message_types:
+            message = _control_message(message_type, session_id="sid-parity")
+            assert manager.accepts(message), message_type
+            # The same gate the orchestrator's request handler applies.
+            manager.dispatch(message)
+        operations = set()
+        for _ in message_types:
+            result = await asyncio.wait_for(results.get(), timeout=2.0)
+            assert isinstance(result, DuplexControlResultMessage)
+            assert result.session_id == "sid-parity"
+            operations.add(result.operation)
+        assert operations == {"open", "close", "resume", "touch", "collect_action_records"}
+    finally:
+        await manager.shutdown()
 
 
 # --------------------------------------------------------------------------- #

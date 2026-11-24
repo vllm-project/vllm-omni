@@ -844,7 +844,13 @@ class ModelChannel:
                 perf.mark_handled(item.context.perf_chunks)
 
     async def _ingest_action_capture(self, item: StageOutput, expected_epoch: int) -> None:
-        """Ingest one delivery's capture payload; absent or invalid payloads close the session."""
+        """Ingest one delivery's capture payload.
+
+        Payload presence is a property of the delivery kind: a closure
+        (``segment_finished``) samples no unit of its own and carries a payload
+        only when its final step did; a unit-bearing delivery without one lost
+        it in transit. An invalid payload closes the session either way.
+        """
         session = self._ctx.session
         actions = session.actions
         if actions is None or not session.config.action_capture:
@@ -853,6 +859,14 @@ class ModelChannel:
             return
         payload = item.context.segment_capture_payload
         if payload is None:
+            if item.context.segment_finished:
+                logger.info(
+                    "duplex action capture closure without payload: session=%s stage=%s request=%s",
+                    session.session_id,
+                    item.stage_id,
+                    item.request_id,
+                )
+                return
             await self._fail_action_capture(
                 f"capture delivery without payload: stage={item.stage_id} request={item.request_id}"
             )
@@ -889,8 +903,6 @@ class ModelChannel:
             # Lease already closed/expired: the output belongs to a dead session.
             return None
         session.touch_lease(DuplexLeaseActivity.MODEL_OUTPUT)
-        if self._ctx.plugin.data_plane.is_terminal(item.request_id):
-            return None
         pending_capture_error = session.capture_pending_error
         if pending_capture_error is not None:
             session.capture_pending_error = None
@@ -898,9 +910,11 @@ class ModelChannel:
             session.capture_pending_error_code = None
             await self._fail_action_capture(pending_capture_error, code=pending_code)
             return None
-        # Ingest runs after the epoch/lease guards, so stale-epoch outputs
-        # drop exactly like their segments.
+        # Before the terminal check, after the epoch/lease guards: a closed
+        # request still delivers its final unit here.
         await self._ingest_action_capture(item, expected_epoch)
+        if self._ctx.plugin.data_plane.is_terminal(item.request_id):
+            return None
         if self._out.auto_responds():
             active_request_id = session.active_request_id
             if active_request_id is not None and active_request_id != item.request_id:
