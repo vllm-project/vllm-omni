@@ -442,8 +442,10 @@ class HiUniPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
             "img_cfg_scale": float(extra_args.get("img_cfg_scale", extra_args.get("image_cfg_scale", 1.0))),
             "shift": float(extra_args.get("shift", extra_args.get("flow_shift", 4.0))),
             "num_inference_steps": int(sp.num_inference_steps or 25),
-            "height": int(sp.height) if sp.height else None,
-            "width": int(sp.width) if sp.width else None,
+            # /v1/images/edits with size="auto" fills in the input image size and flags it as not provided;
+            # treat that as no explicit size so the output follows the preprocessed reference grid.
+            "height": int(sp.height) if sp.height and not getattr(sp, "height_not_provided", False) else None,
+            "width": int(sp.width) if sp.width and not getattr(sp, "width_not_provided", False) else None,
         }
 
     def _forward_t2i(self, prompt: str, s: dict[str, Any]) -> DiffusionOutput:

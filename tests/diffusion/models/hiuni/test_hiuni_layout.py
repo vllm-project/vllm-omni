@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU checks for HiUni token layouts, attention masks, sigmas and pixel patch helpers."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -12,6 +14,7 @@ from vllm_omni.diffusion.models.hiuni.pipeline_hiuni import (
     IM_START_ID,
     IMG_PAD_ID,
     TIME_TOKEN_ID,
+    HiUniPipeline,
     build_attention_mask,
     build_positions,
     build_startend,
@@ -25,6 +28,7 @@ from vllm_omni.diffusion.models.hiuni.pipeline_hiuni import (
     t2i_layout,
 )
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_hiuni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -115,6 +119,16 @@ def test_decode_image_shapes_and_resize():
     assert image.size == (96, 64)
     assert image.getpixel((0, 0)) == (128, 128, 128)
     assert decode_image(latents, 64, 96, size=(50, 40)).size == (50, 40)
+
+
+def test_auto_edit_size_is_not_an_explicit_size():
+    def sizes(**kwargs):
+        req = SimpleNamespace(sampling_params=OmniDiffusionSamplingParams(height=576, width=480, **kwargs))
+        sampling = HiUniPipeline._sampling(HiUniPipeline, req)
+        return sampling["height"], sampling["width"]
+
+    assert sizes() == (576, 480)
+    assert sizes(height_not_provided=True, width_not_provided=True) == (None, None)
 
 
 def test_sample_token_greedy_and_top_k_one():
