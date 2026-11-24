@@ -145,6 +145,15 @@ offload never turns a finished request into an error. Restoring offloaded
 pages into the prefix-hit lookup path is a follow-up phase: phase 1 is
 capacity-only offloading.
 
+The host store is bounded by `diffusion_kv_offload_max_bytes` when it is set.
+The Scheduler plans the evictions from its index (oldest unreferenced pages
+first), the Engine relays `discard_diffusion_kv_pages` to the Workers, and the
+Scheduler forgets a page only after the Workers report the payload gone; a
+failed discard keeps the page tracked and the plan is retried. A page with live
+references is never planned, so the budget may be exceeded while restores are
+in flight. Omitting the budget keeps every offloaded page resident for the life
+of the process.
+
 ### AR-to-DiT transfer contract
 
 When an AR stage and a DiT stage are deployed separately, the previous
@@ -337,7 +346,7 @@ and a prepared memory-profile request. The main fields are:
 | `diffusion_kv_mode` | `dense_legacy` (default) or `paged_scheduler` |
 | `diffusion_kv_max_rows_per_request` | Worker row capacity for one public request, including CFG branches |
 | `enable_diffusion_kv_page_offload` | Copy the stable prefix pages of completed requests to host memory (phase 1; requires `paged_scheduler` and `enable_prefix_caching`) |
-| `diffusion_kv_offload_max_bytes` | Optional host byte budget for offloaded pages; `None` keeps pages until explicit invalidation |
+| `diffusion_kv_offload_max_bytes` | Optional host byte budget for offloaded pages. When set, the Scheduler discards the oldest unreferenced host pages once the budget is exceeded; `None` keeps every offloaded page resident for the life of the process |
 | `kv_cache_memory_bytes` | Optional explicit physical KV-pool budget per Worker rank |
 | `gpu_memory_utilization` | Automatic pool sizing when no byte budget is supplied |
 | `diffusion_attention_backend` | Must resolve to `FLASH_ATTN` for the current paged implementation |

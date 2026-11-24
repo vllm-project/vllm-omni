@@ -70,7 +70,7 @@ stages:
 | `diffusion_kv_max_rows_per_request` | Yes for paged | Positive Worker row limit, including all internal CFG branches; use `1` without CFG and `2` for standard CFG |
 | `enable_prefix_caching` | Optional | Publish the stable prefix of completed requests so later requests can hit the cached pages |
 | `enable_diffusion_kv_page_offload` | Optional | Also copy those published prefix pages to host memory after a request completes, freeing their device blocks. Requires `paged_scheduler` and `enable_prefix_caching` |
-| `diffusion_kv_offload_max_bytes` | Optional | Host byte budget for offloaded pages; omit it to keep every offloaded page resident until invalidated |
+| `diffusion_kv_offload_max_bytes` | Optional | Host byte budget for offloaded pages. When set, the oldest unreferenced host pages are discarded once the budget is exceeded; omit it to keep every offloaded page resident for the life of the process |
 | `kv_cache_memory_bytes` | Optional | Explicit physical KV-pool budget per Worker/rank; omit it to use automatic sizing |
 | `gpu_memory_utilization` | Optional | Automatic pool-sizing fraction when no explicit byte budget is set |
 | `max_num_seqs` | Recommended `1` | Public request capacity; it is separate from the internal CFG row limit |

@@ -1292,29 +1292,56 @@ class DiffusionEngine:
 
         scheduler = self.scheduler
         pending = scheduler.pending_kv_page_offloads()
-        if not pending:
-            return
-        request_ids = list(pending)
-        pages = [page for targets in pending.values() for page in targets]
-        try:
-            sizes = self.executor.save_diffusion_kv_pages(pages)
-            for request_id, targets in pending.items():
-                scheduler.commit_kv_page_offload(
-                    request_id,
-                    {page.key: int(sizes.get(page.key, 0)) for page in targets},
-                )
-        except Exception as exc:
-            logger.error(
-                "Diffusion KV page offload failed for requests %s; releasing them on-device",
-                request_ids,
-                exc_info=True,
-            )
+        if pending:
+            request_ids = list(pending)
+            pages = [page for targets in pending.values() for page in targets]
             try:
-                scheduler.abort_kv_page_offload(request_ids)
-            except Exception:
-                logger.exception("Failed to release requests held for Diffusion KV page offload")
-                self._fail_engine(exc)
-                raise
+                sizes = self.executor.save_diffusion_kv_pages(pages)
+                for request_id, targets in pending.items():
+                    scheduler.commit_kv_page_offload(
+                        request_id,
+                        {page.key: int(sizes.get(page.key, 0)) for page in targets},
+                    )
+            except Exception as exc:
+                logger.error(
+                    "Diffusion KV page offload failed for requests %s; releasing them on-device",
+                    request_ids,
+                    exc_info=True,
+                )
+                try:
+                    scheduler.abort_kv_page_offload(request_ids)
+                except Exception:
+                    logger.exception("Failed to release requests held for Diffusion KV page offload")
+                    self._fail_engine(exc)
+                    raise
+            # The budget only grows when a commit lands, so planning here keeps
+            # a failed discard from being retried on every idle loop iteration;
+            # the next commit retries it.
+            self._drain_kv_page_discards()
+
+    def _drain_kv_page_discards(self) -> None:
+        """Evict host-resident pages that no longer fit the configured budget.
+
+        The Scheduler owns the byte budget and plans the evictions; the
+        Workers own the payloads, so the Engine relays the discard and only
+        then lets the Scheduler forget the pages.  A failed discard leaves the
+        index untouched and the plan is retried on the next drain.
+        """
+
+        scheduler = self.scheduler
+        keys = scheduler.plan_kv_page_discards()
+        if not keys:
+            return
+        try:
+            discarded = self.executor.discard_diffusion_kv_pages(keys)
+        except Exception:
+            logger.exception(
+                "Discarding %d Diffusion KV page(s) failed; retrying after the next offload",
+                len(keys),
+            )
+            return
+        scheduler.confirm_kv_page_discards(keys)
+        logger.info("Discarded %d Diffusion KV page(s) to enforce the host offload budget", discarded)
 
     def _prepare_kv_for_forward(self, sched_output: DiffusionSchedulerOutput) -> None:
         if (

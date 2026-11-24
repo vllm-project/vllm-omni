@@ -248,6 +248,13 @@ class DiffusionKVOffloadIndex:
     def pages(self) -> tuple[OffloadedKVPage, ...]:
         return tuple(self._pages.values())
 
+    def num_bytes(self, key: bytes) -> int:
+        """Return the reported host size of one tracked page."""
+
+        if key not in self._bytes:
+            raise KeyError(f"No offloaded KV page for key {key!r}")
+        return self._bytes[key]
+
     def refs(self, key: bytes) -> int:
         """Return the live reference count of one page."""
 
@@ -398,6 +405,11 @@ class DiffusionKVOffloadCoordinator:
     The coordinator owns the index, drives the transport and enforces the host
     byte budget.  Pages are evicted from the host store only when nothing
     references them, so a restore can never race an eviction.
+
+    A multi-process deployment never moves bytes inside the Scheduler: the
+    Engine relays page names over RPC.  Such a caller holds a budget without a
+    local transport and enforces it by driving
+    :meth:`plan_budget_evictions` -> RPC discard -> :meth:`confirm_evictions`.
     """
 
     def __init__(
@@ -408,11 +420,9 @@ class DiffusionKVOffloadCoordinator:
     ) -> None:
         if max_bytes is not None and (type(max_bytes) is not int or max_bytes <= 0):
             raise ValueError(f"max_bytes must be a positive integer when set, got {max_bytes!r}")
-        if transport is None and max_bytes is not None:
-            # A budget needs a discard path.  Without a transport the
-            # coordinator can only track pages, so a budget would be a
-            # promise the coordinator cannot keep.
-            raise ValueError("max_bytes requires a transport that can discard host-resident pages")
+        # A budget without a transport is legal: the caller relays discards to
+        # the Workers itself.  ``enforce_budget`` raises in that case instead
+        # of leaving the budget silently unenforced.
         self._transport = transport
         self._max_bytes = max_bytes
         self._index = DiffusionKVOffloadIndex()
@@ -532,25 +542,49 @@ class DiffusionKVOffloadCoordinator:
 
         Returns the keys that were dropped.  Referenced pages are never
         dropped, so the budget can temporarily be exceeded while requests are
-        in flight.
+        in flight.  A caller that moves payloads itself must use this method;
+        one that relays discards by RPC uses :meth:`plan_budget_evictions` and
+        :meth:`confirm_evictions` instead.
         """
 
         if self._max_bytes is None:
             return ()
-        dropped: list[bytes] = []
-        while self.bytes_used > self._max_bytes:
-            candidate = self._find_evictable()
-            if candidate is None:
-                break
-            self._require_transport("discard").discard_pages([candidate])
-            self._index.remove(candidate)
-            dropped.append(candidate)
-        return tuple(dropped)
+        planned = self.plan_budget_evictions()
+        if not planned:
+            return ()
+        self._require_transport("discard").discard_pages(planned)
+        self.confirm_evictions(planned)
+        return planned
 
-    def _find_evictable(self) -> bytes | None:
-        """Return the oldest unreferenced page key, if any."""
+    def plan_budget_evictions(self) -> tuple[bytes, ...]:
+        """Return the keys to discard so the host store fits its budget.
 
+        Nothing is discarded or forgotten here: a caller that moves payloads
+        by RPC discards them and then calls :meth:`confirm_evictions`.  Pages
+        with live references are never returned, so the plan may leave the
+        budget exceeded while restores are in flight.
+        """
+
+        if self._max_bytes is None:
+            return ()
+        planned: list[bytes] = []
+        remaining = self.bytes_used
         for page in self._index.pages():
-            if self._index.refs(page.key) == 0:
-                return page.key
-        return None
+            if remaining <= self._max_bytes:
+                break
+            if self._index.refs(page.key) != 0:
+                continue
+            planned.append(page.key)
+            remaining -= self._index.num_bytes(page.key)
+        return tuple(planned)
+
+    def confirm_evictions(self, keys: Iterable[bytes]) -> None:
+        """Forget pages whose payloads the caller has discarded."""
+
+        for key in keys:
+            if self._index.page(key) is None:
+                # Already confirmed: a retried discard must stay idempotent.
+                continue
+            if self._index.refs(key) != 0:
+                raise RuntimeError(f"Offloaded KV page {key!r} was discarded while still referenced")
+            self._index.remove(key)

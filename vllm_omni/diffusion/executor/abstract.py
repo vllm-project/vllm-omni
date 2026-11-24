@@ -232,6 +232,37 @@ class DiffusionExecutor(ABC):
                 raise RuntimeError(f"Worker rank {rank} disagrees on saved Diffusion KV page sizes")
         return dict(sizes)
 
+    def discard_diffusion_kv_pages(self, keys: Sequence[bytes]) -> int:
+        """Drop host-resident diffusion KV page payloads on every Worker.
+
+        The Scheduler plans the discards from its byte budget and only forgets
+        a page after this call confirms the payload is gone.  All ranks must
+        agree: the Scheduler index describes one store per Worker, so a rank
+        that drops a different set would leave the others holding bytes the
+        Scheduler no longer counts.
+        """
+
+        unique_keys = list(dict.fromkeys(keys))
+        if not unique_keys:
+            return 0
+        result = self.collective_rpc(
+            "discard_diffusion_kv_pages",
+            args=(unique_keys,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if not isinstance(result, list) or not result:
+            raise TypeError(f"discard_diffusion_kv_pages returned {type(result).__name__}, expected a non-empty list")
+        discarded = result[0]
+        if not isinstance(discarded, int):
+            raise TypeError(f"discard_diffusion_kv_pages returned {type(discarded).__name__}, expected int")
+        for rank, rank_discarded in enumerate(result[1:], start=1):
+            if rank_discarded != discarded:
+                raise RuntimeError(
+                    f"Worker rank {rank} discarded {rank_discarded} Diffusion KV page(s), expected {discarded}"
+                )
+        return discarded
+
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput) -> KVConnectorOutput | None:
         if scheduler_output.kv_prefetch_connector_metadata is not None:
             current = replace(

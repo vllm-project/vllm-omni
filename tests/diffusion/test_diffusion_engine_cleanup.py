@@ -78,9 +78,12 @@ def _make_offload_engine(
         pending_kv_page_offloads=Mock(return_value={rid: [page] for rid in pending}),
         commit_kv_page_offload=Mock(),
         abort_kv_page_offload=Mock(),
+        plan_kv_page_discards=Mock(return_value=()),
+        confirm_kv_page_discards=Mock(),
     )
     executor = SimpleNamespace(
         save_diffusion_kv_pages=Mock(side_effect=sizes if isinstance(sizes, Exception) else Mock(return_value=sizes)),
+        discard_diffusion_kv_pages=Mock(return_value=0),
     )
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine.scheduler = scheduler
@@ -127,6 +130,32 @@ def test_drain_kv_page_offloads_is_a_noop_without_holds() -> None:
 
     executor.save_diffusion_kv_pages.assert_not_called()
     scheduler.commit_kv_page_offload.assert_not_called()
+    executor.discard_diffusion_kv_pages.assert_not_called()
+    scheduler.confirm_kv_page_discards.assert_not_called()
+
+
+def test_drain_kv_page_offloads_confirms_the_budget_discards() -> None:
+    engine, scheduler, executor = _make_offload_engine(pending={"r0": True}, sizes={})
+    scheduler.plan_kv_page_discards.return_value = (b"page-1", b"page-2")
+    executor.discard_diffusion_kv_pages.return_value = 2
+
+    engine._drain_kv_page_offloads()
+
+    executor.discard_diffusion_kv_pages.assert_called_once_with((b"page-1", b"page-2"))
+    scheduler.confirm_kv_page_discards.assert_called_once_with((b"page-1", b"page-2"))
+
+
+def test_drain_kv_page_offloads_keeps_the_plan_when_the_discard_fails() -> None:
+    engine, scheduler, executor = _make_offload_engine(pending={"r0": True}, sizes={})
+    scheduler.plan_kv_page_discards.return_value = (b"page-1",)
+    executor.discard_diffusion_kv_pages.side_effect = RuntimeError("worker gone")
+
+    engine._drain_kv_page_offloads()
+
+    # The Worker still holds the payload, so the Scheduler must keep tracking
+    # it and retry on the next drain instead of forgetting it.
+    scheduler.confirm_kv_page_discards.assert_not_called()
+    engine._fail_engine.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -723,6 +723,19 @@ class DiffusionKVModelRunnerBackend:
         )
         return sizes
 
+    def discard_diffusion_kv_pages(self, keys: Sequence[bytes]) -> int:
+        """Drop host-resident page payloads; returns how many were present.
+
+        The Scheduler only forgets a page after this returns, so a missing key
+        here is not an error: a rank that never recorded the page simply
+        reports fewer drops and the executor rejects the disagreement.
+        """
+
+        store = self._kv_page_offload_store
+        if store is None:
+            return 0
+        return sum(1 for key in keys if store.discard(key))
+
     def _capture_page_payload(
         self,
         page: OffloadedKVPage,

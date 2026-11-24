@@ -669,6 +669,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
     def save_diffusion_kv_pages(self, pages: Sequence[OffloadedKVPage]) -> dict[bytes, int]:
         return self.diffusion_kv_backend.save_diffusion_kv_pages(pages)
 
+    def discard_diffusion_kv_pages(self, keys: Sequence[bytes]) -> int:
+        return self.diffusion_kv_backend.discard_diffusion_kv_pages(keys)
+
     def refresh_diffusion_kv_block_table_layout(self) -> None:
         self.diffusion_kv_backend.refresh_block_table_layout()
 

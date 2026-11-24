@@ -309,6 +309,118 @@ def test_coordinator_rejects_an_invalid_budget() -> None:
         DiffusionKVOffloadCoordinator(transport=_transport(device), max_bytes=0)
 
 
+def test_coordinator_plans_budget_evictions_without_a_transport() -> None:
+    pages = [_page(1, source_block_id=0), _page(2, source_block_id=1)]
+    coordinator = DiffusionKVOffloadCoordinator(max_bytes=128)
+    coordinator.commit_saved_pages(pages, {pages[0].key: 128, pages[1].key: 128})
+
+    # The Worker still holds both payloads: the index only forgets a page once
+    # the caller confirms the discard.
+    assert coordinator.plan_budget_evictions() == (pages[0].key,)
+    assert len(coordinator.index) == 2
+    coordinator.confirm_evictions((pages[0].key,))
+    assert pages[0].key not in coordinator.index
+    assert coordinator.bytes_used == 128
+
+
+def test_coordinator_plan_is_stable_until_it_is_confirmed() -> None:
+    page = _page(1)
+    coordinator = DiffusionKVOffloadCoordinator(max_bytes=1)
+    coordinator.commit_saved_pages([page], {page.key: 64})
+
+    assert coordinator.plan_budget_evictions() == (page.key,)
+    assert coordinator.plan_budget_evictions() == (page.key,)
+    coordinator.confirm_evictions((page.key,))
+    assert coordinator.plan_budget_evictions() == ()
+
+
+def test_coordinator_confirm_evictions_tolerates_a_repeated_key() -> None:
+    page = _page(1)
+    coordinator = DiffusionKVOffloadCoordinator(max_bytes=1)
+    coordinator.commit_saved_pages([page], {page.key: 8})
+
+    coordinator.confirm_evictions((page.key,))
+    coordinator.confirm_evictions((page.key,))
+
+    assert len(coordinator.index) == 0
+
+
+def test_coordinator_enforce_budget_requires_a_local_transport() -> None:
+    page = _page(1)
+    coordinator = DiffusionKVOffloadCoordinator(max_bytes=1)
+    coordinator.commit_saved_pages([page], {page.key: 8})
+
+    with pytest.raises(RuntimeError, match="requires a local transport"):
+        coordinator.enforce_budget()
+
+    assert page.key in coordinator.index
+
+
+def test_scheduler_commit_tracks_saved_pages_in_the_offload_index() -> None:
+    from unittest import mock
+
+    from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
+
+    class _Scheduler(BaseScheduler):
+        def update_from_output(self, sched_output, output) -> set[str]:
+            del sched_output, output
+            return set()
+
+    page = _page(1, source_block_id=3)
+    block_pool = SimpleNamespace(free_blocks=mock.Mock())
+    scheduler = _Scheduler()
+    scheduler.od_config = SimpleNamespace(enable_diffusion_kv_page_offload=True)
+    scheduler._kv_offload_coordinator = DiffusionKVOffloadCoordinator(max_bytes=40)
+    scheduler._diffusion_kv_manager = SimpleNamespace(native_manager=SimpleNamespace(block_pool=block_pool))
+    scheduler._release_request_kv = mock.Mock()
+    scheduler._kv_offloading_requests["r0"] = SimpleNamespace(request_id="r0")
+    scheduler._kv_offload_pins["r0"] = ["pinned-block"]
+    scheduler._kv_offload_targets["r0"] = (page,)
+
+    scheduler.commit_kv_page_offload("r0", {page.key: 40})
+
+    index = scheduler.kv_offload_index
+    assert index is not None
+    assert page.key in index
+    block_pool.free_blocks.assert_called_once_with(["pinned-block"])
+    scheduler._release_request_kv.assert_called_once()
+    assert scheduler.pending_kv_page_offloads() == {}
+    # Exactly at the budget: nothing is evicted.
+    assert scheduler.plan_kv_page_discards() == ()
+
+
+def test_scheduler_plans_discards_above_the_host_budget() -> None:
+    from unittest import mock
+
+    from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
+
+    class _Scheduler(BaseScheduler):
+        def update_from_output(self, sched_output, output) -> set[str]:
+            del sched_output, output
+            return set()
+
+    first = _page(1, source_block_id=0)
+    second = _page(2, source_block_id=1)
+    scheduler = _Scheduler()
+    scheduler.od_config = SimpleNamespace(enable_diffusion_kv_page_offload=True)
+    scheduler._kv_offload_coordinator = DiffusionKVOffloadCoordinator(max_bytes=40)
+    scheduler._diffusion_kv_manager = SimpleNamespace(
+        native_manager=SimpleNamespace(block_pool=SimpleNamespace(free_blocks=mock.Mock()))
+    )
+    scheduler._release_request_kv = mock.Mock()
+    for request_id, page in (("r0", first), ("r1", second)):
+        scheduler._kv_offloading_requests[request_id] = SimpleNamespace(request_id=request_id)
+        scheduler._kv_offload_pins[request_id] = []
+        scheduler._kv_offload_targets[request_id] = (page,)
+        scheduler.commit_kv_page_offload(request_id, {page.key: 40})
+
+    assert scheduler.plan_kv_page_discards() == (first.key,)
+    scheduler.confirm_kv_page_discards((first.key,))
+    assert scheduler.plan_kv_page_discards() == ()
+    assert scheduler.kv_offload_index is not None
+    assert second.key in scheduler.kv_offload_index
+
+
 def test_store_and_index_agree_on_which_pages_are_available() -> None:
     device = _FakeDevice()
     device.blocks[(0, 0)] = _payload(7)
