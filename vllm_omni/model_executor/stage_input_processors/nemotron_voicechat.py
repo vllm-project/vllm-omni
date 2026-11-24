@@ -520,9 +520,19 @@ def talker2code2wav_full_payload(
     # region: NeMo keeps gen_codes rows t = P..T-1 (P = logical prompt len),
     # i.e. row indices P-1 onward here. P >= 1 always (a system prompt is
     # required), so this never drops acoustic frames.
-    prompt_len = _info_get(getattr(request, "additional_information", None), "nvc_logical_prompt_len")
+    # ``_request_info`` decodes both transport generations; the request payload
+    # can arrive as a serialized object rather than a dict, which the dict-only
+    # lookup used to miss. The talker reports the length it trimmed against in
+    # its own output meta, so use that as the fallback -- the async producer
+    # above already works this way.
+    prompt_len = _info_get(_request_info(request), "nvc_logical_prompt_len")
     if prompt_len is None:
-        prompt_len = _info_get(getattr(request, "additional_information_cpu", None), "nvc_logical_prompt_len")
+        for source in (pooling_output, kwargs.get("multimodal_output")):
+            prompt_len = _info_get(source, "meta.nvc_logical_prompt_len")
+            if prompt_len is None:
+                prompt_len = _info_get(source, "nvc_logical_prompt_len")
+            if prompt_len is not None:
+                break
     if prompt_len is None:
         # Explicit failure, never a silent trim=0 (untrimmed prompt-region codes
         # would ship to the codec). The connector layer logs producer errors.
