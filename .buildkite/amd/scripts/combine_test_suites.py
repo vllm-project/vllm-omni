@@ -89,8 +89,13 @@ def combine_test_suites(suite_specs: Sequence[str]) -> dict[str, Any]:
             combined["env"][name] = value
 
         suite_steps = _flatten_steps(suite, input_path)
-        retained_steps = [step for step in suite_steps if step not in prior_steps]
-        duplicate_steps = [step for step in suite_steps if step in prior_steps]
+        retained_steps: list[dict[str, Any]] = []
+        duplicate_steps: list[dict[str, Any]] = []
+        for step in suite_steps:
+            if step in prior_steps:
+                duplicate_steps.append(step)
+            else:
+                retained_steps.append(step)
         if duplicate_steps:
             duplicate_jobs = sum(step.get("parallelism", 1) for step in duplicate_steps)
             print(
