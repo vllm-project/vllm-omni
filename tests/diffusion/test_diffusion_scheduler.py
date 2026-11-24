@@ -37,6 +37,7 @@ from vllm_omni.diffusion.sched import (
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData, SchedulerRequestState
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_COUNT_KEY
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -599,6 +600,62 @@ class TestGetRequestBatchSamplingParamsKey:
 
 
 class TestRequestScheduler:
+    @pytest.mark.parametrize("shift_key", ["flow_shift", "audio_flow_shift", "timestep_shift", "timesteps_shift"])
+    @pytest.mark.parametrize("flow_shift", [float("nan"), 0.0, -2.0, "abc"])
+    def test_rejects_invalid_flow_shift_without_batch_key(
+        self, monkeypatch, shift_key: str, flow_shift: object
+    ) -> None:
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.sched.request_scheduler.request_batch_key_allowed", lambda *args, **kwargs: False
+        )
+        request = _make_request("unbatchable")
+        request.sampling_params.extra_args = {shift_key: flow_shift}
+        assert self.scheduler._build_sampling_params_key(request) is None
+
+        with pytest.raises(OmniClientError):
+            self.scheduler.add_request(request)
+
+        assert self.scheduler.num_waiting_requests() == 0
+        assert self.scheduler.get_request_state("unbatchable") is None
+
+    @pytest.mark.parametrize("shift_key", ["flow_shift", "audio_flow_shift", "timestep_shift", "timesteps_shift"])
+    @pytest.mark.parametrize(
+        "flow_shift",
+        [
+            "nan",
+            "inf",
+            "-inf",
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            0.0,
+            -2.0,
+            "abc",
+            True,
+            False,
+            pytest.param(10**400, id="huge-int"),
+        ],
+    )
+    def test_rejects_invalid_flow_shift(self, shift_key: str, flow_shift: object) -> None:
+        request = _make_request("invalid-shift")
+        request.sampling_params.extra_args = {shift_key: flow_shift}
+
+        with pytest.raises(OmniClientError, match=rf"^{shift_key} (must be|is too large)") as exc_info:
+            self.scheduler.add_request(request)
+        assert type(exc_info.value.__cause__) is ValueError
+        assert str(exc_info.value) == str(exc_info.value.__cause__)
+
+        assert self.scheduler.num_waiting_requests() == 0
+
+    @pytest.mark.parametrize("shift_key", ["flow_shift", "audio_flow_shift", "timestep_shift", "timesteps_shift"])
+    @pytest.mark.parametrize("shift", [None, 0.25, "3.0"])
+    def test_accepts_positive_or_unspecified_shift(self, shift_key: str, shift: object) -> None:
+        request = _make_request("valid-shift")
+        request.sampling_params.extra_args = {shift_key: shift}
+
+        assert self.scheduler.add_request(request) == "valid-shift"
+        assert self.scheduler.num_waiting_requests() == 1
+
     def setup_method(self) -> None:
         self.scheduler: RequestScheduler = RequestScheduler()
         self.scheduler.initialize(_scheduler_config(request_batch_max_wait_ms=0.0))
@@ -1987,6 +2044,32 @@ class TestDiffusionEngine:
 
 
 class TestStepScheduler:
+    @pytest.mark.parametrize("shift_key", ["flow_shift", "audio_flow_shift", "timestep_shift", "timesteps_shift"])
+    @pytest.mark.parametrize(
+        "flow_shift",
+        ["nan", "inf", "-inf", float("nan"), float("inf"), float("-inf"), "abc", 0.0, -2.0, True, False],
+    )
+    def test_rejects_invalid_flow_shift_before_queueing(self, shift_key: str, flow_shift: object) -> None:
+        request = _make_step_request("invalid-shift", num_inference_steps=2)
+        request.sampling_params.extra_args = {shift_key: flow_shift}
+
+        with pytest.raises(OmniClientError):
+            self.scheduler.add_request(request)
+
+        assert self.scheduler.num_waiting_requests() == 0
+        assert self.scheduler.get_request_state("invalid-shift") is None
+        assert self.scheduler._request_progress == {}
+
+    @pytest.mark.parametrize("shift_key", ["flow_shift", "audio_flow_shift", "timestep_shift", "timesteps_shift"])
+    @pytest.mark.parametrize("extra_args", [{}, {"flow_shift": None}, {"flow_shift": 0.25}, {"flow_shift": "5.0"}])
+    def test_accepts_finite_or_unspecified_flow_shift(self, shift_key: str, extra_args: dict) -> None:
+        request = _make_step_request("valid-shift", num_inference_steps=2)
+        request.sampling_params.extra_args = {shift_key: value for value in extra_args.values()}
+
+        assert self.scheduler.add_request(request) == "valid-shift"
+        assert self.scheduler.num_waiting_requests() == 1
+        assert self.scheduler.schedule().scheduled_request_ids == ["valid-shift"]
+
     def setup_method(self) -> None:
         self.scheduler: StepScheduler = StepScheduler()
         self.scheduler.initialize(_scheduler_config())
