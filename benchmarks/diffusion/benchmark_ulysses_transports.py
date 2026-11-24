@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm_omni.diffusion.distributed.ulysses_transport import overlap_chunk_count
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.platforms import current_omni_platform
 
@@ -177,9 +178,9 @@ def main() -> None:
                 results = {t: {int(s): ms for s, ms in v.items()} for t, v in json.load(f).items()}
         all_results[world_size] = results
         hpr = args.heads // world_size
-        chunks = args.overlap_chunks or max(hpr // 2, 1)
+        chunks = overlap_chunk_count(hpr, args.overlap_chunks)  # 0: the overlap does not apply to this head count
         q_bytes = [s // world_size * args.heads * args.head_dim * itemsize for s in seqs]
-        chunk_bytes = [s // world_size * (hpr // chunks) * args.head_dim * itemsize for s in seqs]
+        chunk_bytes = [s // world_size * (hpr // max(chunks, 1)) * args.head_dim * itemsize for s in seqs]
         series = {t: [results.get(t, {}).get(s) for s in seqs] for t in TRANSPORTS}
 
         print(f"\n## {world_size} GPUs, sm{capability}, {args.heads} heads x {args.head_dim}, {chunks} overlap chunks")
@@ -197,7 +198,7 @@ def main() -> None:
             min(x for x in (o, c) if x is not None) if (o, c) != (None, None) else None
             for o, c in zip(series["copy_engine_overlap"], series["copy_engine"])
         ]
-        if hpr // chunks >= 1 and hpr % chunks == 0 and chunks > 1:
+        if chunks:
             overlap = _threshold(chunk_bytes, series["copy_engine_overlap"], series["copy_engine"], args.min_gain)
             if overlap is not None:
                 tables["COPY_ENGINE_OVERLAP_CHUNK"][world_size] = overlap
