@@ -282,6 +282,25 @@ def test_ltx_reference_runner_uses_platform_vocoder_determinism(
         assert torch.backends.cudnn.deterministic is previous
 
 
+@pytest.mark.parametrize(
+    ("hip_version", "expected"),
+    [(None, None), ("6.3.0", "1")],
+    ids=["cuda", "rocm"],
+)
+def test_ltx25_runner_env_requests_deterministic_miopen(
+    monkeypatch: pytest.MonkeyPatch,
+    hip_version: str | None,
+    expected: str | None,
+) -> None:
+    monkeypatch.setattr(torch.version, "hip", hip_version)
+    monkeypatch.delenv("MIOPEN_DEBUG_CONVOLUTION_DETERMINISTIC", raising=False)
+
+    env = _ltx25_runner_env("official-revision")
+
+    assert env.get("MIOPEN_DEBUG_CONVOLUTION_DETERMINISTIC") == expected
+    assert env["VLLM_TEST_LTX_OFFICIAL_REVISION"] == "official-revision"
+
+
 def test_connector_weight_index_is_authoritative(tmp_path: Path) -> None:
     from .run_ltx25_reference import _connector_weight_files
 
@@ -310,6 +329,25 @@ def _run(command: list[str], *, env: dict[str, str], timeout: int = 1800) -> Non
     start = time.perf_counter()
     subprocess.run(command, env=env, timeout=timeout, check=True)
     print(f"{' '.join(command[:3])} finished in {time.perf_counter() - start:.1f}s")
+
+
+def _ltx25_runner_env(official_revision: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
+    env["PYTHONUNBUFFERED"] = "1"
+    repository_root = Path(__file__).resolve().parents[4]
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(repository_root) if not existing_pythonpath else f"{repository_root}{os.pathsep}{existing_pythonpath}"
+    )
+    if torch.version.hip is not None:
+        # The LTX-2.5 vocoder is convolution-heavy. MIOpen can otherwise pick
+        # numerically nondeterministic kernels independently in the official
+        # and Omni subprocesses, which makes waveform parity move between
+        # identical runs. Restrict both sides to deterministic convolution
+        # solvers while leaving CUDA's cuDNN policy unchanged.
+        env["MIOPEN_DEBUG_CONVOLUTION_DETERMINISTIC"] = "1"
+    return env
 
 
 def _omni_runner_timeout_args() -> list[str]:
@@ -822,14 +860,7 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
         str(request_path),
         "--enable-layerwise-offload",
     ]
-    env = os.environ.copy()
-    env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
-    env["PYTHONUNBUFFERED"] = "1"
-    repository_root = Path(__file__).resolve().parents[4]
-    existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        str(repository_root) if not existing_pythonpath else f"{repository_root}{os.pathsep}{existing_pythonpath}"
-    )
+    env = _ltx25_runner_env(official_revision)
 
     official_output = output_root / "official"
     _run(
@@ -967,14 +998,7 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
         str(request_path),
         "--enable-layerwise-offload",
     ]
-    env = os.environ.copy()
-    env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
-    env["PYTHONUNBUFFERED"] = "1"
-    repository_root = Path(__file__).resolve().parents[4]
-    existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        str(repository_root) if not existing_pythonpath else f"{repository_root}{os.pathsep}{existing_pythonpath}"
-    )
+    env = _ltx25_runner_env(official_revision)
 
     official_output = output_root / "official"
     official_sidecar_args: list[str] = []
@@ -1116,14 +1140,7 @@ def test_ltx25_t2a_matches_official(accuracy_artifact_root: Path) -> None:
     # The audio-only transformer and Gemma fit on one H100 without offload.
     runner = Path(__file__).with_name("run_ltx25_reference.py")
     runner_args = [str(runner), "--request", str(request_path)]
-    env = os.environ.copy()
-    env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
-    env["PYTHONUNBUFFERED"] = "1"
-    repository_root = Path(__file__).resolve().parents[4]
-    existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        str(repository_root) if not existing_pythonpath else f"{repository_root}{os.pathsep}{existing_pythonpath}"
-    )
+    env = _ltx25_runner_env(official_revision)
 
     official_output = output_root / "official"
     _run(
