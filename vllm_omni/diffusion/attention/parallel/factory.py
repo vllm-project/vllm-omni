@@ -58,6 +58,7 @@ def build_parallel_attention_strategy(
     ulysses_a2a_permute = getattr(p, "ulysses_a2a_permute", False)
     ulysses_a2a_zero_copy = getattr(p, "ulysses_a2a_zero_copy", False)
     ulysses_ce_overlap_chunks = int(getattr(p, "ulysses_ce_overlap_chunks", 0) or 0)
+    ulysses_a2a_backend = getattr(p, "ulysses_a2a_backend", "copy_engine")
     if ulysses_a2a_permute:
         from vllm_omni.diffusion.distributed.a2a_permute import validate_a2a_permute_config
 
@@ -116,6 +117,7 @@ def build_parallel_attention_strategy(
                 use_sync=use_sync,
                 ulysses_a2a_permute=ulysses_a2a_permute,
                 ulysses_a2a_zero_copy=ulysses_a2a_zero_copy,
+                ulysses_a2a_backend=ulysses_a2a_backend,
             )
         logger.debug(f"Using AllGatherKVParallelAttention (allgather_degree={allgather_degree})")
         return AllGatherKVParallelAttention(sp_group=sp_group)
@@ -131,6 +133,7 @@ def build_parallel_attention_strategy(
             ulysses_a2a_permute=ulysses_a2a_permute,
             ulysses_a2a_zero_copy=ulysses_a2a_zero_copy,
             ce_overlap_chunks=ulysses_ce_overlap_chunks,
+            ulysses_a2a_backend=ulysses_a2a_backend,
         )
 
     # Pure Ring Attention

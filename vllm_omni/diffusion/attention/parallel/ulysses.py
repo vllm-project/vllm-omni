@@ -253,6 +253,7 @@ class UlyssesParallelAttention:
         ulysses_a2a_permute: bool = False,
         ulysses_a2a_zero_copy: bool = False,
         ce_overlap_chunks: int = 0,
+        ulysses_a2a_backend: str = "copy_engine",
     ) -> None:
         self._sp_group = sp_group
         self.ce_overlap_chunks = int(ce_overlap_chunks)
@@ -265,6 +266,7 @@ class UlyssesParallelAttention:
         # existing exchange, and explicit symmetric memory takes precedence.
         self._packed_qkv = not ulysses_a2a_permute and envs.VLLM_OMNI_PACKED_QKV
         self._ulysses_a2a_zero_copy = ulysses_a2a_zero_copy
+        self._flashinfer_a2a = ulysses_a2a_permute and ulysses_a2a_backend == "flashinfer"
         if ulysses_a2a_permute:
             from vllm_omni.diffusion.distributed.a2a_permute import (
                 ensure_a2a_permute_available,
@@ -280,6 +282,10 @@ class UlyssesParallelAttention:
             )
             if _a2a_permute_enabled(ulysses_a2a_permute, scatter_idx, gather_idx, sp_group.ulysses_world_size):
                 ensure_a2a_permute_available()
+                if self._flashinfer_a2a:
+                    from vllm_omni.diffusion.distributed.flashinfer_ulysses import ensure_flashinfer_ulysses_available
+
+                    ensure_flashinfer_ulysses_available()
 
     @property
     def enabled(self) -> bool:
@@ -569,14 +575,20 @@ class UlyssesParallelAttention:
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd, ulysses_qkv_fwd_group
 
                 group_name = self._ulysses_pg.group_name
+                use_flashinfer = self._flashinfer_a2a and gate_compress is None
                 # Exchange the gate first: it is copied out of the shared
                 # workspace, while zero-copy Q/K/V stay views of it that any
                 # later exchange would overwrite before attention reads them.
                 if gate_compress is not None:
                     gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
-                query, key, value = ulysses_qkv_fwd_group(
-                    query, key, value, group_name, ulysses_world_size, self._ulysses_a2a_zero_copy
-                )
+                if use_flashinfer:
+                    from vllm_omni.diffusion.distributed.flashinfer_ulysses import ulysses_fi_qkv
+
+                    query, key, value = ulysses_fi_qkv(query, key, value, group_name, ulysses_world_size)
+                else:
+                    query, key, value = ulysses_qkv_fwd_group(
+                        query, key, value, group_name, ulysses_world_size, self._ulysses_a2a_zero_copy
+                    )
                 if self._use_sync:
                     current_omni_platform.synchronize()
             elif (
@@ -773,14 +785,19 @@ class UlyssesParallelAttention:
             ctx.gather_idx,
             dist.get_world_size(ctx.ulysses_pg),
         ):
-            from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
+            if self._flashinfer_a2a:
+                from vllm_omni.diffusion.distributed.flashinfer_ulysses import ulysses_fi_o
 
-            output = ulysses_o_rev(
-                attn_output,
-                ctx.ulysses_pg.group_name,
-                dist.get_world_size(ctx.ulysses_pg),
-                self._ulysses_a2a_zero_copy,
-            )
+                output = ulysses_fi_o(attn_output, ctx.ulysses_pg.group_name, dist.get_world_size(ctx.ulysses_pg))
+            else:
+                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
+
+                output = ulysses_o_rev(
+                    attn_output,
+                    ctx.ulysses_pg.group_name,
+                    dist.get_world_size(ctx.ulysses_pg),
+                    self._ulysses_a2a_zero_copy,
+                )
             if ctx.use_sync:
                 current_omni_platform.synchronize()
             return output

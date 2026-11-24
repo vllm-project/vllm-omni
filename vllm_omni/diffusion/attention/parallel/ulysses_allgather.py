@@ -65,6 +65,7 @@ class UlyssesAllGatherKVParallelAttention(AllGatherKVParallelAttention):
         use_sync: bool,
         ulysses_a2a_permute: bool = False,
         ulysses_a2a_zero_copy: bool = False,
+        ulysses_a2a_backend: str = "copy_engine",
     ) -> None:
         super().__init__(sp_group)
         self._ulysses = UlyssesParallelAttention(
@@ -74,6 +75,7 @@ class UlyssesAllGatherKVParallelAttention(AllGatherKVParallelAttention):
             use_sync=use_sync,
             ulysses_a2a_permute=ulysses_a2a_permute,
             ulysses_a2a_zero_copy=ulysses_a2a_zero_copy,
+            ulysses_a2a_backend=ulysses_a2a_backend,
         )
 
     @property

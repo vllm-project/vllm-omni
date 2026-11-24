@@ -877,6 +877,7 @@ DIFFUSION_PARALLEL_KNBS = [
     ("ulysses_a2a_permute", True),
     ("ulysses_a2a_zero_copy", True),
     ("ulysses_ce_overlap_chunks", 2),
+    ("ulysses_a2a_backend", "flashinfer"),
     ("ring_degree", 2),
     ("allgather_degree", 8),
     ("use_hsdp", True),
@@ -911,8 +912,8 @@ def test_from_cli_args_applies_diffusion_parallel_knobs():
             # Standalone HSDP (all other parallelism at 1) cannot
             # auto-calculate its shard size; pass one explicitly.
             factory_kwargs["hsdp_shard_size"] = 2048
-        if knob in ("ulysses_a2a_zero_copy", "ulysses_ce_overlap_chunks"):
-            # Both options run on the copy-engine exchange.
+        if knob in ("ulysses_a2a_zero_copy", "ulysses_ce_overlap_chunks", "ulysses_a2a_backend"):
+            # These options run on the copy-engine exchange.
             factory_kwargs["ulysses_a2a_permute"] = True
         stage_cfg = StageConfigFactory.create_default_diffusion(factory_kwargs)[0]
         parallel_config = stage_cfg["engine_args"]["parallel_config"]

@@ -459,6 +459,7 @@ class OmniEngineArgs(EngineArgs):
     ulysses_a2a_permute: bool | None = None
     ulysses_a2a_zero_copy: bool | None = None
     ulysses_ce_overlap_chunks: int | None = None
+    ulysses_a2a_backend: str | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     use_hsdp: bool | None = None
@@ -831,6 +832,7 @@ class OrchestratorArgs:
     ulysses_a2a_permute: bool | None = None
     ulysses_a2a_zero_copy: bool | None = None
     ulysses_ce_overlap_chunks: int | None = None
+    ulysses_a2a_backend: str | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
@@ -975,6 +977,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "ulysses_a2a_permute",
         "ulysses_a2a_zero_copy",
         "ulysses_ce_overlap_chunks",
+        "ulysses_a2a_backend",
         "ring_degree",
         "allgather_degree",
         "use_hsdp",

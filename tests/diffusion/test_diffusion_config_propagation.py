@@ -86,11 +86,13 @@ class TestParallelConfigPropagation:
             ring_degree=1,
             ulysses_a2a_permute=True,
             ulysses_a2a_zero_copy=True,
+            ulysses_a2a_backend="flashinfer",
         )
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.parallel_config.ulysses_degree == 2
         assert od.parallel_config.ring_degree == 1
         assert od.parallel_config.ulysses_a2a_permute is True
+        assert od.parallel_config.ulysses_a2a_backend == "flashinfer"
         assert od.parallel_config.ulysses_a2a_zero_copy is True
 
     def test_ulysses_ce_overlap_roundtrip(self):
