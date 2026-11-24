@@ -78,10 +78,11 @@ uses the ordinary loader and does not request DLO's direct-checkpoint mmap.
 Keep the compatibility DLO flags for a model-specific full-topology rank-local
 lifecycle; do not add resident layers solely to force backend selection.
 
-The disk-backed encoder path is rank-local and single-rank in this release. With
-a multi-rank AllGather DiT group, a rank-local text encoder stays on the ordinary
-loader rather than joining the checkpoint-mmap plan, because the backend's
-rank-local mmap handles are tied to the DiT transport.
+The disk-backed encoder path is rank-local and single-rank in this release.
+Checkpoint-mmap eligibility is resolved per component from its own transfer, so
+a rank-local text encoder joins the checkpoint-mmap plan beside a multi-rank
+AllGather DiT group as well. An encoder that uses multi-rank AllGather itself
+is not planned and keeps the ordinary loader.
 
 ```python
 from vllm_omni import Omni
@@ -192,9 +193,11 @@ intersects the declaration with the user configuration and the parallel
 constraints. HSDP and a multi-rank AllGather transfer for that component resolve
 back to `PINNED` at plan-resolution time with a logged `fallback_reason`. TP
 greater than one and online quantization are loader-side preflights: the loader
-declines the mmap plan and keeps the ordinary loader, logging the reason. In
-every case the component keeps the ordinary loader. The declaration never
-changes how a component computes; it only selects where its weights are stored.
+declines the mmap plan and keeps the ordinary loader, logging the reason. When
+only an encoder is affected and a DiT is selected, the DiT is still planned and
+the encoder alone keeps the ordinary loader. In every case the component keeps
+the ordinary loader. The declaration never changes how a component computes; it
+only selects where its weights are stored.
 
 MiniMax-H3's text encoder is the first declarer: it streams `vision.blocks` and
 `text_model.layers` from the checkpoint files with the same two bounded staging
