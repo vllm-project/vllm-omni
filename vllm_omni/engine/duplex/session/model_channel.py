@@ -39,6 +39,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputContext,
     DuplexOutputDecision,
     DuplexStageSubmission,
+    ToolCallAbandonReason,
     duplex_data_plane_request_info,
     duplex_is_auxiliary_request,
     duplex_same_turn_request_ids,
@@ -58,7 +59,11 @@ from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.perf_ledger import with_perf_chunk
-from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallRegistrationError
+from vllm_omni.engine.duplex.session.tool_calls import (
+    ToolCallAbandonment,
+    ToolCallOrigin,
+    ToolCallRegistrationError,
+)
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
@@ -669,7 +674,12 @@ class ModelChannel:
     # ------------------------------------------------------------------ #
 
     def decide_output(
-        self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
+        self,
+        stage_id: int,
+        output: RequestOutput,
+        context: DuplexOutputContext,
+        *,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
         """Pure plugin decision (no session mutation: this runs inline on the orchestrator loop)."""
         decision = self._ctx.plugin.decide_output(
@@ -679,6 +689,7 @@ class ModelChannel:
             segment_token_ids=context.segment_token_ids,
             segment_output_metadata=dict(context.segment_output_metadata),
             output=output,
+            streaming_context=streaming_context,
         )
         if decision is not None and not isinstance(decision, DuplexOutputDecision):
             raise TypeError("duplex plugin decide_output() must return DuplexOutputDecision or None")
@@ -693,7 +704,12 @@ class ModelChannel:
         )
 
     def release_concurrent_turn_requests(
-        self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
+        self,
+        stage_id: int,
+        output: RequestOutput,
+        context: DuplexOutputContext,
+        *,
+        streaming_context: object | None = None,
     ) -> bool:
         """Ask the plugin whether the next commit may start while TTS drains."""
         return self._ctx.plugin.release_concurrent_turn_requests(
@@ -701,6 +717,7 @@ class ModelChannel:
             segment_finished=context.segment_finished,
             output=output,
             context=context,
+            streaming_context=streaming_context,
         )
 
     def stage_metrics_snapshot(
@@ -1159,6 +1176,10 @@ class ModelChannel:
         if not isinstance(arguments, str):
             self._out.emit_error("invalid_function_call", _ARGUMENTS_MUST_BE_JSON)
             return
+        blocked_by = self._ctx.tool_calls.blocked_by(name, arguments)
+        if blocked_by is not None:
+            await self._suppress_function_call(call_id, name, arguments, blocked_by)
+            return
         item_id = f"item_{uuid.uuid4().hex}"
         response_id = f"resp_{uuid.uuid4().hex}"
         try:
@@ -1208,6 +1229,54 @@ class ModelChannel:
                 "response_id": response_id,
             }
         )
+
+    async def _suppress_function_call(self, call_id: str, name: str, arguments: str, blocked_by: str) -> None:
+        """Refuse a repeat without exposing or recording it.
+
+        Only an abandoned call gets a notice: a pending call's result may still
+        arrive, so telling the model it failed would be false.
+        """
+        session = self._ctx.session
+        blocker = self._ctx.tool_calls.record(blocked_by)
+        self._out.emit(
+            {
+                "type": "function_call.suppressed",
+                "session_id": session.session_id,
+                "epoch": session.epoch,
+                "name": name,
+                "arguments": arguments,
+                "blocked_by_call_id": blocked_by,
+                "blocked_by_state": blocker.state.value if blocker is not None else None,
+            }
+        )
+        if blocker is not None and blocker.is_pending:
+            return
+        origin = ToolCallOrigin(
+            call_id=call_id,
+            epoch=session.epoch,
+            turn_id=session.turn_id,
+            response_id=None,
+            item_id=f"item_{uuid.uuid4().hex}",
+            name=name,
+            arguments=arguments,
+        )
+        try:
+            updated_runtime = self._ctx.plugin.runtime_config_for_abandoned_tool_call(
+                session.config,
+                copy.deepcopy(dict(session.runtime_config)),
+                ToolCallAbandonment(origin, ToolCallAbandonReason.SUPPRESSED),
+                history_len=len(session.history),
+            )
+        except Exception:
+            logger.exception("Failed to tell the model a repeated function call was refused")
+            self._out.emit_error(
+                "tool_call_settlement_failed",
+                "the session could not apply a tool-call terminal decision",
+            )
+            await self._close_from_runtime("tool_call_lifecycle")
+            return
+        if updated_runtime is not None:
+            session.replace_runtime_config(copy.deepcopy(updated_runtime))
 
     async def _send_one_model_output_event(
         self,
@@ -1694,6 +1763,9 @@ class ModelChannel:
             value = model_result.get(name)
             if isinstance(value, bool):
                 metadata[name] = value
+        listen_source = model_result.get("listen_source")
+        if isinstance(listen_source, str) and listen_source:
+            metadata["listen_source"] = listen_source
         effective_stage_metrics = stage_metrics if stage_metrics is not None else model_result.get("stage_metrics")
         if isinstance(effective_stage_metrics, Mapping):
             metadata["stage_metrics"] = {
@@ -1900,6 +1972,20 @@ class ModelChannel:
         payload = self.silence_unit_payload()
         if auto_response and count + 1 == continuation_limit:
             payload["force_listen"] = True
+        explicit_create_id = model_state.explicit_response_create_id if response_owned else None
+        if (
+            response_owned
+            and count == 0
+            and explicit_create_id is not None
+            and owner_id == f"response:{explicit_create_id}"
+        ):
+            # response.create opens the assistant turn. The duplex model may
+            # still hold the previous turn's turn-ended latch -- left set when
+            # a truncated turn was told to stop -- and that latch forces the
+            # new response's silent units to keep listening before the model
+            # can answer. The first unit of the response releases it, the same
+            # way the seeded opening turn does in the stage prefill.
+            payload["open_assistant_turn"] = True
         payload["duplex_turn_id"] = payload_turn_id_value
         try:
             scheduled = await self._schedule_silence_continuation(

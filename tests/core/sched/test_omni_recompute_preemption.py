@@ -82,7 +82,7 @@ def _output(request=None):
     ids = [] if request is None else [request.request_id]
     return ModelRunnerOutput(
         req_ids=ids,
-        req_id_to_index={rid: i for i, rid in enumerate(ids)},
+        # req_id_to_index was dropped upstream; the pin derives it from req_ids.
         sampled_token_ids=[] if request is None else [[1]],
         logprobs=None,
         prompt_logprobs_dict={},

@@ -1,4 +1,4 @@
-# Opt-in single-Hopper C64 throughput profile: one AR and two codec replicas.
+# Opt-in single-GPU C64 throughput profile (tuned on Hopper): one AR and two codec replicas.
 # Inherit sampling, connector, and runtime settings from the full-response profile.
 # Each stage has aggregate capacity 64; this is not a streaming TTFP profile.
 # One Model Runner V2 talker serves all 64 requests: a decode step costs about

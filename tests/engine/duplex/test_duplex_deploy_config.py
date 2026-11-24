@@ -13,6 +13,7 @@ from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
 )
+from vllm_omni.engine.duplex.replica_placement import DuplexReplicaPlacement
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -88,6 +89,39 @@ def test_duplex_session_runtime_loads_replica_placement_fields(tmp_path) -> None
     assert config.max_sessions_per_replica == 3
     assert config.worker_max_sessions == 3
     assert config.replica_groups == [{0: 0, 1: 0}, {0: 1, 1: 0}]
+
+
+@pytest.mark.parametrize("groups_yaml", ["", "  replica_groups: null\n"])
+def test_deploy_yaml_joins_unequal_replica_counts_without_explicit_groups(tmp_path, groups_yaml) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text(
+        "session_mode: duplex\n"
+        "duplex_session:\n"
+        "  replica_policy: least_sessions\n"
+        "  max_sessions_per_replica: 3\n"
+        f"{groups_yaml}"
+        "stages:\n"
+        "  - {stage_id: 0, num_replicas: 1}\n"
+        "  - {stage_id: 1, num_replicas: 3}\n"
+        "  - {stage_id: 2, num_replicas: 1}\n",
+        encoding="utf-8",
+    )
+    deploy = load_deploy_config(deploy_path)
+    config = deploy.duplex_session
+    assert config.replica_groups is None
+    assert config.max_sessions_per_replica is not None
+    placement = DuplexReplicaPlacement(
+        stage_replica_counts=[stage.num_replicas for stage in deploy.stages],
+        max_sessions_per_replica=config.max_sessions_per_replica,
+        replica_groups=config.replica_groups,
+    )
+    assert placement.snapshot()["groups"] is None
+    assert placement.snapshot()["stage_replica_counts"] == (1, 3, 1)
+    assert [dict(placement.reserve(f"s{index}").replicas) for index in range(3)] == [
+        {0: 0, 1: 0, 2: 0},
+        {0: 0, 1: 1, 2: 0},
+        {0: 0, 1: 2, 2: 0},
+    ]
 
 
 @pytest.mark.parametrize("policy", ["round_robin", "", None, True])

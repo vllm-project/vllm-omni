@@ -5,6 +5,9 @@ from __future__ import annotations
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities
 
+#: Most tools one session may declare.
+MAX_SESSION_TOOLS = 5
+
 
 def nemotron_voicechat_capabilities(*, max_sessions: int = 1) -> DuplexCapabilities:
     """The Nemotron VoiceChat native-duplex preset of the generic capability payload.
@@ -18,6 +21,9 @@ def nemotron_voicechat_capabilities(*, max_sessions: int = 1) -> DuplexCapabilit
     supports_multi_session = max_sessions > 1
     return DuplexCapabilities(
         supports_model_native_turn_policy=True,
+        tool_mode="declared",
+        function_call_output_continuation="automatic",
+        max_tools=MAX_SESSION_TOOLS,
         supports_external_turn_signal=False,
         supports_client_commit=True,
         supports_barge_in=False,

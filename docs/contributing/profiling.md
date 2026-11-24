@@ -87,7 +87,7 @@ Supported fields:
 | `warmup_iterations` | Torch-profiler warmup iterations. |
 | `active_iterations` | Torch-profiler active iterations. |
 
-For detailed explanations of the fields, please refer to upstream vLLM implementation [vllm/config/profiler.py](https://github.com/vllm-project/vllm/blob/v0.33.0/vllm/config/profiler.py)
+For detailed explanations of the fields, please refer to upstream vLLM implementation [vllm/config/profiler.py](https://github.com/vllm-project/vllm/blob/v0.34.0/vllm/config/profiler.py)
 
 ### Minimal configurations by output
 
@@ -339,7 +339,7 @@ Recommended viewers:
 
 For upstream background on the underlying vLLM profiling infrastructure, see the [vLLM profiling guide](https://docs.vllm.ai/en/stable/contributing/profiling/).
 
-## 6. Profiling Omni AR/TTS stages
+## 7. Profiling Omni AR/TTS stages
 
 For Omni AR and TTS stages, put `profiler_config` under each stage that should
 be captured. The serving API then controls a narrow window with
@@ -385,7 +385,7 @@ wrapper and uses `cudaProfilerStart/Stop`; the report is only valid if the
 CUDA API, GPU kernel, OS runtime, and NVTX summaries. Treat profiler latency as
 diagnostic only; use a separate no-profiler run for performance numbers.
 
-## 7. Orchestrator Monitor
+## 8. Orchestrator Monitor
 
 > **Warning:** Diagnostic only. Adds lightweight counters on the orchestrator poll loop and per-replica queue depth. Disable in production unless you are actively debugging orchestrator saturation.
 
@@ -421,6 +421,12 @@ Each 1-second window records:
 | `replicas.<stage,replica>.inflight` | Requests currently bound/routed to the replica |
 
 On shutdown the server also logs a short summary (`loop_active_pct`, per-replica queue averages/maxima).
+
+If a request also sets `return_stage_metrics=true`, each finished-stage snapshot
+includes a bounded `orchestrator_snapshot` with current and run-high-water
+dispatch depth plus per-replica output-queue and inflight values. This makes the
+same signals available in serving benchmark result JSON without parsing the
+shutdown file.
 
 `loop_idle` and `loop_active` count loop iterations, so their absolute scale is
 tied to which orchestration loop is running. Under the legacy poll loop

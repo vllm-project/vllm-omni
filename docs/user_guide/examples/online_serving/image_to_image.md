@@ -129,7 +129,7 @@ python openai_chat_client.py --input input1.png input2.png --prompt "Combine the
     pip install 'vllm-omni[demo]'
     ```
 
-    For this 0.33 source checkout, follow the
+    For this 0.34 source checkout, follow the
     [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
     from the repository root. Build the temporary Gradio wheel and include it
     with `.[demo]` in the same normal install command.
@@ -211,7 +211,7 @@ Wrap generation parameters inside `extra_body` in the request JSON:
     ```
 
     For details on how generation parameters are handled across different clients, see the
-    [Chat Completions API guide](../../../../serving/chat_completions_api.md).
+    [Chat Completions API guide](../../../serving/chat_completions_api.md).
 
 ### Layered Image Generation (Qwen-Image-Layered)
 
@@ -364,8 +364,8 @@ Provide multiple images in `content` (order matters):
 
 When using `/v1/chat/completions`, pass these inside `extra_body` in the curl
 JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK (see the
-[Chat Completions API guide](../../../../serving/chat_completions_api.md)).
-When using the dedicated [`/v1/images/edits`](../../../../serving/image_edit_api.md)
+[Chat Completions API guide](../../../serving/chat_completions_api.md)).
+When using the dedicated [`/v1/images/edits`](../../../serving/image_edit_api.md)
 endpoint, pass the supported generation controls as top-level form fields
 directly. For image dimensions and count, use `size` and `n` rather than
 `height`, `width`, or `num_outputs_per_prompt`.
