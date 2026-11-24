@@ -805,8 +805,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 dit_uses_allgather = dit_distributed_offload and resolved_offload.uses_allgather(DIT_COMPONENT)
                 tensor_parallel_size = int(self.parallel_config.tensor_parallel_size)
                 use_hsdp = bool(self.parallel_config.use_hsdp)
-                data_parallel_size = int(self.parallel_config.data_parallel_size)
-                sequence_parallel_size = int(self.parallel_config.sequence_parallel_size)
+                data_parallel_size = self.parallel_config.data_parallel_size or 1
+                sequence_parallel_size = self.parallel_config.sequence_parallel_size or 1
                 dlo_group_size = data_parallel_size if data_parallel_size > 1 else sequence_parallel_size
                 modules = ModuleDiscovery.discover(model)
                 plan = get_offload_plan(model)

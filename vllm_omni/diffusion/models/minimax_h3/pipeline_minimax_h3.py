@@ -1211,22 +1211,15 @@ class MiniMaxH3Pipeline(
             "transformer",
         )
         offline_transformer = self._offline_checkpoints.get("transformer")
-        native_lowbit = any(
-            checkpoint.execution_mode in {"native_mx", "native_int"}
-            for checkpoint in self._offline_checkpoints.values()
-        )
+        native_mx = any(checkpoint.execution_mode == "native_mx" for checkpoint in self._offline_checkpoints.values())
         if self._offline_checkpoints:
-            if native_lowbit:
+            if native_mx:
                 if od_config.quantization_config is not None:
-                    raise ValueError("offline native quantization selects the NPU/weight format; remove overrides")
+                    raise ValueError("offline native MX selects quantization from delivery metadata; remove overrides")
                 if offline_transformer is not None:
-                    from .native_int import H3NativeIntConfig
                     from .native_mx import H3NativeMXConfig
 
-                    factory = (
-                        H3NativeIntConfig if offline_transformer.execution_mode == "native_int" else H3NativeMXConfig
-                    )
-                    transformer_quant_config = factory.from_checkpoint(offline_transformer)
+                    transformer_quant_config = H3NativeMXConfig.from_checkpoint(offline_transformer)
             elif transformer_quant_config is not None:
                 raise ValueError("offline dequantize mode requires transformer quantization_config=None")
             if modular or ref2va_model_path is not None or control_path:
@@ -1276,7 +1269,7 @@ class MiniMaxH3Pipeline(
         )
         if offline_transformer is not None:
             self.transformer._strict_offline_loading = True
-            if native_lowbit:
+            if native_mx:
                 transformer_quant_config.validate_model_targets(self.transformer)
         if self._fasth3_checkpoint is not None:
             spec = self._fasth3_checkpoint

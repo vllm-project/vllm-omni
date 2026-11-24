@@ -27,16 +27,17 @@ if TYPE_CHECKING:
     from .offline_quantization import OfflineComponentCheckpoint
 
 logger = init_logger(__name__)
-_MX4 = "W4A4_MXFP4_DUALSCALE"
+_MX4_DUAL = "W4A4_MXFP4_DUALSCALE"
+_MX4_SINGLE = "W4A4_MXFP4"
 _MX8 = "W8A8_MXFP8"
 _OUTPUT_CHUNK = 32768
 _EXECUTED_BITS: set[int] = set()
 
 
 def _target_bits(scheme: str) -> int | None:
-    if scheme in {_MX4, "W4A4_DYNAMIC"}:
+    if scheme in {_MX4_SINGLE, _MX4_DUAL}:
         return 4
-    return 8 if scheme in {_MX8, "W8A8_DYNAMIC"} else None
+    return 8 if scheme == _MX8 else None
 
 
 @torch.no_grad()
@@ -299,7 +300,7 @@ class NativeMXLinearMethod(LazyWeightMixin, LinearMethodBase):
 class H3NativeMXConfig(QuantizationConfig):
     """Delivery-driven model-local MX config; no global quantization override."""
 
-    delivery_schemes = {_MX4, _MX8}
+    delivery_schemes = {_MX4_SINGLE, _MX4_DUAL, _MX8}
 
     def __init__(self, targets: dict[str, int]) -> None:
         super().__init__()
