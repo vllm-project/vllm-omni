@@ -1885,77 +1885,103 @@ class DiffusionEngine:
             raise RuntimeError("Diffusion execution completed without an output.")
         return final_output
 
+    def _drive_sync_requests(
+        self,
+        target_ids: list[str],
+        *,
+        expect_single_result: bool = False,
+    ) -> dict[str, DiffusionOutput]:
+        """Drive synchronous target requests to completion, keyed by request id.
+
+        Shared loop behind :meth:`add_req_and_wait_for_response` and
+        :meth:`_add_requests_and_wait`: schedule, prepare KV, execute, poll,
+        update, and finalize until every target request has finished.
+        ``expect_single_result`` keeps the single-request contract of
+        :meth:`add_req_and_wait_for_response`, whose only caller is the
+        synchronous dummy run and therefore expects one scheduled result per
+        step.
+        """
+        target_set = set(target_ids)
+        outputs: dict[str, DiffusionOutput] = {}
+        while target_set:
+            self._process_aborts_queue()
+            try:
+                sched_output = self.scheduler.schedule()
+            except Exception as exc:
+                self._fail_engine(exc)
+                raise
+            if sched_output.is_empty:
+                finished_here = target_set & sched_output.finished_req_ids
+                for rid in finished_here:
+                    self._remove_diffusion_kv_requests([rid])
+                    outputs[rid] = self._finalize_finished_request(rid)
+                target_set -= finished_here
+                # Every target finished in this wave, so the loop is done; only
+                # targets still waiting on a scheduler that has nothing left to
+                # run are a dead end.
+                if target_set and not self.scheduler.has_requests():
+                    raise RuntimeError("Diffusion scheduler has no runnable requests.")
+                continue
+
+            scheduled = set(sched_output.scheduled_request_ids)
+            try:
+                self._prepare_kv_for_forward(sched_output)
+                runner_output: BaseRunnerOutput = (
+                    self.execute_fn(sched_output) if scheduled else BatchRunnerOutput.from_list([])
+                )
+                self._poll_native_kv()
+            except EngineDeadError:
+                raise
+            except Exception as exc:
+                if self._closed:
+                    raise
+                logger.error("Execution failed for diffusion requests %s", sorted(scheduled), exc_info=True)
+                runner_output = BatchRunnerOutput.from_list(
+                    [
+                        RunnerOutput(
+                            request_id=request_id,
+                            step_index=None,
+                            finished=True,
+                            result=DiffusionOutput.from_exception(exc),
+                        )
+                        for request_id in sorted(scheduled)
+                    ]
+                )
+
+            self._process_aborts_queue()
+            finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+
+            if (
+                expect_single_result
+                and scheduled
+                and isinstance(runner_output, BatchRunnerOutput)
+                and len(runner_output) != 1
+            ):
+                raise ValueError("Sync func should receive one result at one time")
+
+            for rid in target_set & finished_req_ids:
+                self._remove_diffusion_kv_requests([rid])
+                output = self._finalize_finished_request(
+                    rid,
+                    runner_output=runner_output.get_request_output(rid),
+                    missing_result_error="Diffusion execution finished without a final output.",
+                )
+                if output.async_output_id:
+                    fut = self.executor.wait_output_ready(output.async_output_id)
+                    output = fut.result(timeout=_async_output_timeout())
+                outputs[rid] = output
+            target_set -= finished_req_ids
+
+        return outputs
+
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         request = self._prepare_request_for_admission(request)
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
             target_request_id = self.scheduler.add_request(request)
-
-            # keep scheduling and executing until the target request is finished
-            while True:
-                self._process_aborts_queue()
-                try:
-                    sched_output = self.scheduler.schedule()
-                except Exception as exc:
-                    self._fail_engine(exc)
-                    raise
-                if sched_output.is_empty:
-                    state = self.scheduler.get_request_state(target_request_id)
-                    if target_request_id in sched_output.finished_req_ids and state is not None and state.is_finished():
-                        self._remove_diffusion_kv_requests([target_request_id])
-                        return self._finalize_finished_request(target_request_id)
-                    if not self.scheduler.has_requests():
-                        raise RuntimeError("Diffusion scheduler has no runnable requests.")
-                    continue
-
-                # NOTE: add_req_and_wait_for_response() is synchronous, will be only called
-                # within _dummy_run, only one request will be scheduled
-                request_id = target_request_id
-                try:
-                    self._prepare_kv_for_forward(sched_output)
-                    runner_output: BaseRunnerOutput = (
-                        self.execute_fn(sched_output)
-                        if sched_output.scheduled_request_ids
-                        else BatchRunnerOutput.from_list([])
-                    )
-                    self._poll_native_kv()
-                except EngineDeadError:
-                    raise
-                except Exception as exc:
-                    if self._closed:
-                        raise
-                    logger.error("Execution failed for diffusion request %s", request_id, exc_info=True)
-                    runner_output = RunnerOutput(
-                        request_id=request_id,
-                        step_index=None,
-                        finished=True,
-                        result=DiffusionOutput.from_exception(exc),
-                    )
-
-                self._process_aborts_queue()
-
-                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-
-                # sync func should receive one result
-                if (
-                    sched_output.scheduled_request_ids
-                    and isinstance(runner_output, BatchRunnerOutput)
-                    and len(runner_output) != 1
-                ):
-                    raise ValueError("Sync func should receive one result at one time")
-                if target_request_id in finished_req_ids:
-                    self._remove_diffusion_kv_requests([target_request_id])
-                    req_output = runner_output.get_request_output(target_request_id)
-                    output = self._finalize_finished_request(
-                        target_request_id,
-                        runner_output=req_output,
-                        missing_result_error="Diffusion execution finished without a final output.",
-                    )
-                    if output.async_output_id:
-                        fut = self.executor.wait_output_ready(output.async_output_id)
-                        output = fut.result(timeout=_async_output_timeout())
-                    return output
+            outputs = self._drive_sync_requests([target_request_id], expect_single_result=True)
+            return outputs[target_request_id]
 
     def profile(
         self,
@@ -2185,78 +2211,13 @@ class DiffusionEngine:
         )
 
     def _add_requests_and_wait(self, requests: list[OmniDiffusionRequest]) -> list[DiffusionOutput]:
-        """Synchronously drive multiple requests to completion.
-
-        Mirrors :meth:`add_req_and_wait_for_response` but supports any number of
-        target requests (that method assumes a single request).
-        """
+        """Synchronously drive multiple requests to completion."""
         requests = [self._prepare_request_for_admission(req) for req in requests]
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
             target_ids = [self.scheduler.add_request(req) for req in requests]
-            target_set = set(target_ids)
-            outputs: dict[str, DiffusionOutput] = {}
-
-            while target_set:
-                self._process_aborts_queue()
-                try:
-                    sched_output = self.scheduler.schedule()
-                except Exception as exc:
-                    self._fail_engine(exc)
-                    raise
-                if sched_output.is_empty:
-                    finished_here = target_set & sched_output.finished_req_ids
-                    if finished_here:
-                        target_set -= finished_here
-                        for rid in finished_here:
-                            self._remove_diffusion_kv_requests([rid])
-                            outputs[rid] = self._finalize_finished_request(rid)
-                    if not self.scheduler.has_requests():
-                        raise RuntimeError("Diffusion scheduler has no runnable requests.")
-                    continue
-
-                scheduled = set(sched_output.scheduled_request_ids)
-                try:
-                    self._prepare_kv_for_forward(sched_output)
-                    runner_output: BaseRunnerOutput = (
-                        self.execute_fn(sched_output) if scheduled else BatchRunnerOutput.from_list([])
-                    )
-                    self._poll_native_kv()
-                except EngineDeadError:
-                    raise
-                except Exception as exc:
-                    if self._closed:
-                        raise
-                    logger.error("Execution failed for diffusion requests %s", sorted(scheduled), exc_info=True)
-                    runner_output = BatchRunnerOutput.from_list(
-                        [
-                            RunnerOutput(
-                                request_id=req_id,
-                                step_index=None,
-                                finished=True,
-                                result=DiffusionOutput.from_exception(exc),
-                            )
-                            for req_id in sorted(scheduled)
-                        ]
-                    )
-
-                self._process_aborts_queue()
-                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-
-                for rid in target_set & finished_req_ids:
-                    self._remove_diffusion_kv_requests([rid])
-                    output = self._finalize_finished_request(
-                        rid,
-                        runner_output=runner_output.get_request_output(rid),
-                        missing_result_error="Diffusion execution finished without a final output.",
-                    )
-                    if output.async_output_id:
-                        fut = self.executor.wait_output_ready(output.async_output_id)
-                        output = fut.result(timeout=_async_output_timeout())
-                    outputs[rid] = output
-                target_set -= finished_req_ids
-
+            outputs = self._drive_sync_requests(target_ids)
             return [outputs[rid] for rid in target_ids]
 
     def run_warmup_batch_profile(self) -> None:

@@ -2032,6 +2032,39 @@ class TestDiffusionEngine:
         engine.pre_process_func.assert_called_once_with(request)
         engine.execute_fn.assert_called_once()
 
+    def test_add_requests_and_wait_drives_all_targets_in_request_order(self, mocker: MockerFixture) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
+        engine.od_config = SimpleNamespace(streaming_output=False)
+        engine.scheduler = RequestScheduler()
+        engine.scheduler.initialize(_scheduler_config())
+        engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+        engine._closed = False
+        engine.abort_queue = queue.Queue()
+
+        results: dict[str, DiffusionOutput] = {}
+
+        def execute(sched_output):
+            batch = []
+            for rid in sched_output.scheduled_request_ids:
+                runner_output = _make_request_output(rid)
+                results[rid] = runner_output.result
+                batch.append(runner_output)
+            return BatchRunnerOutput.from_list(batch)
+
+        engine.pre_process_func = mocker.Mock(side_effect=lambda req: req)
+        engine.execute_fn = mocker.Mock(side_effect=execute)
+
+        requests = [_make_request(rid) for rid in ("a", "b", "c")]
+        outputs = engine._add_requests_and_wait(requests)
+
+        assert len(outputs) == len(requests)
+        for output, rid in zip(outputs, ("a", "b", "c"), strict=True):
+            assert output is results[rid]
+            assert output.error is None
+        engine.pre_process_func.assert_has_calls([mocker.call(req) for req in requests])
+
     def test_supports_scheduler_interface_injection(self, mocker: MockerFixture) -> None:
         request = _make_request("engine_iface")
         runner_output = _make_request_output("engine_iface")
