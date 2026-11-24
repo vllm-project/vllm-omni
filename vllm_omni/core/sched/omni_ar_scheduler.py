@@ -38,7 +38,6 @@ from vllm_omni.core.sched.utils import (
 from vllm_omni.core.sched.utils import (
     streaming_update_replaces_prompt as _streaming_update_replaces_prompt,
 )
-from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import CONTINUE_TOKEN_ID
@@ -2501,6 +2500,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         A request that ends at stage 0 (``modalities=["text"]``) has no Talker,
         unless it returns its stage payload for one.
         """
+        from vllm_omni.data_entry_keys import returns_stage_payload
+
         ends_at_stage_zero, _ = self._omni_final_stage_flags(request)
         return not ends_at_stage_zero or returns_stage_payload(getattr(request, "additional_information", None))
 
