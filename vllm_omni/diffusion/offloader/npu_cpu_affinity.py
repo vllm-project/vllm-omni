@@ -217,7 +217,9 @@ def maybe_bind_npu_offload_cpu(od_config: OmniDiffusionConfig, device: torch.dev
             try:
                 allowed = set(os.sched_getaffinity(tid))
                 local = allowed & local_cpus
-                if local and local != allowed:
+                if not local:
+                    raise RuntimeError(f"no allowed CPUs on the NPU NUMA node for thread {tid}")
+                if local != allowed:
                     os.sched_setaffinity(tid, local)
                     changed[tid] = allowed
             except ProcessLookupError:

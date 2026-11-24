@@ -78,6 +78,22 @@ def test_partial_thread_binding_failure_restores_earlier_threads(monkeypatch):
     assert masks == {0: {0, 1, 2, 3}, 7: {0, 1, 2, 3}}
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_remote_only_live_thread_rolls_back_binding(monkeypatch, explicit):
+    masks = {0: {0, 1, 2, 3}, 7: {0, 1}}
+    monkeypatch.setattr(affinity, "_worker_threads", lambda: [0, 7])
+    monkeypatch.setattr(affinity.os, "sched_getaffinity", lambda tid: set(masks[tid]))
+    monkeypatch.setattr(affinity.os, "sched_setaffinity", lambda tid, cpus: masks.update({tid: set(cpus)}))
+    monkeypatch.setattr(affinity, "_npu_affinity", lambda index: (8, 1, {2, 3, 99}))
+    device = SimpleNamespace(type="npu", index=0)
+    if explicit:
+        with pytest.raises(RuntimeError, match="no allowed CPUs.*thread 7"):
+            affinity.maybe_bind_npu_offload_cpu(config(enable_cpu_binding=True), device)
+    else:
+        assert not affinity.maybe_bind_npu_offload_cpu(config(), device)
+    assert masks == {0: {0, 1, 2, 3}, 7: {0, 1}}
+
+
 def test_no_allowed_local_cpu_does_not_widen_limits(runtime, monkeypatch):
     monkeypatch.setattr(affinity, "_npu_affinity", lambda index: (8, 1, {99}))
     assert not affinity.maybe_bind_npu_offload_cpu(config(), SimpleNamespace(type="npu", index=0))
