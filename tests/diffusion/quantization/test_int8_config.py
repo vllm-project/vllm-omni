@@ -507,6 +507,8 @@ class TestOffloadAfterQuant:
         second = make_layer()
         model = torch.nn.Sequential(first, second)
         assert DiffusersPipelineLoader._prepare_lazy_weight_loading(model) == 2
+        assert not getattr(first, "_lazy_bias_loader_tracked", False)
+        assert not getattr(second, "_lazy_bias_loader_tracked", False)
 
         # All weights arrive before their biases. Weight-only processing must
         # still finalize each layer before the next weight is materialized.
@@ -522,6 +524,10 @@ class TestOffloadAfterQuant:
         second.bias.weight_loader(second.bias, bias)
         assert first._already_called_process_weights_after_loading
         assert second._already_called_process_weights_after_loading
+
+        offload_layer = make_layer()
+        offload_layer.quant_method.enable_offload_after_quant(offload_layer)
+        assert offload_layer._lazy_bias_loader_tracked
 
 
 class TestInt8LinearMethod:

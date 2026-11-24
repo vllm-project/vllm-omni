@@ -376,7 +376,9 @@ class LazyWeightMixin:
         self.process_weights_after_loading(layer)  # type: ignore[attr-defined]
 
     def _install_bias_load_tracking(self, layer: torch.nn.Module) -> None:
-        """Track bias loading so a weight-first checkpoint cannot finalize early."""
+        """Track bias loading only when finalization or offload needs it."""
+        if not self.finalize_requires_bias and not self._offload_after_quant:
+            return
         if getattr(layer, "_lazy_bias_loader_tracked", False):
             return
         if not getattr(layer, "has_bias", False):
