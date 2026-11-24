@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 
 from vllm_omni.diffusion.attention.distributed_sparse_attention import MindIEParallelResource
-from vllm_omni.diffusion.data import MindIEParallelConfig, resolve_mindie_sparse_backend
+from vllm_omni.diffusion.data import resolve_mindie_sparse_backend
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
 from vllm_omni.platforms import current_omni_platform
 

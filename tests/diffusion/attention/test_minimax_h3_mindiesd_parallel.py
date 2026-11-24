@@ -14,6 +14,7 @@ from vllm_omni import platforms
 from vllm_omni.diffusion import forward_context
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 from vllm_omni.diffusion.attention.parallel.ulysses_allgather import UlyssesAllGatherKVParallelAttention
+from vllm_omni.diffusion.data import MindIEParallelConfig
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelResources
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu]
@@ -71,7 +72,7 @@ def adapter(monkeypatch):
             precision="bf16",
             sparse_type="rf_v3",
             sparsity=0.8,
-            parallel=module.MindIEParallelConfig(),
+            parallel=MindIEParallelConfig(),
         ),
         softmax_scale=0.125,
         _resolve_plan=lambda metadata: plan,
@@ -112,7 +113,7 @@ def run(adapter, *, query=None):
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_pipeline_call_is_explicit_and_state_is_reused(adapter, enabled):
-    adapter.impl.rainfusion.parallel = adapter.module.MindIEParallelConfig(
+    adapter.impl.rainfusion.parallel = MindIEParallelConfig(
         overlap_comm=enabled,
         rainfusion_reorder_hoist=enabled,
         optimize_attention_pipeline=enabled,
