@@ -12,7 +12,8 @@ import os
 import queue
 import threading
 import time
-from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from types import AsyncGeneratorType
@@ -351,6 +352,7 @@ class DiffusionEngine:
                 )
             self._init_runtime_state()
             self._init_execute_fn()
+            self._run_warmup_calibration()
             self._log_execution_mode(od_config)
         except Exception:
             # close() cannot be used because runtime synchronization state may not exist yet.
@@ -549,11 +551,69 @@ class DiffusionEngine:
                 getattr(od_config, "request_batch_max_wait_ms", None),
             )
 
-        if self.step_execution:
+    def _run_warmup_calibration(self) -> None:
+        """Startup calibration phase that measures the DRR sweet-spot batch.
+
+        This is an explicit phase of engine startup, not a side effect of
+        logging: it runs right after the executor and scheduler exist because
+        calibration needs a real forward. The calibrated value is applied
+        through ``scheduler.apply_token_budget``, which clamps it to the
+        mode-defined token capacity (the paged KV block table), so capacity
+        always wins over calibration. Dense mode has no token-counted
+        admission capacity and applies the value unclamped.
+
+        Skipped, with an INFO log, unless step execution is enabled, the
+        resolved policy is DRR, ``warmup_auto_calibrate`` opted in, and
+        ``max_num_batched_tokens`` is unset -- an explicit budget is the
+        user's decision and already defines the DRR budget.
+        """
+        batching_config = getattr(self.scheduler, "batching_config", None)
+        if batching_config is None or not getattr(batching_config, "warmup_auto_calibrate", False):
+            return
+        if not getattr(batching_config, "uses_compute_budget", False):
+            logger.info("Warmup batch profile skipped: DRR (compute_budget) policy is not enabled.")
+            return
+        if not self.step_execution:
+            logger.info("Warmup batch profile skipped: requires step_execution.")
+            return
+        explicit_budget = self.od_config.max_num_batched_tokens
+        if explicit_budget is not None:
+            logger.info(
+                "Warmup batch profile skipped: explicit max_num_batched_tokens=%s already defines the DRR budget.",
+                explicit_budget,
+            )
+            return
+        try:
+            self.run_warmup_batch_profile()
+        except Exception as e:
+            logger.warning("Warmup batch profile skipped: %s", e, exc_info=True)
+
+    @contextmanager
+    def _calibration_overrides(self, b_max: int) -> Iterator[None]:
+        """Pin admission to the sweep ladder, then always restore startup state.
+
+        The ladder measures full ladder batches, so a ``fixed`` policy keeps
+        DRR from trimming or reordering them, and the count cap is raised
+        because an unset ``max_num_seqs`` leaves the count cap unset. Both
+        are restored on exit, including when the sweep fails, and worker
+        recording is always stopped -- a live recorder adds a device sync to
+        every later denoise step.
+        """
+        saved_policy = self.scheduler.batching_policy
+        saved_max_num_reqs = int(getattr(self.scheduler, "max_num_running_reqs", 1))
+        try:
+            # A fixed policy consumes no token budget, so the temporary count
+            # cap alone bounds each ladder batch.
+            self.scheduler.batching_policy = FixedDiffusionBatchingPolicy()
+            self.scheduler.max_num_running_reqs = b_max
+            yield
+        finally:
             try:
-                self.run_warmup_batch_profile()
-            except Exception as e:
-                logger.warning("Warmup batch profile skipped: %s", e, exc_info=True)
+                self.collective_rpc("stop_warmup_batch_profile", unique_reply_rank=0, exec_all_ranks=True)
+            except Exception:
+                logger.warning("Failed to stop warmup batch profile recording on workers.", exc_info=True)
+            self.scheduler.max_num_running_reqs = saved_max_num_reqs
+            self.scheduler.batching_policy = saved_policy
 
     async def _check_and_start_background_loop(self):
         if self._closed:
@@ -2200,37 +2260,19 @@ class DiffusionEngine:
             return [outputs[rid] for rid in target_ids]
 
     def run_warmup_batch_profile(self) -> None:
-        """Auto-calibrate the DRR token budget at startup via a ladder sweep.
+        """Sweep a ladder of batch sizes and apply the sweet-spot token budget.
 
-        Preconditions (skip with an INFO log otherwise): step_execution enabled,
-        the resolved policy is DRR (``compute_budget``), ``warmup_auto_calibrate``
-        opted in via the diffusion batching config, and no explicit
-        ``max_num_batched_tokens`` (that value already defines the budget).
-        An unset ``max_num_batched_tokens`` also leaves the DRR request-count
-        cap unset, so the ladder is bounded by ``warmup_profile_max_batch`` and
-        the scheduler count cap is raised temporarily for the sweep. The sweep
-        forces a ``fixed`` policy so the target ladder batches are not
-        truncated, then applies the sweet-spot batch as
-        ``token_budget = ref_tokens * B*`` through
-        ``scheduler.apply_token_budget`` and switches back to ``compute_budget``.
-        Any failure restores the original policy and never blocks startup.
+        The startup preconditions (step execution, DRR policy, opt-in, no
+        explicit budget) live in ``_run_warmup_calibration``; this method
+        assumes they hold. ``_calibration_overrides`` pins the fixed policy
+        and count cap that make each ladder batch measurable, and restores
+        startup state plus stops worker recording on every exit path. The
+        sweet-spot batch is applied as ``token_budget = ref_tokens * B*``
+        through ``scheduler.apply_token_budget``, which clamps it to the
+        mode-defined token capacity. A failure propagates to the startup
+        phase, which logs it and lets startup continue.
         """
-        batching_config = getattr(self.scheduler, "batching_config", None)
-        if batching_config is None or not getattr(batching_config, "warmup_auto_calibrate", False):
-            return
-        if not getattr(batching_config, "uses_compute_budget", False):
-            logger.info("Warmup batch profile skipped: DRR (compute_budget) policy is not enabled.")
-            return
-        if not self.step_execution:
-            logger.info("Warmup batch profile skipped: requires step_execution.")
-            return
-        explicit_budget = self.od_config.max_num_batched_tokens
-        if explicit_budget is not None:
-            logger.info(
-                "Warmup batch profile skipped: explicit max_num_batched_tokens=%s already defines the DRR budget.",
-                explicit_budget,
-            )
-            return
+        batching_config = self.scheduler.batching_config
 
         start_wall = time.perf_counter()
         deadline = time.monotonic() + float(batching_config.warmup_profile_timeout_s)
@@ -2286,124 +2328,106 @@ class DiffusionEngine:
                 old_budget = int(self.scheduler.token_budget or 0)
                 self.scheduler.apply_token_budget(new_budget)
                 logger.info(
-                    "[WarmupBatchProfile] cache hit key=%s: B*=%s old_budget=%s new_budget=%s "
+                    "[WarmupBatchProfile] cache hit key=%s: B*=%s old_budget=%s new_budget=%s capacity=%s "
                     "(sweep skipped; set warmup_profile_refresh=True to recalibrate)",
                     cache_key,
                     b_star,
                     old_budget,
                     new_budget,
+                    self.scheduler.token_budget_capacity,
                 )
                 return
 
-        saved_policy = self.scheduler.batching_policy
-        saved_max_num_reqs = int(getattr(self.scheduler, "max_num_running_reqs", 1))
         points: list[dict[str, float]] = []
         stop_reason: str | None = None
         warmup_request_ids: list[str] = []
         try:
-            # Force fixed policy so each ladder batch is scheduled at full size:
-            # admission takes the token budget only from a policy that
-            # consumes one, so the fixed policy leaves the ladder bounded by
-            # the temporary count cap below.
-            self.scheduler.batching_policy = FixedDiffusionBatchingPolicy()
-            # An unset max_num_batched_tokens also leaves the count cap unset;
-            # temporarily pin it to the ladder so the batches can be admitted.
-            self.scheduler.max_num_running_reqs = b_max
+            with self._calibration_overrides(b_max):
+                for batch in levels:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(
+                            f"Warmup batch profile timed out after {batching_config.warmup_profile_timeout_s}s."
+                        )
 
-            for batch in levels:
-                if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        f"Warmup batch profile timed out after {batching_config.warmup_profile_timeout_s}s."
+                    self.collective_rpc("start_warmup_batch_profile", unique_reply_rank=0, exec_all_ranks=True)
+                    requests = [self._make_warmup_profile_request(i, ref_h, ref_w, num_steps) for i in range(batch)]
+                    warmup_request_ids.extend(req.request_id for req in requests)
+                    outputs = self._add_requests_and_wait(requests)
+                    for output in outputs:
+                        if output.error:
+                            raise RuntimeError(f"Warmup profile request failed: {output.error}")
+                    records = self.collective_rpc(
+                        "collect_warmup_batch_profile", unique_reply_rank=0, exec_all_ranks=True
                     )
+                    records = records or []
+                    agg = aggregate_step_records(records, discard_steps)
+                    if not agg:
+                        logger.warning("Warmup batch profile: no valid records at batch=%s.", batch)
+                        continue
 
-                self.collective_rpc("start_warmup_batch_profile", unique_reply_rank=0, exec_all_ranks=True)
-                requests = [self._make_warmup_profile_request(i, ref_h, ref_w, num_steps) for i in range(batch)]
-                warmup_request_ids.extend(req.request_id for req in requests)
-                outputs = self._add_requests_and_wait(requests)
-                for output in outputs:
-                    if output.error:
-                        raise RuntimeError(f"Warmup profile request failed: {output.error}")
-                records = self.collective_rpc("collect_warmup_batch_profile", unique_reply_rank=0, exec_all_ranks=True)
-                records = records or []
-                agg = aggregate_step_records(records, discard_steps)
-                if not agg:
-                    logger.warning("Warmup batch profile: no valid records at batch=%s.", batch)
-                    continue
+                    # Prefer the ladder batch itself; fall back to largest measured.
+                    b_actual = batch if batch in agg else max(agg)
+                    t_ms = agg[b_actual]
+                    thr = b_actual / t_ms if t_ms > 0 else 0.0
+                    point = {"b": float(b_actual), "t": t_ms, "thr": thr}
+                    points.append(point)
 
-                # Prefer the ladder batch itself; fall back to largest measured.
-                b_actual = batch if batch in agg else max(agg)
-                t_ms = agg[b_actual]
-                thr = b_actual / t_ms if t_ms > 0 else 0.0
-                point = {"b": float(b_actual), "t": t_ms, "thr": thr}
-                points.append(point)
+                    prev = points[-2] if len(points) >= 2 else None
+                    stop, reason = should_stop_early(prev, point, max_step_ms, min_gain)
+                    if stop:
+                        stop_reason = reason
+                        break
 
-                prev = points[-2] if len(points) >= 2 else None
-                stop, reason = should_stop_early(prev, point, max_step_ms, min_gain)
-                if stop:
-                    stop_reason = reason
-                    break
+                if not points:
+                    raise RuntimeError("Warmup batch profile collected no valid points.")
 
-            if not points:
-                raise RuntimeError("Warmup batch profile collected no valid points.")
+                b_star, analysis = choose_sweet_spot_batch(points, max_step_ms, min_gain)
+                if analysis["method"] == "fallback_min_batch":
+                    logger.warning(
+                        "Warmup batch profile: no ladder point within warmup_profile_max_step_ms=%s; "
+                        "falling back to the smallest batch B*=%s.",
+                        max_step_ms,
+                        b_star,
+                    )
+                ref_tokens = batching_config.spatial_tokens(ref_h, ref_w)
+                new_budget = int(ref_tokens * b_star)
+                old_budget = int(self.scheduler.token_budget or 0)
 
-            b_star, analysis = choose_sweet_spot_batch(points, max_step_ms, min_gain)
-            if analysis["method"] == "fallback_min_batch":
-                logger.warning(
-                    "Warmup batch profile: no ladder point within warmup_profile_max_step_ms=%s; "
-                    "falling back to the smallest batch B*=%s.",
-                    max_step_ms,
+                self.scheduler.apply_token_budget(new_budget)
+
+                logger.info(
+                    "[WarmupBatchProfile] ladder=%s points=%s stop_reason=%s B*=%s method=%s "
+                    "old_budget=%s new_budget=%s capacity=%s elapsed=%.2fs",
+                    levels,
+                    analysis["throughput"],
+                    stop_reason,
                     b_star,
+                    analysis["method"],
+                    old_budget,
+                    new_budget,
+                    self.scheduler.token_budget_capacity,
+                    time.perf_counter() - start_wall,
                 )
-            ref_tokens = batching_config.spatial_tokens(ref_h, ref_w)
-            new_budget = int(ref_tokens * b_star)
-            old_budget = int(self.scheduler.token_budget or 0)
 
-            self.scheduler.apply_token_budget(new_budget)
-
-            logger.info(
-                "[WarmupBatchProfile] ladder=%s points=%s stop_reason=%s B*=%s method=%s "
-                "old_budget=%s new_budget=%s elapsed=%.2fs",
-                levels,
-                analysis["throughput"],
-                stop_reason,
-                b_star,
-                analysis["method"],
-                old_budget,
-                new_budget,
-                time.perf_counter() - start_wall,
-            )
-
-            if cache_enabled:
-                saved_path = save_cached_profile(
-                    cache_dir,
-                    cache_key,
-                    {
-                        "b_star": b_star,
-                        "budget": new_budget,
-                        "method": analysis["method"],
-                        "stop_reason": stop_reason,
-                        "points": analysis["points"],
-                        "throughput": analysis["throughput"],
-                        "fields": cache_fields,
-                    },
-                )
-                if saved_path:
-                    logger.info("[WarmupBatchProfile] cached profile to %s (key=%s)", saved_path, cache_key)
-                else:
-                    logger.warning("[WarmupBatchProfile] failed to write profile cache under %s.", cache_dir)
-        except Exception as exc:
-            self.scheduler.batching_policy = saved_policy
-            logger.warning("Warmup batch profile failed (%s); restored original policy.", exc, exc_info=True)
-            raise
+                if cache_enabled:
+                    saved_path = save_cached_profile(
+                        cache_dir,
+                        cache_key,
+                        {
+                            "b_star": b_star,
+                            "budget": new_budget,
+                            "method": analysis["method"],
+                            "stop_reason": stop_reason,
+                            "points": analysis["points"],
+                            "throughput": analysis["throughput"],
+                            "fields": cache_fields,
+                        },
+                    )
+                    if saved_path:
+                        logger.info("[WarmupBatchProfile] cached profile to %s (key=%s)", saved_path, cache_key)
+                    else:
+                        logger.warning("[WarmupBatchProfile] failed to write profile cache under %s.", cache_dir)
         finally:
-            # Stop recording on every rank even when the sweep fails before
-            # its collect RPC: a live recorder adds two device syncs to each
-            # later denoise step and grows without bound.
-            try:
-                self.collective_rpc("stop_warmup_batch_profile", unique_reply_rank=0, exec_all_ranks=True)
-            except Exception:
-                logger.warning("Failed to stop warmup batch profile recording on workers.", exc_info=True)
-            self.scheduler.max_num_running_reqs = saved_max_num_reqs
             # Never leak warmup requests into the scheduler: a residual request
             # in _running/_waiting with popped state poisons every later
             # schedule() call (KeyError) and kills server startup.

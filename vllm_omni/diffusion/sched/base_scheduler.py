@@ -566,6 +566,11 @@ class BaseScheduler(ABC):
         """Current DRR admission budget in packed tokens; ``None`` when DRR is off."""
         return self._token_budget
 
+    @property
+    def token_budget_capacity(self) -> int | None:
+        """Mode-defined token capacity the budget is clamped to; ``None`` if undefined."""
+        return self._token_budget_capacity
+
     def _running_admission_tokens(self) -> int:
         tokens = 0
         for request_id in self._running:

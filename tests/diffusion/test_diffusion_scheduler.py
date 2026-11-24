@@ -1138,6 +1138,20 @@ class TestRequestScheduler:
         assert output.num_running_reqs == 2
         assert output.num_waiting_reqs == 1
 
+    def test_applied_token_budget_is_unclamped_in_dense_mode(self) -> None:
+        """Dense mode defines no token-counted capacity, so calibration applies unclamped."""
+        self.scheduler.initialize(
+            _scheduler_config(
+                max_num_batched_tokens=8192,
+                diffusion_batching_config={"policy": "compute_budget"},
+            )
+        )
+        assert self.scheduler.token_budget_capacity is None
+
+        self.scheduler.apply_token_budget(16384)
+
+        assert self.scheduler.token_budget == 16384
+
     @pytest.mark.parametrize("action", ["abort", "timeout", "preempt"])
     def test_diffusion_kv_loading_defers_free_and_blocks_preempt(self, mocker: MockerFixture, action: str) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=5)

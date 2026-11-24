@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
+import logging
 import queue
 import threading
 import time
@@ -1579,6 +1580,7 @@ def test_warmup_profile_stops_recording_when_sweep_fails(
     engine.collective_rpc = fake_collective_rpc
     engine._make_warmup_profile_request = lambda *args, **kwargs: SimpleNamespace(request_id="warmup-req")
     engine._add_requests_and_wait = lambda requests: [SimpleNamespace(error="boom")]
+    engine._calibration_overrides = lambda b_max: DiffusionEngine._calibration_overrides(engine, b_max)
 
     with pytest.raises(RuntimeError, match="Warmup profile request failed"):
         DiffusionEngine.run_warmup_batch_profile(engine)
@@ -1590,3 +1592,62 @@ def test_warmup_profile_stops_recording_when_sweep_fails(
     assert scheduler.max_num_running_reqs == 1
     assert scheduler.batching_policy is saved_policy
     assert batching_config.policy == "compute_budget"
+
+
+@pytest.mark.cpu
+def test_warmup_calibration_skips_when_budget_is_explicit(caplog: pytest.LogCaptureFixture) -> None:
+    """An explicit token budget is the user's decision; calibration must not override it."""
+    caplog.set_level(logging.INFO)
+    sweep_runs: list[None] = []
+    batching_config = DiffusionBatchingConfig(policy="compute_budget", warmup_auto_calibrate=True)
+    engine = SimpleNamespace(
+        scheduler=SimpleNamespace(batching_config=batching_config),
+        od_config=SimpleNamespace(max_num_batched_tokens=4096),
+        step_execution=True,
+        run_warmup_batch_profile=lambda: sweep_runs.append(None),
+    )
+
+    DiffusionEngine._run_warmup_calibration(engine)
+
+    assert sweep_runs == []
+    assert any("explicit max_num_batched_tokens=4096" in message for message in caplog.messages)
+
+
+@pytest.mark.cpu
+def test_warmup_calibration_runs_sweep_and_never_blocks_startup(caplog: pytest.LogCaptureFixture) -> None:
+    """With all preconditions met the sweep runs, and its failure only warns."""
+    caplog.set_level(logging.INFO)
+    sweep_runs: list[None] = []
+
+    def failing_sweep() -> None:
+        sweep_runs.append(None)
+        raise RuntimeError("sweep failed")
+
+    batching_config = DiffusionBatchingConfig(policy="compute_budget", warmup_auto_calibrate=True)
+    engine = SimpleNamespace(
+        scheduler=SimpleNamespace(batching_config=batching_config),
+        od_config=SimpleNamespace(max_num_batched_tokens=None),
+        step_execution=True,
+        run_warmup_batch_profile=failing_sweep,
+    )
+
+    DiffusionEngine._run_warmup_calibration(engine)
+
+    assert sweep_runs == [None]
+    assert "sweep failed" in caplog.text
+
+
+@pytest.mark.cpu
+def test_execution_mode_logging_does_not_run_calibration() -> None:
+    """Calibration is an explicit startup phase, not a side effect of logging."""
+    sweep_runs: list[None] = []
+    engine = SimpleNamespace(
+        execution_mode=DiffusionExecutionMode.STEP_BATCH,
+        step_execution=True,
+        run_warmup_batch_profile=lambda: sweep_runs.append(None),
+    )
+    od_config = SimpleNamespace(resolved_max_num_seqs=lambda: 1, request_batch_max_wait_ms=None)
+
+    DiffusionEngine._log_execution_mode(engine, od_config)
+
+    assert sweep_runs == []
