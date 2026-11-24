@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
+from tests.model_executor.models.minicpmo_4_5.helpers import reference_codec_penalty
 from tests.model_executor.models.minicpmo_4_5.test_talker_mrv2 import _talker
 
 pytestmark = [pytest.mark.core_model]
@@ -43,12 +44,12 @@ def test_talker_sampler_supports_upstream_dummy_sampler_profiling():
     # with for_sampler_warmup() before any RequestState admission.
     runner._dummy_sampler_run(torch.randn(3, vocab, device=device))
     assert reqs.index_to_req_id == {}
-    assert wrapped._v1_generators == {}
+    assert wrapped._seeded_generators == {}
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_mrv2_sampler_applies_codec_window_penalty_instead_of_stock_penalty():
-    """The real MRv2 sampler pipeline scores the V1 16-frame codec penalty.
+    """The real MRv2 sampler pipeline scores the 16-frame codec penalty.
 
     The stock penalty would tax every code in the prompt (the scheduler's
     placeholder id 0) and in the whole output once; the Talker's penalty taxes
@@ -63,7 +64,6 @@ def test_mrv2_sampler_applies_codec_window_penalty_instead_of_stock_penalty():
 
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         _CODEC_PENALTY_WINDOW,
-        _apply_batched_repetition_penalty,
         _install_mrv2_talker_sampler,
     )
 
@@ -96,7 +96,7 @@ def test_mrv2_sampler_applies_codec_window_penalty_instead_of_stock_penalty():
         np.array([len(prompt) + len(output) + 1]),
         skip_top_k_top_p=True,
     )
-    expected = _apply_batched_repetition_penalty(
+    expected = reference_codec_penalty(
         logits.cpu(), [torch.tensor(output)], penalty=penalty, window_size=_CODEC_PENALTY_WINDOW
     )
     torch.testing.assert_close(processed.cpu(), expected)
@@ -110,7 +110,7 @@ def test_mrv2_sampler_applies_codec_window_penalty_instead_of_stock_penalty():
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_mrv2_talker_sampler_follows_v1_streams_across_preemption_without_host_sync():
-    """The wrapper entry point applies masked and forced EOS around the V1
+    """The wrapper entry point applies masked and forced EOS around the seeded
     seeded draw, keeps each request's generator across preemption and slot
     changes, restarts it only after the request finishes, and never blocks
     the host on the device."""
@@ -192,7 +192,7 @@ def test_mrv2_talker_sampler_follows_v1_streams_across_preemption_without_host_s
         assert output.num_sampled.tolist() == [int(req_id != unfinished) for req_id in req_ids]
         for req_id in req_ids:
             if req_id in reference:
-                assert torch.equal(wrapped._v1_generators[req_id].get_state(), reference[req_id].get_state())
+                assert torch.equal(wrapped._seeded_generators[req_id].get_state(), reference[req_id].get_state())
 
     for req_id in ("a", "b", "greedy"):
         admit(req_id)
@@ -201,7 +201,7 @@ def test_mrv2_talker_sampler_follows_v1_streams_across_preemption_without_host_s
     step(["a", "b", "greedy"], masked=[False, True, False], forced=[False, False, False])
 
     # Preemption frees the slot without finishing the request; the resumed
-    # request lands in another slot and continues its V1 stream.
+    # request lands in another slot and continues its seeded stream.
     old_slot = reqs.req_id_to_index["a"]
     reqs.remove_request("a")
     reqs.add_request("hold", 3, [0, 0, 0], 3, 64)

@@ -69,6 +69,7 @@ from .tensor_utils import (
     restore_tensor_storage,
     set_tensor_storage,
     tensor_storage_metadata,
+    zeros_for_storage,
 )
 from .tensor_utils import (
     dtype_size as _dtype_size,
@@ -83,10 +84,10 @@ logger = init_logger(__name__)
 _ACTIVE_HWR_REGISTRATIONS: list[tuple[HostRegistration, HostWeightLease]] = []
 _ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
 
-# XCCL and NCCL reject E8M0 scales as a collective element type. E8M0 is one
-# byte wide and bit-preserving under a uint8 reinterpretation, so collect the
-# underlying byte storage and view the output back as E8M0.
-_BYTE_VIEW_ALLGATHER_DTYPES = frozenset({torch.float8_e8m0fnu})
+# Collective backends do not support E8M0 scales or packed FP4 as element
+# types. Both are byte-addressable and bit-preserving under a uint8 view, so
+# collect the underlying bytes and view the output back to the original dtype.
+_BYTE_VIEW_ALLGATHER_DTYPES = frozenset({torch.float8_e8m0fnu, torch.float4_e2m1fn_x2})
 
 
 def _all_gather_shard(
@@ -486,12 +487,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
             # Allocate ONLY the shard (1/dp_size), zero-padded to ceil.
             # Avoids materialising the full block on CPU.
-            shard = torch.zeros(
-                shard_size,
-                dtype=dtype,
-                device="cpu",
-                pin_memory=pin_memory,
-            )
+            shard = zeros_for_storage(shard_size, dtype, pin_memory=pin_memory)
 
             current_offset = 0
             for spec in specs:
@@ -1042,32 +1038,48 @@ class PinnedResidentLayerGroup:
             raise RuntimeError(self._load_error)
         if self.loaded:
             return
+        needs_copy = not self._gpu_buffers
+        gpu_buffers = self._allocate_device_buffers() if needs_copy else self._gpu_buffers
         try:
-            if self._gpu_buffers:
-                self._bind_device_buffers(self._gpu_buffers)
-                self.loaded = True
-            else:
-                self._load_once()
-        except BaseException as error:
-            self._load_error = (
-                f"Resident core load failed ({type(error).__name__}); "
-                "restore CPU weights or disable before loading again"
-            )
+            if needs_copy:
+                self._copy_to_device(gpu_buffers)
+            self._bind_device_buffers(gpu_buffers)
+        except BaseException:
+            try:
+                current_omni_platform.synchronize()
+                clear_tensor_storage(target for state in self._states for target in state["targets"].values())
+            except BaseException as rollback_error:
+                # Keep transfers' backing alive until disable can drain and restore it.
+                self._gpu_buffers = gpu_buffers
+                self._load_error = (
+                    f"Resident core load rollback failed ({type(rollback_error).__name__}); "
+                    "restore CPU weights or disable before loading again"
+                )
+                raise
+            gpu_buffers.clear()
             raise
+        self._gpu_buffers = gpu_buffers
+        self.loaded = True
 
-    def _load_once(self) -> None:
+    def _allocate_device_buffers(self) -> list[dict[torch.dtype, torch.Tensor]]:
         # Allocate on the compute stream so the caching allocator can reuse
         # blocks released by the encoder stage.  Allocating on the copy stream
         # would create a separate stream-local pool and inflate peak HBM.
         gpu_buffers: list[dict[torch.dtype, torch.Tensor]] = []
-        self._gpu_buffers = gpu_buffers
-        for state in self._states:
-            block_buffers: dict[torch.dtype, torch.Tensor] = {}
-            gpu_buffers.append(block_buffers)
-            for dtype, metas in state["metadata"].items():
-                total = sum(meta["numel"] for meta in metas)
-                block_buffers[dtype] = torch.empty(total, dtype=dtype, device=self.device)
+        try:
+            for state in self._states:
+                gpu_buffers.append(
+                    {
+                        dtype: torch.empty(sum(meta["numel"] for meta in metas), dtype=dtype, device=self.device)
+                        for dtype, metas in state["metadata"].items()
+                    }
+                )
+        except BaseException:
+            gpu_buffers.clear()
+            raise
+        return gpu_buffers
 
+    def _copy_to_device(self, gpu_buffers: list[dict[torch.dtype, torch.Tensor]]) -> None:
         self.copy_stream.wait_stream(current_omni_platform.current_stream())
         ready = current_omni_platform.Event()
         with current_omni_platform.stream(self.copy_stream):
@@ -1108,11 +1120,7 @@ class PinnedResidentLayerGroup:
                     self._cpu_staging_events[slot] = slot_ready
             ready.record(self.copy_stream)
 
-        self._bind_device_buffers(gpu_buffers)
-
         current_omni_platform.current_stream().wait_event(ready)
-        self._gpu_buffers = gpu_buffers
-        self.loaded = True
 
     def offload(self) -> None:
         if not self.loaded:

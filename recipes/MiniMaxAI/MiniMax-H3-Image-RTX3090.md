@@ -60,9 +60,8 @@ of that measurement.
 ## Prepare the source and runtime
 
 Use the `codex/h3-image-3090-opt` branch of the `barkly1te/vllm-omni` fork.
-Its optimizations are required by the options below. The branch is rebased on
-Omni `80f1ae5fb6a5e85ad58235cd10eb7a05d2082118`; a released Omni wheel alone
-does not select this source.
+Its optimizations are required by the options below. Record the exact source
+commit with the runtime versions when reproducing a result.
 
 ```bash
 git clone --branch codex/h3-image-3090-opt \
@@ -74,7 +73,7 @@ source .venv/bin/activate
 ```
 
 Follow the [CUDA source installation guide](../../docs/getting_started/installation/gpu.md#build-from-source)
-for this checkout's matching vLLM 0.33.0, PyTorch, driver, and cuDNN runtime.
+for the vLLM, PyTorch, driver, and cuDNN versions required by your checkout.
 Install Omni from this checkout with `uv pip install -e .`, and keep the
 guide's cuDNN library exports in the server shell. Do not use the published
 Omni 0.32.0 installation commands for this branch. Finish with:

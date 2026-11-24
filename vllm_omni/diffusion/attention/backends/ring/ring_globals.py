@@ -5,6 +5,8 @@
 
 import logging
 
+import torch
+
 # test if flash_attn (FA2) is available
 try:
     import flash_attn  # noqa: F401
@@ -21,6 +23,20 @@ try:
     HAS_VLLM_FLASH_ATTN = True
 except (ImportError, ModuleNotFoundError):
     HAS_VLLM_FLASH_ATTN = False
+
+
+@torch.compiler.assume_constant_result
+def bundled_flash_attn_version(device: torch.device) -> int | None:
+    """Keep the worker's hardware probe outside the compiled Ring graph."""
+    if not HAS_VLLM_FLASH_ATTN or device.type != "cuda":
+        return None
+    try:
+        from vllm_omni.diffusion.attention.backends.utils.fa import resolve_vllm_flash_attn_version
+
+        return resolve_vllm_flash_attn_version()
+    except (ImportError, RuntimeError):
+        return None
+
 
 # Optional source-built FA3 fallback (forward only, no backward needed for inference).
 # Note: FA3 high-level API may or may not return softmax_lse depending on version.

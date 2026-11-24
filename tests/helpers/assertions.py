@@ -765,21 +765,24 @@ def _assert_preset_voice_gender_from_audio(
 def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ) -> float:
     frame_len = int(0.03 * sr)
     hop = frame_len // 2
+    lags = np.arange(max(1, int(sr / 400)), min(int(sr / 80), frame_len - 1) + 1)
     hnr_values: list[float] = []
     for start in range(0, len(pcm_samples) - frame_len, hop):
-        frame = pcm_samples[start : start + frame_len].astype(np.float32, copy=False)
+        frame = pcm_samples[start : start + frame_len].astype(np.float64, copy=False)
         frame = frame - np.mean(frame)
-        if np.max(np.abs(frame)) < 0.01:
+        if np.max(np.abs(frame)) < 0.01 or lags.size == 0:
             continue
         ac = np.correlate(frame, frame, mode="full")[len(frame) - 1 :]
-        ac = ac / (ac[0] + 1e-10)
-        min_lag = int(sr / 400)
-        max_lag = min(int(sr / 80), len(ac))
-        if min_lag >= max_lag:
-            continue
-        peak = float(np.max(ac[min_lag:max_lag]))
-        if 0 < peak < 1:
-            hnr_values.append(10 * np.log10(peak / (1 - peak + 1e-10)))
+        # At lag k only N-k samples overlap. Dividing by the full frame's
+        # energy attenuates low-pitch peaks even for a noiseless periodic
+        # signal. Normalize each correlation by the two overlapping segments'
+        # energies instead; their geometric mean also bounds it by one.
+        energy = np.concatenate(([0.0], np.cumsum(frame * frame)))
+        denominator = np.sqrt(energy[frame_len - lags] * (energy[-1] - energy[lags]))
+        correlation = np.divide(ac[lags], denominator, out=np.zeros(lags.size), where=denominator > 1e-10)
+        peak = min(float(np.max(correlation)), 1.0 - 1e-7)
+        if peak > 0:
+            hnr_values.append(10 * np.log10(peak / (1 - peak)))
     # Silence and constant signals provide no usable harmonic estimate. They
     # must not pass a model-specific floor of zero or below.
     return float(np.mean(hnr_values)) if hnr_values else float("-inf")
@@ -793,12 +796,11 @@ def _assert_pcm_int16_speech_hnr(
 ) -> None:
     """Validate harmonic-to-noise ratio on raw int16 PCM from /v1/audio/speech.
 
-    min_hnr_db defaults to the global _MIN_PCM_SPEECH_HNR_DB (1.0 dB),
-    which matches the cleaner TTS models the helper was originally calibrated
-    for. Quieter codecs (e.g. MOSS-TTS-Nano, whose voice_clone output is
-    intrinsically around -2 dB) can pass a lower per-test threshold via
-    request_config["min_hnr_db"] to keep the catastrophic-failure check
-    while not gating CI on a model-intrinsic property.
+    min_hnr_db defaults to the global _MIN_PCM_SPEECH_HNR_DB (1.0 dB).
+    Tests can override it via request_config["min_hnr_db"]. The estimate uses
+    overlap-normalized correlation so a lower fundamental frequency does not
+    itself lower the score. Silence, constant signals and noise must fail;
+    HNR alone does not establish transcript correctness or perceptual quality.
 
     ``sr`` must be the stream's real sample rate: the autocorrelation lag window
     is derived from it, so a wrong rate detunes the 80-400 Hz pitch search and

@@ -276,7 +276,7 @@ def test_image_dlo_cpu_adaln_requires_explicit_opt_in(
         assert all(p.device.type == "cpu" for p in parameters)
 
 
-@pytest.mark.parametrize("setting", ["hwr", "cache_disabled", "video", "tp1"])
+@pytest.mark.parametrize("setting", ["hwr", "cache_disabled", "video", "tp1", "npu"])
 def test_image_dlo_cpu_adaln_rejects_unqualified_compositions(
     image_dlo_adaln_config,
     monkeypatch,
@@ -289,6 +289,9 @@ def test_image_dlo_cpu_adaln_rejects_unqualified_compositions(
         config.cache_config["minimax_h3_adaln_cache"] = False
     elif setting == "video":
         config.model_class_name = "MiniMaxH3Pipeline"
+    elif setting == "npu":
+        monkeypatch.setattr(h3.current_omni_platform, "is_cuda", lambda: False)
+        monkeypatch.setattr(h3.current_omni_platform, "is_npu", lambda: True)
     else:
         monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
     with pytest.raises(ValueError):

@@ -29,6 +29,7 @@ Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsu
 | **Per-tensor online FP8 linears** | ✅ Ordinary loader finalizes weights and scales before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Online INT8 linears** | ✅ Ordinary loader finalizes the int8 weight (contiguous or transposed view) and fp32 scale before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Online MXFP8 linears** | ✅ Ordinary loader finalizes the fp8 weight (contiguous) and e8m0 block scale (contiguous or transposed view) before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
+| **Online MXFP4 linears (vLLM XPU kernel)** | ✅ Ordinary loader finalizes the packed fp4 weight and e8m0 block scale before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Other online quantization methods** | ❌ Rejected until runtime packing and scale layouts are validated. | ⚠️ Allowed through the ordinary loader; validation is method-specific. |
 | **Model-level or standard layerwise CPU offload** | ❌ Disabled because DLO takes priority. | ❌ Disabled because DLO takes priority. |
 | **Resident leading layers** | ❌ Rejected. | ✅ Requires eligible resident paths in the model's `OffloadPlan`. |
@@ -217,9 +218,10 @@ without another H2D copy.
 
 Retained backing stays allocated during subsequent encoder and VAE stages.
 It consumes physical device memory and is separate from the free allocator
-cache policy below. A partial load latches a failure rather than reusing
-incomplete backing. Disable restores ordinary CPU tensors, releases retained
-allocations, and clears that failure state. Base weights must stay immutable
+cache policy below. A failed load drains pending transfers, restores placeholders,
+and discards partial backing so the next request can retry. If rollback fails,
+disable restores ordinary CPU tensors, releases the backing, and clears the
+failure state. Base weights must stay immutable
 until this disable, update, and re-enable cycle completes.
 
 The H3-Image recipe validates this opt-in policy on two RTX 3090 GPUs. That

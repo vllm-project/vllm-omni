@@ -18,6 +18,7 @@ from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
 
 import vllm_omni.diffusion.offloader.distributed_layerwise_backend as dist_backend_module
+import vllm_omni.diffusion.offloader.tensor_utils as tensor_utils_module
 from tests.diffusion.offloader.helpers import (
     DummyStream,
     _PlainEncoder,
@@ -34,6 +35,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 )
 from vllm_omni.diffusion.offloader import plan_resolver
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+from vllm_omni.diffusion.offloader.chunked_transport import build_part_manifest, pack_local_shard
 from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
     DistributedLayerwiseOffloadHook,
@@ -353,6 +355,98 @@ def _install_flat_shards(hook: DistributedLayerwiseOffloadHook, source_block: nn
         for dtype, metas in hook.metadata.items()
         for m in metas
     )
+
+
+@pytest.fixture
+def fail_packed_fp4_zeros(monkeypatch):
+    real_zeros = torch.zeros
+
+    def guarded_zeros(*args, **kwargs):
+        if kwargs.get("dtype") == torch.float4_e2m1fn_x2:
+            raise NotImplementedError('"fill_cpu" not implemented for Float4_e2m1fn_x2')
+        return real_zeros(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", guarded_zeros)
+
+
+@pytest.fixture
+def fail_packed_fp4_zero_(monkeypatch):
+    real_zero_ = torch.Tensor.zero_
+
+    def guarded_zero_(self, *args, **kwargs):
+        if self.dtype == torch.float4_e2m1fn_x2:
+            raise NotImplementedError('"fill_cpu" not implemented for Float4_e2m1fn_x2')
+        return real_zero_(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "zero_", guarded_zero_)
+
+
+class TestPackedMxfp4Storage:
+    def test_zeros_for_storage_uses_byte_backing_for_packed_fp4(self, fail_packed_fp4_zeros):
+        tensor = tensor_utils_module.zeros_for_storage(8, torch.float4_e2m1fn_x2)
+        assert tensor.dtype == torch.float4_e2m1fn_x2
+        assert tensor.view(torch.uint8).tolist() == [0] * 8
+
+    def test_zero_tensor_storage_uses_byte_view_for_packed_fp4(self, fail_packed_fp4_zero_):
+        tensor = torch.arange(8, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        tensor_utils_module.zero_tensor_storage(tensor)
+        assert tensor.view(torch.uint8).tolist() == [0] * 8
+
+    def test_flatten_physical_storage_uses_byte_backing_for_packed_fp4(self, fail_packed_fp4_zeros):
+        backing = torch.arange(12, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        tensor = backing.view(3, 4).t()
+        flattened = tensor_utils_module.flatten_physical_storage(tensor)
+        assert flattened.view(torch.uint8).tolist() == list(range(12))
+
+    def test_shard_and_pin_allocates_packed_fp4_without_fill(self, fail_packed_fp4_zeros):
+        block = nn.Module()
+        block.weight = nn.Parameter(
+            torch.arange(12, dtype=torch.uint8).view(torch.float4_e2m1fn_x2),
+            requires_grad=False,
+        )
+        shards, _ = DistributedLayerwiseOffloadHook._shard_and_pin(
+            dict(block.named_parameters()),
+            {},
+            dp_size=2,
+            rank=0,
+            pin_memory=False,
+        )
+        assert shards[torch.float4_e2m1fn_x2].view(torch.uint8).tolist() == list(range(6))
+
+    def test_pack_local_shard_zeroes_packed_fp4_without_fill(self, fail_packed_fp4_zero_):
+        tensor = torch.arange(7, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        specs = [("weight", tensor, False)]
+        manifest = build_part_manifest(
+            specs,
+            block_id=0,
+            part_id="block",
+            weight_shard_size=2,
+            weight_shard_rank=1,
+            chunk_size_bytes=8,
+            alignment_bytes=1,
+        )
+        shards = pack_local_shard(
+            specs,
+            manifest,
+            allocator=lambda numel, dtype: torch.empty(numel, dtype=torch.uint8).fill_(0xFF).view(dtype),
+        )
+        assert shards[torch.float4_e2m1fn_x2].view(torch.uint8).tolist() == [4, 5, 6, 0]
+
+    def test_all_gather_shard_byte_views_packed_fp4(self, monkeypatch):
+        local = torch.arange(4, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        output = torch.empty(8, dtype=torch.float4_e2m1fn_x2)
+        calls = []
+
+        def fake_allgather(output, input_tensor, *, group):
+            del group
+            calls.append((output.dtype, input_tensor.dtype))
+            output.view(torch.uint8)[:4].copy_(input_tensor.view(torch.uint8))
+            output.view(torch.uint8)[4:].copy_(torch.arange(4, 8, dtype=torch.uint8))
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
+        dist_backend_module._all_gather_shard(output, local, None)
+        assert calls == [(torch.uint8, torch.uint8)]
+        assert output.view(torch.uint8).tolist() == list(range(8))
 
 
 class TestDistributedLayerwiseOffloadHook:
@@ -1190,7 +1284,7 @@ class TestPinnedResidentLayerGroup:
                 pin_memory=False,
                 retain_device_storage=retain,
             )
-            copies = mocker.spy(group, "_load_once")
+            copies = mocker.spy(group, "_copy_to_device")
             for _ in range(2):
                 group.load()
                 actual = blocks[1](blocks[0](x))
@@ -1204,12 +1298,14 @@ class TestPinnedResidentLayerGroup:
             actual = blocks[1](blocks[0](x))
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
+    @pytest.mark.parametrize("retain", [False, True])
     @pytest.mark.parametrize("failure", ["allocation", "copy", "binding"])
-    def test_failed_load_cannot_reuse_partial_backing(
+    def test_failed_load_releases_partial_backing_and_can_retry(
         self,
         patched_offload_runtime,
         monkeypatch,
         failure,
+        retain,
     ):
         blocks = [nn.Linear(2, 2), nn.Linear(2, 2)]
         expected = [block.weight.detach().clone() for block in blocks]
@@ -1218,7 +1314,7 @@ class TestPinnedResidentLayerGroup:
             device=torch.device("cpu"),
             copy_stream=DummyStream(),
             pin_memory=False,
-            retain_device_storage=True,
+            retain_device_storage=retain,
         )
         if failure == "allocation":
             target, method = torch, "empty"
@@ -1240,9 +1336,8 @@ class TestPinnedResidentLayerGroup:
             patch.setattr(target, method, fail_second)
             with pytest.raises(RuntimeError, match="injected resident load"):
                 group.load()
-            with pytest.raises(RuntimeError, match="restore CPU"):
-                group.load()
-        group.restore_to_cpu()
+        assert all(block.weight.numel() == 0 for block in blocks)
+        assert not group._gpu_buffers
         group.load()
         for block, weight in zip(blocks, expected, strict=True):
             torch.testing.assert_close(block.weight, weight, atol=0, rtol=0)
@@ -1274,7 +1369,14 @@ class TestPinnedResidentLayerGroup:
                     "_bind_device_buffers",
                     fail_bind,
                 )
-                with pytest.raises(RuntimeError, match="injected load"):
+                patch.setattr(
+                    current_omni_platform,
+                    "synchronize",
+                    Mock(side_effect=RuntimeError("injected cleanup failure")),
+                )
+                with pytest.raises(RuntimeError, match="injected cleanup"):
+                    group.load()
+                with pytest.raises(RuntimeError, match="restore CPU"):
                     group.load()
             target, method = current_omni_platform, "synchronize"
         else:
