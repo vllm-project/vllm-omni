@@ -58,6 +58,9 @@ platforms:
         encoder_enable_npu_graph: true
         encoder_max_npu_graphs: 4
         minicpmo_long_prefill_eager: true
+        minicpmo_request_rope: true
+        minicpmo_visual_a16_prefill: true
+        minicpmo_resampler_max_frames: 16
       compilation_config:
         cudagraph_mode: FULL_DECODE_ONLY
     - max_num_seqs: 16
@@ -66,11 +69,9 @@ platforms:
       model_runner: v2
       model_subdir: original
       additional_config:
-        minicpmo_talker_prefill_eager: true
-        ascend_compilation_config:
-          enable_npugraph_ex: true
-          enable_static_kernel: true
-          enable_super_kernel: false
+        minicpmo_talker_short_prefill_eager: true
+        minicpmo_talker_refill_coalesce: true
+        minicpmo_talker_wide_graph_capacity: 256
       stage_id: 1
       default_sampling_params:
         temperature: 0.8
@@ -90,7 +91,7 @@ platforms:
         prompt_lookup_max: 1
       compilation_config:
         cudagraph_mode: FULL_DECODE_ONLY
-    - max_num_seqs: 16
+    - max_num_seqs: 32
       devices: 0,1
       num_replicas: 2
       additional_config:
@@ -104,6 +105,9 @@ platforms:
       model_runner: v2
       model_subdir: original
       stage_id: 2
+      env:
+        MINICPMO_C8_SECONDARY_VOCODER_HOST_CACHE: '1'
+        MINICPMO_C8_SECONDARY_VOCODER_TIGHT_MEMORY: '1'
       default_sampling_params:
         temperature: 0.0
         top_p: 1.0
@@ -114,3 +118,18 @@ platforms:
       connector_of_shared_memory:
         extra:
           cfm_max_graphs: 96
+          micro_batch_size: 8
+          secondary_vocoder_micro_batch_size: 4
+          whole_euler_pad_max_rows: 2
+          token2wav_runtime_prompt_cache_size: 512
+          token2wav_setup_host_cache_size: 512
+          token2wav_ref_cpu_prefetch_workers: 4
+          generation_max_regular_batch: 16
+          generation_min_batch_size: 4
+          generation_max_wait_ms: 25
+          cfm_drop_upstream_att_buffer: true
+          code2wav_encoder_padded_flow_history: 416
+          code2wav_encoder_padded_flow_continuations: true
+          minicpmo_code2wav_sync_primary: true
+          generation_first_chunk_express: true
+          generation_first_chunk_express_min_slack_s: 0.30

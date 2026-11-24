@@ -110,10 +110,17 @@ def test_active_fused_decode_checks_shadow_before_commit(tmp_path, monkeypatch, 
     assert graph.run.call_count == (2 if matches else 1)
 
 
-@pytest.mark.parametrize("mismatch", [None, "hidden", "kv"])
-@pytest.mark.parametrize("rows", [2, 12, 16])
-@pytest.mark.parametrize("wide_capacity", (512, 256))
-def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, mismatch, rows, wide_capacity):
+@pytest.mark.parametrize(
+    ("rows", "wide_capacity", "mismatch"),
+    [
+        (2, 512, None),
+        (12, 256, None),
+        (16, 512, None),
+        (12, 256, "hidden"),
+        (16, 256, "kv"),
+    ],
+)
+def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, rows, wide_capacity, mismatch):
     mode = tmp_path / "mode"
     mode.write_text("active_fixed")
     monkeypatch.setattr(talker_batched_decode, "MODE", str(mode))

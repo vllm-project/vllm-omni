@@ -15,17 +15,18 @@ export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1}"
 export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_WORKER_MULTIPROC_METHOD=spawn
 export MINICPMO_TALKER_STATIC_EXCLUDED_OP=ScatterPaKvCache
 export MINICPMO_NPU_DSPARK_NATIVE_GATHER=1 MINICPMO_NPU_KSTEP_SKIP_TERMINAL_TAIL=1
-export MINICPMO_C8_SECONDARY_VOCODER_HOST_CACHE=1 MINICPMO_C8_SECONDARY_VOCODER_TIGHT_MEMORY=1
+export MINICPMO_NPU_THINKER_PREFILL_STARTUP="$runtime_dir/thinker-prefill-startup"
+export MINICPMO_NPU_TALKER_PREFILL_STARTUP="$runtime_dir/talker-prefill-startup"
 export MINICPMO_NPU_TALKER_FUSED_MODE_FILE="$runtime_dir/talker-mode"
 export MINICPMO_NPU_TALKER_NARROW_C8_MODE_FILE="$runtime_dir/talker-batch-mode"
 export MINICPMO_NPU_TALKER_HYBRID_CONTEXT_FILE="$runtime_dir/talker-hybrid"
 export MINICPMO_C8_TALKER_ROUTE_FILE="$runtime_dir/talker-route"
 export MINICPMO_C8_VOCODER_ROUTE_FILE="$runtime_dir/vocoder-route"
-printf 'active_thinker_prefill\n' > "$MINICPMO_NPU_TALKER_FUSED_MODE_FILE"
-printf '%s\n' "${TALKER_BATCH_MODE:-active_fixed}" > "$MINICPMO_NPU_TALKER_NARROW_C8_MODE_FILE"
+printf 'tail_capacity\n' > "$MINICPMO_NPU_TALKER_FUSED_MODE_FILE"
+printf '%s\n' "${TALKER_BATCH_MODE:-active_fixed_padded}" > "$MINICPMO_NPU_TALKER_NARROW_C8_MODE_FILE"
 touch "$MINICPMO_NPU_TALKER_HYBRID_CONTEXT_FILE"
-printf '%s deployment\n' "${TALKER_ROUTE:-quarter}" > "$MINICPMO_C8_TALKER_ROUTE_FILE"
-printf '%s deployment\n' "${VOCODER_ROUTE:-quarter}" > "$MINICPMO_C8_VOCODER_ROUTE_FILE"
+printf '%s deployment\n' "${TALKER_ROUTE:-half}" > "$MINICPMO_C8_TALKER_ROUTE_FILE"
+printf '%s deployment\n' "${VOCODER_ROUTE:-adaptive_secondary}" > "$MINICPMO_C8_VOCODER_ROUTE_FILE"
 
 python3 - "$repo_root" "$runtime_dir" "$MODEL_ROOT" "$DRAFT_MODEL" "${DEPLOY_CONFIG:-}" "${MAX_NUM_SEQS:-}" <<'PY'
 import json
@@ -38,8 +39,6 @@ from vllm_omni.config.stage_config import resolve_deploy_yaml
 repo, runtime, model, draft = (Path(p).resolve() for p in sys.argv[1:5])
 deployment, seqs_arg = sys.argv[5:7]
 deploy_path = Path(deployment).resolve() if deployment else repo / "vllm_omni/deploy/minicpmo_4_5_2gpu.yaml"
-if not deployment and not seqs_arg:
-    seqs_arg = "16"
 seqs = int(seqs_arg) if seqs_arg else None
 if seqs is not None and seqs <= 0:
     raise ValueError("MAX_NUM_SEQS must be positive")
@@ -56,8 +55,9 @@ if seqs is not None:
 for stage in config["platforms"]["npu"]["stages"]:
     if seqs is not None:
         stage["max_num_seqs"] = seqs
-    if stage["stage_id"] == 0:
-        stage["speculative_config"]["model"] = str(draft)
+    spec = stage.get("speculative_config")
+    if stage["stage_id"] == 0 and spec and spec["method"] == "dspark":
+        spec["model"] = str(draft)
 (runtime / "deploy.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
 print(f"Rendered deployment: {runtime / 'deploy.yaml'}", flush=True)
 PY

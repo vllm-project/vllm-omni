@@ -89,8 +89,8 @@ The opt-in MiniCPM-o exact-prefill, fused decode and compact-batch graphs
 qualify on their first eligible use in each worker. Active mode still returns
 the reference result while comparing hidden state/KV or codec/stop/KV state;
 only a successful check enables later replay. Mismatches keep the reference
-path. The [Ascend recipe](../../../recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md)
-supplies the deployment, explicit model assets and launcher controls.
+path. The [Ascend recipe](gh-file:recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md)
+supplies the deployment, model assets and launcher controls.
 
 ## MiniMax H3 image NPU adapter
 

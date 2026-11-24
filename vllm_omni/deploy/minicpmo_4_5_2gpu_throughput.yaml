@@ -1,4 +1,4 @@
-base_config: minicpmo_4_5_2gpu_vocoder_replicas.yaml
+base_config: minicpmo_4_5_2gpu.yaml
 
 platforms:
   npu:

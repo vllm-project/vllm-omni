@@ -30,7 +30,6 @@ from vllm_omni.platforms.npu.worker.talker_context import (
     SHORT_CONTEXT,
     hybrid_enabled,
     scheduled_length,
-    trace_context,
 )
 from vllm_omni.platforms.npu.worker.talker_fused_sampling import make_device_sampler
 
@@ -427,7 +426,6 @@ def run_fused_step(runner, mode_path, batch_desc, model_inputs, batch, run_model
     if hybrid and batch.num_reqs == 1:
         length = scheduled_length(batch, 1, WIDTH)
         if length is None or length > CAPACITY:
-            trace_context(batch, "wide_c1", length)
             return baseline()
     talker = getattr(runner.model, "talker", runner.model)
     live = prepare_step(runner, talker, batch_desc, model_inputs, batch)
@@ -493,8 +491,6 @@ def run_fused_step(runner, mode_path, batch_desc, model_inputs, batch, run_model
                 if tail:
                     logger.info("[talker-fused-c1] split steps=%d early_exits=%d", graph.tail_steps, graph.tail_skips)
             logger.info_once("[talker-fused-c1] active replay enabled mode=%s", mode)
-            if hybrid:
-                trace_context(batch, "fused_c1", length, graph.capacity)
             return commit(talker, live, hidden, packed, codes, stops, draws)
         assert saved is not None
         slots = saved[0]

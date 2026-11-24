@@ -184,6 +184,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self.requires_raw_input_tokens = self.model_stage == "llm"
 
         if self.model_stage == "llm":
+            if (
+                current_omni_platform.is_npu()
+                and (vllm_config.additional_config or {}).get("minicpmo_visual_a16_prefill") is True
+            ):
+                from vllm_omni.platforms.npu.models.minicpmo_visual_precision import enable_visual_prefill_a16
+
+                enable_visual_prefill_a16(vllm_config.quant_config)
             # Initialize thinker model (image preprocessing + vision encoder + 3D resampler)
             self.thinker = init_vllm_registered_model(
                 vllm_config=vllm_config,

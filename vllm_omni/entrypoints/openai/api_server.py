@@ -479,6 +479,16 @@ async def omni_run_server_worker(
 
         await omni_init_app_state(engine_client, app.state, args)
 
+        if os.getenv("MINICPMO_NPU_THINKER_PREFILL_STARTUP"):
+            from vllm_omni.platforms.npu.worker.thinker_prefill_startup import precapture_thinker_prefill
+
+            await precapture_thinker_prefill(engine_client)
+
+        if os.getenv("MINICPMO_NPU_TALKER_PREFILL_STARTUP"):
+            from vllm_omni.platforms.npu.worker.talker_prefill_startup import precapture_talker_prefill
+
+            await precapture_talker_prefill(engine_client)
+
         # Complete the configured video request before serve_http can expose
         # /health or admit user traffic. Failure unwinds the engine context.
         video_warmup_request = getattr(args, "video_output_warmup", None)

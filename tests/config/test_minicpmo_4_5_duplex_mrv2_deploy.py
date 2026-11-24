@@ -10,7 +10,10 @@ from vllm_omni.config.stage_config import (
     _apply_platform_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
+    resolve_deploy_yaml,
 )
+from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
+from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
 from vllm_omni.platforms import current_omni_platform
 
@@ -77,7 +80,7 @@ def test_duplex_mrv2_profile_npu_full_mrv2(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("deploy_name", "devices", "replicas"),
     [
-        ("minicpmo_4_5_2gpu_vocoder_replicas.yaml", "0,1", 2),
+        ("minicpmo_4_5_2gpu.yaml", "0,1", 2),
         ("minicpmo_4_5_2gpu_throughput.yaml", "0", 1),
     ],
 )
@@ -98,7 +101,7 @@ def test_two_card_vocoder_profiles_preserve_shared_tuning(monkeypatch, deploy_na
     extra = config.connectors["connector_of_shared_memory"]["extra"]
     assert extra["codec_chunk_frames"] == 32
     assert extra["token2wav_n_timesteps"] == 5
-    assert extra["micro_batch_size"] == 8
+    assert (extra["micro_batch_size"], extra["secondary_vocoder_micro_batch_size"]) == (8, 4)
     assert extra["token2wav_setup_host_cache_size"] == 512
     assert extra["token2wav_runtime_prompt_cache_size"] == 512
     assert "code2wav_encoder_graph_singleton_history_frames" not in extra
@@ -107,10 +110,6 @@ def test_two_card_vocoder_profiles_preserve_shared_tuning(monkeypatch, deploy_na
 @pytest.mark.parametrize("deploy_name", [_DEPLOY, "minicpmo_4_5_turn.yaml"])
 @pytest.mark.parametrize("platform", ["cuda", "npu", "rocm", "xpu", "musa", "cpu"])
 def test_reference_optimizations_are_cuda_only(monkeypatch, deploy_name, platform):
-    from vllm_omni.config.stage_config import resolve_deploy_yaml
-    from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
-    from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
-
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     path = get_deploy_config_path(deploy_name)
     deploy = _apply_platform_overrides(load_deploy_config(path), platform=platform)
@@ -134,10 +133,6 @@ def test_reference_optimizations_are_cuda_only(monkeypatch, deploy_name, platfor
 @pytest.mark.parametrize("platform", ["cuda", "npu"])
 @pytest.mark.parametrize("depth", [1, 2])
 def test_platform_connector_overlay_preserves_inherited_options(tmp_path, monkeypatch, deploy_name, platform, depth):
-    from vllm_omni.config.stage_config import resolve_deploy_yaml
-    from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
-    from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
-
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     path = get_deploy_config_path(deploy_name)
     expected = _apply_platform_overrides(load_deploy_config(path), platform=platform).connectors

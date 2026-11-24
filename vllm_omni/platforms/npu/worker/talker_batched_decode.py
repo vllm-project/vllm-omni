@@ -19,7 +19,6 @@ from vllm_omni.platforms.npu.worker.talker_context import (
     SHORT_CONTEXT,
     hybrid_enabled,
     scheduled_length,
-    trace_context,
 )
 from vllm_omni.platforms.npu.worker.talker_exact_rotary import fused as exact_bf16_rotary
 
@@ -310,7 +309,6 @@ def prepare(runner, talker, model_inputs, input_batch, width):
         return None
     length = scheduled_length(input_batch, rows, width)
     if hybrid and (length is None or length > full_capacity):
-        trace_context(input_batch, "wide_batch", length)
         return None
     block = runner.vllm_config.cache_config.block_size
     embeds, positions = model_inputs.get("inputs_embeds"), model_inputs.get("positions")
@@ -351,12 +349,13 @@ def prepare(runner, talker, model_inputs, input_batch, width):
     # Keep one 16-row capture. A longer sequence takes the existing full-context path.
     if graph_rows == 16:
         extra = getattr(runner.vllm_config, "additional_config", None)
-        short_capacity = extra.get("minicpmo_talker_wide_graph_capacity", full_capacity) if isinstance(extra, dict) else full_capacity
+        short_capacity = full_capacity
+        if isinstance(extra, dict):
+            short_capacity = extra.get("minicpmo_talker_wide_graph_capacity", full_capacity)
         if not isinstance(short_capacity, int) or short_capacity not in (256, full_capacity):
             raise ValueError("minicpmo_talker_wide_graph_capacity must be 256 or 512")
         if short_capacity != full_capacity:
             if length is None or length > short_capacity:
-                trace_context(input_batch, "wide_graph_full_context_fallback", length, short_capacity)
                 return None
             preferred = full_capacity = short_capacity
     elif length is not None:
@@ -409,8 +408,6 @@ def prepare(runner, talker, model_inputs, input_batch, width):
                     fused_rope,
                 )
                 output = compact.replay()[:rows]
-                if hybrid and frame == width - 1:
-                    trace_context(input_batch, "compact_batch", length, capacity)
                 return output
             except (RuntimeError, TypeError, ValueError):
                 rejected.add(qualification)

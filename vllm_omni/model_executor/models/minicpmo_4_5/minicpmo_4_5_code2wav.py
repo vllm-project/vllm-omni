@@ -1641,19 +1641,6 @@ class MiniCPMO45Code2Wav(nn.Module):
                 self._states.pop(request_id, None)
             else:
                 self._states[request_id] = state
-        if os.getenv("MINICPMO_RSI_NATIVE_AUDIO_TRACE"):
-            for item, output in zip(items, outputs, strict=True):
-                if item.duplex_turn_id >= 0:
-                    logger.info(
-                        "RSI_NATIVE_PCM request=%s turn=%s chunk=%d frames=%d samples=%d tail=%s segment=%s",
-                        item.request_id,
-                        item.duplex_turn_id,
-                        item.chunk_seq,
-                        int(item.tokens.numel()),
-                        int(output.numel()),
-                        item.last_chunk,
-                        item.tts_is_last_chunk,
-                    )
         sample_rate_tensor = torch.as_tensor(sample_rate, dtype=torch.int32)
         return OmniOutput(
             text_hidden_states=None,

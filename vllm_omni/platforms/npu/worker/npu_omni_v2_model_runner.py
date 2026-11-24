@@ -298,6 +298,67 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
                 logger.exception("[minicpmo] v2 static-shape install failed; stock backend kept")
         super().__init__(*args, **kwargs)
         self._scheduler_ngram = use_scheduler_ngram(self.vllm_config)
+        self._minicpmo_native_rope_reqs: set[str] = set()
+        self._minicpmo_rope_offsets_dirty = False
+        self._visual_a16_prefill = (
+            self.model_config.model_stage == "llm"
+            and (self.vllm_config.additional_config or {}).get("minicpmo_visual_a16_prefill") is True
+        )
+        self._visual_a16_reqs: set[str] = set()
+        self._thinker_prefill_startup_path = (
+            os.getenv("MINICPMO_NPU_THINKER_PREFILL_STARTUP")
+            if self.model_config.model_stage == "llm" and "MiniCPMO45" in str(self.model_config.architectures)
+            else None
+        )
+
+    def _minicpmo_rope_model(self):
+        thinker = getattr(self.model, "thinker", None)
+        return thinker if getattr(thinker, "rope_row_offsets", None) is not None else None
+
+    def add_requests(self, scheduler_output):
+        if self._visual_a16_prefill:
+            for data in scheduler_output.scheduled_new_reqs:
+                if not getattr(data, "resumable", False) and any(
+                    feature.modality in {"image", "video"} for feature in (data.mm_features or ())
+                ):
+                    self._visual_a16_reqs.add(data.req_id)
+        if self._minicpmo_rope_model() is not None:
+            for data in scheduler_output.scheduled_new_reqs:
+                params = data.sampling_params
+                prompt = data.prompt_token_ids
+                if (
+                    not getattr(data, "resumable", False)
+                    and params is not None
+                    and params.max_tokens is not None
+                    and prompt is not None
+                    and len(prompt) + params.max_tokens <= 10240
+                ):
+                    self._minicpmo_native_rope_reqs.add(data.req_id)
+        super().add_requests(scheduler_output)
+
+    def finish_requests(self, scheduler_output):
+        self._minicpmo_native_rope_reqs.difference_update(scheduler_output.finished_req_ids)
+        self._visual_a16_reqs.difference_update(scheduler_output.finished_req_ids)
+        super().finish_requests(scheduler_output)
+
+    def _prepare_minicpmo_rope(self, batch):
+        model = self._minicpmo_rope_model()
+        if model is None:
+            return
+        offsets = model.rope_row_offsets
+        long_rows = [rid not in self._minicpmo_native_rope_reqs for rid in batch.req_ids]
+        if not any(long_rows):
+            if self._minicpmo_rope_offsets_dirty:
+                offsets.zero_()
+                self._minicpmo_rope_offsets_dirty = False
+            return
+        values = np.zeros(batch.num_tokens_after_padding, dtype=np.int64)
+        starts = batch.query_start_loc_np
+        for i, is_long in enumerate(long_rows):
+            if is_long:
+                values[starts[i] : starts[i + 1]] = model.rope_long_offset
+        async_tensor_h2d(values, out=offsets[: len(values)])
+        self._minicpmo_rope_offsets_dirty = True
 
     def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc, num_active_loras=0):
         drafts = scheduler_output.scheduled_spec_decode_tokens
@@ -308,7 +369,9 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
                 row = self.req_states.req_id_to_index[req_id]
                 draft_ids[row, : len(tokens)] = tokens
             async_tensor_h2d(draft_ids, out=self.req_states.draft_tokens)
-        return super().prepare_inputs(scheduler_output, batch_req_state, batch_desc, num_active_loras)
+        batch = super().prepare_inputs(scheduler_output, batch_req_state, batch_desc, num_active_loras)
+        self._prepare_minicpmo_rope(batch)
+        return batch
 
     def _can_skip_spec_cpu_length_sync(self) -> bool:
         # The synchronous scheduler already supplies rejection-adjusted lengths.
@@ -339,9 +402,44 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
             self._omni_kstep_dummy_profile = was_profile
 
     def _call_model(self, model_inputs, *, input_batch, batch_desc):
+        if (
+            self._visual_a16_prefill
+            and input_batch.has_prefill
+            and not input_batch.is_dummy
+            and input_batch.req_ids
+            and all(req_id in self._visual_a16_reqs for req_id in input_batch.req_ids)
+        ):
+            from vllm_omni.platforms.npu.models import minicpmo_visual_precision
+
+            context = get_forward_context()
+            previous = context.skip_compiled
+            context.skip_compiled = True
+            minicpmo_visual_precision.visual_prefill_active = True
+            logger.info_once("MiniCPM-o uses W8A16 for all-visual prefill")
+            try:
+                return super()._call_model(model_inputs, input_batch=input_batch, batch_desc=batch_desc)
+            finally:
+                minicpmo_visual_precision.visual_prefill_active = False
+                context.skip_compiled = previous
         mode_path = os.getenv("MINICPMO_NPU_TALKER_FUSED_MODE_FILE")
-        if mode_path and self.model_config.model_stage == "llm" and input_batch.has_prefill:
-            if "MiniCPMO45" in str(self.model_config.architectures):
+        startup_path = self._thinker_prefill_startup_path
+        if self.model_config.model_stage == "llm" and input_batch.has_prefill:
+            if startup_path:
+                if input_batch.num_reqs == 1 and input_batch.req_ids[0] in self._minicpmo_native_rope_reqs:
+                    from vllm_omni.platforms.npu.worker.prefill_graph import run_prefill
+
+                    output = run_prefill(
+                        self,
+                        None,
+                        model_inputs,
+                        input_batch,
+                        batch_desc,
+                        thinker=True,
+                        startup_path=startup_path,
+                    )
+                    if output is not None:
+                        return output
+            elif mode_path and "MiniCPMO45" in str(self.model_config.architectures):
                 from vllm_omni.platforms.npu.worker.prefill_graph import run_prefill
 
                 output = run_prefill(self, mode_path, model_inputs, input_batch, batch_desc, thinker=True)
@@ -371,6 +469,21 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         use_eager = (self.vllm_config.additional_config or {}).get(
             "minicpmo_talker_prefill_eager"
         ) is True and not input_batch.is_dummy
+        if (
+            not use_eager
+            and (self.vllm_config.additional_config or {}).get("minicpmo_talker_short_prefill_eager") is True
+            and not input_batch.is_dummy
+            and input_batch.num_reqs == 1
+            and 2 <= input_batch.num_tokens <= 32
+        ):
+            infos = model_inputs.get("model_intermediate_buffer") or ()
+            if len(infos) == 1 and isinstance(infos[0], dict):
+                duplex = infos[0].get("duplex")
+                use_eager = not infos[0].get("native_duplex") and not (
+                    isinstance(duplex, dict) and duplex.get("data_plane") is True
+                )
+                if use_eager:
+                    logger.info_once("[talker-prefill-c1] eager path for short single-request turn")
         context = get_forward_context() if use_eager else None
         if context is not None:
             # Avoid blocking the Talker worker on first-use static kernel
@@ -378,10 +491,11 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
             previous = context.skip_compiled
             context.skip_compiled = True
         try:
-            if mode_path:
+            startup_path = os.getenv("MINICPMO_NPU_TALKER_PREFILL_STARTUP")
+            if startup_path or mode_path:
                 from vllm_omni.platforms.npu.worker.prefill_graph import run_prefill
 
-                output = run_prefill(self, mode_path, model_inputs, input_batch, batch_desc)
+                output = run_prefill(self, mode_path, model_inputs, input_batch, batch_desc, startup_path=startup_path)
                 if output is not None:
                     self._kstep_ran_last = False
                     return output

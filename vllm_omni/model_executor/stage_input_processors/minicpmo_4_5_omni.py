@@ -34,8 +34,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.handoff import (
     unpack_handoff_tensor,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
-from vllm_omni.worker_v2.stage_trace import boundary as _c8_boundary
-from vllm_omni.worker_v2.stage_trace import enabled as _c8_trace_enabled
 
 logger = init_logger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
@@ -478,23 +476,6 @@ def tts2code2wav_async_chunk(
     else:
         context = []
         output_codes = []
-    if native_duplex and os.getenv("MINICPMO_RSI_NATIVE_AUDIO_TRACE"):
-        logger.info(
-            "RSI_NATIVE_CODEC request=%s turn=%s condition=%s chunk=%d new=%d length=%d left=%d "
-            "held=%d flush=%s tail=%s sampled=%s codes=%s",
-            request_id,
-            duplex_turn_id,
-            condition_seq,
-            int(record["chunk_seq"]),
-            new_token_count,
-            codec_end,
-            len(context),
-            len(pending),
-            flush_pending,
-            last_chunk,
-            getattr(request, "sampled_token_ids", ()),
-            new_codes,
-        )
     state["codec_end"] = codec_end
     code_flat_numel = len(output_codes)
     if native_duplex and (code_flat_numel > 0 or (text_without_audio and finished)):
@@ -561,8 +542,6 @@ def tts2code2wav_async_chunk(
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
         _drop_codec_state(transfer_manager, request_id)
-    if _c8_trace_enabled():
-        _c8_boundary("codec_to_vocoder", request=request_id, chunk=chunk_seq, frames=new_token_count, last=last_chunk)
     return payload
 
 
@@ -1435,19 +1414,6 @@ def llm2tts(
                 llm_output_ids,
                 prompt_token_ids,
             )
-        if is_native_duplex_handoff and os.getenv("MINICPMO_RSI_NATIVE_AUDIO_TRACE"):
-            logger.info(
-                "RSI_NATIVE_TEXT request=%s condition=%s first=%s end=%s punct=%s ids=%s text=%r",
-                llm_output.request_id,
-                condition_sequence_value,
-                native_turn_start,
-                native_turn_end_handoff,
-                turn_text_ends_sentence,
-                handoff_ids,
-                thinker_text,
-            )
-        if _c8_trace_enabled():
-            _c8_boundary("text_to_talker", request=str(llm_output.request_id))
         tts_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=scheduler_prompt_token_ids,

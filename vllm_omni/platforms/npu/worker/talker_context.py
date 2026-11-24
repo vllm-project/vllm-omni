@@ -4,13 +4,9 @@
 
 import os
 
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
 SHORT_CONTEXT = 512
 MODEL_CONTEXT = 4096
 HYBRID_MODE_FILE = os.getenv("MINICPMO_NPU_TALKER_HYBRID_CONTEXT_FILE")
-TRACE_FILE = os.getenv("MINICPMO_C8_TRACE_FILE")
 
 
 def hybrid_enabled(model_len):
@@ -26,8 +22,3 @@ def scheduled_length(batch, rows, width):
     if int(lengths.min()) < width:
         return None
     return int(lengths.max())
-
-
-def trace_context(batch, path, length, capacity=None):
-    if TRACE_FILE and os.path.isfile(TRACE_FILE):
-        logger.info("[talker-context] path=%s length=%s graph=%s requests=%s", path, length, capacity, batch.req_ids)

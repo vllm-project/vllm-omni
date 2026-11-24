@@ -2879,6 +2879,24 @@ class OrchestratorBase:
     ) -> Any:
         """Process a bypassing request's raw prompt with the input processor that also prepares the
         prompts forwarded to this stage, so the stage keeps a single multimodal cache sender."""
+        startup_marker = os.getenv("MINICPMO_NPU_TALKER_PREFILL_STARTUP")
+        if (
+            stage_id == 1
+            and startup_marker
+            and req_id.startswith("minicpmo-talker-startup-")
+            and os.path.isfile(startup_marker)
+            and self._next_stage_input_is_tokens(prompt)
+        ):
+            # A synthetic Talker handoff is already tokenized. Use the same
+            # constructor as a normal Thinker-to-Talker transfer.
+            request = await self._build_next_stage_request(
+                req_id,
+                stage_id,
+                prompt,
+                req_state.sampling_params_list[stage_id],
+                replica_id=replica_id,
+            )
+            return apply_omni_final_stage_metadata(request, req_state.final_stage_id)
         if replica_id is not None:
             prompt = await asyncio.to_thread(self._scope_stage_mm_cache_to_replica, stage_id, prompt, replica_id)
         request = await self._process_stage_inputs(

@@ -1134,14 +1134,18 @@ class BatchedToken2Wav(nn.Module):
         caches = [state.flow_cache["conformer_att_cache"] for state in states]
         lengths = [int(value.numel()) for value in tokens]
         lookahead = self.flow.encoder.pre_lookahead_layer.pre_lookahead_len
-        valid_lengths = [length if last else length - lookahead for length, last in zip(lengths, last_chunks, strict=True)]
+        valid_lengths = [
+            length if last else length - lookahead for length, last in zip(lengths, last_chunks, strict=True)
+        ]
         offsets = [history - int(cache.shape[3]) for cache in caches]
 
         padded = torch.stack([F.pad(value, (0, width - length)) for value, length in zip(tokens, lengths, strict=True)])
         convolution = torch.cat([state.flow_cache["conformer_cnn_cache"] for state in states])
         low = torch.cat(
-            [F.pad(cache[:split, :, :, : cache.shape[3] // 2], (0, 0, offset // 2, 0))
-             for cache, offset in zip(caches, offsets, strict=True)],
+            [
+                F.pad(cache[:split, :, :, : cache.shape[3] // 2], (0, 0, offset // 2, 0))
+                for cache, offset in zip(caches, offsets, strict=True)
+            ],
             dim=1,
         )
         high = torch.cat(
@@ -1151,8 +1155,15 @@ class BatchedToken2Wav(nn.Module):
         with self._autocast(padded.device):
             hidden, cnn_low, cnn_high, low, high = runner.run(
                 "padded_flow_chunks",
-                (padded, convolution, low, high, index_to_device(lengths, padded.device),
-                 index_to_device(valid_lengths, padded.device), index_to_device(offsets, padded.device)),
+                (
+                    padded,
+                    convolution,
+                    low,
+                    high,
+                    index_to_device(lengths, padded.device),
+                    index_to_device(valid_lengths, padded.device),
+                    index_to_device(offsets, padded.device),
+                ),
                 (),
                 self._forward_padded_flow_encoder,
             )
@@ -1162,8 +1173,10 @@ class BatchedToken2Wav(nn.Module):
             lower = low[:, row : row + 1, :, offset // 2 : history // 2 + length].repeat(1, 1, 1, 2, 1)
             upper = high[:, row : row + 1, :, offset : history + length * 2]
             convolution = torch.cat(
-                (cnn_low[row : row + 1, :, length - 2 : length],
-                 cnn_high[row : row + 1, :, length * 2 - 4 : length * 2]),
+                (
+                    cnn_low[row : row + 1, :, length - 2 : length],
+                    cnn_high[row : row + 1, :, length * 2 - 4 : length * 2],
+                ),
                 dim=2,
             )
             result.append((hidden[row : row + 1, : length * 2], convolution, torch.cat((lower, upper))))
@@ -1195,8 +1208,13 @@ class BatchedToken2Wav(nn.Module):
         runner.run(
             "padded_flow_chunks",
             (
-                tokens, convolution, low, high,
-                tokens.new_full((rows,), width), tokens.new_full((rows,), width), tokens.new_zeros(rows),
+                tokens,
+                convolution,
+                low,
+                high,
+                tokens.new_full((rows,), width),
+                tokens.new_full((rows,), width),
+                tokens.new_zeros(rows),
             ),
             (),
             self._forward_padded_flow_encoder,
@@ -2786,13 +2804,16 @@ class BatchedToken2Wav(nn.Module):
                     continue
                 if last_chunk:
                     terminal_rows.extend(rows)
-                elif self._padded_flow_continuations and width == width_cap and (
-                    exact_graphs is None or (len(rows), width, history) not in exact_graphs.graphs
+                elif (
+                    self._padded_flow_continuations
+                    and width == width_cap
+                    and (exact_graphs is None or (len(rows), width, history) not in exact_graphs.graphs)
                 ):
                     continuation_rows.extend(rows)
             terminal_batches = [terminal_rows[start : start + 4] for start in range(0, len(terminal_rows), 4)]
             continuation_batches = [
-                continuation_rows[start : start + 4] for start in range(0, len(continuation_rows), 4)
+                continuation_rows[start : start + 4]
+                for start in range(0, len(continuation_rows), 4)
                 if len(continuation_rows) - start >= 2
             ]
             for rows in terminal_batches + continuation_batches:

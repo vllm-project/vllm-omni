@@ -25,12 +25,10 @@ channels-last and merged-CFM implementations are removed.
 
 ## Ascend two-card profile
 
-The opt-in [Ascend deployment recipe](../../recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md)
-keeps Thinker 40960, Talker 4096, two Talker/Code2Wav replicas and five-step CFM.
-Its active graph modes qualify each worker's eligible shapes on first use;
-reference outputs remain authoritative during qualification and on mismatch.
-The recipe lists upstream dependency revisions and checkpoint hashes. It
-does not change CUDA defaults or establish fresh performance/quality results.
+The [Ascend deployment recipe](gh-file:recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md)
+keeps Thinker 40960, Talker 4096, two Talker and two Code2Wav replicas, and
+five-step CFM. Eligible graphs qualify against reference results before
+replay. Failed qualification keeps the reference path.
 
 ## Turn prefix-cache memory
 
