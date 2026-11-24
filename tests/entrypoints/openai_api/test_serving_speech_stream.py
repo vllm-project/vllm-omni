@@ -2096,7 +2096,16 @@ class TestWebSocketSentenceSplitting:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian", "seed": 42, "watermarking": False})
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "seed": 42,
+                        "watermarking": False,
+                        "temperature": 0.7,
+                        "repetition_penalty": 1.1,
+                    }
+                )
                 ws.send_json({"type": "input.text", "text": "Hello."})
                 ws.send_json({"type": "input.done"})
                 ws.receive_json()
@@ -2107,6 +2116,8 @@ class TestWebSocketSentenceSplitting:
         speech_request = speech_service._generate_audio_bytes.await_args_list[0].args[0]
         assert speech_request.seed == 42
         assert speech_request.watermarking is False
+        assert speech_request.temperature == 0.7
+        assert speech_request.repetition_penalty == 1.1
 
 
 def _qwen3_sample_rate_check(request: OpenAICreateSpeechRequest) -> str | None:
@@ -2122,7 +2133,12 @@ class TestSessionConfigRestParameters:
         rest_fields = set(OpenAICreateSpeechRequest.model_fields)
         session_fields = set(StreamingSpeechSessionConfig.model_fields)
         assert rest_fields - session_fields == {"input", "stream", "stream_format"}
-        assert session_fields - rest_fields == {"text_input_mode", "split_granularity", "stream_audio"}
+        assert session_fields - rest_fields == {
+            "text_input_mode",
+            "model_input_mode",
+            "split_granularity",
+            "stream_audio",
+        }
 
     def test_every_shared_field_is_forwarded(self):
         config = StreamingSpeechSessionConfig()

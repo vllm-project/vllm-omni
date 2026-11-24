@@ -50,6 +50,9 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
 vllm-omni serve nineninesix/gepard-1.0 --omni --port 8091 --trust-remote-code \
     --stage-init-timeout 900 \
     --deploy-config vllm_omni/deploy/gepard.yaml
+
+# Chatterbox Turbo (built-in voice or one reference recording; `pip install 'vllm-omni[chatterbox]'`)
+vllm serve ResembleAI/chatterbox-turbo --omni --port 8091
 ```
 
 ### Generate Speech
@@ -169,6 +172,42 @@ configured budgets. This is a token limit, not an audio-duration limit.
 | `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`). Local files fold `mtime_ns` and `size` into cache keys to automatically reload on-disk edits; HTTP URLs and base64 URIs remain cached by string locator. |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
+
+### Sampling overrides
+
+Speech requests can override the first AR stage's temperature and repetition
+penalty at the top level or through `extra_params`. Explicit top-level values
+take precedence over nested values, then the stage's `default_sampling_params`;
+omitted or `null` values do not override them. Overrides are merged before
+validation, so shadowed nested values are ignored. The first-stage `temperature`
+follows vLLM `SamplingParams` validation and normalization (currently a finite
+value in `[0, 2]`, with small positive values raised to `0.01`).
+Normalization happens before adapter prompt construction, so model metadata
+and stage sampling use the same effective temperature.
+`repetition_penalty` must be finite and positive, with `1.0` disabling repetition
+scaling for the first AR stage.
+
+For Qwen3-TTS, request `temperature` also controls the residual Subtalker's
+temperature and sampling switch, using the normalized first-stage value.
+Without a request override, an effective first-stage temperature of zero also
+makes the Subtalker greedy; other values keep its deployment defaults.
+Explicit `extra_params.subtalker_sampling_params`
+fields override residual defaults and take precedence over temperature
+inheritance; `{}` keeps residual defaults without inheriting temperature.
+Accepted fields are `do_sample` (boolean), `temperature` (finite, nonnegative),
+`top_k` (-1 or a nonnegative integer, capped at the residual vocabulary size),
+and `top_p` (only `1.0` is supported).
+
+This request makes both Qwen3-TTS predictors greedy and disables the first
+stage's repetition penalty:
+
+```json
+{
+  "input": "Hello, how are you?",
+  "temperature": 0.0,
+  "repetition_penalty": 1.0
+}
+```
 
 ### Response Format
 
@@ -620,6 +659,9 @@ when the first text arrives. `ref_audio` takes a single string and
 `speaker_embedding` a flat list. `duration_seconds` and `token_count` set the
 length of a whole request, so they require `split_granularity="none"` and
 `text_input_mode="buffered"`. Session parameters:
+
+`temperature`, `repetition_penalty`, and `extra_params` are forwarded through
+the same sampling override validation, precedence, and normalization as REST.
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
@@ -1205,6 +1247,39 @@ parity should be checked against the upstream adapter on your deployment.
 | Model | Description |
 | ------- | ------------- |
 | `BreezeBlue/Breeze-TTS-2` | Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder, bundled Qwen3-TTS codec) at 24 kHz. Four modes are selected from the request fields: plain (`input` + speaker tag `voice`, `S0`..`S9`), voice design (`instructions`), voice clone (`ref_audio` + `ref_text`, exactly one clip), and voice direction (reference + `instructions`). Greedy decoding only: `sample_rate` must be `24000`, `speed` must be `1.0`, and `guidance_scale`/`cfg_scale` other than `1.0`, `negative_prompt`, `temperature`/`top_p`/`top_k` overrides, `language`, and `speaker_embedding` are rejected. Streaming returns PCM `speech.audio.delta` events. See [`recipes/BreezeBlue/Breeze-TTS-2.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/BreezeBlue/Breeze-TTS-2.md). |
+
+### Chatterbox Turbo and Original
+
+| Model | Description |
+| ------- | ------------- |
+| `ResembleAI/chatterbox-turbo` | GPT-2 T3 with the two-step meanflow S3Gen decoder; English, built-in voice or voice cloning from one reference recording |
+| `ResembleAI/chatterbox` | Llama T3 with paired classifier-free guidance and the ten-step S3Gen decoder; adds `exaggeration` and `cfg_weight` controls |
+
+`ResembleAI/chatterbox-turbo` and `ResembleAI/chatterbox` serve English speech
+at 24 kHz through `/v1/audio/speech` and the shared sentence-segmented WebSocket
+frontend. Use `voice: "default"` for the built-in voice, or one `ref_audio`
+recording (URL or data URL) without `ref_text`. Both use the shared one-second
+minimum; Turbo repeats a clip of five seconds or less until it is longer, where
+upstream refuses it.
+
+Non-streaming formats are WAV, PCM, MP3 and FLAC. Streaming uses
+`stream: true`, `stream_format: "audio"` and `response_format: "pcm"` or `"wav"`.
+PCM is mono signed 16-bit little-endian at 24 kHz. Other output sample rates
+are unsupported by this adapter.
+
+Original accepts nonnegative finite `extra_params.exaggeration` and
+`extra_params.cfg_weight`; a request without them gets the deploy file's stage 0
+`additional_config` values (0.5 each, upstream's defaults). Turbo rejects those fields.
+Both reject VoiceDesign, free-form instructions and multilingual synthesis.
+`max_new_tokens` accepts 1 to 1000 speech tokens, upstream's generation cap,
+and defaults to 1000. Admission capacity does not guarantee real-time playback.
+References queued together are encoded as one batch, and a reference evicted from
+the speaker cache is encoded again in whatever batch is current, so cloned-voice
+output can vary slightly with concurrency and cache state; see the
+[H100 recipe](https://github.com/vllm-project/vllm-omni/tree/main/recipes/ResembleAI/Chatterbox-H100.md#reference-conditioning-batch).
+
+See the [online examples](../user_guide/examples/online_serving/text_to_speech.md#chatterbox-turbo-and-original)
+and the [H100 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ResembleAI/Chatterbox-H100.md).
 
 ## Error Responses
 

@@ -94,17 +94,6 @@ run_server_params = [
     )
 ]
 
-default_tts_server_params = [
-    pytest.param(
-        OmniServerParams(
-            model=MODEL,
-            stage_config_path=_DEFAULT_STAGE_CONFIG,
-            server_args=["--trust-remote-code"],
-        ),
-        id="async_chunk",
-    )
-]
-
 # Exercise the throughput path in the existing L4 lane with smaller capacities.
 # The production H200 profile retains its own admission and graph buckets.
 _FAST_PATH_STAGE_CONFIG = modify_stage_config(
@@ -154,11 +143,12 @@ def test_cached_predictor_streaming_audio(omni_server, online_client, run_level)
     )
 
 
+# These three cases must stay adjacent and share one module-scoped OmniServer.
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", default_tts_server_params, indirect=True)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_default_cuda_graph_startup(omni_server) -> None:
     """Verify both stages start with the shipped CUDA Graph configuration.
 
