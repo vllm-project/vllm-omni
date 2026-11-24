@@ -18,6 +18,38 @@ We use **Qwen-Image** as the reference implementation for decode parallel, and *
 
 ## Overview
 
+### MiniMax-H3 temporal scheduling on NPU
+
+MiniMax-H3 can opt into request-local temporal tile scheduling with
+`enable_vae_temporal_scheduling=True`. The default keeps the native per-clip
+path without planning or budget collectives. This adapter uses the trusted
+checkpoint's tile primitives, rather than `DistributedVaeExecutor` below.
+
+Only independently decodable, context-complete ViT calls may be reordered.
+Task descriptors preserve original batch N, time slice and context, spatial
+position and shape. Deterministic shape-bucket assignment must produce the same
+collective order on every video-group rank. Native spatial blending, temporal
+overlap, crop and output order remain authoritative. No plan survives a request.
+
+The bounded planner uses integer task geometry, without trial decode, online
+calibration or latency prediction. It evaluates W=1 through min(16, clip count),
+including incomplete final windows. Within the group-minimum incremental memory
+budget, it minimizes assignment waste in latent elements, then window size.
+For uniform tiles the balancing period P/gcd(S,P) explains the smallest divisible
+window; real edge shapes are evaluated separately. Sixteen bounds live output
+storage and metadata; the memory budget may impose a smaller limit.
+Unsupported checkpoint/backend contracts, insufficient budget, single rank/clip
+or native stacked tiling retain native execution. Invalid configuration raises
+an error. Planning supports non-power-of-two and 16-rank groups, without implying
+hardware validation or a performance guarantee at any size. Actual speed and
+memory growth require matched OFF/ON measurements including all planning work.
+
+See the [user guide](../../user_guide/diffusion/parallelism/vae_parallelism.md#adaptive-temporal-scheduling-minimax-h3-npu)
+for supported paths, logs and limitations. Regression coverage is in
+`tests/diffusion/models/minimax_h3/test_minimax_h3_vae_schedule.py` and
+`test_minimax_h3_vae_window.py`; hardware claims require same-device OFF/ON
+measurements in addition to these CPU tests.
+
 ### What is Vae Patch parallel?
 
 **VAE Patch Parallelism** is an acceleration technique for both **encoding** and **decoding**. Instead of processing the entire tensor at once, the tensor is:
