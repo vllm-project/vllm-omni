@@ -101,6 +101,7 @@ class _FakeDuplexOmni(DuplexOmni):
 
     def __init__(self) -> None:
         self.model = "demo-duplex-model"
+        self.engine = SimpleNamespace(duplex_frontend_group_count=1)
         self._stage_configs = [object(), object(), object()]
         self._vllm_config = SimpleNamespace(
             lora_config=None,
@@ -391,8 +392,14 @@ def test_joyai_serving_profiles(monkeypatch, asr, duplex):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("log_error_stack", [False, True])
-async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch, mocker, log_error_stack) -> None:
+@pytest.mark.parametrize(
+    ("log_error_stack", "group_count"),
+    [(False, 1), (True, 1), (False, 0)],
+    ids=["healthy", "log-error-stack", "no-live-group"],
+)
+async def test_duplex_app_state_wires_only_the_session_surfaces(
+    monkeypatch, mocker, log_error_stack, group_count
+) -> None:
     """Lock the duplex ``app.state``: the two session-backed surfaces are live, every turn-based service is None.
 
     Fails if a turn-based service is wired into a duplex server (its route
@@ -406,6 +413,8 @@ async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch, moc
     derenderer_ctor = mocker.patch.object(api_server, "OnlineDerenderer")
     monkeypatch.setattr(api_server, "OmniOpenAIServingChat", lambda **kwargs: SimpleNamespace(**kwargs))
     engine = _FakeDuplexOmni()
+    engine.engine.duplex_frontend_group_count = group_count
+    warning = mocker.spy(api_server.logger, "warning")
     state = State()
 
     await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=log_error_stack))
@@ -426,6 +435,7 @@ async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch, moc
     state.online_renderer.warmup.assert_called_once_with()
     assert state.engine_client is engine
     assert state.vllm_config is engine._vllm_config
+    assert any("no complete replica group" in call.args[0] for call in warning.call_args_list) == (group_count == 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -648,18 +658,20 @@ def test_turn_deployment_rejects_explicit_duplex_without_falling_back_to_stt(fla
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "explicit_template, tokenizer_template, tokenizer_error, expected",
+    "explicit_template, pipeline_template, tokenizer_template, tokenizer_error, expected",
     [
-        ("explicit", None, False, "explicit"),
-        (None, "tokenizer", False, None),
-        (None, None, False, "model-json"),
-        (None, None, True, "model-json"),
+        ("explicit", "pipeline", None, False, "explicit"),
+        (None, "pipeline", "tokenizer", False, "pipeline"),
+        (None, None, "tokenizer", False, None),
+        (None, None, None, False, "model-json"),
+        (None, None, None, True, "model-json"),
     ],
 )
 async def test_shared_chat_template_resolution(
-    mocker, explicit_template, tokenizer_template, tokenizer_error, expected
+    mocker, explicit_template, pipeline_template, tokenizer_template, tokenizer_error, expected
 ):
     engine = _FakeDuplexOmni()
+    engine.engine = SimpleNamespace(pipeline_config=SimpleNamespace(chat_template=pipeline_template))
     tokenizer = mocker.patch.object(
         engine,
         "get_tokenizer",
@@ -670,5 +682,5 @@ async def test_shared_chat_template_resolution(
     model_template = mocker.patch.object(api_server, "_load_model_chat_template_json", return_value="model-json")
 
     assert await api_server._resolve_chat_template(engine, _minimal_args()) == expected
-    assert tokenizer.call_count == (0 if explicit_template is not None else 1)
+    assert tokenizer.call_count == (0 if explicit_template is not None or pipeline_template is not None else 1)
     assert model_template.call_count == (1 if expected == "model-json" else 0)

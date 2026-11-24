@@ -327,6 +327,11 @@ def _validate_daily_omni(result: dict[str, Any], *, min_accuracy: float | None) 
     return errs
 
 
+def validate_daily_omni(result: dict[str, Any], *, min_accuracy: float | None) -> list[str]:
+    """Public accuracy-gate helper for DFX and other cross-package callers."""
+    return _validate_daily_omni(result, min_accuracy=min_accuracy)
+
+
 def _validate_videomme(result: dict[str, Any], *, min_accuracy: float | None) -> list[str]:
     errs: list[str] = []
     acc = result.get("videomme_accuracy")
@@ -416,6 +421,65 @@ def _validate_seed_tts(
         )
     )
     return errs
+
+
+def dataset_accuracy_errors(
+    result: dict[str, object],
+    dataset: str,
+    expected: int,
+    baseline: Mapping[str, float],
+    *,
+    enforce_thresholds: bool = True,
+) -> list[str]:
+    """Check dataset scoring coverage independently of the model and concurrency."""
+    failures = ["timed_out_requests", "cancelled_after_timeout_requests"]
+    if dataset == "daily-omni":
+        counts = ["daily_omni_evaluated_ok"]
+        scores = ["daily_omni_accuracy"]
+        failures += ["daily_omni_request_failed", "daily_omni_no_gold"]
+    elif dataset == "seed-tts":
+        counts = ["seed_tts_content_evaluated"]
+        scores = ["seed_tts_content_error_mean"]
+        failures += ["seed_tts_request_failed", "seed_tts_no_pcm", "seed_tts_asr_failed", "seed_tts_empty_audio"]
+        if baseline.get("min_seed_tts_mean_sim") is not None:
+            counts.append("seed_tts_sim_evaluated")
+            scores.append("seed_tts_sim_mean")
+            failures += ["seed_tts_sim_failed", "seed_tts_sim_skipped_no_ref"]
+    else:
+        raise ValueError(f"No dataset accuracy contract for {dataset}")
+    errors = [f"{key}={result.get(key)!r}, expected {expected}" for key in counts if result.get(key) != expected]
+    errors += [f"{key}={result[key]}; workload coverage is incomplete" for key in failures if result.get(key, 0)]
+    for key in scores:
+        value = result.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            errors.append(f"{key} must be a finite score: {value!r}")
+    limits = baseline if enforce_thresholds else {}
+    if dataset == "daily-omni":
+        errors += _validate_daily_omni(result, min_accuracy=limits.get("min_daily_omni_accuracy"))
+    else:
+        errors += _validate_seed_tts(
+            result,
+            max_mean_wer=limits.get("max_seed_tts_mean_wer"),
+            min_mean_sim=limits.get("min_seed_tts_mean_sim"),
+            min_mean_utmos=None,
+        )
+    return errors
+
+
+def validate_seed_tts(
+    result: dict[str, Any],
+    *,
+    max_mean_wer: float | None,
+    min_mean_sim: float | None,
+    min_mean_utmos: float | None,
+) -> list[str]:
+    """Public accuracy-gate helper for DFX and other cross-package callers."""
+    return _validate_seed_tts(
+        result,
+        max_mean_wer=max_mean_wer,
+        min_mean_sim=min_mean_sim,
+        min_mean_utmos=min_mean_utmos,
+    )
 
 
 def _seed_tts_floor_errors(
@@ -1805,6 +1869,41 @@ def assert_images_pixel_close(
         f"p99<={p99_threshold:.6e})"
     )
     return dict(metrics)
+
+
+def assert_video_pixel_close(
+    *,
+    model_name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    mean_threshold: float,
+    p99_threshold: float,
+    frame_psnr_threshold: float,
+) -> None:
+    """Assert frame-first ``[frames, ...]`` videos in ``[0, 1]`` match within pixel tolerances.
+
+    ``mean_abs_diff`` and ``p99_abs_diff`` bound global and tail drift like
+    ``assert_images_pixel_close``; ``worst_frame_psnr`` (dB) keeps one bad
+    frame from hiding in the clip-wide averages.
+    """
+    assert actual.shape == expected.shape, f"{model_name} video shapes differ: {actual.shape} vs {expected.shape}"
+    diff = (actual.float() - expected.float()).abs()
+    mean_abs_diff = diff.mean().item()
+    p99_abs_diff = float(np.quantile(diff.numpy(), 0.99))
+    frame_mse = diff.pow(2).flatten(1).mean(dim=1)
+    worst_frame_psnr = (-10 * torch.log10(frame_mse.max().clamp_min(1e-12))).item()
+    print(
+        f"{model_name} video metrics: mean_abs_diff={mean_abs_diff:.6e} (<={mean_threshold:.6e}), "
+        f"p99_abs_diff={p99_abs_diff:.6e} (<={p99_threshold:.6e}), "
+        f"worst_frame_psnr={worst_frame_psnr:.2f} dB (>={frame_psnr_threshold:.2f}), "
+        f"max_abs_diff={diff.max().item():.6e}"
+    )
+    assert (
+        mean_abs_diff <= mean_threshold and p99_abs_diff <= p99_threshold and worst_frame_psnr >= frame_psnr_threshold
+    ), (
+        f"Video diff exceeded threshold for {model_name}: mean_abs_diff={mean_abs_diff:.6e}, "
+        f"p99_abs_diff={p99_abs_diff:.6e}, worst_frame_psnr={worst_frame_psnr:.2f} dB"
+    )
 
 
 def compute_image_ssim_psnr(

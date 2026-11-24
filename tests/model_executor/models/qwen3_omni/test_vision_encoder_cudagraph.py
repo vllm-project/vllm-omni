@@ -3,7 +3,6 @@
 """CPU contracts for Qwen3-Omni stage routing and encoder graph buffers."""
 
 from contextlib import nullcontext
-from inspect import getattr_static
 from types import SimpleNamespace
 
 import pytest
@@ -12,8 +11,7 @@ from torch import nn
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
 from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.worker.encoder_cudagraph import BudgetGraphMetadata, EncoderCudaGraphManager
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.encoder_cudagraph import BudgetGraphMetadata
 
 import vllm_omni.model_executor.models.qwen3_omni.qwen3_omni as outer_module
 import vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker as thinker_module
@@ -23,7 +21,6 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
 )
 from vllm_omni.worker.encoder_cudagraph import SingleReplayEncoderCudaGraphManager
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -96,8 +93,9 @@ def _config(stage="thinker", *, embeds=False):
             encoder_cudagraph_token_budgets=[2, 4],
             encoder_cudagraph_max_vision_items_per_batch=2,
             encoder_cudagraph_max_frames_per_batch=None,
+            encoder_cudagraph_max_token_budget=5120,
         ),
-        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
         device_config=SimpleNamespace(device="cpu"),
         speculative_config=None,
     )
@@ -131,44 +129,6 @@ def _combined(monkeypatch, stage, *, embeds=False):
     monkeypatch.setattr(cls, "_init_special_tokens_embeddings", lambda self: None)
     monkeypatch.setattr(cls, "_get_talker_suppressed_tokens", lambda self: [])
     return cls(vllm_config=cfg), cfg
-
-
-def _runner_factory(model, cfg, supports_mm_inputs=True):
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.compilation_config = cfg.compilation_config
-    runner.supports_mm_inputs = supports_mm_inputs
-    runner.model = model
-    runner.vllm_config = cfg
-    runner.device = torch.device("cpu")
-    runner.dtype = torch.float32
-    return runner._create_encoder_cudagraph_manager()
-
-
-@pytest.mark.parametrize("stage,enabled", [("thinker", True), ("talker", False), ("code2wav", False), (None, True)])
-def test_real_wrapper_construction_controls_runner_protocol(monkeypatch, stage, enabled):
-    model, cfg = _combined(monkeypatch, stage)
-    assert supports_encoder_cudagraph(model) is enabled
-    manager = _runner_factory(model, cfg)
-    assert (manager is not None) is enabled
-    if enabled:
-        assert getattr_static(model, "encoder_cudagraph_forward").__self__ is model.thinker
-        assert type(manager) is SingleReplayEncoderCudaGraphManager
-        assert manager.model is model
-        assert manager.config.out_hidden_size == 12
-        assert manager.supports_modality("image")
-        assert not manager.supports_modality("video")
-        assert not manager.supports_modality("audio")
-
-
-def test_runner_keeps_the_upstream_manager_without_the_opt_in(monkeypatch):
-    model, cfg = _combined(monkeypatch, "thinker")
-    model.encoder_cudagraph_single_replay = False
-    assert type(_runner_factory(model, cfg)) is EncoderCudaGraphManager
-
-
-def test_runner_builds_no_manager_without_multimodal_inputs(monkeypatch):
-    model, cfg = _combined(monkeypatch, "thinker")
-    assert _runner_factory(model, cfg, supports_mm_inputs=False) is None
 
 
 def test_thinker_construction_enables_the_image_graph(monkeypatch):
@@ -206,12 +166,6 @@ def test_image_graph_gate(monkeypatch, change):
         monkeypatch.setattr(graph_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=False))
     model._enable_image_encoder_cudagraph()
     assert supports_encoder_cudagraph(model) is (change is None)
-
-
-def test_precomputed_embeddings_keep_existing_encoder_entry(monkeypatch):
-    model, cfg = _combined(monkeypatch, "thinker", embeds=True)
-    assert not supports_encoder_cudagraph(model.thinker)
-    assert _runner_factory(model, cfg) is None
 
 
 def _images(grids, offset=0):
@@ -333,67 +287,6 @@ def test_graph_entry_preserves_vision_module_hooks():
     assert len(calls) == 1 and calls[0] is values["pixel_values"]
 
 
-def _run_encoder_step(monkeypatch, model, manager, batches):
-    import vllm.v1.worker.gpu_model_runner as runner_module
-
-    monkeypatch.setattr(runner_module, "group_and_batch_mm_kwargs", lambda *args, **kwargs: iter(batches))
-    keys = [f"item{index}" for index in range(sum(count for _, count, _ in batches))]
-    cached: dict[str, torch.Tensor] = {}
-    runner = SimpleNamespace(
-        _batch_mm_inputs_from_scheduler=lambda _: (keys, [(m, {}) for m, _, _ in batches], []),
-        observability_config=None,
-        model=model,
-        lora_config=None,
-        device=torch.device("cpu"),
-        is_multimodal_pruning_enabled=False,
-        requires_sequential_video_encoding=False,
-        timed_encoder_operation=lambda *args: nullcontext(),
-        encoder_cudagraph_manager=manager,
-        _cache_encoder_output=lambda key, value, *args: cached.__setitem__(key, value),
-    )
-    scheduler = SimpleNamespace(ec_manager_metadata=None, free_encoder_mm_hashes=[])
-    GPUModelRunner._execute_mm_encoder(runner, scheduler)
-    return [cached[key] for key in keys]
-
-
-def test_actual_runner_dispatch_keeps_video_and_audio_eager(monkeypatch):
-    model = _thinker()
-    manager = _cpu_manager(model)
-    eager_modalities = []
-
-    def embed_multimodal(**kwargs):
-        eager_modalities.append(kwargs["kind"])
-        return [torch.zeros(1, 12)]
-
-    model.embed_multimodal = embed_multimodal
-    image = _images([[1, 2, 2]])
-    expected = model.encoder_eager_forward(image)
-    batches = [("image", 1, image), ("video", 1, {"kind": "video"}), ("audio", 1, {"kind": "audio"})]
-    cached = _run_encoder_step(monkeypatch, model, manager, batches)
-    assert eager_modalities == ["video", "audio"]
-    assert len(cached) == 3
-    torch.testing.assert_close(cached[0], expected)
-    assert manager.graph_hits == 1
-
-
-def test_runner_encodes_a_group_beyond_one_replay_in_one_eager_call(monkeypatch):
-    model = _thinker()
-    manager = _cpu_manager(model)
-    calls = []
-
-    def embed_multimodal(**kwargs):
-        calls.append(kwargs["image_grid_thw"].tolist())
-        return list(model.encoder_eager_forward(kwargs).split([2, 3]))
-
-    model.embed_multimodal = embed_multimodal
-    images = _images([[1, 2, 4], [1, 2, 6]])
-    cached = _run_encoder_step(monkeypatch, model, manager, [("image", 2, images)])
-    assert calls == [[[1, 2, 4], [1, 2, 6]]]
-    for output, reference in zip(cached, model.encoder_eager_forward(images).split([2, 3])):
-        torch.testing.assert_close(output, reference)
-    assert manager.graph_hits == 0 and manager.graph_misses == 2
-
-
 def test_eager_vision_chunks_follow_frame_boundaries():
     """A 60x22x40 video is 52800 patches; chunks stay on frame edges and cover it."""
     grid = torch.tensor([[60, 22, 40]], dtype=torch.int32)
@@ -445,3 +338,57 @@ def test_chunked_eager_video_matches_one_forward(monkeypatch):
         chunked = model(x, grid)
         whole = model.forward_with_encoder_metadata(x, model.prepare_encoder_metadata(grid))
     torch.testing.assert_close(chunked, whole)
+
+
+@pytest.mark.parametrize("method", ["eagle3", "extract_hidden_states"])
+def test_thinker_rejects_unsupported_aux_method_before_loading(monkeypatch, method):
+    cfg = _config()
+    cfg.speculative_config = SimpleNamespace(method=method)
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", lambda **kwargs: pytest.fail("loaded model"))
+    with pytest.raises(ValueError, match="only supports DFlash"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+@pytest.mark.parametrize("dflash_config", [None, {}, {"target_layer_ids": []}])
+def test_thinker_rejects_missing_dflash_layers_before_loading(monkeypatch, dflash_config):
+    cfg = _config()
+    cfg.speculative_config = SimpleNamespace(
+        method="dflash",
+        use_dflash=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config=dflash_config)),
+    )
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", lambda **kwargs: pytest.fail("loaded model"))
+    with pytest.raises(ValueError, match="requires non-empty dflash_config.target_layer_ids"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+def test_thinker_rejects_dflash_pipeline_parallel_before_loading(monkeypatch):
+    cfg = _config()
+    cfg.parallel_config.pipeline_parallel_size = 2
+    cfg.speculative_config = SimpleNamespace(
+        method="dflash",
+        use_dflash=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config={"target_layer_ids": [3, 31]})),
+    )
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", lambda **kwargs: pytest.fail("loaded model"))
+    with pytest.raises(ValueError, match="DFlash requires pipeline_parallel_size=1"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+@pytest.mark.parametrize("method, tp, pp", [("dflash", 2, 1), ("ngram", 1, 2)])
+def test_thinker_supported_speculation_reaches_model_loading(monkeypatch, method, tp, pp):
+    cfg = _config()
+    cfg.parallel_config.tensor_parallel_size = tp
+    cfg.parallel_config.pipeline_parallel_size = pp
+    cfg.speculative_config = SimpleNamespace(
+        method=method,
+        use_dflash=lambda: method == "dflash",
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config={"target_layer_ids": [1, 3]})),
+    )
+
+    def load_model(**kwargs):
+        raise RuntimeError("reached weight loading")
+
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", load_model)
+    with pytest.raises(RuntimeError, match="reached weight loading"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)

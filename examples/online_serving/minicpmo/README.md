@@ -315,6 +315,7 @@ vllm bench omni-duplex-eval --omni evaluate \
     --judge-base-url http://127.0.0.1:8000 \
     --judge-model Qwen/Qwen2.5-VL-7B-Instruct \
     --judge-video-mode video_url \
+    --judge-frame-max-side 1920 \
     --eval-workers 4
 
 vllm bench omni-duplex-eval --omni summarize \
@@ -327,6 +328,16 @@ run all nine splits. `--limit 1` is useful for a smoke test. Realtime
 generation records `clock=media`; artifacts generated with
 `--pace as-fast-as-possible` record `clock=invalid` and evaluation rejects
 them unless `--allow-invalid-clock` is explicit.
+
+`--judge-frame-max-side` defaults to 1920 pixels on the longer side of each
+extracted real-time description (RTD) judge frame. This reduces image token usage
+on high-resolution clips while preserving aspect ratio. The cap applies to
+temporal and sampled content frames, including the sampled-frame retry in
+`video_url` mode. Use `--judge-frame-max-side 0` to keep source resolution. When
+changing the cap, use a fresh `--score-root` or rescore all previously scored RTD
+samples with `--overwrite`. For scoring through `vllm bench serve`, pass
+`--duplex-eval-judge-frame-max-side` as described in the
+[serving benchmark guide](../../../docs/cli/bench/serve.md#omni-duplexeval-realtime-benchmark).
 
 ## Related examples
 

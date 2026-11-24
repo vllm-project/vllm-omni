@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from vllm_omni.diffusion.distributed.member_batch import ExecutionBatch
 from vllm_omni.diffusion.interaction.modality_handlers.prompt import prompt_update_versions
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -420,14 +421,15 @@ def _prepare_timesteps(
     )
 
 
+def _cfg_scalars(state: StepRequestState) -> tuple[bool, float, bool]:
+    true_cfg_scale = getattr(state.sampling, "true_cfg_scale", None) or 4.0
+    cfg_normalize = bool(getattr(state.sampling, "cfg_normalize", False))
+    return state.do_true_cfg, true_cfg_scale, cfg_normalize
+
+
 def _prepare_cfg_scalars(
     states: Sequence[StepRequestState],
 ) -> tuple[bool, float, bool]:
-    def _cfg_scalars(state: StepRequestState) -> tuple[bool, float, bool]:
-        true_cfg_scale = getattr(state.sampling, "true_cfg_scale", None) or 4.0
-        cfg_normalize = bool(getattr(state.sampling, "cfg_normalize", False))
-        return state.do_true_cfg, true_cfg_scale, cfg_normalize
-
     scalars = _cfg_scalars(states[0])
     for state in states[1:]:
         if _cfg_scalars(state) != scalars:
@@ -631,6 +633,7 @@ class InputBatch:
     negative_txt_seq_lens: list[int] | None = None
     use_mixfusion: bool = False
     states: Sequence[StepRequestState] = field(default_factory=tuple)
+    execution_batch: ExecutionBatch | None = None
 
     # For midway prompt updates (typically for video generation) that changes embeddings without changing ids,
     # Keep a snapshot of the current per-request versions of prompt embeddings for later runtime comparison

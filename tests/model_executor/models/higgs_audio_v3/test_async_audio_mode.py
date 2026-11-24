@@ -74,5 +74,5 @@ def test_actual_state_guard_and_eos(bad_state):
         with pytest.raises(RuntimeError, match="tail mismatch"):
             call()
     else:
-        assert call().sampled_token_ids.tolist() == [[99999], [151671]]
+        assert call().tolist() == [[99999], [151671]]
         assert seen_codes["code_row_mask"].tolist() == [True, False]

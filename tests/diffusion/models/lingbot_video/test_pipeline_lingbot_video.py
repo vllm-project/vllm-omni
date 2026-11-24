@@ -614,6 +614,153 @@ def test_load_weights_rejects_external_weight_stream():
         pipeline.load_weights([("transformer.weight", torch.zeros(1))])
 
 
+@pytest.mark.parametrize(
+    ("config", "host"),
+    [
+        ({}, False),
+        ({"enable_layerwise_offload": True}, True),
+        ({"enable_cpu_offload": True}, True),
+        ({"enable_layerwise_offload": True, "enable_cpu_offload": True}, True),
+        ({"diffusion_offload_config": {"mode": "layer", "components": ["dit"]}}, True),
+        ({"diffusion_offload_config": {"mode": "module", "components": ["dit", "text_encoder"]}}, True),
+    ],
+    ids=["none", "layerwise", "cpu", "both", "public-layer", "public-module"],
+)
+def test_construction_device_follows_offload_policy(monkeypatch, config, host):
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+
+    for component_class in (
+        module.LingBotVideoTransformer3DModel,
+        module.Qwen3VLForConditionalGeneration,
+        module.AutoencoderKLWan,
+    ):
+        monkeypatch.setattr(component_class, "from_pretrained", lambda *args, **kwargs: nn.Linear(2, 2))
+    monkeypatch.setattr(module.Qwen3VLProcessor, "from_pretrained", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(module.FlowUniPCMultistepScheduler, "from_pretrained", lambda *args, **kwargs: None)
+    # The meta device stands in for the accelerator, so the test runs on CPU-only hosts.
+    monkeypatch.setattr(module, "get_local_device", lambda: torch.device("meta"))
+
+    pipeline = module.LingBotVideoPipeline(
+        od_config=SimpleNamespace(
+            model="unused",
+            dtype=torch.float32,
+            enable_diffusion_pipeline_profiler=False,
+            quantization_config=None,
+            **config,
+        )
+    )
+
+    expected = "cpu" if host else "meta"
+    assert pipeline.device == torch.device("meta")
+    for component in (pipeline.transformer, pipeline.text_encoder, pipeline.vae):
+        assert component.weight.device.type == expected
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"enable_distributed_layerwise_offload": True},
+        {
+            "diffusion_offload_config": {
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "allgather"}},
+            }
+        },
+        {
+            "diffusion_offload_config": {
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "rank-local", "resident_layers": 1}},
+            }
+        },
+    ],
+    ids=["legacy", "allgather", "resident-layers"],
+)
+def test_distributed_layerwise_offload_is_rejected(config):
+    from vllm_omni.diffusion.models.lingbot_video.pipeline_lingbot_video import LingBotVideoPipeline
+
+    with pytest.raises(ValueError, match="does not support distributed layerwise offload"):
+        LingBotVideoPipeline(od_config=SimpleNamespace(**config))
+
+
+def test_offload_plan_streams_text_encoder_blocks():
+    from vllm_omni.diffusion.models.lingbot_video.pipeline_lingbot_video import LingBotVideoPipeline
+    from vllm_omni.diffusion.offloader.component_utils import get_encoder_block_groups
+
+    text_encoder = nn.Module()
+    text_encoder.model = nn.Module()
+    text_encoder.model.visual = nn.Module()
+    text_encoder.model.visual.blocks = nn.ModuleList([nn.Linear(2, 2) for _ in range(2)])
+    text_encoder.model.language_model = nn.Module()
+    text_encoder.model.language_model.layers = nn.ModuleList([nn.Linear(2, 2) for _ in range(3)])
+
+    plan = LingBotVideoPipeline._offload_plan
+    groups = get_encoder_block_groups(text_encoder, "text_encoder", plan, strict=True)
+    assert [len(group) for group in groups] == [2, 3]
+
+
+def test_quantization_is_rejected():
+    from vllm_omni.diffusion.models.lingbot_video.pipeline_lingbot_video import LingBotVideoPipeline
+
+    with pytest.raises(NotImplementedError, match="does not support quantization"):
+        LingBotVideoPipeline(od_config=SimpleNamespace(quantization_config=object()))
+
+
+@pytest.mark.parametrize(
+    ("config", "offloaded"),
+    [
+        ({}, False),
+        ({"enable_cpu_offload": True}, True),
+        ({"enable_layerwise_offload": True}, True),
+        ({"diffusion_offload_config": {"mode": "module", "components": ["dit", "text_encoder"]}}, True),
+    ],
+    ids=["none", "cpu", "layerwise", "public-module"],
+)
+def test_to_host_keeps_execution_device_under_offload(config, offloaded):
+    pipeline = _make_pipeline()
+    pipeline.od_config = SimpleNamespace(**config)
+    pipeline.transformer = nn.Linear(2, 2)
+    pipeline.device = torch.device("meta")
+
+    assert pipeline.to("cpu") is pipeline
+    assert pipeline.transformer.weight.device.type == "cpu"
+    assert pipeline.device == (torch.device("meta") if offloaded else torch.device("cpu"))
+
+
+def test_model_level_offload_pairs_transformer_with_text_encoder():
+    from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+    from vllm_omni.diffusion.offloader.sequential_backend import ModelLevelOffloadBackend, SequentialOffloadHook
+
+    pipeline = _make_pipeline()
+    pipeline.transformer = nn.Linear(2, 2)
+    pipeline.text_encoder = nn.Linear(2, 2)
+    pipeline.vae = nn.Linear(2, 2)
+    backend = ModelLevelOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.MODEL_LEVEL, pin_cpu_memory=False), torch.device("cpu")
+    )
+
+    backend.enable(pipeline)
+    try:
+        assert backend.enabled
+        dit_hook = pipeline.transformer._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+        encoder_hook = pipeline.text_encoder._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+        assert dit_hook.offload_targets == [pipeline.text_encoder]
+        assert encoder_hook.offload_targets == [pipeline.transformer]
+    finally:
+        backend.disable()
+
+
+def test_to_dtype_does_not_cast_vae():
+    pipeline = _make_pipeline()
+    pipeline.transformer = nn.Linear(2, 2)
+    pipeline.vae = nn.Linear(2, 2)
+
+    pipeline.to(torch.bfloat16)
+    assert pipeline.transformer.weight.dtype == torch.bfloat16
+    assert pipeline.vae.weight.dtype == torch.float32
+
+
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
 def test_pipeline_profiler_records_executed_stages_per_request(monkeypatch, enabled):
     from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module

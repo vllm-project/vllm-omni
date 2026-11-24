@@ -26,11 +26,20 @@ def fixed_seed():
         yield
 
 
+def _select_weight_norm_api(api, monkeypatch):
+    if api == "legacy":
+        monkeypatch.setattr(hifigan, "weight_norm", nn.utils.weight_norm)
+    return api
+
+
 @pytest.fixture(params=["parametrized", "legacy"])
 def weight_norm_api(request, monkeypatch):
-    if request.param == "legacy":
-        monkeypatch.setattr(hifigan, "weight_norm", nn.utils.weight_norm)
-    return request.param
+    return _select_weight_norm_api(request.param, monkeypatch)
+
+
+@pytest.fixture
+def checkpoint_weight_norm_api(request, monkeypatch):
+    return _select_weight_norm_api(request.param, monkeypatch)
 
 
 @pytest.fixture(
@@ -178,17 +187,17 @@ def test_f0_fold_leaves_generator_norms_unchanged(weight_norm_api):
 
 
 @pytest.mark.parametrize(
-    "weight_norm_api,legacy_checkpoint",
+    "checkpoint_weight_norm_api,legacy_checkpoint",
     [("parametrized", False), ("parametrized", True), ("legacy", True)],
-    indirect=["weight_norm_api"],
+    indirect=["checkpoint_weight_norm_api"],
 )
 def test_load_folds_loaded_generator_and_f0_weights(
-    tmp_path, weight_norm_api, legacy_checkpoint, runtime, fold_context
+    tmp_path, checkpoint_weight_norm_api, legacy_checkpoint, runtime, fold_context
 ):
     device = runtime
     model = _make_loader()
     assert model.hift.training and model.hift.f0_predictor.training and model.flow_model.training
-    assert hasattr(model.hift.f0_predictor.condnet[0], "weight_g") == (weight_norm_api == "legacy")
+    assert hasattr(model.hift.f0_predictor.condnet[0], "weight_g") == (checkpoint_weight_norm_api == "legacy")
     state = _write_checkpoint(model, tmp_path, legacy_checkpoint)
     # Do not forward the loader instance before loading. A separate unfolded
     # reference refreshes legacy cached weights from the changed checkpoint.

@@ -27,3 +27,77 @@ def test_mel_caches_stay_fp32_when_first_built_under_bf16_default():
         wav, n_fft=1024, num_mels=128, sampling_rate=24000, hop_size=256, win_size=1024, fmin=0, fmax=12000
     )
     assert mels.dtype == torch.float32 and mels.shape[1] == 128
+
+
+def test_reference_encoder_loads_flat_mimi_checkpoint_and_encodes():
+    from transformers import MimiConfig
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2Encoder,
+    )
+
+    config = MimiConfig(
+        hidden_size=16,
+        num_filters=4,
+        upsampling_ratios=[2, 2],
+        upsample_groups=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        intermediate_size=32,
+        codebook_size=8,
+        codebook_dim=8,
+        vector_quantization_hidden_dimension=8,
+        num_quantizers=4,
+        sampling_rate=160,
+        frame_rate=20,
+    )
+    config._attn_implementation = "eager"
+    original_config = config.to_dict()
+    encoder = Qwen3TTSTokenizerV2Encoder._from_config(config).eval()
+    assert config.to_dict() == original_config
+    assert encoder.config is not config
+    # Mimi's SEANet lives directly under the model on the allowed flat
+    # layout, and under MimiEncoderModel on the nested layout.
+    seanet = getattr(encoder.encoder, "encoder_seanet", encoder.encoder)
+    transformer = (
+        encoder.encoder.encoder_transformer
+        if hasattr(encoder.encoder, "encoder_seanet")
+        else encoder.encoder_transformer
+    )
+    downsample = encoder.encoder.downsample if hasattr(encoder.encoder, "encoder_seanet") else encoder.downsample
+    holder = torch.nn.Module()
+    holder.encoder = encoder
+    # These are the original speech_tokenizer/ checkpoint's namespaces,
+    # including a persistent VQ buffer rather than only model parameters.
+    weights = [
+        (
+            "encoder.encoder.layers.0.conv.weight",
+            torch.full_like(seanet.layers[0].conv.weight, 0.125),
+        ),
+        ("encoder.encoder_transformer.layers.0.input_layernorm.weight", torch.full((16,), 0.75)),
+        ("encoder.downsample.conv.weight", torch.full_like(downsample.conv.weight, 0.25)),
+        ("encoder.quantizer.semantic_residual_vector_quantizer.layers.0.codebook.embed_sum", torch.ones(8, 8)),
+    ]
+    codebook = encoder.quantizer.semantic_residual_vector_quantizer.layers[0].codebook
+    destinations = [
+        seanet.layers[0].conv.weight,
+        transformer.layers[0].input_layernorm.weight,
+        downsample.conv.weight,
+        codebook.embed_sum,
+    ]
+    storage = [tensor.data_ptr() for tensor in destinations]
+    loaded = AutoWeightsLoader(holder).load_weights(weights)
+    assert len(loaded) == len(weights)
+    assert [tensor.data_ptr() for tensor in destinations] == storage
+    for tensor, value in zip(destinations, (0.125, 0.75, 0.25, 1)):
+        assert torch.all(tensor == value)
+    assert encoder.decoder is None
+    # Nested Mimi exposes decoder submodules as read-only compatibility
+    # properties, while flat Mimi owns them as separate modules.
+    assert not {"decoder", "decoder_transformer", "upsample"}.intersection(dict(encoder.named_children()))
+    with torch.inference_mode():
+        codes = encoder.encode(torch.zeros(1, 1, 160), num_quantizers=2, return_dict=True).audio_codes
+    assert codes.shape == (1, 2, 20)
+    assert torch.all((codes >= 0) & (codes < 8))
