@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import json
+import logging
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
@@ -169,6 +170,31 @@ from vllm_omni.utils.speakers import (
 )
 
 logger = init_logger(__name__)
+
+# Per-stage fields logged for image requests. Like vLLM's SamplingParams log
+# line, each field is logged with its effective value, defaults included. A field
+# is listed when the image request can set it and it changes the output or the
+# compute cost: vLLM's core sampling fields for AR stages, and for diffusion
+# stages the fields set from n, size, seed, num_inference_steps, guidance_scale,
+# true_cfg_scale, layers, generator_device and the extra num_frames field.
+# Prompt text, tensors, runtime state and open-ended dicts/lists are not logged.
+_IMAGE_REQUEST_LOG_FIELDS = (
+    "n",
+    "num_outputs_per_prompt",
+    "seed",
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_tokens",
+    "height",
+    "width",
+    "num_frames",
+    "num_inference_steps",
+    "guidance_scale",
+    "true_cfg_scale",
+    "layers",
+    "generator_device",
+)
 
 
 async def _identity_async(value: Any) -> Any:
@@ -3665,6 +3691,36 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return engine, gen_prompt, gen_params, pil_images
 
+    def _log_image_request(
+        self,
+        request_id: str,
+        prompt: str,
+        sampling_params_list: list[SamplingParams | OmniDiffusionSamplingParams],
+    ) -> None:
+        """Log an image request under its ID with an allowlisted parameter summary.
+
+        Follows the speech request logs: INFO with ``--enable-log-requests``,
+        DEBUG otherwise, and the prompt (truncated to ``--max-log-len``, as in
+        vLLM's RequestLogger) at DEBUG only when request logging is enabled.
+        """
+        # Instances built by for_diffusion() have no request logger.
+        request_logger = getattr(self, "request_logger", None)
+        level = logging.DEBUG if request_logger is None else logging.INFO
+        if not logger.isEnabledFor(level):
+            return
+        if request_logger is not None:
+            max_log_len = request_logger.max_log_len
+            logger.debug(
+                "Request %s details: prompt: %r.",
+                request_id,
+                prompt if max_log_len is None else prompt[:max_log_len],
+            )
+        params = [
+            {name: value for name in _IMAGE_REQUEST_LOG_FIELDS if (value := getattr(sp, name, None)) is not None}
+            for sp in sampling_params_list
+        ]
+        logger.log(level, "Received request %s: params: %s.", request_id, params)
+
     async def generate_diffusion_images(
         self,
         *,
@@ -3733,14 +3789,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 sampling_params_list = [gen_params]
 
             sampling_params_list = coerce_param_message_types(sampling_params_list, stream)
-            # Instances built by for_diffusion() have no request logger.
-            if getattr(self, "request_logger", None) is not None:
-                self._log_inputs(
-                    request_id,
-                    engine_prompt,
-                    params_list=sampling_params_list,
-                    lora_request=None,
-                )
+            self._log_image_request(request_id, prompt, sampling_params_list)
             result_generator = diffusion_engine.generate(
                 prompt=engine_prompt,
                 sampling_params_list=sampling_params_list,
