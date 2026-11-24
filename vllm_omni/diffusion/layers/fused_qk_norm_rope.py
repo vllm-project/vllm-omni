@@ -24,10 +24,9 @@ The CUDA fast path fuses RMSNorm and RoPE without materializing normalized Q/K
 or rotary-product intermediates. The interleaved mode supports any even
 ``rotary_dim <= head_dim <= 256`` (``tl.arange`` padding to the next power of
 two); the half-split mode keeps the pre-existing kernel and its MiniMax-H3
-geometry contract (``head_dim == 128``, ``rotary_dim == 96``). On Ascend,
-MiniMax-H3 can use MindIE-SD's EagleSplitNormRopeConcat when its BF16 kernel
-is registered at process startup. Otherwise Ascend composes RMSNorm and rotary
-primitives.
+geometry contract (``head_dim == 128``, ``rotary_dim == 96``). Ascend
+composes its RMSNorm and rotary fused primitives on the MiniMax-H3 geometry;
+unsupported inputs use the eager reference.
 
 ``cuda_rms_norm=True`` (single-stream and joint ops) reproduces the vLLM CUDA
 RMSNorm reduction order and keeps the rotation free of FMA contraction, so for
@@ -39,25 +38,15 @@ per-stream fused path) keep the default.
 
 from __future__ import annotations
 
-import json
-import os
-from collections.abc import Callable
-from functools import cache
-from importlib.util import find_spec
-from pathlib import Path
-
 import torch
 import torch.nn.functional as F
 from torch.library import Library
-from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_omni.diffusion import envs
 from vllm_omni.platforms import current_omni_platform
-
-logger = init_logger(__name__)
 
 _FUSED_HEAD_DIM = 128
 _FUSED_ROTARY_DIM = 96
@@ -603,72 +592,6 @@ def _npu_apply_rope_table(
     return torch.cat((x_rot, x_pass), dim=-1)
 
 
-@cache
-def _get_npu_eagle_qk_norm_rope() -> Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None:
-    """Load Eagle when the MindIE-SD vendor and BF16 binary are available."""
-    active_paths = os.getenv("ASCEND_CUSTOM_OPP_PATH", "").split(os.pathsep)
-    if not any(active_paths):
-        return None
-
-    try:
-        # A late MindIE-SD import updates os.environ after CANN may have read it.
-        # Linux exposes the original environment passed to the process at exec.
-        startup_env = Path("/proc/self/environ").read_bytes().split(b"\0")
-        opp_prefix = b"ASCEND_CUSTOM_OPP_PATH="
-        startup_opp = next((entry for entry in startup_env if entry.startswith(opp_prefix)), b"")
-        startup_paths = os.fsdecode(startup_opp[len(opp_prefix) :])
-        if not startup_paths:
-            return None
-        sdk = find_spec("mindiesd")
-        if sdk is None or sdk.origin is None:
-            return None
-        vendor = (Path(sdk.origin).parent / "ops/vendors/aie_ascendc").resolve()
-        if not any(Path(path).resolve() == vendor for path in startup_paths.split(os.pathsep) if path):
-            return None
-        if not any(Path(path).resolve() == vendor for path in active_paths if path):
-            return None
-
-        from vllm_ascend.utils import get_ascend_device_type
-
-        soc = {"A2": "ascend910b", "A5": "ascend950"}.get(get_ascend_device_type().name)
-        if soc is None:
-            return None
-        op = "EagleSplitNormRopeConcat"
-        tbe = vendor / "op_impl/ai_core/tbe"
-        registry = json.loads((tbe / "config" / soc / f"aic-{soc}-ops-info.json").read_text(encoding="utf-8"))
-        if not isinstance(registry, dict) or op not in registry:
-            return None
-        kernels = tbe / "kernel"
-        index = json.loads((kernels / "config" / soc / "binary_info_config.json").read_text(encoding="utf-8"))
-        binaries = index[op]["binaryList"]
-    except (ImportError, OSError, RuntimeError, ValueError, TypeError, KeyError):
-        return None
-
-    if not isinstance(binaries, list):
-        return None
-    for entry in binaries:
-        try:
-            if not (kernels / entry["binPath"]).is_file():
-                continue
-            info = json.loads((kernels / entry["jsonPath"]).read_text(encoding="utf-8"))["supportInfo"]
-            if info["inputs"][0]["dtype"] == info["outputs"][0]["dtype"] == "bfloat16":
-                break
-        except (OSError, ValueError, TypeError, KeyError, IndexError):
-            continue
-    else:
-        return None
-
-    try:
-        from mindiesd.fused_ops import eagle_split_norm_rope_concat
-    except Exception as exc:
-        # MindIE-SD can raise its own exception while loading the native plugin.
-        logger.debug("MindIE-SD Eagle Q/K norm/RoPE is unavailable: %s", exc)
-        return None
-    if not hasattr(torch.ops.mindiesd, "eagle_split_norm_rope_concat"):
-        return None
-    return eagle_split_norm_rope_concat
-
-
 def _npu_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -678,7 +601,7 @@ def _npu_qk_norm_rope(
     eps: float,
     rotary_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply weighted RMSNorm and partial RoPE on Ascend."""
+    """Use Ascend RMSNorm and RoPE fused primitives for MiniMax-H3 DiT."""
     import torch_npu
 
     q_heads, kv_heads = q.shape[1], k.shape[1]
@@ -689,29 +612,29 @@ def _npu_qk_norm_rope(
         and 0 < q.numel() + 2 * k.numel() <= torch.iinfo(torch.int32).max
         and torch.finfo(torch.float32).tiny <= eps <= torch.finfo(torch.float32).max
         and (not torch.is_grad_enabled() or not any(t.requires_grad for t in (q, k, q_weight, k_weight, rope_table)))
-        and (eagle := _get_npu_eagle_qk_norm_rope()) is not None
     ):
-        # Eagle copies V independently. The caller already owns V, so fill its slot with K.
-        packed = torch.cat((q, k, k), dim=1)
-        cos, sin = rope_table.reshape(q.shape[0], 2, rotary_dim // 2).transpose(0, 1).contiguous().unbind(0)
         try:
-            q_out, k_out, _ = eagle(
+            from mindiesd.fused_ops import eagle_split_norm_rope_concat
+
+            # The caller retains V. Use K to fill Eagle's V slot.
+            packed = torch.cat((q, k, k), dim=1)
+            cos, sin = rope_table.reshape(q.shape[0], 2, rotary_dim // 2).transpose(0, 1).contiguous().unbind(0)
+            q_out, k_out, _ = eagle_split_norm_rope_concat(
                 packed,
                 q_weight,
                 k_weight,
                 cos,
                 sin,
                 [q_heads, kv_heads, kv_heads],
-                norm_type=3,  # weighted RMSNorm
-                rope_mode=1,  # half-split RoPE
+                norm_type=3,
+                rope_mode=1,
                 rotary_dim=rotary_dim,
                 epsilon=eps,
                 output_bnsd=False,
             )
-        except ImportError:
-            pass  # The SDK facade loads its native symbol on first call.
-        else:
             return q_out, k_out
+        except ImportError:
+            pass
 
     q_norm = torch_npu.npu_rms_norm(q, q_weight, epsilon=eps)[0]
     k_norm = torch_npu.npu_rms_norm(k, k_weight, epsilon=eps)[0]
