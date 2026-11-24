@@ -771,7 +771,6 @@ class UlyssesParallelAttention:
                     output_img,
                     ctx.ulysses_pg.group_name,
                     dist.get_world_size(ctx.ulysses_pg),
-                    self._output_views,
                 )
                 if ctx.use_sync:
                     current_omni_platform.synchronize()
@@ -824,7 +823,6 @@ class UlyssesParallelAttention:
                     attn_output,
                     ctx.ulysses_pg.group_name,
                     dist.get_world_size(ctx.ulysses_pg),
-                    self._output_views,
                 )
             if ctx.use_sync:
                 current_omni_platform.synchronize()

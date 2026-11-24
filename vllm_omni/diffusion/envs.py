@@ -35,8 +35,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in portable packed QKV/O exchanges for strict Ulysses. Read
     # when the attention strategy is constructed; all ranks must agree.
     "VLLM_OMNI_PACKED_QKV": lambda: os.environ.get("VLLM_OMNI_PACKED_QKV", "0") == "1",
-    # Return the Ulysses attention output of the symmetric-memory transports (copy engine, its overlap and
-    # FlashInfer) as a view of their buffer instead of copying it out. A view stays valid only until the next
+    # Return the Ulysses attention output of the copy-engine overlap and FlashInfer transports as a view of their
+    # buffer instead of copying it out (the plain copy engine always copies). A view stays valid only until the next
     # exchange on the group, so enable only for models that consume it at once. Read at strategy construction.
     "VLLM_OMNI_ULYSSES_OUTPUT_VIEWS": lambda: os.environ.get("VLLM_OMNI_ULYSSES_OUTPUT_VIEWS", "0") == "1",
     # Minimum rotary-table span (B*S positions) at which consumers of the shared

@@ -414,14 +414,14 @@ def _(query, key, value, group_name, world_size, zero_copy=False):
 #   scatter sequence (dim 1), gather heads (dim 2). Matches all_to_all_4D(y,1,2).
 # ---------------------------------------------------------------------------
 @torch.library.custom_op("vllm_omni_a2a::ulysses_o_rev", mutates_args=(), device_types="cuda")
-def ulysses_o_rev(y: torch.Tensor, group_name: str, world_size: int, zero_copy: bool = False) -> torch.Tensor:
+def ulysses_o_rev(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
     B, S, H, D = y.shape
-    exchanged = _exchange_ce((y,), group_name, world_size, reverse=True, zero_copy=zero_copy)
-    return exchanged.view(B, S // world_size, H * world_size, D)
+    # The output leaves the attention layer, so it is always copied out.
+    return _exchange_ce((y,), group_name, world_size, reverse=True).view(B, S // world_size, H * world_size, D)
 
 
 @ulysses_o_rev.register_fake
-def _(y: torch.Tensor, group_name: str, world_size: int, zero_copy: bool = False) -> torch.Tensor:
+def _(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
     B, s_global, Hl, D = y.shape
     return y.new_empty(B, s_global // world_size, Hl * world_size, D)
 
@@ -473,7 +473,7 @@ def ulysses_qkv_fwd_group(
 
 
 @ulysses_o_rev.register_kernel("privateuseone")
-def _(y: torch.Tensor, group_name: str, world_size: int, zero_copy: bool = False) -> torch.Tensor:
+def _(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
     from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import ulysses_o_rev as npu_rev
 
     return npu_rev(y, group_name, world_size)
