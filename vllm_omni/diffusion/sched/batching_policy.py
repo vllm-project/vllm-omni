@@ -3,9 +3,7 @@
 
 from __future__ import annotations
 
-import time
-from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
@@ -22,73 +20,59 @@ logger = init_logger(__name__)
 _DRR_REFERENCE_UNITS = 1024.0
 
 
-class DiffusionBatchingPolicy(ABC):
-    """Policy plugin that decides which waiting requests enter the batch.
+class DiffusionBatchingPolicy:
+    """Pure queries that steer the scheduler's admission loop.
 
-    A policy owns both the request-count cap (``get_max_running_reqs``) and the
-    admission order (``admit_waiting``). The scheduler only delegates, so new
-    policies extend behavior without touching the scheduler itself.
+    The scheduler owns admission bookkeeping: budget accumulation, the
+    request-count cap, the batch-compatibility gate and the dispatch of
+    ``_admit_state`` results. A policy only supplies the candidate order, the
+    per-request numbers and an optional reservation target, so new policies
+    plug in without changing ``BaseScheduler``.
     """
+
+    # FIFO stops at the first incompatible waiting request to preserve arrival
+    # order. Policies that may skip incompatible candidates to fill the batch
+    # (DRR) set this to False.
+    stops_at_incompatible_head: bool = True
 
     def on_schedule_start(self) -> None:
         """Hook called once at the beginning of a scheduler cycle."""
 
-    def admit_waiting(
-        self,
-        scheduler: BaseScheduler,
-        scheduled_new_reqs: list[Any],
-        scheduled_cached_request_ids: list[str],
-    ) -> None:
-        """Admit waiting requests in arrival (FIFO) order.
-
-        This is upstream vLLM's admission loop: walk ``_waiting`` from the head
-        and let the scheduler try each request until a cap, a failed KV
-        reservation, or a batch-compatibility gate stops it. Policies that
-        reorder or budget the queue override this method.
-        """
-        deferred: list[str] = []
-        waiting_budget = len(scheduler._waiting)
-        while scheduler._waiting and waiting_budget and len(scheduler._running) < scheduler.max_num_running_reqs:
-            waiting_budget -= 1
-            state = scheduler._request_states.get(scheduler._waiting[0])
-            if state is None:
-                scheduler._waiting.popleft()
+    def order_candidates(self, scheduler: BaseScheduler, now: float) -> list[SchedulerRequestState]:
+        """Return the waiting requests to consider this step, in admission order."""
+        candidates: list[SchedulerRequestState] = []
+        for request_id in scheduler._waiting:
+            state = scheduler._request_states.get(request_id)
+            if state is None or state.is_finished():
                 continue
-            if len(scheduler._running) >= scheduler._effective_max_running_reqs(state):
-                break
-            if not scheduler._can_schedule_waiting(state):
-                break
-            result = scheduler._admission_scan_outcome(state, scheduled_new_reqs, scheduled_cached_request_ids)
-            if result == "deferred":
-                deferred.append(scheduler._waiting.popleft())
-            elif result == "stop":
-                break
-            # "admitted" / "error": continue with the next waiting request.
-        scheduler._waiting.extendleft(reversed(deferred))
+            candidates.append(state)
+        return candidates
 
-    @abstractmethod
-    def get_max_running_reqs(
-        self,
-        hard_cap: int,
-        candidate_state: SchedulerRequestState,
-    ) -> int:
-        """Return the effective request cap for admitting ``candidate_state``."""
+    def request_tokens(self, state: SchedulerRequestState) -> int:
+        """Capacity units ``state`` consumes against the admission budget."""
+        raise NotImplementedError("This batching policy does not consume an admission budget.")
+
+    def request_cost(self, state: SchedulerRequestState) -> int:
+        """Weighted cost used to score admission order; defaults to capacity."""
+        return self.request_tokens(state)
+
+    def reservation_target(self, candidates: list[SchedulerRequestState], now: float) -> SchedulerRequestState | None:
+        """Return a candidate whose budget gap must be held this step, if any."""
+        return None
+
+    def count_cap(self, hard_cap: int) -> int:
+        """Request-count cap for this step, given the configured ``max_num_seqs``."""
+        return max(1, int(hard_cap))
 
 
 class FixedDiffusionBatchingPolicy(DiffusionBatchingPolicy):
     """Preserve the existing fixed ``max_num_seqs`` behavior."""
 
-    def get_max_running_reqs(
-        self,
-        hard_cap: int,
-        candidate_state: SchedulerRequestState,
-    ) -> int:
-        del candidate_state
-        return max(1, int(hard_cap))
-
 
 class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
     """DRR admission: order by cost-normalized aging, fill a compute budget."""
+
+    stops_at_incompatible_head = False
 
     def __init__(
         self,
@@ -103,126 +87,7 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
         # comes from ``compute_unit_budget`` (optionally warmup-calibrated).
         self.request_budget_units = max(1, int(request_budget_units)) if request_budget_units is not None else None
 
-    def admission_budget(self) -> int:
-        if self.request_budget_units is not None:
-            return self.request_budget_units
-        return self.config.effective_compute_unit_budget()
-
-    def admit_waiting(
-        self,
-        scheduler: BaseScheduler,
-        scheduled_new_reqs: list[Any],
-        scheduled_cached_request_ids: list[str],
-    ) -> None:
-        candidates = self.sorted_waiting_states(scheduler)
-        if not candidates:
-            return
-        self._admit_by_compute_budget(scheduler, candidates, scheduled_new_reqs, scheduled_cached_request_ids)
-
-    def _admit_by_compute_budget(
-        self,
-        scheduler: BaseScheduler,
-        candidates: list[SchedulerRequestState],
-        scheduled_new_reqs: list[Any],
-        scheduled_cached_request_ids: list[str],
-    ) -> None:
-        budget = self.admission_budget()
-        running_units = self.running_compute_units(scheduler)
-        reserve_time = max(0.0, float(self.config.drr_reserve_time_s))
-        now = time.perf_counter()
-        # A request costlier than the whole budget must not deadlock admission:
-        # when nothing is running there is no concurrency left to budget, so
-        # the highest-scored head is admitted regardless of its cost. This also
-        # covers a budget calibrated from cheaper reference requests (no CFG,
-        # single frame) than the ones the server actually serves.
-        if not scheduler._running and candidates:
-            head = candidates[0]
-            if not scheduler._can_schedule_waiting(head):
-                return
-            outcome = scheduler._admission_scan_outcome(head, scheduled_new_reqs, scheduled_cached_request_ids)
-            if outcome == "stop":
-                return
-            if outcome == "admitted":
-                running_units += self.request_units(head)
-            candidates = candidates[1:]
-
-        # Anti-starvation: an aged waiting request gets the head slot even when
-        # it is not the score head. The waiting score is cost normalized, so
-        # with beta > 0 an old large request can sit behind younger cheap ones
-        # indefinitely; keying the reservation on the score head then never
-        # keeps a slot for it. Pick the oldest request that has aged past the
-        # threshold: admit it directly if it both fits the remaining budget and
-        # is compatible with the running batch, otherwise hold its gap so later
-        # admissions cannot eat it.  Compatibility is deliberately not part of
-        # the selection: an aged request that cannot join the current batch
-        # still needs the gap kept, or filling it would only prolong the batch.
-        remaining = budget - running_units
-        reserve_state = None
-        for state in candidates:
-            age = max(0.0, now - state.queued_at) if state.queued_at else 0.0
-            if age > reserve_time and (
-                reserve_state is None or (state.queued_at or 0.0) < (reserve_state.queued_at or 0.0)
-            ):
-                reserve_state = state
-
-        if reserve_state is not None:
-            reserved_cost = self.request_units(reserve_state)
-            if reserved_cost > remaining or not scheduler._can_schedule_waiting(reserve_state):
-                # Reservation mode: keep a gap for the aged request and admit
-                # only requests that fit into it, then stop admission so the
-                # gap survives until the reserved request can be scheduled.
-                gap = remaining - reserved_cost
-                for state in candidates:
-                    if state is reserve_state:
-                        continue
-                    if not scheduler._can_schedule_waiting(state):
-                        continue
-                    cost = self.request_units(state)
-                    if cost > gap:
-                        continue
-                    if len(scheduler._running) >= self.max_admissions(scheduler.max_num_running_reqs):
-                        break
-                    outcome = scheduler._admission_scan_outcome(state, scheduled_new_reqs, scheduled_cached_request_ids)
-                    if outcome == "stop":
-                        break
-                    if outcome == "admitted":
-                        gap -= cost
-                return
-            # The aged request fits the budget, but the explicit max_num_seqs
-            # count cap still binds: do not push the running count past it.
-            # Leaving it waiting keeps it the preferred head next cycle.
-            if len(scheduler._running) >= self.max_admissions(scheduler.max_num_running_reqs):
-                return
-            # The aged request fits: give it the head slot first, then admit in
-            # score order for whatever budget is left. Without this, cheaper
-            # younger requests in score order would consume the freed slot and
-            # the aged request would miss it again.
-            outcome = scheduler._admission_scan_outcome(reserve_state, scheduled_new_reqs, scheduled_cached_request_ids)
-            if outcome == "stop":
-                return
-            if outcome == "admitted":
-                running_units += reserved_cost
-            candidates = [state for state in candidates if state is not reserve_state]
-
-        # No aged request is blocked: admit in score order, skipping requests
-        # that do not fit so cheaper ones can fill the remaining budget.
-        index = 0
-        while index < len(candidates):
-            head = candidates[index]
-            head_cost = self.request_units(head)
-            if (
-                running_units + head_cost <= budget
-                and len(scheduler._running) < self.max_admissions(scheduler.max_num_running_reqs)
-                and scheduler._can_schedule_waiting(head)
-            ):
-                outcome = scheduler._admission_scan_outcome(head, scheduled_new_reqs, scheduled_cached_request_ids)
-                if outcome == "stop":
-                    break
-                if outcome == "admitted":
-                    running_units += head_cost
-            index += 1
-
-    def sorted_waiting_states(self, scheduler: BaseScheduler) -> list[SchedulerRequestState]:
+    def order_candidates(self, scheduler: BaseScheduler, now: float) -> list[SchedulerRequestState]:
         """Order waiting requests by DRR score, descending.
 
         Ties fall back to enqueue time (FIFO) then request_id for
@@ -230,27 +95,19 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
         """
         alpha = float(self.config.drr_alpha)
         beta = float(self.config.drr_beta)
-        now = time.perf_counter()
         scored: list[tuple[float, float, str, SchedulerRequestState]] = []
         for request_id in scheduler._waiting:
             state = scheduler._request_states.get(request_id)
             if state is None or state.is_finished():
                 continue
             age = max(0.0, now - state.queued_at) if state.queued_at else 0.0
-            norm_cost = max(self.request_units(state) / _DRR_REFERENCE_UNITS, 1e-6)
+            norm_cost = max(self.request_cost(state) / _DRR_REFERENCE_UNITS, 1e-6)
             score = (age**alpha) / (norm_cost**beta)
             scored.append((score, state.queued_at, request_id, state))
         scored.sort(key=lambda item: (-item[0], item[1], item[2]))
         return [item[3] for item in scored]
 
-    def running_compute_units(self, scheduler: BaseScheduler) -> int:
-        return sum(
-            self.request_units(scheduler._request_states[request_id])
-            for request_id in scheduler._running
-            if request_id in scheduler._request_states
-        )
-
-    def request_units(self, state: SchedulerRequestState) -> int:
+    def request_tokens(self, state: SchedulerRequestState) -> int:
         config = self.config
         key = state.sampling_params_key
         if key is None:
@@ -266,8 +123,27 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
             units = int(units * float(config.cfg_compute_multiplier))
         return max(1, units)
 
-    def max_admissions(self, hard_cap: int) -> int:
-        """Request-count bound for the budgeted admission loops.
+    def reservation_target(self, candidates: list[SchedulerRequestState], now: float) -> SchedulerRequestState | None:
+        """Pick the oldest waiting request that has aged past the reserve threshold.
+
+        Anti-starvation: an aged waiting request gets the head slot even when
+        it is not the score head. The waiting score is cost normalized, so with
+        beta > 0 an old large request can sit behind younger cheap ones
+        indefinitely; keying the reservation on the score head then never keeps
+        a slot for it. Compatibility is deliberately not part of the selection:
+        an aged request that cannot join the current batch still needs the gap
+        kept, or filling it would only prolong the batch.
+        """
+        reserve_time = max(0.0, float(self.config.drr_reserve_time_s))
+        target: SchedulerRequestState | None = None
+        for state in candidates:
+            age = max(0.0, now - state.queued_at) if state.queued_at else 0.0
+            if age > reserve_time and (target is None or (state.queued_at or 0.0) < (target.queued_at or 0.0)):
+                target = state
+        return target
+
+    def count_cap(self, hard_cap: int) -> int:
+        """Request-count bound for budgeted admission.
 
         The compute-unit sum is the real admission constraint, so the count
         bound only matters when the caller pinned ``max_num_seqs`` explicitly.
@@ -277,35 +153,6 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
         if self.request_budget_units is not None:
             return max(1, int(hard_cap))
         return 1 << 30
-
-    def get_max_running_reqs(
-        self,
-        hard_cap: int,
-        candidate_state: SchedulerRequestState,
-    ) -> int:
-        hard_cap = max(1, int(hard_cap))
-        request_units = self.request_units(candidate_state)
-        budget = self.admission_budget()
-        dynamic_cap = (budget + request_units - 1) // request_units
-        if self.request_budget_units is not None:
-            capped = max(1, min(hard_cap, dynamic_cap))
-        else:
-            # ``max_num_seqs <= 1`` is the "unset" sentinel: the computed
-            # budget replaces it as the request-count cap.
-            capped = max(1, dynamic_cap)
-
-        if self.config.log_stats:
-            logger.info(
-                "[DiffusionBatching] request_compute_units=%s budget=%s budget_source=%s "
-                "dynamic_max_num_seqs=%s hard_max_num_seqs=%s effective_max_num_seqs=%s",
-                request_units,
-                budget,
-                "max_num_seqs" if self.request_budget_units is not None else "compute_unit_budget",
-                dynamic_cap,
-                hard_cap,
-                capped,
-            )
-        return capped
 
 
 class DiffusionBatchProfilerPolicy(DiffusionBatchingPolicy):
@@ -325,12 +172,7 @@ class DiffusionBatchProfilerPolicy(DiffusionBatchingPolicy):
         self._schedule_count += 1
         self._current_cap = self._schedule_count // interval + 1
 
-    def get_max_running_reqs(
-        self,
-        hard_cap: int,
-        candidate_state: SchedulerRequestState,
-    ) -> int:
-        del candidate_state
+    def count_cap(self, hard_cap: int) -> int:
         hard_cap = max(1, int(hard_cap))
         cap = min(hard_cap, self._current_cap)
         logger.info("[DiffusionBatchProfiler] max_num_seqs=%s", cap)

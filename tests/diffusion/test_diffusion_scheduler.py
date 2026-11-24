@@ -1471,6 +1471,29 @@ class TestRequestScheduler:
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
+    def test_fifo_stops_at_incompatible_waiting_head(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(_scheduler_config(max_num_seqs=2))
+
+        compat_a = scheduler.add_request(
+            _make_step_request("compat_a", sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=123))
+        )
+        # Incompatible head: fixed-step batches are single-key, so b cannot join
+        # a. FIFO preserves arrival order and stops there instead of skipping b
+        # to batch the compatible c behind it.
+        scheduler.add_request(
+            _make_step_request("incompat", sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4, seed=123))
+        )
+        scheduler.add_request(
+            _make_step_request("compat_c", sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=123))
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [compat_a]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 2
+
     def test_batches_different_quality_levels_separately(self) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(_scheduler_config(max_num_seqs=2))
@@ -1669,6 +1692,62 @@ class TestRequestScheduler:
         # a (4096) + c (4096) = 8192 <= 10240.
         assert _new_ids(second) == [req_id_a, req_id_c]
         assert second.num_running_reqs == 2
+        assert second.num_waiting_reqs == 0
+
+    def test_drr_skips_incompatible_candidate_to_fill_batch(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_seqs=1,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                    "compute_unit_budget": 10240,
+                },
+            )
+        )
+
+        # b is the batch-shape owner (1024x768 -> 3072 units) and ages to the
+        # DRR head; a (1024x1024) is incompatible with it, c (1024x768) is
+        # compatible. Unlike FIFO, DRR keeps scanning past the incompatible a
+        # and admits c in the same step.
+        scheduler.add_request(
+            OmniDiffusionRequest(
+                prompt="prompt_a",
+                sampling_params=OmniDiffusionSamplingParams(width=1024),
+                request_id="a",
+            )
+        )
+        req_id_b = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompt="prompt_b",
+                sampling_params=OmniDiffusionSamplingParams(width=768),
+                request_id="b",
+            )
+        )
+        req_id_c = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompt="prompt_c",
+                sampling_params=OmniDiffusionSamplingParams(width=768),
+                request_id="c",
+            )
+        )
+        state_b = scheduler.get_request_state(req_id_b)
+        assert state_b is not None
+        state_b.queued_at = time.perf_counter() - 1.0
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [req_id_b, req_id_c]
+        assert first.num_running_reqs == 2
+        assert first.num_waiting_reqs == 1
+
+        scheduler.update_from_output(
+            first,
+            BatchRunnerOutput.from_list([_make_request_output(req_id_b), _make_request_output(req_id_c)]),
+        )
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == ["a"]
         assert second.num_waiting_reqs == 0
 
     def test_abort_request_for_waiting_and_running(self) -> None:

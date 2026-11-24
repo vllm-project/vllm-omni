@@ -79,10 +79,11 @@ _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in 
 class BaseScheduler(ABC):
     """Shared queue/state bookkeeping for diffusion schedulers.
 
-    Which waiting requests are admitted, and in what order, is owned by the
+    Which waiting requests are admitted, and in what order, is steered by the
     configured ``DiffusionBatchingPolicy``. The default policy reproduces
     upstream vLLM's FIFO admission; alternative policies (e.g. compute-budget
-    DRR) override ``admit_waiting`` without changing this class.
+    DRR) override ``order_candidates`` and the per-request accounting queries
+    without changing the admission loop in this class.
     """
 
     def __init__(self) -> None:
@@ -100,7 +101,7 @@ class BaseScheduler(ABC):
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
         # DRR budget pinned by an explicit max_num_seqs (> 1), in compute
-        # units. None means the policy derives the budget itself.
+        # units. None means the budget comes from ``batching_config``.
         self.user_request_budget_units: int | None = None
         self._prefetch_enabled: bool = False
         self._diffusion_kv_manager: DiffusionKVCacheManager | None = None
@@ -390,15 +391,124 @@ class BaseScheduler(ABC):
         scheduled_new_reqs: list[NewRequestData],
         scheduled_cached_request_ids: list[str],
     ) -> None:
+        """Admit waiting requests, owning all accounting.
+
+        The policy supplies the candidate order and the per-request numbers;
+        budget accumulation, the count cap, the compatibility gate and the
+        admission dispatch live here so FIFO and budgeted policies share one
+        path.
+        """
         if not self._waiting:
             return
-        self.batching_policy.admit_waiting(self, scheduled_new_reqs, scheduled_cached_request_ids)
+        policy = self.batching_policy
+        now = time.perf_counter()
+        candidates = policy.order_candidates(self, now)
+        if not candidates:
+            return
+
+        budget = self._admission_budget_units()
+        running_tokens = self._running_admission_tokens() if budget is not None else 0
+
+        # A request costlier than the whole budget must not deadlock admission:
+        # when nothing is running there is no concurrency left to budget, so
+        # the head candidate is admitted regardless of its cost. This also
+        # covers a budget calibrated from cheaper reference requests (no CFG,
+        # single frame) than the ones the server actually serves.
+        if budget is not None and not self._running:
+            head = candidates[0]
+            if not self._can_schedule_waiting(head):
+                return
+            outcome = self._admission_scan_outcome(head, scheduled_new_reqs, scheduled_cached_request_ids, now)
+            if outcome == "stop":
+                return
+            if outcome == "admitted":
+                running_tokens += policy.request_tokens(head)
+            candidates = candidates[1:]
+
+        if budget is not None:
+            remaining = budget - running_tokens
+            reserved = policy.reservation_target(candidates, now)
+            if reserved is not None:
+                reserved_tokens = policy.request_tokens(reserved)
+                if reserved_tokens > remaining or not self._can_schedule_waiting(reserved):
+                    # Reservation mode: keep a gap for the reserved request and
+                    # admit only requests that fit into it, then stop admission
+                    # so the gap survives until the reserved request can run.
+                    gap = remaining - reserved_tokens
+                    for state in candidates:
+                        if state is reserved:
+                            continue
+                        if not self._can_schedule_waiting(state):
+                            continue
+                        tokens = policy.request_tokens(state)
+                        if tokens > gap:
+                            continue
+                        if len(self._running) >= policy.count_cap(self.max_num_running_reqs):
+                            break
+                        outcome = self._admission_scan_outcome(
+                            state, scheduled_new_reqs, scheduled_cached_request_ids, now
+                        )
+                        if outcome == "stop":
+                            break
+                        if outcome == "admitted":
+                            gap -= tokens
+                    return
+                # The reserved request fits the budget, but the explicit
+                # max_num_seqs count cap still binds: do not push the running
+                # count past it. Leaving it waiting keeps it the preferred head
+                # next cycle.
+                if len(self._running) >= policy.count_cap(self.max_num_running_reqs):
+                    return
+                # The reserved request fits: give it the head slot first, then
+                # admit in order for whatever budget is left. Without this,
+                # younger cheaper requests would take the freed slot and the
+                # aged request would miss it again.
+                outcome = self._admission_scan_outcome(reserved, scheduled_new_reqs, scheduled_cached_request_ids, now)
+                if outcome == "stop":
+                    return
+                if outcome == "admitted":
+                    running_tokens += reserved_tokens
+                candidates = [state for state in candidates if state is not reserved]
+
+        for state in candidates:
+            if not self._can_schedule_waiting(state):
+                if policy.stops_at_incompatible_head:
+                    break
+                continue
+            if len(self._running) >= policy.count_cap(self.max_num_running_reqs):
+                break
+            if budget is not None:
+                tokens = policy.request_tokens(state)
+                if running_tokens + tokens > budget:
+                    continue
+            outcome = self._admission_scan_outcome(state, scheduled_new_reqs, scheduled_cached_request_ids, now)
+            if outcome == "stop":
+                break
+            if outcome == "admitted" and budget is not None:
+                running_tokens += tokens
+
+    def _admission_budget_units(self) -> int | None:
+        """Capacity budget for this schedule step; None means unbudgeted."""
+        if not self.batching_config.uses_compute_budget:
+            return None
+        if self.user_request_budget_units is not None:
+            return max(1, int(self.user_request_budget_units))
+        return self.batching_config.effective_compute_unit_budget()
+
+    def _running_admission_tokens(self) -> int:
+        tokens = 0
+        for request_id in self._running:
+            state = self._request_states.get(request_id)
+            if state is not None:
+                tokens += self.batching_policy.request_tokens(state)
+        return tokens
 
     def _admit_state(
         self,
         state: SchedulerRequestState,
         scheduled_new_reqs: list[NewRequestData],
         scheduled_cached_request_ids: list[str],
+        now: float,
     ) -> str:
         """Admit one waiting request, reserving KV pages first.
 
@@ -475,7 +585,7 @@ class BaseScheduler(ABC):
         state.status = DiffusionRequestStatus.RUNNING
         self._running.append(request_id)
         if was_new_request:
-            state.req.scheduler_queue_wait_ms = max((time.perf_counter() - state.queued_at) * 1000.0, 0.0)
+            state.req.scheduler_queue_wait_ms = max((now - state.queued_at) * 1000.0, 0.0)
             scheduled_new_reqs.append(
                 NewRequestData.from_state(
                     state,
@@ -491,6 +601,7 @@ class BaseScheduler(ABC):
         state: SchedulerRequestState,
         scheduled_new_reqs: list[NewRequestData],
         scheduled_cached_request_ids: list[str],
+        now: float,
     ) -> str:
         """Run ``_admit_state`` and normalize its result for admission loops.
 
@@ -503,7 +614,7 @@ class BaseScheduler(ABC):
           blocks ("stalled") or a post-reservation gate rejected the request
           ("gated").
         """
-        outcome = self._admit_state(state, scheduled_new_reqs, scheduled_cached_request_ids)
+        outcome = self._admit_state(state, scheduled_new_reqs, scheduled_cached_request_ids, now)
         if outcome in ("gated", "stalled"):
             return "stop"
         return outcome
@@ -855,17 +966,13 @@ class BaseScheduler(ABC):
     def _explicit_request_budget_units(self) -> int | None:
         """Return the DRR budget pinned by an explicit ``max_num_seqs > 1``.
 
-        ``max_num_seqs <= 1`` is the default/unset sentinel: the policy computes
-        the budget from ``compute_unit_budget`` (or warmup calibration) instead
-        and replaces the literal cap with the budget-derived request count.
+        ``max_num_seqs <= 1`` is the default/unset sentinel: the admission
+        budget then comes from ``compute_unit_budget`` (or warmup calibration)
+        and no literal request-count cap applies.
         """
         if self.max_num_running_reqs <= 1:
             return None
         return self.max_num_running_reqs * self.batching_config.reference_compute_units()
-
-    def _effective_max_running_reqs(self, candidate_state: SchedulerRequestState) -> int:
-        """Return the request-count cap for the current homogeneous batch."""
-        return self.batching_policy.get_max_running_reqs(self.max_num_running_reqs, candidate_state)
 
     def _enqueue_waiting(self, state: SchedulerRequestState, *, front: bool = False) -> None:
         request_id = state.request_id
@@ -876,9 +983,6 @@ class BaseScheduler(ABC):
 
     def _remove_waiting_id(self, request_id: str) -> None:
         self._waiting = deque(req_id for req_id in self._waiting if req_id != request_id)
-
-    def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
-        return True
 
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
         if not self._running:
