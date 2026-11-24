@@ -89,6 +89,8 @@ def test_two_card_vocoder_profiles_preserve_shared_tuning(monkeypatch, deploy_na
     thinker, talker, vocoder = stages
     assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
     assert thinker.yaml_engine_args["max_model_len"] == 40960
+    assert thinker.yaml_engine_args["interleave_mm_strings"] is True
+    assert thinker.yaml_engine_args["media_io_kwargs"]["video"] == {"fps": 1, "num_frames": 128}
     spec = thinker.yaml_engine_args["speculative_config"]
     assert (spec["method"], spec["num_speculative_tokens"]) == ("dspark", 7)
     assert talker.yaml_runtime["num_replicas"] == 2

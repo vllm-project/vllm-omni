@@ -49,7 +49,7 @@ def test_kstep_talker_prefill_skips_compile_for_graph_reference_and_fallback(mon
     context = SimpleNamespace(skip_compiled=False)
     monkeypatch.setattr(npu_omni_v2_model_runner, "get_forward_context", lambda: context)
 
-    def replay(*args):
+    def replay(*args, startup_path=None):
         assert context.skip_compiled
         return "graph" if graph_hit else None
 

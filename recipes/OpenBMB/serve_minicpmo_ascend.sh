@@ -67,7 +67,6 @@ exec numactl --cpunodebind="${NUMA_NODE:-0}" --preferred="${NUMA_NODE:-0}" \
   python3 -m vllm_omni.entrypoints.cli.main serve "$MODEL_ROOT" \
   --served-model-name openbmb/MiniCPM-o-4_5 \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-8000}" \
-  --omni --trust-remote-code --interleave-mm-strings \
-  --media-io-kwargs '{"video":{"fps":1,"num_frames":128}}' \
+  --omni --trust-remote-code \
   --stage-init-timeout 1000 --init-timeout 1200 --log-stats \
   --deploy-config "$runtime_dir/deploy.yaml" "$@"
