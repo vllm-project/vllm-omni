@@ -54,7 +54,6 @@
         "omniinteract_persist_artifacts": false,
         "omniinteract_max_video_duration_s": 600,
         "omniinteract_evaluate": true,
-        "split_accuracy": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
         "benchmark_env": {
           "ACC_BENCH_RESULT_DIR": "tests/e2e/accuracy/omniinteract/results"

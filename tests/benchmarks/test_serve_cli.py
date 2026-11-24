@@ -136,7 +136,6 @@ def test_extend_omni_choices_updates_tracking_parser_shadow(dataset_name: str) -
         (["--omniinteract-subsets", "1qna"], "omniinteract_subsets", ["1qna"]),
         (["--seed-tts-locale", "zh"], "seed_tts_locale", "zh"),
         (["--seed-tts-reference-as-input"], "seed_tts_reference_as_input", True),
-        (["--split-accuracy"], "split_accuracy", True),
     ],
 )
 def test_add_omni_args_registers_arguments_on_tracking_parser(
@@ -160,7 +159,6 @@ def test_add_omni_args_preserves_implicit_defaults() -> None:
 
     args = parser.parse_args([])
     assert args.print_stage is False
-    assert args.split_accuracy is False
     assert args.omni_fail_fast_on_timeout is False
     assert args.daily_omni_input_mode == "all"
     assert args.omniinteract_subsets == ["1q1a", "1q1a_math", "1qna"]
@@ -626,112 +624,3 @@ def test_realtime_chat_choice_is_available_without_importing_runtime() -> None:
     parser.add_argument("--backend", choices=["openai-chat-omni"])
     extend_omni_choices(parser)
     assert parser.parse_args(["--backend", "openai-realtime-chat"]).backend == "openai-realtime-chat"
-
-
-def test_write_split_accuracy_result_copies_header_and_keeps_original(tmp_path, monkeypatch):
-    from vllm_omni.benchmarks.serve import write_split_accuracy_result
-
-    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
-    result = {
-        "date": "20261027-120000",
-        "model_id": "openbmb/MiniCPM-o-4_5",
-        "completed": 8,
-        "failed": 0,
-        "mean_ttft_ms": 12.5,
-        "daily_omni_accuracy": 0.8,
-        "daily_omni_evaluated_ok": 8,
-    }
-    path = write_split_accuracy_result(
-        result,
-        argparse.Namespace(split_accuracy=True, result_dir=str(tmp_path), dataset_name="daily-omni"),
-    )
-    assert path is not None
-    assert path.name == "result_acc_MiniCPM-o-4_5_daily_omni_20261027_120000.json"
-    saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["date"] == "20261027-120000"
-    assert saved["failed"] == 0
-    assert saved["daily_omni_accuracy"] == 0.8
-    assert "mean_ttft_ms" not in saved
-    assert result["mean_ttft_ms"] == 12.5
-    assert result["daily_omni_accuracy"] == 0.8
-
-
-def test_write_split_accuracy_result_skips_when_flag_off(tmp_path, monkeypatch):
-    from vllm_omni.benchmarks.serve import write_split_accuracy_result
-
-    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
-    path = write_split_accuracy_result(
-        {"date": "20261027-120000", "daily_omni_accuracy": 0.8},
-        argparse.Namespace(split_accuracy=False, result_dir=str(tmp_path), dataset_name="daily-omni"),
-    )
-    assert path is None
-    assert list(tmp_path.glob("result_acc_*.json")) == []
-
-
-def test_write_split_accuracy_result_uses_acc_bench_result_dir(tmp_path, monkeypatch):
-    from vllm_omni.benchmarks.serve import write_split_accuracy_result
-
-    acc_dir = tmp_path / "acc"
-    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(acc_dir))
-    path = write_split_accuracy_result(
-        {
-            "date": "20261027-120000",
-            "model_id": "openbmb/MiniCPM-o-4_5",
-            "omni_duplex_eval": {"published": 1, "accuracy": {"status": "ok"}},
-        },
-        argparse.Namespace(split_accuracy=True, result_dir=str(tmp_path / "perf"), dataset_name="omni-duplex-eval"),
-    )
-    assert path is not None
-    assert path.parent == acc_dir
-    saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["omni_duplex_eval"] == {"accuracy": {"status": "ok"}}
-    assert "published" not in saved["omni_duplex_eval"]
-
-
-def test_main_split_accuracy_without_cli_parser(tmp_path, mocker, monkeypatch):
-    from vllm_omni.benchmarks import serve
-
-    async def fake_vllm(_args: argparse.Namespace) -> dict[str, object]:
-        return {
-            "date": "20261027-120000",
-            "model_id": "openbmb/MiniCPM-o-4_5",
-            "completed": 4,
-            "failed": 0,
-            "mean_ttft_ms": 1.0,
-            "seed_tts_content_error_mean": 0.02,
-        }
-
-    mocker.patch.object(serve, "vllm_main_async", side_effect=fake_vllm)
-    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
-    result = serve.main(
-        argparse.Namespace(
-            split_accuracy=True,
-            result_dir=str(tmp_path),
-            dataset_name="seed-tts",
-            realtime_video_evaluate=None,
-            seed_tts_wer_eval=False,
-            seed_tts_wer_save_items=False,
-            daily_omni_save_eval_items=False,
-            videomme_save_eval_items=False,
-            omni_request_timeout_s=None,
-            omni_fail_fast_on_timeout=False,
-            omni_isolate_prefix_cache=False,
-            print_stage=False,
-            duplex_metric_aggregation="session",
-            extra_body=None,
-            backend="openai-chat-omni",
-            endpoint="/v1/chat/completions",
-            explicit_keys=frozenset(),
-            save_detailed=False,
-            request_rate=float("inf"),
-            self_timed=False,
-        )
-    )
-    assert result["seed_tts_content_error_mean"] == 0.02
-    assert result["mean_ttft_ms"] == 1.0
-    acc_paths = list(tmp_path.glob("result_acc_*.json"))
-    assert len(acc_paths) == 1
-    saved = json.loads(acc_paths[0].read_text(encoding="utf-8"))
-    assert saved["seed_tts_content_error_mean"] == 0.02
-    assert saved["completed"] == 4
-    assert "mean_ttft_ms" not in saved

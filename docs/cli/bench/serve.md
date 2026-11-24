@@ -97,16 +97,6 @@ Specify to save benchmark results to a json file
   clocks and timezones must agree. Older result files without `benchmark_end_time`
   cannot establish a sampling window from `date` alone.
 
-- `--split-accuracy`
-  After the serving result JSON is assembled, copy metadata from `date` through
-  `failed` plus dataset accuracy fields (`daily_omni_*`, `seed_tts_*`,
-  `omniinteract.accuracy`, `omni_duplex_eval.accuracy`) into a
-  separate `result_acc_*.json`. The original `--save-result` file is unchanged.
-  The sidecar directory is `ACC_BENCH_RESULT_DIR` when set, otherwise
-  `--result-dir`, otherwise the current directory. The same flag works when
-  calling `vllm_omni.benchmarks.serve.main` / `main_async` with
-  `split_accuracy=True` (no CLI required). Default: off.
-
 - `--omni-isolate-prefix-cache`
   Give the measured chat/completions requests a fresh, shared `cache_salt`
   for each benchmark invocation. Ready checks and individual warmup requests

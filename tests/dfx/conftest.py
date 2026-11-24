@@ -1176,8 +1176,7 @@ def run_benchmark(
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(persisted, f, ensure_ascii=False, indent=2)
     # Evaluated scores must be published even when no quality baseline is configured.
-    # ``--split-accuracy`` already wrote the sidecar in serve.py; a second DFX envelope would collide.
-    if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and "--split-accuracy" not in args:
+    if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args:
         from tests.e2e.accuracy.helpers import (
             _DUPLEX_EVAL_DEFAULT_ACC_DIR,
             _acc_result_filename,
@@ -1224,9 +1223,7 @@ def run_benchmark(
             # exception, independent of publishing record-only evaluated scores.
             allowed_exit_codes = (0, -6) if current_omni_platform.is_npu() else (0,)
             assert returncode in allowed_exit_codes, f"benchmark exited with unexpected code {returncode}"
-    if "--split-accuracy" not in args and (
-        dataset_name == "daily-omni" or (dataset_name == "seed-tts" and "--seed-tts-wer-eval" in args)
-    ):
+    if dataset_name == "daily-omni" or (dataset_name == "seed-tts" and "--seed-tts-wer-eval" in args):
         from tests.e2e.accuracy.helpers import (
             _DAILY_OMNI_DATASET,
             _DAILY_OMNI_DEFAULT_ACC_DIR,
@@ -1254,7 +1251,7 @@ def run_benchmark(
             benchmark_params_name=benchmark_params_name,
             accuracy_baseline=accuracy_baseline,
         )
-    if dataset_name == "omniinteract" and "--omniinteract-evaluate" in args and "--split-accuracy" not in args:
+    if dataset_name == "omniinteract" and "--omniinteract-evaluate" in args:
         _write_omniinteract_accuracy_result(
             result,
             args=args,
