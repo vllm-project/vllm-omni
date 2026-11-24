@@ -32,6 +32,19 @@ Use `stream: true` for Server-Sent Events. Input media syntax, supported output
     Each server hosts one model. Query `GET /v1/models` for its served model
     name when your client requires the `model` field.
 
+## Audio output voices
+
+For models that declare supported speakers, `audio.voice` selects a matching
+speaker name without regard to case. If the name is not supported (for example,
+an OpenAI voice name on a model with different speakers), it does not override
+the model's default speaker. Other explicitly supplied speaker metadata is
+preserved. When the model declares no discoverable speaker list, nested
+`audio.voice` is ignored and the model's default remains in effect.
+
+The top-level vLLM `voice` and `speaker` fields take precedence over
+`audio.voice` and are validated against a declared speaker list. An unsupported
+top-level name returns a `400` error.
+
 ## vLLM Extension Parameters
 
 Send standard and vLLM-specific Chat parameters as top-level fields in a

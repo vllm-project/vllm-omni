@@ -34,7 +34,7 @@ from vllm_omni.engine.duplex.realtime_events import (
     discard_pending_input_audio,
     project_internal_event,
 )
-from vllm_omni.engine.duplex.session import overlap_policy
+from vllm_omni.engine.duplex.session import helpers, overlap_policy
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 
 
@@ -249,7 +249,11 @@ class SessionEmitter:
         if realtime_input_still_open:
             session.reset_overlap_speech()
             return True, None
-        if can_promote_overlap and session.overlap_speech_ms > 0:
+        if (
+            can_promote_overlap
+            and session.overlap_speech_ms > 0
+            and (not session.capabilities.supports_chat_fallback or model_state.deferred_response_create)
+        ):
             has_deferred_overlap = (
                 model_state.audio_buffer.has_pending() or model_state.committed_audio_payload is not None
             )
@@ -297,6 +301,10 @@ class SessionEmitter:
         session.reset_overlap_speech()
         mergeable = model_state.mergeable_committed_audio()
         if can_promote_overlap and model_state.deferred_response_create and mergeable is not None:
+            if session.capabilities.supports_chat_fallback and helpers.assistant_playback_active(session):
+                # Keep the deferred marker until the final playback ACK can
+                # release this turn; no other terminal event may follow.
+                return True, None
             deferred_overlap_payload = mergeable
             model_state.deferred_response_create = False
             model_state.input_since_commit = False

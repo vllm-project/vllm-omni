@@ -27,6 +27,9 @@ from vllm_omni.engine.duplex.messages import (
     DuplexControlResultMessage,
     DuplexSessionCommandMessage,
     DuplexSessionError,
+    DuplexSessionFallbackFailedMessage,
+    DuplexSessionFallbackOutputMessage,
+    DuplexSessionFallbackStartedMessage,
     OpenDuplexSessionMessage,
     ResumeDuplexSessionMessage,
     TouchDuplexSessionMessage,
@@ -68,10 +71,13 @@ class DuplexOmniEngine(AsyncOmniEngine):
     duplex_frontend_max_sessions: int
 
     # Any: **kwargs is forwarded verbatim to ``OmniEngineBase.__init__``.
-    def __init__(self, model: str, *, duplex_audio_encoder: EncodeAudio, **kwargs: Any) -> None:
+    def __init__(
+        self, model: str, *, duplex_audio_encoder: EncodeAudio, allow_chat_fallback: bool = True, **kwargs: Any
+    ) -> None:
         # Injected by ``DuplexOmni`` (entrypoint layer): the engine package
         # knows how to hand model audio to the plugin, not how to encode it.
         self._audio_encoder = duplex_audio_encoder
+        self._allow_chat_fallback = allow_chat_fallback
         super().__init__(model, **kwargs)
 
     # ---- orchestrator construction (orchestrator thread) ----
@@ -99,6 +105,8 @@ class DuplexOmniEngine(AsyncOmniEngine):
         self.plugin = load_duplex_plugin(plugin_path, self._audio_encoder)
         self.plugin.configure_pipeline(pipeline_config)
         self.plugin.configure_server(self.duplex_session_config)
+        if not self._allow_chat_fallback and self.duplex_capabilities.supports_chat_fallback:
+            raise ValueError("chat fallback requires the in-process duplex backend")
         validate_duplex_replica_policy(self.plugin, self.duplex_session_config)
 
     # Any: signature of the ``OmniEngineBase._create_orchestrator`` seam it overrides.
@@ -366,6 +374,77 @@ class DuplexOmniEngine(AsyncOmniEngine):
             pass
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._submit_command, message)
+
+    def _submit_fallback_message(self, message: EngineQueueMessage) -> None:
+        """Enqueue one API-side fallback lifecycle message with bounded backpressure."""
+        session_id = getattr(message, "session_id", None)
+        if not isinstance(session_id, str):
+            raise DuplexSessionError("fallback message has no session id", code="invalid_argument")
+        if not self.is_alive():
+            raise DuplexSessionError("engine is not alive", code="engine_dead", session_id=session_id)
+        try:
+            self.request_queue.sync_q.put(message, timeout=_COMMAND_PUT_TIMEOUT_S)
+        except queue.Full as exc:
+            raise DuplexSessionError(
+                "engine request queue is full",
+                code="engine_backpressure",
+                retryable=True,
+                session_id=session_id,
+            ) from exc
+
+    async def submit_fallback_started_async(
+        self,
+        session_id: str,
+        request_id: str,
+        response_id: str,
+        epoch: int,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        message = DuplexSessionFallbackStartedMessage(
+            session_id=session_id,
+            request_id=request_id,
+            response_id=response_id,
+            epoch=epoch,
+        )
+        await loop.run_in_executor(None, lambda: self._submit_fallback_message(message))
+
+    async def submit_fallback_output_async(
+        self,
+        session_id: str,
+        request_id: str,
+        response_id: str,
+        epoch: int,
+        output: dict[str, object],
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        message = DuplexSessionFallbackOutputMessage(
+            session_id=session_id,
+            request_id=request_id,
+            response_id=response_id,
+            epoch=epoch,
+            output=output,
+        )
+        await loop.run_in_executor(None, lambda: self._submit_fallback_message(message))
+
+    async def submit_fallback_failed_async(
+        self,
+        session_id: str,
+        request_id: str,
+        response_id: str,
+        epoch: int,
+        error: str,
+        error_code: str,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        message = DuplexSessionFallbackFailedMessage(
+            session_id=session_id,
+            request_id=request_id,
+            response_id=response_id,
+            epoch=epoch,
+            error=error,
+            error_code=error_code,
+        )
+        await loop.run_in_executor(None, lambda: self._submit_fallback_message(message))
 
 
 __all__ = ["DuplexOmniEngine"]

@@ -45,6 +45,8 @@ from vllm_omni.engine.duplex.messages import (
     DuplexControlResultMessage,
     DuplexSessionError,
     DuplexSessionEventMessage,
+    DuplexSessionFallbackCancelMessage,
+    DuplexSessionFallbackRequestMessage,
 )
 from vllm_omni.engine.duplex.process_engine import ProcessDuplexEngineClient
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
@@ -68,7 +70,7 @@ class _ProcessWorkerRuntime:
         from vllm_omni.entrypoints.duplex.warmup import warmup_silence_unit
 
         load_general_plugins()
-        self.runtime = DuplexOmni(model=model, **options)
+        self.runtime = DuplexOmni(model=model, _process_worker=True, **options)
         self.model = self.runtime.model
         self.engine = self.runtime.engine
         assert isinstance(self.engine, DuplexOmniEngine)
@@ -349,15 +351,21 @@ class DuplexOmni(AsyncOmni):
     def _create_engine(self, **engine_kwargs: Any) -> DuplexOmniEngine:
         from vllm_omni.entrypoints.duplex.audio_encoding import encode_audio
 
-        return DuplexOmniEngine(duplex_audio_encoder=encode_audio, **engine_kwargs)
+        return DuplexOmniEngine(
+            duplex_audio_encoder=encode_audio,
+            allow_chat_fallback=not self._process_worker,
+            **engine_kwargs,
+        )
 
     def __init__(
         self,
         model: str = "",
         *args: Any,
         duplex_engine_backend_as_process: bool = False,
+        _process_worker: bool = False,
         **kwargs: Any,
     ) -> None:
+        self._process_worker = _process_worker
         self.session_only = duplex_engine_backend_as_process
         if self.session_only:
             if args:
@@ -376,9 +384,18 @@ class DuplexOmni(AsyncOmni):
         self._handles: dict[str, DuplexSessionHandle] = {}
         #: Rollbacks of resumes whose caller was cancelled mid-RPC (see ``resume_session``).
         self._resume_compensations: set[asyncio.Task[None]] = set()
-        #: Initial and maximum delay between replays of an abandoned resume
-        #: whose answers keep timing out.
+        #: Initial and maximum delay between replays of an abandoned resume.
         self._resume_replay_backoff_s: tuple[float, float] = (0.5, 5.0)
+        self._fallback_sink: (
+            Callable[[DuplexSessionFallbackRequestMessage | DuplexSessionFallbackCancelMessage], None] | None
+        ) = None
+
+    def set_fallback_sink(
+        self,
+        sink: Callable[[DuplexSessionFallbackRequestMessage | DuplexSessionFallbackCancelMessage], None] | None,
+    ) -> None:
+        """Register the API-side consumer for internal fallback messages."""
+        self._fallback_sink = sink
 
     async def generate(self, *args: Any, **kwargs: Any) -> AsyncGenerator[OmniRequestOutput, None]:
         if self.session_only:
@@ -416,8 +433,8 @@ class DuplexOmni(AsyncOmni):
 
     # ---- session lifecycle ----
 
-    @staticmethod
     def _resolve_session_config(
+        self,
         config: DuplexSessionConfig | Mapping[str, object] | None,
         *,
         model: str,
@@ -433,7 +450,11 @@ class DuplexOmni(AsyncOmni):
         elif isinstance(config, DuplexSessionConfig):
             resolved = config
         elif isinstance(config, Mapping):
-            resolved = DuplexSessionConfig.from_realtime(config, model=model)
+            resolved = DuplexSessionConfig.from_realtime(
+                config,
+                model=model,
+                supports_model_native_turn_policy=self.duplex_capabilities.supports_model_native_turn_policy,
+            )
         else:
             raise TypeError(f"unsupported duplex session config: {type(config).__name__}")
         if resolved.model is None:
@@ -695,6 +716,12 @@ class DuplexOmni(AsyncOmni):
     # ---- engine output routing ----
 
     def _route_engine_message(self, msg: object) -> bool:
+        if isinstance(msg, (DuplexSessionFallbackRequestMessage, DuplexSessionFallbackCancelMessage)):
+            if self._fallback_sink is None:
+                logger.warning("[DuplexOmni] dropping fallback message without an API sink")
+            else:
+                self._fallback_sink(msg)
+            return True
         if not isinstance(msg, DuplexSessionEventMessage):
             return False
         handle = self._handles.get(msg.session_id)

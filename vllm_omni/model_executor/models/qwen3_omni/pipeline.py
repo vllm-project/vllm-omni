@@ -97,6 +97,17 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
     ),
 )
 
+QWEN3_OMNI_CHAT_FALLBACK_PIPELINE = replace(
+    QWEN3_OMNI_PIPELINE,
+    model_type="qwen3_omni_moe_chat_fallback",
+    default_session_mode="duplex",
+    default_deploy_config_name="qwen3_omni_chat_fallback.yaml",
+    duplex_plugin=(
+        "vllm_omni.model_executor.models.qwen3_omni.duplex.chat_fallback_plugin.Qwen3OmniChatFallbackPlugin"
+    ),
+)
+
+
 QWEN3_OMNI_RESUMABLE_PIPELINE = replace(
     QWEN3_OMNI_PIPELINE,
     model_type="qwen3_omni_moe_resumable",

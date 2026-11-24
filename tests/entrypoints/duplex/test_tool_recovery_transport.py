@@ -46,11 +46,19 @@ class InProcessControl:
         self.duplex_session_config = self.manager.runtime_config
         self.engine = self
         self.handle: DuplexSessionHandle | None = None
+        self._fallback_sink = None
+
+    def set_fallback_sink(self, sink) -> None:
+        self._fallback_sink = sink
+
+    @property
+    def duplex_capabilities(self):
+        return self.manager.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions)
 
     async def open_session(self, payload):
         session_id = f"duplex-{uuid4().hex}"
         handle = DuplexSessionHandle(self, session_id)
-        config = DuplexOmni._resolve_session_config(payload, model="nemotron")
+        config = DuplexOmni._resolve_session_config(self, payload, model="nemotron")
         await self.manager.handle(
             OpenDuplexSessionMessage(
                 control_id="transport-open",
