@@ -65,6 +65,13 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True, help="NVIDIA-NemotronLabs-VoiceChat-11B directory")
     parser.add_argument("--wav", required=True, help="user speech (any sr; resampled to 16 kHz mono)")
     parser.add_argument("--output-dir", default="results/nemotron_voicechat")
+    parser.add_argument(
+        "--stage-init-timeout",
+        type=float,
+        default=900.0,
+        help="Seconds to wait for each stage to become ready. The 300 s "
+        "default is too short for a cold start that still compiles kernels.",
+    )
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
     parser.add_argument(
         "--deploy-config",
@@ -136,7 +143,12 @@ def main() -> None:
     omni_kwargs: dict = {}
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
-    omni = Omni(model=str(ckpt), trust_remote_code=True, **omni_kwargs)
+    omni = Omni(
+        model=str(ckpt),
+        trust_remote_code=True,
+        stage_init_timeout=args.stage_init_timeout,
+        **omni_kwargs,
+    )
     outputs = omni.generate(inputs, sampling_params_list)
 
     out_dir = Path(args.output_dir)
