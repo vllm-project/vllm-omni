@@ -556,11 +556,14 @@ class UlyssesParallelAttention:
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd, ulysses_qkv_fwd_group
 
                 group_name = self._ulysses_pg.group_name
+                # Exchange the gate first: it is copied out of the shared
+                # workspace, while zero-copy Q/K/V stay views of it that any
+                # later exchange would overwrite before attention reads them.
+                if gate_compress is not None:
+                    gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
                 query, key, value = ulysses_qkv_fwd_group(
                     query, key, value, group_name, ulysses_world_size, self._ulysses_a2a_zero_copy
                 )
-                if gate_compress is not None:
-                    gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
                 if self._use_sync:
                     current_omni_platform.synchronize()
             else:
