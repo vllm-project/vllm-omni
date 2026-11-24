@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from unittest.mock import patch
+
 import pytest
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -70,26 +72,40 @@ class TinyVAE(nn.Module):
         return latent[:, :3]
 
 
-@pytest.mark.parametrize(
-    "additional_config, dtype", [({}, torch.float16), ({"seedvr2_dit_compute_dtype": "bfloat16"}, torch.bfloat16)]
-)
-def test_pipeline_component_dtypes(tmp_path, monkeypatch, additional_config, dtype):
+def make_tiny_pipeline(tmp_path, monkeypatch, additional_config, text):
     monkeypatch.setattr(sr, "SeedVR2NaDiT", TinyDiT)
     monkeypatch.setattr(sr, "SeedVR2VAE", TinyVAE)
     monkeypatch.setattr(sr, "get_local_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(sr, "_device_memory", lambda: None)
     monkeypatch.setattr(sr, "set_torch_threads_for_runtime", lambda: None)
-    checked: list[torch.dtype] = []
-    monkeypatch.setattr(sr.current_platform, "check_if_supports_dtype", checked.append)
-    # Direct BF16 rounding of this value differs from rounding through checkpoint FP16.
-    text = torch.full((1, 5120), 0.99795, dtype=torch.float32)
-    assert not torch.equal(text.bfloat16(), text.half().bfloat16())
     torch.save(text, tmp_path / "pos_emb.pt")
     config = OmniDiffusionConfig(
         model=str(tmp_path), dtype=torch.float16, enforce_eager=True, additional_config=additional_config
     )
     with set_default_torch_dtype(torch.float16):
-        pipeline = sr.SeedVR2Pipeline(od_config=config)
+        return sr.SeedVR2Pipeline(od_config=config)
+
+
+def make_request(request_id):
+    return OmniDiffusionRequest(
+        prompt={"prompt": "", "multi_modal_data": {"video": torch.zeros(1, 3, 16, 16)}},
+        request_id=request_id,
+        sampling_params=OmniDiffusionSamplingParams(
+            height=16, width=16, seed=17, fps=24, extra_args={"color_correction_method": "none"}
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "additional_config, dtype", [({}, torch.float16), ({"seedvr2_dit_compute_dtype": "bfloat16"}, torch.bfloat16)]
+)
+def test_pipeline_component_dtypes(tmp_path, monkeypatch, additional_config, dtype):
+    checked: list[torch.dtype] = []
+    monkeypatch.setattr(sr.current_platform, "check_if_supports_dtype", checked.append)
+    # Direct BF16 rounding of this value differs from rounding through checkpoint FP16.
+    text = torch.full((1, 5120), 0.99795, dtype=torch.float32)
+    assert not torch.equal(text.bfloat16(), text.half().bfloat16())
+    pipeline = make_tiny_pipeline(tmp_path, monkeypatch, additional_config, text)
     bf16 = dtype == torch.bfloat16
     assert checked == ([torch.bfloat16] if bf16 else [])
     assert pipeline.transformer.scale.dtype == dtype
@@ -109,16 +125,8 @@ def test_pipeline_component_dtypes(tmp_path, monkeypatch, additional_config, dty
         )
     torch.testing.assert_close(pipeline.transformer.rope.freqs, freqs.float(), rtol=0, atol=0)
 
-    frames = torch.zeros(1, 3, 16, 16)
-    request = OmniDiffusionRequest(
-        prompt={"prompt": "", "multi_modal_data": {"video": frames}},
-        request_id="seedvr2-precision",
-        sampling_params=OmniDiffusionSamplingParams(
-            height=16, width=16, seed=17, fps=24, extra_args={"color_correction_method": "none"}
-        ),
-    )
     with torch.autocast("cpu", dtype=torch.float16):
-        pipeline(DiffusionRequestBatch([request]))
+        pipeline(DiffusionRequestBatch([make_request("seedvr2-precision")]))
         assert torch.is_autocast_enabled("cpu")
     assert pipeline.transformer.autocast_enabled is (not bf16)
     assert pipeline.vae.decoder_input.dtype == torch.float16
@@ -126,3 +134,35 @@ def test_pipeline_component_dtypes(tmp_path, monkeypatch, additional_config, dty
         assert pipeline.vae.decoder_input.isfinite().all()
     else:
         assert pipeline.vae.decoder_input.isnan().all()
+
+
+@pytest.mark.parametrize("bad_index", [0, 1], ids=["invalid-first", "invalid-last"])
+def test_nonfinite_velocity_isolated_to_request(tmp_path, monkeypatch, bad_index):
+    monkeypatch.setattr(sr.current_platform, "check_if_supports_dtype", lambda dtype: None)
+    pipeline = make_tiny_pipeline(
+        tmp_path, monkeypatch, {"seedvr2_dit_compute_dtype": "bfloat16"}, torch.zeros(1, 5120)
+    )
+    reference = pipeline(DiffusionRequestBatch([make_request("valid")]))[0]
+    # Inject a nonfinite value into the DiT output for just one of two requests.
+    bad_request = iter([bad_index == 0, bad_index == 1])
+
+    def inject_nonfinite(module, args, output):
+        if next(bad_request):
+            return NaDiTOutput(vid_sample=torch.full_like(output.vid_sample, float("nan")))
+        return output
+
+    requests = [make_request("invalid" if i == bad_index else "valid") for i in range(2)]
+    with (
+        pipeline.transformer.register_forward_hook(inject_nonfinite),
+        patch.object(pipeline.vae, "decode", wraps=pipeline.vae.decode) as decode,
+    ):
+        outputs = pipeline(DiffusionRequestBatch(requests))
+
+    assert len(outputs) == 2
+    bad, good = outputs[bad_index], outputs[1 - bad_index]
+    assert bad.error and "non-finite" in bad.error
+    assert bad.output is None
+    assert good.error is None
+    assert isinstance(good.output, dict) and isinstance(reference.output, dict)
+    torch.testing.assert_close(good.output["payload"]["video"], reference.output["payload"]["video"])
+    decode.assert_called_once()

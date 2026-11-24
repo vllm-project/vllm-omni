@@ -589,6 +589,10 @@ def sample_noise(condition: torch.Tensor, generator: torch.Generator) -> torch.T
     return torch.empty_like(condition).normal_(generator=generator)
 
 
+class _NonFiniteVelocityError(RuntimeError):
+    """The current request's DiT velocity cannot be used for an FP16 solver update."""
+
+
 def velocity_to_fp16(velocity: torch.Tensor) -> torch.Tensor:
     """Check the BF16 DiT output at the FP16 Euler boundary."""
     if velocity.dtype != torch.bfloat16:
@@ -598,7 +602,7 @@ def velocity_to_fp16(velocity: torch.Tensor) -> torch.Tensor:
     # aminmax propagates NaNs and avoids a clip-sized finiteness mask.
     low, high = torch.aminmax(velocity)
     if not (torch.isfinite(low) & torch.isfinite(high)).item():
-        raise RuntimeError("SeedVR2 DiT velocity is non-finite after conversion to FP16")
+        raise _NonFiniteVelocityError("SeedVR2 DiT velocity is non-finite after conversion to FP16")
     return velocity
 
 
@@ -698,7 +702,11 @@ class SeedVR2Pipeline(nn.Module):
             if use_bf16:
                 # Window SP assembles the full velocity on every rank before
                 # returning, so all participants validate the same values.
-                velocity = velocity_to_fp16(velocity)
+                try:
+                    velocity = velocity_to_fp16(velocity)
+                except _NonFiniteVelocityError as exc:
+                    outputs.append(DiffusionOutput.from_exception(exc))
+                    continue
             # Reference Euler returns fp32, then VAE casts to fp16 before scaling.
             restored = noise - velocity.reshape_as(noise)
             decoded = self.vae.decode((restored / 0.9152).permute(3, 0, 1, 2).unsqueeze(0))

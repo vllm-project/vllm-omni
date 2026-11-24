@@ -107,7 +107,9 @@ Keep `--dtype float16` for the pipeline. SeedVR2 loads the same checkpoint
 into BF16 DiT parameters and uses BF16 text conditioning. RoPE frequency
 buffers retain FP32 precision. The VAE, sampled noise and Euler update use
 FP16. SeedVR2 checks that the DiT velocity is finite after conversion to FP16
-before passing it to the solver. Use the same option on all workers.
+before passing it to the solver. If this check detects a NaN or infinity,
+only the affected request returns an error. Other requests in the batch continue.
+Use the same option on all workers.
 
 The default is `float16`. Restart the service to change this setting. Both
 the video endpoint and the long-video endpoint use the loaded model's precision.
