@@ -177,6 +177,11 @@ def test_native_oversized_chunk_uses_real_finish_cleanup_and_emits_one_error(
     scheduler.aux_output_connector = None
     scheduler.ec_connector = None
     scheduler.defer_block_free = False
+    # vLLM 0.34 Scheduler state reached via the inherited upstream cleanup /
+    # requeue paths; __new__ bypasses the __init__ that creates them.
+    scheduler.async_kv_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler._parked_reservations = {}
+    scheduler._parked_reserved_blocks = 0
     kv_cache = mocker.Mock(spec=KVCacheManager)
     kv_cache.take_events.return_value = []
     kv_cache.estimate_cached_tokens.return_value = 0
@@ -216,7 +221,6 @@ def test_native_oversized_chunk_uses_real_finish_cleanup_and_emits_one_error(
         previous_step.total_num_scheduled_tokens = in_flight_tokens
         previous_output = OmniModelRunnerOutput(
             req_ids=[request.request_id],
-            req_id_to_index={request.request_id: 0},
             sampled_token_ids=[[]],
             pooler_output=[],
             multimodal_outputs=[audio_payload],
@@ -262,7 +266,6 @@ def test_native_oversized_chunk_uses_real_finish_cleanup_and_emits_one_error(
     assert len(scheduler._pending_chunk_error_outputs) == 1
     runner_output = OmniModelRunnerOutput(
         req_ids=[],
-        req_id_to_index={},
         sampled_token_ids=[],
         pooler_output=[],
     )

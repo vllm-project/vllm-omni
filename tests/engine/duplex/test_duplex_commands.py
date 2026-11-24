@@ -16,6 +16,7 @@ from vllm_omni.engine.duplex.commands import (
     AppendAudio,
     AppendText,
     BargeIn,
+    CancelFunctionCall,
     CancelInput,
     CancelResponse,
     ClearInput,
@@ -63,6 +64,7 @@ _MINIMAL_PAYLOADS: dict[str, tuple[dict[str, object], type[DuplexCommand]]] = {
     "turn.signal": ({"event": "user_started"}, SignalTurn),
     "input.text.append": ({"text": "hello"}, AppendText),
     "input.cancel": ({}, CancelInput),
+    "function_call.cancel": ({"call_id": "call_1"}, CancelFunctionCall),
     "barge_in": ({}, BargeIn),
 }
 

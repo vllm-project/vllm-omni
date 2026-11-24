@@ -32,6 +32,12 @@ shard reject the offload config at startup.
 
 ## Software environment
 
+The versions and measurements below record the original vLLM 0.33 environment.
+The current Dockerfile targets vLLM 0.34; use the
+[XPU installation guide](../../docs/getting_started/installation/gpu/xpu.inc.md)
+for its matching runtime. Rebuilding the current source does not reproduce or
+qualify the historical measurements below.
+
 | Item | Version |
 | --- | --- |
 | Base image | `vllm/vllm-openai-xpu` 0.33.0, built into the vLLM-Omni image with `docker/Dockerfile.xpu` |

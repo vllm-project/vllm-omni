@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Reusable utility for building tiny diffusion models with random weights.
 
 Mirrors the component loading loop in DiffusionPipeline.from_pretrained,
@@ -33,7 +36,7 @@ def build_tiny_from_configs(
     pipeline_name: str,
     model_id: str,
     configs_dir: str | Path | None = None,
-    transform: dict[str, Callable[[dict], dict]] | None = None,
+    transform: dict[str | None, Callable[[dict], dict]] | None = None,
 ) -> str:
     """Build a tiny diffusion model with random weights.
 
@@ -104,10 +107,17 @@ def build_tiny_from_configs(
 
     init_dict, _, _ = pipeline_cls.extract_init_dict(config_dict)
 
-    # Pop non-component entries (optional pipeline kwargs like is_distilled),
-    # same as DiffusionPipeline.from_pretrained lines 345-350
+    # Mirrors DiffusionPipeline.from_pretrained's component parsing. Keep this
+    # close to upstream so diffusers bumps are easy to reconcile. Optional
+    # components such as WanPipeline's transformer/transformer_2 must stay in
+    # init_dict so they are instantiated below.
     _, optional_kwargs = DiffusionPipeline._get_signature_keys(pipeline_cls)
-    init_kwargs = {k: init_dict.pop(k) for k in optional_kwargs if k in init_dict}
+    init_kwargs = {
+        k: init_dict.pop(k) for k in optional_kwargs if k in init_dict and k not in pipeline_cls._optional_components
+    }
+
+    # Mirrors from_pretrained's load_module: skip components saved as [null, null].
+    init_dict = {k: v for k, v in init_dict.items() if v[0] is not None}
 
     with (
         patch.object(ModelMixin, "from_pretrained", classmethod(_diffusers_from_config)),

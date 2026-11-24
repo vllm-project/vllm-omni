@@ -959,7 +959,12 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type, 
         if pipeline.default_deploy_config_name is not None
         else DeployConfig()
     )
+    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.device_name", "cuda")
     model = _fake_model_root(pipeline, tmp_path)
+    if model_type in {"fish_omni", "lfm3_audio", "lfm3_audio_text", "lfm3_omni", "lfm3_omni_text"}:
+        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+            _legacy_and_typed_stages(pipeline, deploy, model=model)
+        return
     legacy_stages, omni_config = _legacy_and_typed_stages(
         pipeline,
         deploy,

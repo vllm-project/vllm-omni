@@ -40,6 +40,8 @@ class Yue2Config(PretrainedConfig):
         latent_dim: int = 64,
         max_latent_frames: int = 24576,
         timestep_shift: float = 1.0,
+        yue2_vae_path: str | None = None,
+        yue2_vae_revision: str = "main",
         **kwargs: Any,
     ) -> None:
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -56,6 +58,8 @@ class Yue2Config(PretrainedConfig):
         self.latent_dim = latent_dim
         self.max_latent_frames = max_latent_frames
         self.timestep_shift = timestep_shift
+        self.yue2_vae_path = yue2_vae_path
+        self.yue2_vae_revision = yue2_vae_revision
         # The checkpoint's config.json (like upstream's qwen_config derivative,
         # fast.py) omits the standard Qwen3 fields the AR backbone expects;
         # synthesize the same defaults upstream does so vLLM's Qwen3Model and

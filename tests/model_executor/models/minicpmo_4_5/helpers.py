@@ -57,3 +57,16 @@ def stage0_vision_runtime():
         [torch.full((2, 2), float(index), dtype=torch.float32)] for index in range(len(frames))
     ]
     return runtime
+
+
+def reference_codec_penalty(logits, histories, *, penalty, window_size):
+    """Scalar per-request oracle for the Talker's frequency-scaled codec window."""
+    import torch
+
+    rows = []
+    for row, history in zip(logits, histories, strict=True):
+        recent = history.reshape(-1)[-window_size:].long()
+        frequencies = torch.bincount(recent, minlength=row.shape[-1]).to(row.dtype)
+        alpha = torch.pow(torch.as_tensor(penalty, dtype=row.dtype), frequencies)
+        rows.append(torch.where(row < 0, row * alpha, row / alpha))
+    return torch.stack(rows)

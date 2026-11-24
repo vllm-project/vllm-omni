@@ -622,16 +622,16 @@ Select the device with `HIP_VISIBLE_DEVICES` (not `CUDA_VISIBLE_DEVICES`), drop 
 CUDA-only `FLASHINFER_DISABLE_VERSION_CHECK`, and install without the `[fa4]` extra
 (FA4 is CUDA-only). The VAE uses AITER GroupNorm on ROCm.
 
-For this source checkout, build the frozen vLLM 0.33.0 ROCm runtime from
-source using the repository Dockerfile, from the Omni repository root:
+For this source checkout, build the image with the matching vLLM 0.34.0
+ROCm runtime from the Omni repository root:
 
 ```bash
-docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v033-source .
+docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v034-source .
 ```
 
 See the [ROCm installation guide](../../docs/getting_started/installation/gpu/rocm.inc.md)
 for source/runtime details. Container and native H3 validation on ROCm remain
-pending for this checkout; an older ROCm wheel cannot provide its 0.33 APIs.
+pending for this checkout; an older ROCm wheel cannot provide its 0.34 APIs.
 
 Historical prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. That image bundles TorchCodec (for image+audio Ref2VA) and `ffmpeg` (for
 video-reference Ref2VA).
@@ -910,9 +910,10 @@ vllm serve "$MODEL" --omni --task-type fl2va --trust-remote-code \
 ```
 
 The initial control path uses resident BF16 weights and tensor parallelism.
-Reference/keyframe conditioning, visual timeline guides, sequence parallelism, approximate cache acceleration and
-quantized control execution require separate support; do not combine them with
-this configuration. Control/Turbo combinations need their own validation and
+Keyframe conditioning, visual timeline guides, continuation (`continue_from` and long-video), sequence parallelism,
+approximate cache acceleration and quantized control execution require separate support; do not combine them with
+this configuration. On base H3 weights control also takes no references. The FastH3 Omni checkpoint takes control as
+Ref2VA with its reference images; see [FastH3 Omni control](../FastVideo/FastH3-Omni.md#controlnet). Control/Turbo combinations need their own validation and
 are not established by ordinary H3 Turbo results.
 
 Active control conditioning cannot be reused in a `latent_refine` pass at a
@@ -1225,7 +1226,7 @@ full and windowed latents.
 
 ## Request-scoped sampler
 
-H3 supports `euler` (the default) and `res_multistep`. Select the sampler per
+H3 supports `euler` (the default), `res_multistep`, and `heun`. Select the sampler per
 request; it applies to both video and audio, using their separate sigma schedules.
 For the HTTP examples above, set `num_inference_steps=20` and add
 `"sampler":"res_multistep"` to the existing `extra_params` object. For example,
@@ -1248,7 +1249,11 @@ sampling_params = OmniDiffusionSamplingParams(
 )
 ```
 
-Both samplers use one DiT evaluation per step in request mode and step execution.
+`euler` and `res_multistep` use one DiT evaluation per step in request mode and
+step execution. `heun` evaluates the DiT a second time at the Euler proposal and
+averages the two derivatives, so an N-step schedule ending at zero uses `2N - 1`
+evaluations; the final step to zero is a plain Euler update. Heun needs uncached
+model runs, so it is rejected with `quality=high` or a server-wide cache backend.
 `res_multistep` retains the previous denoised prediction independently for each
 request and each stream; its first and final updates use Euler. Omitting `sampler`
 or selecting `euler` preserves the existing Euler update. Reducing the step count
@@ -1256,8 +1261,8 @@ reduces model evaluations, but quality depends on the prompt and configuration;
 20 RES steps are a candidate to compare against an Euler-50 reference.
 
 Requests using a fixed distilled `base_schedule` from a checkpoint or adapter
-must keep `sampler="euler"`. RES sampling with those schedules has not been
-validated and is rejected with `ValueError`.
+must keep `sampler="euler"`. RES and Heun sampling with those schedules have not
+been validated and are rejected with `ValueError`.
 
 ## Request-scoped quality
 
@@ -1476,7 +1481,7 @@ storyboard prompts into this six-section format.
 
 ### Turbo LoRA
 
-The eight Diffusers-layout LightX2V Turbo artifacts are supported. The
+The nine Diffusers-layout LightX2V Turbo artifacts below are supported. The
 filename records the contract, so the server reads the step count, task family
 and flow shift from it and validates each request against the artifact that is
 loaded. It does not rewrite request or deploy-config sampling values: the
@@ -1491,6 +1496,7 @@ rejected.
 | `minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 4 | 6 | 8 |
 | `minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 12 | 8 |
 | `minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 6 | 8 |
+| `minimax_h3_fl2v_turbo_8step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 12 | 128 |
 | `minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` | Ref2VA | 4 | 4 | 12 | 8 |
 | `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` | Ref2VA | 8 | 8 | 6 | 8 |
 
@@ -1507,6 +1513,14 @@ request-level `scale` is a further multiplier on top of it.
 > rank`, so the `alpha=8` rows drive at 1/16 the strength of the `alpha=128`
 > rows. 8 is the default of LightX2V's reference script, which never reads the
 > metadata; its documented `v0.1` command does not override that default.
+>
+> `8step_v1.2` is the one artifact that also adapts the timestep modulation:
+> it adds a rank-16 pair on the AdaLN projection of each of the 50 DiT blocks
+> and of the output layer, and stores an alpha tensor next to every pair. Those
+> 51 pairs are applied at their own `scale * alpha / rank` (16 / 16), not at
+> the rank-128 pairs' value. It is also the one `_768p` artifact that runs at
+> `flow_shift` 12: LightX2V's reference configs use 12 for it and 6 for the
+> other `_768p` files.
 
 Every artifact except `minimax_h3_fl2v_turbo_4step_v0.1` also ships a
 `_comfyui_` export of the same weights. Those fuse Q/K/V into one projection
@@ -1572,6 +1586,11 @@ evaluations.
 
 ### FlashGen native LoRA
 
+FlashGen native adapters require `--lora-application runtime` (the default).
+`--lora-application merged` is rejected during loading because the adapter's
+schedule and request validation require runtime activation. An active native
+adapter cannot be stacked with other adapters.
+
 The FlashGen 4-step T2VA artifact uses the native MiniMax-H3 module layout and
 declares its distilled sigma schedule in safetensors metadata. It is published on
 [ModelScope](https://modelscope.cn/models/FlashGen/Minimax-H3-4step-lora-flashgen):
@@ -1602,7 +1621,7 @@ Each request must use T2VA and the distilled interval-count contract:
 -F "lora={\"name\":\"h3-flashgen-v1.0\",\"path\":\"${FLASHGEN_LORA}\",\"scale\":1.0}"
 ```
 
-This path rejects Ref2VA and checkpoints that already pin `base_schedule` in
+The T2VA v1 artifact rejects Ref2VA and checkpoints that already pin `base_schedule` in
 `model_index.json`. The adapter metadata carries
 `base_schedule=1.0,0.7,0.4,0.15,0.0`, so `num_inference_steps=4` means four
 denoiser evaluations, not five sigma points. Request-mode generation may omit
@@ -1626,6 +1645,44 @@ To validate a deployment, post the same fixed-seed T2VA request twice with the
 adapter and twice without it, then compare the four output digests. The adapter
 is bound and deterministic when each pair matches internally and the two pairs
 differ from each other.
+
+#### FlashGen native LoRA v2 for I2VA and Ref2VA
+
+Use the published v2 safetensors file exported for the matching official base
+partition. For I2VA, start a FL2VA server with `--task-type fl2va` and send a
+single first frame in `input_reference`. Set `task=fl2va` and
+`frame_indices=[0]` in `extra_params`. For Ref2VA, start a dedicated Ref2VA
+server with `--task-type ref2va`; set `task=ref2va` and send the reference
+image in `input_reference`. Both services use `--lora-backend peft` and may
+preload the published file with `--lora-path`. Select it in the request with
+the usual `lora` field and `scale=1.0`. FL2VA exports also load on a
+`--task-type combined` server; requests using that adapter must still select
+`task=fl2va`.
+
+The [four-A5 conditioning validation](https://github.com/vllm-project/vllm-omni/pull/10596#discussion_r4623182377)
+also completed four-step FL2VA requests with a last frame, first and last
+frames, and `continue_from`. First/last output frames matched their input
+images with SSIM 0.982/0.979 in the tested two-frame case. Three keyframes
+and timeline guides were rejected by existing validation. Ref2VA requests
+with a video, image plus audio, and image plus video also completed with
+fully decodable video and audio. Reference audio/video adherence remains
+unverified; these results establish completion for the tested inputs.
+
+The artifact supplies a four-interval base sigma schedule. Omit `sampler`
+to use the H3 default Euler sampler. The adapter requires `flow_shift=12`
+and `audio_flow_shift=3`. If the base model defaults differ, pass these
+values explicitly in `extra_params`. Send `num_inference_steps=4` when using
+step execution.
+
+Ref2VA uses rank 384 for packed QKV and rank 128 for the other projections.
+The runtime LoRA manager uses a shared buffer rank across wrapped layers. It
+rounds 384 up to the next supported rank, 512, so rank-128 projections reserve
+four times the LoRA buffer capacity they would need at rank 128. The actual
+per-device memory overhead depends on tensor parallelism and the backend.
+The exported factors already carry their effective scale. An active v2
+adapter requires request `scale=1.0`; other nonzero scales are rejected.
+`scale=0` disables the adapter and its sampling constraints. Legacy T2VA v1
+request scaling is unchanged.
 
 ### FastH3 adapter
 
@@ -1684,7 +1741,7 @@ FL2VA takes a first frame, a last frame, or both, with the same
 
 The student was distilled at 8 steps with H3's default video/audio shifts of
 12/3 and the Euler sampler. A request with another step count, a shift
-override, `sampler=res_multistep`, or a `lora=` field is rejected. Add
+override, a non-Euler `sampler`, or a `lora=` field is rejected. Add
 `--quantization fp8` to run the DiT and text-encoder linears in FP8, including
 the linear branch's output projection.
 
@@ -1748,7 +1805,7 @@ Select a specific file when a directory contains multiple adapters. General Diff
 | `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
 | `fps` | `24` | H3 output FPS is fixed |
 | `num_inference_steps` | `50` | Matches the reference accuracy workloads |
-| `extra_params.sampler` | `euler` | Per-request `euler` or `res_multistep` for both streams; fixed distilled schedules require Euler |
+| `extra_params.sampler` | `euler` | Per-request `euler`, `res_multistep`, or `heun` for both streams; fixed distilled schedules require Euler; Heun requires uncached runs |
 | `flow_shift` | `12` | Video sigma shift |
 | `audio_flow_shift` | `3` | Audio sigma shift, passed in `extra_params` |
 | `seed` | Task-specific | Use a fixed value for reproducibility |

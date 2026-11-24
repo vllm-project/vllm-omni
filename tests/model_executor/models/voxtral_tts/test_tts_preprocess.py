@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Tests for TTS feedback preprocessing and eager EOS write-back."""
 
 import functools
 
@@ -104,3 +105,155 @@ def test_tts_postprocess_retains_v1_request_order_fallback():
     torch.testing.assert_close(first["codes"]["audio"], frames[0])
     torch.testing.assert_close(second["codes"]["audio"], frames[1])
     assert model.post_process_idx == 2
+
+
+class _FixedAudioCodes(nn.Module):
+    def __init__(self, codes: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("codes", codes)
+
+    def forward(
+        self, llm_hidden: torch.Tensor, cfg_alpha: torch.Tensor, noise: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        assert noise is None
+        return self.codes
+
+
+@pytest.fixture
+def audio_generation_model():
+    model = _make_voxtral_tts_model()
+    from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation import (
+        AudioSpecialTokens,
+        VoxtralTTSAudioGenerationForConditionalGeneration,
+    )
+
+    end_audio_id = AudioSpecialTokens.id(AudioSpecialTokens.end_audio)
+    audio_codes = torch.tensor([[end_audio_id, 2, 3], [2, 4, 5]], dtype=torch.long)
+
+    # Exercise the real EOS producer and its indexed-assignment consumer;
+    # the acoustic transformer only supplies deterministic integer codes.
+    generator = VoxtralTTSAudioGenerationForConditionalGeneration.__new__(
+        VoxtralTTSAudioGenerationForConditionalGeneration
+    )
+    nn.Module.__init__(generator)
+    generator.acoustic_transformer = _FixedAudioCodes(audio_codes)
+    generator._end_audio_token_id = end_audio_id
+
+    model.model = generator
+    model._cudagraph_acoustic_transformer = None
+    return model, audio_codes
+
+
+@pytest.mark.parametrize(
+    "model_dtype", [torch.float16, torch.bfloat16, torch.float32], ids=["float16", "bfloat16", "float32"]
+)
+def test_eager_eos_matches_hidden_states_dtype(audio_generation_model, model_dtype: torch.dtype):
+    model, audio_codes = audio_generation_model
+    logits_indices = torch.tensor([1, 3])
+
+    # Reuse the model across dtypes to catch stale cached EOS constants too.
+    for dtype in (torch.bfloat16, model_dtype):
+        hidden_states = torch.full((4, 8), 0.25, dtype=dtype)
+        expected = torch.full_like(hidden_states, 0.25)
+        expected[1, 0] = 1.0
+        expected[3, 0] = 0.0
+
+        with torch.inference_mode():
+            output = model.make_omni_output(hidden_states, logits_index=logits_indices)
+
+        assert output.text_hidden_states.dtype == dtype
+        torch.testing.assert_close(output.text_hidden_states, expected, rtol=0, atol=0)
+        actual_codes = torch.cat(output.multimodal_outputs["codes"]["audio"], dim=0).squeeze(1)
+        torch.testing.assert_close(actual_codes, audio_codes)
+
+
+def _make_voxtral_tts_model_with_real_embeddings(hidden_size: int = 8):
+    """A Voxtral TTS wrapper whose generation model uses the real audio-token embedding path."""
+    from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation import (
+        VoxtralTTSAudioGenerationForConditionalGeneration as GenerationModel,
+    )
+    from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_tokenizer import (
+        MultiVocabEmbeddings,
+        VoxtralTTSAudioTokenizer,
+    )
+
+    audio_model_args = {
+        "semantic_codebook_size": 16,
+        "acoustic_codebook_size": 5,
+        "n_acoustic_codebook": 3,
+        "acoustic_transformer_args": {"input_dim": hidden_size},
+    }
+
+    class AudioTokenizer(nn.Module):
+        encode_tokens = VoxtralTTSAudioTokenizer.encode_tokens
+
+        def __init__(self):
+            super().__init__()
+            self.audio_token_embedding = MultiVocabEmbeddings(audio_model_args, embedding_dim=hidden_size)
+
+    class AudioGeneration(nn.Module):
+        embed_multimodal = GenerationModel.embed_multimodal
+        _parse_and_validate_audio_arrays = GenerationModel._parse_and_validate_audio_arrays
+
+        def __init__(self):
+            super().__init__()
+            self.audio_tokenizer = AudioTokenizer()
+            self.text_embedding = nn.Embedding(64, hidden_size)
+
+        def embed_input_ids(self, input_ids):
+            return self.text_embedding(input_ids)
+
+    model = _make_voxtral_tts_model()
+    model.model = AudioGeneration()
+    codebook_sizes = model.model.audio_tokenizer.audio_token_embedding.codebook_sizes
+    return model, codebook_sizes
+
+
+def _random_frame(codebook_sizes: list[int]) -> torch.Tensor:
+    # Shape matches what tts_postprocess stores per request: (1, 1, num_codebooks).
+    return torch.stack([torch.randint(0, size, ()) for size in codebook_sizes]).view(1, 1, -1)
+
+
+def test_preprocess_decode_batch_matches_per_row_tts_preprocess():
+    torch.manual_seed(0)
+    model, codebook_sizes = _make_voxtral_tts_model_with_real_embeddings()
+    input_ids = torch.tensor([model._audio_token_id] * 4)
+    req_infos = [{"codes": {"audio": _random_frame(codebook_sizes)}} for _ in range(4)]
+
+    with torch.no_grad():
+        expected = torch.cat(
+            [
+                model.tts_preprocess(
+                    input_ids[i : i + 1],
+                    model.model.embed_input_ids(input_ids[i : i + 1]),
+                    **dict(info),
+                )[1].reshape(1, -1)
+                for i, info in enumerate(req_infos)
+            ]
+        )
+        out_ids, embeds, updates = model.preprocess_decode_batch(input_ids=input_ids, req_infos=req_infos)
+
+    assert out_ids is input_ids
+    assert updates == [{}, {}, {}, {}]
+    torch.testing.assert_close(embeds, expected, rtol=0, atol=0)
+
+
+def test_preprocess_decode_batch_row_without_frame_keeps_token_embedding():
+    torch.manual_seed(0)
+    model, codebook_sizes = _make_voxtral_tts_model_with_real_embeddings()
+    input_ids = torch.tensor([model._audio_token_id] * 3)
+    req_infos = [
+        {"codes": {"audio": _random_frame(codebook_sizes)}},
+        {},
+        {"codes": {"audio": _random_frame(codebook_sizes)}},
+    ]
+
+    with torch.no_grad():
+        _, embeds, updates = model.preprocess_decode_batch(input_ids=input_ids, req_infos=req_infos)
+        for row in (0, 2):
+            _, expected, _ = model.tts_preprocess(
+                input_ids[row : row + 1], model.model.embed_input_ids(input_ids[row : row + 1]), **dict(req_infos[row])
+            )
+            torch.testing.assert_close(embeds[row : row + 1], expected.reshape(1, -1), rtol=0, atol=0)
+        torch.testing.assert_close(embeds[1], model.model.embed_input_ids(input_ids[1:2])[0], rtol=0, atol=0)
+    assert updates == [{}, {}, {}]

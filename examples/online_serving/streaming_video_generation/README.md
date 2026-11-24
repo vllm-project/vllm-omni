@@ -77,7 +77,7 @@ pip install 'vllm-omni[demo]' websockets
 The command-line client needs only `av` and `websockets`, including when saving
 video; it does not require PyTorch or a local vLLM/vLLM-Omni installation.
 
-For the Gradio demo in this 0.33 source checkout, install `.[demo]` with the temporary Gradio wheel
+For the Gradio demo in this 0.34 source checkout, install `.[demo]` with the temporary Gradio wheel
 using the [source dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
 from the repository root, while retaining the `av` and `websockets` client
 dependencies above. The published-package command above applies to released

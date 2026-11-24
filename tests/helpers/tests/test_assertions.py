@@ -407,6 +407,37 @@ def test_pcm_voiced_signal_passes_the_default_speech_hnr_gate():
     )
 
 
+@pytest.mark.parametrize("sample_rate", [16_000, 24_000, 48_000])
+@pytest.mark.parametrize("frequency", [80, 100, 200, 400])
+@pytest.mark.parametrize("snr_db", [10, 20])
+def test_pcm_hnr_recovers_known_noise_ratio_across_pitch(sample_rate, frequency, snr_db):
+    time = np.arange(sample_rate) / sample_rate
+    tone = 0.4 * np.sin(2 * np.pi * frequency * time + 0.31)
+    noise_std = 0.4 / np.sqrt(2) * 10 ** (-snr_db / 20)
+    signal = tone + np.random.default_rng(0).normal(0, noise_std, sample_rate)
+
+    # The ratio is set by the signal powers, independently of the estimator.
+    # Finite-window normalization must not penalize low-pitched voices.
+    measured = assertions._compute_pcm_hnr_db(signal, sr=sample_rate)
+    assert measured == pytest.approx(snr_db, abs=1.0)
+
+
+@pytest.mark.parametrize("corruption", ["noise_dominant", "shuffled"])
+def test_pcm_hnr_rejects_corrupted_periodic_audio(corruption):
+    sample_rate = 24_000
+    time = np.arange(sample_rate) / sample_rate
+    signal = 0.1 * np.sin(2 * np.pi * 100 * time)
+    rng = np.random.default_rng(0)
+    if corruption == "noise_dominant":
+        signal += rng.normal(0, 0.1 / np.sqrt(2) * 10 ** (6 / 20), sample_rate)
+    else:
+        rng.shuffle(signal)
+    pcm = (signal * 32767).astype("<i2").tobytes()
+
+    with pytest.raises(AssertionError, match="HNR"):
+        assertions._assert_pcm_int16_speech_hnr(pcm, min_hnr_db=-2.0, sr=sample_rate)
+
+
 @pytest.mark.parametrize("sample_rate", [None, 0, -1, True, 24000.5, "not-a-rate"])
 def test_pcm_transcript_opt_in_rejects_invalid_declared_sample_rate(sample_rate):
     with pytest.raises(AssertionError, match="transcript_pcm_sample_rate"):

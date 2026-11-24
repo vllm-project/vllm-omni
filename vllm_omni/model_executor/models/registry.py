@@ -88,6 +88,12 @@ _OMNI_MODELS = {
         "step_audio2_token2wav",
         "StepAudio2Token2WavForConditionalGeneration",
     ),
+    ## chatterbox
+    "ChatterboxForConditionalGeneration": (
+        "chatterbox",
+        "chatterbox",
+        "ChatterboxForConditionalGeneration",
+    ),
     "CosyVoice3Model": (
         "cosyvoice3",
         "cosyvoice3",
@@ -372,6 +378,7 @@ _OMNI_MODELS = {
         "vibevoice",
         "VibeVoiceForConditionalGeneration",
     ),
+    "PhononTalkerForConditionalGeneration": ("phonon", "phonon_talker", "PhononTalkerForConditionalGeneration"),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
         "voxcpm2",
@@ -541,7 +548,7 @@ _OMNI_MODELS = {
     ## YuE2-3B (text-to-music; single-stage native-AR with terminal NAR/VAE)
     "Yue2ForCausalLM": (
         "yue2",
-        "yue2",
+        "runtime",
         "Yue2ForCausalLM",
     ),
 }
