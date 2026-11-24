@@ -331,3 +331,119 @@ def test_output_cache_opt_in(stage, session, draft, expected):
         speculative_config=_speculative_config() if draft else None,
     )
     assert caches_turn_outputs(config) is expected
+
+
+def _publish(scheduler, scheduler_output, spans, sampled, hidden):
+    """Like _deliver, with row hidden states [hidden, position]; returns every emitted output."""
+    rids = list(spans)
+    payloads = []
+    for rid in rids:
+        start, ids = spans[rid]
+        positions = torch.arange(start, start + len(ids))
+        payloads.append(
+            {
+                "latent": torch.stack([torch.full((len(ids),), float(hidden)), positions.float()], dim=1),
+                "latent_input_ids": torch.tensor(ids, dtype=torch.long).reshape(-1, 1),
+                "latent_positions": positions.reshape(-1, 1),
+            }
+        )
+    output = ModelRunnerOutput(
+        req_ids=rids,
+        sampled_token_ids=[sampled[rid] for rid in rids],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    output.multimodal_outputs = output.inter_stage_outputs = payloads
+    return [o for outputs in scheduler.update_from_output(scheduler_output, output).values() for o in outputs.outputs]
+
+
+def _rows_of(outputs, position, token_id):
+    """(finish_reason, hidden) for every emitted row of ``token_id`` at ``position``."""
+    found = []
+    for o in outputs:
+        rows = o.multimodal_output
+        if not rows:
+            continue
+        ids = rows["latent_input_ids"].reshape(-1).tolist()
+        positions = rows["latent_positions"].reshape(-1).tolist()
+        found += [
+            (o.finish_reason, rows["latent"][i, 0].item())
+            for i, (p, t) in enumerate(zip(positions, ids))
+            if p == position and t == token_id
+        ]
+    return found
+
+
+STALE, RECOMPUTED = 1.0, 2.0
+
+
+@pytest.mark.parametrize("prefix_caching", [True, False], ids=["output_cache", "cold"])
+@pytest.mark.parametrize("stale_first", [True, False], ids=["stale_then_readmit", "readmit_then_stale"])
+def test_running_prefix_cache_reset_keeps_the_final_row(prefix_caching, stale_first):
+    """Drafts off: reset_prefix_cache(reset_running_requests=True) preempts the terminal forward in flight.
+
+    Its stale output is dropped, while the worker's delivery watermark already counts the row,
+    so with the output cache the recompute carries no rows. The final row must still reach the
+    Talker exactly once and the request must keep its length stop.
+    """
+    scheduler = _scheduler(prefix_caching, num_spec=0)
+    runner = _TrimmingRunner(prefix_caching)
+    a = _request("A", PROMPT, 2)
+    scheduler.add_request(a)
+    outputs = []
+    for sampled in (111, FINAL):
+        step = scheduler.schedule()
+        outputs += _publish(scheduler, step, runner.rows(scheduler, step), {"A": [sampled]}, 0.0)
+    assert "A" in scheduler._minicpmo45_terminal_rows
+    final_position = a.num_tokens - 1
+
+    terminal = scheduler.schedule()
+    terminal_rows = runner.rows(scheduler, terminal)
+    assert terminal_rows["A"] == (final_position, [FINAL])
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert a.status == RequestStatus.PREEMPTED and a.drop_stale_output and a.num_stale_output_tokens == 1
+
+    def stale():
+        return _publish(scheduler, terminal, terminal_rows, {"A": [DRAFT_ID]}, STALE)
+
+    if stale_first:
+        outputs += stale()
+    readmit = scheduler.schedule()
+    assert _booked(scheduler, readmit)["A"][0] == 0
+    readmit_rows = runner.rows(scheduler, readmit)
+    # The real adapter trims every recomputed row only under the output cache.
+    assert (readmit_rows["A"][1] == []) is prefix_caching
+    if not stale_first:
+        outputs += stale()
+    outputs += _publish(scheduler, readmit, readmit_rows, {"A": [DRAFT_ID]}, RECOMPUTED)
+
+    assert [(o.request_id, o.finish_reason) for o in outputs if o.finish_reason is not None] == [
+        ("A", FinishReason.LENGTH)
+    ]
+    # Exactly once: from the stale forward the watermark counted, or else from the recompute.
+    assert _rows_of(outputs, final_position, FINAL) == [
+        (None, STALE) if prefix_caching else (FinishReason.LENGTH, RECOMPUTED)
+    ]
+    assert list(a.output_token_ids) == [111, FINAL]
+    assert not scheduler.requests and not scheduler._minicpmo45_terminal_rows
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == NUM_BLOCKS - 1
+
+
+@pytest.mark.parametrize("prefix_caching", [True, False], ids=["output_cache", "cold"])
+def test_text_only_reply_stops_without_a_terminal_forward(prefix_caching):
+    """modalities=["text"] ends at stage 0: no Talker takes the final row, so no extra forward."""
+    from tests.core.sched.test_minicpmo_mrv2_terminal_row import _final_stage_zero
+
+    scheduler = _scheduler(prefix_caching, num_spec=0)
+    a = _request("A", PROMPT, 2)
+    _final_stage_zero(a)
+    scheduler.add_request(a)
+    finishes = []
+    for sampled in (111, FINAL):
+        step = scheduler.schedule()
+        _, step_finishes = _deliver(scheduler, step, _booked(scheduler, step), {"A": [sampled]})
+        finishes += step_finishes
+    assert finishes == [("A", FinishReason.LENGTH)]
+    assert not scheduler._minicpmo45_terminal_rows and not scheduler.requests
+    assert scheduler.schedule().total_num_scheduled_tokens == 0

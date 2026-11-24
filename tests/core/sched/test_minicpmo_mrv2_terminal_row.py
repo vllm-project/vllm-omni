@@ -392,3 +392,53 @@ def test_own_row_check_needs_consecutive_rows_ending_at_the_final_token(ids, pos
         "latent": torch.zeros(rows, 2),
     }
     assert ends_with_own_row(payload, 3, 12) is ok
+
+
+def _final_stage_zero(request, return_stage_payload=False):
+    # What apply_omni_final_stage_metadata stores for modalities=["text"].
+    from vllm_omni.data_entry_keys import RETURN_STAGE_PAYLOAD_KEY
+    from vllm_omni.engine.serialization import serialize_additional_information
+
+    request.additional_information = serialize_additional_information(
+        {"omni_final_stage_id": 0, RETURN_STAGE_PAYLOAD_KEY: return_stage_payload}
+    )
+
+
+@pytest.mark.parametrize(
+    "speculative,drafts,sampled",
+    [(False, [], [12]), (True, [12, 99, 98], [12, 13]), (True, [12, 13, 14], [12, 13, 14, 15])],
+    ids=["ordinary", "correction", "bonus"],
+)
+def test_text_only_length_stop_finishes_without_a_terminal_forward(monkeypatch, speculative, drafts, sampled):
+    """A request that ends at stage 0 has no Talker to take the final row."""
+    scheduler, request = _scheduler(monkeypatch, speculative=speculative)
+    _final_stage_zero(request)
+    request.max_tokens = 1 + len(sampled)
+    _step(scheduler, request, drafts, sampled)
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert request.output_token_ids == [11, *sampled]
+    assert scheduler._minicpmo45_terminal_rows == {}
+
+
+def test_returned_stage_payload_still_takes_the_terminal_forward(monkeypatch):
+    """A run request that returns its stage-0 payload hands the rows on, so the final row is still needed."""
+    scheduler, request = _scheduler(monkeypatch)
+    _final_stage_zero(request, return_stage_payload=True)
+    request.max_tokens = 2
+    _step(scheduler, request, [], [12])
+    assert not request.is_finished() and request.request_id in scheduler._minicpmo45_terminal_rows
+
+
+@pytest.mark.parametrize("metadata", ["none", "text_only", "returns_stage_payload"])
+def test_terminal_hold_needs_a_row_consumer(monkeypatch, metadata):
+    scheduler, request = _scheduler(monkeypatch)
+    if metadata != "none":
+        _final_stage_zero(request, return_stage_payload=metadata == "returns_stage_payload")
+    # The in-flight step may sample the last token.
+    request.max_tokens = 2
+    request.num_output_placeholders = 1
+    request.next_decode_eligible_step = 5
+    scheduler.running = [request]
+    held = metadata != "text_only"
+    assert scheduler._hold_minicpmo45_terminal_steps() == ([(request, 5)] if held else [])
+    assert request.next_decode_eligible_step == (ar_sched_mod._HELD_DECODE_STEP if held else 5)

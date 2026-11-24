@@ -176,3 +176,68 @@ def test_negative_in_flight_count_is_logged(monkeypatch):
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
     assert request.num_output_placeholders == 0
     assert [w[1] for w in warnings if "negative" in w[0]] == [request.request_id]
+
+
+def test_overlapping_recompute_publishes_the_recomputed_final_row():
+    """The overlap case through real schedule() and the published outputs (output cache off).
+
+    Stale and recomputed rows carry different hidden states; the length stop must
+    publish the recomputed final token's own row.
+    """
+    from vllm.v1.engine import FinishReason
+
+    from tests.core.sched.test_minicpmo_mrv2_terminal_prefix_hit import (
+        DRAFT_ID,
+        FINAL,
+        NUM_BLOCKS,
+        PROMPT,
+        RECOMPUTED,
+        STALE,
+        _booked,
+        _publish,
+        _request,
+        _rows_of,
+        _scheduler,
+    )
+
+    scheduler = _scheduler(False, num_spec=0)
+    a = _request("A", PROMPT, 2)
+    scheduler.add_request(a)
+    outputs = []
+    for sampled in (111, FINAL):
+        step = scheduler.schedule()
+        outputs += _publish(scheduler, step, _booked(scheduler, step), {"A": [sampled]}, 0.0)
+    final_position = a.num_tokens - 1
+    terminal = scheduler.schedule()
+    terminal_rows = _booked(scheduler, terminal)
+    scheduler.running.remove(a)
+    scheduler._preempt_request(a, 0.0)
+    outputs += _publish(scheduler, terminal, terminal_rows, {"A": [DRAFT_ID]}, STALE)
+    assert a.status == RequestStatus.PREEMPTED
+
+    # Two recompute chunks; async scheduling books the final one before the first returns.
+    scheduler.max_num_scheduled_tokens = 8
+    first = scheduler.schedule()
+    first_rows = _booked(scheduler, first)
+    second = scheduler.schedule()
+    second_rows = _booked(scheduler, second)
+    assert (first_rows["A"][0], second_rows["A"][0]) == (0, 8)
+    assert a.num_computed_tokens == a.num_tokens
+
+    partial = _publish(scheduler, first, first_rows, {"A": []}, RECOMPUTED)
+    assert [o.finish_reason for o in partial] == [None] and not a.is_finished()
+    final = _publish(scheduler, second, second_rows, {"A": [DRAFT_ID]}, RECOMPUTED)
+    outputs += partial + final
+
+    stops = [o for o in outputs if o.finish_reason is not None]
+    assert [(o.request_id, o.finish_reason) for o in stops] == [("A", FinishReason.LENGTH)]
+    (stop,) = stops
+    assert stop.new_token_ids == []
+    rows = stop.multimodal_output
+    assert rows["latent_input_ids"].reshape(-1)[-1].item() == FINAL
+    assert rows["latent_positions"].reshape(-1)[-1].item() == final_position
+    assert rows["latent"][-1].tolist() == [RECOMPUTED, float(final_position)]
+    assert _rows_of([stop], final_position, FINAL) == [(FinishReason.LENGTH, RECOMPUTED)]
+    assert list(a.output_token_ids) == [111, FINAL]
+    assert not scheduler.requests and not scheduler._minicpmo45_terminal_rows
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == NUM_BLOCKS - 1
