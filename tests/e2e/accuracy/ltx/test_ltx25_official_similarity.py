@@ -110,6 +110,7 @@ class LTXAccuracyThresholds:
     audio_relative_l2: float
     audio_relative_l2_rocm: float
     audio_cosine_similarity: float
+    audio_cosine_similarity_rocm: float
     audio_quiet_reference_rms: float
     audio_quiet_max_abs: float
     audio_quiet_mean_abs: float
@@ -122,6 +123,9 @@ STRICT_THRESHOLDS = LTXAccuracyThresholds(
     audio_relative_l2=0.10,
     audio_relative_l2_rocm=0.15,
     audio_cosine_similarity=0.99,
+    # An L2 envelope of 0.15 implies cosine >= sqrt(1 - 0.15**2), or
+    # approximately 0.98869. Allow only a small rounding margin below it.
+    audio_cosine_similarity_rocm=0.9885,
     audio_quiet_reference_rms=1e-3,
     audio_quiet_max_abs=2e-3,
     audio_quiet_mean_abs=1e-4,
@@ -673,13 +677,19 @@ def _audio_relative_l2_threshold() -> float:
     return STRICT_THRESHOLDS.audio_relative_l2
 
 
+def _audio_cosine_similarity_threshold() -> float:
+    if torch.version.hip is not None:
+        return STRICT_THRESHOLDS.audio_cosine_similarity_rocm
+    return STRICT_THRESHOLDS.audio_cosine_similarity
+
+
 def _assert_strict_audio_similarity(audio_metrics: dict[str, float | bool]) -> None:
     if audio_metrics["reference_rms"] <= STRICT_THRESHOLDS.audio_quiet_reference_rms:
         assert audio_metrics["max_abs"] <= STRICT_THRESHOLDS.audio_quiet_max_abs
         assert audio_metrics["mean_abs"] <= STRICT_THRESHOLDS.audio_quiet_mean_abs
         return
     assert audio_metrics["relative_l2"] <= _audio_relative_l2_threshold()
-    assert audio_metrics["cosine_similarity"] >= STRICT_THRESHOLDS.audio_cosine_similarity
+    assert audio_metrics["cosine_similarity"] >= _audio_cosine_similarity_threshold()
 
 
 def test_strict_audio_similarity_uses_absolute_bounds_for_quiet_reference() -> None:
@@ -700,12 +710,36 @@ def test_strict_audio_similarity_rejects_noisy_quiet_prediction() -> None:
         _assert_strict_audio_similarity(_audio_metrics(reference, prediction))
 
 
-def test_audio_relative_l2_threshold_is_platform_aware(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_audio_similarity_thresholds_are_platform_aware(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(torch.version, "hip", None)
     assert _audio_relative_l2_threshold() == STRICT_THRESHOLDS.audio_relative_l2
+    assert _audio_cosine_similarity_threshold() == STRICT_THRESHOLDS.audio_cosine_similarity
 
     monkeypatch.setattr(torch.version, "hip", "6.3")
     assert _audio_relative_l2_threshold() == STRICT_THRESHOLDS.audio_relative_l2_rocm
+    assert _audio_cosine_similarity_threshold() == STRICT_THRESHOLDS.audio_cosine_similarity_rocm
+
+
+def test_rocm_audio_similarity_accepts_bounded_vocoder_variance(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Observed for full one-stage I2V in AMD weekly #17406. The relative-L2
+    # result is inside the ROCm envelope, so the cosine floor must be coherent
+    # with that same bounded variance instead of imposing the CUDA envelope.
+    audio_metrics: dict[str, float | bool] = {
+        "bitwise_equal": False,
+        "reference_rms": 0.20214187191814845,
+        "prediction_rms": 0.2027906485621266,
+        "max_abs": 0.242919921875,
+        "mean_abs": 0.01812429878777723,
+        "relative_l2": 0.14621020841028853,
+        "cosine_similarity": 0.9893506172753935,
+    }
+
+    monkeypatch.setattr(torch.version, "hip", "6.3")
+    _assert_strict_audio_similarity(audio_metrics)
+
+    monkeypatch.setattr(torch.version, "hip", None)
+    with pytest.raises(AssertionError):
+        _assert_strict_audio_similarity(audio_metrics)
 
 
 def _write_ltx25_accuracy_result(
@@ -726,7 +760,7 @@ def _write_ltx25_accuracy_result(
     }
     baseline: dict[str, float] = {
         "audio_relative_l2": _audio_relative_l2_threshold(),
-        "audio_cosine_similarity": STRICT_THRESHOLDS.audio_cosine_similarity,
+        "audio_cosine_similarity": _audio_cosine_similarity_threshold(),
         "audio_quiet_reference_rms": STRICT_THRESHOLDS.audio_quiet_reference_rms,
         "audio_quiet_max_abs": STRICT_THRESHOLDS.audio_quiet_max_abs,
         "audio_quiet_mean_abs": STRICT_THRESHOLDS.audio_quiet_mean_abs,
@@ -1162,8 +1196,8 @@ def test_ltx25_t2a_matches_official(accuracy_artifact_root: Path) -> None:
         "omni_model_revision": omni_model_revision,
         "resolved_omni_model_path": str(omni_model),
         "thresholds": {
-            "audio_relative_l2": STRICT_THRESHOLDS.audio_relative_l2,
-            "audio_cosine_similarity": STRICT_THRESHOLDS.audio_cosine_similarity,
+            "audio_relative_l2": _audio_relative_l2_threshold(),
+            "audio_cosine_similarity": _audio_cosine_similarity_threshold(),
         },
         "peak_memory_mb": {
             "official_allocated": official_metadata["peak_memory_allocated_mb"],
