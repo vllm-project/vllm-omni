@@ -52,6 +52,7 @@ from vllm_omni.model_executor.common.request_outputs import coerce_int as _coerc
 from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
 from vllm_omni.model_executor.common.request_outputs import first_completion as _first_completion
 from vllm_omni.model_executor.common.request_outputs import multimodal_output as _multimodal_output
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex import token_trace as _token_trace
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import (
     minicpmo45_native_capabilities,
 )
@@ -1039,6 +1040,29 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             return MiniCPMO45DuplexWindowConfig.from_mapping(provided)
         except ValueError as exc:
             raise MiniCPMO45ClientRuntimeConfigError(str(exc), code="invalid_sliding_window_config") from exc
+
+    # ---- per-unit token trace (extra_body.trace_tokens) ----
+
+    def token_trace_started(self, *, session_id: str) -> None:
+        _token_trace.start(session_id)
+
+    def token_trace_stopped(self, *, session_id: str) -> None:
+        _token_trace.stop(session_id)
+
+    def unit_token_trace(
+        self,
+        *,
+        stage_id: int,
+        output: object,
+        context: object,
+        cursor: dict[str, object],
+        runtime_config: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Thinker and Talker ids per unit: their scheduler prompts are placeholders (see ``token_trace``)."""
+        del context
+        return _token_trace.unit_token_trace(
+            stage_id=stage_id, output=output, cursor=cursor, runtime_config=runtime_config
+        )
 
 
 __all__ = [

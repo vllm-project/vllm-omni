@@ -80,9 +80,9 @@ import math
 import time
 from collections import deque
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import TypeGuard
+from typing import TYPE_CHECKING, TypeGuard
 
 from vllm.logger import init_logger
 
@@ -95,6 +95,9 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexUnitOutputs,
 )
 from vllm_omni.protocol.duplex.events import DuplexEvent, InputProcessed
+
+if TYPE_CHECKING:
+    from vllm_omni.engine.duplex.session.token_trace import TokenTracer
 
 logger = init_logger(__name__)
 
@@ -199,7 +202,8 @@ class StageProgress:
     segment_finished: bool
     #: The plugin's classification of a decision taken on this output, if any.
     decision: DuplexUnitDecision | None = None
-    #: The final-stage output and its context (``None`` for other stages).
+    #: The output and its context: always for the final stage, and on a segment end of
+    #: any stage when the session is token-traced (``None`` otherwise).
     output: object | None = None
     context: DuplexOutputContext | None = None
 
@@ -229,6 +233,9 @@ class InputClockUnit:
     # Pipeline view, kept after the unit was settled so its late output stays its own.
     upstream_segment_finished: bool = False
     final_segment_finished: bool = False
+    #: Token trace (``extra_body.trace_tokens``): per-stage ids, and the initial prompt on the first unit.
+    traces: list[dict[str, object]] = field(default_factory=list)
+    prompt_trace: dict[str, object] | None = None
 
     @property
     def index(self) -> int:
@@ -329,6 +336,8 @@ class InputClock:
         #: Epochs whose hold overflowed: their later-stage progress is no longer held (``_hold``).
         self._hold_overflowed: set[int] = set()
         self._closed = False
+        #: Per-unit token trace (``extra_body.trace_tokens``); ``None`` unless the session asked for it.
+        self.tracer: TokenTracer | None = None
         #: Last time the pipeline produced something (or became busy): the liveness valve's reference.
         self.last_progress = clock()
         self._failed_hooks: set[str] = set()
@@ -730,7 +739,7 @@ class InputClock:
             if not owner.upstream_segment_finished:
                 return
             owner.final_segment_finished = True
-            self._uncredited_final_ends.popleft()
+            self._trace(owner, self._uncredited_final_ends.popleft())
 
     def _hold(self, progress: StageProgress) -> None:
         """Keep a later stage's progress that no speaking unit can take yet, for the next unit that speaks.
@@ -803,7 +812,9 @@ class InputClock:
             unit = self._claim_unaccepted(epoch, ordinal)
         if unit is None:
             self._warn("input clock: Stage-0 segment end %s of epoch %s matches no submission", ordinal, epoch)
+            self._trace(None, progress)
             return
+        self._trace(unit, progress)
         decision = progress.decision
         ends_unit = (decision is not None and decision.ends_unit) or progress.final_stage_id == 0
         if not unit.complete:
@@ -845,9 +856,11 @@ class InputClock:
         )
         if target is None:
             if progress.segment_finished or (progress.decision is not None and progress.decision.ends_unit):
-                # Ahead of the Stage-0 segment end that makes its unit speaking.
+                # Ahead of the Stage-0 segment end that makes its unit speaking (traced when replayed).
                 self._hold(progress)
             return
+        if progress.segment_finished:
+            self._trace(target, progress)
         decision = progress.decision
         if decision is not None and decision.ends_unit:
             self._speaking.remove(target)
@@ -946,6 +959,22 @@ class InputClock:
             self._suppressed_warnings = 0
         logger.warning(message, *args)
 
+    def _trace(self, unit: InputClockUnit | None, progress: StageProgress) -> None:
+        """Collect a stage's segment ids for ``unit``; with no unit to credit, the segment is still consumed.
+
+        The plugin's per-stage cursor (and, e.g., a queue of hand-offs) then
+        stays aligned with the stage's segments. The trace is a debug aid: a
+        failure is logged and never reaches the session.
+        """
+        if self.tracer is None:
+            return
+        try:
+            self.tracer.on_stage_segment(
+                unit, stage_id=progress.stage_id, output=progress.output, context=progress.context
+            )
+        except Exception:
+            logger.exception("token trace: collecting stage %s failed", progress.stage_id)
+
     def _complete(self, unit: InputClockUnit) -> None:
         """Mark ``unit`` complete and advance the acknowledged prefix, recording each unit it passes for ``units[]``."""
         unit.complete = True
@@ -958,6 +987,14 @@ class InputClock:
             if head.reason is not None:
                 entry["reason"] = head.reason
             self._completed_since_ack.append((head.seq, entry, self._unit_end))
+            if self.tracer is not None and not self._closed:
+                # Before the acknowledgement that covers this unit (and, at
+                # teardown, before the session's terminal event). A debug aid:
+                # a failure must not hold back the acknowledgements or the teardown.
+                try:
+                    self.tracer.emit_unit(head, end_ms=self.unit_end_us // 1000)
+                except Exception:
+                    logger.exception("token trace: rendering unit %s failed", head.index)
 
     # ------------------------------------------------------------------ #
     # Acknowledgements                                                   #

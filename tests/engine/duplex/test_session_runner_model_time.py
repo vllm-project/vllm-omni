@@ -17,6 +17,7 @@ import pytest
 from tests.engine.duplex.test_session_runner import (
     LISTEN_TOKEN_ID,
     SESSION_ID,
+    Harness,
     RecordingStagePort,
     _fake_encode_audio,
     _SplitDetector,
@@ -45,6 +46,7 @@ from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import MiniCPMO45PcmAppendBuffer
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
+from vllm_omni.protocol.duplex.events import DuplexEvent
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1957,5 +1959,185 @@ async def test_a_failing_append_in_the_backlog_chain_stops_the_backlog(monkeypat
         (ack,) = _acks(events)
         assert (ack.input_index, ack.audio_end_ms, ack.unit_end_ms) == (1, 3000, 1000)
         assert _units(ack) == [("dropped", None)], "one unit was tried; the backlog stopped at the failed chain"
+    finally:
+        await close_harness(h)
+
+
+# --------------------------------------------------------------------------- #
+# Token trace (extra_body.trace_tokens)                                      #
+# --------------------------------------------------------------------------- #
+
+
+DEBUG_EVENTS = DuplexSessionRuntimeConfig(enable_debug_events=True)
+TRACED = {**INPUT_CLOCK, "trace_tokens": True}
+
+
+async def _deliver_traced_listen(h: Harness, request_id: str) -> list[DuplexEvent]:
+    return await h.deliver_and_settle(
+        listen_output(request_id),
+        stage_id=0,
+        segment_finished=True,
+        segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+        segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+    )
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_traced_session_sends_each_unit_trace_before_its_acknowledgement() -> None:
+    h = await open_harness(extra_body=TRACED, runtime_config=DEBUG_EVENTS)
+    try:
+        assert h.runner.token_traced
+        await h.run(append_audio())
+        events = await _deliver_traced_listen(h, h.stage0_request_id())
+        assert types(events) == ["response.listen", "debug.unit_tokens", "input_audio_buffer.processed"]
+        trace = events[1].to_realtime()
+        assert (trace["unit_index"], trace["end_ms"], trace["decision"]) == (0, 1000, "listen")
+        assert trace["stages"][0]["output"][-1][0] == LISTEN_TOKEN_ID
+    finally:
+        await close_harness(h)
+
+
+class _UnnamingTokenizer:
+    all_special_ids = [1]
+
+    def get_added_vocab(self) -> dict[str, int]:
+        return {}
+
+    def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
+        raise IndexError("piece table out of range")
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_trace_rendering_failure_neither_withholds_acknowledgements_nor_breaks_the_close() -> None:
+    h = await open_harness(extra_body=TRACED, runtime_config=DEBUG_EVENTS)
+    try:
+        h.runner.trace_tokenizer = _UnnamingTokenizer()
+        await h.run(append_audio())
+        events = await _deliver_traced_listen(h, h.stage0_request_id())
+        assert types(events) == ["response.listen", "debug.unit_tokens", "input_audio_buffer.processed"]
+
+        await h.run(append_audio())
+        h.runner._input_clock._units[0].traces.append({"stage": "thinker", "input": [5, 6], "output": [7]})
+        events = await h.run(commands.CloseSession())
+
+        assert [t for t in types(events) if t != "debug.unit_tokens"][-2:] == [
+            "input_audio_buffer.processed",
+            "session.closed",
+        ]
+        assert SESSION_ID not in h.manager.runners
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_an_open_that_fails_after_the_trace_started_stops_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    started: list[str] = []
+    stopped: list[str] = []
+    monkeypatch.setattr(
+        MiniCPMO45DuplexPlugin, "token_trace_started", lambda self, *, session_id: started.append(session_id)
+    )
+    monkeypatch.setattr(
+        MiniCPMO45DuplexPlugin, "token_trace_stopped", lambda self, *, session_id: stopped.append(session_id)
+    )
+
+    def _fail(self, session, *, stage_id):
+        raise RuntimeError("stage request reservation failed")
+
+    monkeypatch.setattr(DuplexSessionManager, "ensure_stage_request", _fail)
+    with pytest.raises(AssertionError):  # the harness insists on a successful open
+        await open_harness(extra_body=TRACED, runtime_config=DEBUG_EVENTS)
+
+    assert started == [SESSION_ID] and stopped == [SESSION_ID]
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_unit_trace_is_taken_from_the_output_as_it_arrived() -> None:
+    """The trace reads the output when the clock takes it: later growth of the live token lists is not this unit's."""
+    h = await open_harness(extra_body=TRACED, runtime_config=DEBUG_EVENTS)
+    try:
+        await h.run(append_audio())
+        output = listen_output(h.stage0_request_id())
+        live = output.outputs[0].token_ids
+        h.deliver(
+            output,
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+        live.extend([13, 14])  # the next unit's tokens, before the clock takes the segment end
+        events = await h.settle()
+
+        (trace,) = [e.to_realtime() for e in events if e.type == "debug.unit_tokens"]
+        assert [piece[0] for piece in trace["stages"][0]["output"]] == [11, 12, LISTEN_TOKEN_ID]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_traced_session_closed_with_a_unit_in_flight_sends_its_trace_before_the_teardown() -> None:
+    h = await open_harness(extra_body=TRACED, runtime_config=DEBUG_EVENTS)
+    try:
+        await h.run(append_audio())
+        events = await h.run(commands.CloseSession())
+        assert types(events) == ["debug.unit_tokens", "input_audio_buffer.processed", "session.closed"]
+        assert events[0].decision == "aborted"
+        late = await _deliver_traced_listen(h, h.stage0_request_id())
+        assert "debug.unit_tokens" not in types(late), "nothing is traced after the terminal event"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+@pytest.mark.parametrize(
+    ("extra_body", "debug_events", "code"),
+    [
+        (TRACED, False, "token_trace_disabled"),
+        ({"trace_tokens": True}, True, "token_trace_requires_input_clock"),
+    ],
+    ids=["debug-events-off", "without-the-clock"],
+)
+async def test_a_session_asking_for_a_token_trace_it_cannot_have_is_refused(
+    extra_body: dict[str, object], debug_events: bool, code: str
+) -> None:
+    runtime_config = DuplexSessionRuntimeConfig(max_sessions=2, enable_debug_events=debug_events)
+    h = await open_harness(runtime_config=runtime_config)
+    try:
+        config = DuplexSessionConfig(model="openbmb/MiniCPM-o-4_5", extra_body={"auto_response": True, **extra_body})
+        await h.manager.handle(
+            OpenDuplexSessionMessage(
+                control_id="c-trace",
+                session_id="trace-refused",
+                session_config=config,
+                output_buffer=DuplexOutputBuffer(max_bytes=1 << 20, max_events=64),
+            )
+        )
+        result = await asyncio.wait_for(h.results.get(), timeout=2.0)
+        assert (result.ok, result.error_code) == (False, code)
+        assert "trace-refused" not in h.manager.runners
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+@pytest.mark.parametrize(
+    ("debug_events", "code"),
+    [(False, "token_trace_disabled"), (True, "input_clock_update_unsupported")],
+    ids=["debug-events-off", "fixed-at-creation"],
+)
+async def test_a_session_update_cannot_turn_the_token_trace_on(debug_events: bool, code: str) -> None:
+    h = await open_harness(
+        extra_body=INPUT_CLOCK, runtime_config=DuplexSessionRuntimeConfig(enable_debug_events=debug_events)
+    )
+    try:
+        events = await h.run(commands.UpdateSession(patch={"extra_body": {"trace_tokens": True}}, event_id="evt-tr"))
+        errors = [event for event in events if event.type == "error"]
+        assert [(e.code, e.related_event_id) for e in errors] == [(code, "evt-tr")]
+        assert "session.updated" not in types(events)
+        assert "trace_tokens" not in h.session.config.extra_body
+        await h.run(append_audio())
+        events = await _deliver_traced_listen(h, h.stage0_request_id())
+        assert "debug.unit_tokens" not in types(events)
+        assert not h.runner.token_traced
     finally:
         await close_harness(h)

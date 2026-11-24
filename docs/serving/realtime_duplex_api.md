@@ -1253,6 +1253,7 @@ below).
 | `clock` | unset | `"input"` makes the session *input-clocked*: model time advances only with client input, and every client input is acknowledged once its outputs are out (see below). Set it when the session is created. |
 | `input_clock_unit_timeout_s` | `15` | Input-clocked sessions only: liveness valve, see [Timeouts](#timeouts). Set it when the session is created. |
 | `input_clock_unit_max_s` | `60` | Input-clocked sessions only: maximum unit age, see [Timeouts](#timeouts). Set it when the session is created. |
+| `trace_tokens` | `false` | Input-clocked sessions only: `true` sends one `debug.unit_tokens` event per model unit with the token ids each stage consumed and produced (see [Per-unit token trace](#per-unit-token-trace)). Debug aid; needs a server with `duplex_session.enable_debug_events: true`. Set it when the session is created. |
 
 #### Input-clocked sessions
 
@@ -1614,6 +1615,76 @@ A session without `clock: "input"` does not create the input clock: it
 never receives `input_audio_buffer.processed`, and the clock adds no work to
 its mailbox, appends or teardown.
 
+#### Per-unit token trace
+
+To check what a duplex model actually sees and says per unit — unit
+delimiters, audio placeholder tokens, listen/speak control tokens, TTS
+boundaries — create an input-clocked session with
+`extra_body.trace_tokens = true` as well. For every model unit the server
+sends one event when the unit completes, before the
+`input_audio_buffer.processed` that covers it, and once, before the first
+unit, the initial context as unit `-1` with `decision: "prompt"` when the
+model reports it:
+
+```json
+{
+  "type": "debug.unit_tokens",
+  "event_id": "event_…",
+  "session_id": "sess_…",
+  "unit_index": 3,
+  "end_ms": 4000,
+  "decision": "speak",
+  "stages": [
+    {"stage": "thinker", "input": [[151718, "<|chunk_eos|>"], [151684, "</unit>"], [151683, "<unit>"], [151698, "<|audio|>"]], "output": [[151706, "<|speak|>"], [9625, "ĠFrance"]]},
+    {"stage": "talker", "input": [[9625, "ĠFrance"], [151687, "<audio_bos>"]], "output": [[5838, "s3:5838"]]}
+  ],
+  "special_ids": [151683, 151684, 151698, 151706, 151718]
+}
+```
+
+`input` is what the stage appended to its context for the unit and `output`
+what it generated, every id included (a viewer collapses repeated audio
+placeholders). Text is the raw tokenizer piece (`convert_ids_to_tokens`), so
+special tokens stay visible; ids outside the text vocabulary (codec codes)
+carry a model-defined label, and so do scheduler placeholders a model reports
+when the ids its stage actually consumed are unavailable (`placeholder:<id>`),
+so a recorded trace never passes placeholders off as consumed tokens.
+`special_ids` lists the tokenizer's special and added ids among them. Stages that did not run for the unit, or did not end a
+segment for it, are omitted. `end_ms` is the unit's `units[].end_ms` in the
+acknowledgement that reports it. A unit settled without its model output
+(`cancelled`, `aborted`, `timed_out`, ...; see the `units[].decision` table
+above) is reported with that decision and whatever ids were collected for it
+by then; at teardown these traces precede the teardown acknowledgement and
+the session's terminal event, and nothing is traced after it.
+
+The trace relies on the input clock's unit tracking, so it is available only
+together with `clock: "input"`: a session that asks for it without the clock
+is refused with error `token_trace_requires_input_clock`. Like the clock, it
+is set when the session is created; a `session.update` that turns it on or
+off is rejected with `input_clock_update_unsupported`.
+
+The trace is off on the server side by default: it carries the full model
+context, including server-side system prompts and templates a client cannot
+otherwise see. An operator enables it in the deploy config:
+
+```yaml
+duplex_session:
+  enable_debug_events: true
+```
+
+Without it, a session that asks for `extra_body.trace_tokens: true` is
+refused with error `token_trace_disabled` (`invalid_request_error`); nothing
+is traced.
+
+Trace events count against the session's output budget like any other event
+(see [Output limits and slow consumers](#output-limits-and-slow-consumers));
+the prompt trace (unit `-1`) carries the whole initial context and can be
+large, so a slow consumer of a traced session reaches `output_backpressure`
+sooner. The tokenizer that names the ids is loaded when the session is
+created. The trace is a debug aid: if collecting or rendering it fails, the
+failure is logged, the affected event is sent without token pieces or not at
+all, and the session and its acknowledgements are unaffected.
+
 ### Compatibility with the OpenAI Realtime protocol
 
 The Realtime dialect is, by design, an OpenAI-Realtime-compatible surface:
@@ -1805,6 +1876,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `input_audio_buffer.speech_stopped` | 1 | Speech end detected. |
 | `input_audio_buffer.committed` | 2 | Commit accepted. OpenAI name; wraps the native `input.committed` payload under `event` (`turn_id`, `epoch`, `response_create_deferred`, ...). |
 | `input_audio_buffer.cleared` | 1 | Input buffer cleared (after `input_audio_buffer.clear` or `input.cancel`). |
+| `debug.unit_tokens` | 3 | Opt-in (`extra_body.trace_tokens`, input-clocked sessions): the token ids each stage consumed and produced for one model unit (see [Per-unit token trace](#per-unit-token-trace)). |
 | `input_audio_buffer.processed` | 3 | Input-clocked sessions only: one per append / commit / `response.create`, after all of its outputs (see [Input-clocked sessions](#input-clocked-sessions)). |
 | `conversation.item.added` | 2 | Item entered history (GA spelling). OpenAI name; carries `previous_item_id` and echoes the originating event. |
 | `conversation.item.created` | 2 | Same as `conversation.item.added` in the beta spelling; both are emitted. |

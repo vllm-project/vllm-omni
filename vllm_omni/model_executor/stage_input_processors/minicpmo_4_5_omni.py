@@ -20,6 +20,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex import token_trace as _token_trace
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import pack_handoff_tensor, unpack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
@@ -1252,6 +1253,10 @@ def llm2tts(
             handoff_ids,
             pack_handoff_tensor(handoff_hidden) if isinstance(handoff_hidden, torch.Tensor) else handoff_hidden,
         )
+        if is_native_duplex_handoff:
+            # Opt-in token trace: the Talker scheduler only sees placeholder ids. An empty
+            # hand-off is a Talker segment too, so it is recorded (one entry per segment end).
+            _token_trace.record_handoff(str(llm_output.request_id), handoff_ids)
         if is_native_duplex_handoff:
             # Always write the flag: the connector merges per-request meta across
             # units, so a turn_end=True left by the previous turn's last unit would
