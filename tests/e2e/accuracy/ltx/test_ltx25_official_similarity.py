@@ -95,6 +95,11 @@ NEGATIVE_PROMPT = (
 # PyTorch SDPA priority order so both sides select the same available kernel.
 ATTENTION_BACKEND = "torch_sdpa_default_bf16" if torch.version.hip is not None else "torch_sdpa_cudnn_bf16"
 LTX25_STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
+# MI300 cold initialization legitimately exceeded the engine's 600-second
+# default in AMD weekly #17385. Keep the allowance case-local and bounded.
+LTX25_OMNI_STAGE_INIT_TIMEOUT_S = 1200
+LTX25_OMNI_INIT_TIMEOUT_S = 1800
+LTX25_OMNI_PROCESS_TIMEOUT_S = 2400
 
 
 @dataclass(frozen=True)
@@ -293,6 +298,15 @@ def _run(command: list[str], *, env: dict[str, str], timeout: int = 1800) -> Non
     start = time.perf_counter()
     subprocess.run(command, env=env, timeout=timeout, check=True)
     print(f"{' '.join(command[:3])} finished in {time.perf_counter() - start:.1f}s")
+
+
+def _omni_runner_timeout_args() -> list[str]:
+    return [
+        "--stage-init-timeout",
+        str(LTX25_OMNI_STAGE_INIT_TIMEOUT_S),
+        "--init-timeout",
+        str(LTX25_OMNI_INIT_TIMEOUT_S),
+    ]
 
 
 def _clone_pinned_source(root: Path, repository: str, revision: str) -> None:
@@ -770,8 +784,10 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
             str(omni_model),
             "--model-class-name",
             "LTX2DistilledTwoStagePipeline",
-        ],
+        ]
+        + _omni_runner_timeout_args(),
         env=env,
+        timeout=LTX25_OMNI_PROCESS_TIMEOUT_S,
     )
 
     official_metadata = json.loads((official_output / "metadata.json").read_text())
@@ -923,8 +939,10 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
             str(omni_model),
             "--model-class-name",
             model_class_name,
-        ],
+        ]
+        + _omni_runner_timeout_args(),
         env=env,
+        timeout=LTX25_OMNI_PROCESS_TIMEOUT_S,
     )
 
     official_metadata = json.loads((official_output / "metadata.json").read_text())
@@ -1058,8 +1076,10 @@ def test_ltx25_t2a_matches_official(accuracy_artifact_root: Path) -> None:
             str(omni_model),
             "--model-class-name",
             "LTX2TextToAudioPipeline",
-        ],
+        ]
+        + _omni_runner_timeout_args(),
         env=env,
+        timeout=LTX25_OMNI_PROCESS_TIMEOUT_S,
     )
 
     official_metadata = json.loads((official_output / "metadata.json").read_text())

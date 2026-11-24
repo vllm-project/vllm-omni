@@ -3407,6 +3407,21 @@ def test_ltx_weekly_two_stage_accuracy_has_bounded_cold_start_headroom() -> None
     assert 'omni_kwargs["init_timeout"] = args.init_timeout' in runner_source
 
 
+def test_ltx25_weekly_accuracy_has_bounded_cold_start_headroom() -> None:
+    accuracy_source = Path("tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py").read_text(encoding="utf-8")
+    runner_source = Path("tests/e2e/accuracy/ltx/run_ltx25_reference.py").read_text(encoding="utf-8")
+
+    assert "LTX25_OMNI_STAGE_INIT_TIMEOUT_S = 1200" in accuracy_source
+    assert "LTX25_OMNI_INIT_TIMEOUT_S = 1800" in accuracy_source
+    assert "LTX25_OMNI_PROCESS_TIMEOUT_S = 2400" in accuracy_source
+    assert accuracy_source.count("+ _omni_runner_timeout_args()") == 3
+    assert accuracy_source.count("timeout=LTX25_OMNI_PROCESS_TIMEOUT_S") == 3
+    assert 'parser.add_argument("--stage-init-timeout", type=int)' in runner_source
+    assert 'parser.add_argument("--init-timeout", type=int)' in runner_source
+    assert runner_source.count('omni_kwargs["stage_init_timeout"] = args.stage_init_timeout') == 2
+    assert runner_source.count('omni_kwargs["init_timeout"] = args.init_timeout') == 2
+
+
 _SENSENOVA_U1_SMOKE_NODES = (
     "tests/e2e/offline_inference/test_sensenova_u1_expansion.py::test_sensenova_u1_lora_scale_and_deactivation",
     "tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py::test_sensenova_u1_text2img",

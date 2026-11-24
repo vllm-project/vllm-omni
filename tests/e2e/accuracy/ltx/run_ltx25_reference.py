@@ -53,6 +53,8 @@ def _parse_args() -> argparse.Namespace:
         default="distilled_two_stage",
     )
     parser.add_argument("--enable-layerwise-offload", action="store_true")
+    parser.add_argument("--stage-init-timeout", type=int)
+    parser.add_argument("--init-timeout", type=int)
     return parser.parse_args()
 
 
@@ -760,14 +762,19 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request["seed"])
-    omni = Omni(
-        model=args.model,
-        model_class_name=args.model_class_name,
-        enforce_eager=True,
-        enable_layerwise_offload=args.enable_layerwise_offload,
-        diffusion_attention_config=attention_config,
-        parallel_config=DiffusionParallelConfig(),
-    )
+    omni_kwargs = {
+        "model": args.model,
+        "model_class_name": args.model_class_name,
+        "enforce_eager": True,
+        "enable_layerwise_offload": args.enable_layerwise_offload,
+        "diffusion_attention_config": attention_config,
+        "parallel_config": DiffusionParallelConfig(),
+    }
+    if args.stage_init_timeout is not None:
+        omni_kwargs["stage_init_timeout"] = args.stage_init_timeout
+    if args.init_timeout is not None:
+        omni_kwargs["init_timeout"] = args.init_timeout
+    omni = Omni(**omni_kwargs)
     try:
         # The explicit public class argument selects the worker pipeline. The
         # parent Omni proxy can only expose the checkpoint's base class, which
@@ -843,14 +850,19 @@ def _run_omni_t2a(args: argparse.Namespace, request: dict[str, Any]) -> None:
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request["seed"])
-    omni = Omni(
-        model=args.model,
-        model_class_name=args.model_class_name,
-        enforce_eager=True,
-        enable_layerwise_offload=args.enable_layerwise_offload,
-        diffusion_attention_config={"default": {"backend": _omni_attention_backend()}},
-        parallel_config=DiffusionParallelConfig(),
-    )
+    omni_kwargs = {
+        "model": args.model,
+        "model_class_name": args.model_class_name,
+        "enforce_eager": True,
+        "enable_layerwise_offload": args.enable_layerwise_offload,
+        "diffusion_attention_config": {"default": {"backend": _omni_attention_backend()}},
+        "parallel_config": DiffusionParallelConfig(),
+    }
+    if args.stage_init_timeout is not None:
+        omni_kwargs["stage_init_timeout"] = args.stage_init_timeout
+    if args.init_timeout is not None:
+        omni_kwargs["init_timeout"] = args.init_timeout
+    omni = Omni(**omni_kwargs)
     try:
         sampling_params = OmniDiffusionSamplingParams(
             generator=generator,
