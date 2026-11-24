@@ -9,7 +9,9 @@ Owns both halves of the ``omni_lora_ipc`` backend:
 
 from __future__ import annotations
 
+import inspect
 import os
+import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -25,6 +27,7 @@ from vllm.distributed.weight_transfer.base import (
     WeightSource,
     materialize_full_tensor,
 )
+from vllm.distributed.weight_transfer.clients import HTTPVLLMWeightSyncClient
 from vllm.distributed.weight_transfer.factory import (
     WeightTransferEngineFactory,
     WeightTransferTrainerFactory,
@@ -94,6 +97,10 @@ class MergedLoRASessionAbortedError(RuntimeError):
     """Raised on the worker when the trainer explicitly aborts a staged session."""
 
 
+class MergedLoRAUpdateIDMismatchError(ValueError):
+    """Raised when a weight-update chunk carries an ``update_id`` that does not match the active session."""
+
+
 _ABORT_UPDATE_PAYLOAD: dict[str, Any] = {
     "names": [],
     "dtype_names": [],
@@ -121,6 +128,29 @@ def _extract_error_text(exc: BaseException) -> str:
             if isinstance(raw_content, (bytes, bytearray)) and raw_content:
                 parts.append(raw_content.decode("utf-8", errors="replace"))
     return " ".join(part for part in parts if part)
+
+
+def _validate_update_id(update_id: str | None) -> str | None:
+    if update_id is None:
+        return None
+    if not isinstance(update_id, str) or not update_id.strip():
+        raise ValueError("update_id must be a non-empty string")
+    return update_id
+
+
+def _accepts_update_id(fn: Any) -> bool:
+    """Return True if ``fn`` explicitly accepts keyword argument ``update_id``."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    param = sig.parameters.get("update_id")
+    if param is None:
+        return False
+    return param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 def _uses_http_pickle_client(client: Any) -> bool:
@@ -156,8 +186,10 @@ class MergedLoRAIPCUpdateInfo(IPCWeightTransferUpdateInfo):
     lora_int_id: int = 1
     abort: bool = False
     ipc_handles_wire: list[dict[str, Any]] | dict[str, Any] | None = None
+    update_id: str | None = None
 
     def __post_init__(self) -> None:
+        self.update_id = _validate_update_id(self.update_id)
         if self.abort:
             if (
                 self.names
@@ -211,6 +243,8 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
     lora_manager: LoRAManager
     cpu_group: torch.distributed.ProcessGroup | None = None
     _last_abort_was_non_mutating: bool = False
+    _update_id: str | None = None
+    _skip_next_end_weight_update: bool = False
 
     def __init__(
         self,
@@ -231,6 +265,7 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
         never masked and a committed policy is never falsely reported as aborted.
         """
         cleanup_error: Exception | None = None
+        self._update_id = None
         if hasattr(self, "_staged"):
             self._staged.tensors.clear()
         for label, step in (
@@ -251,8 +286,9 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
         if not suppress_errors and cleanup_error is not None:
             raise cleanup_error
 
-    def start_weight_update(self) -> None:
+    def start_weight_update(self, update_id: str | None = None) -> None:
         """Begin a session; its first chunk selects dense or adapter loading."""
+        validated_id = _validate_update_id(update_id)
         if not hasattr(self, "lora_manager"):
             from vllm_omni.lora.merged_manager import ARMergedLoRAManager
 
@@ -269,6 +305,8 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
         self._adapter_id = 1
         self._error: Exception | None = None
         self._last_abort_was_non_mutating = False
+        self._skip_next_end_weight_update = False
+        self._update_id = validated_id
 
     def receive_weights(self, update_info: MergedLoRAIPCUpdateInfo) -> None:
         """Receive unchanged IPC tensors with optional adapter metadata.
@@ -277,8 +315,10 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
             update_info: IPC handles and PEFT configuration repeated per chunk.
 
         Raises:
-            ValueError: A session mixes adapter identities, configs or update kinds.
+            ValueError: A session mixes adapter identities, configs, update IDs, or update kinds.
         """
+        if update_info.update_id is not None and self._update_id != update_info.update_id:
+            raise MergedLoRAUpdateIDMismatchError("Weight-update chunk update_id does not match the active session")
         kind = "dense" if update_info.peft_config is None else "adapter"
         if self._kind is None:
             self._kind = kind
@@ -302,16 +342,28 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
             finally:
                 self.reset_weight_update_target()
 
-    def abort_weight_update(self) -> bool:
+    def matches_update_id(self, update_id: str | None) -> bool:
+        """Return True when ``update_id`` matches the active session (or is untagged)."""
+        return update_id is None or self._update_id == update_id
+
+    def abort_weight_update(self, update_id: str | None = None) -> bool:
         """Discard staged adapter tensors without preparing or committing.
+
+        When ``update_id`` is provided, only aborts if it matches the active
+        session's ``_update_id``.
 
         Returns:
             ``True`` when live model weights were not mutated during the
             aborted session (empty or staged-adapter session), ``False`` when
-            a dense base update may already have modified live weights.
+            a dense base update may already have modified live weights or when
+            ``update_id`` does not match the active session.
         """
+        validated_id = _validate_update_id(update_id)
+        if not self.matches_update_id(validated_id):
+            return False
         non_mutating = self._kind != "dense"
         self._last_abort_was_non_mutating = non_mutating
+        self._skip_next_end_weight_update = False
         self._kind = None
         self._peft_config = None
         self._error = None
@@ -324,10 +376,22 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
         Args:
             update_info: Serialized ``MergedLoRAIPCUpdateInfo``.
         """
+        self._skip_next_end_weight_update = False
         if isinstance(update_info, dict) and update_info.get("abort"):
-            self.parse_update_info(update_info)
+            parsed = self.parse_update_info(update_info)
+            if not self.matches_update_id(parsed.update_id):
+                # Do not raise: another caller owns the active session, so worker
+                # update_weights error cleanup must leave that session untouched.
+                return
             self.abort_weight_update()
             raise MergedLoRASessionAbortedError("Merged LoRA weight-update session aborted by trainer")
+        if isinstance(update_info, dict) and "update_id" in update_info and update_info["update_id"] is not None:
+            incoming_id = _validate_update_id(update_info["update_id"])
+            if not self.matches_update_id(incoming_id):
+                # Reject stale/foreign chunks without running session failure cleanup
+                # or closing the active caller's session on Diffusion or AR workers.
+                self._skip_next_end_weight_update = True
+                raise MergedLoRAUpdateIDMismatchError("Weight-update chunk update_id does not match the active session")
         try:
             super().update_weights(update_info)
         except Exception as error:
@@ -340,6 +404,7 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
 
     def finish_weight_update(self) -> None:
         """Validate all ranks before copying a new policy into live storage."""
+        self._skip_next_end_weight_update = False
         failed = False
         committed = False
         try:
@@ -766,19 +831,34 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
             if not suppress_errors:
                 raise
 
-    def _abort_remote_session(self, *, finish_attempted: bool = False) -> None:
+    def _abort_remote_session(
+        self,
+        *,
+        finish_attempted: bool = False,
+        update_id: str | None = None,
+    ) -> None:
         """Drop staged weights on the worker without committing when a session fails.
 
-        Uses ``client.abort_weight_update()`` when the client exposes it, and
-        otherwise sends the abort-sentinel payload through the standard 4-method
-        ``VLLMWeightSyncClient.update_weights`` route so both diffusion and AR
-        workers discard staged tensors without committing and clear
-        ``_weight_update_active``.
+        Uses ``client.abort_weight_update()`` when the client exposes it (and
+        accepts ``update_id`` whenever ``update_id`` is scoped to a session),
+        and otherwise sends the abort-sentinel payload through the standard
+        4-method ``VLLMWeightSyncClient.update_weights`` route so both
+        diffusion and AR workers discard staged tensors without committing and
+        clear ``_weight_update_active``.
         """
         abort_fn = getattr(self.client, "abort_weight_update", None)
-        if callable(abort_fn):
+        if callable(abort_fn) and (update_id is None or _accepts_update_id(abort_fn)):
             try:
-                abort_fn()
+                if update_id is not None:
+                    aborted = abort_fn(update_id=update_id)
+                    if aborted is False:
+                        logger.debug(
+                            "Skipped remote omni_lora_ipc abort for update_id=%s because another session is active.",
+                            update_id,
+                        )
+                        return
+                else:
+                    abort_fn()
                 if finish_attempted:
                     logger.warning(
                         "Remote omni_lora_ipc session aborted after an interrupted finish_weight_update; "
@@ -794,8 +874,16 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
                 )
             return
 
+        payload = dict(_ABORT_UPDATE_PAYLOAD)
+        if update_id is not None:
+            payload["update_id"] = update_id
         try:
-            self.client.update_weights(dict(_ABORT_UPDATE_PAYLOAD))
+            self.client.update_weights(payload)
+            if update_id is not None:
+                logger.debug(
+                    "Remote omni_lora_ipc abort for update_id=%s was ignored because another session is active.",
+                    update_id,
+                )
         except Exception as abort_exc:
             msg = _extract_error_text(abort_exc)
             if isinstance(abort_exc, MergedLoRASessionAbortedError) or "aborted by trainer" in msg:
@@ -912,9 +1000,11 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
         rpc_error: BaseException | None = None
         peer_failure: tuple[int, str] | None = None
         session_started = False
+        start_with_id_attempted = False
         update_attempted = False
         session_finished = False
         finish_attempted = False
+        session_update_id: str | None = None
         try:
             if self.is_sender:
                 assert normalized_cfg is not None
@@ -933,7 +1023,13 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
                     "peft_config": normalized_cfg,
                     "lora_int_id": resolved_id,
                 }
-                self.client.start_weight_update()
+                if _accepts_update_id(self.client.start_weight_update):
+                    session_update_id = uuid.uuid4().hex
+                    payload["update_id"] = session_update_id
+                    start_with_id_attempted = True
+                    self.client.start_weight_update(update_id=session_update_id)
+                else:
+                    self.client.start_weight_update()
                 session_started = True
                 update_attempted = True
                 self.client.update_weights(payload)
@@ -942,11 +1038,14 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
                 session_finished = True
         except BaseException as exc:
             rpc_error = exc
-            # Only abort after start_weight_update() confirmed session ownership;
-            # without a session token, aborting on an unconfirmed start could
-            # disrupt another caller's empty active session.
-            if self.is_sender and session_started and not session_finished:
-                self._abort_remote_session(finish_attempted=finish_attempted)
+            # Abort after a confirmed start, or after an unconfirmed start only
+            # when an update_id token was sent so the worker can verify session
+            # ownership and leave any other caller's session untouched.
+            if self.is_sender and (session_started or start_with_id_attempted) and not session_finished:
+                self._abort_remote_session(
+                    finish_attempted=finish_attempted,
+                    update_id=session_update_id,
+                )
         finally:
             # Keep staging references strongly alive until after the worker ack
             # and collective outcome exchange across all trainer ranks.
@@ -979,6 +1078,15 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
         if peer_failure is not None:
             err_rank, err_msg = peer_failure
             raise RuntimeError(f"omni_lora_ipc weight sync failed on rank {err_rank}: {err_msg}")
+
+
+class OmniHTTPWeightSyncClient(HTTPVLLMWeightSyncClient):
+    """HTTP weight-sync client passing ``update_id`` to Omni's ``/start_weight_update``."""
+
+    def start_weight_update(self, update_id: str | None = None) -> None:
+        validated_id = _validate_update_id(update_id)
+        body = {"update_id": validated_id} if validated_id is not None else None
+        self._post("start_weight_update", body)
 
 
 WeightTransferEngineFactory.register_engine("omni_lora_ipc", MergedLoRAIPCWeightTransferEngine)

@@ -1156,15 +1156,25 @@ class DiffusionWorker:
         typed_init_info = engine.parse_init_info(init_info)
         engine.init_transfer_engine(typed_init_info)
 
-    def start_weight_update(self) -> None:
+    def start_weight_update(self, update_id: str | None = None) -> None:
         """Start a new weight update session for diffusion model."""
         engine = self._get_weight_transfer_engine()
         if self._weight_update_active:
             raise RuntimeError(
                 "start_weight_update called while a weight update is already active. Call finish_weight_update first."
             )
+        if update_id is not None and (not isinstance(update_id, str) or not update_id.strip()):
+            raise ValueError("update_id must be a non-empty string")
         try:
-            engine.start_weight_update()
+            if update_id is not None:
+                from vllm_omni.lora.weight_transfer import _accepts_update_id
+
+                if _accepts_update_id(engine.start_weight_update):
+                    engine.start_weight_update(update_id=update_id)
+                else:
+                    engine.start_weight_update()
+            else:
+                engine.start_weight_update()
         except BaseException:
             try:
                 engine.reset_weight_update_target()
@@ -1175,6 +1185,13 @@ class DiffusionWorker:
                 )
             raise
         self._weight_update_active = True
+        self._weight_update_id: str | None = update_id
+
+    def start_weight_update_with_id(self, update_id: str) -> None:
+        """Start a weight update session tagged with a caller-supplied ``update_id``."""
+        if not isinstance(update_id, str) or not update_id.strip():
+            raise ValueError("update_id must be a non-empty string")
+        self.start_weight_update(update_id=update_id)
 
     def update_weights(self, update_info: dict) -> None:
         """Receive one weight update chunk from the trainer.
@@ -1187,8 +1204,15 @@ class DiffusionWorker:
             raise RuntimeError("start_weight_update must be called before update_weights.")
         try:
             engine.update_weights(update_info)
-        except BaseException:
+        except BaseException as exc:
+            from vllm_omni.lora.weight_transfer import MergedLoRAUpdateIDMismatchError
+
+            if isinstance(exc, MergedLoRAUpdateIDMismatchError):
+                if hasattr(engine, "_skip_next_end_weight_update"):
+                    engine._skip_next_end_weight_update = False
+                raise
             self._weight_update_active = False
+            self._weight_update_id = None
             try:
                 engine.reset_weight_update_target()
             except Exception:
@@ -1207,6 +1231,7 @@ class DiffusionWorker:
             engine.finish_weight_update()
         finally:
             self._weight_update_active = False
+            self._weight_update_id = None
             try:
                 engine.reset_weight_update_target()
             except Exception:
@@ -1217,12 +1242,17 @@ class DiffusionWorker:
                     exc_info=True,
                 )
 
-    def abort_weight_update(self) -> None:
+    def abort_weight_update(self, update_id: str | None = None) -> bool:
         """Abort an active weight update session without committing staged tensors."""
         engine = self._get_weight_transfer_engine()
+        if update_id is not None and (not isinstance(update_id, str) or not update_id.strip()):
+            raise ValueError("update_id must be a non-empty string")
         if not self._weight_update_active:
-            return
+            return False
+        if update_id is not None and getattr(self, "_weight_update_id", None) != update_id:
+            return False
         self._weight_update_active = False
+        self._weight_update_id = None
         abort_fn = getattr(engine, "abort_weight_update", None)
         try:
             if callable(abort_fn):
@@ -1234,6 +1264,7 @@ class DiffusionWorker:
                 "Failed to clean up diffusion weight transfer engine during abort_weight_update.",
                 exc_info=True,
             )
+        return True
 
     def execute_model(
         self,
