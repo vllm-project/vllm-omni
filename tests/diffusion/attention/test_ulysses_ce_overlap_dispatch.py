@@ -9,6 +9,7 @@ import torch
 from vllm_omni.diffusion.attention import layer
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel import ulysses_ce_overlap
+from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -68,6 +69,7 @@ def _case(**overrides):
         {"attn_metadata": AttentionMetadata(attn_mask=torch.ones(1, 8, dtype=torch.bool))},
         {"attn_metadata": AttentionMetadata(joint_query=torch.empty(1, 2, 8, 16))},
         {"attn_metadata": AttentionMetadata(extra={"gate_compress": torch.empty(1)})},
+        {"attn_metadata": AttentionMetadata(extra={REFERENCE_ISOLATION: (None, None)})},
     ],
 )
 def test_ineligible_layers_keep_the_standard_path(monkeypatch, overrides):
