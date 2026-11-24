@@ -1145,6 +1145,8 @@ def test_flux2_klein_weekly_pixel_contract_uses_native_image_diff() -> None:
     source = Path("tests/e2e/offline_inference/test_flux2_klein.py").read_text(encoding="utf-8")
 
     assert "ImageChops.difference(first, second).getbbox(alpha_only=False)" in source
+    assert "if current_omni_platform.is_rocm():" in source
+    assert "assert _image_difference_bbox(images1[0], images2[0]) is None" in source
     assert "list(images1[0].getdata())" not in source
     assert "zip(images1[0].getdata(), images2[0].getdata())" not in source
 
