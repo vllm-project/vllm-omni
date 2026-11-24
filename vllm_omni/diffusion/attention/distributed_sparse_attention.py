@@ -23,12 +23,7 @@ logger = init_logger(__name__)
 
 
 class MindIEParallelResource:
-    """Own a caller-supplied SDK state on one live communicator/device.
-
-    The pinned SDK has no close method. Omni drains work and drops its state
-    reference at coordinator teardown; cyclic SDK chains are collected there.
-    SDK internals and its process-group ownership are never modified.
-    """
+    """Own SDK state; drain work before collecting cached buffers at teardown."""
 
     def __init__(
         self,
@@ -107,10 +102,9 @@ class MindIEParallelResource:
             return
         if self.active:
             raise RuntimeError("cannot close active MindIE parallel resource")
-        # Every worker owns one current device. Drain both SDK streams before
-        # releasing their buffers; failure leaves state and storage intact.
+        # Synchronization failure leaves the state and its storage intact.
         with torch.npu.device(self.device):
             platforms.current_omni_platform.synchronize()
-        logger.info("MindIE-SD pipeline completed_calls=%d", self.completed_calls)
+        logger.debug("MindIE-SD pipeline closed.", extra={"completed_calls": self.completed_calls})
         self.state = None
         gc.collect()

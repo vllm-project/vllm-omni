@@ -4,9 +4,8 @@ Omni delegates complete parallel attention to MindIE-SD and retains request layo
 
 ## Requirements and configuration
 
-Use a matching MindIE-SD `lly/minimax-h3-u8-kvgather2-20261110` build exposing `mindiesd.build_rf_attention_plan` and
-`mindiesd.parallel.{ParallelState, distributed_sparse_attention}`, with matching
-native plugin/OPP. The distributed executor supports exactly these paths:
+Use a matching MindIE-SD `lly/minimax-h3-u8-kvgather2-20261110` build and native plugin/OPP.
+It must expose `mindiesd.build_rf_attention_plan` and `mindiesd.parallel.{ParallelState, distributed_sparse_attention}`:
 
 | Path | `sparse_type` | `precision` | `bsa_backend` | Communication | Hardware |
 | --- | --- | --- | --- | --- | --- |
@@ -15,8 +14,7 @@ native plugin/OPP. The distributed executor supports exactly these paths:
 | Eagle QBSA | `rf_v3` | `mix` | `eagle` | BF16; optionally INT8 Q/K, FP8 V | A5 |
 | Native MXFP8 BSA | `rf_v3` | `mxfp8` | `cann` | BF16; optionally MXFP8 Q/K/V and E8M0 scales | A5 |
 
-Omitting `bsa_backend` resolves the provider shown above. A conflicting explicit
-provider or another algorithm/precision tuple raises at configuration time.
+`bsa_backend` defaults to the table's provider; conflicting providers or algorithm/precision tuples fail configuration.
 Admission requires Ascend NPU, equal `[1,S_local,H,D]` Q/K/V, strict Ulysses and
 heads divisible by its degree. FP16 converts BF16 producer operands explicitly
 and restores the producer dtype; quantized paths consume BF16 producer tensors.
@@ -26,10 +24,7 @@ coordinator's orthogonal `allgather_group` as `ParallelState.cp_group`. It requi
 `pre_rearranged=True`, Ulysses degree 4 or 8, CP degree 2 or 4, global sequence
 world 8, 16 or 32, and D128. MXFP8 also requires D128 in pure Ulysses.
 Ring, paged/reference KV, joint attention, VDN and gate compression are unsupported.
-RF reorder hoist also requires every main-DiT layer to use compatible settings,
-no attention schedule, and one request per forward.
-
-Enable the executor through `block_sparse.parallel`:
+RF hoisting requires compatible settings on every main-DiT layer, no attention schedule and one request per forward.
 
 ```json
 {
@@ -37,10 +32,8 @@ Enable the executor through `block_sparse.parallel`:
     "backend": "RAINFUSION_ATTN",
     "block_sparse": {
       "sparsity": 0.8,
-      "start_step": 0,
       "precision": "bf16",
       "sparse_type": "rf_v3",
-      "bsa_backend": "eagle",
       "parallel": {
         "overlap_comm": true,
         "rainfusion_reorder_hoist": true,
@@ -63,10 +56,8 @@ For mix and native MXFP8, `block_sparse.parallel.quantized_comm` defaults to `fa
 
 ## Execution and state ownership
 
-Unsupported original-order calls decline before SDK state allocation or
-communication. A rejected RF-reordered sparse call raises to prevent an unaware
-fallback. Execution failures poison the shared resource and propagate without
-collective retry.
+Original-order refusals allocate no state and submit no collectives. RF-reordered refusals raise before fallback.
+Execution failures poison the shared resource and propagate without collective retry.
 
 The SP coordinator owns one `ParallelState` per Ulysses group, CP group, device,
 algorithm, precision and provider. Calls supply only `state`; the executor does not accept
@@ -119,4 +110,4 @@ flowchart TD
 
 With `quantized_comm=true`, mix/MXFP8 are quantized before forward exchange and the consumer reuses their payload/scales. With `false` (default), all exchange is BF16 and quantization occurs at the consumer. Float attention retains its native communication dtype. For 56 heads and U8, both schedules issue seven chunks with three forward and one reverse All-to-All each: 28 calls per layer; CP gathers are counted separately.
 
-All four provider rows support pure strict Ulysses (original/global RF input order) and CP×Ulysses (global RF order required), with serial/overlap and B off/on. Mix/MXFP8 independently accept quantized communication off/on. CP uses U4/U8 with CP2/CP4, complete sequence worlds 8/16/32, batch 1 and D128; pure Ulysses needs an exact head split, and native MXFP8 always requires D128.
+Internal sparse diagnostics use DEBUG: set `VLLM_LOGGING_LEVEL=DEBUG` and `MINDIE_LOG_LEVEL=sd:debug` when troubleshooting.

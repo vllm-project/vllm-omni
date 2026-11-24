@@ -291,7 +291,7 @@ def test_collective_failure_poisons_resource_without_replay(adapter):
         run(adapter)
 
 
-def test_teardown_drains_before_releasing_state_and_is_idempotent(adapter, monkeypatch):
+def test_teardown_drains_before_releasing_state_and_is_idempotent(adapter, monkeypatch, caplog):
     from contextlib import nullcontext
 
     run(adapter)
@@ -299,12 +299,15 @@ def test_teardown_drains_before_releasing_state_and_is_idempotent(adapter, monke
         ("mindiesd", adapter.group, None, adapter.query.device, "rf_v3", "bf16", "eagle"), lambda: None
     )
     state, drained = resource.state, []
+    caplog.set_level("DEBUG", logger=resource.__class__.__module__)
+    monkeypatch.setattr(sys.modules[resource.__class__.__module__].logger, "handlers", [caplog.handler])
     monkeypatch.setattr(
         adapter.module.torch, "npu", SimpleNamespace(device=lambda device: nullcontext()), raising=False
     )
     monkeypatch.setattr(adapter.platform, "synchronize", lambda: drained.append(resource.state), raising=False)
     adapter.coordinator.resources.close()
     assert drained == [state] and resource.state is None
+    assert caplog.records[-1].levelname == "DEBUG" and caplog.records[-1].completed_calls == 1
     adapter.coordinator.resources.close()
     assert drained == [state]
     with pytest.raises(RuntimeError, match="closed"):

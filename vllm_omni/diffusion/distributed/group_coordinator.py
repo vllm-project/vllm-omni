@@ -814,7 +814,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 }
             else:
                 if self.recv_buffer[name].get(segment_idx, None) is not None:
-                    logger.warning(f"Recv buffer [name: {name}, segment_idx: {segment_idx}] already exist. updating...")
+                    logger.warning("Receive buffer already exists.", extra={"buffer": name, "segment": segment_idx})
                 self.recv_buffer[name][segment_idx] = torch.zeros(recv_prev_shape, device=self.device, dtype=self.dtype)
 
     def _communicate_shapes(self, tensor_send_to_next=None, recv_prev=False):
