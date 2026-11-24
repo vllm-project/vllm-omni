@@ -12,8 +12,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("available", [False, True])
 def test_dense_flash_capability_tracks_mindiesd(monkeypatch, available):
     pytest.importorskip("vllm_ascend")
+    from vllm_omni.platforms.npu import _310p
     from vllm_omni.platforms.npu.platform import NPUOmniPlatform
 
+    monkeypatch.setattr(_310p, "is_310p", lambda device=None: False)
     monkeypatch.setattr(
         importlib.util,
         "find_spec",
@@ -21,6 +23,21 @@ def test_dense_flash_capability_tracks_mindiesd(monkeypatch, available):
     )
 
     assert NPUOmniPlatform.supports_diffusion_dense_flash_attention() is available
+
+
+def test_dense_flash_capability_disabled_on_310p(monkeypatch):
+    pytest.importorskip("vllm_ascend")
+    from vllm_omni.platforms.npu import _310p
+    from vllm_omni.platforms.npu.platform import NPUOmniPlatform
+
+    monkeypatch.setattr(_310p, "is_310p", lambda device=None: True)
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name: object() if name == "mindiesd" else None,
+    )
+
+    assert NPUOmniPlatform.supports_diffusion_dense_flash_attention() is False
 
 
 def test_paged_config_uses_ascend_kernel_block_size() -> None:

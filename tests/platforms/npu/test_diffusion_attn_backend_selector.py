@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the NPU diffusion attention backend selector.
 
 Regression coverage for the eager ``mindiesd`` import in
 ``NPUOmniPlatform.get_diffusion_attn_backend_cls``: the import must run only
 for backends that reach mindiesd kernels (FLASH_ATTN, and RAINFUSION_ATTN via
 its dense FlashAttention fallback), so that a broken optional mindiesd
-install cannot block backends that never use it (e.g. TORCH_SDPA).
+install cannot block backends that never use it (e.g. TORCH_SDPA), and 310P
+must default to TORCH_SDPA even when ``mindiesd`` is installed.
 
 The platform module is loaded from source with fake vllm/vllm-ascend
 dependencies, so the tests run on CPU without NPU or mindiesd installed.
@@ -89,7 +90,7 @@ class _FakeOmniPlatform:
         pass
 
 
-def _load_platform_module(monkeypatch: pytest.MonkeyPatch):
+def _load_platform_module(monkeypatch: pytest.MonkeyPatch, *, is_310p: bool = False):
     """Load vllm_omni/platforms/npu/platform.py with fake dependencies."""
     _install_fake_module(monkeypatch, "vllm")
     _install_fake_module(
@@ -110,8 +111,14 @@ def _load_platform_module(monkeypatch: pytest.MonkeyPatch):
         "vllm_omni.diffusion.attention",
         "vllm_omni.diffusion.attention.backends",
         "vllm_omni.platforms",
+        "vllm_omni.platforms.npu",
     ):
         _install_fake_module(monkeypatch, pkg)
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.platforms.npu._310p",
+        is_310p=lambda device=None: is_310p,
+    )
     _install_fake_module(
         monkeypatch,
         "vllm_omni.diffusion.attention.backends.registry",
@@ -215,3 +222,30 @@ def test_default_backend_falls_back_to_sdpa_without_mindiesd(
     path = platform_cls.get_diffusion_attn_backend_cls(None, head_size=64)
 
     assert path == "fake.backends.torch_sdpa.Backend"
+
+
+def test_default_backend_skips_mindiesd_and_uses_sdpa_on_310p(
+    monkeypatch: pytest.MonkeyPatch,
+    mindiesd_tracker: list[str],
+):
+    platform_cls = _load_platform_module(monkeypatch, is_310p=True)
+
+    assert platform_cls.supports_diffusion_dense_flash_attention() is False
+    path = platform_cls.get_diffusion_attn_backend_cls(None, head_size=64)
+
+    assert path == "fake.backends.torch_sdpa.Backend"
+    assert mindiesd_tracker == []
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_supports_diffusion_dense_flash_attention_tracks_mindiesd_on_non_310p(
+    monkeypatch: pytest.MonkeyPatch,
+    available: bool,
+):
+    platform_cls = _load_platform_module(monkeypatch, is_310p=False)
+    monkeypatch.setattr(
+        "importlib.util.find_spec",
+        lambda name, *a, **k: object() if name == "mindiesd" and available else None,
+    )
+
+    assert platform_cls.supports_diffusion_dense_flash_attention() is available
