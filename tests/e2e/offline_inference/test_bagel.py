@@ -68,7 +68,7 @@ def _extract_text(omni_outputs: list) -> str:
     return ""
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_bagel_text2text(run_level, omni_runner: OmniRunner) -> None:
     """Test Bagel text2text produces correct text output."""
     omni = omni_runner.omni
@@ -89,7 +89,7 @@ def test_bagel_text2text(run_level, omni_runner: OmniRunner) -> None:
         assert text == REFERENCE_TEXT_TEXT2TEXT, f"Text mismatch: expected {REFERENCE_TEXT_TEXT2TEXT!r}, got {text!r}"
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_bagel_img2text(run_level, omni_runner: OmniRunner) -> None:
     """Test Bagel img2text produces correct text output."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")

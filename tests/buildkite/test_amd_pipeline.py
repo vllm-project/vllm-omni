@@ -2325,7 +2325,7 @@ def test_bagel_weekly_covers_shared_offline_rocm_nodes() -> None:
     for test_name, source_path in source_by_test.items():
         source = source_path.read_text(encoding="utf-8")
         marks = source.split(f"def {test_name}", maxsplit=1)[0].rsplit("\n\n", maxsplit=1)[-1]
-        assert '@hardware_test(res={"cuda": "H100", "rocm": "MI325"})' in marks
+        assert '@hardware_test(res={"cuda": "H100", "rocm": "MI300"})' in marks
         runner_param = source.split("_OMNI_RUNNER_PARAM =", maxsplit=1)[1].split("\n)", maxsplit=1)[0]
         assert '"stage_init_timeout": 2400' in runner_param
         assert '"init_timeout": 2700' in runner_param
@@ -3309,6 +3309,10 @@ def test_final_diffusion_parity_weekly_jobs_are_exact_nonblocking_qualifiers() -
         "tests/e2e/online_serving/test_flux_kontext_expansion.py": (
             'hardware_marks(res={"cuda": "L4", "rocm": "MI300"})',
         ),
+        "tests/e2e/offline_inference/test_z_image.py": (
+            '@hardware_test(res={"cuda": "L4", "rocm": "MI300", "xpu": "B60"}, '
+            'num_cards={"cuda": 1, "rocm": 1, "xpu": 2})',
+        ),
         "tests/e2e/online_serving/test_nextstep_expansion.py": ('res={"cuda": "L4", "rocm": "MI300", "xpu": "B60"}',),
         "tests/e2e/online_serving/test_flux2_expansion.py": (
             'hardware_marks(res={"cuda": "L4", "rocm": "MI300"}, num_cards=4)',
@@ -3324,6 +3328,32 @@ def test_final_diffusion_parity_weekly_jobs_are_exact_nonblocking_qualifiers() -
         source = Path(source_path).read_text(encoding="utf-8")
         for fragment in fragments:
             assert fragment in source
+
+    hidream_source = Path("tests/e2e/accuracy/test_hidream_o1_image.py").read_text(encoding="utf-8")
+    assert 'H100_BASELINE_PATH = BASELINE_DIR / "hidream_o1_baseline.png"' in hidream_source
+    assert 'MI300_BASELINE_PATH = BASELINE_DIR / "hidream_o1_mi300_baseline.png"' in hidream_source
+    assert "current_omni_platform.is_rocm()" in hidream_source
+    assert "SSIM_THRESHOLD = 0.8" in hidream_source
+    assert "PSNR_THRESHOLD = 19.0" in hidream_source
+
+
+def test_ltx_weekly_two_stage_accuracy_has_bounded_cold_start_headroom() -> None:
+    accuracy_source = Path("tests/e2e/accuracy/ltx/test_ltx_official_similarity.py").read_text(encoding="utf-8")
+    runner_source = Path("tests/e2e/accuracy/ltx/run_ltx_reference.py").read_text(encoding="utf-8")
+
+    for case_name in ("ltx2_two_stage_layer_fused_t2v", "ltx23_two_stage_layer_fused_i2v"):
+        case_source = accuracy_source.split(f'name="{case_name}"', maxsplit=1)[1].split("    ),", maxsplit=1)[0]
+        assert "omni_stage_init_timeout_s=1200" in case_source
+        assert "omni_init_timeout_s=1800" in case_source
+        assert "omni_process_timeout_s=2400" in case_source
+
+    assert 'omni_args.extend(["--stage-init-timeout", str(case.omni_stage_init_timeout_s)])' in accuracy_source
+    assert 'omni_args.extend(["--init-timeout", str(case.omni_init_timeout_s)])' in accuracy_source
+    assert "_run(omni_args, env=env, timeout=case.omni_process_timeout_s)" in accuracy_source
+    assert 'parser.add_argument("--stage-init-timeout", type=int)' in runner_source
+    assert 'parser.add_argument("--init-timeout", type=int)' in runner_source
+    assert 'omni_kwargs["stage_init_timeout"] = args.stage_init_timeout' in runner_source
+    assert 'omni_kwargs["init_timeout"] = args.init_timeout' in runner_source
 
 
 _SENSENOVA_U1_SMOKE_NODES = (
