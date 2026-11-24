@@ -260,7 +260,7 @@ class TestAttentionSpec:
     def test_block_sparse_parallel_config_forwarded(self, enabled):
         parallel = {
             "overlap_comm": enabled,
-            "reorder_hoist": enabled,
+            "rainfusion_reorder_hoist": enabled,
             "optimize_attention_pipeline": enabled,
             "quantized_comm": not enabled,
         }

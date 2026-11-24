@@ -43,7 +43,7 @@ Enable the executor through `block_sparse.parallel`:
       "bsa_backend": "eagle",
       "parallel": {
         "overlap_comm": true,
-        "reorder_hoist": true,
+        "rainfusion_reorder_hoist": true,
         "optimize_attention_pipeline": true
       }
     }
@@ -55,7 +55,7 @@ Omit `parallel` to retain ordinary Omni attention. `overlap_comm=false` selects
 the SDK serial schedule for diagnosis. All three controls default to true.
 With overlap enabled, the SDK submits all forward transfers before computing
 the ready chunks. `optimize_attention_pipeline` enables SDK preparation/buffer
-reuse and can be disabled explicitly. `reorder_hoist` builds the RF plan once
+reuse and can be disabled explicitly. `rainfusion_reorder_hoist` builds the RF plan once
 before RoPE, relabels text/image/audio/output positions and lets SD skip per-layer
 row permutation while preserving RF order. Sparse step/layer gates still apply.
 

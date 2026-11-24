@@ -1,125 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""MiniMax-H3 admission and ownership for MindIE-SD distributed attention.
-
-The SDK owns both A2A directions and attention. It is a complete executor,
-not a scatter/gather transport. Declined calls have submitted no collectives.
-"""
+"""MiniMax-H3 admission for the complete MindIE-SD attention executor."""
 
 from __future__ import annotations
 
-import gc
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-from vllm.logger import init_logger
 
+from vllm_omni.diffusion.attention.distributed_sparse_attention import MindIEParallelResource
 from vllm_omni.diffusion.data import MindIEParallelConfig, resolve_mindie_sparse_backend
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
-    from mindiesd.parallel import ParallelState
-
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
     from vllm_omni.diffusion.attention.layer import Attention
-
-logger = init_logger(__name__)
-
-
-class MindIEParallelResource:
-    """Own a caller-supplied SDK state on one live communicator/device.
-
-    The pinned SDK has no close method. Omni drains work and drops its state
-    reference at coordinator teardown; cyclic SDK chains are collected there.
-    SDK internals and its process-group ownership are never modified.
-    """
-
-    def __init__(
-        self,
-        group: dist.ProcessGroup,
-        device: torch.device,
-        config: MindIEParallelConfig,
-        *,
-        cp_group: dist.ProcessGroup | None = None,
-        precision: str = "bf16",
-        sparse_type: str = "rf_v3",
-        bsa_backend: str | None = None,
-    ):
-        self.device = device
-        self.config = config
-        self.precision = precision
-        self.sparse_type = sparse_type
-        self.bsa_backend = resolve_mindie_sparse_backend(sparse_type, precision, bsa_backend)
-        from mindiesd.parallel import ParallelState
-
-        self.state: ParallelState | None = ParallelState(
-            group=group,
-            cp_group=cp_group,
-            overlap_comm=config.overlap_comm,
-            optimize_attention_pipeline=config.optimize_attention_pipeline,
-            bsa_backend=self.bsa_backend,
-            quantized_comm=config.quantized_comm,
-        )
-        self.failed = False
-        self.active = False
-        self.completed_calls = 0
-
-    def execute(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        spans: list,
-        *,
-        used_len: int,
-        scale: float,
-        sparsity: float,
-        pre_rearranged: bool,
-    ) -> torch.Tensor:
-        if self.state is None or self.failed:
-            raise RuntimeError("MindIE parallel resource is closed or failed; recreate the worker")
-        if self.active:
-            raise RuntimeError("concurrent calls cannot share a MindIE parallel resource")
-        from mindiesd.parallel import distributed_sparse_attention
-
-        self.active = True
-        try:
-            output = distributed_sparse_attention(
-                q,
-                k,
-                v,
-                spans,
-                state=self.state,
-                sparse_type=self.sparse_type,
-                used_len=used_len,
-                precision=self.precision,
-                scale=scale,
-                sparsity=sparsity,
-                pre_rearranged=pre_rearranged,
-            )
-            self.completed_calls += 1
-            return output
-        except Exception:
-            # No alternate transport or replay after a partial collective.
-            self.failed = True
-            raise
-        finally:
-            self.active = False
-
-    def close(self) -> None:
-        if self.state is None:
-            return
-        if self.active:
-            raise RuntimeError("cannot close active MindIE parallel resource")
-        # Every worker owns one current device. Drain both SDK streams before
-        # releasing their buffers; failure leaves state and storage intact.
-        with torch.npu.device(self.device):
-            current_omni_platform.synchronize()
-        logger.info("MiniMax-H3 MindIE-SD pipeline completed_calls=%d", self.completed_calls)
-        self.state = None
-        gc.collect()
 
 
 def supports_mindiesd_ulysses(strategy) -> bool:

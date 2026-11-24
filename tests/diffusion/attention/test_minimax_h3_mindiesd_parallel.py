@@ -19,7 +19,7 @@ from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelRe
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu]
 
 MODEL_DIR = Path(__file__).resolve().parents[3] / "vllm_omni/diffusion/models/minimax_h3"
-HELPER_NAME = "vllm_omni.diffusion.models.minimax_h3.attention.mindiesd_parallel"
+HELPER_NAME = "vllm_omni.diffusion.models.minimax_h3.attention.rainfusion_sdk_dispatch"
 
 
 def load_module(monkeypatch, name, path):
@@ -51,7 +51,7 @@ def adapter(monkeypatch):
     setattr(stub, "ParallelState", new_state)
     setattr(stub, "distributed_sparse_attention", distributed_attention)
     monkeypatch.setitem(sys.modules, stub.__name__, stub)
-    module = load_module(monkeypatch, HELPER_NAME, MODEL_DIR / "attention/mindiesd_parallel.py")
+    module = load_module(monkeypatch, HELPER_NAME, MODEL_DIR / "attention/rainfusion_sdk_dispatch.py")
     monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(module.dist, "get_world_size", lambda group: 2)
 
@@ -113,7 +113,10 @@ def run(adapter, *, query=None):
 @pytest.mark.parametrize("enabled", [False, True])
 def test_pipeline_call_is_explicit_and_state_is_reused(adapter, enabled):
     adapter.impl.rainfusion.parallel = adapter.module.MindIEParallelConfig(
-        overlap_comm=enabled, reorder_hoist=enabled, optimize_attention_pipeline=enabled, quantized_comm=not enabled
+        overlap_comm=enabled,
+        rainfusion_reorder_hoist=enabled,
+        optimize_attention_pipeline=enabled,
+        quantized_comm=not enabled,
     )
     assert torch.equal(run(adapter), adapter.query + 1)
     run(adapter)
@@ -202,7 +205,7 @@ def test_explicit_fp16_attention_restores_the_bf16_producer_dtype(adapter):
 def test_rf_hoist_preserves_modalities_and_declines_an_unresolved_plan(adapter, monkeypatch):
     helper = load_module(
         monkeypatch,
-        HELPER_NAME.replace("mindiesd_parallel", "rf_reorder_hoist"),
+        HELPER_NAME.replace("rainfusion_sdk_dispatch", "rf_reorder_hoist"),
         MODEL_DIR / "attention/rf_reorder_hoist.py",
     )
     plan = torch.tensor([0, 1, 4, 5, 2, 3, 10, 11, 12, 13, 6, 7, 8, 9])

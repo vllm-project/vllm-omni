@@ -10,7 +10,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.data import resolve_mindie_sparse_backend
 from vllm_omni.platforms import current_omni_platform
 
-from .mindiesd_parallel import supports_mindiesd_ulysses
+from .rainfusion_sdk_dispatch import supports_mindiesd_ulysses
 
 
 def relabel_branch(branch, permutation: torch.Tensor, inverse: torch.Tensor) -> None:
@@ -51,11 +51,13 @@ def maybe_hoist_branch(branch, model) -> bool:
     configs = [
         impl.rainfusion.parallel if backend.get_name() == "RAINFUSION_ATTN" else None for impl, backend, _ in records
     ]
-    if not any(config is not None and config.reorder_hoist for config in configs):
+    if not any(config is not None and config.rainfusion_reorder_hoist for config in configs):
         return False
     if getattr(getattr(model, "od_config", None), "kv_offload_config", None) is not None:
         raise ValueError("RF reorder hoist cannot relabel a reference-KV reuse request")
-    if not current_omni_platform.is_npu() or any(config is None or not config.reorder_hoist for config in configs):
+    if not current_omni_platform.is_npu() or any(
+        config is None or not config.rainfusion_reorder_hoist for config in configs
+    ):
         raise ValueError("RF reorder hoist requires MindIE parallel on every main-DiT attention layer")
     for layer, (impl, _, _) in zip(layers, records, strict=True):
         resolve_mindie_sparse_backend(
