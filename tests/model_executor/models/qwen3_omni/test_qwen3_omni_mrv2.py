@@ -155,6 +155,9 @@ def test_talker_tensor_forward_keeps_full_graph_capture(async_chunk, profile_onl
     mocker.patch.object(Qwen3OmniMoeForConditionalGeneration, "_init_special_tokens_embeddings", return_value=set())
     model = Qwen3OmniMoeForConditionalGeneration(vllm_config=config)
     assert model.have_multimodal_outputs is True
+    assert model.mtp_sample_uniforms is True
+    assert model.mtp_sample_uniforms_preserve_eager_stream is True
+    assert model.mtp_accepts_per_row_generators is True
 
     runner = object.__new__(OmniGPUModelRunner)
     runner._staged_writes = staged_writes.StagedWrites()

@@ -32,22 +32,24 @@ The Tensor Parallel implementation relies vLLM's Parallel Layers:
 **Parallel Layer Types:**
 
 | Layer Type | Purpose | Weight Partitioning |
-|------------|---------|---------------------|
+| ------------ | --------- | --------------------- |
 | `ColumnParallelLinear` | First FFN layer, separated QKV | Columns (output dimension) |
 | `RowParallelLinear` | Second FFN layer, attention output | Rows (input dimension) |
 | `QKVParallelLinear` | Multi-head/grouped-query attention QKV | Handles head replication automatically |
+| `MergedColumnParallelLinear` | Fused projection with several outputs (e.g. QKV + MLP) | Each output segment split by columns |
+| `MergedRowParallelLinear` (vLLM-Omni) | Projection of `cat([attn, mlp])` in parallel attention + MLP blocks | Each input segment split by rows |
 | `ReplicatedLinear` | Layers that shouldn't be sharded | No partitioning (replicated) |
 
 ---
 
 ## Step-by-Step Implementation
 
-
 ### Step 1: Identify Linear Layers
 
 Find all `nn.Linear` layers in your transformer that need to be sharded.
 
 **Key questions:**
+
 - Which layers should be column parallel (weight split by columns)?
 - Which layers should be row parallel (weight split by rows)?
 
@@ -145,12 +147,37 @@ class YourModelAttention(nn.Module):
 - Set `input_is_parallel=True` on `RowParallelLinear` when input comes from `ColumnParallelLinear`
 - Use `QKVParallelLinear` for attention projections (handles head replication automatically)
 
+#### Parallel attention + MLP blocks
+
+FLUX-style single-stream blocks run attention and the MLP side by side and project
+their concatenation: `out = proj_out(cat([attn, mlp], dim=-1))`. Keep both branches
+sharded and use `MergedRowParallelLinear` from `vllm_omni.diffusion.layers.linear`
+for the output projection, instead of gathering them for a replicated `proj_out`:
+
+```python
+from vllm_omni.diffusion.layers.linear import MergedRowParallelLinear
+
+self.proj_mlp = ColumnParallelLinear(dim, mlp_dim, gather_output=False, return_bias=False)
+self.proj_out = MergedRowParallelLinear([dim, mlp_dim], dim, return_bias=False)
+
+# attn: [B, S, dim / N] (local heads, not gathered); mlp: [B, S, mlp_dim / N]
+out = self.proj_out(torch.cat([attn, act(self.proj_mlp(x))], dim=-1))  # one GEMM + all-reduce
+```
+
+The checkpoint keeps the unsharded `proj_out.weight`; the layer's loader gives each rank
+the columns of its own `attn` and `mlp` shards, and its LoRA wrapper does the same for
+LoRA A. A fused input projection whose output holds several segments (e.g. FLUX.2's
+`to_qkv_mlp_proj` = Q, K, V, gate, up) uses `MergedColumnParallelLinear(output_sizes=[...])`
+so that every segment is split on its own. Quantization methods whose parameters cannot be
+re-ordered per segment are reported by `merged_row_parallel_supported()`; keep those
+projections replicated (`disable_tp=True`) and gather the attention output.
+
 ### Step 3: Validate TP Constraints
 
 For correct TP operation, these dimensions **must be divisible** by `tensor_parallel_size`:
 
 | Dimension | Reason | Example Error |
-|-----------|--------|---------------|
+| --------- | ------ | ------------- |
 | `num_heads` | Heads sharded by QKVParallelLinear | `num_heads=30, tp=4` ❌ (30 % 4 ≠ 0) |
 | `num_kv_heads` | KV heads sharded by QKVParallelLinear | `num_kv_heads=30, tp=4` ❌ (30 % 4 ≠ 0) |
 
@@ -210,6 +237,7 @@ python text_to_image.py \
 **Problem:** Linear layers not replaced with parallel equivalents.
 
 **Solution:** Replace with parallel layers:
+
 ```python
 # ❌ BAD
 self.proj = nn.Linear(dim, dim)
@@ -229,6 +257,7 @@ self.proj = RowParallelLinear(dim, dim, input_is_parallel=True)
 **Problem:** RowParallelLinear expects sharded input but receives full tensor.
 
 **Solution:** Set `input_is_parallel=True` when input comes from ColumnParallelLinear:
+
 ```python
 # ✅ GOOD: Correct pairing
 self.w1 = ColumnParallelLinear(dim, hidden_dim, return_bias=False,)
@@ -245,6 +274,7 @@ self.w2 = RowParallelLinear(
 **Problem:** QKV split sizes don't match sharded dimensions.
 
 **Solution:** Use `self.to_qkv.num_heads` (local heads per GPU):
+
 ```python
 # ❌ BAD: Uses total heads
 q_size = self.total_num_heads * self.head_dim
@@ -260,9 +290,10 @@ q_size = self.to_qkv.num_heads * self.head_dim
 Complete examples in the codebase:
 
 | Model | Path | Pattern | Notes |
-|-------|------|---------|-------|
+| ------- | ------ | --------- | ------- |
 | **Z-Image** | `vllm_omni/diffusion/models/z_image/z_image_transformer.py` | Standard TP | Full implementation with validation |
-| **FLUX** | `vllm_omni/diffusion/models/flux/flux_transformer.py` | Dual-stream | Image + text streams |
+| **FLUX** | `vllm_omni/diffusion/models/flux/flux_transformer.py` | Dual-stream | Image + text streams; single-stream blocks use `MergedRowParallelLinear` |
+| **FLUX.2** | `vllm_omni/diffusion/models/flux2/flux2_transformer.py` | Fused parallel block | `MergedColumnParallelLinear` QKV + SwiGLU input, `MergedRowParallelLinear` output |
 | **Qwen-Image** | `vllm_omni/diffusion/models/qwen_image/qwen_image_transformer.py` | Standard TP | With RoPE |
 | **TP Tests** | `tests/diffusion/distributed/test_tensor_parallel.py` | E2E testing | TP correctness and performance |
 | **Constraint Tests** | `tests/diffusion/models/z_image/test_zimage_tp_constraints.py` | Unit testing | Validation logic |
