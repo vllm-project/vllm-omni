@@ -39,13 +39,11 @@
     btn.textContent = label;
   }
 
-  function chooseMime() {
-    const candidates = [
-      'video/mp4; codecs="avc1.42E01E"',
-      'video/mp4; codecs="avc1.4D401F"',
-      'video/mp4; codecs="avc1.64001F"',
-      "video/mp4"
-    ];
+  function chooseMime(withAudio) {
+    const audioCodec = withAudio ? ", mp4a.40.2" : "";
+    const candidates = ["avc1.42E01E", "avc1.4D401F", "avc1.64001F"]
+      .map(codec => `video/mp4; codecs="${codec}${audioCodec}"`);
+    candidates.push("video/mp4");
     for (const mime of candidates) {
       if (window.MediaSource && MediaSource.isTypeSupported(mime)) return mime;
     }
@@ -149,7 +147,7 @@
       return configJson;
     }
 
-    const mime = chooseMime();
+    const mime = chooseMime(Boolean(config.payload.audio_reference));
     if (!mime) {
       setStatus("MSE unsupported");
       setStartButton(false, "Restart");
@@ -185,7 +183,7 @@
         setStartButton(true, "Streaming...");
         log("Connected: " + config.url);
         ws.send(JSON.stringify(config.payload));
-        log("Sent session.start: " + JSON.stringify(config.payload));
+        log("Sent session.start fields: " + Object.keys(config.payload).join(", "));
       };
       ws.onmessage = (event) => {
         if (typeof event.data === "string") {

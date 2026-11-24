@@ -5,17 +5,21 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import queue
 import threading
+import wave
 from collections.abc import AsyncGenerator, Callable
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, MagicMock
 
 import anyio
 import numpy as np
+import pybase64
 import pytest
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pytest_mock import MockerFixture
@@ -24,6 +28,7 @@ from starlette.testclient import TestClient
 from tests.helpers.media import generate_synthetic_image
 from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
 from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
+from vllm_omni.entrypoints.openai.video.generation.helpers import VideoRequestResources
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -428,7 +433,9 @@ class TestStreamingVideoOutputWebSocket:
         )
         request = VideoGenerationRequest(**request_data)
 
-        _prompt, sampling_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
+        _prompt, sampling_params, _video_params = asyncio.run(
+            handler._build_prompt_and_sampling_params(request, VideoRequestResources())
+        )
 
         assert sampling_params.quality == "high"
 
@@ -452,11 +459,15 @@ class TestStreamingVideoOutputWebSocket:
         )
         request = VideoGenerationRequest(**request_data)
 
-        _prompt, sampling_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
+        _prompt, sampling_params, _video_params = asyncio.run(
+            handler._build_prompt_and_sampling_params(request, VideoRequestResources())
+        )
 
         assert sampling_params.quality == "high"
         sampling_params.extra_args["stage_default"] = "mutated"
-        _prompt, next_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
+        _prompt, next_params, _video_params = asyncio.run(
+            handler._build_prompt_and_sampling_params(request, VideoRequestResources())
+        )
         assert next_params.extra_args["stage_default"] == "keep"
         assert defaults.extra_args == {"stage_default": "keep"}
 
@@ -508,15 +519,32 @@ class TestStreamingVideoOutputWebSocket:
         engine_client.streaming_encoder_factory.assert_called_once()
         assert engine_client.streaming_encoder_factory.call_args.kwargs["output_format"] == "m4s"
 
-    def test_streaming_session_accepts_initial_image_reference(self, mocker: MockerFixture):
-        """session.start forwards image_reference as prompt multi_modal_data.image."""
+    @pytest.mark.parametrize("with_audio", [False, True])
+    def test_streaming_session_accepts_initial_media_references(self, mocker: MockerFixture, with_audio: bool):
+        audio_buffer = io.BytesIO()
+        with wave.open(audio_buffer, "wb") as wav:
+            wav.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
+            wav.writeframes(bytes(480))
+        audio_bytes = audio_buffer.getvalue()
+        audio_url = "data:audio/wav;base64," + pybase64.b64encode(audio_bytes).decode()
+        audio_paths: list[Path] = []
         captured_prompts: list[dict[str, object]] = []
 
         async def mock_generate(*_args, **kwargs):
             captured_prompts.append(kwargs["prompt"])
+            if with_audio:
+                path = Path(kwargs["prompt"]["multi_modal_data"]["audio"])
+                assert path.read_bytes() == audio_bytes
+                audio_paths.append(path)
             yield OmniRequestOutput.from_diffusion(
                 request_id="req-ws",
                 images=[_fake_video_frames(2)],
+                final_output_type="image",
+                finished=False,
+            )
+            yield OmniRequestOutput.from_diffusion(
+                request_id="req-ws",
+                images=[],
                 final_output_type="image",
                 finished=True,
             )
@@ -539,6 +567,7 @@ class TestStreamingVideoOutputWebSocket:
                         "width": 4,
                         "height": 4,
                         "image_reference": {"image_url": image_url},
+                        **({"audio_reference": {"audio_url": audio_url}} if with_audio else {}),
                     }
                 )
                 assert ws.receive_json()["type"] == "video.start"
@@ -549,6 +578,9 @@ class TestStreamingVideoOutputWebSocket:
         image = prompt["multi_modal_data"]["image"]  # type: ignore[index]
         assert image.size == (4, 4)
         engine_client.abort.assert_not_called()
+        if with_audio:
+            assert len(audio_paths) == 1
+            assert not audio_paths[0].exists()
 
     def test_streaming_session_rejects_unknown_format(self, mocker: MockerFixture):
         async def mock_generate(*_args, **_kwargs):
@@ -1536,7 +1568,7 @@ class TestStreamingVideoOutputExtraParams:
         request = VideoGenerationRequest(prompt="p", extra_params={"preencode_mp4": True})
 
         with pytest.raises(HTTPException) as excinfo:
-            await self._handler()._build_prompt_and_sampling_params(request)
+            await self._handler()._build_prompt_and_sampling_params(request, VideoRequestResources())
 
         assert excinfo.value.status_code == HTTPStatus.BAD_REQUEST.value
         assert "preencode_mp4" in excinfo.value.detail
@@ -1544,7 +1576,7 @@ class TestStreamingVideoOutputExtraParams:
     async def test_other_extra_params_still_reach_the_engine(self):
         request = VideoGenerationRequest(prompt="p", extra_params={"flow_shift": 3.0})
 
-        _, gen_params, _ = await self._handler()._build_prompt_and_sampling_params(request)
+        _, gen_params, _ = await self._handler()._build_prompt_and_sampling_params(request, VideoRequestResources())
 
         assert gen_params.extra_args["flow_shift"] == 3.0
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Gradio demo for `/v1/realtime/video`.
 
 Usage:
@@ -13,10 +13,16 @@ Start a vLLM-Omni server with streaming output enabled first, for example:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 from pathlib import Path
 from typing import Any, TypedDict
+
+import numpy as np
+import pybase64
+import soundfile
+from PIL import Image
 
 try:
     import gradio as gr
@@ -201,6 +207,10 @@ def _set_optional_field_enabled(enabled: bool) -> Any:
     return gr.update(interactive=enabled)
 
 
+def _media_data_url(data: bytes, media_type: str) -> str:
+    return f"data:{media_type};base64,{pybase64.b64encode(data).decode('ascii')}"
+
+
 def build_browser_stream_config(
     host: str,
     port: int | float,
@@ -226,6 +236,9 @@ def build_browser_stream_config(
     include_true_cfg_scale: bool,
     true_cfg_scale: int | float | None,
     prompt_updates_df: list[list[Any]] | None,
+    reference_image: Image.Image | None = None,
+    reference_audio: tuple[int, np.ndarray] | None = None,
+    enable_prompt_updates: bool = True,
 ) -> tuple[str, Any]:
     """Build the browser-side WebSocket request config for the HTML/MSE player."""
     if not model.strip():
@@ -249,7 +262,16 @@ def build_browser_stream_config(
         true_cfg_scale=true_cfg_scale if include_true_cfg_scale else None,
         seed=seed if include_seed else None,
     )
-    prompt_updates = _parse_prompt_updates_dataframe(prompt_updates_df)
+    if reference_image is not None:
+        image_buffer = io.BytesIO()
+        reference_image.save(image_buffer, format="PNG")
+        payload["image_reference"] = {"image_url": _media_data_url(image_buffer.getvalue(), "image/png")}
+    if reference_audio is not None:
+        sample_rate, samples = reference_audio
+        audio_buffer = io.BytesIO()
+        soundfile.write(audio_buffer, samples, sample_rate, format="WAV")
+        payload["audio_reference"] = {"audio_url": _media_data_url(audio_buffer.getvalue(), "audio/wav")}
+    prompt_updates = _parse_prompt_updates_dataframe(prompt_updates_df) if enable_prompt_updates else []
     config = {
         "url": f"ws://{host}:{int(port)}/v1/realtime/video",
         "payload": payload,
@@ -276,6 +298,10 @@ def create_demo() -> gr.Blocks:
                 port = gr.Number(label="Server Port", value=8000, precision=0)
                 model = gr.Textbox(label="Model", value="BestWishYsh/Helios-Distilled")
                 prompt = gr.Textbox(label="Prompt", value=DEFAULT_PROMPT, lines=3)
+                reference_image = gr.Image(
+                    label="Reference image (optional)", sources=["upload"], type="pil", image_mode="RGB"
+                )
+                reference_audio = gr.Audio(label="Reference audio (optional)", sources=["upload"], type="numpy")
 
                 with gr.Row():
                     width = gr.Number(label="Width", value=640, precision=0)
@@ -328,6 +354,7 @@ def create_demo() -> gr.Blocks:
                             include_seed = gr.Checkbox(label="Send", value=True)
 
                 with gr.Accordion("Prompt Updates", open=True):
+                    enable_prompt_updates = gr.Checkbox(label="Enable Prompt Updates", value=True)
                     gr.Markdown(
                         "Schedule midway text `session.interaction` messages after `video.start`. "
                         "With one row, leave it fully empty or fill both **At (s)** and **Prompt**. "
@@ -380,6 +407,9 @@ def create_demo() -> gr.Blocks:
             include_true_cfg_scale,
             true_cfg_scale,
             prompt_updates_df,
+            reference_image,
+            reference_audio,
+            enable_prompt_updates,
         ]
         for toggle, field in [
             (include_negative_prompt, negative_prompt),

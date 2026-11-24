@@ -35,7 +35,7 @@ def _run(monkeypatch, sizes: list[int], speech_samples: int, streaming: bool):
     pipeline.od_config = SimpleNamespace(streaming_output=streaming)
     pipeline.audio_features = cast(Any, SimpleNamespace(sample_rate=SAMPLE_RATE))
     pipeline.generate_chunks = generate_chunks
-    monkeypatch.setattr(module, "load_speech", lambda audio, rate: np.zeros(speech_samples, dtype=np.float32))
+    monkeypatch.setattr(module, "load_speech", lambda audio, rate: np.arange(speech_samples, dtype=np.float32))
     monkeypatch.setattr(module, "get_emit_chunk", lambda: emitted.append)
     request = SimpleNamespace(
         prompts=[{"prompt": "A person speaking.", "multi_modal_data": {"image": object(), "audio": "speech.wav"}}],
@@ -55,9 +55,14 @@ def test_offline_video_ends_with_the_speech(monkeypatch):
 
 
 def test_streaming_stops_with_the_speech_and_reports_what_was_sent(monkeypatch):
-    # 1.5 s of speech needs 24 frames: chunk 0 (13 frames) and 11 frames of chunk 1 of a 3-chunk plan.
-    outputs, emitted, requested = _run(monkeypatch, [13, 16, 16], 36000, streaming=True)
-    assert [(out.chunk_index, out.output.shape[2]) for out in emitted] == [(0, 13), (1, 11)]
+    # The last video frame covers a partial audio frame period.
+    speech_samples = 35991
+    outputs, emitted, requested = _run(monkeypatch, [13, 16, 16], speech_samples, streaming=True)
+    assert [(out.chunk_index, out.output[0].shape[2]) for out in emitted] == [(0, 13), (1, 11)]
+    first, second = [out.output for out in emitted]
+    assert first[2:] == second[2:] == (SAMPLE_RATE, 16)
+    assert len(first[1]) == 13 * SAMPLE_RATE // 16
+    np.testing.assert_array_equal(np.concatenate([first[1], second[1]]), np.arange(speech_samples, dtype=np.float32))
     assert requested == [0, 1]  # the third chunk is never generated
     finished = outputs[0]
     assert finished.finished and (finished.chunk_index, finished.total_chunks) == (1, 2)

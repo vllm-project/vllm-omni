@@ -32,7 +32,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.kyutai_aura.audio import (
     MIMI_REPO,
     MimiSemanticFeatures,
@@ -49,6 +49,8 @@ from vllm_omni.diffusion.models.kyutai_aura.config import (
 from vllm_omni.diffusion.models.kyutai_aura.kv_cache import RollingChunkKVCache
 from vllm_omni.diffusion.models.kyutai_aura.sampling import StudentSigmas, crop_chunks, decode_spans
 from vllm_omni.diffusion.models.kyutai_aura.transformer import KyutaiAuraTransformer
+from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
+from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
 from vllm_omni.diffusion.request_streaming import get_emit_chunk
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
@@ -91,12 +93,15 @@ def get_kyutai_aura_post_process_func(od_config: OmniDiffusionConfig) -> Callabl
     return post_process_func
 
 
-class KyutaiAuraPipeline(nn.Module, SupportImageInput, SupportAudioInput):
+class KyutaiAuraPipeline(nn.Module, SupportImageInput, SupportAudioInput, SupportsComponentDiscovery):
     """Kyutai AURA on the default diffusion engine: one portrait and a speech recording per request;
     the video is generated chunk by chunk and returned whole or emitted per chunk when streaming."""
 
     support_image_input: ClassVar[bool] = True
     support_audio_input: ClassVar[bool] = True
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
@@ -109,6 +114,7 @@ class KyutaiAuraPipeline(nn.Module, SupportImageInput, SupportAudioInput):
             raise ValueError(f"{od_config.model} is not a released Kyutai AURA checkpoint")
         self.cfg = cfg
         self.device = get_local_device()
+        self._text_encoder_stager: PinnedModuleStager | None = None
         extra: dict[str, Any] = getattr(od_config, "model_config", None) or {}
 
         aura_dir = _local_dir(od_config.model, [cfg.checkpoint])
@@ -138,7 +144,41 @@ class KyutaiAuraPipeline(nn.Module, SupportImageInput, SupportAudioInput):
         with torch.device("meta"):
             encoder = UMT5EncoderModel(_WAN_UMT5_CONFIG)
         encoder = _load_wan_t5_as_umt5(encoder, str(base_dir / UMT5_FILE), dtype=torch.bfloat16)
-        return encoder.to(self.device).eval().requires_grad_(False), tokenizer
+        # Selected text encoders start on the host; the offload backend enables
+        # request-scoped staging after the pipeline has finished loading.
+        if not resolve_offload(self.od_config).offloads(TEXT_ENCODER_COMPONENT):
+            encoder = encoder.to(self.device)
+        return encoder.eval().requires_grad_(False), tokenizer
+
+    def enable_omni_model_cpu_offload(
+        self,
+        *,
+        device: torch.device,
+        pin_memory: bool = True,
+        use_hsdp: bool = False,
+        offload_components: frozenset[str] | None = None,
+    ) -> None:
+        """Stage umT5 only for prompt encoding, keeping its output on the GPU."""
+        if use_hsdp:
+            raise ValueError("Kyutai AURA text encoder offload does not support HSDP.")
+        if offload_components != frozenset({TEXT_ENCODER_COMPONENT}):
+            raise ValueError(
+                'Kyutai AURA supports module offload with components=["text_encoder"] only; '
+                'use diffusion_offload_config={"mode":"module","components":["text_encoder"]}.'
+            )
+        if self._text_encoder_stager is None:
+            self._text_encoder_stager = PinnedModuleStager(
+                self.text_encoder,
+                device,
+                pin_memory=pin_memory,
+                retain_device_storage=False,
+            )
+
+    def disable_omni_model_cpu_offload(self) -> None:
+        """Restore the ordinary device-resident text encoder execution path."""
+        if self._text_encoder_stager is not None:
+            self._text_encoder_stager.load()
+            self._text_encoder_stager = None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """All weights are loaded in __init__ (the standalone DiT file strictly, the Wan base files and
@@ -163,7 +203,14 @@ class KyutaiAuraPipeline(nn.Module, SupportImageInput, SupportAudioInput):
             return_tensors="pt",
         )
         ids, mask = tokens.input_ids.to(self.device), tokens.attention_mask.to(self.device)
-        hidden = self.text_encoder(ids, mask).last_hidden_state
+        stager = self._text_encoder_stager
+        if stager is not None:
+            stager.load()
+        try:
+            hidden = self.text_encoder(ids, mask).last_hidden_state
+        finally:
+            if stager is not None:
+                stager.offload()
         return hidden[0, : int(mask.gt(0).sum())]
 
     def load_portrait(self, image: str | Path | Image.Image) -> torch.Tensor:
@@ -329,12 +376,26 @@ class KyutaiAuraPipeline(nn.Module, SupportImageInput, SupportAudioInput):
         chunks: list[torch.Tensor] = []
         delivered: list[float] = []
         sent = 0
+        sent_frames = 0
+        audio_start = 0
         start = time.perf_counter()
         generated = self.generate_chunks(image, audio, text, seed=seed, num_chunks=num_chunks)
         for index, total, video in crop_chunks(generated, speech_frames):
             sent += 1
             if emit is not None:
-                emit(DiffusionOutput(finished=False, chunk_index=index, total_chunks=total, output=video[None].half()))
+                # Use cumulative frame boundaries so rounding never drops or repeats samples.
+                sent_frames += video.shape[1]
+                audio_end = round(sent_frames * sample_rate / self.cfg.fps)
+                audio_chunk = waveform[audio_start:audio_end].copy()
+                audio_start = audio_end
+                emit(
+                    DiffusionOutput(
+                        finished=False,
+                        chunk_index=index,
+                        total_chunks=total,
+                        output=(video[None].half(), audio_chunk, sample_rate, self.cfg.fps),
+                    )
+                )
             else:
                 chunks.append(video.cpu())
                 delivered.append(time.perf_counter() - start)
