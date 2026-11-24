@@ -1014,6 +1014,12 @@ class OmniOpenAIServingVideo:
             raw_action_dim=cls._coerce_optional_int(action_metadata.get("raw_action_dim")),
             action_mode=str(action_mode) if action_mode is not None else None,
             domain_id=cls._coerce_optional_int(action_metadata.get("domain_id")),
+            policy_profile=action_metadata.get("policy_profile"),
+            early_stop_actions=cls._coerce_optional_int(action_metadata.get("early_stop_actions")),
+            denoise_steps=cls._coerce_optional_int(action_metadata.get("denoise_steps")),
+            requested_denoise_steps=cls._coerce_optional_int(action_metadata.get("requested_denoise_steps")),
+            policy_timing=action_metadata.get("policy_timing"),
+            timing_contract=action_metadata.get("timing_contract"),
         )
 
     @staticmethod

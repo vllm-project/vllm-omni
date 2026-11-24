@@ -90,6 +90,8 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames, is_video_file_path
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.models.cosmos3.execution_timing import instrument_pipeline
+from vllm_omni.diffusion.models.cosmos3.moh_timing import MOH_TIMING_CONTRACT
 from vllm_omni.entrypoints.openai.video_api_utils import positive_float
 from vllm_omni.experimental.world_models.adapters.state_cosmos3_adapter import (
     Cosmos3StateAdapter,
@@ -978,6 +980,7 @@ def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
+@instrument_pipeline
 class Cosmos3OmniDiffusersPipeline(
     nn.Module,
     PipelineParallelMixin,
@@ -1088,6 +1091,11 @@ class Cosmos3OmniDiffusersPipeline(
         _validate_cosmos3_pp_model_offload(od_config, resolved_offload.strategy)
         self.device = get_local_device()
         self.dtype = od_config.dtype
+
+        from .numerical_precision import configure_numerical_precision
+
+        if configure_numerical_precision(self.device, self.dtype):
+            logger.info("Cosmos3 strict FP32 precision enabled on %s (TF32/HF32 disabled)", self.device)
 
         model_path = od_config.model
         local_files_only = os.path.exists(model_path)
@@ -2527,6 +2535,13 @@ class Cosmos3OmniDiffusersPipeline(
             res_tmpl = None
         requested_aspect_ratio = self._get_sp_param(sp, "aspect_ratio", None)
         prompt_aspect_ratio = _json_object_aspect_ratio(prompt)
+        if self._get_sp_param(sp, "policy_profile", None) in {
+            "libero10_native_nonstream_v1",
+            "libero10_native_constant_v1",
+        }:
+            # Training names the 320x192 canvas "16,9"; reducing the actual
+            # dimensions to 5:3 would change the native tokenized caption.
+            aspect_ratio_override = prompt_aspect_ratio
         metadata_aspect_ratio = requested_aspect_ratio if requested_aspect_ratio is not None else prompt_aspect_ratio
         canvas_aspect_ratio = aspect_ratio_override or _aspect_ratio_for_dimensions(width, height)
         normalized_metadata_ratio = _normalize_aspect_ratio(metadata_aspect_ratio)
@@ -3016,6 +3031,77 @@ class Cosmos3OmniDiffusersPipeline(
         cfg_parallel = self._cfg_parallel_active() and do_cfg
         pp_active = self._pp_parallel_active()
         step_scheduler = scheduler if scheduler is not None else self.scheduler
+        shared_kwargs = dict(shared_kwargs)
+        action_schedule = shared_kwargs.pop("_action_schedule", "default")
+        has_alpha = float(shared_kwargs.pop("_has_alpha", 0.6))
+        has_u0 = float(shared_kwargs.pop("_has_u0", 0.9))
+        has_formula = shared_kwargs.pop("_has_formula", "paper_v3")
+        action_stream = shared_kwargs.pop("_action_stream", None)
+        early_stop_actions = shared_kwargs.pop("_early_stop_actions", None)
+        sampler_metrics = shared_kwargs.pop("_sampler_metrics", None)
+        if early_stop_actions is not None:
+            if (
+                type(early_stop_actions) is not int
+                or action_latents is None
+                or not 1 <= early_stop_actions <= action_latents.shape[1]
+                or action_schedule not in {"constant_euler", "has_euler"}
+            ):
+                raise ValueError("early_stop_actions requires an Euler action schedule and integer 1 <= K <= H")
+        global_times = action_times = None
+        if action_schedule != "default":
+            if pp_active:
+                raise ValueError("Cosmos3 Euler action schedules currently require pipeline parallel size 1")
+            if action_schedule not in {"constant_euler", "has_euler"} or action_latents is None:
+                raise ValueError("Euler action schedules require action latents and a supported schedule")
+            if not 0 < has_alpha <= 1 or not 0 <= has_u0 < 1 or has_formula not in {"paper_v1", "paper_v3"}:
+                raise ValueError("Invalid HAS parameters")
+            global_times = torch.linspace(1, 0, len(timesteps) + 1, device=latents.device, dtype=torch.float32)
+            horizon = action_latents.shape[1]
+            from .has_schedule import compute_has_local_times
+
+            action_times = compute_has_local_times(
+                global_times[:, None, None],
+                torch.zeros(1, dtype=torch.long, device=latents.device),
+                horizon,
+                alpha=has_alpha,
+                u0=has_u0,
+                formula=has_formula,
+            )[:, 0]
+            if action_schedule == "constant_euler":
+                action_times = global_times[:, None].expand(-1, horizon)
+            timesteps = global_times[:-1] * 1000.0
+        current_step = 0
+        publisher = None
+        ready_schedule = None
+        if early_stop_actions is not None or action_stream is not None:
+            # Match Framework: use the original device time grid, synchronize
+            # readiness once, and check the completed prefix after each update.
+            if action_times is None:
+                raise ValueError("Action readiness requires an Euler action schedule")
+            ready_schedule = (action_times <= 1e-6).detach().cpu()
+        if action_stream is not None:
+            if action_schedule != "has_euler" or action_latents.shape[:2] != (1, 16):
+                raise ValueError("Action streaming requires batch=1, horizon=16 and HAS-Euler")
+            if not isinstance(action_stream, dict) or action_stream.get("version") != 1:
+                raise ValueError("Unsupported Cosmos3 action stream protocol")
+            if _is_rank_zero():
+                from vllm_omni.entrypoints.cosmos3.action_ready_stream import ActionReadyPublisher
+
+                publisher = ActionReadyPublisher(
+                    action_stream["callback_url"], len(timesteps), early_stop_actions or action_latents.shape[1]
+                )
+
+        def _prefix_complete() -> bool:
+            return early_stop_actions is not None and bool(ready_schedule[current_step + 1, :early_stop_actions].all())
+
+        def _set_action_time(step_index: int) -> None:
+            nonlocal current_step
+            current_step = step_index
+            if action_schedule == "has_euler":
+                shared_kwargs["action_timesteps"] = (
+                    (action_times[step_index] * 1000).unsqueeze(0).expand(action_latents.shape[0], -1)
+                )
+
         # Session-keyed UND K/V (RFC #4480); None => bespoke transformer-instance cache.
         kv_state = self._new_cosmos3_state(session_id)
         self._kv_reset_und(kv_state)
@@ -3155,7 +3241,14 @@ class Cosmos3OmniDiffusersPipeline(
                 action_pred = action_pred * action_velocity_mask
                 if raw_action_dim is not None and 0 < raw_action_dim < action_pred.shape[-1]:
                     action_pred[..., raw_action_dim:] = 0
-            if action_latents is None and sound_latents is None:
+            if global_times is not None:
+                dt = global_times[current_step + 1] - global_times[current_step]
+                latents = latents + dt * video_pred.float()
+                action_dt = (action_times[current_step + 1] - action_times[current_step])[None, :, None]
+                action_latents = action_latents + action_dt * action_pred.float()
+                if sound_latents is not None:
+                    sound_latents = sound_latents + dt * sound_pred.float()
+            elif action_latents is None and sound_latents is None:
                 latents = self._scheduler_step_via_pp_driver(
                     video_pred, t, latents, step_scheduler=step_scheduler, generator=generator
                 )
@@ -3188,6 +3281,13 @@ class Cosmos3OmniDiffusersPipeline(
                 action_latents = (
                     action_velocity_mask * action_latents + (1.0 - action_velocity_mask) * action_condition_latents
                 )
+            if publisher is not None:
+                ready = ready_schedule[current_step + 1]
+                newly_ready = ready & ~ready_schedule[current_step]
+                if bool(newly_ready.any()):
+                    publisher.after_step(
+                        current_step, len(timesteps), [action_latents[0]], newly_ready[None], ready[None]
+                    )
             outputs = [latents]
             if action_latents is not None:
                 outputs.append(action_latents)
@@ -3219,6 +3319,7 @@ class Cosmos3OmniDiffusersPipeline(
                 cfg_rank_is_negative = get_classifier_free_guidance_rank() != 0
                 for step_index, t in enumerate(self.progress_bar(timesteps)):
                     self._set_denoise_step_metadata(step_index, timesteps, step_scheduler)
+                    _set_action_time(step_index)
                     self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     # Outside the interval, scale=1 makes the combined output equal
@@ -3254,6 +3355,8 @@ class Cosmos3OmniDiffusersPipeline(
                     if kv_state is not None:
                         self._kv_capture_und(kv_state, is_negative=cfg_rank_is_negative)
                     _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
+                    if _prefix_complete():
+                        break
 
             elif do_cfg:
                 cond_cache: tuple = (None, None)
@@ -3262,6 +3365,7 @@ class Cosmos3OmniDiffusersPipeline(
 
                 for step_index, t in enumerate(self.progress_bar(timesteps)):
                     self._set_denoise_step_metadata(step_index, timesteps, step_scheduler)
+                    _set_action_time(step_index)
                     self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     cfg_active = _cfg_active_at(t)
@@ -3320,12 +3424,15 @@ class Cosmos3OmniDiffusersPipeline(
                         noise_pred = noise_cond
 
                     _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
+                    if _prefix_complete():
+                        break
 
             else:
                 # No CFG: a single cond branch per step. Bespoke (state None) keeps
                 # using the transformer-instance cache exactly as before.
                 for step_index, t in enumerate(self.progress_bar(timesteps)):
                     self._set_denoise_step_metadata(step_index, timesteps, step_scheduler)
+                    _set_action_time(step_index)
                     self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     self._kv_load_und(kv_state, is_negative=False)
@@ -3342,11 +3449,19 @@ class Cosmos3OmniDiffusersPipeline(
                     if kv_state is not None:
                         self._kv_capture_und(kv_state, is_negative=False)
                     _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
+                    if _prefix_complete():
+                        break
+            if sampler_metrics is not None:
+                sampler_metrics.update(denoise_steps=current_step + 1, requested_denoise_steps=len(timesteps))
+            if publisher is not None:
+                publisher.verify_complete()
         finally:
             # Conditioning is request-local and no longer needed by VAE decode.
             # Dropping session state alone leaves these transformer aliases live.
             self.transformer.reset_cache()
             self._clear_denoise_step_metadata()
+            if publisher is not None:
+                publisher.close()
             self._reset_mixed_precision()
             # Cosmos3 currently receives a unique request_id rather than a
             # reusable rollout session id. Retaining its state would only pin
@@ -4270,6 +4385,38 @@ class Cosmos3OmniDiffusersPipeline(
         action_condition_latents = None
         raw_action_dim = None
         action_offset = 1
+        policy_profile = self._get_sp_param(sp, "policy_profile", None)
+        native_policy = policy_profile in {"libero10_native_nonstream_v1", "libero10_native_constant_v1"}
+        early_stop_actions = self._get_sp_param(sp, "early_stop_actions", None)
+        if early_stop_actions is not None:
+            if not native_policy or type(early_stop_actions) is not int or not 1 <= early_stop_actions <= 16:
+                raise ValueError("early_stop_actions requires a native LIBERO profile and integer 1 <= K <= 16")
+        if policy_profile is not None and not native_policy:
+            raise ValueError(f"Unsupported Cosmos3 policy_profile: {policy_profile!r}")
+        action_stream = self._get_sp_param(sp, "action_stream", None)
+        if action_stream is not None and policy_profile != "libero10_native_nonstream_v1":
+            raise ValueError("Action streaming requires the native LIBERO HAS policy profile")
+        native_frame_size = self._get_sp_param(sp, "native_frame_size", None) if native_policy else None
+        if native_policy:
+            if not action_enabled or action_mode != ACTION_MODE_POLICY or domain_id != 5:
+                raise ValueError("The native LIBERO profile requires LIBERO policy action mode")
+            if not isinstance(native_frame_size, (list, tuple)) or len(native_frame_size) != 4:
+                raise ValueError("The native LIBERO profile requires native_frame_size=[H,W,content_H,content_W]")
+            if list(native_frame_size[:2]) != [height, width]:
+                raise ValueError("native_frame_size canvas must match the request size")
+            if action_chunk_size != 16 or frame_rate != 20 or guidance_scale != 1:
+                raise ValueError("The native LIBERO profile requires 16 actions, 20 fps and guidance=1")
+            if num_inference_steps != 10 or self._get_sp_param(sp, "raw_action_dim", 10) != 10:
+                raise ValueError("The native LIBERO profile requires 10 denoising steps and raw_action_dim=10")
+            expected_schedule = "constant_euler" if policy_profile == "libero10_native_constant_v1" else "has_euler"
+            native_schedule = (
+                self._get_sp_param(sp, "action_time_schedule", expected_schedule),
+                self._get_sp_param(sp, "faster_formula", "paper_v3"),
+                self._get_sp_param(sp, "faster_alpha", 0.6),
+                self._get_sp_param(sp, "faster_u0", 0.9),
+            )
+            if native_schedule != (expected_schedule, "paper_v3", 0.6, 0.9):
+                raise ValueError(f"Native LIBERO profile requires {expected_schedule}, paper_v3, alpha=0.6, u0=0.9")
         if action_enabled:
             if action_video_tensor is not None and action_video_tensor.ndim == 4:
                 action_video_tensor = action_video_tensor.unsqueeze(0)
@@ -4298,6 +4445,15 @@ class Cosmos3OmniDiffusersPipeline(
             raw_action_dim = int(raw_action_dim_param) if raw_action_dim_param is not None else None
             clean_action = None
             action_condition_indexes = None
+            if getattr(self, "enable_diffusion_pipeline_profiler", False):
+                raise ValueError("Disable diffusion pipeline profiling for MoH policy timing")
+            if action_video_tensor is not None:
+                action_video_tensor = self._to_vae_device(action_video_tensor)
+            elif image_tensor is not None:
+                image_tensor = self._to_vae_device(image_tensor)
+            # Tokenization, observation transforms and input H2D are outside;
+            # noise, VAE/prefix encoding and all sampling iterations are inside.
+            sampling_start = time.monotonic()
             action_prepared = self._prepare_action_latents(
                 mode=action_mode,
                 action_chunk_size=action_chunk_size,
@@ -4310,6 +4466,8 @@ class Cosmos3OmniDiffusersPipeline(
             action_latents, action_velocity_mask, action_condition_latents, raw_action_dim = action_prepared
             action_offset = action_start_frame_offset(action_mode, action_chunk_size, num_frames)
 
+        if native_policy and action_video_tensor is None and image_tensor is not None:
+            action_video_tensor = image_tensor.unsqueeze(2)
         if action_enabled and action_video_tensor is not None:
             latents, velocity_mask, condition_latents = self._prepare_latents_action_video(
                 action_video_tensor,
@@ -4318,6 +4476,7 @@ class Cosmos3OmniDiffusersPipeline(
                 width,
                 num_frames,
                 generator,
+                image_size=native_frame_size,
             )
             image_latent = condition_latents[:, :, 0:1]
         elif is_v2v:
@@ -4352,6 +4511,24 @@ class Cosmos3OmniDiffusersPipeline(
             image_latent = None
             condition_latents = None
 
+        if native_policy:
+            # Native uses independent NumPy RandomState(seed) streams for each
+            # modality and accumulates Euler updates in fp32.
+            def _native_noise(shape):
+                array = np.random.RandomState(seed).standard_normal(tuple(shape[1:])).astype(np.float32)
+                return torch.from_numpy(array).unsqueeze(0).to(self.device)
+
+            latents = (
+                velocity_mask.float() * _native_noise(latents.shape)
+                + (1 - velocity_mask.float()) * condition_latents.float()
+            )
+            action_noise = _native_noise(action_latents.shape)
+            action_noise[..., raw_action_dim:] = 0
+            action_latents = (
+                action_velocity_mask.float() * action_noise
+                + (1 - action_velocity_mask.float()) * action_condition_latents.float()
+            )
+
         T_latent = latents.shape[2]
         H_latent = latents.shape[3]
         W_latent = latents.shape[4]
@@ -4370,6 +4547,17 @@ class Cosmos3OmniDiffusersPipeline(
 
         # --- Denoising loop ---
         shared_kwargs = dict(video_shape=video_shape, fps=frame_rate)
+        sampler_metrics = {}
+        if native_policy:
+            shared_kwargs.update(
+                _action_schedule=self._get_sp_param(sp, "action_time_schedule", expected_schedule),
+                _has_alpha=self._get_sp_param(sp, "faster_alpha", 0.6),
+                _has_u0=self._get_sp_param(sp, "faster_u0", 0.9),
+                _has_formula=self._get_sp_param(sp, "faster_formula", "paper_v3"),
+                _action_stream=action_stream,
+                _early_stop_actions=early_stop_actions,
+                _sampler_metrics=sampler_metrics,
+            )
         if velocity_mask is not None:
             shared_kwargs["noisy_frame_mask"] = velocity_mask
         if action_enabled:
@@ -4434,11 +4622,16 @@ class Cosmos3OmniDiffusersPipeline(
             else:
                 latents = diffusion_output
 
+        # Stop before output D2H/NumPy conversion, video decode, serialization
+        # or persistence, exactly as MoH's sample_actions call boundary does.
+        policy_timing = {"infer_ms": (time.monotonic() - sampling_start) * 1000} if action_enabled else None
+
         # --- Decode ---
         if _is_rank_zero():
             logger.info("Decoding video...")
         decode_start = time.time()
-        video = self._decode_latents(latents)
+        action_only = native_policy and not bool(self._get_sp_param(sp, "return_video", True))
+        video = None if action_only else self._decode_latents(latents)
         if _is_rank_zero():
             logger.info("Video decoded in %.2fs", time.time() - decode_start)
             if not sound_enabled:
@@ -4462,18 +4655,26 @@ class Cosmos3OmniDiffusersPipeline(
         if action_enabled:
             if action_latents is None or raw_action_dim is None or domain_id is None:
                 raise ValueError("Cosmos3 action generation finished without action latents.")
-            action = action_latents[:, :, :raw_action_dim].detach().cpu()
+            action = action_latents[:, :early_stop_actions, :raw_action_dim].detach().cpu()
+            payload = {"actions": action}
+            if video is not None:
+                payload["video"] = video
             return DiffusionOutput(
                 output={
-                    "payload": {
-                        "video": video,
-                        "actions": action,
-                    },
+                    "payload": payload,
                     "metadata": {
+                        **({"common": {"action_only_output": action_only}} if native_policy else {}),
                         "actions": {
                             "raw_action_dim": raw_action_dim,
                             "action_mode": action_mode,
                             "domain_id": domain_id,
+                            **({
+                                "policy_timing": policy_timing,
+                                "timing_contract": MOH_TIMING_CONTRACT,
+                                "policy_profile": policy_profile,
+                                "early_stop_actions": early_stop_actions,
+                                **sampler_metrics,
+                            } if native_policy else {}),
                         },
                     },
                 },

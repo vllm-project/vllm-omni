@@ -174,7 +174,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         return "vllm_omni.platforms.npu.worker.npu_generation_worker.NPUGenerationWorker"
 
     @classmethod
-    def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
+    def init_diffusion_worker_vllm_config(cls, vllm_config: Any, od_config: Any = None) -> None:
         from vllm_ascend.ascend_config import init_ascend_config
         from vllm_ascend.utils import adapt_patch
 
@@ -182,7 +182,16 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         # NPUWorker constructor, where worker-local patches are normally
         # installed.  In particular, AscendBlockTables needs the patched
         # non-UVA buffer implementation on NPU.
-        adapt_patch()
+        # Unpaged Cosmos uses Torch SDPA and no AR block tables. Importing
+        # AR worker patches here unnecessarily requires unrelated Qwen model
+        # modules from an unreleased vLLM checkout.
+        unpaged_cosmos = (
+            od_config is not None
+            and getattr(od_config, "model_class_name", None) == "Cosmos3OmniPipeline"
+            and getattr(od_config, "diffusion_kv_mode", None) in (None, "dense_legacy")
+        )
+        if not unpaged_cosmos:
+            adapt_patch()
         init_ascend_config(vllm_config)
 
         # Register Ascend LoRA classes for generic vLLM from_layer paths.

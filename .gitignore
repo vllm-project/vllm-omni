@@ -296,3 +296,16 @@ lance_compare/
 
 # Linting binaries downloaded by local pre-commit hooks
 shellcheck*/
+
+# Local Cosmos3 deployment files and benchmark assets
+/.runtime/
+/.cosmos3-native/
+/.cosmos3-renderer/
+/.cosmos3-env/
+/MUJOCO_LOG.TXT
+/uv
+/render-support.tar.gz
+/plugins/cosmos3_client/vllm_omni_cosmos3_client/_vendor/
+/examples/cosmos3/environment/
+
+!/vllm_omni/entrypoints/cosmos3/libero_native_frame_wise_relative_rot6d.json

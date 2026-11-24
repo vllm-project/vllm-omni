@@ -433,6 +433,12 @@ class VideoAction(BaseModel):
     raw_action_dim: int | None = Field(default=None, description="Raw action dimension requested by the model")
     action_mode: str | None = Field(default=None, description="Action generation mode")
     domain_id: int | None = Field(default=None, description="Action embodiment domain id")
+    policy_profile: str | None = Field(default=None, description="Policy preprocessing and sampling profile executed")
+    early_stop_actions: int | None = Field(default=None, description="Requested completed action prefix length")
+    denoise_steps: int | None = Field(default=None, description="Actual Euler sampling iterations executed")
+    requested_denoise_steps: int | None = Field(default=None, description="Original sampling grid length")
+    policy_timing: dict[str, float] | None = Field(default=None, description="Worker sampler wall time in milliseconds")
+    timing_contract: str | None = Field(default=None, description="Versioned model timing boundary")
 
 
 class VideoData(BaseModel):
