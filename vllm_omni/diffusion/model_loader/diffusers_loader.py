@@ -1057,11 +1057,17 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         An encoder added to the plan in that topology would therefore skip its
         ordinary weight source without anyone realizing it from the plan, so
         ``dit_mmap_ready`` keeps the encoder on the ordinary loader instead.
+
+        A rank that owns no encoder shard holds a weight-less stub. It has no
+        weight source to plan from, and planning it would fail the whole plan,
+        the DiT included, so the stub stays on the ordinary loader.
         """
         if plan is None or not selected or not dit_mmap_ready:
             return ()
         selected_encoders: list[tuple[str, nn.Module]] = []
         for name, encoder in zip(modules.encoder_names, modules.encoders):
+            if getattr(encoder, "is_loaded", True) is False:
+                continue
             if encoder_component_type(name, plan) != TEXT_ENCODER_COMPONENT:
                 continue
             requested = plan.component_backing.get(name)

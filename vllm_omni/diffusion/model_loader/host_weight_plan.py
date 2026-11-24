@@ -477,7 +477,29 @@ def build_checkpoint_binding_plan(
 
         _validate_source_metadata(required, bindings)
     except (OSError, ValueError, _PlanIncompatibleError) as exc:
-        return HostWeightPlanResult(None, str(exc))
+        if not (encoder_modules and dit_modules):
+            return HostWeightPlanResult(None, str(exc))
+        # An encoder is planned only through its own source and name mapping,
+        # so a failure that disappears without it is encoder-specific, for
+        # example a TP-sharded runtime shape. The DiT must not fall back to the
+        # ordinary loader and materialize in full for that; plan it alone. The
+        # encoder then keeps its ordinary weight source like any unplanned one.
+        logger.info(
+            "Text encoder(s) %s cannot join the checkpoint-mmap plan (%s); planning the DiT alone",
+            [component_path for component_path, _module in encoder_modules],
+            exc,
+        )
+        dit_only = build_checkpoint_binding_plan(
+            pipeline,
+            dit_modules=dit_modules,
+            sources=sources,
+            model_path=model_path,
+            tensor_parallel_size=tensor_parallel_size,
+            online_quantization=online_quantization,
+            use_pipeline_key_remap=use_pipeline_key_remap,
+            has_distilled_lora=has_distilled_lora,
+        )
+        return dit_only
 
     return HostWeightPlanResult(
         HostWeightPlan(
