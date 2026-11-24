@@ -25,117 +25,79 @@ eight-step distilled schedule. Both used BF16 eager mode,
 Ulysses sequence parallelism with replicated weights. Some base runs
 overlapped checkpoint downloads to shared storage.
 
-Measured on an Atlas 900 A3 SuperPoD compute node with an arm64 host,
-CANN 9.3.0, Ascend driver 26.1.1, PyTorch 2.10.0, and torch-npu
-2.10.0.post7. The vLLM-Omni image was `v0.34.0-a3` with OCI index
-`sha256:584e105786b352505427ef81b9080b90267e12114462221f3db41b7988eb044b`.
-
-At concurrency 1, the client decoded each response as one 1024×1024 PNG.
-Each profile ran two rounds of one warm-up and five timed requests. Round 1
-used `p20` for warm-up and `p01` through `p05` for timing. Round 2 used
-`p19` for warm-up and `p06` through `p10` for timing.
+Tests ran on one Atlas 900 A3 SuperPoD node at 1024×1024 and concurrency 1.
+Each profile ran two rounds with one warm-up and five timed requests each.
+The warm-ups used `p20` and `p19`. Timed requests used `p01` through `p10` in order.
 [Prompt corpus](../../benchmarks/diffusion/h3-image-prompts.jsonl)
 
 P50 is the median of ten request latencies measured through receipt of the
 full HTTP response. Peak extra HBM is the largest increase over each die's
-pre-launch reading. The sampler waited three seconds between `npu-smi info` calls.
+pre-launch reading. The runs used `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`
+and sampled HBM with `npu-smi info`, with three seconds between calls.
 
 ### A3 checkpoint
 
-Download the checkpoint into a persistent model directory on the host.
+Download the checkpoints on the host.
 
 ```bash
-export MODEL_ROOT=/path/to/models
-modelscope download --model Qwen/Qwen-Image-2.1 \
-  --local_dir "${MODEL_ROOT}/Qwen-Image-2.1" --max-workers 8
-modelscope download --model Qwen/Qwen-Image-2.1-Turbo \
-  --local_dir "${MODEL_ROOT}/Qwen-Image-2.1-Turbo" --max-workers 8
+modelscope download --model Qwen/Qwen-Image-2.1 --local_dir ./models/Qwen-Image-2.1
+modelscope download --model Qwen/Qwen-Image-2.1-Turbo --local_dir ./models/Qwen-Image-2.1-Turbo
 ```
-
-Use the same Diffusers layout for Hugging Face downloads. Each directory needs
-`model_index.json` plus the text encoder, DiT, and VAE weights.
 
 ### A3 environment
 
-Use `quay.io/ascend/vllm-omni:v0.34.0-a3` with an installed Ascend driver.
-See the [NPU installation guide](../../docs/getting_started/installation/npu.md)
-for the host requirements.
-
-#### Start the container
-
-Check device use with `npu-smi info`. Use `npu-smi info -m` to map logical
-IDs to physical cards. For 2, 4, or 8 dies, select both dies on each card.
-
-```bash
-export IMAGE=quay.io/ascend/vllm-omni:v0.34.0-a3
-export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11
-IFS=, read -r -a dies <<< "${ASCEND_RT_VISIBLE_DEVICES}"
-device_args=()
-for die in "${dies[@]}"; do
-  device_args+=(--device "/dev/davinci${die}")
-done
-
-docker run --rm -it --init --privileged --network host --shm-size 16g \
-  "${device_args[@]}" \
-  --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc \
-  -v /usr/local/dcmi:/usr/local/dcmi:ro \
-  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
-  -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64:ro \
-  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info:ro \
-  -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
-  -v "${MODEL_ROOT}:/models:ro" \
-  -e ASCEND_RT_VISIBLE_DEVICES -e "NPU_DIES=${#dies[@]}" \
-  "${IMAGE}" bash
-```
+Use `quay.io/ascend/vllm-omni:v0.34.0-a3` with `--privileged` and
+`--network host` in place of port mapping. Mount `./models` at `/models`.
+Expose the selected free dies and set `ASCEND_RT_VISIBLE_DEVICES` to their
+logical IDs. Use `npu-smi info -m` to select both dies on each physical card
+for the 2-, 4-, and 8-die profiles.
+[NPU Docker setup](../../docs/getting_started/installation/npu.md#set-up-using-docker)
 
 ### Start an A3 server
 
-Run this in the container. Set `MODEL_ID` to `Qwen/Qwen-Image-2.1-Turbo`
-to serve Turbo.
+Run one of these commands in the container. For 1, 2, or 4 dies, set both
+`--num-gpus` and `--usp` to the selected die count.
+
+#### Qwen-Image-2.1
 
 ```bash
-export MODEL_ID=Qwen/Qwen-Image-2.1
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 VLLM_TARGET_DEVICE=npu
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export HCCL_NPU_SOCKET_PORT_RANGE=auto
-
-vllm serve "/models/${MODEL_ID##*/}" --omni \
-  --host 127.0.0.1 --port 18089 --served-model-name "${MODEL_ID}" \
+vllm serve /models/Qwen-Image-2.1 --omni \
+  --host 127.0.0.1 --port 18089 --served-model-name Qwen/Qwen-Image-2.1 \
   --dtype bfloat16 --enforce-eager --trust-remote-code --max-num-seqs 1 \
-  --num-gpus "${NPU_DIES}" --usp "${NPU_DIES}" --ulysses-mode strict
+  --num-gpus 8 --usp 8 --ulysses-mode strict
 ```
 
-### Request and verification
+#### Qwen-Image-2.1-Turbo
 
-Set the same `MODEL_ID` in a second shell.
+```bash
+vllm serve /models/Qwen-Image-2.1-Turbo --omni \
+  --host 127.0.0.1 --port 18089 --served-model-name Qwen/Qwen-Image-2.1-Turbo \
+  --dtype bfloat16 --enforce-eager --trust-remote-code --max-num-seqs 1 \
+  --num-gpus 8 --usp 8 --ulysses-mode strict
+```
+
+### Text-to-image request
 
 ```bash
 set -o pipefail
-curl -fsS http://127.0.0.1:18089/v1/models | jq -r '.data[].id'
-
-sampling='{"true_cfg_scale":1.0,"num_inference_steps":20}'
-if [[ "${MODEL_ID}" == Qwen/Qwen-Image-2.1-Turbo ]]; then
-  sampling='{"true_cfg_scale":1.0}'
-fi
-jq -nc --arg model "${MODEL_ID}" --argjson sampling "${sampling}" \
-  '{model:$model,prompt:"A ceramic teapot on a wooden table",size:"1024x1024",
-    n:1,seed:42,generator_device:"cpu",response_format:"b64_json",
-    output_format:"png"} + $sampling' \
-  | curl -fsS http://127.0.0.1:18089/v1/images/generations \
-      -H 'Content-Type: application/json' --data-binary @- \
-  | jq -er '.data[0].b64_json' | base64 -d > qwen-image.png
-
-python - <<'PYTHON'
-from PIL import Image
-
-with Image.open("qwen-image.png") as image:
-    image.load()
-    assert image.format == "PNG" and image.size == (1024, 1024)
-PYTHON
+curl -fsS http://127.0.0.1:18089/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"Qwen/Qwen-Image-2.1",
+    "prompt":"A ceramic teapot on a wooden table",
+    "size":"1024x1024",
+    "n":1,
+    "num_inference_steps":20,
+    "true_cfg_scale":1.0,
+    "seed":42,
+    "generator_device":"cpu",
+    "response_format":"b64_json",
+    "output_format":"png"
+  }' | jq -er '.data[0].b64_json' | base64 -d > qwen-image.png
 ```
 
-The A3 measurements cover text-to-image. For the image-editing API, see the
+For Turbo, set `model` to `Qwen/Qwen-Image-2.1-Turbo` and omit
+`num_inference_steps` to use its eight-step schedule. For the image-editing API, see the
 [Qwen-Image-2.1 recipe](Qwen-Image-2.1.md#online-serving).
 
 ## Atlas 800I A2

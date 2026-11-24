@@ -24,56 +24,34 @@ The DiT and text encoder used BF16 in eager mode, and the VAE used
 FP32. Requests used 50 denoising steps, CFG 3, flow shift 5, seed 0,
 and a CPU random generator.
 
-Measured on an Atlas 900 A3 SuperPoD compute node with an arm64 host,
-CANN 9.3.0, Ascend driver 26.1.1, PyTorch 2.10.0, and torch-npu
-2.10.0.post7. The vLLM-Omni image was `v0.34.0-a3` with OCI index
-`sha256:584e105786b352505427ef81b9080b90267e12114462221f3db41b7988eb044b`.
-
-At concurrency 1, the client decoded each response as one 1024×1024 PNG.
-Each profile ran two rounds of one warm-up and five timed requests. Round 1
-used `p20` for warm-up and `p01` through `p05` for timing. Round 2 used
-`p19` for warm-up and `p06` through `p10` for timing.
-[Prompt corpus](../../benchmarks/diffusion/h3-image-prompts.jsonl)
-
-P50 is the median of ten request latencies measured through receipt of the
-full HTTP response. Peak extra HBM is the largest increase over each die's
-pre-launch reading. The sampler waited three seconds between `npu-smi info` calls.
+Tests ran on one Atlas 900 A3 SuperPoD node at 1024×1024 and concurrency 1.
+The runs followed the same prompt order, warm-ups, and measurement method as the
+[Qwen A3 baseline](../Qwen/Qwen-Image-2.1-NPU.md#ascend-a3-performance).
 
 ## Checkpoint
 
 ```bash
-export MODEL_ROOT=/path/to/models
-modelscope download --model openmoss/MOSS-Image-Base \
-  --local_dir "${MODEL_ROOT}/MOSS-Image-Base" --max-workers 8
+modelscope download --model openmoss/MOSS-Image-Base --local_dir ./models/MOSS-Image-Base
 ```
 
-## Environment
+## Start the server
 
-Use `quay.io/ascend/vllm-omni:v0.34.0-a3`. The container command mounts
-`MODEL_ROOT` at `/models` and sets `NPU_DIES` from the selected logical IDs.
-[A3 container setup](../Qwen/Qwen-Image-2.1-NPU.md#start-the-container)
-
-## Command
+Mount the model directory and select the dies as described in the
+[A3 container setup](../Qwen/Qwen-Image-2.1-NPU.md#a3-environment).
+For 1, 2, or 4 dies, set both `--num-gpus` and `--tensor-parallel-size`
+to the selected die count.
 
 ```bash
-export MODEL_ID=OpenMOSS-Team/MOSS-Image-Base
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 VLLM_TARGET_DEVICE=npu
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export HCCL_NPU_SOCKET_PORT_RANGE=auto
-
-vllm serve "/models/${MODEL_ID##*/}" --omni \
-  --host 127.0.0.1 --port 18089 --served-model-name "${MODEL_ID}" \
+vllm serve /models/MOSS-Image-Base --omni \
+  --host 127.0.0.1 --port 18089 --served-model-name OpenMOSS-Team/MOSS-Image-Base \
   --dtype bfloat16 --enforce-eager --trust-remote-code --max-num-seqs 1 \
-  --num-gpus "${NPU_DIES}" --tensor-parallel-size "${NPU_DIES}"
+  --num-gpus 8 --tensor-parallel-size 8
 ```
 
-## Request and verification
+## Text-to-image request
 
 ```bash
 set -o pipefail
-curl -fsS http://127.0.0.1:18089/v1/models | jq -r '.data[].id'
-
 curl -fsS http://127.0.0.1:18089/v1/images/generations \
   -H 'Content-Type: application/json' \
   -d '{
@@ -89,12 +67,4 @@ curl -fsS http://127.0.0.1:18089/v1/images/generations \
     "response_format":"b64_json",
     "output_format":"png"
   }' | jq -er '.data[0].b64_json' | base64 -d > moss-image.png
-
-python - <<'PYTHON'
-from PIL import Image
-
-with Image.open("moss-image.png") as image:
-    image.load()
-    assert image.format == "PNG" and image.size == (1024, 1024)
-PYTHON
 ```
