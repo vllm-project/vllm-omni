@@ -942,6 +942,7 @@ It never contains client text.
 | Qwen3-Omni | As a tool message on the next prompt, for every reason except a suppressed repeat. A notice does not start a response by itself. |
 | Nemotron VoiceChat | On the function channel of the open request. After an epoch cancellation the model is told only if it repeats the call. |
 | JoyAI-VL-Interaction | As a delegated result on the next observation. After an epoch cancellation the question does not resurface, and the model is told only if it asks again. |
+| Realtime-Venus Omni | As a `<backend>` result on the next native input unit. After epoch cancellation, the notice is sent only if the model repeats the call. |
 
 **Interruptions.** `extra_body.function_call_interrupt_policy` sets what an epoch advance
 does to pending calls. It is fixed at session open. With `cancel` (the default),
@@ -965,14 +966,14 @@ model sets them; a client only reads them.
 | --- | --- | --- |
 | `none` | The model has no tool support. Non-empty `tools` is refused with `tools_unsupported`. | MiniCPM-o, PersonaPlex, Aura |
 | `declared` | The client defines the tools. The model reads their name, description and parameters in its prompt and calls them by name. | Qwen3-Omni, Nemotron VoiceChat |
-| `delegate_only` | The model has one built-in function, `delegate`, which hands a plain-language question to the application. Other tools are refused. | JoyAI-VL-Interaction |
+| `delegate_only` | The model has one built-in function, `delegate`, which hands a plain-language question to the application. Other tools are refused. | JoyAI-VL-Interaction, Realtime-Venus Omni |
 
 `function_call_output_continuation` values:
 
 | Value | What the client does after `function_call_output` | Models |
 | --- | --- | --- |
 | `client_response_create` | Send `response.create`. The model is turn-based, and the result is used in the response that event opens. Without it, the result waits for the next user turn. | Qwen3-Omni |
-| `automatic` | Nothing more. The result is fed into a later frame of the running request, and the model continues by itself. | Nemotron VoiceChat |
+| `automatic` | No `response.create`. The result is fed into a later frame of the running request. Keep streaming input or silence for native model time. | Nemotron VoiceChat, Realtime-Venus Omni |
 | `next_observation` | Nothing more. The next camera commit carries the result. To have it spoken, send a short user turn such as "Answer now with the result you received." | JoyAI-VL-Interaction |
 | `none` | Not applicable: the model has no tool support. | MiniCPM-o, PersonaPlex, Aura |
 
@@ -1061,6 +1062,17 @@ so audio playback and ACKs are not needed. List all flags with:
 ```bash
 python -m vllm_omni.clients.tool_calls --help
 ```
+
+For native input, replace `--prompt` with `--input-wav` (mono PCM16, 16 kHz),
+or `--initial-user-text` on a model that supports initial text seeding. These
+modes stream silence after the supplied input until the timeout, so tools run
+alongside incoming audio and native models can continue their answer. Native
+input requests text and audio; use `--output-wav answer.wav` to save the speech.
+For offline probes, `--ack-collected-audio` explicitly simulates immediate
+playback of received audio. Interactive applications must acknowledge audio
+actually played. See the
+[Venus tool examples](gh-file:recipes/inclusionAI/Realtime-Venus.md#tool-execution)
+for local arithmetic, inventory lookup and voice requests.
 
 Deployment setting `duplex_session.max_tool_calls_per_session` (default 4096)
 bounds the records one session may track, pending calls and settled tombstones

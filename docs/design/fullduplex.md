@@ -649,6 +649,7 @@ vllm_omni/
 │       ├── turn_detection.py        server-side VAD turn detector used by the session
 │       ├── audio.py                 compatibility re-export, via protocol/duplex
 │       ├── vad.py / intermediate.py
+│       ├── response_judge.py        post-ASR judge: does a committed turn need a reply
 │       └── session/                 one engine-resident session and everything that runs it
 │           ├── engine_session.py    DuplexEngineSession: ledgers, lease, fence, stage resources, append sequencing
 │           ├── runner.py            DuplexSessionRunner (per-session mailbox on the orchestrator loop)
@@ -1294,6 +1295,14 @@ cannot reopen a retired gate; the early-stop marker is removed at response end.
 A successful write is not proof of server acceptance, and the runner never sends
 playback ACKs on behalf of the application.
 
+The output-decision and concurrent-turn-release hooks receive the current
+request's streaming context. A host plugin can use that context to share a
+decision with its stage-input bridge without retaining request state on the
+shared plugin. For the optional response judge, AURA returns its listen
+decision from `decide_output`; the generic orchestrator does not interpret
+judge output. AURA resolves its stage roles in `configure_pipeline`, before
+serving requests, and rejects missing required roles or duplicate roles.
+
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage
 sampling defaults once the stage pools exist. Plugin hooks that may block
@@ -1475,6 +1484,15 @@ ending in U+FFFD may continue to complete its UTF-8 bytes when a positive
 cap is set. That cap keeps the token that crosses the target, then closes
 the chunk before another draw. Hard token and request caps retain priority;
 explicit `force_listen` bypasses only the soft character target.
+
+The listen decision takes the released `streaming_generate` knobs. A session
+created with `extra_body={"listen_prob_scale": s}` multiplies the listen logit
+by `s` after the repetition penalty, and `extra_body={"listen_top_k": k}`
+returns `<|listen|>` outright when it ranks within the top-`k` logits, before
+the final draw. Both default to neutral (`1.0` / unset) and are validated at
+session creation; they ride the append payload next to `force_listen` and
+cannot change once the session exists. An early listen never enters the
+repetition history, matching the reference decoder's early return.
 
 MiniCPM-o preserves the stage-2 sampled `<|turn_eos|>`, including after text
 without sentence-ending punctuation. The sampler does not infer whether an
@@ -1805,3 +1823,85 @@ cancels its tasks and releases its recordings.
   during playback; `--inline` drives the same scenario through
   `InlineDuplexClient`), `tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py`
   (admission, resume, takeover, expiry).
+
+## Realtime-Venus delegation speech condition
+
+Realtime-Venus selects the native duplex engine by default through
+`realtime_venus_omni.yaml`;
+`realtime_venus_omni_turn.yaml` selects the ordinary turn engine. Both
+profiles inherit the corresponding MiniCPM-o duplex or turn deployment,
+including its Flow precision, step count and stage settings.
+
+Realtime-Venus reuses the MiniCPM-o stage implementation. Its optional
+`delegate_open_token_id` and `delegate_close_token_id` belong to the model
+plugin's special-token metadata. At the native Thinker-to-Talker handoff,
+the bridge removes delegation delimiters and their enclosed token/hidden-state
+rows from speech conditioning while preserving the complete text output.
+Delegation parsing uses the full current unit, including a delimiter sampled
+in the opening decision slot. That decision updates the mute state even when
+it has no speech-condition row; the remaining speech rows retain MiniCPM's
+original alignment. Delimiter-only units still carry their text and mask
+transition, so a closing decision in a later unit can resume speech.
+The mask is request-local, continues across units, and resets at a new turn
+or the turn-end token. Delegation can also mask the turn-end speech row;
+dialogue termination is derived from the original Thinker unit.
+Models without these optional IDs retain their existing handoff.
+
+The Venus session plugin additionally projects one completed delegate span per
+model turn as the shared Realtime `delegate(question)` function. Parsing is
+request/turn-local and accepts spans split across text deltas. A repetition of
+the same completed span within that model turn cannot execute a second call.
+The application
+executes the call; the shared session ledger owns result admission, deadlines,
+repeat suppression and interruption policy. MiniCPM-o continues to advertise
+`tool_mode: none`.
+
+Accepted Venus results are tokenized as `<backend>result</backend>` into a
+bounded private runtime queue. The delimiters are encoded separately; reserved
+token spellings inside the result body are encoded as ordinary text, preserving
+their readable content without adding model control tokens.
+Results wait for a projected turn-end or genuine model-listen boundary;
+synthetic segment-complete listen events only schedule another unit and leave
+the result queued. Closing a delegate span alone does not end the foreground turn.
+An identical completed span repeated in a later unit also permits injection,
+so a model waiting for its backend cannot strand the accepted result in a loop.
+The next append reserves their exact token count and feeds them after that
+unit's media in the existing Thinker KV. They also
+belong to the unit's sliding-window history and reopen the speech gate after a
+completed turn. Ownership transfers to the stage only on successful submission;
+the commit removes only the submitted generations, retaining newer arrivals.
+Cancellation clears unsubmitted results; submitted requests retain the ordinary
+epoch fence. This is native duplex continuation, not HTTP `tool_calls` or the
+external Venus Harness/memory runtime.
+
+A fully muted unit following speech sets model-owned `meta.speech_flush`.
+The Talker appends only its audio-begin embedding to the existing condition,
+with a 26-token maximum and no minimum. The codec bridge drains pending frames
+and closes the vocoder stream, but does not set the dialogue `turn_end` or mark
+that dialogue turn as already terminal. These flags travel with the condition's
+sequence identity so delayed outputs cannot flush a later condition. The flag
+is explicitly false on subsequent units; it cannot stick through metadata merge.
+
+Repeated muted units and a bare turn terminator after the flush produce no new
+codec tokens. Speech resuming in the same dialogue turn replaces the Talker
+prompt/KV and starts a fresh vocoder stream. The first speech after initial
+delegation-only units also starts with fresh Talker prompt/KV and a zero minimum
+codec-token budget, even though there was no earlier speech to flush. Subsequent
+speech units continue normally. A new turn or request resets all delegation
+state. This keeps speech lifecycle independent of dialogue lifecycle.
+
+`meta.text_without_audio` opts Venus units into text delivery independent of
+speech generation. It travels through Talker and Code2Wav for every unit,
+including mixed delegation/speech units that sample codec EOS before producing
+any audio frames. The codec bridge consumes their pending text at the unit
+boundary; the data plane emits it once using the same cache-epoch/chunk-sequence
+deduplication as audio. It does not wait for later speech or replay the text with
+the next audible unit. Stock MiniCPM keeps its existing audio-gated delivery.
+Zero-frame flushes on a live native request carry a scheduling placeholder so
+the generation receiver retains their text and boundary metadata, including
+speech-only flushes with `last_chunk=True`. `code_flat_numel=0` keeps the
+placeholder out of vocoder input; it does not close the resumable request.
+
+This filtering does not execute delegated work or supply the external Venus
+memory runtime. The [Realtime-Venus recipe](gh-file:recipes/inclusionAI/Realtime-Venus.md)
+defines the currently exposed serving scope and validation limitations.

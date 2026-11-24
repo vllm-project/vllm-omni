@@ -48,8 +48,10 @@ from vllm_omni.diffusion.sched.interface import (
     StepBatchSamplingParamsKey,
     _AdmissionWaitDecision,
 )
+from vllm_omni.diffusion.utils.flow_matching import normalize_shift
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import per_sample_kv_count
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import absorb_attention_schedule_extra_args
 from vllm_omni.lora.utils import build_lora_batch_key
 
@@ -178,6 +180,14 @@ class BaseScheduler(ABC):
         return self._add_request_with_request_id(request.request_id, request)
 
     def _add_request_with_request_id(self, request_id: str, request: OmniDiffusionRequest) -> str:
+        extra_args = request.sampling_params.extra_args or {}
+        for name in ("flow_shift", "audio_flow_shift", "timestep_shift", "timesteps_shift"):
+            value = extra_args.get(name)
+            if value is not None:
+                try:
+                    normalize_shift(value, name=name)
+                except ValueError as exc:
+                    raise OmniClientError(str(exc)) from exc
         try:
             # A schedule written into extra_args after construction reaches here unabsorbed on the
             # inline stage client, whose clone() does not re-run __post_init__; the subprocess client
