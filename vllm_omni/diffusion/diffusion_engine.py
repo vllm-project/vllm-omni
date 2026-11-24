@@ -562,10 +562,10 @@ class DiffusionEngine:
         always wins over calibration. Dense mode has no token-counted
         admission capacity and applies the value unclamped.
 
-        Skipped, with an INFO log, unless step execution is enabled, the
-        resolved policy is DRR, ``warmup_auto_calibrate`` opted in, and
-        ``max_num_batched_tokens`` is unset -- an explicit budget is the
-        user's decision and already defines the DRR budget.
+        It runs only with step execution enabled, DRR as the resolved policy,
+        ``warmup_auto_calibrate`` opted in, and ``max_num_batched_tokens``
+        unset -- an explicit budget is the user's decision and already defines
+        the DRR budget. Skips after the opt-in are logged at INFO.
         """
         batching_config = getattr(self.scheduler, "batching_config", None)
         if batching_config is None or not getattr(batching_config, "warmup_auto_calibrate", False):

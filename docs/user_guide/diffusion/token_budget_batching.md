@@ -151,10 +151,11 @@ scheduler exist, because it needs a real forward pass. It sweeps a batch-size
 ladder at the reference shape, picks the sweet spot, and applies the result
 through the scheduler, which clamps it to the mode-defined capacity: the paged
 KV block-table capacity in paged mode, unclamped in dense mode (dense mode has
-no token-counted admission capacity). It is skipped when
-`--max-num-batched-tokens` is set explicitly, when step execution is off, or
-when DRR is not the resolved policy. The calibrated profile is cached so only
-the first startup pays the sweep; `warmup_profile_refresh` forces a re-sweep.
+no token-counted admission capacity). It runs only when `warmup_auto_calibrate`
+is enabled, and is skipped when `--max-num-batched-tokens` is set explicitly,
+when step execution is off, or when DRR is not the resolved policy. The
+calibrated profile is cached so only the first startup pays the sweep;
+`warmup_profile_refresh` forces a re-sweep.
 
 ## Mixed-Shape Scheduling
 
