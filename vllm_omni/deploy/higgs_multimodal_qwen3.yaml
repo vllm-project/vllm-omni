@@ -41,7 +41,8 @@ stages:
     max_num_seqs: 16
     gpu_memory_utilization: 0.6
     # MRV2 runs the decode step on the external CUDA graph; the local MLP
-    # CUDA graph of the old V1 profile is not used here.
+    # The local MLP CUDA graph of the explicit eager profile is not used here;
+    # this default selects the external FULL graph instead.
     enforce_eager: false
     attention_backend: FLASH_ATTN
     trust_remote_code: true

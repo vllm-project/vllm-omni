@@ -3,6 +3,13 @@
 With vLLM 0.34, Model Runner V2 is the only supported runner. The default
 profile is `higgs_multimodal_qwen3.yaml`; `model_runner: v1` is rejected.
 
+## Legacy profile names
+
+The `_high_throughput.yaml` and `_low_latency.yaml` names are retained for
+compatibility, but both files are V2 profiles after #10800. The former keeps
+the eager local MLP graph for throughput; the latter uses the external
+`FULL_DECODE_ONLY` graph for low latency. Neither file is a V1 opt-out.
+
 ## Model Runner V2 (default)
 
 The default profile uses Stage 0 `model_runner: v2`, `FULL` CUDA graph capture,

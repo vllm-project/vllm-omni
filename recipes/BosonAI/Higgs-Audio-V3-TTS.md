@@ -123,7 +123,7 @@ python examples/online_serving/text_to_speech/higgs_audio_v3/batch_speech_client
 - Deploy profiles:
     - Default: `vllm_omni/deploy/higgs_multimodal_qwen3.yaml`.
     - H200 tuning: `vllm_omni/deploy/higgs_multimodal_qwen3_mrv2_h200.yaml` (64-sequence capacities, larger capture sizes, MPS).
-    - The old `_high_throughput.yaml` and `_low_latency.yaml` files retain V1 execution settings and are unavailable as V1 opt-outs with vLLM 0.34.
+    - The `_high_throughput.yaml` and `_low_latency.yaml` names are retained for compatibility, but both files are V2 profiles on vLLM 0.34: the former keeps the eager local MLP graph and the latter uses the external `FULL_DECODE_ONLY` graph. Neither is a V1 opt-out.
     - Profile details: `vllm_omni/deploy/README_higgs_audio_v3.md`.
 - Validation notes:
     - Earlier V1/V2 quality and performance comparisons predate the vLLM 0.34 rebase. They do not qualify the current runtime; repeat matched hardware measurements before making new parity or speedup claims.

@@ -1670,7 +1670,7 @@ class TestRegistry:
     def test_deploy_yaml_uses_native_flashinfer(self):
         from vllm_omni.config.stage_config import load_deploy_config
 
-        # The V1 opt-out profiles keep the FLASHINFER shape; the default yaml
+        # The explicit V2 profiles keep the FLASHINFER shape; the default yaml
         # flipped to MRV2 (FLASH_ATTN) and is anchored separately below.
         for name in (
             "higgs_multimodal_qwen3_high_throughput.yaml",

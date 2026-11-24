@@ -721,9 +721,11 @@ chunk). They keep V2 and async scheduling enabled, but disable the six new
 CUDA-tuned `audio_mrv2_*` optimizations. This preserves configuration behavior;
 NPU, XPU, ROCm and MUSA hardware validation remains separate.
 
-The legacy `_high_throughput.yaml` and `_low_latency.yaml` files retain their
-old V1 execution settings and are not V1 opt-outs on vLLM 0.34. Use the default
-or H200 profile above; selecting `model_runner: v1` is rejected.
+The `_high_throughput.yaml` and `_low_latency.yaml` names are retained for
+compatibility, but both files are V2 profiles on vLLM 0.34. The former keeps
+the eager local MLP graph; the latter uses the external `FULL_DECODE_ONLY`
+graph. Neither file is a V1 opt-out. Use the default or H200 profile above;
+selecting `model_runner: v1` is rejected.
 
 The V2 sampler supports `temperature`, `top_p`, `top_k` and `seed`. Non-neutral
 penalties, logprobs, min_tokens, min_p, allowed/bad token ids and logit_bias
