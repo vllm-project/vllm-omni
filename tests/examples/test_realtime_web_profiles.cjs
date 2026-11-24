@@ -845,27 +845,15 @@ test('AURA holds vision-follow from a tool call until its follow-up answers', as
   await app.ui.stopSession({ terminal: false });
 });
 
-test('AURA playback at 1.5x shortens audio without raising its pitch', async () => {
-  const app = shell('aura-ptt', 'manual', { realPlayback: true });
-  await app.ui.startSession();
-  receive(app, { type: 'response.created', response: { id: 'r1' } });
-  const rate = 24000;
+function tonePcm(rate, hz = 200) {
   const pcm = new Int16Array(rate);
   for (let index = 0; index < pcm.length; index += 1) {
-    pcm[index] = Math.round(12000 * Math.sin((2 * Math.PI * 200 * index) / rate));
+    pcm[index] = Math.round(12000 * Math.sin((2 * Math.PI * hz * index) / rate));
   }
-  receive(app, {
-    type: 'response.output_audio.delta',
-    response_id: 'r1',
-    delta: Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength).toString('base64'),
-    format: 'pcm16',
-    sample_rate_hz: rate,
-  });
-  await app.ui.awaitQueue();
-  receive(app, { type: 'response.output_audio.done', response_id: 'r1' });
-  receive(app, { type: 'response.done', response: { id: 'r1', status: 'completed' } });
-  await app.ui.awaitQueue();
-  const player = app.nodes.find(node => node.name === 'fullduplex-pcm-playback').player;
+  return pcm;
+}
+
+function collectHeard(player, rate) {
   const heard = [];
   let silent = 0;
   for (let frame = 0; frame < 400 && heard.length < rate; frame += 1) {
@@ -879,15 +867,66 @@ test('AURA playback at 1.5x shortens audio without raising its pitch', async () 
     silent = 0;
     for (const sample of block) heard.push(sample);
   }
+  return heard;
+}
+
+function prefers200Hz(heard) {
   const body = heard.slice(2000, 10000);
   const corr = (lag) => {
     let score = 0;
     for (let index = 0; index < body.length - lag; index += 4) score += body[index] * body[index + lag];
     return score;
   };
-  assert.ok(heard.length > 12000 && heard.length < 19000, `played ${heard.length} samples`);
-  assert.ok(corr(120) > corr(80), 'a 200 Hz tone must not become 300 Hz');
+  // 200 Hz period is 120 samples at 24 kHz; 300 Hz would prefer lag 80.
+  return corr(120) > corr(80);
+}
+
+test('AURA playback at 1x plays the full chunk without raising its pitch', async () => {
+  // aura_ptt.js ships playbackSpeed: 1 (real-time). The old 1.5x length bound
+  // fails once the profile stopped time-stretching.
+  const app = shell('aura-ptt', 'manual', { realPlayback: true });
+  await app.ui.startSession();
+  receive(app, { type: 'response.created', response: { id: 'r1' } });
+  const rate = 24000;
+  const pcm = tonePcm(rate);
+  receive(app, {
+    type: 'response.output_audio.delta',
+    response_id: 'r1',
+    delta: Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength).toString('base64'),
+    format: 'pcm16',
+    sample_rate_hz: rate,
+  });
+  await app.ui.awaitQueue();
+  receive(app, { type: 'response.output_audio.done', response_id: 'r1' });
+  receive(app, { type: 'response.done', response: { id: 'r1', status: 'completed' } });
+  await app.ui.awaitQueue();
+  const player = app.nodes.find(node => node.name === 'fullduplex-pcm-playback').player;
+  const heard = collectHeard(player, rate);
+  assert.ok(heard.length > 22000 && heard.length < 26000, `played ${heard.length} samples`);
+  assert.ok(prefers200Hz(heard), 'a 200 Hz tone must stay near 200 Hz at 1x');
   await app.ui.stopSession({ terminal: false });
+});
+
+test('playback worklet at 1.5x shortens audio without raising its pitch', () => {
+  // Keep time-stretch coverage without changing the shipped AURA profile speed.
+  let Playback;
+  const ctx = vm.createContext({
+    sampleRate: 24000,
+    AudioWorkletProcessor: class {
+      constructor() { this.port = { postMessage() {} }; }
+    },
+    registerProcessor: (_name, cls) => { Playback = cls; },
+  });
+  vm.runInContext(fs.readFileSync(path.join(root, 'playback_worklet.js'), 'utf8'), ctx);
+  const player = new Playback();
+  const rate = 24000;
+  player.handleMessage({
+    type: 'audio', responseId: 'r1', pcm: tonePcm(rate), initialBufferMs: 0, playbackSpeed: 1.5,
+  });
+  player.handleMessage({ type: 'drain', responseId: 'r1' });
+  const heard = collectHeard(player, rate);
+  assert.ok(heard.length > 12000 && heard.length < 19000, `played ${heard.length} samples`);
+  assert.ok(prefers200Hz(heard), 'a 200 Hz tone must not become 300 Hz');
 });
 
 function visionAppends(app) {
