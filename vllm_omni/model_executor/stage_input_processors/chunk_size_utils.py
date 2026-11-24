@@ -76,6 +76,20 @@ def parse_chunk_ramp(cfg: dict, steady: int | None = None) -> list[int] | None:
     return ramp
 
 
+def parse_single_frame_start_ramp(cfg: dict, steady: int | None = None) -> list[int] | None:
+    """Parse ``codec_chunk_ramp`` for a stream that always emits one frame first.
+
+    The single-stage PCM stream sends its first decoded frame immediately, so
+    a ramp entry above 1 at index 0 cannot be honored and would shift every
+    later chunk. Such a ramp is disabled, like any other invalid ramp.
+    """
+    ramp = parse_chunk_ramp(cfg, steady=steady)
+    if ramp is not None and ramp[0] != 1:
+        logger.warning("codec_chunk_ramp[0]=%d must be 1 for single-stage streaming; disabling.", ramp[0])
+        return None
+    return ramp
+
+
 def ramp_chunk_size(index: int, ramp: list[int], steady: int) -> int:
     """Return the target chunk size for chunk ``index`` under the ramp schedule.
 

@@ -29,6 +29,9 @@ class StreamingAudioSnapshot(Protocol):
 class AudioRequest:
     samples_per_frame: int
     chunk_frames: int
+    # Frames per emitted chunk, by emission index; chunk_frames after the last.
+    chunk_ramp: tuple[int, ...] = ()
+    emissions: int = 0
     active: bool = True
     emitted: bool = False
     direct_first_pending: bool = False
@@ -53,13 +56,15 @@ class AudioRequest:
                     pcm = pcm[self.samples_per_frame :]
                     size = max(0, size - self.samples_per_frame)
                     self.emitted = True
+                    self.emissions += 1
                     self.first_audio_required = True
             if size:
                 self.pending.append(pcm)
                 self.pending_samples += size
             frames = self.pending_samples // self.samples_per_frame
             out = None
-            if frames and (ended or not self.emitted or frames >= self.chunk_frames):
+            target = self.chunk_ramp[self.emissions] if self.emissions < len(self.chunk_ramp) else self.chunk_frames
+            if frames and (ended or not self.emitted or frames >= target):
                 if all(isinstance(part, np.ndarray) for part in self.pending):
                     array = np.concatenate(self.pending) if len(self.pending) > 1 else self.pending[0]
                     out = torch.from_numpy(array)
@@ -69,6 +74,7 @@ class AudioRequest:
                 self.pending.clear()
                 self.pending_samples = 0
                 self.emitted = True
+                self.emissions += 1
             if ended:
                 self.active = False
                 self.pending.clear()
@@ -83,14 +89,15 @@ class AudioRequest:
 
 
 class StreamingAudioBuffer:
-    def __init__(self, samples_per_frame: int, chunk_frames: int) -> None:
+    def __init__(self, samples_per_frame: int, chunk_frames: int, chunk_ramp: Iterable[int] = ()) -> None:
         self.samples_per_frame = samples_per_frame
         self.chunk_frames = chunk_frames
+        self.chunk_ramp = tuple(chunk_ramp)
         self.requests: dict[str, AudioRequest] = {}
 
     def add(self, request_id: str) -> AudioRequest:
         if request_id not in self.requests:
-            self.requests[request_id] = AudioRequest(self.samples_per_frame, self.chunk_frames)
+            self.requests[request_id] = AudioRequest(self.samples_per_frame, self.chunk_frames, self.chunk_ramp)
         return self.requests[request_id]
 
     def finish(self, request_ids: Iterable[str]) -> None:
