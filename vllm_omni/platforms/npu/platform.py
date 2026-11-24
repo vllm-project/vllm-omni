@@ -255,8 +255,14 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def apply_diffusion_model_patches(cls, model, od_config) -> None:
+        from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+        from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_image import MiniMaxH3ImagePipeline
         from vllm_omni.platforms.npu.models.minimax_h3_image import apply_minimax_h3_image_graphs
 
+        if isinstance(model, (MiniMaxH3Pipeline, MiniMaxH3ImagePipeline)):
+            from vllm_omni.platforms.npu.models.minimax_h3_dit import apply_minimax_h3_dit_fusions
+
+            apply_minimax_h3_dit_fusions(model)
         apply_minimax_h3_image_graphs(model, od_config)
 
     @classmethod

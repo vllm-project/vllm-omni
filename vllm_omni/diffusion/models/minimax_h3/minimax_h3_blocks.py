@@ -49,7 +49,6 @@ if TYPE_CHECKING:
 
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
-_FP32_INFO = torch.finfo(_FP32_DTYPE)
 
 
 # AdaLN modality count: token tags carry -1 for padding and 0/1/2 for
@@ -193,16 +192,6 @@ def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm
     # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
     # reduction, matching that accumulation semantic.
     return RMSNorm(size, eps=eps, dtype=dtype)
-
-
-def _is_ascend_device_type(*allowed: str) -> bool:
-    try:
-        from vllm_ascend.utils import get_ascend_device_type
-
-        device_type = get_ascend_device_type()
-    except (ImportError, KeyError, RuntimeError):
-        return False
-    return device_type.name in allowed
 
 
 class MiniMaxH3Attention(nn.Module):
@@ -490,51 +479,23 @@ class MiniMaxH3Attention(nn.Module):
         self, x: torch.Tensor, rope_table: torch.Tensor | None, vdn_window: VDNLayout | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project/normalize/rotate QKV, retaining raw Q/K for the VDN branch."""
-        total = x.shape[0]
         qkv, _ = self.qkv_proj(x)
+        if self.vdn is not None and vdn_window is None:
+            raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
+        return self._split_norm_rope(qkv, rope_table)
+
+    def _split_norm_rope(
+        self, qkv: torch.Tensor, rope_table: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        total = qkv.shape[0]
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_kv_heads, self.head_dim)
         v = v.view(total, self.num_kv_heads, self.head_dim)
-        if self.vdn is not None and vdn_window is None:
-            raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
         # The VDN linear branch reads the raw projections; norm/RoPE are out of place.
         q_raw, k_raw = q, k
-        if (
-            qkv.device.type == "npu"
-            and rope_table is not None
-            and self.head_dim == 128
-            and self.rot_dim in (32, 64, 96, 128)
-            and _FP32_INFO.tiny <= self.q_norm.variance_epsilon <= _FP32_INFO.max
-            and 0 < qkv.numel() <= torch.iinfo(torch.int32).max
-            and _is_ascend_device_type("A2", "A5")
-        ):
-            try:
-                from mindiesd.fused_ops import eagle_split_norm_rope_concat
-
-                # H3 packs half-width cos and sin side by side; Eagle takes contiguous halves.
-                cos, sin = rope_table.reshape(total, 2, self.rot_dim // 2).transpose(0, 1).contiguous().unbind(0)
-                q, k, v = eagle_split_norm_rope_concat(
-                    qkv.view(total, self.num_heads + 2 * self.num_kv_heads, self.head_dim).contiguous(),
-                    self.q_norm.weight.contiguous(),
-                    self.k_norm.weight.contiguous(),
-                    cos,
-                    sin,
-                    [self.num_heads, self.num_kv_heads, self.num_kv_heads],
-                    norm_type=3,  # weighted RMSNorm
-                    rope_mode=1,  # HALF (NeoX)
-                    rotary_dim=self.rot_dim,
-                    epsilon=self.q_norm.variance_epsilon,
-                    output_bnsd=False,  # preserve [local tokens, local heads, head_dim]
-                )
-            except ImportError:
-                # The SD facade imports its optional native operator on first use.
-                pass
-            else:
-                return q, k, v, q_raw, k_raw
-
         if rope_table is None:
             q = self.q_norm(q)
             k = self.k_norm(k)
@@ -660,28 +621,6 @@ class MiniMaxH3MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Wrapped linears (e.g. LoRA) must retain their own forward computation.
-        if x.device.type == "npu" and type(self.fc1) is MergedColumnParallelLinear and _is_ascend_device_type("A2"):
-            from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
-
-            if isinstance(self.fc1.quant_method, NPUInt8LinearMethod):
-                try:
-                    import torch_npu
-                    from mindiesd.fused_ops import eagle_quant_batch_matmul_swiglu
-
-                    quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x.reshape(-1, x.shape[-1]))
-                    hidden = eagle_quant_batch_matmul_swiglu(
-                        quantized_x,
-                        self.fc1.weight,
-                        self.fc1.weight_scale,
-                        pertoken_scale=pertoken_scale,
-                        output_dtype=x.dtype,
-                    )
-                except ImportError:
-                    pass
-                else:
-                    out, _ = self.fc2(hidden.reshape(*x.shape[:-1], -1))
-                    return out
         hidden, _ = self.fc1(x)
         hidden = self.act_fn(hidden)
         out, _ = self.fc2(hidden)

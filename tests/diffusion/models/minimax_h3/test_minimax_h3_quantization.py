@@ -346,12 +346,13 @@ def test_pipeline_resolves_transformer_component_quant_config():
     assert _resolve_component_quant_config(transformer_config, "transformer") is transformer_config
 
 
-def _swiglu_inputs(mocker, quant_method, *, device_name="A2", wrapped=False):
+def _swiglu_inputs(mocker, quant_method, *, device_name="A2"):
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
+    from vllm_omni.platforms.npu.models import minimax_h3_dit
 
-    mocker.patch.object(blocks, "_is_ascend_device_type", side_effect=lambda *allowed: device_name in allowed)
+    mocker.patch.object(minimax_h3_dit, "_ascend_device_name", return_value=device_name)
     x = Mock(device=SimpleNamespace(type="npu"), shape=(2, 3, 4), dtype=torch.bfloat16)
     fc1 = MergedColumnParallelLinear.__new__(MergedColumnParallelLinear)
     nn.Module.__init__(fc1)
@@ -362,7 +363,7 @@ def _swiglu_inputs(mocker, quant_method, *, device_name="A2", wrapped=False):
 
     mlp = blocks.MiniMaxH3MLP.__new__(blocks.MiniMaxH3MLP)
     nn.Module.__init__(mlp)
-    mlp.fc1 = Mock(wraps=fc1, quant_method=quant_method) if wrapped else fc1
+    mlp.fc1 = fc1
     mlp.act_fn = Mock()
     mlp.fc2 = Mock(return_value=(mocker.sentinel.output, None))
 
@@ -375,6 +376,7 @@ def _swiglu_inputs(mocker, quant_method, *, device_name="A2", wrapped=False):
             "mindiesd.fused_ops": SimpleNamespace(eagle_quant_batch_matmul_swiglu=fused),
         },
     )
+    minimax_h3_dit.apply_minimax_h3_dit_fusions(mlp)
     return mlp, x, quantize, fused
 
 
@@ -406,23 +408,24 @@ def test_mlp_preserves_swiglu_fallback(mocker, case):
     from vllm_omni.quantization.int8_config import DiffusionInt8Config, NPUInt8LinearMethod
 
     method = NPUInt8LinearMethod(DiffusionInt8Config(is_checkpoint_int8_serialized=True))
-    if case == "non_int8":
-        method = UnquantizedLinearMethod()
-    mlp, x, quantize, fused = _swiglu_inputs(
-        mocker, method, device_name="A5" if case == "A5" else "A2", wrapped=case == "wrapped"
-    )
+    mlp, x, quantize, fused = _swiglu_inputs(mocker, method, device_name="A5" if case == "A5" else "A2")
     if case == "missing_sdk":
         mocker.patch.dict(sys.modules, {"mindiesd.fused_ops": None})
     elif case == "missing_native":
         fused.side_effect = ImportError("native SwiGLU unavailable")
+    elif case == "non_int8":
+        mlp.fc1.quant_method = UnquantizedLinearMethod()
+    elif case == "wrapped":
+        wrapper = nn.Module()
+        wrapper.base_layer = mlp.fc1
+        wrapper.quant_method = mlp.fc1.quant_method
+        wrapper.forward = Mock(wraps=wrapper.base_layer)
+        mlp.fc1 = wrapper
 
     assert mlp(x) is mocker.sentinel.output
 
     expected_calls = 1 if case == "missing_native" else 0
     assert quantize.call_count == fused.call_count == expected_calls
-    if case == "wrapped":
-        mlp.fc1.assert_called_once_with(x)
-    else:
-        mlp.fc1.forward.assert_called_once_with(x)
+    mlp.fc1.forward.assert_called_once_with(x)
     mlp.act_fn.assert_called_once_with(mocker.sentinel.projected)
     mlp.fc2.assert_called_once_with(mlp.act_fn.return_value)

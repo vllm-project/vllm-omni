@@ -147,29 +147,49 @@ def _qkv_inputs(*, head_dim=128, rot_dim=96, eps=1e-6):
     return attention, packed, table
 
 
-def _mock_npu_qkv(monkeypatch, attention, device_name):
-    attention.qkv_proj = lambda x: (Mock(wraps=x, device=SimpleNamespace(type="npu")), None)
-    utils = SimpleNamespace(get_ascend_device_type=lambda: SimpleNamespace(name=device_name))
-    monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
+def _install_npu_qkv(monkeypatch, attention, device_name, *, a5_native=True):
+    from vllm_omni.platforms.npu.models import minimax_h3_dit
+
+    attention.qkv_proj = lambda x: (Mock(wraps=x, shape=x.shape, device=SimpleNamespace(type="npu")), None)
+    monkeypatch.setattr(minimax_h3_dit, "_ascend_device_name", lambda: device_name)
+    monkeypatch.setattr(minimax_h3_dit, "_supports_eagle_qkv_on_a5", lambda: a5_native)
+    minimax_h3_dit.apply_minimax_h3_dit_fusions(nn.ModuleList([attention]))
 
 
 def test_missing_device_detection_disables_eagle(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import _is_ascend_device_type
+    from vllm_omni.platforms.npu.models.minimax_h3_dit import _ascend_device_name
 
     monkeypatch.setitem(sys.modules, "vllm_ascend.utils", None)
-    assert not _is_ascend_device_type("A2", "A5")
+    assert _ascend_device_name() is None
+
+
+def test_npu_qkv_patch_is_local_to_the_model(monkeypatch):
+    from vllm_omni.platforms.npu.models import minimax_h3_dit
+
+    attention, packed, table = _qkv_inputs()
+    expected = attention._project_qkv(packed, table)
+    common_method = type(attention)._split_norm_rope
+    op = Mock()
+    monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_split_norm_rope_concat=op))
+    monkeypatch.setattr(minimax_h3_dit, "_ascend_device_name", lambda: "A2")
+    minimax_h3_dit.apply_minimax_h3_dit_fusions(attention)
+
+    assert type(attention)._split_norm_rope is common_method
+    torch.testing.assert_close(attention._project_qkv(packed, table), expected, atol=0, rtol=0)
+    op.assert_not_called()
 
 
 @pytest.mark.parametrize("device_name", ["A2", "A5"])
 def test_project_qkv_calls_eagle_with_local_rope_halves(monkeypatch, device_name):
     attention, packed, table = _qkv_inputs()
-    _mock_npu_qkv(monkeypatch, attention, device_name)
+    attention.vdn = nn.Identity()
     q, k, _ = packed.view(7, 6, 128).split(2, dim=1)
     outputs = (object(), object(), object())
     op = Mock(return_value=outputs)
     monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_split_norm_rope_concat=op))
+    _install_npu_qkv(monkeypatch, attention, device_name)
 
-    actual_q, actual_k, actual_v, raw_q, raw_k = attention._project_qkv(packed, table)
+    actual_q, actual_k, actual_v, raw_q, raw_k = attention._project_qkv(packed, table, vdn_window=object())
 
     op.assert_called_once()
     qkv, qw, kw, cos, sin, heads = op.call_args.args
@@ -193,11 +213,11 @@ def test_project_qkv_eagle_numel_limit(monkeypatch, rows, use_eagle):
     attention.num_heads = attention.num_kv_heads = 56
     packed = torch.empty(rows, 3 * attention.num_heads * attention.head_dim, device="meta", dtype=torch.bfloat16)
     table = packed.new_empty((rows, attention.rot_dim))
-    _mock_npu_qkv(monkeypatch, attention, "A2")
     eagle = Mock(return_value=(None, None, None))
     fallback = Mock(return_value=(None, None))
     monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_split_norm_rope_concat=eagle))
     monkeypatch.setattr(blocks, "fused_qk_norm_rope", fallback)
+    _install_npu_qkv(monkeypatch, attention, "A2")
 
     attention._project_qkv(packed, table)
 
@@ -209,9 +229,9 @@ def test_project_qkv_eagle_numel_limit(monkeypatch, rows, use_eagle):
 def test_project_qkv_falls_back_for_unsupported_eagle_config(monkeypatch, head_dim, rot_dim, eps):
     attention, packed, table = _qkv_inputs(head_dim=head_dim, rot_dim=rot_dim, eps=eps)
     expected = attention._project_qkv(packed, table)
-    _mock_npu_qkv(monkeypatch, attention, "A2")
     eagle = Mock(side_effect=AssertionError("Eagle does not support this configuration"))
     monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_split_norm_rope_concat=eagle))
+    _install_npu_qkv(monkeypatch, attention, "A2")
 
     actual = attention._project_qkv(packed, table)
 
@@ -231,12 +251,25 @@ def test_project_qkv_preserves_fallback(monkeypatch, device_name, has_rope, expe
     table = table if has_rope else None
     expected = attention._project_qkv(packed, table)
 
-    _mock_npu_qkv(monkeypatch, attention, device_name)
     op = Mock(side_effect=ImportError("native QKV unavailable"))
     monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_split_norm_rope_concat=op))
+    _install_npu_qkv(monkeypatch, attention, device_name)
     actual = attention._project_qkv(packed, table)
 
     assert op.call_count == expected_calls
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_a5_without_native_qkv_uses_fallback_with_public_op_present(monkeypatch):
+    attention, packed, table = _qkv_inputs()
+    expected = attention._project_qkv(packed, table)
+    op = Mock()
+    monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_split_norm_rope_concat=op))
+    _install_npu_qkv(monkeypatch, attention, "A5", a5_native=False)
+
+    actual = attention._project_qkv(packed, table)
+
+    op.assert_not_called()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
