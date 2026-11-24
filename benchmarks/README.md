@@ -70,6 +70,24 @@ Closed-loop, audio-clocked interaction benchmark (`mpeval.unified.v3`) for spoke
 - **Dataset**: Pinned [`ChengqianMa/Duplex-MPE`](https://huggingface.co/datasets/ChengqianMa/Duplex-MPE) (`2,000` explicit/implicit pairs; `--mini` `20`-pair smoke subset)
 - **Key metrics**: target response rate (`TR`), conditional/unconditional answer accuracy (`AA`), bystander silence preservation (`SP`), answering-window yield (`AY`)
 
+### [SOVBench-O](../docs/cli/bench/serve.md#sovbench-o-benchmark) — Streaming Omni Multi-Choice Sessions
+
+Multiple-choice questions over audio-video streams that keep advancing as a session
+progresses (issue #10954): every turn reveals one new clip, the model replays the clips
+accumulated since the session start, and the dialogue history is built from the model's own
+previous predictions. Ports the reference protocol, prompt text, and scorer from the
+StreamOV repository (SOVBench-O: 172 sessions / 969 groups / 1739 turns).
+
+- **Layout**: `vllm_omni/benchmarks/data_modules/sovbench_o_dataset.py` (session parsing,
+  per-turn prompt construction, media decode/cache), `sovbench_o_eval.py` (option-letter
+  extraction + accuracy)
+- **Datasets**: annotations `streamov_bench.jsonl` (pinned StreamOV repository file) and media
+  `benchvideos.tar` (Hugging Face `PatrickyMing/StreamOV`)
+
+- **Key metrics**: overall accuracy over parseable predictions, per turn type
+  (Real-time / Recall / Proactive), per group size, per session length; per-turn predictions
+  are saved for independent rescoring
+
 ### Common serving metrics framework
 
 `vllm_omni/benchmarks/` extends `vllm bench serve --omni` with Omni-specific datasets, backends, and multimodal metrics. Key metrics include:

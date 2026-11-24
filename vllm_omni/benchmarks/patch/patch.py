@@ -72,6 +72,11 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSTextDataset,
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
+from vllm_omni.benchmarks.data_modules.sovbench_o_dataset import (
+    SOVBenchODataset,
+    SOVBenchOSampleRequest,
+    build_sovbench_o_turn_messages,
+)
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
 from vllm_omni.benchmarks.data_modules.videomme_dataset import (
     VIDEOMME_DEFAULT_HF_REPO,
@@ -496,6 +501,18 @@ def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: Reque
     setattr(rfi, "omniinteract_prepared_input", sample.omniinteract_prepared_input)
 
 
+def _attach_sovbench_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
+    """Carry a SOVBench-O session onto the request input for the turn-chained request function."""
+    if not isinstance(sample, SOVBenchOSampleRequest):
+        return
+    setattr(rfi, "sovbench_session", sample.sovbench_session)
+    setattr(rfi, "sovbench_reference_mode", sample.sovbench_reference_mode)
+    setattr(rfi, "sovbench_use_audio", sample.sovbench_use_audio)
+    setattr(rfi, "sovbench_media", sample.sovbench_media)
+    setattr(rfi, "sovbench_max_frames", sample.sovbench_max_frames)
+    setattr(rfi, "sovbench_output_len", sample.sovbench_output_len)
+
+
 def _async_limiter(max_concurrency: int | None) -> contextlib.AbstractAsyncContextManager[object]:
     if max_concurrency:
         return asyncio.Semaphore(max_concurrency)
@@ -691,6 +708,41 @@ def _videomme_repo_from_args(args, *, explicit: bool = False) -> str | None:
     return None
 
 
+def _get_sovbench_o_samples(args: argparse.Namespace, tokenizer: Any, **kwargs: Any) -> list[SampleRequest]:
+    """Load SOVBench-O sessions; one turn-chained request per session.
+
+    Accepts either the plain ``openai-chat-omni`` backend (preprocess remaps it
+    to the ``sovbench-o`` request function) or the explicit ``sovbench-o`` name.
+    """
+    if args.backend not in ("openai-chat-omni", "sovbench-o"):
+        raise ValueError(
+            "SOVBench-O dataset requires the omni chat backend. "
+            f"Got backend={args.backend!r}. Please use '--backend openai-chat-omni'"
+        )
+    dataset = SOVBenchODataset(
+        dataset_path=getattr(args, "dataset_path", None),
+        jsonl_path=getattr(args, "sovbench_jsonl", None),
+        reference_mode=getattr(args, "sovbench_reference_mode", "sample_level_multi_turn"),
+        use_audio=bool(getattr(args, "sovbench_use_audio", False)),
+        fps=getattr(args, "sovbench_fps", 1.0),
+        media_dir=getattr(args, "sovbench_video_dir", None),
+        max_frames=getattr(args, "sovbench_max_frames", None),
+        random_seed=args.seed,
+    )
+    out_len = getattr(args, "output_len", None)
+    if out_len is None:
+        out_len = getattr(args, "hf_output_len", None)
+    if out_len is None:
+        out_len = SOVBenchODataset.DEFAULT_OUTPUT_LEN
+    return dataset.sample(
+        tokenizer=tokenizer,
+        num_requests=args.num_prompts,
+        output_len=out_len,
+        request_id_prefix=args.request_id_prefix,
+        no_oversample=args.no_oversample,
+    )
+
+
 def get_samples(args, tokenizer, **kwargs):
     """Omni override of ``vllm.benchmarks.datasets.get_samples``.
 
@@ -767,6 +819,9 @@ def get_samples(args, tokenizer, **kwargs):
     is_omniinteract = args.dataset_name == "omniinteract"
     if args.dataset_name == "omni-duplex-eval":
         return get_duplex_eval_samples(args)
+
+    if args.dataset_name == "sovbench-o":
+        return _get_sovbench_o_samples(args, tokenizer, **kwargs)
 
     # Check if we need to handle omni-related backends/datasets
     is_omni_backend = args.backend in [
@@ -1447,35 +1502,18 @@ _REQUEST_STAGE_METRIC_FIELDS = (
     "finish_reason",
     defs.AUDIO_FRAMES,
     f"{defs.AUDIO_DURATION}_s",
-    defs.STAGE_GEN_TIME_MS,
-    "rx_transfer_bytes",
-    "rx_decode_time_ms",
-    "rx_in_flight_time_ms",
-    defs.SCHEDULER_QUEUE_WAIT_MS,
-    defs.VLLM_QUEUED_MS,
-    defs.VLLM_PREFILL_MS,
-    defs.VLLM_DECODE_MS,
-    defs.VLLM_NUM_PREEMPTIONS,
-    defs.ORCHESTRATOR_DISPATCH_WAIT_MS,
-    defs.ORCHESTRATOR_DISPATCH_WAIT_MAX_MS,
-    defs.ORCHESTRATOR_DISPATCH_BATCHES,
-    "pipeline_timings",
-    defs.ORCHESTRATOR_SNAPSHOT,
 )
 
 
 def _compact_request_stage_metrics(snapshot: object) -> dict[str, dict] | None:
-    """Keep bounded workload and latency diagnostics; empty snapshots become None."""
+    """Keep the stage fields used for workload checks; empty snapshots become None."""
     if not isinstance(snapshot, dict) or not snapshot:
         return None
-    compacted = {}
-    for stage, metrics in snapshot.items():
-        if not isinstance(metrics, dict):
-            continue
-        stage_metrics = {field: metrics[field] for field in _REQUEST_STAGE_METRIC_FIELDS if field in metrics}
-        if stage_metrics:
-            compacted[stage] = stage_metrics
-    return compacted or None
+    return {
+        stage: {field: metrics[field] for field in _REQUEST_STAGE_METRIC_FIELDS if field in metrics}
+        for stage, metrics in snapshot.items()
+        if isinstance(metrics, dict)
+    }
 
 
 def _apply_chat_stage0_token_timings(output: MixRequestFuncOutput) -> bool:
@@ -2264,6 +2302,11 @@ async def async_request_openai_chat_omni_completions(
                                 if choices := data.get("choices"):
                                     modality = data.get("modality")
                                     choice = choices[0]
+                                    if isinstance(choice.get("finish_reason"), str):
+                                        # Surfaced for consumers that need the
+                                        # per-turn terminal state (e.g. the
+                                        # SOVBench-O replay history).
+                                        setattr(output, "omni_finish_reason", choice["finish_reason"])
                                     delta = choice.get("delta") or {}
                                     content = delta.get("content")
                                     if not content and isinstance(delta.get("audio"), dict):
@@ -2494,6 +2537,69 @@ async def async_request_openai_chat_omni_completions(
             logger.error(f"ERROR: send request failed, reason is: {output.error}")
             break
 
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+async def async_request_sovbench_o_completions(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+    mm_position: Literal["first", "last"] = "last",
+) -> RequestFuncOutput:
+    """Run one SOVBench-O session: turn by turn, feeding each prediction back as history.
+
+    Every turn is a fresh chat-completions request over the accumulated clips
+    (the reference replay protocol); the request returns when the last turn's
+    answer arrives. Per-turn predictions land on the shared session object so
+    the post-run accuracy hook can score them.
+    """
+    sovbench = getattr(request_func_input, "sovbench_session", None)
+    if sovbench is None:
+        return await async_request_openai_chat_omni_completions(
+            request_func_input, session, pbar=pbar, mm_position=mm_position
+        )
+
+    per_turn_output_len = int(getattr(request_func_input, "sovbench_output_len", 0) or 0) or 64
+    predictions: list[str] = []
+    finish_reasons: list[str] = []
+    turn_outputs: list[RequestFuncOutput] = []
+    started = time.perf_counter()
+    for turn_index in range(len(sovbench.turns)):
+        messages = build_sovbench_o_turn_messages(
+            sovbench,
+            turn_index,
+            predictions,
+            reference_mode=getattr(request_func_input, "sovbench_reference_mode", "sample_level_multi_turn"),
+            media=getattr(request_func_input, "sovbench_media", None),
+            use_audio=bool(getattr(request_func_input, "sovbench_use_audio", False)),
+            max_frames=getattr(request_func_input, "sovbench_max_frames", None),
+            prior_finish_reasons=finish_reasons,
+        )
+        turn_input = copy.copy(request_func_input)
+        setattr(turn_input, "omni_chat_messages", messages)
+        turn_input.output_len = per_turn_output_len
+        turn_output = await async_request_openai_chat_omni_completions(turn_input, session)
+        turn_outputs.append(turn_output)
+        predictions.append(turn_output.generated_text if turn_output.success else "")
+        finish_reasons.append(str(getattr(turn_output, "omni_finish_reason", "") or ""))
+        sovbench.turn_finish_reasons = finish_reasons
+
+    output = RequestFuncOutput()
+    # Per-turn prompt_len carries the server's usage.prompt_tokens (set by
+    # the omni chat request function); sum them like output_tokens instead of
+    # the sample-level placeholder, which is the first session's first stem.
+    output.prompt_len = sum(int(t.prompt_len or 0) for t in turn_outputs)
+    output.start_time = started
+    output.generated_text = "\n".join(predictions)
+    output.output_tokens = sum(int(t.output_tokens or 0) for t in turn_outputs)
+    output.success = bool(turn_outputs) and all(t.success for t in turn_outputs)
+    output.error = next((t.error for t in turn_outputs if not t.success), "")
+    output.latency = time.perf_counter() - started
+    if turn_outputs:
+        output.ttft = turn_outputs[0].ttft
+    sovbench.turn_predictions = predictions
     if pbar:
         pbar.update(1)
     return output
@@ -3839,10 +3945,16 @@ ASYNC_REQUEST_FUNCS["daily-omni"] = async_request_openai_chat_omni_completions
 if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("daily-omni")
 
+# SOVBench-O backend: one chat-completions request per turn, chained in session order
+# so each turn's history can use the model's own previous predictions (issue #10954).
+ASYNC_REQUEST_FUNCS["sovbench-o"] = async_request_sovbench_o_completions
+if "sovbench-o" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("sovbench-o")
+
 # Backends whose request body is a completions / chat completions request, the
 # protocols that accept ``cache_salt``. Speech derives its own server-side salt
 # and drops unknown fields; multimodal processor caches are not keyed by it.
-CACHE_SALT_BACKENDS = frozenset({"openai", "openai-chat", "openai-chat-omni", "daily-omni"})
+CACHE_SALT_BACKENDS = frozenset({"openai", "openai-chat", "openai-chat-omni", "daily-omni", "sovbench-o"})
 
 _ISOLATE_PREFIX_CACHE = False
 
@@ -4060,6 +4172,7 @@ async def benchmark(
     _attach_omni_chat_to_request_func_input(input_requests[0], test_input)
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
     _attach_omniinteract_to_request_func_input(input_requests[0], test_input)
+    _attach_sovbench_to_request_func_input(input_requests[0], test_input)
     attach_duplex_eval(input_requests[0], test_input)
     test_input = bind_realtime_video(input_requests[0], test_input)
 
@@ -4271,6 +4384,7 @@ async def benchmark(
         _attach_omni_chat_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         _attach_omniinteract_to_request_func_input(request, request_func_input)
+        _attach_sovbench_to_request_func_input(request, request_func_input)
         attach_duplex_eval(request, request_func_input)
         request_func_input = bind_realtime_video(request, request_func_input)
         request_func_inputs.append(request_func_input)
@@ -4544,6 +4658,21 @@ async def benchmark(
     if _vm_acc is not None:
         result.update(_vm_acc)
         print_videomme_accuracy_summary(_vm_acc)
+
+    from vllm_omni.benchmarks.data_modules.sovbench_o_eval import (
+        compute_sovbench_o_accuracy_metrics,
+        print_sovbench_o_accuracy_summary,
+    )
+
+    _save_sov = os.environ.get("SOVBENCH_O_SAVE_EVAL_ITEMS", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    _sov_acc = compute_sovbench_o_accuracy_metrics(input_requests, outputs, include_per_item=_save_sov)
+    if _sov_acc is not None:
+        result.update(_sov_acc)
+        print_sovbench_o_accuracy_summary(_sov_acc)
 
     if _seed_tts_capture_pcm_for_wer():
         from vllm_omni.benchmarks.data_modules.seed_tts_eval import (

@@ -91,6 +91,8 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         os.environ["DAILY_OMNI_SAVE_EVAL_ITEMS"] = "1"
     if getattr(args, "videomme_save_eval_items", False):
         os.environ["VIDEOMME_SAVE_EVAL_ITEMS"] = "1"
+    if getattr(args, "sovbench_save_eval_items", False):
+        os.environ["SOVBENCH_O_SAVE_EVAL_ITEMS"] = "1"
     request_timeout_s = getattr(args, "omni_request_timeout_s", None)
     if request_timeout_s is not None:
         set_request_timeout_s(request_timeout_s)

@@ -1095,6 +1095,70 @@ it does not establish that a supplied local mirror contains the entire official 
 Use `--videomme-save-eval-items` (or `VIDEOMME_SAVE_EVAL_ITEMS=1`) for per-request
 `videomme_eval_items` rows.
 
+### SOVBench-O Benchmark
+
+SOVBench-O (`--dataset-name sovbench-o`) scores multiple-choice questions over
+audio-video streams that keep advancing as a session progresses. Every turn reveals one
+new clip; the request replays the clips accumulated since the session start (the
+reference replay protocol — advancing a persistent duplex session would be a future
+option), and the dialogue history is built from the model's own previous predictions,
+never the gold answers. The protocol, prompt text, and scorer are ported from the
+reference VLMEvalKit integration in the StreamOV repository: 172 sessions, 969 groups,
+1739 turns (694 Real-time, 97 Recall, 948 Proactive).
+
+One benchmark request covers one whole session: turns are chained in order, and each
+turn is a fresh `/v1/chat/completions` call through `--backend openai-chat-omni`. Media
+follows the reference's session-relative sampling grid: the `--sovbench-fps` grid
+(default 1.0) is computed once over the whole revealed clip prefix and mapped back to
+clip-local frame indices, so the frames the model sees match the reference's
+merged-video sampling. Frames are sent as inline JPEG image parts, so the server needs
+no `--allowed-local-media-path`; pass `--sovbench-use-audio` to also attach each clip's
+16 kHz mono audio. `--sovbench-reference-mode` selects the
+dialogue accumulation: `sample_level_multi_turn` (default, whole session) or
+`group_level_multi_turn` (history resets at each new group while earlier media stays
+available).
+
+Data setup (once):
+
+```bash
+# Annotations (pinned to StreamOV repository commit 3decd08a):
+curl -L -o streamov_bench.jsonl \
+  https://raw.githubusercontent.com/PatrickXM/StreamOV/3decd08ac36e4e9f1e5c918a4dd28d9a2cd63455/streamov_bench/streamov_bench.jsonl
+# Media (~3 GB tar):
+curl -L -o benchvideos.tar \
+  "https://huggingface.co/datasets/PatrickyMing/StreamOV/resolve/main/benchvideos.tar"
+tar xf benchvideos.tar
+```
+
+Run a small, reproducible session subset against a served MiniCPM-o 4.5 (the JSONL
+order is fixed, so `--num-prompts 2` always selects the same two sessions):
+
+```bash
+vllm bench serve --omni \
+  --backend openai-chat-omni \
+  --endpoint /v1/chat/completions \
+  --dataset-name sovbench-o \
+  --sovbench-jsonl /path/to/streamov_bench.jsonl \
+  --sovbench-video-dir /path/to/benchvideos \
+  --model openbmb/MiniCPM-o-4_5 \
+  --num-prompts 2 \
+  --max-concurrency 1 \
+  --save-result \
+  --sovbench-save-eval-items
+```
+
+`--num-prompts N` selects the first N sessions of the JSONL (`0` = all); sessions are
+never oversampled because a duplicate would double-count its turns in the accuracy.
+`--sovbench-max-frames` caps the accumulated image parts per turn when a session's
+replay would not fit the model's image budget, at the cost of replay fidelity.
+
+The result JSON carries `sovbench_o_accuracy` (exact-match over parseable predictions,
+matching the reference scorer; unparsable answers are excluded from the denominator),
+`sovbench_o_total` / `sovbench_o_valid`, and the `sovbench_o_by_turn_type` /
+`sovbench_o_by_group_size` / `sovbench_o_by_session_length` breakdowns. Set
+`SOVBENCH_O_SAVE_EVAL_ITEMS=1` (or pass `--sovbench-save-eval-items`) to also emit the
+per-turn prediction rows under `sovbench_o_eval_items` for independent rescoring.
+
 ### Multi-Modal Benchmark
 
 <details class="admonition abstract" markdown="1">
