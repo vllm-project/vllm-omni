@@ -117,6 +117,7 @@ class TestMiniMaxH3Fusions:
     @pytest.mark.parametrize(
         ("device", "soc", "registered", "late", "expected"),
         [
+            ("A2", "ascend910b", "both", False, (True, True)),
             ("A2", "ascend910b", "qkv", False, (True, False)),
             ("A2", "ascend910b", "swiglu", False, (False, True)),
             ("A2", "ascend910b", "both", True, (False, False)),
@@ -127,6 +128,9 @@ class TestMiniMaxH3Fusions:
     def test_h3_platform_installs_registered_fusions(
         self, tmp_path, monkeypatch, device, soc, registered, late, expected
     ):
+        from vllm_omni.diffusion.models.minimax_h3.controlnet import MiniMaxH3ControlBlock
+        from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3DiTBlock, MiniMaxH3MLP
+        from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3TokenRefinerBlock
         from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
         from vllm_omni.platforms.npu.models import minimax_h3 as h3
 
@@ -161,27 +165,37 @@ class TestMiniMaxH3Fusions:
         monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
         pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
         nn.Module.__init__(pipeline)
-        for name in pipeline._dit_modules:
-            blocks = [
-                SimpleNamespace(attn=SimpleNamespace(head_dim=128, rot_dim=rot_dim), mlp=nn.Module())
-                for rot_dim in (96, 48)
-            ]
-            refiner = SimpleNamespace(attn=nn.Module(), mlp=nn.Module())
-            setattr(pipeline, name, SimpleNamespace(blocks=blocks, token_refiner=SimpleNamespace(blocks=[refiner])))
+
+        def make_block(cls):
+            block = cls.__new__(cls)
+            nn.Module.__init__(block)
+            block.attn, _, _ = _qkv_inputs()
+            block.mlp = MiniMaxH3MLP.__new__(MiniMaxH3MLP)
+            nn.Module.__init__(block.mlp)
+            return block
+
+        main, short_rope, zero_eps, unequal_eps = [make_block(MiniMaxH3DiTBlock) for _ in range(4)]
+        short_rope.attn.rot_dim = 48
+        zero_eps.attn.q_norm.variance_epsilon = zero_eps.attn.k_norm.variance_epsilon = 0
+        unequal_eps.attn.k_norm.variance_epsilon = 1e-4
+        refiner = make_block(MiniMaxH3TokenRefinerBlock)
+        control = make_block(MiniMaxH3ControlBlock)
+        pipeline.transformer = nn.Module()
+        pipeline.transformer.blocks = nn.ModuleList([main, short_rope, zero_eps, unequal_eps])
+        pipeline.transformer.token_refiner = nn.Module()
+        pipeline.transformer.token_refiner.blocks = nn.ModuleList([refiner])
+        pipeline.transformer.controlnet = nn.Module()
+        pipeline.transformer.controlnet.control_blocks = nn.ModuleList([control])
 
         platform.apply_diffusion_model_patches(pipeline, SimpleNamespace(model_class_name="MiniMaxH3Pipeline"))
 
         use_qkv, use_swiglu = expected
-        for name in pipeline._dit_modules:
-            dit = getattr(pipeline, name)
-            main, short_rope = dit.blocks
-            refiner = dit.token_refiner.blocks[0]
-            expected_qkv = MethodType(h3._npu_project_qkv, main.attn) if use_qkv else None
-            assert getattr(main.attn, "_project_qkv", None) == expected_qkv
-            assert not hasattr(short_rope.attn, "_project_qkv")
-            assert not hasattr(refiner.attn, "_project_qkv")
-            for block in (*dit.blocks, refiner):
-                assert block.mlp.forward.__func__ is (h3.forward_h3_mlp if use_swiglu else nn.Module.forward)
+        for block in (main, control):
+            assert (block.attn._project_qkv.__func__ is h3._npu_project_qkv) == use_qkv
+        for block in (short_rope, zero_eps, unequal_eps, refiner):
+            assert "_project_qkv" not in vars(block.attn)
+        for block in (main, refiner):
+            assert block.mlp.forward.__func__ is (h3.forward_h3_mlp if use_swiglu else MiniMaxH3MLP.forward)
 
     def test_project_qkv_calls_eagle_with_local_rope_halves(self, eagle_qkv):
         attention, packed, table = _qkv_inputs()

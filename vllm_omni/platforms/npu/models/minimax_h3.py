@@ -9,7 +9,6 @@ import json
 import os
 from collections.abc import Callable
 from importlib.util import find_spec
-from itertools import chain
 from pathlib import Path
 from types import MethodType
 from typing import Any
@@ -224,6 +223,8 @@ def forward_h3_mlp(self: Any, x: torch.Tensor) -> torch.Tensor:
 
 def apply_minimax_h3_dit_fusions(model: torch.nn.Module, early_opp_paths: frozenset[str]) -> None:
     """Bind eligible H3 blocks without changing classes or loading MindIE-SD on other platforms."""
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3DiTBlock, MiniMaxH3MLP
+
     try:
         from vllm_ascend.utils import get_ascend_device_type
 
@@ -256,13 +257,16 @@ def apply_minimax_h3_dit_fusions(model: torch.nn.Module, early_opp_paths: frozen
         and _SWIGLU in op_info
         and _has_eagle_kernel(kernels, index.get(_SWIGLU), _matches_int8_swiglu_inputs)
     )
-    for name in model._dit_modules:
-        dit = getattr(model, name)
-        if use_qkv:
-            for block in dit.blocks:
-                attn = block.attn
-                if (attn.head_dim, attn.rot_dim) == (128, 96):
-                    attn._project_qkv = MethodType(_npu_project_qkv, attn)
-        if use_swiglu:
-            for block in chain(dit.blocks, dit.token_refiner.blocks):
-                block.mlp.forward = MethodType(forward_h3_mlp, block.mlp)
+    fp32 = torch.finfo(torch.float32)
+    for module in model.modules():
+        if use_qkv and isinstance(module, MiniMaxH3DiTBlock):
+            attn = module.attn
+            eps = attn.q_norm.variance_epsilon
+            if (
+                (attn.head_dim, attn.rot_dim) == (128, 96)
+                and fp32.tiny <= eps <= fp32.max
+                and eps == attn.k_norm.variance_epsilon
+            ):
+                attn._project_qkv = MethodType(_npu_project_qkv, attn)  # type: ignore[method-assign]
+        elif use_swiglu and isinstance(module, MiniMaxH3MLP):
+            module.forward = MethodType(forward_h3_mlp, module)  # type: ignore[method-assign]

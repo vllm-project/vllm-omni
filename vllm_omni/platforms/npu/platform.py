@@ -365,13 +365,11 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         head_size: int,
         allow_trtllm_default: bool = True,
     ) -> str:
-        if cls._early_diffusion_opp_paths is not None:
-            return cls._select_diffusion_attn_backend(selected_backend)
-        before_import = _custom_opp_paths()
+        before_import = _custom_opp_paths() if cls._early_diffusion_opp_paths is None else None
         backend = cls._select_diffusion_attn_backend(selected_backend)
-        # Only the first backend's eager MindIE-SD import can add paths here.
-        # Later imports can change the environment after CANN has frozen its registry.
-        cls._early_diffusion_opp_paths = _STARTUP_OPP_PATHS | (_custom_opp_paths() - before_import)
+        if before_import is not None:
+            # A later MindIE-SD import may happen after CANN has frozen its registry.
+            cls._early_diffusion_opp_paths = _STARTUP_OPP_PATHS | (_custom_opp_paths() - before_import)
         return backend
 
     @classmethod
