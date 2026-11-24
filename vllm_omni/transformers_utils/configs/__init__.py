@@ -101,6 +101,12 @@ def __dir__():
 
 # Eagerly import all config modules so their AutoConfig.register() side-effects
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
+# vLLM 0.34 added its own LFM3-Audio config. The Omni model builds its layers
+# from the checkpoint's modeling code, which needs the checkpoint's config
+# classes. Drop vLLM's entry here, before any `get_config` call can also
+# register it with AutoConfig.
+from vllm.transformers_utils.config import _CONFIG_REGISTRY  # noqa: E402
+
 from vllm_omni.transformers_utils.configs import audio8_tts as _audio8_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import auk as _auk  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import chatterbox as _chatterbox  # noqa: F401, E402
@@ -121,3 +127,5 @@ from vllm_omni.transformers_utils.configs import vibevoice as _vibevoice  # noqa
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import yue2 as _yue2  # noqa: F401, E402
+
+_CONFIG_REGISTRY.pop("lfm3_audio", None)

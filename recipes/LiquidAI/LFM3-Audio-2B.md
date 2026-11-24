@@ -1,5 +1,9 @@
 # LFM3-Audio-2B on CUDA
 
+> **Model Runner V2.** With vLLM 0.34, both profiles run on Model Runner V2;
+> see [Model Runner V2 validation](#model-runner-v2-validation). The RTX 4090
+> measurements below are historical Model Runner V1 results.
+
 ## Model and execution
 
 [LiquidAI/LFM3-Audio-2B](https://huggingface.co/LiquidAI/LFM3-Audio-2B)
@@ -87,6 +91,28 @@ When a stream's frame count is a multiple of four, its last chunk ends at a code
 boundary. The final empty payload then does not flush the overlap-add tail,
 and 480 samples (20 ms) are missing. This is an open LFM3 streaming issue
 shared with LFM3-Omni.
+
+## Model Runner V2 validation
+
+One RTX 5090 D v2 (24 GB), vLLM 0.34.0, PyTorch 2.14.0+cu130 and Transformers
+5.22.2, with the pinned checkpoint revision. The reference is
+`AutoModelForMultimodalLM` with eager attention in BF16 under the same
+Transformers version. Each request ran alone.
+
+- Text-only profile: greedy token IDs matched the reference for four text
+  prompts, including one of 779 tokens, and for ASR and a question about the
+  same clip.
+- Speech profile with full payloads (no `--async-chunk`): for two sentences,
+  each with greedy and seeded temperature-1.0, top-k 128 audio, waveforms were
+  bitwise identical to the reference codes decoded by LiquidCodec. The four
+  cases had 24, 24, 42 and 36 frames.
+- `tests/e2e/online_serving/test_lfm3_audio.py` covers speech with
+  `--async-chunk`, two concurrent streams, and ASR.
+
+vLLM 0.34 has its own `lfm3_audio` config class. vLLM-Omni uses the
+checkpoint's config instead, because the model is built from the checkpoint's
+modeling code. Interleaved speech-to-speech and performance have not been
+remeasured on Model Runner V2.
 
 ## Measured performance
 
