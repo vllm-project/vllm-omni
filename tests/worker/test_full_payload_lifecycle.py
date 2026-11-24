@@ -39,39 +39,58 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _host(replace_keys: frozenset[str] = frozenset()) -> OmniRunnerDataPlane:
-    host = OmniRunnerDataPlane.__new__(OmniRunnerDataPlane)
-    host._native_requests = {}
-    host._native_output_lock = threading.RLock()
-    host._pending_full_payload_send = {}
-    host._full_payload_token_ends = {}
-    host._full_payload_replace_keys_cached = replace_keys
-    host._stage_id = 0
-    host.send_full_payload_outputs = MagicMock()
-    host._request_ids_mapping = {}
-    host._lock = threading.Lock()
-    host._pending_save_counts = {}
-    host._deferred_send_cleanup = set()
-    host._put_req_chunk = {}
-    host._send_side_request_payload = {}
-    host._code_prompt_token_ids = {}
-    host._cached_ic = {}
-    host._ramp_chunk_count = {}
-    host._adaptive_states = {}
-    host._kv_pending_transfers = {}
-    host._kv_active_transfers = set()
-    host._kv_completed_transfers = set()
-    host._kv_triggered_requests = set()
-    host._get_req_chunk = {}
-    host._pending_load_reqs = {}
-    host._finished_load_reqs = set()
-    host._chunk_ready_req_ids = set()
-    host._chunk_finished_req_ids = set()
-    host._chunk_stream_completed = set()
-    host._stage_recv_req_ids = set()
-    host._full_payload_pending_broadcast_req_ids = set()
-    host._async_chunk_updated_req_ids = set()
-    host._local_stage_payload_cache = {}
-    host._local_request_metadata = {}
+    # Exercise the real native lifecycle initialization. Only connector I/O
+    # and the background worker are substituted, so new request state does
+    # not need to be copied into each __new__-constructed test double.
+    def init_connectors(host, *, model_config):
+        host._async_chunk = False
+        host._custom_process_func = MagicMock()
+        host._pending_full_payload_send = {}
+        host._full_payload_token_ends = {}
+        host._full_payload_replace_keys_cached = replace_keys
+        host._stage_id = 0
+        host.send_full_payload_outputs = MagicMock()
+        host._request_ids_mapping = {}
+        host._lock = threading.Lock()
+        host._pending_save_counts = {}
+        host._deferred_send_cleanup = set()
+        host._put_req_chunk = {}
+        host._send_side_request_payload = {}
+        host._code_prompt_token_ids = {}
+        host._cached_ic = {}
+        host._ramp_chunk_count = {}
+        host._adaptive_states = {}
+        host._kv_pending_transfers = {}
+        host._kv_active_transfers = set()
+        host._kv_completed_transfers = set()
+        host._kv_triggered_requests = set()
+        host._get_req_chunk = {}
+        host._pending_load_reqs = {}
+        host._finished_load_reqs = set()
+        host._chunk_ready_req_ids = set()
+        host._chunk_finished_req_ids = set()
+        host._chunk_stream_completed = set()
+        host._stage_recv_req_ids = set()
+        host._full_payload_pending_broadcast_req_ids = set()
+        host._async_chunk_updated_req_ids = set()
+        host._local_stage_payload_cache = {}
+        host._local_request_metadata = {}
+
+    def start_worker(host, **kwargs):
+        host._native_output_error = None
+        host._native_output_error_lock = threading.Lock()
+        host._native_output_closed = False
+
+    model_config = SimpleNamespace(
+        async_chunk=False,
+        model_stage="talker",
+        custom_process_next_stage_input_func="test.full_payload",
+    )
+    with (
+        patch.object(OmniRunnerDataPlane, "init_omni_connectors", init_connectors),
+        patch.object(OmniRunnerDataPlane, "_start_output_worker", start_worker),
+    ):
+        host = OmniRunnerDataPlane(SimpleNamespace(), model_config)
     return host
 
 
@@ -314,19 +333,7 @@ def test_generation_free_request_records_discard_before_upstream_free():
 
 
 def test_data_plane_replay_preserves_token_history_and_codec_payload():
-    plane = OmniRunnerDataPlane.__new__(OmniRunnerDataPlane)
-    plane._native_requests = {}
-    plane._native_output_lock = threading.RLock()
-    plane._native_send_lock = threading.Lock()
-    plane._native_output_error = None
-    plane._native_output_error_lock = threading.Lock()
-    plane._native_outputs_in_flight = {}
-    plane._native_terminal_pending = set()
-    plane._async_chunk = False
-    plane._can_send = True
-    plane._pending_full_payload_send = {}
-    plane._full_payload_replace_keys_cached = frozenset()
-    plane._full_payload_token_ends = {}
+    plane = _host()
     plane.recv_full_payload_inputs = MagicMock()
     plane.send_chunks = MagicMock(return_value=1)
     plane.cleanup_finished_request = MagicMock()

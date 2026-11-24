@@ -258,7 +258,7 @@ platforms:
         # Keep the three stages' concurrency caps aligned so the top tier is
         # not gated by a single stage.
         max_num_seqs: 8
-        # Measured single-card co-location budget (910B1). The turn-mode v1
+        # Measured single-card co-location budget (910B1). The original turn-mode
         # KV check needs one full 40960-token request on this stage:
         # 144.8 KiB/token x 40960 = 5.62 GiB, so the KV pool must stay above
         # that -- 0.50 leaves only 4.79 GiB and engine init fails with

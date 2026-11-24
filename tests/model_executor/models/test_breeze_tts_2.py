@@ -87,7 +87,8 @@ def reference_codec(mocker):
             num_key_value_heads=2,
             head_dim=8,
             intermediate_size=32,
-            codebook_size=8,
+            # Above torch.cdist's 25-row threshold, like the real 2048-entry codebook.
+            codebook_size=32,
             codebook_dim=8,
             vector_quantization_hidden_dimension=8,
             num_quantizers=4,
@@ -132,6 +133,31 @@ def test_reference_encoder_loads_flat_codec_checkpoint_and_matches_its_codes(ref
     for row, codes in enumerate(expected):
         assert torch.equal(eager[row, :, : codes.shape[-1]], codes)
         assert torch.equal(compiled[row, :, : codes.shape[-1]], codes)
+
+
+def test_short_reference_reuses_the_warmup_compile_and_keeps_its_codes(reference_codec) -> None:
+    # Mimi's quantizer calls torch.cdist, which checks for more than 25 rows, so a
+    # reference of 25 frames or fewer, encoded alone, would compile again.
+    breeze, vllm_config, _, codec = reference_codec
+    breeze.load_weights(vllm_config)
+    counter = torch._dynamo.testing.CompileCounter()
+    breeze._compiled_encode = torch.compile(breeze._encode_impl, fullgraph=True, dynamic=True, backend=counter)
+    torch._dynamo.reset()
+    with torch.no_grad():
+        breeze.warmup(2)
+    warmup_compiles = counter.frame_count
+    torch.manual_seed(1)
+    # 1.0 s (the API minimum) and 1.5 s at 24 kHz: 13 and 19 frames.
+    waves = [torch.randn(length) * 0.1 for length in (24000, 36000)]
+    frames = [-(-wave.numel() // 1920) for wave in waves]
+    with torch.no_grad():
+        single = breeze.encode_batch(waves[:1], frames[:1])
+        pair = breeze.encode_batch(waves, frames)
+        expected = [codec.encode(wave[None, None], num_quantizers=3).audio_codes[0].T for wave in waves]
+    assert counter.frame_count == warmup_compiles
+    assert torch.equal(single[0], expected[0])
+    for codes, reference in zip(pair, expected, strict=True):
+        assert torch.equal(codes, reference)
 
 
 @pytest.mark.parametrize(

@@ -1372,7 +1372,36 @@ all of them for that append. The timeouts' defaults are the same for every
 model (a per-plugin default is a possible follow-up). A plugin enables the mode with
 `supports_input_clock = True` once those hooks match its real unit
 boundaries; sessions of other models that ask for it are refused
-(`input_clock_unsupported`). No model opts in yet.
+(`input_clock_unsupported`). A plugin whose committed turn can split into
+several Stage-0 submissions for some input modality (vision units it
+replays separately, `prepare_commit_prefix`) names the modalities its
+clocked sessions do accept in `input_clock_input_modalities`; the session
+is then created without the others (`apply_input_clock_capabilities`), so
+the modality check refuses them (`invalid_input_modality`). MiniCPM-o 4.5
+opts in, for audio: its Code2Wav stage streams across unit boundaries, so
+its `unit_output_complete` waits for the Talker segment end and the Code2Wav
+output of the chunk that flushes the unit's remaining codes
+(`tts_is_last_chunk`). The orchestrator reads each stage's stream
+independently, so the flushes of several queued units can arrive before the
+first Talker segment end while the engine hands every final-stage output to
+the oldest speaking unit; the hook therefore counts the flags in `state` and
+consumes them in unit order, the n-th flag completing the n-th speaking unit
+(a Code2Wav segment end alone does not complete a unit, so a trailing
+control-only turn-end snapshot of the previous unit cannot complete the next
+one); a Stage-0 segment that
+hands the Talker nothing (`<|speak|>` straight into `<|chunk_eos|>`, or the
+chunk terminator drawn as the unit's first decision) is forwarded as an
+empty hand-off, which the Talker closes like any segment, so every speaking
+unit has a Talker segment end and a flagged Code2Wav output of its own and
+the default `unit_decision` is enough; and its input buffer implements
+`prepare_backlog`. The flag marks the end of what the bridge hands Code2Wav
+for the unit, not of its audio: the vocoder's lookahead, and a remainder
+shorter than 5 frames that the connector carries into the next unit's first
+chunk, put the unit's last codec frames (usually 200–440 ms of audio; no
+structural bound) into audio emitted with the next unit, as in real-time
+operation, so the codec path is the same with and without the clock. Only
+the chunk that ends the turn flushes everything; the API doc states this lag
+in the model's entry.
 
 What a plugin must guarantee before it opts in:
 
@@ -1432,9 +1461,11 @@ embeddings even when they do not add a pooled token.
 The default `minicpmo_4_5.yaml` deployment selects MRv2 for all three stages
 on CUDA, ROCm and NPU. The ROCm override changes runner selection while
 preserving the shared duplex session, async-chunk, device, connector and stage
-topology contracts. The CUDA-only reference-attention, FlashAttention, graph,
-speculation and fused-kernel behavior described below does not apply to ROCm;
-runner selection alone does not establish ROCm runtime or quality qualification.
+topology contracts. The CUDA-only reference-attention, FlashAttention, graph
+and speculation behavior described below does not apply to ROCm. A ROCm FP16
+Code2Wav configuration may select the shared fused CFM body with its SDPA
+fallback; it does not enable NVIDIA tiled attention. Runner selection and this
+dispatch coverage alone do not establish ROCm runtime or quality qualification.
 
 MiniCPM-o native duplex does not apply a character cap unless
 `max_speak_chars_per_chunk` is set to a positive value. The default is 0,
@@ -1444,6 +1475,15 @@ ending in U+FFFD may continue to complete its UTF-8 bytes when a positive
 cap is set. That cap keeps the token that crosses the target, then closes
 the chunk before another draw. Hard token and request caps retain priority;
 explicit `force_listen` bypasses only the soft character target.
+
+The listen decision takes the released `streaming_generate` knobs. A session
+created with `extra_body={"listen_prob_scale": s}` multiplies the listen logit
+by `s` after the repetition penalty, and `extra_body={"listen_top_k": k}`
+returns `<|listen|>` outright when it ranks within the top-`k` logits, before
+the final draw. Both default to neutral (`1.0` / unset) and are validated at
+session creation; they ride the append payload next to `force_listen` and
+cannot change once the session exists. An early listen never enters the
+repetition history, matching the reference decoder's early return.
 
 MiniCPM-o preserves the stage-2 sampled `<|turn_eos|>`, including after text
 without sentence-ending punctuation. The sampler does not infer whether an
