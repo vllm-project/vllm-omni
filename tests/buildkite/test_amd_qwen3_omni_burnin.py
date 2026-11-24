@@ -17,6 +17,7 @@ SOURCE_DEPENDENCIES = Path(".buildkite/common/ci_source_file_dependencies.yml")
 COLLECTION_GUARD = Path(".buildkite/amd/scripts/assert-pytest-collection.sh")
 RUNNER = Path(".buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh")
 CORRECTNESS_TEST = Path("tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py")
+ACCURACY_TEST = Path("tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py")
 PERF_CONFIGS = {
     "Qwen3-Omni No-Async-Chunk Perf": Path("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json"),
     "Qwen3-Omni Async-Chunk Perf": Path("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json"),
@@ -159,6 +160,13 @@ def test_qwen3_omni_correctness_enables_only_the_new_rocm_resource() -> None:
     assert source.count("current_omni_platform.is_rocm()") == 2
     assert "stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S" in source
     assert "init_timeout=QWEN3_OMNI_COLD_INIT_TIMEOUT_S" in source
+
+
+def test_qwen3_omni_accuracy_uses_the_rocm_cold_start_timeout() -> None:
+    source = ACCURACY_TEST.read_text(encoding="utf-8")
+    assert "QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S" in source
+    assert "stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S" in source
+    assert "if current_omni_platform.is_rocm() else None" in source
 
 
 def test_qwen3_omni_perf_counts_and_existing_baselines_are_preserved() -> None:
