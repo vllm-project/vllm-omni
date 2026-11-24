@@ -20,8 +20,8 @@ reads the output from, the symmetric workspace (no copy-out): the output view st
 first action publishes READY only after earlier work on the compute stream has finished.
 
 Flags (uint32, monotonic epochs, one slot per writer rank) live after the data in each rank's workspace:
-READY[N]: writer's regions are free for this epoch; IN[chunks][N]: writer's chunk inputs landed here;
-OUT[N]: writer's outputs for every chunk landed here.
+``READY[N]``: writer's regions are free for this epoch; ``IN[chunks][N]``: writer's chunk inputs landed here;
+``OUT[N]``: writer's outputs for every chunk landed here.
 """
 
 from __future__ import annotations
