@@ -283,7 +283,13 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     parallel_config = od_config.parallel_config
     assert parallel_config.data_parallel_size is not None
     vllm_config.parallel_config.tensor_parallel_size = parallel_config.tensor_parallel_size
-    vllm_config.parallel_config.data_parallel_size = parallel_config.data_parallel_size
+    # HSDP rank-local requests use Omni's DP group only for request routing.
+    # They must remain non-DP from vLLM's model-layout perspective; otherwise
+    # FusedMoE folds the request lanes into TP and partitions expert tensors a
+    # second time before HSDP is applied.
+    vllm_config.parallel_config.data_parallel_size = (
+        1 if getattr(parallel_config, "hsdp_data_parallel", False) else parallel_config.data_parallel_size
+    )
     if parallel_config.enable_expert_parallel and od_config.is_moe:
         vllm_config.parallel_config.data_parallel_size = (
             parallel_config.data_parallel_size * parallel_config.cfg_parallel_size
@@ -303,6 +309,16 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
             "Disabling MoE LoRA for online MXFP4 on a native-capable CUDA/XPU device "
             "without a startup adapter; "
             "this enables the native MXFP4 MoE backend."
+        )
+        moe_lora_enabled = False
+    if moe_lora_enabled and current_omni_platform.is_xpu() and not getattr(od_config, "lora_path", None):
+        # vLLM's native XPU MoE experts do not support LoRA; a LoRAConfig would push every
+        # MoE DiT to the EMULATION backend. Build the bridge on XPU only for a startup LoRA.
+        logger.info(
+            "Disabling MoE LoRA on XPU without a startup adapter (--lora-path); "
+            "this keeps the experts on the native XPU MoE backend instead of EMULATION. "
+            "MoE LoRA added after startup will not be applied to the experts on XPU; "
+            "pass a startup adapter if you need it."
         )
         moe_lora_enabled = False
     if moe_lora_enabled:

@@ -12,11 +12,12 @@ import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import pytest
 import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import MooncakeStoreConnectorStats
 
 from vllm_omni.distributed.kv_transfer.mooncake import connector as connector_module
 from vllm_omni.distributed.kv_transfer.mooncake.config import MooncakeConfig
@@ -52,6 +53,10 @@ class NativeTokenDatabase:
 class NativeWorkerSeam:
     store: NativeStore
     token_dbs: list[NativeTokenDatabase]
+    kv_connector_stats: MooncakeStoreConnectorStats = field(default_factory=MooncakeStoreConnectorStats)
+
+    def _record_kv_connector_operation(self, operation, duration_seconds, num_keys, **fields):
+        self.kv_connector_stats.record_operation(operation, duration_seconds, num_keys, **fields)
 
 
 @pytest.fixture

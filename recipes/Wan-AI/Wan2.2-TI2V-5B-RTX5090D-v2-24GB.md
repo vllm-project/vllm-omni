@@ -243,7 +243,7 @@ requests. Both produced MP4s with the same SHA-256 as at `18747cd29`.
 | --- | --- | --- |
 | Online FP8 transformer | Qualified at the native shape; fails the metric thresholds at 832x480 | [FP8](../../docs/user_guide/quantization/fp8.md) |
 | BF16 | Does not run at the native shape on this machine (VRAM, or host memory with offload) | — |
-| Int8 W8A8 | Not supported on SM 12.0 with vLLM 0.33.0 | [Int8](../../docs/user_guide/quantization/int8.md) |
+| Int8 W8A8 | Not supported on SM 12.0 with vLLM 0.33.0 or 0.34.0 | [Int8](../../docs/user_guide/quantization/int8.md) |
 | Layerwise offload (DiT) | Qualified with FP8 (recommended) | [CPU offload](../../docs/user_guide/diffusion/cpu_offload.md) |
 | Module offload | Not qualified on the stock path | [CPU offload](../../docs/user_guide/diffusion/cpu_offload.md) |
 | VAE tiling | Required at the native shape | [VAE parallelism and tiling](../../docs/user_guide/diffusion/parallelism/vae_parallelism.md) |

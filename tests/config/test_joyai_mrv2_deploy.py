@@ -31,10 +31,10 @@ def test_joyai_runner_and_transport_contract(monkeypatch, platform, asr, duplex)
     assert len(stages) == (4 if asr else 3)
     for stage in stages:
         args = stage.yaml_engine_args
-        assert args["use_v2_model_runner"] is (platform == "cuda")
+        assert args["use_v2_model_runner"] is True
         assert args["supports_native_mrv2_data_plane"] is True
         assert args["session_mode"] == ("duplex" if duplex else "turn")
-        assert args["async_chunk"] is (duplex and not asr)
+        assert args["async_chunk"] is duplex
     assert stages[-2].yaml_engine_args["recompute_preemption"] == "fail"
     assert stages[-1].yaml_engine_args["requires_full_payload_input"] is True
     joyai = pipeline.stages[int(asr)]
@@ -53,7 +53,5 @@ def test_joyai_stage_runner_override(monkeypatch, v1_stages):
     )
     for stage_id in v1_stages:
         deploy.stages[stage_id].model_runner = "v1"
-    stages = merge_pipeline_deploy(JOYAI_VL_INTERACTION_PIPELINE, deploy)
-    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [
-        stage_id not in v1_stages for stage_id in range(3)
-    ]
+    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+        merge_pipeline_deploy(JOYAI_VL_INTERACTION_PIPELINE, deploy)

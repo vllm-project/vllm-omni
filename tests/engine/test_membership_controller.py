@@ -242,6 +242,33 @@ async def test_unregister_then_register_restores_coordinator_replica_slot(monkey
 
 
 @pytest.mark.asyncio
+async def test_unregister_awaits_async_removal_handler_before_request_cleanup(monkeypatch):
+    pool = FakePool(stage_id=0)
+    pool.replica_ids["tcp://replica-0"] = 0
+    controller = _controller(monkeypatch, pool, FakeHub())
+    order: list[str] = []
+
+    async def on_removed(stage_id: int, replica_id: int) -> None:
+        await asyncio.sleep(0)
+        order.append(f"removed:{stage_id}:{replica_id}")
+
+    async def cleanup(request_ids: list[str]) -> None:
+        order.append("cleanup:" + ",".join(request_ids))
+
+    controller.install_membership_handlers(
+        output_queue=asyncio.Queue(),
+        cleanup_callback=cleanup,
+        replica_removed_callback=on_removed,
+    )
+
+    await controller.handle_unregister(0, "tcp://replica-0", cleanup_callback=cleanup)
+
+    # The session owner closes its sessions before the generic per-request
+    # cleanup runs, so the client observes a session close, not a bare abort.
+    assert order == ["removed:0:0", "cleanup:req-1,req-2"]
+
+
+@pytest.mark.asyncio
 async def test_handle_register_deduplicates_inflight_and_attached_replica(monkeypatch):
     pool = FakePool(stage_id=0)
     factory_started = threading.Event()

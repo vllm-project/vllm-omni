@@ -43,11 +43,14 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     FASTWAN_DMD_TIMESTEPS,
     Wan22Pipeline,
     build_wan_scheduler,
+    resolve_wan_flow_shift,
+    resolve_wan_sample_solver,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -249,15 +252,13 @@ def test_forward_passes_request_shift_without_mutating_scheduler_config(solver: 
         torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("flow_shift", [float("nan"), float("inf")])
-def test_forward_rejects_unusable_sigmas_right_after_set_timesteps(flow_shift: float) -> None:
-    """Under sigma windows, sigmas that a bad flow_shift produces fail this request before its latents are
-    prepared or any denoise forward runs; a valid flow_shift and an unscheduled request are unaffected."""
+@pytest.mark.parametrize("sigma", [-0.1, 1.1])
+def test_forward_rejects_unusable_sigmas_right_after_set_timesteps(sigma: float) -> None:
     reached: list[str] = []
 
-    def run(shift: float) -> None:
-        # A fresh pipeline per request, so no request inherits the scheduler another one built.
+    def run(sigma_value: float) -> None:
         pipeline = _make_pipeline()
+        pipeline.scheduler.sigmas = torch.tensor([sigma_value, 0.5, 0.0])
 
         def prepare_latents(**kwargs):
             reached.append("prepare_latents")
@@ -269,22 +270,100 @@ def test_forward_rejects_unusable_sigmas_right_after_set_timesteps(flow_shift: f
 
         pipeline.prepare_latents = prepare_latents
         pipeline.diffuse = diffuse
-        sampling = _make_sampling(num_inference_steps=4, extra_args={"sample_solver": "euler", "flow_shift": shift})
+        sampling = _make_sampling(num_inference_steps=2)
         request = OmniDiffusionRequest(prompt="prompt", request_id="sigma-check", sampling_params=sampling)
         pipeline.forward(DiffusionRequestBatch(requests=[request]))
 
     with set_forward_context(), bind_attention_schedule(None, (AttentionSigmaWindow(0.0, 1.0, "p"),)):
-        with pytest.raises(InvalidAttentionScheduleError, match="check flow_shift"):
-            run(flow_shift)
+        with pytest.raises(InvalidAttentionScheduleError):
+            run(sigma)
         assert reached == []
-        run(12.0)
+        run(1.0)
         assert reached == ["prepare_latents", "diffuse"]
 
     # Without sigma windows nothing reads the sigmas, so the check does not run.
     reached.clear()
     with set_forward_context():
-        run(flow_shift)
+        run(sigma)
     assert reached == ["prepare_latents", "diffuse"]
+
+
+def test_resolve_wan_sample_solver_rejects_unknown_solver_as_client_error() -> None:
+    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"sample_solver": "abc"}))
+
+    with pytest.raises(OmniClientError) as exc_info:
+        resolve_wan_sample_solver(request)
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "config_shift", "expected"),
+    [({"flow_shift": "12"}, 5.0, 12.0), ({}, 3.0, 3.0), ({}, None, 5.0)],
+)
+def test_resolve_wan_flow_shift_keeps_finite_values(extra_args: dict, config_shift, expected: float) -> None:
+    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args=extra_args))
+
+    assert resolve_wan_flow_shift(request, SimpleNamespace(flow_shift=config_shift)) == expected
+
+
+@pytest.mark.parametrize(
+    "flow_shift",
+    [
+        "nan",
+        "inf",
+        "-inf",
+        float("nan"),
+        float("-inf"),
+        0.0,
+        -2.0,
+        "abc",
+        True,
+        False,
+        pytest.param(10**400, id="huge-int"),
+    ],
+)
+def test_resolve_wan_flow_shift_rejects_invalid_request_value(flow_shift: object) -> None:
+    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"flow_shift": flow_shift}))
+
+    with pytest.raises(OmniClientError, match=r"^flow_shift (must be|is too large)") as exc_info:
+        resolve_wan_flow_shift(request, SimpleNamespace(flow_shift=5.0))
+    assert type(exc_info.value.__cause__) is ValueError
+    assert str(exc_info.value) == str(exc_info.value.__cause__)
+
+
+@pytest.mark.parametrize("bad_shift", ["nan", float("nan"), "inf", 0.0, -2.0])
+def test_forward_never_caches_invalid_flow_shift(bad_shift: object) -> None:
+    pipeline = _make_pipeline()
+    pipeline.scheduler = build_wan_scheduler("unipc", 5.0)
+    pipeline.diffuse = lambda **kwargs: kwargs["latents"]
+
+    def run(solver: str, shift: object) -> None:
+        sampling = _make_sampling(num_inference_steps=5, extra_args={"sample_solver": solver, "flow_shift": shift})
+        request = OmniDiffusionRequest(prompt="prompt", request_id="schedule", sampling_params=sampling)
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
+
+    def assert_euler_sigmas(shift: float) -> None:
+        reference = build_wan_scheduler("euler", shift)
+        reference.set_timesteps(5, device="cpu")
+        torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
+
+    unipc_scheduler = pipeline.scheduler
+    with pytest.raises(OmniClientError):
+        run("euler", bad_shift)
+    assert pipeline.scheduler is unipc_scheduler
+    assert (pipeline._sample_solver, pipeline._flow_shift) == ("unipc", 5.0)
+
+    run("euler", 12.0)
+    assert_euler_sigmas(12.0)
+
+    run("euler", 5.0)
+    euler_scheduler = pipeline.scheduler
+    with pytest.raises(OmniClientError):
+        run("euler", bad_shift)
+    assert pipeline.scheduler is euler_scheduler
+    assert (pipeline._sample_solver, pipeline._flow_shift) == ("euler", 5.0)
+    assert_euler_sigmas(5.0)
 
 
 def test_forward_batches_text_generators_latents_and_splits_outputs() -> None:
@@ -436,6 +515,35 @@ def test_forward_keeps_legacy_output_on_non_owner_vae_rank() -> None:
     assert outputs[0].media is None
     assert outputs[0].output is not None
     assert outputs[0].output.numel() == 0
+
+
+def test_forward_tolerates_none_decode_on_non_decoding_pp_stage() -> None:
+    # Under pipeline parallelism, PipelineParallelMixin wraps vae.decode so that a
+    # stage which does not decode returns (None,) instead of a tensor.
+    pipeline = _make_pipeline()
+    pipeline.vae.decode = lambda latents, return_dict=False: (None,)  # type: ignore[assignment]
+    pipeline.diffuse = lambda **kwargs: torch.zeros_like(kwargs["latents"])  # type: ignore[method-assign]
+
+    batch = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt="prompt",
+                request_id="request-0",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_frames=1,
+                    num_inference_steps=2,
+                    max_sequence_length=32,
+                    output_type="np",
+                ),
+            )
+        ]
+    )
+
+    outputs = pipeline.forward(batch)
+
+    assert len(outputs) == 1
+    assert outputs[0].media is None
+    assert outputs[0].output is None
 
 
 def test_forward_batches_precomputed_prompt_embeddings() -> None:
@@ -1222,8 +1330,13 @@ def _graph_od_config(**overrides) -> SimpleNamespace:
         cache_backend="none",
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
-        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1, data_parallel_size=1),
+        diffusion_kv_mode="dense_legacy",
+        diffusion_kv_cache_dtype=None,
         diffusion_kv_cache_skip_step_indices=None,
+        diffusion_attention_config=AttentionConfig(),
+        diffusion_attention_schedule=None,
+        diffusion_graph_release_after_denoise=False,
     )
     vars(od_config).update(overrides)
     return od_config

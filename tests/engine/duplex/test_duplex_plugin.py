@@ -242,18 +242,16 @@ def test_validate_duplex_plugin_sampling_rejects_non_tuple_results() -> None:
 
 
 @pytest.mark.parametrize(
-    ("policy", "cap", "distributed", "sharing", "error"),
+    ("policy", "cap", "sharing", "error"),
     [
-        ("legacy", None, True, False, None),
-        ("legacy", 2, False, False, None),
-        ("least_sessions", 1, False, False, None),
-        ("least_sessions", 2, False, True, None),
-        ("least_sessions", 2, False, False, "set max_sessions_per_replica to 1"),
-        ("least_sessions", 1, True, False, "does not support distributed hub/LB mode"),
-        ("least_sessions", 2, True, False, "does not support distributed hub/LB mode"),
+        ("legacy", None, False, None),
+        ("legacy", 2, False, None),
+        ("least_sessions", 1, False, None),
+        ("least_sessions", 2, True, None),
+        ("least_sessions", 2, False, "set max_sessions_per_replica to 1"),
     ],
 )
-def test_validate_duplex_replica_policy(policy, cap, distributed, sharing, error) -> None:
+def test_validate_duplex_replica_policy(policy, cap, sharing, error) -> None:
     capability_calls: list[int] = []
 
     class CapabilityPlugin(FakePlugin):
@@ -265,12 +263,12 @@ def test_validate_duplex_replica_policy(policy, cap, distributed, sharing, error
     config = DuplexSessionRuntimeConfig(max_sessions=11, replica_policy=policy, max_sessions_per_replica=cap)
     if error is not None:
         with pytest.raises(ValueError, match=error):
-            validate_duplex_replica_policy(plugin, config, distributed=distributed)
+            validate_duplex_replica_policy(plugin, config)
     else:
-        validate_duplex_replica_policy(plugin, config, distributed=distributed)
-    # Distributed rejection precedes plugin access. Legacy and one-session
-    # replicas do not need a capability that permits sharing.
-    expected = [cap] if policy == "least_sessions" and not distributed and cap > 1 else []
+        validate_duplex_replica_policy(plugin, config)
+    # The capability is consulted whenever more than one session may share a
+    # replica, in local and distributed mode alike.
+    expected = [cap] if policy == "least_sessions" and cap > 1 else []
     assert capability_calls == expected
 
 

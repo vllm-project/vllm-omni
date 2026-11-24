@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from __future__ import annotations
+
 import copy
 from collections.abc import Iterable
 from dataclasses import replace
 from functools import cached_property
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -21,10 +24,11 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 
 class Qwen2_5OmniTalkerForConditionalGeneration(
@@ -94,6 +98,8 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
 
     @cached_property
     def sampler(self):
+        from vllm.v1.sample.sampler import Sampler
+
         if hasattr(self.language_model, "sampler"):
             return self.language_model.sampler
 

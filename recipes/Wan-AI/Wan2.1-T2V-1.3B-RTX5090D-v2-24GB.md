@@ -207,7 +207,7 @@ comparable.
 | --- | --- | --- |
 | BF16, no offload | Qualified at the shapes above (recommended) | — |
 | Online FP8 transformer | Qualified at the shapes above, see the FP8 table | [FP8](../../docs/user_guide/quantization/fp8.md) |
-| Int8 W8A8 | Not supported on SM 12.0 with vLLM 0.33.0 | [Int8](../../docs/user_guide/quantization/int8.md) |
+| Int8 W8A8 | Not supported on SM 12.0 with vLLM 0.33.0 or 0.34.0 | [Int8](../../docs/user_guide/quantization/int8.md) |
 | VAE tiling | Enabled in every row | [VAE parallelism and tiling](../../docs/user_guide/diffusion/parallelism/vae_parallelism.md) |
 | CPU offload | Not needed; not qualified on the stock path | [CPU offload](../../docs/user_guide/diffusion/cpu_offload.md) |
 | Cache-DiT / TeaCache | Not measured | [Cache-DiT](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md) |

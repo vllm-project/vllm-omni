@@ -38,8 +38,8 @@ def _validate_sigma(value: float, name: str) -> float:
 def resolve_sampler_name(name: str | None) -> str:
     if name is None:
         return "euler"
-    if name not in ("euler", "res_multistep"):
-        raise ValueError(f"Unsupported sampler: {name!r}; expected euler or res_multistep")
+    if name not in ("euler", "res_multistep", "heun"):
+        raise ValueError(f"Unsupported sampler: {name!r}; expected euler, res_multistep or heun")
     return name
 
 
@@ -146,7 +146,7 @@ class SamplingState:
 
     The sampler updates this state after each step and uses it to continue
     sampling on the next call. Algorithms needing history create their own
-    history object; Euler leaves it as None. Build updated history
+    history object; Euler and Heun leave it as None. Build updated history
     separately and replace it after validation, so a failed step can be retried.
     """
 
@@ -309,6 +309,54 @@ def sample_res_multistep(
             _commit(active, outputs, callback, histories=new_histories)
 
 
+def sample_heun(
+    model: DenoiseModel,
+    states: Sequence[SamplingState],
+    *,
+    num_steps: int | None = None,
+    callback: SampleCallback | None = None,
+    step_context: StepContext | None = None,
+) -> None:
+    """Predict, evaluate the Euler proposal, then combine both derivatives.
+
+    The correction is skipped for a request whose next sigmas are all zero, so
+    an N-step schedule ending at zero uses 2N - 1 model evaluations.
+    """
+    for active in _sampling_steps(states, num_steps):
+        with step_context(active) if step_context else nullcontext():
+            predictions = _evaluate(model, _current_evaluations(active))
+            derivatives, proposals, corrections = [], [], []
+            for state, prediction in zip(active, predictions, strict=True):
+                ds, trial = [], []
+                for x, x0, schedule in zip(state.latents, prediction, state.sigmas, strict=True):
+                    curr, nxt = schedule[state.step_index : state.step_index + 2]
+                    dtype = torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
+                    d = (x.to(dtype) - x0.to(dtype)) / curr
+                    ds.append(d)
+                    trial.append((x.to(dtype) + (nxt - curr) * d).to(x.dtype))
+                derivatives.append(ds)
+                proposals.append(tuple(trial))
+                next_sigmas = tuple(s[state.step_index + 1] for s in state.sigmas)
+                if any(s > 0 for s in next_sigmas):
+                    corrections.append(ModelEvaluation(state, tuple(trial), next_sigmas))
+            corrected = _evaluate(model, corrections) if corrections else []
+            by_state = {evaluation.state: pred for evaluation, pred in zip(corrections, corrected, strict=True)}
+            outputs = []
+            for state, ds, trial in zip(active, derivatives, proposals, strict=True):
+                output = []
+                for j, (x, d, proposal, schedule) in enumerate(
+                    zip(state.latents, ds, trial, state.sigmas, strict=True)
+                ):
+                    curr, nxt = schedule[state.step_index : state.step_index + 2]
+                    if nxt == 0:
+                        output.append(proposal)
+                    else:
+                        d2 = (proposal.to(d.dtype) - by_state[state][j].to(d.dtype)) / nxt
+                        output.append((x.to(d.dtype) + (nxt - curr) * (d + d2) / 2).to(x.dtype))
+                outputs.append(tuple(output))
+            _commit(active, outputs, callback)
+
+
 class Sampler(ABC):
     """ComfyUI-style sampler interface; models expose prediction, not sampling."""
 
@@ -349,5 +397,5 @@ class KSAMPLER(Sampler):
 
 
 def sampler_object(name: str | None = None) -> KSAMPLER:
-    functions = {"euler": sample_euler, "res_multistep": sample_res_multistep}
+    functions = {"euler": sample_euler, "res_multistep": sample_res_multistep, "heun": sample_heun}
     return KSAMPLER(functions[resolve_sampler_name(name)])

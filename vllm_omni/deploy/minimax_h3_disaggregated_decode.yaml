@@ -4,6 +4,8 @@ trust_remote_code: true
 distributed_executor_backend: mp
 stages:
   - stage_id: 0
+    # Encoder is an LLM-AR stage. Diffusion and VAE decode stay on their own runners.
+    model_runner: v2
     devices: "0,1"
     tensor_parallel_size: 2
     gpu_memory_utilization: 0.3
