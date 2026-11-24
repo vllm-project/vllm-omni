@@ -99,10 +99,12 @@ def _qkv_inputs():
     return attention, packed, table
 
 
-def _install_npu_qkv(attention):
-    from vllm_omni.platforms.npu.models.minimax_h3 import _npu_project_qkv
-
-    attention._project_qkv = MethodType(_npu_project_qkv, attention)
+@pytest.fixture(scope="module")
+def h3():
+    with pytest.MonkeyPatch.context() as patch:
+        if importlib.util.find_spec("torch_npu") is None:
+            patch.setitem(sys.modules, "torch_npu", SimpleNamespace())
+        return importlib.import_module("vllm_omni.platforms.npu.models.minimax_h3")
 
 
 @pytest.fixture
@@ -126,13 +128,12 @@ class TestMiniMaxH3Fusions:
         ],
     )
     def test_h3_platform_installs_registered_fusions(
-        self, tmp_path, monkeypatch, device, soc, registered, late, expected
+        self, tmp_path, monkeypatch, h3, device, soc, registered, late, expected
     ):
         from vllm_omni.diffusion.models.minimax_h3.controlnet import MiniMaxH3ControlBlock
         from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3DiTBlock, MiniMaxH3MLP
         from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3TokenRefinerBlock
         from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-        from vllm_omni.platforms.npu.models import minimax_h3 as h3
 
         sdk = tmp_path / "mindiesd"
         vendor = sdk / "ops/vendors/aie_ascendc"
@@ -197,13 +198,13 @@ class TestMiniMaxH3Fusions:
         for block in (main, refiner):
             assert block.mlp.forward.__func__ is (h3.forward_h3_mlp if use_swiglu else MiniMaxH3MLP.forward)
 
-    def test_project_qkv_calls_eagle_with_local_rope_halves(self, eagle_qkv):
+    def test_project_qkv_calls_eagle_with_local_rope_halves(self, h3, eagle_qkv):
         attention, packed, table = _qkv_inputs()
         attention.vdn = nn.Identity()
         q, k, _ = packed.view(7, 6, 128).split(2, dim=1)
         outputs = (object(), object(), object())
         eagle_qkv.return_value = outputs
-        _install_npu_qkv(attention)
+        attention._project_qkv = MethodType(h3._npu_project_qkv, attention)
 
         actual_q, actual_k, actual_v, raw_q, raw_k = attention._project_qkv(packed, table, vdn_window=object())
 
@@ -223,14 +224,14 @@ class TestMiniMaxH3Fusions:
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     @pytest.mark.parametrize(("rows", "use_eagle"), [(99_864, True), (99_865, False)])
-    def test_project_qkv_eagle_numel_limit(self, eagle_qkv, rows, use_eagle):
+    def test_project_qkv_eagle_numel_limit(self, h3, eagle_qkv, rows, use_eagle):
         attention, _, _ = _qkv_inputs()
         attention.to("meta")
         attention.num_heads = attention.num_kv_heads = 56
         packed = torch.empty(rows, 3 * attention.num_heads * attention.head_dim, device="meta", dtype=torch.bfloat16)
         table = packed.new_empty((rows, attention.rot_dim))
         eagle_qkv.return_value = (None, None, None)
-        _install_npu_qkv(attention)
+        attention._project_qkv = MethodType(h3._npu_project_qkv, attention)
 
         q, *_ = attention._project_qkv(packed, table)
 
@@ -238,12 +239,12 @@ class TestMiniMaxH3Fusions:
         if not use_eagle:
             assert q.shape == (rows, attention.num_heads, attention.head_dim)
 
-    def test_qkv_missing_native_uses_projected_values(self, eagle_qkv):
+    def test_qkv_missing_native_uses_projected_values(self, h3, eagle_qkv):
         attention, packed, table = _qkv_inputs()
         expected = attention._project_qkv(packed, table)
         attention.qkv_proj = Mock(wraps=attention.qkv_proj)
         eagle_qkv.side_effect = ImportError("native QKV unavailable")
-        _install_npu_qkv(attention)
+        attention._project_qkv = MethodType(h3._npu_project_qkv, attention)
 
         actual = attention._project_qkv(packed, table)
 
@@ -251,10 +252,9 @@ class TestMiniMaxH3Fusions:
         eagle_qkv.assert_called_once()
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
-    def test_int8_swiglu_feeds_fc2(self, monkeypatch):
+    def test_int8_swiglu_feeds_fc2(self, monkeypatch, h3):
         from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 
-        from vllm_omni.platforms.npu.models.minimax_h3 import forward_h3_mlp
         from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
 
         fc1 = MergedColumnParallelLinear.__new__(MergedColumnParallelLinear)
@@ -264,12 +264,12 @@ class TestMiniMaxH3Fusions:
         hidden = torch.arange(30).reshape(6, 5)
         quantize = Mock(return_value=(object(), object()))
         eagle = Mock(return_value=hidden)
-        monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_dynamic_quant=quantize))
+        monkeypatch.setattr(h3, "torch_npu", SimpleNamespace(npu_dynamic_quant=quantize))
         monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_quant_batch_matmul_swiglu=eagle))
         x = torch.zeros(2, 3, 4, dtype=torch.bfloat16)
         mlp = SimpleNamespace(fc1=fc1, fc2=Mock(return_value=(hidden, None)))
 
-        assert forward_h3_mlp(mlp, x) is hidden
+        assert h3.forward_h3_mlp(mlp, x) is hidden
         quantized, scale = quantize.return_value
         eagle.assert_called_once_with(
             quantized, fc1.weight, fc1.weight_scale, pertoken_scale=scale, output_dtype=x.dtype

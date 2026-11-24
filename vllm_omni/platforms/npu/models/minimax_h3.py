@@ -14,7 +14,12 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+import torch_npu
 from vllm.logger import init_logger
+
+from vllm_omni.platforms.npu.layers.rotary_embedding import (
+    npu_rotary_mul_with_bsnd_fallback,
+)
 
 logger = init_logger(__name__)
 
@@ -33,8 +38,6 @@ def _apply_rotary_pos_emb_npu(
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply Qwen3-VL text RoPE with fused BNSD rotary multiplication."""
-    from vllm_omni.platforms.npu.layers.rotary_embedding import npu_rotary_mul_with_bsnd_fallback
-
     return (
         npu_rotary_mul_with_bsnd_fallback(q, cos, sin, unsqueeze_dim=1),
         npu_rotary_mul_with_bsnd_fallback(k, cos, sin, unsqueeze_dim=1),
@@ -100,8 +103,6 @@ def apply_minimax_h3_qwen3vl_sdpa_patch() -> None:
 
 def npu_swiglu_from_packed(gate_up: torch.Tensor) -> torch.Tensor:
     """Apply fused SwiGLU to a packed gate/up projection tensor."""
-    import torch_npu
-
     return torch_npu.npu_swiglu(gate_up, dim=-1)
 
 
@@ -203,7 +204,6 @@ def forward_h3_mlp(self: Any, x: torch.Tensor) -> torch.Tensor:
         return type(self).forward(self, x)
 
     try:
-        import torch_npu
         from mindiesd.fused_ops import eagle_quant_batch_matmul_swiglu
 
         quantized_x, scale = torch_npu.npu_dynamic_quant(x.reshape(-1, x.shape[-1]))
