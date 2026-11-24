@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -984,7 +985,8 @@ def test_venus_delegation_masks_aligned_speech_rows_and_preserves_text_tokens():
     assert source.outputs[0].token_ids == ids
 
 
-def test_venus_handoff_preserves_delegate_tags_when_tokenizer_skips_specials():
+@pytest.mark.parametrize("decision_prefix", [[], [9304], [9303]], ids=["no_speak", "speak", "leading_listen"])
+def test_venus_handoff_preserves_delegate_tags_when_tokenizer_skips_specials(decision_prefix):
     from vllm_omni.model_executor.models.realtime_venus.delegation import DelegateParser
 
     def decode(ids, *, skip_special_tokens=False):
@@ -999,7 +1001,7 @@ def test_venus_handoff_preserves_delegate_tags_when_tokenizer_skips_specials():
     texts = []
     calls = []
     for content in ([9400, 21], [22, 9401]):
-        unit = [9304, *content, 9308]
+        unit = [*decision_prefix, *content, 9308]
         cumulative.extend(unit)
         source, _ = _native_source([101], list(cumulative), [101, *unit])
         source.outputs[0].multimodal_output["meta"].update(delegate_open_token_id=9400, delegate_close_token_id=9401)
@@ -1010,6 +1012,102 @@ def test_venus_handoff_preserves_delegate_tags_when_tokenizer_skips_specials():
         assert handoff["ids"]["tts"] == []  # Delimiters/payload still never condition speech.
     assert texts == ["<delegate>add ", "12 and 30</delegate>"]
     assert calls == [None, "add 12 and 30"]
+
+
+def test_venus_closing_delegate_decision_restores_aligned_speech():
+    from vllm_omni.model_executor.models.realtime_venus.delegation import DelegateParser
+
+    context = StreamingInputState(
+        bridge_states={"duplex": {"epoch": 0, "model_turn_id": 0}},
+        source_token_decoder=lambda ids, **_: "".join({21: "lookup", 22: "Done."}.get(i, "") for i in ids),
+    )
+    parser = DelegateParser()
+    cumulative = []
+    handoffs = []
+    calls = []
+    for unit in ([9304, 9400, 21, 9308], [9401, 22, 9310, 9308]):
+        cumulative.extend(unit)
+        source, latent = _native_source([101], list(cumulative), [101, *unit[:-1]])
+        source.outputs[0].multimodal_output["meta"].update(delegate_open_token_id=9400, delegate_close_token_id=9401)
+        info = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+        handoffs.append(info)
+        calls.append(parser.feed(info["meta"]["native_duplex_segment_text"]))
+
+    assert calls == [None, "lookup"]
+    assert handoffs[0]["ids"]["tts"] == []
+    resumed = handoffs[1]
+    assert resumed["ids"]["tts"] == [22, 9310]
+    assert torch.equal(torch.as_tensor(unpack_handoff_tensor(resumed["hidden_states"]["tts"])), latent[[2, 3]])
+    assert resumed["meta"]["turn_start"] is True
+    assert resumed["meta"]["turn_end"] is True
+    assert resumed["meta"]["speech_muted"] is False
+
+
+def test_venus_delimiter_only_decisions_flush_once_and_resume_speech():
+    from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext
+    from vllm_omni.model_executor.models.realtime_venus.delegation import DelegateParser
+    from vllm_omni.model_executor.models.realtime_venus.duplex import VenusDataPlane
+
+    context = StreamingInputState(
+        bridge_states={"duplex": {"epoch": 0, "model_turn_id": 0}},
+        source_token_decoder=lambda ids, **_: "".join(
+            {21: "lookup", 22: "Done.", 23: "Checking."}.get(i, "") for i in ids
+        ),
+    )
+    parser = DelegateParser()
+    plane = VenusDataPlane(lambda *args: "")
+    data_context = DuplexDataPlaneContext(auto_responds=True, active_response_id="response", turn_id=0)
+    tool_calls: list[dict[str, object]] = []
+    cumulative = []
+    handoffs = []
+    calls = []
+    for unit in ([9304, 23, 9308], [9400, 9308], [9304, 21, 9308], [9401, 9308], [9304, 22, 9310, 9308]):
+        cumulative.extend(unit)
+        source, latent = _native_source([101], list(cumulative), [101, *unit[:-1]])
+        source.outputs[0].multimodal_output["meta"].update(delegate_open_token_id=9400, delegate_close_token_id=9401)
+        info = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+        handoffs.append(info)
+        calls.append(parser.feed(info["meta"]["native_duplex_segment_text"]))
+        # Project the handoff text with the codec bridge's per-unit identity.
+        output = SimpleNamespace(
+            request_id="req-1",
+            finished=False,
+            outputs=[],
+            multimodal_output={
+                "meta": {
+                    **info["meta"],
+                    "llm_output_text": info["meta"]["native_duplex_segment_text"],
+                    "tts_is_last_chunk": True,
+                    "duplex_audio_cache_epoch": 0,
+                    "duplex_audio_chunk_seq": len(handoffs),
+                    "duplex_turn_id": 0,
+                }
+            },
+        )
+        tool_calls.extend(
+            event for event in plane.project_output(output, context=data_context) if event.get("function_call")
+        )
+
+    assert calls == [None, None, None, "lookup", None]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["name"] == "delegate"
+    arguments = tool_calls[0]["arguments"]
+    assert isinstance(arguments, str)
+    assert json.loads(arguments) == {"question": "lookup"}
+    assert [info["ids"]["tts"] for info in handoffs] == [[23], [], [], [], [22, 9310]]
+    assert [info["meta"]["speech_flush"] for info in handoffs] == [False, True, False, False, False]
+    assert [info["meta"]["speech_muted"] for info in handoffs] == [False, True, True, True, False]
+    assert [info["meta"]["native_duplex_segment_text"] for info in handoffs] == [
+        "Checking.",
+        "<delegate>",
+        "lookup",
+        "</delegate>",
+        "Done.",
+    ]
+    resumed = handoffs[-1]
+    assert resumed["meta"]["turn_start"] is True
+    assert resumed["meta"]["turn_end"] is True
+    assert torch.equal(torch.as_tensor(unpack_handoff_tensor(resumed["hidden_states"]["tts"])), latent[[2, 3]])
 
 
 def test_venus_delegation_state_crosses_units_and_resets_at_turn_end():

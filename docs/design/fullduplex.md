@@ -1819,6 +1819,11 @@ Realtime-Venus reuses the MiniCPM-o stage implementation. Its optional
 plugin's special-token metadata. At the native Thinker-to-Talker handoff,
 the bridge removes delegation delimiters and their enclosed token/hidden-state
 rows from speech conditioning while preserving the complete text output.
+Delegation parsing uses the full current unit, including a delimiter sampled
+in the opening decision slot. That decision updates the mute state even when
+it has no speech-condition row; the remaining speech rows retain MiniCPM's
+original alignment. Delimiter-only units still carry their text and mask
+transition, so a closing decision in a later unit can resume speech.
 The mask is request-local, continues across units, and resets at a new turn
 or the turn-end token. Delegation can also mask the turn-end speech row;
 dialogue termination is derived from the original Thinker unit.

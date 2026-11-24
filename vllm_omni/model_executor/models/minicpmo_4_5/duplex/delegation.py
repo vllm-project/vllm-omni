@@ -57,12 +57,20 @@ def speech_condition_indices(
 
 
 def filter_delegate_condition(
-    token_ids: list[int], hidden: torch.Tensor, special_token_ids: dict[str, int], state: dict
+    token_ids: list[int],
+    hidden: torch.Tensor,
+    special_token_ids: dict[str, int],
+    state: dict,
+    *,
+    condition_start: int = 0,
 ) -> tuple[list[int], torch.Tensor]:
+    # A sampled opening/closing decision still changes delegation state even
+    # though MiniCPM excludes that decision's row from speech conditioning.
+    condition_ids = token_ids[condition_start:] if condition_start else token_ids
     open_id = special_token_ids.get("delegate_open_token_id", -1)
     close_id = special_token_ids.get("delegate_close_token_id", -1)
     if open_id < 0 or close_id < 0:
-        return token_ids, hidden
+        return condition_ids, hidden
     keep, muted = speech_condition_indices(
         token_ids,
         open_id=open_id,
@@ -71,10 +79,12 @@ def filter_delegate_condition(
         muted=bool(state.get("delegate_muted", False)),
     )
     state["delegate_muted"] = muted
-    if len(keep) == len(token_ids):
-        return token_ids, hidden
+    if condition_start:
+        keep = [index - condition_start for index in keep if index >= condition_start]
+    if len(keep) == len(condition_ids):
+        return condition_ids, hidden
     indices = torch.tensor(keep, dtype=torch.long, device=hidden.device)
-    return [token_ids[i] for i in keep], hidden.index_select(0, indices)
+    return [condition_ids[i] for i in keep], hidden.index_select(0, indices)
 
 
 def delegate_speech_boundary(

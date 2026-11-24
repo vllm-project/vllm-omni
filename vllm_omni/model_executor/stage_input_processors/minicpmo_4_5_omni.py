@@ -1124,6 +1124,11 @@ def llm2tts(
 
         tts_token_ids_slice = tts_hidden_slice = None
         native_segment_end = False
+        has_delegation = (
+            special_token_ids.get("delegate_open_token_id", -1) >= 0
+            and special_token_ids.get("delegate_close_token_id", -1) >= 0
+        )
+        delegate_decision = None
         if not is_native_duplex_handoff:
             # Not guarded on the row count: a prefix-cache hit on Model Runner V2
             # forwards no rows for the cached tokens, and a reply with no rows
@@ -1176,6 +1181,11 @@ def llm2tts(
                 out_start = 0
             elif unit_start < len(out_ids) and out_ids[unit_start] not in tts_end_ids:
                 out_start = unit_start + 1
+                if has_delegation and out_ids[unit_start] in (
+                    special_token_ids["delegate_open_token_id"],
+                    special_token_ids["delegate_close_token_id"],
+                ):
+                    delegate_decision = out_ids[unit_start]
             elif unit_start < len(out_ids) and out_ids[unit_start] in chunk_terminator_ids:
                 out_start = unit_start
             else:
@@ -1207,7 +1217,8 @@ def llm2tts(
                     # the segment through the normal downstream transport.
                     tts_token_ids_slice = torch.empty(0, dtype=torch.long)
                     tts_hidden_slice = thinker_hidden_states[:0]
-                    thinker_text = ""
+                    if not has_delegation:
+                        thinker_text = ""
         handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
         native_turn_end_handoff = bool(
             is_native_duplex_handoff and handoff_ids and handoff_ids[-1] == special_token_ids.get("turn_eos_token_id")
@@ -1225,14 +1236,22 @@ def llm2tts(
                 # Match the released streaming_generate contract: transcript
                 # text comes from total_ids_in_unit, the same slice that
                 # conditions the Talker.
-                thinker_text = handoff_text
+                # Venus needs the complete current-unit text decoded above:
+                # the omitted decision can itself open/close a delegate span.
+                if not has_delegation:
+                    thinker_text = handoff_text
                 spoken_text = handoff_text
         if is_native_duplex_handoff and handoff_ids is not None and tts_hidden_slice is not None:
             bridge_states = getattr(_streaming_context, "bridge_states", None)
             handoff_state = bridge_states.get("minicpmo45_tts_handoff") if isinstance(bridge_states, dict) else None
             if isinstance(handoff_state, dict):
+                control_ids = [delegate_decision, *handoff_ids] if delegate_decision is not None else handoff_ids
                 speech_ids, tts_hidden_slice = filter_delegate_condition(
-                    handoff_ids, tts_hidden_slice, special_token_ids, handoff_state
+                    control_ids,
+                    tts_hidden_slice,
+                    special_token_ids,
+                    handoff_state,
+                    condition_start=int(delegate_decision is not None),
                 )
                 if speech_ids is not handoff_ids:
                     spoken_text = _decode_native_duplex_token_ids(
@@ -1240,7 +1259,7 @@ def llm2tts(
                     )
                 if special_token_ids.get("delegate_open_token_id", -1) >= 0:
                     speech_flush, speech_restart, skip_speech = delegate_speech_boundary(
-                        handoff_ids,
+                        control_ids,
                         speech_ids,
                         turn_end_id=special_token_ids.get("turn_eos_token_id"),
                         state=handoff_state,
