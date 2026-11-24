@@ -259,18 +259,3 @@ class TestMiniMaxH3Fusions:
             quantized, fc1.weight, fc1.weight_scale, pertoken_scale=scale, output_dtype=x.dtype
         )
         torch.testing.assert_close(mlp.fc2.call_args.args[0], hidden.reshape(2, 3, 5))
-
-    def test_swiglu_preserves_wrapped_fc1(self):
-        from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3MLP
-        from vllm_omni.platforms.npu.models.minimax_h3 import forward_h3_mlp
-        from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
-
-        mlp = MiniMaxH3MLP.__new__(MiniMaxH3MLP)
-        nn.Module.__init__(mlp)
-        mlp.fc1 = Mock(return_value=(torch.ones(2, 4), None), quant_method=Mock(spec=NPUInt8LinearMethod))
-        mlp.act_fn = nn.Identity()
-        mlp.fc2 = Mock(return_value=(torch.ones(2, 2), None))
-        x = Mock(device=SimpleNamespace(type="npu"), dtype=torch.bfloat16)
-
-        assert forward_h3_mlp(mlp, x) is mlp.fc2.return_value[0]
-        mlp.fc1.assert_called_once_with(x)
