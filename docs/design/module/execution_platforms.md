@@ -79,8 +79,6 @@ use MindIE-SD. RMSNorm accepts hidden sizes up to 8192 and requires epsilon to
 remain finite and positive in FP32. Other supported H3 inputs use Omni's Triton
 kernels. With Triton-Ascend 3.6, the optional SDK must include the indexed gate
 fix from [MindIE-SD !917](https://gitcode.com/Ascend/MindIE-SD/pull/917).
-The NPU runtime and CI images build the SDK from the same pinned upstream
-revision.
 
 ## MiniMax H3 image NPU adapter
 

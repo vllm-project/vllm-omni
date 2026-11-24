@@ -11,10 +11,7 @@ RUN sed -i "s@^\(deb.*\)https\?://[a-z0-9.-]*\.ubuntu\.com@\1http://cache-servic
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential \
-        cmake \
         ffmpeg \
-        git \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
@@ -32,6 +29,7 @@ ENV LD_PRELOAD=libjemalloc.so.2
 
 RUN python3 -m pip install -U pip && \
     python3 -m pip install -v \
+      "mindiesd==3.3.0" \
       "pytest>=7.0.0" \
       "pytest-asyncio>=0.21.0" \
       "pytest-cov>=4.0.0" \
@@ -56,11 +54,6 @@ RUN python3 -m pip install -U pip && \
       --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
       --default-timeout=60
-
-COPY docker/install_mindiesd.sh /tmp/install_mindiesd.sh
-RUN PIP_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
-    PIP_TRUSTED_HOST=cache-service.nginx-pypi-cache.svc.cluster.local \
-    bash /tmp/install_mindiesd.sh
 
 COPY . .
 
