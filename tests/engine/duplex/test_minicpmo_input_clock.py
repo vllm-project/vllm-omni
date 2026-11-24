@@ -31,7 +31,7 @@ from vllm_omni.protocol.duplex.events import InputProcessed
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SPEAK, CHUNK_EOS = 151706, 151718
-INPUT_CLOCK = {"clock": "input"}
+INPUT_CLOCK: dict[str, object] = {"clock": "input"}
 
 
 def _plugin() -> MiniCPMO45DuplexPlugin:
