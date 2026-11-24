@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Exercise Qwen3 CI selection with real jobs, including mixed-model diffs."""
+"""Exercise Qwen3 nightly selection with real jobs, including mixed-model diffs."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "common" / "scripts"))
 
-from runtime_shard import discover_test_files  # noqa: E402
 from upload_pipeline import filter_pipeline_by_source_dependencies  # noqa: E402
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -178,24 +177,3 @@ def test_tooling_and_optional_features_select_relevant_jobs(nightly, changed_fil
 def test_full_nightly_keeps_all_jobs(nightly):
     doc = nightly[2]
     assert _selected(nightly, None) == {step["label"] for step in _leaves(doc)}
-
-
-@pytest.mark.parametrize(
-    "changed_file",
-    [
-        "tests/e2e/online_serving/test_qwen3_omni_duplex_tools.py",
-        "vllm_omni/engine/duplex/session/runner.py",
-        "vllm_omni/clients/tool_calls.py",
-        "vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml",
-        "tests/helpers/runtime.py",
-    ],
-)
-def test_cuda_merge_keeps_duplex_tool_tests(changed_file):
-    path = Path(".buildkite/cuda/test-merge.yml")
-    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-    filtered = filter_pipeline_by_source_dependencies(doc, [changed_file, MINICPM], pipeline_path=path)
-    selected = {step["label"]: step for step in _leaves(filtered)}
-    step = selected["Omni · Qwen3-Omni Test"]
-    assert step["mirror_hardwares"] == "h100_2"
-    files = set().union(*(discover_test_files(command, Path.cwd()) for command in step["commands"]))
-    assert "tests/e2e/online_serving/test_qwen3_omni_duplex_tools.py" in files

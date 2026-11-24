@@ -635,14 +635,6 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
     - tests/e2e/online_serving/test_qwen3_omni_thinking.py
 
-  omni_qwen3_omni_duplex_tools_function:
-    - *qwen3_omni
-    - *duplex
-    - vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
-    - tests/e2e/online_serving/test_qwen3_omni_duplex_tools.py
-    - tests/helpers/
-    - tests/conftest.py
-
   omni_joyai_duplex_function:
     - *duplex
     - vllm_omni/model_executor/models/joyai_vl_interaction/

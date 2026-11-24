@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Qwen3-Omni duplex playback, interruption, and semantic VAD regressions."""
+"""Qwen3-Omni duplex playback, semantic VAD, and tool-calling regressions."""
 
 from __future__ import annotations
 
@@ -29,6 +29,8 @@ from tests.entrypoints.openai_api.helpers import (
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer, get_model_prefix
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig
+from vllm_omni.clients.tool_calls import DuplexToolRunner
 from vllm_omni.config.stage_config import load_deploy_config
 from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
 
@@ -61,7 +63,7 @@ def qwen_duplex_server(
     cached_smart_turn_artifact,
     run_level,
 ):
-    """Load real weights once for all interruption repetitions and history checks."""
+    """Share real weights across playback, history, and tool-calling checks."""
     from transformers import AutoProcessor
 
     assert run_level in {"advanced_model", "full_model"}, "Duplex playback acceptance requires real weights"
@@ -484,6 +486,156 @@ async def _run_duplex_history(runtime, log_path: Path, *, reject_overflow: bool 
     assert len(response_ids) == (_DUPLEX_AUDIO_HISTORY_LIMIT if reject_overflow else 6)
 
 
+TURN_TIMEOUT_S = 180.0
+RESULT_TIMEOUT_S = 3.0
+WEATHER_TOOL = {
+    "type": "function",
+    "name": "get_weather",
+    "description": "Get the current weather for a city.",
+    "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string", "description": "The city name."}},
+        "required": ["city"],
+    },
+}
+INSTRUCTIONS = (
+    "You are a helpful assistant. For any question about the weather you must call the get_weather tool "
+    "instead of guessing. For anything else, answer directly in one short sentence without calling a tool."
+)
+WEATHER_QUESTION = "What is the weather in Paris right now?"
+WEATHER_RESULT = json.dumps({"city": "Paris", "temperature_c": 17})
+
+
+def _tool_session_config(**extra_body: object) -> SessionConfig:
+    return SessionConfig(
+        modalities=("text",),
+        auto_response=False,
+        temperature=0.0,
+        instructions=INSTRUCTIONS,
+        max_output_tokens=128,
+        extra_body=extra_body,
+    )
+
+
+class _ToolSession:
+    """One connected client, with its events kept for the assertions."""
+
+    def __init__(self, client: DuplexClient, collector: EventCollector) -> None:
+        self.client = client
+        self.collector = collector
+
+    def events_since(self, start: int) -> list[dict[str, object]]:
+        return self.collector.events[start:]
+
+    def calls(self) -> list[dict[str, object]]:
+        """Every function call the model published to the client."""
+        items = [
+            event.get("item") for event in self.collector.events if event.get("type") == "response.output_item.done"
+        ]
+        return [item for item in items if isinstance(item, dict) and item.get("type") == "function_call"]
+
+    def duplex_events(self, event_type: str) -> list[dict[str, object]]:
+        bodies = [event.get("event") for event in self.collector.events if event.get("type") == event_type]
+        return [body for body in bodies if isinstance(body, dict)]
+
+    def error_codes(self) -> list[object]:
+        codes = []
+        for event in self.collector.errors():
+            error = event.get("error")
+            codes.append(error.get("code") if isinstance(error, dict) else None)
+        return codes
+
+    async def finish_response(self, start: int) -> str:
+        """Wait for the turn's own response, and return its text.
+
+        The turn's response opens first. A function call inside it is projected
+        as a separate response, which must not be mistaken for the end.
+        """
+        deadline = asyncio.get_running_loop().time() + TURN_TIMEOUT_S
+        while asyncio.get_running_loop().time() < deadline:
+            events = self.events_since(start)
+            created = next((event for event in events if event.get("type") == "response.created"), None)
+            response_id = self.collector.response_id(created) if created is not None else None
+            if response_id is not None and self.collector.response_is_done(response_id):
+                text = self.collector.response_text(response_id)
+                print(f"[qwen-tools] answer {response_id}: {text!r}")
+                return text
+            await asyncio.sleep(0.1)
+        raise AssertionError(f"the turn did not finish; events: {[event.get('type') for event in events][-12:]}")
+
+    async def ask(self, text: str) -> str:
+        start = len(self.collector.events)
+        await self.client.send(
+            {
+                "type": "conversation.item.create",
+                "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]},
+            }
+        )
+        await self.client.send({"type": "response.create"})
+        return await self.finish_response(start)
+
+    async def ask_for_weather(self) -> str:
+        """Ask the weather question and return the call_id the model published."""
+        await self.ask(WEATHER_QUESTION)
+        calls = self.calls()
+        assert calls, f"Qwen published no function call: {self.collector.errors()}"
+        assert calls[-1]["name"] == "get_weather"
+        assert "paris" in str(calls[-1]["arguments"]).lower()
+        return str(calls[-1]["call_id"])
+
+    async def wait_for_settled(self, call_id: str) -> dict[str, object]:
+        deadline = asyncio.get_running_loop().time() + TURN_TIMEOUT_S
+        while asyncio.get_running_loop().time() < deadline:
+            for event in self.duplex_events("duplex.function_call.settled"):
+                if event.get("call_id") == call_id:
+                    return event
+            await asyncio.sleep(0.05)
+        raise AssertionError(f"call {call_id} never settled; errors: {self.collector.errors()}")
+
+    async def continue_with_result(self, call_id: str, output: str) -> str:
+        start = len(self.collector.events)
+        await self.client.send_function_call_output(call_id, output)
+        await self.client.send({"type": "response.create"})
+        return await self.finish_response(start)
+
+    def report(self) -> None:
+        """Keep what the model did in the test output, pass or fail."""
+        print(
+            f"[qwen-tools] calls={len(self.calls())} "
+            f"suppressed={len(self.duplex_events('duplex.function_call.suppressed'))} errors={self.error_codes()}"
+        )
+        for event in self.collector.events:
+            event_type = str(event.get("type"))
+            if event_type in {"response.created", "response.done", "duplex.function_call.suppressed"}:
+                print(f"[qwen-tools] {event_type} {self.collector.response_id(event)}")
+            elif event_type == "response.output_item.done":
+                print(f"[qwen-tools] output_item {json.dumps(event.get('item'))[:200]}")
+
+
+async def _in_tool_session(url: str, config: SessionConfig, body) -> None:
+    collector = EventCollector()
+    async with DuplexClient(url, model=MODEL, config=config, reconnect=None) as client:
+        consumer = asyncio.create_task(collector.consume(client))
+        await asyncio.sleep(0)
+        session = _ToolSession(client, collector)
+        try:
+            await client.send({"type": "session.update", "session": {"tools": [WEATHER_TOOL]}})
+            capabilities = client.session_info.get("capabilities")
+            assert isinstance(capabilities, dict)
+            assert capabilities["tool_mode"] == "declared"
+            assert capabilities["function_call_output_continuation"] == "client_response_create"
+            await body(session)
+        finally:
+            session.report()
+            await client.close()
+            await asyncio.wait_for(consumer, timeout=10)
+
+
+def _run_tool_session(omni_server, config: SessionConfig, body) -> None:
+    url = f"ws://{omni_server.host}:{omni_server.port}/v1/realtime?duplex=1"
+    asyncio.run(_in_tool_session(url, config, body))
+
+
 @pytest.mark.omni
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 class TestQwen3OmniDuplexPlayback:
@@ -604,6 +756,146 @@ class TestQwen3OmniDuplexPlayback:
     def test_full_history_rejects_audio_overflow(self, qwen_duplex_server, tmp_path: Path):
         """The unconfigured default preserves sources and rejects a fifth audio input."""
         asyncio.run(_run_duplex_history(qwen_duplex_server, tmp_path / "events.json", reject_overflow=True))
+
+    @pytest.mark.advanced_model
+    def test_a_tool_result_reaches_the_next_answer(self, qwen_duplex_server):
+        async def body(session: _ToolSession) -> None:
+            call_id = await session.ask_for_weather()
+            answer = await session.continue_with_result(call_id, WEATHER_RESULT)
+            assert "17" in answer, answer
+            assert session.error_codes() == []
+
+        _run_tool_session(qwen_duplex_server.server, _tool_session_config(), body)
+
+    @pytest.mark.advanced_model
+    def test_the_client_can_keep_talking_while_a_tool_is_pending(self, qwen_duplex_server):
+        async def body(session: _ToolSession) -> None:
+            call_id = await session.ask_for_weather()
+
+            reply = await session.ask("Before that, what is the capital of Japan?")
+            assert "tokyo" in reply.lower(), reply
+            assert session.duplex_events("duplex.function_call.settled") == []
+            assert len(session.calls()) == 1, session.calls()
+
+            await session.continue_with_result(call_id, WEATHER_RESULT)
+            assert session.error_codes() == []
+
+        _run_tool_session(qwen_duplex_server.server, _tool_session_config(function_call_interrupt_policy="keep"), body)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="#8857 splices a result before later user turns, so the model answers the newest question instead",
+    )
+    @pytest.mark.advanced_model
+    def test_a_result_after_a_later_turn_reaches_the_answer(self, qwen_duplex_server):
+        async def body(session: _ToolSession) -> None:
+            call_id = await session.ask_for_weather()
+            await session.ask("Before that, what is the capital of Japan?")
+
+            answer = await session.continue_with_result(call_id, WEATHER_RESULT)
+
+            assert "17" in answer, answer
+
+        _run_tool_session(qwen_duplex_server.server, _tool_session_config(function_call_interrupt_policy="keep"), body)
+
+    @pytest.mark.advanced_model
+    def test_a_timed_out_call_is_not_repeated_on_the_next_turn(self, qwen_duplex_server):
+        """Nothing blocks a repeat here: the user turn lifts the block, so this measures the notice."""
+
+        async def body(session: _ToolSession) -> None:
+            call_id = await session.ask_for_weather()
+            settled = await session.wait_for_settled(call_id)
+            assert (settled["state"], settled["reason"]) == ("timed_out", "timeout")
+
+            await session.ask("Thanks. What is the capital of Japan?")
+
+            assert len(session.calls()) == 1, session.calls()
+
+        _run_tool_session(qwen_duplex_server.server, _tool_session_config(tool_result_timeout_s=RESULT_TIMEOUT_S), body)
+
+    @pytest.mark.advanced_model
+    def test_a_late_result_never_reaches_the_answer(self, qwen_duplex_server):
+        async def body(session: _ToolSession) -> None:
+            call_id = await session.ask_for_weather()
+            await session.wait_for_settled(call_id)
+
+            await session.client.send_function_call_output(call_id, json.dumps({"city": "Paris", "temperature_c": 93}))
+            answer = await session.ask("Thanks. What is the capital of Japan?")
+
+            assert "invalid_function_call_output" in session.error_codes()
+            assert "93" not in answer, answer
+
+        _run_tool_session(qwen_duplex_server.server, _tool_session_config(tool_result_timeout_s=RESULT_TIMEOUT_S), body)
+
+    @pytest.mark.advanced_model
+    def test_a_repeated_question_cannot_republish_an_abandoned_call(self, qwen_duplex_server):
+        """The same question invites the same call, so the guard has to hold under ``never``."""
+
+        async def body(session: _ToolSession) -> None:
+            call_id = await session.ask_for_weather()
+            await session.wait_for_settled(call_id)
+
+            await session.ask(WEATHER_QUESTION)
+
+            assert len(session.calls()) == 1, session.calls()
+            for suppressed in session.duplex_events("duplex.function_call.suppressed"):
+                assert suppressed["blocked_by_call_id"] == call_id
+
+        config = _tool_session_config(tool_result_timeout_s=RESULT_TIMEOUT_S, function_call_retry_policy="never")
+        _run_tool_session(qwen_duplex_server.server, config, body)
+
+    @pytest.mark.advanced_model
+    def test_a_failed_tool_ends_the_call_and_the_session_carries_on(self, qwen_duplex_server):
+        async def body(session: _ToolSession) -> None:
+            call_id = await session.ask_for_weather()
+
+            await session.client.cancel_function_call(call_id, reason="failed")
+            settled = await session.wait_for_settled(call_id)
+            assert (settled["state"], settled["reason"]) == ("cancelled", "client_failed")
+
+            reply = await session.ask("Thanks. What is the capital of Japan?")
+            assert "tokyo" in reply.lower(), reply
+            assert len(session.calls()) == 1, session.calls()
+            assert session.error_codes() == []
+
+        _run_tool_session(qwen_duplex_server.server, _tool_session_config(), body)
+
+    @pytest.mark.advanced_model
+    def test_immediate_runner_handler_continues_without_another_client_action(self, qwen_duplex_server):
+        async def body(session: _ToolSession) -> None:
+            handled = []
+
+            async def get_weather(arguments):
+                handled.append(arguments)
+                return WEATHER_RESULT
+
+            runner = DuplexToolRunner(session.client, {"get_weather": get_weather})
+            task = asyncio.create_task(runner.run())
+            try:
+                await asyncio.sleep(0)
+                await session.ask_for_weather()
+                deadline = asyncio.get_running_loop().time() + TURN_TIMEOUT_S
+                while asyncio.get_running_loop().time() < deadline:
+                    if task.done():
+                        await task
+                    answers = [
+                        session.collector.response_text(rid)
+                        for event in session.collector.events
+                        if event.get("type") == "response.done"
+                        and (rid := session.collector.response_id(event)) is not None
+                    ]
+                    if any("17" in text for text in answers):
+                        assert len(handled) == 1
+                        assert session.error_codes() == []
+                        assert runner.undelivered_results == {}
+                        return
+                    await asyncio.sleep(0.1)
+                raise AssertionError("runner did not continue the immediate tool result")
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        _run_tool_session(qwen_duplex_server.server, _tool_session_config(), body)
 
     # Keep this fixture parameter last to group the default-policy cases on one server.
     @pytest.mark.advanced_model
