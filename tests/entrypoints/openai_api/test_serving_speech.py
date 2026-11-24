@@ -6437,6 +6437,32 @@ class TestGLMTTSServing:
         assert tts_params == {}
         glm_tts_server._adapter._build_prompt.assert_awaited_once()
 
+    def test_prepare_speech_generation_glm_tts_explicit_cap_overrides_ratio(
+        self,
+        glm_tts_server,
+        mocker: MockerFixture,
+    ):
+        glm_tts_server._adapter._build_prompt = mocker.AsyncMock(
+            return_value={
+                "prompt": "Hello",
+                "multi_modal_data": {"audio": (np.zeros(24000), 24000)},
+                "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
+            }
+        )
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="Reference text",
+            max_new_tokens=2048,
+        )
+        glm_tts_server._adapter._estimate_text_token_len = mocker.MagicMock(return_value=10)
+
+        asyncio.run(glm_tts_server._prepare_speech_generation(request))
+        sampling_params = glm_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+
+        assert sampling_params.min_tokens == 20
+        assert sampling_params.max_tokens == 2048
+
 
 @pytest.fixture
 def ming_tts_server(mocker: MockerFixture):
