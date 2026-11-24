@@ -1832,18 +1832,30 @@ execution are refused: the heads belong to one DiT and are bound for one request
 
 ControlNet, `continue_from` and long-video continuation, latent-mask editing and timeline guides do not depend on
 how a request is sampled, so they are available with every adapter above on its own schedule. On one H200 node
-(TP 8, `--task-type ref2va`, 480x832, 124 frames, one reference image, seed 20261124):
+(TP 8, 480x832, 124 frames, seed 20261124, `quality=lossless`), each cell is one request.
+
+Ref2VA server (`--task-type ref2va`), one reference image:
 
 | Weights | Depth control | Guide at frame 96, SSIM to the guide (unguided) | Edit, kept half PSNR | `continue_from`, SSIM across the join (inside a clip) | 20 s `long_video` |
 | --- | --- | --- | --- | --- | --- |
-| Base Ref2VA, 20 steps | follows the pose | - | - | - | - |
+| Base Ref2VA, 20 steps | follows the pose | 0.930 (0.777) | 38.2 dB | 0.860 (0.825) | 481 frames |
 | LightX2V `ref2v_turbo_8step_v1.0_768p` | follows the pose | 0.914 (0.725) | 37.6 dB | 0.821 (0.838) | 481 frames |
 | Pika `8step_hd_ref2va` | follows the pose | 0.936 (0.724) | 38.4 dB | 0.907 (0.865) | 481 frames |
 | Pika `4step_ref2va_lite_r32` | follows the pose | 0.879 (0.723) | 36.6 dB | 0.796 (0.806) | 481 frames |
 | PAI `Ref2VA-Acc-8Step` | follows the pose | 0.932 (0.747) | 37.9 dB | 0.824 (0.794) | 481 frames |
 
-Depth control was judged by eye against the control clip; the other columns are measured on the returned MP4s. These
-runs establish that each combination completes and takes effect, not a quality ranking: one prompt, one seed.
+FL2VA server (`--task-type fl2va`), T2VA requests with `aspect_ratio=9:16`:
+
+| Weights | Depth control | Guide at frame 96, SSIM to the guide (unguided) | Edit, kept half PSNR | `continue_from`, SSIM across the join (inside a clip) | 20 s `long_video` |
+| --- | --- | --- | --- | --- | --- |
+| Base FL2VA, 20 steps | follows the pose | 0.932 (0.619) | 35.7 dB | 0.858 (0.834) | 481 frames |
+| LightX2V `fl2v_turbo_8step_v1.2_768p` | follows the pose | 0.928 (0.600) | 35.4 dB | 0.800 (0.773) | 481 frames |
+| Pika `8step_hd_fl2va` | follows the pose | 0.913 (0.565) | 35.9 dB | 0.755 (0.700) | 481 frames |
+| PAI `FL2VA-Acc-8Step` | follows the pose | 0.923 (0.625) | 35.6 dB | 0.829 (0.795) | 481 frames |
+
+Depth control was judged by eye against the control clip; the other columns are measured on the returned MP4s. The
+guide image is a frame of the base Ref2VA row's unguided clip, which raises that row's unguided figure. These runs
+establish that each combination completes and takes effect, not a quality ranking: one prompt, one seed.
 
 ## Key parameters
 
