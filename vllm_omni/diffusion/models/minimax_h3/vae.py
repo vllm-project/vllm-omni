@@ -1416,11 +1416,13 @@ class MiniMaxH3AudioVAE(nn.Module):
         children = dict(self.model.named_children())
         roots = (self.remote, self.model)
         root_state = any(list(root.parameters(recurse=False)) or list(root.buffers(recurse=False)) for root in roots)
-        if (
-            all(isinstance(children.get(name), nn.Module) for name in ("encoder", "mean_proj", "decoder"))
-            and set(dict(self.remote.named_children())) == {"model"}
-            and not root_state
-        ):
+        if not {"encoder", "mean_proj", "decoder"}.issubset(children):
+            reason = "missing encoder, mean_proj, or decoder child"
+        elif {name for name, _ in self.remote.named_children()} != {"model"}:
+            reason = "unexpected remote child layout"
+        elif root_state:
+            reason = "parameters or buffers at the root"
+        else:
             encoder = [module for name, module in children.items() if name in encoder_names]
             decoder = [module for name, module in children.items() if name not in encoder_names]
             storage = [
@@ -1435,6 +1437,8 @@ class MiniMaxH3AudioVAE(nn.Module):
                 self._encoder_stager = PinnedModuleStager(encoder, device, pin_memory=True)
                 self._decoder_stager = PinnedModuleStager(decoder, device, pin_memory=True)
                 return
+            reason = "shared storage across encoder and decoder groups"
+        logger.debug("MiniMax H3 audio VAE falling back to whole staging: %s", reason)
         self._stager = PinnedModuleStager(self.remote, device, pin_memory=True)
 
     def _part_stager(self, part: str) -> PinnedModuleStager | None:
