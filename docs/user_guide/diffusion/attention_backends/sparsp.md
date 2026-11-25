@@ -1,7 +1,7 @@
-# SparSP demand routing for LTX-2
+# SparSP demand routing for video diffusion
 
-SparSP is an experimental CUDA attention backend for native LTX-2 video
-self-attention with eager, single-node, pure Ring sequence parallelism.
+SparSP is an experimental CUDA attention backend for LTX-Video, LTX-2 and original HunyuanVideo
+with eager, single-node, pure Ring sequence parallelism.
 Every routing policy uses the same Q128/K64 selector and NCCL process group.
 K/V payloads preserve the input BF16 or FP16 bits.
 
@@ -38,7 +38,15 @@ contiguous ownership at 384×768 and periodic ownership at 768×1536.
 
 Set `parallel_config.ring_degree` to the number of ranks and
 `enforce_eager` to true. In `diffusion_attention_config`, configure the
-LTX-2 video self-attention role.
+role for the pipeline you are running.
+
+| Pipeline | Attention role | Token handling |
+| --- | --- | --- |
+| Lightricks LTX-Video (Diffusers load format) | `ltx.video_self` | Shard video tokens, rotary positions and token-wise timesteps. Text cross-attention stays local with replicated text. |
+| Native LTX-2 | `ltx2.video_self` | Apply SparSP to the video self-attention layers. |
+| Original `hunyuanvideo-community/HunyuanVideo` (Diffusers load format) | `hunyuan_video.video_joint` | Shard both video and caption tokens. Route their concatenated Q/K/V in the dual-stream and single-stream blocks. |
+
+For example, to enable manifest planning for LTX-2:
 
 ```yaml
 per_role:
@@ -53,7 +61,11 @@ per_role:
 The backend requires complete 64-token K/V blocks per rank, matching FP16
 or BF16 Q/K/V, and one CUDA device per rank. Set Ulysses, AllGather-KV,
 and tensor parallel degrees to one. Use eager execution with no attention
-schedule, padding, external masks, or joint video attention.
+schedule or video-token padding.
+For original HunyuanVideo, select `diffusion_load_format: diffusers` and use a
+fully valid caption token budget. Video and caption lengths must each divide
+evenly across ranks, with a combined shard length divisible by 64. The optional
+padded geometry from the standalone SparSP runner is outside this adapter’s scope.
 
 ## Optional provider
 

@@ -149,9 +149,12 @@ class SparSPAttentionImpl(AttentionImpl):
         layout = ctx.sparsp_video_layout
         if self.config.placement == "interval_periodic" and layout is None:
             raise ValueError("SparSP interval placement requires a model adapter for tokens and RoPE")
+        video_tokens = query.shape[1]
+        if attn_metadata is not None:
+            video_tokens -= attn_metadata.extra.get("sparsp_sharded_text_tokens", 0)
         if layout is not None and (
             layout.degree != parallel.ring_degree
-            or layout.permutation.numel() != query.shape[1] * parallel.ring_degree
+            or layout.permutation.numel() != video_tokens * parallel.ring_degree
             or layout.permutation.device != query.device
         ):
             raise ValueError("SparSP placement does not match the device, Ring degree or complete query grid")

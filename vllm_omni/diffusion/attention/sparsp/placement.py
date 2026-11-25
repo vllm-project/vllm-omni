@@ -45,3 +45,21 @@ def interval_periodic_layout(grid: tuple[int, int, int], degree: int, device: to
     inverse = torch.empty_like(permutation)
     inverse[permutation] = torch.arange(tokens, device=device)
     return SparSPVideoLayout(grid, degree, permutation, inverse)
+
+
+def resolve_video_layout(
+    grid: tuple[int, int, int],
+    degree: int,
+    device: torch.device,
+    placement: str,
+    cached: SparSPVideoLayout | None,
+) -> SparSPVideoLayout | None:
+    """Resolve an opt-in model's placement before splitting the video sequence."""
+    tokens = grid[0] * grid[1] * grid[2]
+    if tokens == 0 or tokens % (64 * degree):
+        raise ValueError("SparSP requires complete unpadded K64 blocks on each Ring rank")
+    if placement == "none" or (placement == "auto" and not supports_interval_periodic_layout(grid, degree)):
+        return None
+    if cached is not None and cached.grid == grid and cached.degree == degree and cached.permutation.device == device:
+        return cached
+    return interval_periodic_layout(grid, degree, device)
