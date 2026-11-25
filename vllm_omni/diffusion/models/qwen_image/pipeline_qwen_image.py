@@ -287,6 +287,42 @@ class QwenImagePipeline(
 
     supports_weight_reload: ClassVar[bool] = True
 
+    def _get_diffusion_lora_name_aliases(self, full_module_name: str) -> list[str]:
+        """Map Qwen-Image engine module names to Diffusers PEFT adapter keys.
+
+        Diffusers exports attention output projections as ``*.to_out.0`` (and
+        may omit the leading ``transformer.`` component prefix), whereas the
+        engine registers ``QwenImageAttention.to_out`` directly.
+        """
+        aliases: list[str] = []
+        if full_module_name.endswith(".to_out") or full_module_name == "to_out":
+            aliases.append(f"{full_module_name}.0")
+        if full_module_name.startswith("transformer."):
+            stripped = full_module_name.removeprefix("transformer.")
+            aliases.append(stripped)
+            if stripped.endswith(".to_out") or stripped == "to_out":
+                aliases.append(f"{stripped}.0")
+        return list(dict.fromkeys(aliases))
+
+    def merged_lora_spec(self):
+        """Return the validated merged-LoRA capability contract for Qwen-Image."""
+        from vllm_omni.lora.capability import (
+            MergedLoRASpec,
+            derive_packed_modules_mapping_from_stacked,
+        )
+
+        stacked = getattr(
+            getattr(self, "transformer", None),
+            "stacked_params_mapping",
+            QwenImageTransformer2DModel.stacked_params_mapping,
+        )
+        return MergedLoRASpec(
+            components=tuple(self._dit_modules),
+            packed_modules_mapping=derive_packed_modules_mapping_from_stacked(stacked),
+            name_aliases=self._get_diffusion_lora_name_aliases,
+            unquantized_linear_only=True,
+        )
+
     def __init__(
         self,
         *,

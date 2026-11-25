@@ -380,6 +380,20 @@ def _validate_seed_tts(
     if setup:
         errs.append(f"Seed-TTS eval setup failed: {setup}")
         return errs
+    # --no-oversample can yield fewer requests than --num-prompts, and each
+    # Realtime request can contain multiple turns. Compare successful requests
+    # with the sampled session count, independently of scorer coverage below.
+    sessions = int(result.get("seed_tts_session_count", 0) or 0)
+    completed = int(result.get("completed", 0) or 0)
+    failed = int(result.get("failed", 0) or 0)
+    failed_turns = int(result.get("seed_tts_request_failed", 0) or 0)
+    if sessions <= 0 or completed != sessions or failed or failed_turns:
+        errs.append(
+            "Seed-TTS request coverage is incomplete: "
+            f"seed_tts_session_count={sessions}, completed={completed}, "
+            f"failed={failed}, seed_tts_request_failed={failed_turns}; "
+            "every sampled request must succeed before accuracy metrics can pass."
+        )
     timed_out = int(result.get("timed_out_requests", 0) or 0)
     cancelled = int(result.get("cancelled_after_timeout_requests", 0) or 0)
     if timed_out or cancelled:
@@ -1191,7 +1205,8 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
                 print(
                     f"[Seed-TTS] mean_wer={data.get('seed_tts_content_error_mean')} "
                     f"mean_sim={data.get('seed_tts_sim_mean')} mean_utmos={data.get('seed_tts_utmos_mean')} "
-                    f"evaluated={data.get('seed_tts_content_evaluated')}",
+                    f"evaluated={data.get('seed_tts_content_evaluated')} "
+                    f"completed={data.get('completed')}/{data.get('seed_tts_session_count')}",
                     flush=True,
                 )
 
