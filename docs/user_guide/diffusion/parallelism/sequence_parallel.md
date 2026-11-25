@@ -243,7 +243,7 @@ In `DiffusionParallelConfig`:
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
 
 With the default `ulysses_a2a_backend="auto"`, each strict Ulysses group is probed once at startup and every
-exchange uses the fastest transport measured for that GPU and group size (MiniMax-H3 on B200), falling back to
+exchange uses the fastest transport measured for that GPU and group size (MiniMax-H3 on B200 and H100), falling back to
 `nccl` elsewhere; the selection is logged once per group. Set `--ulysses-a2a-backend` to override:
 
 ```bash

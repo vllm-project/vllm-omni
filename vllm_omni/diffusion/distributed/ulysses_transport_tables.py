@@ -18,7 +18,12 @@ FLASHINFER_MIN_BYTES: dict[str, dict[int, int]] = {
     "10.0": {8: 14 * MiB},
 }
 
+# H100 SXM (700 W, NVLink), MiniMax-H3 end to end only (Q is 259 / 129.5 / 64.75 MiB per rank at 2 / 4 / 8 GPUs): the
+# copy engine beat NCCL by 3.0 / 2.5 / 1.5%, so the entries stop just below those sizes, since nothing smaller was
+# measured. The overlap gained nothing there and FlashInfer was slower than the copy engine at 8 GPUs, so neither has
+# an sm9.0 entry.
 COPY_ENGINE_MIN_BYTES: dict[str, dict[int, int]] = {
+    "9.0": {2: 256 * MiB, 4: 128 * MiB, 8: 64 * MiB},
     "10.0": {2: 56 * MiB, 4: 28 * MiB, 8: 14 * MiB},
 }
 

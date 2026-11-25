@@ -20,6 +20,11 @@ from vllm_omni.platforms.interface import OmniPlatformEnum, UnspecifiedOmniPlatf
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 MiB = 1024 * 1024
+# The shipped tables, captured before the fixture below swaps in synthetic ones.
+_SHIPPED_TABLES = {
+    name: getattr(ulysses_transport_tables, name)
+    for name in ("FLASHINFER_MIN_BYTES", "COPY_ENGINE_MIN_BYTES", "COPY_ENGINE_OVERLAP_MIN_CHUNK_BYTES")
+}
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +80,19 @@ def test_ineligible_groups_fall_through_to_nccl(overrides, pure_strict, reason):
     reasons = eligible_transports(topology, pure_strict=pure_strict)
     assert all(reason in r for r in reasons.values())
     assert _plan(topology, pure_strict=pure_strict) == ulysses_transport.NCCL_PLAN
+
+
+@pytest.mark.parametrize("world_size, h3_q_mib", [(2, 259), (4, 129.5), (8, 64.75)])
+def test_shipped_sm90_rows_pick_the_copy_engine_for_h3_only(monkeypatch, world_size, h3_q_mib):
+    for name, table in _SHIPPED_TABLES.items():
+        monkeypatch.setattr(ulysses_transport_tables, name, table)
+    topology = _topology(world_size, capability="9.0")
+    reasons = eligible_transports(topology, pure_strict=True)
+    assert reasons["copy_engine"] is None
+    assert "not measured" in reasons["flashinfer"] and "not measured" in reasons["copy_engine_overlap"]
+    plan = _plan(topology, heads=56 // world_size)
+    assert plan.exchange(int(h3_q_mib * MiB)) == "copy_engine"
+    assert plan.exchange(int(h3_q_mib * MiB) // 4) == "nccl"  # smaller messages were not measured on sm9.0
 
 
 def test_unmeasured_world_size_is_not_eligible():
