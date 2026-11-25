@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+import math
+from ctypes import c_float
+from functools import cache
+
 import torch
 from vllm.triton_utils import tl, triton
 
@@ -22,6 +26,33 @@ def _launch_row_chunks(kernel, rows: int, device_type: str, *args, **kwargs) -> 
         return
     for row_offset, chunk_rows in _iter_row_chunks(rows):
         kernel[(chunk_rows,)](*args, row_offset, **kwargs)
+
+
+@cache
+def _supports_mindiesd_device(device: torch.device) -> bool:
+    return torch.npu.get_device_name(device).lower().startswith(("ascend910", "ascend950"))
+
+
+def _supports_mindiesd_inputs(
+    x: torch.Tensor, table: torch.Tensor, indices: torch.Tensor, *values: torch.Tensor
+) -> bool:
+    return (
+        x.ndim == 2
+        and x.numel() > 0
+        and table.ndim == 2
+        and table.shape[0] > 0
+        and table.shape[1] == x.shape[1]
+        and indices.shape == (x.shape[0],)
+        and indices.dtype in (torch.int32, torch.int64)
+        and indices.device == x.device
+        and all(t.device == x.device and t.dtype == torch.bfloat16 and t.stride(-1) == 1 for t in (x, table, *values))
+        and _supports_mindiesd_device(x.device)
+    )
+
+
+def _unit_inner_stride(t: torch.Tensor) -> torch.Tensor:
+    # The native Triton fallback also assumes unit column stride.
+    return t if t.stride(-1) == 1 else t.contiguous()
 
 
 @triton.jit
@@ -215,6 +246,16 @@ def indexed_gate(
     """Return ``x + gate[indices] * other`` without indexed temporaries."""
     if x.is_cpu:
         return (x + gate.index_select(0, indices) * other).to(x.dtype)
+    if x.device.type == "npu":
+        if other.shape == x.shape and _supports_mindiesd_inputs(x, gate, indices, other):
+            try:
+                from mindiesd.layers.index_modulation import indexed_gate as mindiesd_indexed_gate
+            except ImportError:
+                pass
+            else:
+                output = torch.empty_like(x, memory_format=torch.contiguous_format)
+                return mindiesd_indexed_gate(output, x, gate, other, indices)
+        x, gate, other = map(_unit_inner_stride, (x, gate, other))
     output = torch.empty_like(x)
     rows, hidden_size = x.shape
     if rows == 0:
@@ -256,6 +297,21 @@ def rms_norm_indexed_scale_shift(
         normalized = normalized * torch.rsqrt(variance + eps)
         normalized = (weight.float() * normalized).to(input_dtype)
         return (normalized * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(input_dtype)
+    if x.device.type == "npu":
+        if (
+            _supports_mindiesd_inputs(x, shift, indices, weight, scale)
+            and x.shape[1] <= 8192
+            and weight.shape == (x.shape[1],)
+            and scale.shape == shift.shape
+            and 0 < c_float(eps).value < math.inf
+        ):
+            try:
+                from mindiesd.layers.index_modulation import rms_norm_indexed_scale_shift as mindiesd_rms
+            except ImportError:
+                pass
+            else:
+                return mindiesd_rms(x, weight, shift, scale, indices, eps)
+        x, weight, shift, scale = map(_unit_inner_stride, (x, weight, shift, scale))
     output = torch.empty_like(x)
     rows, hidden_size = x.shape
     if rows:

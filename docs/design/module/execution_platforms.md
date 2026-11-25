@@ -73,12 +73,9 @@ tests in a fresh `uv` environment on every affected device platform.
 
 ## MiniMax H3 DiT modulation on Ascend
 
-The NPU model-patch hook binds the two standalone indexed modulation operations
-on loaded MiniMax-H3 DiT blocks on Ascend 910 and 950. Compatible BF16 inputs
-use MindIE-SD. RMSNorm accepts hidden sizes up to 8192 and requires epsilon to
-remain finite and positive in FP32. Other supported H3 inputs use Omni's Triton
-kernels. With Triton-Ascend 3.6, the optional SDK must include the indexed gate
-fix from [MindIE-SD !917](https://gitcode.com/Ascend/MindIE-SD/pull/917).
+The indexed modulation layer uses MindIE-SD for eligible BF16 inputs on Ascend
+910 and 950, with Omni Triton as its fallback. With Triton-Ascend 3.6, install a
+MindIE-SD build containing [!917](https://gitcode.com/Ascend/MindIE-SD/pull/917).
 
 ## MiniMax H3 image NPU adapter
 

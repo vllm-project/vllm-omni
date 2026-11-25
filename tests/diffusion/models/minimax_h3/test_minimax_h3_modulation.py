@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import sys
+
 import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
 from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE, NVIDIA_CUDA_OR_XPU
 from tests.helpers.mark import hardware_marks, hardware_test
+from vllm_omni.diffusion.layers import indexed_modulation
 from vllm_omni.diffusion.layers.indexed_modulation import (
     _MAX_1D_GRID_SIZE,
     _iter_row_chunks,
@@ -71,7 +74,8 @@ def test_launch_row_chunks_is_npu_only(device_type, expected_grids_and_offsets):
     "device",
     [pytest.param("npu", marks=hardware_marks(res={"npu": "A3"}, num_cards=1))],
 )
-def test_modulation_wrappers_match_reference_above_grid_limit(device):
+def test_modulation_wrappers_match_reference_above_grid_limit(device, mocker):
+    mocker.patch.object(indexed_modulation, "_supports_mindiesd_inputs", return_value=False)
     rows = 69888
     hidden_size = 16
     num_conditions = 7
@@ -215,6 +219,77 @@ def test_npu_fused_modulation_preserves_bf16_residual_boundary():
     # Subtracting one after RMSNorm exposes any use of the unrounded update.
     assert torch.equal(residual_out, residual)
     torch.testing.assert_close(modulated_out, torch.zeros_like(modulated_out), atol=1e-5, rtol=0)
+
+
+@hardware_test(res={"npu": "A2"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
+@pytest.mark.parametrize("width", [8192, 8193])
+def test_mindiesd_rms_width_limit(mocker, width):
+    sdk = pytest.importorskip("mindiesd.layers.index_modulation")
+    device = current_omni_platform.get_torch_device()
+    x = torch.empty(1, width, dtype=torch.bfloat16, device=device)
+    weight = x[0]
+    indices = torch.zeros(1, dtype=torch.long, device=device)
+    sdk_rms = mocker.patch.object(sdk, "rms_norm_indexed_scale_shift", return_value=x)
+    # Check dispatch independently of the fallback kernel's on-chip buffer limit.
+    triton_launch = mocker.patch.object(indexed_modulation, "_launch_row_chunks")
+
+    result = rms_norm_indexed_scale_shift(x, weight, x, x, indices, 1e-6)
+
+    if width == 8192:
+        assert result is x
+        sdk_rms.assert_called_once_with(x, weight, x, x, indices, 1e-6)
+        triton_launch.assert_not_called()
+    else:
+        sdk_rms.assert_not_called()
+        triton_launch.assert_called_once()
+
+
+@hardware_test(res={"npu": "A2"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
+@pytest.mark.parametrize(
+    ("dtype", "eps", "col_stride", "expected_sdk_calls"),
+    [
+        pytest.param(torch.bfloat16, 1e-6, 1, (1, 1), id="h3-bf16"),
+        pytest.param(torch.float16, 1e-6, 1, (0, 0), id="fp16"),
+        pytest.param(torch.bfloat16, 0.0, 1, (0, 1), id="zero-eps"),
+        pytest.param(torch.bfloat16, 1e-50, 1, (0, 1), id="eps-rounds-to-zero"),
+        pytest.param(torch.bfloat16, 1e-6, 2, (0, 0), id="strided-columns"),
+        pytest.param(torch.bfloat16, 1e-6, 1, None, id="missing-sdk"),
+    ],
+)
+def test_npu_modulation_dispatch_and_outputs(monkeypatch, mocker, dtype, eps, col_stride, expected_sdk_calls):
+    if expected_sdk_calls is None:
+        monkeypatch.setitem(sys.modules, "mindiesd.layers.index_modulation", None)
+        triton_launch = mocker.spy(indexed_modulation, "_launch_row_chunks")
+    else:
+        sdk = pytest.importorskip("mindiesd.layers.index_modulation")
+        sdk_rms = mocker.spy(sdk, "rms_norm_indexed_scale_shift")
+        sdk_gate = mocker.spy(sdk, "indexed_gate")
+
+    width = 5376
+    device = current_omni_platform.get_torch_device()
+    generator = torch.Generator().manual_seed(1234)
+    x, other, gate, shift, scale = [
+        torch.randn(rows, width * col_stride, generator=generator).to(dtype) for rows in (5, 5, 3, 3, 3)
+    ]
+    weight = torch.randn(width, generator=generator).to(dtype)
+    indices = torch.tensor([2, 0, 2, 1, 0])
+    npu_x, npu_other, npu_gate, npu_shift, npu_scale = (
+        t.to(device)[:, ::col_stride] for t in (x, other, gate, shift, scale)
+    )
+    npu_indices = indices.to(device)
+    result_rms = rms_norm_indexed_scale_shift(npu_x, weight.to(device), npu_shift, npu_scale, npu_indices, eps)
+    result_gate = indexed_gate(npu_x, npu_gate, npu_other, npu_indices)
+    if expected_sdk_calls is None:
+        assert triton_launch.call_count == 2
+    else:
+        assert (sdk_rms.call_count, sdk_gate.call_count) == expected_sdk_calls
+
+    x, other, gate, shift, scale = (t[:, ::col_stride].float() for t in (x, other, gate, shift, scale))
+    norm = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * weight.float()
+    torch.testing.assert_close(result_rms.cpu(), (norm * (1 + scale[indices]) + shift[indices]).to(dtype))
+    torch.testing.assert_close(result_gate.cpu(), (x + gate[indices] * other).to(dtype))
 
 
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
