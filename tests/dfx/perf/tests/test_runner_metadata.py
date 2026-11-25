@@ -1933,7 +1933,9 @@ def test_daily_omni_run_benchmark_writes_result_acc_when_acc_dir_set(tmp_path, m
     assert saved["branch"] == "acc-branch"
     assert not list(perf_dir.glob("result_acc_*.json"))
     perf_saved = json.loads(next(perf_dir.glob("result_*.json")).read_text())
-    assert perf_saved["daily_omni_accuracy"] == 0.8
+    assert "daily_omni_accuracy" not in perf_saved
+    assert "daily_omni_evaluated_ok" not in perf_saved
+    assert perf_saved["completed"] == 8
     assert result["daily_omni_accuracy"] == 0.8
 
 
@@ -2012,7 +2014,10 @@ def test_seed_tts_run_benchmark_writes_result_acc_when_eval_and_acc_dir_set(tmp_
     assert saved["accuracy"]["seed_tts_sim_mean"] == 0.85
     assert saved["baseline"] == {"max_seed_tts_mean_wer": 0.05, "min_seed_tts_mean_sim": 0.8}
     assert not list(perf_dir.glob("result_acc_*.json"))
-    assert json.loads(next(perf_dir.glob("result_*.json")).read_text())["seed_tts_content_error_mean"] == 0.02
+    perf_saved = json.loads(next(perf_dir.glob("result_*.json")).read_text())
+    assert "seed_tts_content_error_mean" not in perf_saved
+    assert "seed_tts_sim_mean" not in perf_saved
+    assert perf_saved["completed"] == 32
     assert result["seed_tts_content_error_mean"] == 0.02
 
 

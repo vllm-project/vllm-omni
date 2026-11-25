@@ -766,6 +766,13 @@ def _prefixed_accuracy_metrics(result: Mapping[str, object], prefix: str) -> dic
     return {key: value for key, value in result.items() if isinstance(key, str) and key.startswith(prefix)}
 
 
+def _without_prefixed_keys(result: Mapping[str, object], prefix: str) -> Mapping[str, object]:
+    """Drop ``prefix*`` keys from the persisted perf JSON only; callers keep ``result``."""
+    if not any(isinstance(key, str) and key.startswith(prefix) for key in result):
+        return result
+    return {key: value for key, value in result.items() if not (isinstance(key, str) and key.startswith(prefix))}
+
+
 def _write_chat_accuracy_result(
     result: Mapping[str, object],
     *,
@@ -785,6 +792,8 @@ def _write_chat_accuracy_result(
     """Copy Daily-Omni / Seed-TTS scores into ``result_acc_*.json`` when CI opts in.
 
     Opt-in is ``ACC_BENCH_RESULT_DIR``. Unset jobs keep scores only in the perf JSON.
+    When set, the persist path also strips those prefixed keys from the written
+    perf JSON and leaves them on the in-memory result for quality assertions.
     """
     if not os.environ.get("ACC_BENCH_RESULT_DIR"):
         return None
@@ -1173,6 +1182,15 @@ def run_benchmark(
             **result,
             "omniinteract": {key: value for key, value in omniinteract_summary.items() if key != "accuracy"},
         }
+    # Daily-Omni / Seed-TTS follow the same persist split when CI sets
+    # ``ACC_BENCH_RESULT_DIR``: prefixed scores live only in ``result_acc_*.json``.
+    if os.environ.get("ACC_BENCH_RESULT_DIR") and (
+        dataset_name == "daily-omni" or (dataset_name == "seed-tts" and "--seed-tts-wer-eval" in args)
+    ):
+        from tests.e2e.accuracy.helpers import _DAILY_OMNI_METRIC_PREFIX, _SEED_TTS_METRIC_PREFIX
+
+        prefix = _DAILY_OMNI_METRIC_PREFIX if dataset_name == "daily-omni" else _SEED_TTS_METRIC_PREFIX
+        persisted = _without_prefixed_keys(persisted, prefix)
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(persisted, f, ensure_ascii=False, indent=2)
     # Evaluated scores must be published even when no quality baseline is configured.
