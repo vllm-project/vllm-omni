@@ -224,8 +224,9 @@ components are absent because the existing path does not run the memory
 profile for that sizing decision. Generation stages without a KV cache and
 platforms without this device-level probe report an explicit mode or `None`.
 The snapshot is read through the control plane at readiness and remote replica
-attachment when `log_stats` is enabled. It is a diagnostic record and does not
-change allocation, sizing, request output, or per-step metrics.
+attachment when `log_stats` is enabled; the startup probe is best-effort and
+does not delay readiness. It is a diagnostic record and does not change
+allocation, sizing, request output, or per-step metrics.
 
 MRv2 asynchronous output snapshots reuse one capacity buffer per dtype/device
 group in each ring slot. The slot waits for its previous device-to-host copy

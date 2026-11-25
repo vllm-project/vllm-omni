@@ -34,7 +34,7 @@ class MemoryClient:
         self.release = asyncio.Event()
         self.release.set()
 
-    async def collective_rpc_async(self, *, method, **kwargs):
+    async def collective_rpc_async(self, *, method, timeout=None, **kwargs):
         if method == "get_stage_post_warmup_memory_stats":
             result = [self.snapshot]
             self.calls += 1
@@ -44,7 +44,10 @@ class MemoryClient:
         else:
             raise AssertionError(f"unexpected RPC method: {method}")
         self.started.set()
-        await self.release.wait()
+        if timeout is None:
+            await self.release.wait()
+        else:
+            await asyncio.wait_for(self.release.wait(), timeout=timeout)
         return result
 
     def shutdown(self):
@@ -284,6 +287,20 @@ async def test_budget_snapshot_skips_rpc_when_stats_are_disabled(lifecycle):
     await env.orchestrator.publish_stage_gpu_memory_budget()
 
     assert all(client.budget_calls == 0 for client in env.clients)
+
+
+@pytest.mark.asyncio
+async def test_budget_snapshot_timeout_does_not_block_orchestrator_run(lifecycle):
+    env = lifecycle
+    env.orchestrator.log_stats = True
+    env.orchestrator.GPU_MEMORY_BUDGET_RPC_TIMEOUT_S = 0.01
+    env.clients[0].release.clear()
+
+    async def scenario():
+        await asyncio.sleep(0.03)
+        assert env.clients[0].budget_calls == 1
+
+    await env.run(scenario)
 
 
 @pytest.mark.asyncio

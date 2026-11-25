@@ -487,6 +487,7 @@ class OrchestratorBase:
     _orch_monitor: OrchestratorMonitorBase = _NULL_ORCH_MONITOR
     collect_stage_metrics: bool = True
     tracer: Tracer | None = None
+    GPU_MEMORY_BUDGET_RPC_TIMEOUT_S: float = 5.0
 
     def __init__(
         self,
@@ -676,6 +677,13 @@ class OrchestratorBase:
             tasks.append(asyncio.create_task(coro, name=f"orchestrator-background-{index}"))
         if membership_watcher is not None:
             tasks.append(membership_watcher)
+        if self.log_stats:
+            tasks.append(
+                asyncio.create_task(
+                    self.publish_stage_gpu_memory_budget(),
+                    name="startup-gpu-memory-budget",
+                )
+            )
 
         try:
             await asyncio.gather(*tasks)
@@ -757,15 +765,19 @@ class OrchestratorBase:
         if not self.log_stats:
             return
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(
                 self._publish_replica_gpu_memory_budget(pool.stage_id, replica_id, client)
                 for pool in self.stage_pools
                 if getattr(pool, "stage_type", None) != "diffusion"
                 for replica_id in pool.live_replica_ids()
                 if (client := pool.clients[replica_id]) is not None
-            )
+            ),
+            return_exceptions=True,
         )
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning("GPU memory budget snapshot publication failed: %s", result)
 
     async def _publish_replica_memory_diagnostics(
         self, stage_id: int, replica_id: int, client: StagePoolClient
@@ -788,6 +800,7 @@ class OrchestratorBase:
         worker_results = await pool.collective_rpc(
             replica_id=replica_id,
             method="get_gpu_memory_budget_snapshot",
+            timeout=self.GPU_MEMORY_BUDGET_RPC_TIMEOUT_S,
         )
         if self._stages_shutdown or pool.clients[replica_id] is not client or not isinstance(worker_results, list):
             return
