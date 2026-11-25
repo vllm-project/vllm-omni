@@ -3,6 +3,7 @@
 """Synthetic CPU coverage for rank-local input; collectives are simulated."""
 
 from dataclasses import dataclass
+from functools import partial
 
 import numpy as np
 import pytest
@@ -174,6 +175,13 @@ def test_only_assigned_tiles_are_uploaded_and_each_clip_gathers(monkeypatch, ran
 def test_unsupported_checkpoint_uses_ordinary_preparation(attribute):
     vae = _vae()
     setattr(vae.model, attribute, True)
+    assert vae._stream_encode_video_tiles(_frames(), torch.device("cpu")) is None
+    assert vae.model.inputs == []
+
+
+def test_missing_posterior_lookup_falls_back():
+    vae = _vae()
+    vae.model.encode_base = partial(vae.model.encode_base)
     assert vae._stream_encode_video_tiles(_frames(), torch.device("cpu")) is None
     assert vae.model.inputs == []
 

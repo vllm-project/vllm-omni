@@ -1151,9 +1151,9 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         ):
             logger.info_once("MiniMax H3 video tile streaming skipped: unsupported checkpoint encoder layout.")
             return None
-        sample = getattr(model.encode_base, "__func__", model.encode_base).__globals__.get(
-            "DiagonalGaussianDistribution"
-        )
+        encode_base = getattr(model, "encode_base", None)
+        encode_base = getattr(encode_base, "__func__", encode_base)
+        sample = getattr(encode_base, "__globals__", {}).get("DiagonalGaussianDistribution")
         if not callable(sample):
             logger.info_once("MiniMax H3 video tile streaming skipped: checkpoint posterior sampler unavailable.")
             return None
