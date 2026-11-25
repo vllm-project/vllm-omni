@@ -43,7 +43,6 @@ _DEPLOY_DIR = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
 _DEPLOY_LAYOUTS = {
     "minicpmo_4_5.yaml": ["0", "0", "0"],
     "minicpmo_4_5_2gpu.yaml": ["0", "1", "1"],
-    "minicpmo_4_5_npu_2card.yaml": ["0", "0", "0"],
     "minicpmo_4_5_3gpu.yaml": ["0", "1", "2"],
     "minicpmo_4_5_8x4090.yaml": ["0,1,2,3", "4", "5"],
 }
@@ -163,7 +162,8 @@ class TestDeployTopology:
             "minicpmo_4_5.yaml",
             "minicpmo_4_5_3gpu_stage1_replicas.yaml",
             "minicpmo_4_5_4gpu_stage1_replicas.yaml",
-            "minicpmo_4_5_npu_2card.yaml",
+            "minicpmo_4_5_2gpu.yaml",
+            "minicpmo_4_5_3gpu.yaml",
             "minicpmo_4_5_turn.yaml",
             "minicpmo_4_5_duplex_h200.yaml",
         }
@@ -185,10 +185,8 @@ class TestDeployTopology:
             return
         stages = merge_pipeline_deploy(pipeline, deploy)
 
-        # The NPU two-card profile also inherits the base CUDA overrides
-        # when the configuration is resolved for CUDA.
-        cuda_replicas = platform == "cuda" and filename in {"minicpmo_4_5.yaml", "minicpmo_4_5_npu_2card.yaml"}
-        npu_replicas = platform == "npu" and filename == "minicpmo_4_5_npu_2card.yaml"
+        cuda_replicas = platform == "cuda" and filename == "minicpmo_4_5.yaml"
+        npu_replicas = platform == "npu" and filename == "minicpmo_4_5_2gpu.yaml"
         expected_devices = ["0", "0", "0,0"] if cuda_replicas else devices
         if npu_replicas:
             expected_devices = ["1", "1,0", "0,1"]
@@ -204,7 +202,7 @@ class TestDeployTopology:
         assert stages[2].yaml_extras["input_connectors"]["from_stage_1"] == "connector_of_shared_memory"
         connector = deploy.connectors["connector_of_shared_memory"]
         assert connector["name"] == "SharedMemoryConnector"
-        inherits_npu_chunking = platform == "npu" and filename in {"minicpmo_4_5.yaml", "minicpmo_4_5_npu_2card.yaml"}
+        inherits_npu_chunking = platform == "npu" and filename != "minicpmo_4_5_8x4090.yaml"
         assert connector["extra"]["codec_chunk_frames"] == (32 if inherits_npu_chunking else 25)
         assert "initial_codec_chunk_frames" not in connector["extra"]
         assert connector["extra"]["codec_left_context_frames"] == 3
@@ -234,7 +232,7 @@ class TestDeployTopology:
                 "audio": 64,
                 "video": 1,
             }
-        elif filename == "minicpmo_4_5_2gpu.yaml":
+        elif platform == "cuda" and filename == "minicpmo_4_5_2gpu.yaml":
             assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
                 0.9,
                 0.55,
@@ -245,7 +243,6 @@ class TestDeployTopology:
         "filename",
         [
             "minicpmo_4_5.yaml",
-            "minicpmo_4_5_npu_2card.yaml",
             "minicpmo_4_5_2gpu.yaml",
             "minicpmo_4_5_3gpu.yaml",
         ],
@@ -261,23 +258,21 @@ class TestDeployTopology:
         assert "code2wav_max_npu_graphs" not in connector_extra
 
         stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
-        npu_profiles = {"minicpmo_4_5.yaml", "minicpmo_4_5_npu_2card.yaml"}
-        expected_graph_mode = "FULL_DECODE_ONLY" if filename in npu_profiles else "PIECEWISE"
-        assert stages[0].yaml_engine_args["compilation_config"]["cudagraph_mode"] == expected_graph_mode
-        assert stages[1].yaml_engine_args["compilation_config"]["cudagraph_mode"] == expected_graph_mode
+        assert all(
+            stage.yaml_engine_args["compilation_config"]["cudagraph_mode"] == "FULL_DECODE_ONLY" for stage in stages[:2]
+        )
         assert stages[2].yaml_engine_args["enforce_eager"] is True
         # The co-located single-card profile caps capture memory at 32 entries.
         expected_graph_config: dict[str, object] = {
             "code2wav_enable_npu_graph": True,
-            "code2wav_max_npu_graphs": 96 if filename == "minicpmo_4_5_npu_2card.yaml" else 32,
+            "cfm_graph_batch_buckets": [1, 2, 4, 8],
+            "code2wav_max_npu_graphs": 96 if filename == "minicpmo_4_5_2gpu.yaml" else 32,
         }
-        if filename in npu_profiles:
-            expected_graph_config["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
         assert stages[2].yaml_engine_args["additional_config"] == expected_graph_config
 
     @pytest.mark.parametrize(
         ("filename", "devices"),
-        [("minicpmo_4_5.yaml", ["0", "0", "0"]), ("minicpmo_4_5_npu_2card.yaml", ["1", "1,0", "0,1"])],
+        [("minicpmo_4_5.yaml", ["0", "0", "0"]), ("minicpmo_4_5_2gpu.yaml", ["1", "1,0", "0,1"])],
     )
     def test_npu_default_uses_mrv2_with_thinker_ngram(self, filename, devices, monkeypatch):
         monkeypatch.setattr(current_omni_platform, "device_name", "npu")

@@ -191,7 +191,7 @@ To disable Thinker Ngram, set `speculative_config: null` for stage 0 under
 `platforms.npu.stages` in a deploy overlay. Use `async_scheduling: true` there
 to restore asynchronous scheduling for ordinary decoding.
 
-The Ascend `minicpmo_4_5_npu_2card.yaml` profile puts Thinker on the second
+The Ascend `minicpmo_4_5_2gpu.yaml` profile puts Thinker on the second
 visible NPU and one replica of Talker and Code2Wav on each NPU. It inherits
 the common stage settings from `minicpmo_4_5.yaml`. The
 [Ascend launcher](gh-file:recipes/OpenBMB/serve_minicpmo_ascend.sh) selects

@@ -1099,11 +1099,11 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     monkeypatch.setattr(current_omni_platform, "device_name", "npu")
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
-    expected: dict[str, object] = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
-    if deploy_name == "minicpmo_4_5":
-        # Single-card deploy: batch sizes round up to a capture bucket so the
-        # bounded pool can reuse captures across nearby batch sizes.
-        expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
+    expected: dict[str, object] = {
+        "code2wav_enable_npu_graph": True,
+        "cfm_graph_batch_buckets": [1, 2, 4, 8],
+        "code2wav_max_npu_graphs": 96 if deploy_name == "minicpmo_4_5_2gpu" else 32,
+    }
     assert stage.runtime_config.additional_config == expected
     engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
     assert engine_args["additional_config"] == expected

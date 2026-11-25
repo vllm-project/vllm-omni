@@ -38,7 +38,7 @@ from vllm_omni.config.stage_config import resolve_deploy_yaml
 
 repo, runtime, model, draft = (Path(p).resolve() for p in sys.argv[1:5])
 deployment, seqs_arg = sys.argv[5:7]
-default_deploy = repo / "vllm_omni/deploy/minicpmo_4_5_npu_2card.yaml"
+default_deploy = repo / "vllm_omni/deploy/minicpmo_4_5_2gpu.yaml"
 deploy_path = Path(deployment).resolve() if deployment else default_deploy
 seqs = int(seqs_arg) if seqs_arg else None
 if seqs is not None and seqs <= 0:

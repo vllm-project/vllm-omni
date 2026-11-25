@@ -5,7 +5,7 @@ Talker replicas with K16, and two Code2Wav replicas with five-step FP32 CFM.
 All stages use MRv2. The shared KV layout is scoped to MiniCPM-o on Ascend and
 uses the stock vLLM-Ascend allocator.
 
-- [Two-card deployment template](../../vllm_omni/deploy/minicpmo_4_5_npu_2card.yaml)
+- [Two-card deployment template](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml)
 - [Launcher](serve_minicpmo_ascend.sh)
 - [Checkpoint manifest](minicpmo_ascend_checkpoint_manifest.json)
 
@@ -16,6 +16,7 @@ Start with the `quay.nju.edu.cn/atlas-ci/vllm-ascend:v0.34.0` image, the matchin
 Ascend driver, and `numactl`. The measured image digest is
 `sha256:4ec880dc132cc9c3993d914039b2879db5db4f432ef36211417fcdcb9249d590`.
 It contains vLLM `62d4bc3c7`, vLLM-Ascend `19c063b54`, and CANN 9.3.
+The manifest's runtime versions and commit IDs identify this serving image.
 Mount the vLLM-Omni checkout and model assets into the container. Preserve the
 image's CANN environment and Python paths. The launcher prepends this checkout
 to `PYTHONPATH`.
@@ -99,7 +100,7 @@ export PROFILING_MODE=dynamic TASK_QUEUE_ENABLE=1
 bash recipes/OpenBMB/serve_minicpmo_ascend.sh
 ```
 
-The launcher renders `minicpmo_4_5_npu_2card.yaml` with the prepared W8A8
+The launcher renders `minicpmo_4_5_2gpu.yaml` with the prepared W8A8
 Thinker and local DSpark checkpoint. Using the YAML directly with the original
 checkpoint selects the shared Ngram settings.
 It creates mode files in a per-service temporary directory. Set `RUNTIME_DIR`

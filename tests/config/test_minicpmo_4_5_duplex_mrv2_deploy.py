@@ -78,7 +78,7 @@ def test_duplex_mrv2_profile_npu_full_mrv2(monkeypatch) -> None:
 
 
 def test_two_card_deploy_inherits_common_npu_settings(monkeypatch) -> None:
-    config, stages = _resolve_stages(monkeypatch, "npu", "minicpmo_4_5_npu_2card.yaml")
+    config, stages = _resolve_stages(monkeypatch, "npu", "minicpmo_4_5_2gpu.yaml")
     thinker, talker, vocoder = stages
     assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
     assert thinker.yaml_engine_args["max_model_len"] == 40960
@@ -100,11 +100,32 @@ def test_two_card_deploy_inherits_common_npu_settings(monkeypatch) -> None:
     assert "code2wav_encoder_graph_singleton_history_frames" not in extra
 
 
+@pytest.mark.parametrize(("cards", "code2wav_device"), [(2, "1"), (3, "2")])
+def test_multigpu_deploy_inherits_cuda_serving_defaults(monkeypatch, cards, code2wav_device) -> None:
+    config, stages = _resolve_stages(monkeypatch, "cuda", f"minicpmo_4_5_{cards}gpu.yaml")
+    thinker, talker, vocoder = stages
+    assert config.duplex_session.max_sessions == 16
+    assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
+    assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+    assert thinker.yaml_engine_args["limit_mm_per_prompt"] == {"image": 64, "audio": 64, "video": 1}
+    assert thinker.yaml_engine_args["media_io_kwargs"]["video"] == {"fps": 1, "num_frames": 128}
+    assert thinker.yaml_extras["default_sampling_params"]["repetition_penalty"] == 1.0
+    assert thinker.yaml_engine_args["speculative_config"]["num_speculative_tokens"] == 7
+    assert (vocoder.yaml_runtime["devices"], vocoder.yaml_runtime["num_replicas"]) == (code2wav_device, 1)
+    assert talker.yaml_engine_args["attention_backend"] == "FLASH_ATTN"
+    assert talker.yaml_engine_args["speculative_config"]["num_speculative_tokens"] == 15
+    assert not vocoder.yaml_engine_args.get("additional_config")
+    extra = config.connectors["connector_of_shared_memory"]["extra"]
+    assert extra["token2wav_float16"] is True
+    assert extra["token2wav_n_timesteps"] == 5
+    assert "code2wav_encoder_padded_flow_history" not in extra
+
+
 def test_two_card_deploy_accepts_single_vocoder_stage_override(monkeypatch) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", "npu")
     config = VllmOmniConfig.from_pipeline_config(
         MINICPMO_4_5_PIPELINE,
-        user_deploy_config=load_deploy_config(get_deploy_config_path("minicpmo_4_5_npu_2card.yaml")),
+        user_deploy_config=load_deploy_config(get_deploy_config_path("minicpmo_4_5_2gpu.yaml")),
         cli_overrides={"stage_2_devices": "0", "stage_2_num_replicas": 1},
     )
     assert [(s.runtime_config.devices, s.runtime_config.num_replicas) for s in config.stage_configs] == [
