@@ -89,6 +89,7 @@ Code2Wav consumes them through a shared-memory async connector.
 | 2-GPU | GPU 0 | GPU 1 | GPU 1 | 2x large-memory GPU |
 | 3-GPU | GPU 0 | GPU 1 | GPU 2 | 3x GPU |
 | 8x RTX 4090 24GB | GPU 0–3 (TP=4) | GPU 4 | GPU 5 | 8x RTX 4090 consumer |
+| 3x Intel XPU 32GB (overlay) | XPU 0 | XPU 1 | XPU 2 | 3x Intel Arc Pro B70 |
 
 ### Default model runner
 
@@ -171,7 +172,7 @@ video. Use the two-GPU profile for production throughput.
 - OS: Linux
 - Python: 3.10+
 - vLLM / vLLM-Omni: >= 0.21.0 (or current `main`)
-- Optional Talker dep: `stepaudio2-minicpmo` (see Notes for why this is
+- Code2Wav dep: `step-audio2==1.0.0` (see Notes for why this is
   required and how to install it)
 
 #### Command
@@ -390,20 +391,72 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 - All other knobs match the single-GPU section; the only difference is
   the per-card memory pressure on the thinker shards.
 
+## Intel XPU
+
+`minicpmo_4_5.yaml` sets `platforms.xpu.model_runner: v2`, so on XPU all three
+stages build on Model Runner V2, as on CUDA. Thinker and Talker capture XPU
+graphs (`PIECEWISE` + `FULL`). Code2Wav keeps its HiFT/CFM device graphs
+disabled on XPU and runs them eagerly.
+
+### 1 x Intel Arc Pro B70 32GB: default profile does not fit
+
+The unmodified default profile starts on MRv2 on one 32 GB Arc Pro B70, but
+Stage 0 runs out of device memory in its encoder profile run. That profile is
+sized for one large-memory GPU (0.55 utilization, 64 images / 64 audios per
+prompt, 16k batched tokens). No single-card XPU configuration has been
+validated.
+
+### 3 x Intel Arc Pro B70 32GB (validated)
+
+This overlay keeps `minicpmo_4_5.yaml` as its base, so the XPU runner
+selection comes from the default profile. It puts each stage on its own card
+and lowers the Stage-0 limits:
+
+```yaml
+# minicpmo_4_5_b70_3card.yaml
+base_config: vllm_omni/deploy/minicpmo_4_5.yaml
+pipeline: minicpmo_4_5
+stages:
+  - stage_id: 0
+    devices: "0"
+    gpu_memory_utilization: 0.92
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    limit_mm_per_prompt: {image: 16, audio: 16, video: 1}
+  - stage_id: 1
+    devices: "1"
+    gpu_memory_utilization: 0.5
+  - stage_id: 2
+    devices: "2"
+    gpu_memory_utilization: 0.5
+```
+
+```bash
+ZE_AFFINITY_MASK=0,1,2 vllm-omni serve openbmb/MiniCPM-o-4_5 --omni \
+    --trust-remote-code \
+    --deploy-config minicpmo_4_5_b70_3card.yaml --port 8099
+```
+
+With vLLM 0.34.0+xpu and torch 2.15.0+xpu, the server became healthy in about
+140 s. A realtime duplex session on OmniInteract `1q1a` completed with text and
+streamed speech, 100% streaming continuity, and no server errors.
+
 ## Notes (applies to all layouts)
 
-- **Code2Wav dependency**: Stage 2 loads `Token2wav` from the
-  MiniCPM-o-flavored
-  vocoder (PyPI package `stepaudio2-minicpmo` — NOT the upstream
-  `stepfun-ai/Step-Audio2`, whose `Token2wav.__init__` signature
-  rejects `n_timesteps`). Install via the published extra:
+- **Code2Wav dependency**: Stage 2 runs the in-tree Step-Audio2 Token2Wav
+  core, whose checkpoint `flow.yaml` instantiates `cosyvoice2.*` classes. The
+  top-level `cosyvoice2` package comes from PyPI `step-audio2` (the version
+  pinned in `pyproject.toml`):
 
   ```bash
-  pip install stepaudio2-minicpmo
+  pip install step-audio2==1.0.0
   ```
 
-  A missing dep raises `ImportError` at first request with the same
-  install hint instead of silently emitting empty audio.
+  The previously documented `stepaudio2-minicpmo` package is not a
+  substitute: it ships `cosyvoice2` only as `stepaudio2.cosyvoice2`, so with
+  that package alone Stage 2 fails at load with
+  `ImportError: There is no such class as cosyvoice2.flow.flow.CausalMaskedDiffWithXvec`.
+  Do not co-install the two; both provide a top-level `stepaudio2` package.
 
 - **TTS conditioning**: the MiniCPM stage bridge can condition speech from
   the generated assistant span without changing shared serving code.
