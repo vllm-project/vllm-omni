@@ -448,7 +448,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 logger.exception("[H3_VAE_XEFMHA] install failed; decoder attention left unchanged")
         # Env-gated (default on): the remote ViT3DDecoder defines no _repeated_blocks,
         # so regional compilation never touches it and on XPU install_h3_vae_optimizations() returns False (operator
-        # table is CUDA sm89/90/100/103/120 only) -> every decoder block runs unfused eager elementwise/cast/rope
+        # table is CUDA sm80/89/90/100/103/120 only) -> every decoder block runs unfused eager elementwise/cast/rope
         # kernels.
         # ``allow_decoder_compile`` is the pipeline's eager/inductor decision
         # (see ``vae_compile_allowed``); the env switch cannot override a veto.
