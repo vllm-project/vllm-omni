@@ -41,6 +41,24 @@ def test_short_transcript_unrelated_text_still_fails():
         )
 
 
+def test_streamed_chat_audio_mismatch_preserves_failure_and_asr_input(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(tmp_path))
+    response = OmniResponse(
+        success=True,
+        text_content="The lighthouse stood on the far side of the island.",
+        audio_content="A different sentence about horses running in a field.",
+        audio_bytes=b"streamed audio",
+    )
+    with pytest.raises(AssertionError, match=assertions.AUDIO_MISMATCH_MESSAGE):
+        assertions.assert_omni_response(response, {"stream": True}, "full_model")
+
+    (clip,) = tmp_path.glob("*.wav")
+    assert clip.read_bytes() == response.audio_bytes
+    evidence = json.loads(clip.with_suffix(".json").read_text(encoding="utf-8"))
+    assert evidence["transcript"] == response.audio_content
+    assert evidence["expected_text"] == response.text_content
+
+
 def _capture_transcribe(monkeypatch) -> dict:
     captured: dict = {}
 

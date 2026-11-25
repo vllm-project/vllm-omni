@@ -195,6 +195,14 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
     def has_pending(self) -> bool:
         return bool(self._buffer or self._vision_queue)
 
+    def has_ready_unit(self, *, chunk_period_ms: int) -> bool:
+        if self._vision_queue:
+            return True
+        if self._sample_rate_hz is None:
+            return False
+        min_samples = max(1, int(self._sample_rate_hz * max(1, int(chunk_period_ms)) / 1000))
+        return len(self._buffer) >= min_samples * 4
+
     def has_reserved(self) -> bool:
         return bool(self._reservations)
 
@@ -416,25 +424,14 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         return True
 
     def prepare_backlog(self, *, operation_id: str, chunk_period_ms: int) -> MiniCPMO45PcmAppendReservation | None:
-        """Reserve the next whole chunk of audio already buffered (input-clocked sessions), or ``None``.
-
-        An append longer than one chunk leaves its later chunks buffered; the
-        runner of an input-clocked session drains them right after the append,
-        so the append's acknowledgement covers every chunk it completed.
-        """
-        sample_rate_hz = self._sample_rate_hz
-        if sample_rate_hz is None:
+        """Reserve the next complete audio or vision unit, retaining partial PCM."""
+        if not self.has_ready_unit(chunk_period_ms=chunk_period_ms):
             return None
-        min_samples = max(1, int(sample_rate_hz * max(1, int(chunk_period_ms)) / 1000))
-        if len(self._buffer) // 4 < min_samples:
-            return None
-        payload: dict[str, object] = {
-            "type": "audio",
-            "audio": "",
-            "format": "pcm_f32le",
-            "sample_rate_hz": sample_rate_hz,
-        }
-        return self.prepare_append(payload, operation_id=operation_id, chunk_period_ms=chunk_period_ms)
+        return self.prepare_append(
+            {"type": "audio", "audio": "", "format": "pcm_f32le", "sample_rate_hz": self._sample_rate_hz or 16000},
+            operation_id=operation_id,
+            chunk_period_ms=chunk_period_ms,
+        )
 
     def prepare_commit_prefix(
         self, *, operation_id: str, chunk_period_ms: int
