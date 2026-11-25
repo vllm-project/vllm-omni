@@ -31,19 +31,8 @@ def _nvidia_cuda(monkeypatch):
     monkeypatch.setattr(layer, "_is_nvidia_cuda", lambda: True)
 
 
-class _Impl:
-    def __init__(self, invariant):
-        self.invariant = invariant
-
-    def head_count_invariant(self):
-        return self.invariant
-
-
 def _case(**overrides):
-    attention = SimpleNamespace(
-        use_ring=False, _explicit_cross_contract=False, _has_custom_attention=False, head_count_invariant=True
-    )
-    attention.effective_attention = lambda: (_Impl(attention.head_count_invariant), None, None)
+    attention = SimpleNamespace(use_ring=False, _explicit_cross_contract=False, _has_custom_attention=False)
     strategy = SimpleNamespace(
         name="ulysses",
         ce_overlap_chunks=2,
@@ -73,7 +62,6 @@ def _case(**overrides):
         {"use_ring": True},
         {"_explicit_cross_contract": True},
         {"_has_custom_attention": True},
-        {"head_count_invariant": False},
         {"_ulysses_a2a_permute": False},
         {"_scatter_idx": 1},
         {"_sp_group": SimpleNamespace(ring_world_size=2, ulysses_world_size=2)},
@@ -133,26 +121,74 @@ def test_eligible_layer_runs_local_attention_per_chunk(monkeypatch):
     assert output is query and calls == [metadata]
 
 
-@pytest.mark.parametrize("match", [True, False])
-def test_overlap_is_verified_once_per_shape(monkeypatch, match):
-    """The first call at a shape runs both paths; the overlap is kept only if every rank is bit-identical."""
-    reduced = []
-    monkeypatch.setattr(layer.torch.distributed, "all_reduce", lambda t, op, group: reduced.append(group))
+class _Impl:
+    flashinfer_backend = "fa2"
+
+
+def _verifying_layer(monkeypatch, *, match=True, fail=None):
+    """A layer whose overlap and standard paths are fakes; records which ran and every all_reduce."""
+    from vllm_omni.diffusion.attention.parallel import ulysses_ce_overlap
+
+    monkeypatch.setattr(ulysses_ce_overlap, "VERDICTS", {})
+    calls = []
+    monkeypatch.setattr(layer.torch.distributed, "all_reduce", lambda t, op, group: calls.append("all_reduce"))
     reference = torch.randn(1, 8, 8, 16)
-    paths = []
+    attention = SimpleNamespace(impl=_Impl())
+    strategy = SimpleNamespace(_ulysses_pg=SimpleNamespace(group_name="pg"))
+
+    def call():
+        query = torch.empty(1, 8, 8, 16)
+        return layer.Attention._ulysses_ce_overlap_or_none(attention, strategy, query, query, query, None, 2)
 
     def overlap(strategy, q, k, v, m, chunks):
-        paths.append("overlap")
+        calls.append("overlap")
+        if fail == "overlap":
+            raise RuntimeError("overlap failed")
         return reference.clone() if match else reference + 1
 
     def standard(q, k, v, m):
-        paths.append("standard")
-        assert attention._ce_overlap_exact[(tuple(q.shape), q.dtype, 2)] is False
+        # The reference run re-enters the dispatch; the pending verdict sends it down the standard exchange.
+        if layer.Attention._ulysses_ce_overlap_or_none(attention, strategy, q, k, v, m, 2) is not None:
+            raise AssertionError("the reference run must take the standard exchange")
+        calls.append("standard")
+        if fail == "standard":
+            raise RuntimeError("standard failed")
         return reference
 
-    attention = SimpleNamespace(_forward_ulysses_ce_overlap=overlap, _forward_impl=standard)
-    strategy = SimpleNamespace(_ulysses_pg="pg")
-    query = torch.empty(1, 8, 8, 16)
-    output = layer.Attention._verify_ulysses_ce_overlap(attention, strategy, query, query, query, None, 2)
-    assert output is reference and paths == ["overlap", "standard"] and reduced == ["pg"]
-    assert attention._ce_overlap_exact == {((1, 8, 8, 16), torch.float32, 2): match}
+    attention._forward_ulysses_ce_overlap = overlap
+    attention._forward_impl = standard
+    attention.effective_attention = lambda: (attention.impl, None, None)
+    return attention, call, calls, reference, ulysses_ce_overlap.VERDICTS
+
+
+@pytest.mark.parametrize("match", [True, False])
+def test_overlap_is_verified_once_then_reused(monkeypatch, match):
+    """The first call at a shape runs both paths; later calls follow the cached verdict without verifying again."""
+    _, call, calls, reference, _ = _verifying_layer(monkeypatch, match=match)
+    assert call() is reference
+    assert calls == ["overlap", "standard", "all_reduce"]
+    calls.clear()
+    second = call()
+    if match:
+        assert second is not None and calls == ["overlap"]
+    else:
+        assert second is None and calls == []
+
+
+def test_verdict_is_keyed_by_attention_kernel(monkeypatch):
+    """A scheduled switch to another kernel at the same shape is verified on its own."""
+    attention, call, calls, _, _ = _verifying_layer(monkeypatch)
+    call()
+    attention.impl = SimpleNamespace(flashinfer_backend="cute-dsl")
+    calls.clear()
+    call()
+    assert calls == ["overlap", "standard", "all_reduce"]
+
+
+@pytest.mark.parametrize("fail", ["overlap", "standard"])
+def test_failed_verification_leaves_no_verdict(monkeypatch, fail):
+    """A failure on one rank must not leave a verdict that sends it down a different path than its peers later."""
+    _, call, _, _, verdicts = _verifying_layer(monkeypatch, fail=fail)
+    with pytest.raises(RuntimeError):
+        call()
+    assert verdicts == {}

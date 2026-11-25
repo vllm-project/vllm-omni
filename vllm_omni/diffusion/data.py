@@ -334,10 +334,9 @@ class DiffusionParallelConfig:
     """Overlap the CUDA copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
 
     Requires ``ulysses_a2a_permute`` and strict pure Ulysses. Each chunk's Q/K/V move to their head owners while
-    earlier chunks compute, and outputs return as each chunk finishes. It runs only for attention implementations whose
-    ``head_count_invariant()`` is True (per-head output independent of the heads per call), and each layer checks
-    every new shape once against the standard path before keeping the overlap, so results match the unchunked path
-    exactly; other layers and shapes keep the standard exchange.
+    earlier chunks compute, and outputs return as each chunk finishes. The first call for each attention kernel and
+    shape runs the overlap and the standard path on every rank and keeps the overlap only if all ranks are
+    bit-identical, so results match the unchunked path exactly; other kernels and shapes keep the standard exchange.
     """
 
     cfg_parallel_size: int = 1

@@ -362,17 +362,6 @@ class AttentionImpl(ABC, Generic[T]):
             return True
         return kv_cache_dtype in cls._supported_kv_cache_dtypes.get(platform_key, set())
 
-    def head_count_invariant(self) -> bool:
-        """Whether each head's output is bit-identical however many heads one call covers.
-
-        Head-chunked schedules, such as the copy-engine Ulysses overlap, are exact only for such kernels, so they run
-        only where the implementation opts in. Opt in only with evidence from
-        ``tests/helpers/attention_head_invariance.py`` on every platform where it returns True. The declaration covers
-        full-occupancy shapes; a kernel may still split the KV range when a call covers few heads of a short sequence,
-        so callers verify each shape once before relying on it.
-        """
-        return False
-
     def resolve_execution_path(
         self,
         context: ExecutionContext,
