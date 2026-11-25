@@ -1664,6 +1664,13 @@ camera observation must not move the transcript into a separate user turn.
 Deleted transcripts stay absent; cancelled output does not discard an accepted
 user transcript.
 
+The default JoyAI silence persona keeps ongoing user instructions active across
+replies: a completed answer does not finish an instruction about future
+observations. Each new observation must be evaluated against applicable ongoing
+instructions before choosing silence. This does not force a spoken response for
+every camera commit; silence remains valid when no instruction or scene change
+calls for speech. An explicit `joyai_system_prompt` still replaces the persona.
+
 The ASR handoff retains frame timestamps and observation-to-history references,
 so an old frame precedes its reply boundary and the new transcript accompanies
 only the current observation. Both paths apply the image limit before selecting

@@ -2334,10 +2334,13 @@ async def test_conversation_images_and_camera_frames_share_input_order():
 def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.processor = Processor()
-    plugin.max_model_len = 1500
     plugin.max_images = 999
     config = DuplexSessionConfig(instructions="Watch the pot.")
     runtime = plugin.runtime_config_for_update(config, {})
+    # Leave room for the current query, one image and output, independently of
+    # the persona's wording (the test tokenizer counts characters as tokens).
+    system_tokens = len(plugin.processor.tokenizer(text=[plugin._system_prompt(runtime)])["input_ids"][0])
+    plugin.max_model_len = system_tokens + 600
     kwargs = dict(
         request_id="r",
         fence=DuplexFence("s"),
@@ -2362,10 +2365,11 @@ def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
     prompt = plan.prompt
     assert "Watch the pot." in prompt["prompt"] and "Any smoke?" in prompt["prompt"]
     assert "old answer" not in prompt["prompt"]
+    assert len(prompt["multi_modal_data"]["image"]) == 1
     assert prompt["multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 0, 255)
     assert (
         len(plugin.processor(text=[prompt["prompt"]], images=prompt["multi_modal_data"]["image"])["input_ids"][0])
-        <= 1436
+        <= plugin.max_model_len - 64
     )
     plugin.max_model_len = 10
     with pytest.raises(DuplexRuntimeConfigError, match="context budget"):
