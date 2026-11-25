@@ -45,6 +45,11 @@ logger = init_logger(__name__)
 
 
 _DEFAULT_PROMPT_WAV = Path("assets") / "HT_ref_audio.wav"
+_FALLBACK_PROMPT_WAVS = (
+    _DEFAULT_PROMPT_WAV,
+    Path("system_ref_audio.wav"),
+    Path("assets") / "system_ref_audio.wav",
+)
 
 
 @lru_cache(maxsize=8)
@@ -125,8 +130,13 @@ def _stage_matmul_policy(tf32_mode: str) -> Iterator[None]:
 
 
 def default_prompt_wav(model_path: str) -> str:
-    """Return the model-bundled MiniCPM prompt WAV path."""
-    return str(Path(model_path) / _DEFAULT_PROMPT_WAV)
+    """Return the model-bundled MiniCPM / Sage-Interaction prompt WAV path."""
+    base = Path(model_path)
+    for rel in _FALLBACK_PROMPT_WAVS:
+        candidate = base / rel
+        if candidate.is_file():
+            return str(candidate)
+    return str(base / _DEFAULT_PROMPT_WAV)
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -694,9 +704,16 @@ class MiniCPMO45Code2Wav(nn.Module):
             return entry.cache_id, entry.path, cache_key
 
         default_wav, default_cache_id = self._normalized_default_prompt()
+        resolved_wav = str(_scalar(meta.get("prompt_wav"), default_wav))
+        if not Path(resolved_wav).is_file():
+            raise _batch_error(
+                "missing_ref_audio",
+                request_id=state_id,
+                prompt_wav=resolved_wav,
+            )
         return (
             str(_scalar(meta.get("prompt_cache_id"), default_cache_id)),
-            str(_scalar(meta.get("prompt_wav"), default_wav)),
+            resolved_wav,
             None,
         )
 
@@ -1839,7 +1856,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         self.model_path = _resolve_model_dir(self.model_path, self._model_revision)
         prompt_path = Path(self._default_prompt_wav)
         if not prompt_path.is_file():
-            raise FileNotFoundError(f"MiniCPM-o Code2Wav prompt audio not found: {prompt_path}")
+            if self._prompt_wav_override is not None:
+                raise FileNotFoundError(f"MiniCPM-o Code2Wav prompt audio not found: {prompt_path}")
+            logger.warning(
+                "MiniCPM-o Code2Wav: bundled default prompt audio not found at %s; "
+                "sessions must provide per-request ref_audio",
+                prompt_path,
+            )
         token2wav_path = Path(self.model_path) / "assets" / "token2wav"
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
@@ -2131,6 +2154,12 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         precapture("HiFT", backend.precapture_hift)
         prompt_wav, prompt_cache_id = self._normalized_default_prompt()
+        if not Path(prompt_wav).is_file():
+            logger.info(
+                "MiniCPM-o Code2Wav: no bundled default prompt audio at %s; skipping default-voice graph precapture",
+                prompt_wav,
+            )
+            return
         try:
             features = backend.prepare_prompt(prompt_cache_id, prompt_wav)
         except Exception:

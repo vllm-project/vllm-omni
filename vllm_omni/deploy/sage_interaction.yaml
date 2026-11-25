@@ -1,0 +1,8 @@
+# InternLM Sage-Interaction full-duplex three-stage deploy on one GPU.
+# Reuses the MiniCPM-o 4.5 three-stage serving layout with Sage-Interaction's
+# duplex plugin (3-way <|listen|>/<|speak|>/<|delegate|> + tool-result injection).
+base_config: minicpmo_4_5.yaml
+pipeline: sage_interaction
+session_mode: duplex
+duplex_session:
+  max_sessions: 16
