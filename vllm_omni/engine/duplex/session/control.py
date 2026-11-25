@@ -374,7 +374,7 @@ class SessionControl:
                 event_id=realtime_event_id,
             )
             return
-        requests_audio = "audio" in (candidate_config.modalities or ())
+        requests_audio = "audio" in candidate_config.resolved_modalities
         if (
             requests_audio
             and "ref_audio_data" not in session.runtime_config

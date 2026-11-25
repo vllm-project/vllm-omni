@@ -537,6 +537,13 @@ class DuplexSessionConfig:
         """Apply the clamps / defaults ``from_event`` applies to a wire object (typed configs skip them)."""
         return DuplexSessionConfig.from_event({"session": self.as_dict()})
 
+    @property
+    def resolved_modalities(self) -> list[str]:
+        """Output modalities after admission; ``None`` means the deployment default is not applied yet."""
+        if self.modalities is None:
+            raise RuntimeError("output modalities are unresolved; apply with_output_capabilities() first")
+        return self.modalities
+
     def with_output_capabilities(self, capabilities: DuplexCapabilities) -> DuplexSessionConfig:
         modalities = capabilities.resolve_output_modalities(self.modalities)
         if not capabilities.emits_audio:

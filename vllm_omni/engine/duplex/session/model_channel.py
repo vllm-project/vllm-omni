@@ -232,7 +232,7 @@ class ModelChannel:
             "session_id": session.session_id,
             "response_id": response_id,
             "epoch": epoch,
-            "modalities": list(response_config.modalities or ()),
+            "modalities": list(response_config.resolved_modalities),
         }
         if request_id is not None:
             payload["request_id"] = request_id
@@ -456,7 +456,7 @@ class ModelChannel:
                 "conversation_user_source_ids": dict(
                     zip(user_item_ids, session.user_source_ids_for_items(user_item_ids))
                 ),
-                "modalities": list(session.response_config.modalities or ()),
+                "modalities": list(session.response_config.resolved_modalities),
             }
             prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
             prompt_session["stage_sampling_params"] = request_context.sampling_params
@@ -679,7 +679,7 @@ class ModelChannel:
             auto_responds=self._out.auto_responds(),
             response_format=response_config.response_format,
             speed=response_config.speed,
-            modalities=tuple(response_config.modalities or ()),
+            modalities=tuple(response_config.resolved_modalities),
         )
 
     # ------------------------------------------------------------------ #
@@ -1561,16 +1561,17 @@ class ModelChannel:
                 return close_reason, emitted_response
         target_id = draining_response_id if draining_response_id not in (None, session.active_response_id) else None
         previous_sent_ms = session.playback_for_response(target_id).sent_ms
-        text_chars_before_append = len(session.assistant_transcript(target_id))
+        # Transcript lengths only align text with audio; a text-only reply has none.
+        emits_audio = session.capabilities.emits_audio
+        text_chars_before_append = len(session.assistant_transcript(target_id)) if emits_audio else 0
         if isinstance(text, str) and text:
             if target_id is not None:
                 session.append_draining_assistant_text(target_id, text)
             else:
                 session.append_assistant_text(text)
         duration_ms = model_result.get("audio_duration_ms")
-        text_chars = len(session.assistant_transcript(target_id))
         mark_duration_ms = None
-        mark_text_chars: int | None = text_chars
+        mark_text_chars: int | None = len(session.assistant_transcript(target_id)) if emits_audio else None
         if model_result.get("audio_text_mark") is False:
             mark_text_chars = None
         if isinstance(duration_ms, int | float):
@@ -1603,42 +1604,7 @@ class ModelChannel:
         )
         if self._ctx.history_calibration is not None and response_id is not None:
             self._ctx.history_calibration.record(target_id or response_id, model_result)
-        payload = {
-            "type": "response.output_audio.delta",
-            "session_id": session.session_id,
-            "response_id": response_id,
-            "epoch": session.epoch,
-            "text": text if isinstance(text, str) else "",
-            "audio": audio if isinstance(audio, str) else "",
-            "format": (
-                model_result.get("audio_format")
-                if isinstance(model_result.get("audio_format"), str)
-                else session.response_config.response_format
-            ),
-            "end_of_turn": end_of_turn,
-            "model_speak": True,
-        }
-        if mark_duration_ms is not None:
-            payload["audio_duration_ms"] = mark_duration_ms
-        if audio_text_marks:
-            payload["audio_text_marks"] = audio_text_marks
-        elif mark_duration_ms is not None and mark_text_chars is not None:
-            payload["audio_text_marks"] = [
-                {"text_chars": max(0, int(mark_text_chars)), "audio_end_ms": max(0, int(mark_duration_ms))}
-            ]
-        payload["playback"] = session.playback_for_response(target_id).as_dict()
-        sample_rate_hz = model_result.get("sample_rate_hz") or model_result.get("audio_sample_rate_hz")
-        if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
-            payload["sample_rate_hz"] = int(sample_rate_hz)
-        self._attach_runtime_metadata(
-            payload,
-            model_result,
-            stage_metrics=response_stage_metrics,
-            response_request_metrics=response_request_metrics,
-        )
-        if not session.capabilities.emits_audio:
-            # The data plane supplies text and native turn boundaries. Reuse
-            # the existing text projector without synthesizing audio events.
+        if not emits_audio:
             if has_text:
                 self._out.emit(
                     {
@@ -1650,6 +1616,39 @@ class ModelChannel:
                     }
                 )
         else:
+            payload = {
+                "type": "response.output_audio.delta",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "text": text if isinstance(text, str) else "",
+                "audio": audio if isinstance(audio, str) else "",
+                "format": (
+                    model_result.get("audio_format")
+                    if isinstance(model_result.get("audio_format"), str)
+                    else session.response_config.response_format
+                ),
+                "end_of_turn": end_of_turn,
+                "model_speak": True,
+            }
+            if mark_duration_ms is not None:
+                payload["audio_duration_ms"] = mark_duration_ms
+            if audio_text_marks:
+                payload["audio_text_marks"] = audio_text_marks
+            elif mark_duration_ms is not None and mark_text_chars is not None:
+                payload["audio_text_marks"] = [
+                    {"text_chars": max(0, int(mark_text_chars)), "audio_end_ms": max(0, int(mark_duration_ms))}
+                ]
+            payload["playback"] = session.playback_for_response(target_id).as_dict()
+            sample_rate_hz = model_result.get("sample_rate_hz") or model_result.get("audio_sample_rate_hz")
+            if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
+                payload["sample_rate_hz"] = int(sample_rate_hz)
+            self._attach_runtime_metadata(
+                payload,
+                model_result,
+                stage_metrics=response_stage_metrics,
+                response_request_metrics=response_request_metrics,
+            )
             self._out.emit(payload)
         if session.perf is not None and mark_duration_ms is not None and isinstance(response_id, str):
             session.perf.record_audio(response_id=response_id, duration_ms=mark_duration_ms - previous_sent_ms)

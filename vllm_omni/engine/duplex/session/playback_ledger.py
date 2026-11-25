@@ -75,7 +75,9 @@ def apply_playback_ack(
         if (
             event.get("truncate") is not True
             and not session.history_item_has_audio(item_id)
-            and (response_id != session.active_response_id or "audio" not in (session.response_config.modalities or ()))
+            and (
+                response_id != session.active_response_id or "audio" not in session.response_config.resolved_modalities
+            )
         ):
             return [error_event("unsupported_operation", "Text-only items do not support playback acknowledgements")]
         history_is_late = session.playback_ack_is_too_late(response_id, item_id)

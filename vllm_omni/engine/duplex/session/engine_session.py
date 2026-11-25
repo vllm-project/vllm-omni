@@ -2202,7 +2202,7 @@ class DuplexEngineSession:
             "active_response_id": self.active_response_id,
             "active_response_turn_id": self.active_response_turn_id,
             "model": self.config.model,
-            "modalities": list(self.config.modalities or ()),
+            "modalities": list(self.config.resolved_modalities),
             "instructions": self.config.instructions,
             "voice": self.config.voice,
             "response_format": self.config.response_format,
