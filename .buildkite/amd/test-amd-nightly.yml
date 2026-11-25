@@ -1551,6 +1551,24 @@ steps:
 
   - group: ":full_moon: Diffusion Collective Parity MI300 Nightly"
     steps:
+      - label: "FLUX TP2 and MOSS-Image SP2 Parity"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 45
+        source_file_dependencies: [diffusion_flux_mossimage_parallel, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-flux-mossimage-parallel/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 3 30m rocm-flux-mossimage-parallel
+            "tests/diffusion/distributed/test_merged_row_parallel_tp2.py::test_flux_merged_row_tp2_parity_device[2-flux1]"
+            "tests/diffusion/distributed/test_merged_row_parallel_tp2.py::test_flux_merged_row_tp2_parity_device[2-flux2]"
+            tests/diffusion/distributed/test_mossimage_sp.py::test_mossimage_sp_matches_single_gpu_with_odd_joint_length
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
+
       - label: "Wan VAE Spatial-Shard Decode Parity"
         agent_pool: mi300_2
         depends_on: amd-build
