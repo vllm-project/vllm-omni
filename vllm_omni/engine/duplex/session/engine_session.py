@@ -687,12 +687,14 @@ class DuplexEngineSession:
 
         placeholder = self._conversation.history_item_placeholders.pop(item_id, None)
         if placeholder is not None:
-            for index, candidate in enumerate(self._conversation.messages):
-                if candidate is placeholder:
-                    self._conversation.messages[index] = message
+            messages = self._conversation.messages
+            # A response reserves its slot when it opens, so search from the newest message.
+            for index in range(len(messages) - 1, -1, -1):
+                if messages[index] is placeholder:
+                    messages[index] = message
                     break
             else:
-                self._conversation.messages.append(message)
+                messages.append(message)
         elif not any(candidate is message for candidate in self._conversation.messages):
             self._conversation.messages.append(message)
         self._conversation.item_ids[item_id] = message
