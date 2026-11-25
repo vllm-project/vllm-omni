@@ -231,7 +231,7 @@ def test_flashinfer_backend_routes_qkv_and_reverse(monkeypatch, with_gate):
     query, key, value, gate = (torch.randn(1, 3, 4, 16) for _ in range(4))
 
     def qkv(name):
-        def exchange(q, k, v, group_name, world_size):
+        def exchange(q, k, v, group_name, world_size, zero_copy=False):
             assert (group_name, world_size) == ("ulysses", 2)
             calls.append(name)
             return tuple(t[:, :, :2].repeat(1, 2, 1, 1) for t in (q, k, v))
@@ -258,7 +258,8 @@ def test_flashinfer_backend_routes_qkv_and_reverse(monkeypatch, with_gate):
     q, k, v, metadata, context = strategy.pre_attention(query, key, value, metadata)
     assert q.shape == k.shape == v.shape == (1, 6, 2, 16)
     assert strategy.post_attention(q, context).shape == (1, 3, 4, 16)
-    qkv_calls = ["ce_qkv", "ce_gate"] if with_gate else ["fi_qkv"]
+    # The gate is exchanged first on the copy engines (it is copied out); Q/K/V follow as workspace views.
+    qkv_calls = ["ce_gate", "ce_qkv"] if with_gate else ["fi_qkv"]
     assert calls == ["ce_init", "fi_init", *qkv_calls, "fi_reverse"]
 
 
