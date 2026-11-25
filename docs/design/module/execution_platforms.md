@@ -71,13 +71,6 @@ from the common or upstream implementation.
 Validate common import paths without the target accelerator and run focused
 tests in a fresh `uv` environment on every affected device platform.
 
-## MiniMax H3 DiT modulation on Ascend
-
-The indexed modulation layer routes eligible BF16 inputs on Ascend 910 and 950
-to the NPU platform's MindIE-SD adapter, with Omni Triton as its fallback. With
-Triton-Ascend 3.6, install a MindIE-SD build containing
-[!917](https://gitcode.com/Ascend/MindIE-SD/pull/917).
-
 ## MiniMax H3 image NPU adapter
 
 The NPU model-patch hook defaults the image pipeline to single-tile VAE decoder
