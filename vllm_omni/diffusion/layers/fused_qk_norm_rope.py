@@ -1256,8 +1256,9 @@ def fused_qkv_split_norm_rope(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split projected QKV, normalize/rotate Q and K, and retain their raw views for VDN."""
+    return_raw_qk: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Split projected QKV, normalize/rotate Q and K, and optionally return their raw views."""
     packed = qkv.unflatten(-1, (-1, head_dim))
     head_counts = [num_heads, num_kv_heads, num_kv_heads]
     if current_omni_platform.is_npu():
@@ -1280,7 +1281,10 @@ def fused_qkv_split_norm_rope(
                 epsilon=eps,
                 output_bnsd=False,
             )
-            return q, k, v, packed[:, :num_heads], packed[:, num_heads : num_heads + num_kv_heads]
+            if return_raw_qk:
+                q_raw, k_raw, _ = packed.split(head_counts, dim=1)
+                return q, k, v, q_raw, k_raw
+            return q, k, v, None, None
 
     q_raw, k_raw, v = packed.split(head_counts, dim=1)
     q, k = fused_qk_norm_rope(q_raw, k_raw, q_weight, k_weight, rope_table, eps)

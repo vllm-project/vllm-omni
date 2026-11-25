@@ -96,26 +96,39 @@ def test_denoise_branch_keeps_fast_h3_prefix_geometry_model_local():
     assert branch.static_kwargs["packed_seq_params"]["vsa_prefix_segments"] == (2, 3)
 
 
-def test_h3_project_qkv_without_rope_uses_separate_norms():
+@pytest.mark.parametrize("has_vdn", [False, True])
+@pytest.mark.parametrize("has_rope", [False, True])
+def test_h3_project_qkv_retains_raw_qk_for_vdn(has_vdn, has_rope):
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
 
     attention = object.__new__(blocks.MiniMaxH3Attention)
     nn.Module.__init__(attention)
     attention.num_heads, attention.num_kv_heads, attention.head_dim = 2, 1, 2
-    attention.vdn = None
+    attention.vdn = nn.Identity() if has_vdn else None
     packed = torch.arange(24, dtype=torch.float32).reshape(3, 8)
     attention.qkv_proj = Mock(return_value=(packed, None))
     attention.q_norm = Mock(side_effect=torch.neg)
     attention.k_norm = Mock(side_effect=torch.square)
 
+    rope_table = torch.ones(3, 2) if has_rope else None
     with patch.object(blocks, "fused_qkv_split_norm_rope") as fused:
-        result = attention._project_qkv(torch.ones(3, 4), rope_table=None)
+        result = attention._project_qkv(torch.ones(3, 4), rope_table, vdn_window=object())
+
+    if has_rope:
+        fused.assert_called_once()
+        assert fused.call_args.kwargs["return_raw_qk"] is has_vdn
+        return
 
     fused.assert_not_called()
     attention.q_norm.assert_called_once()
     attention.k_norm.assert_called_once()
-    q_raw, k_raw, v = packed.view(3, 4, 2).split([2, 1, 1], dim=1)
-    torch.testing.assert_close(result, (-q_raw, k_raw.square(), v, q_raw, k_raw))
+    q, k, v, q_raw, k_raw = result
+    expected_q, expected_k, expected_v = packed.view(3, 4, 2).split([2, 1, 1], dim=1)
+    torch.testing.assert_close((q, k, v), (-expected_q, expected_k.square(), expected_v))
+    if has_vdn:
+        torch.testing.assert_close((q_raw, k_raw), (expected_q, expected_k), check_stride=True)
+        assert q_raw.data_ptr() == expected_q.data_ptr()
+        assert k_raw.data_ptr() == expected_k.data_ptr()
 
 
 def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
