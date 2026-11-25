@@ -21,8 +21,6 @@ from __future__ import annotations
 
 import math
 from contextlib import nullcontext
-from contextvars import ContextVar
-from dataclasses import dataclass
 from itertools import chain
 from types import MethodType
 from typing import Any, cast
@@ -36,25 +34,11 @@ from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_utils import _persistent_input_buffer
+from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_context import _SPATIAL_SHARD_CONTEXT, SpatialShardContext
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.families import is_role
 from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
 
 logger = init_logger(__name__)
-
-
-@dataclass(frozen=True)
-class SpatialShardContext:
-    input_extent: int
-    local_input_extent: int
-    split_dim: str
-    rank: int
-    world_size: int
-
-
-_SPATIAL_SHARD_CONTEXT: ContextVar[SpatialShardContext | None] = ContextVar(
-    "wan_vae_spatial_shard_context",
-    default=None,
-)
 
 
 def _spatial_dim(split_dim: str) -> int:

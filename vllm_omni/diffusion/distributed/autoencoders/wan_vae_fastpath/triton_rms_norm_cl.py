@@ -34,6 +34,7 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
+from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_context import in_multi_gpu_spatial_decode
 from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
 
 from ._utils import on_kernel_device
@@ -101,6 +102,8 @@ if HAS_TRITON:
         v = _normalize_channels_last(x, gamma, scale, eps, dtype, SILU, EXACT_BF16)
         tl.store(OUT + offsets, v, mask=mask)
 
+    _spatial_rms_norm_cl_kernel = triton.jit(_rms_norm_cl_kernel.fn, do_not_specialize=["rows"])
+
 
 def _rows_view(x: torch.Tensor) -> torch.Tensor | None:
     """``(positions, C)`` view of a channels-last tensor, or ``None`` if it is not one."""
@@ -160,7 +163,8 @@ def rms_norm_channels_last(
     grid = (triton.cdiv(rows, block_p),)
 
     with torch.get_device_module().device(x.device):
-        _rms_norm_cl_kernel[grid](
+        kernel = _spatial_rms_norm_cl_kernel if in_multi_gpu_spatial_decode() else _rms_norm_cl_kernel
+        kernel[grid](
             x_rows,
             gamma.reshape(-1).contiguous(),
             x_rows if bias is None else bias.contiguous(),

@@ -28,7 +28,9 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-from ._utils import _pick_block_width, on_kernel_device, suggests_channels_last
+from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_context import in_multi_gpu_spatial_decode
+
+from ._utils import ROW_TILE_WIDTH, _pick_block_width, on_kernel_device, suggests_channels_last
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # Input elements loaded per program iteration; each is stored four times, so a
@@ -80,6 +82,19 @@ if HAS_TRITON:
             out_offsets = out_row_offsets[:, None] + out_cols[None, :]
             tl.store(out_ptr + out_offsets, doubled, mask=out_mask)
             tl.store(out_ptr + (out_offsets + out_width), doubled, mask=out_mask)
+
+    _spatial_upsample2x_rows_kernel = triton.jit(
+        _upsample2x_rows_kernel.fn,
+        do_not_specialize=[
+            "rows",
+            "height",
+            "width",
+            "out_width",
+            "stride_x_height",
+            "stride_x_channel",
+            "stride_x_batch",
+        ],
+    )
 
     @triton.jit(
         do_not_specialize=[
@@ -218,11 +233,13 @@ def upsample_nearest_2x(x: torch.Tensor) -> torch.Tensor | None:
     if not channels_last and x.stride(3) == 1 and x.stride(2) == width:
         out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
         rows = batch * channels * height
-        block_w = _pick_block_width(width)
+        spatial = in_multi_gpu_spatial_decode()
+        block_w = ROW_TILE_WIDTH if spatial else _pick_block_width(width)
         rows_per_program = max(1, _TILE_ELEMENTS // block_w)
         grid = (triton.cdiv(rows, rows_per_program),)
         with torch.get_device_module().device(x.device):
-            _upsample2x_rows_kernel[grid](
+            kernel = _spatial_upsample2x_rows_kernel if spatial else _upsample2x_rows_kernel
+            kernel[grid](
                 x,
                 out,
                 rows,

@@ -437,24 +437,103 @@ def test_padded_upsample_reuses_kernel_across_resolutions(monkeypatch):
     assert len(kernels) == 3 and kernels[0] is not None and all(k is kernels[0] for k in kernels)
 
 
-@pytest.mark.parametrize("channels_last", [False, True], ids=["lossless", "channels_last"])
+@pytest.fixture
+def spatial_kernel_context():
+    from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_context import (
+        _SPATIAL_SHARD_CONTEXT,
+        SpatialShardContext,
+    )
+
+    token = _SPATIAL_SHARD_CONTEXT.set(SpatialShardContext(32, 16, "width", dist.get_rank(), 2))
+    try:
+        yield
+    finally:
+        _SPATIAL_SHARD_CONTEXT.reset(token)
+
+
+@pytest.mark.parametrize("world_size", [None, 1])
 @torch.inference_mode()
-def test_kernels_reuse_binary_across_shard_heights(mocker, channels_last):
+def test_unsharded_decode_uses_original_row_kernel(mocker, world_size):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_context import (
+        _SPATIAL_SHARD_CONTEXT,
+        SpatialShardContext,
+    )
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_upsample as up
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath._utils import _pick_block_width
+
+    original = mocker.spy(up._upsample2x_rows_kernel, "run")
+    spatial = mocker.spy(up._spatial_upsample2x_rows_kernel, "run")
+    context = SpatialShardContext(128, 128, "width", 0, world_size) if world_size else None
+    token = _SPATIAL_SHARD_CONTEXT.set(context)
+    try:
+        x = torch.randn(1, 32, 8, 128, device="cuda", dtype=torch.bfloat16)
+        assert up.upsample_nearest_2x(x) is not None
+    finally:
+        _SPATIAL_SHARD_CONTEXT.reset(token)
+    original.assert_called_once()
+    assert original.call_args.kwargs["BLOCK_W"] == _pick_block_width(128)
+    spatial.assert_not_called()
+
+
+@torch.inference_mode()
+def test_row_upsample_reuses_kernel_across_tile_and_alignment_boundaries(mocker, spatial_kernel_context):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_upsample as up
+
+    run = mocker.spy(up._spatial_upsample2x_rows_kernel, "run")
+    kernels = []
+    for height, width in ((15, 62), (16, 65)):
+        x = torch.randn(1, 32, height, width, device="cuda", dtype=torch.bfloat16)
+        actual = up.upsample_nearest_2x(x)
+        assert torch.equal(actual, x.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3))
+        kernels.append(run.spy_return)
+    assert run.call_count == 2 and kernels[0] is not None and kernels[0] is kernels[1]
+
+
+@pytest.mark.parametrize("channels_last", [False, True], ids=["lossless", "channels_last"])
+@pytest.mark.parametrize(
+    "shapes",
+    [((16, 32), (17, 32)), ((16, 46), (16, 47)), ((90, 160), (90, 168)), ((49, 62), (49, 65))],
+    ids=["height", "padded-width-alignment", "latent-width", "tile-boundary"],
+)
+@torch.inference_mode()
+def test_kernels_reuse_binary_across_shard_shapes(mocker, channels_last, shapes, spatial_kernel_context):
     from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_data_movement as dm
 
-    cat_pad = mocker.spy(dm._cat_pad_pixels_kernel if channels_last else dm._cat_pad_rows_kernel, "run")
-    residual = mocker.spy(dm._dup_up3d_add_pixels_kernel if channels_last else dm._dup_up3d_add_rows_kernel, "run")
-    for height in (16, 17):
-        x = torch.randn(1, 32, 2, height, 32, device="cuda", dtype=torch.bfloat16)
+    cat_pad = mocker.spy(dm._spatial_cat_pad_pixels_kernel if channels_last else dm._spatial_cat_pad_rows_kernel, "run")
+    residual = mocker.spy(
+        dm._spatial_dup_up3d_add_pixels_kernel if channels_last else dm._spatial_dup_up3d_add_rows_kernel, "run"
+    )
+    kernels = []
+    for height, width in shapes:
+        x = torch.randn(1, 32, 2, height, width, device="cuda", dtype=torch.bfloat16)
         if channels_last:
             x = x.contiguous(memory_format=torch.channels_last_3d)
         assert dm.cat_pad_5d(x, None, (1, 1, 1, 1, 0, 0)) is not None
         assert dm.dup_up3d_add(x, x, 1, 1, 1, False) is not None
-        if height == 16:
-            first_cat_pad, first_residual = cat_pad.spy_return, residual.spy_return
+        kernels.append((cat_pad.spy_return, residual.spy_return))
     assert cat_pad.call_count == residual.call_count == 2
-    assert first_cat_pad is not None and cat_pad.spy_return is first_cat_pad
-    assert first_residual is not None and residual.spy_return is first_residual
+    first, second = kernels
+    assert first[0] is not None and first[0] is second[0]
+    assert first[1] is not None and first[1] is second[1]
+
+
+@torch.inference_mode()
+def test_channels_last_residual_reuses_kernel_with_and_without_deferred_bias(mocker, spatial_kernel_context):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_data_movement as dm
+
+    run = mocker.spy(dm._spatial_dup_up3d_add_pixels_kernel, "run")
+    main = torch.randn(1, 32, 2, 8, 9, device="cuda", dtype=torch.bfloat16).contiguous(
+        memory_format=torch.channels_last_3d
+    )
+    source = torch.randn_like(main)
+    bias = torch.randn(32, device=main.device, dtype=main.dtype)
+    kernels = []
+    for main_bias in (bias, None):
+        actual = dm.dup_up3d_add(main, source, 1, 1, 1, False, main_bias)
+        expected = main if main_bias is None else main + main_bias.view(1, -1, 1, 1, 1)
+        assert torch.equal(actual, expected + source)
+        kernels.append(run.spy_return)
+    assert run.call_count == 2 and kernels[0] is not None and kernels[0] is kernels[1]
 
 
 @torch.inference_mode()

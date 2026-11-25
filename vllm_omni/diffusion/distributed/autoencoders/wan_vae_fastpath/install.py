@@ -238,7 +238,7 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
     # Forward hooks need no check here: every inlined call site checks them at
     # runtime and then calls the module normally.
 
-    return _install_bindings(vae, decoder, bindings, convs, level=level, family=family)
+    return _install_bindings(vae, decoder, bindings, convs, level=level, family=family, spatial_shard=spatial)
 
 
 def _install_bindings(
@@ -251,6 +251,7 @@ def _install_bindings(
     family: fam.WanVaeFamily = fam.WAN,
     encoder: bool = False,
     clone_encoder_shortcuts: bool = False,
+    spatial_shard: bool = False,
 ) -> WanVaeFastPathReport:
     """Commit one component independently, with allocation-free installation rollback."""
     report_attr = ENCODER_REPORT_ATTR if encoder else REPORT_ATTR
@@ -260,7 +261,9 @@ def _install_bindings(
     fused_silu_dtypes: frozenset[torch.dtype] = frozenset()
     if device.type in KERNEL_DEVICE_TYPES:
         fused_silu_dtypes = frozenset(
-            dtype for dtype in (torch.bfloat16, torch.float16) if rn.silu_epilogue_is_exact(device, dtype)
+            dtype
+            for dtype in (torch.bfloat16, torch.float16)
+            if rn.silu_epilogue_is_exact(device, dtype, spatial_shard=spatial_shard)
         )
     cfg = forwards.FastPathConfig(
         fused_silu_dtypes=fused_silu_dtypes,
