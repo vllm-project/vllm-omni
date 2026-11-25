@@ -335,6 +335,16 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
         "platforms": {
+            "cuda": {
+                # Keep 16K context, but bound the profiled prefill activation
+                # peak to leave KV headroom on L4, especially when the
+                # Talker shares a card with Code2Wav (#10981). Chunk prefills
+                # without shortening the supported request or output length.
+                "stages": [
+                    {"stage_id": 0, "max_num_batched_tokens": 2048},
+                    {"stage_id": 1, "max_num_batched_tokens": 2048},
+                ],
+            },
             "rocm": {
                 # ROCm documentation examples request two cards. Share the
                 # Talker's card with Code2Wav and reserve its DiT workspace.
