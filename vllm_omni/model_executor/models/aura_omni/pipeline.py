@@ -112,6 +112,7 @@ AURA_OMNI_PIPELINE = PipelineConfig(
 _ASR, _AURA, _TALKER, _CODE2WAV = AURA_OMNI_PIPELINE.stages
 
 AURA_OMNI_JUDGED_PIPELINE = PipelineConfig(
+    serving_capabilities=AURA_OMNI_PIPELINE.serving_capabilities,
     model_type="aura_omni_judged",
     default_deploy_config_name="aura_omni_judged.yaml",
     model_arch="Qwen3ASRForConditionalGeneration",

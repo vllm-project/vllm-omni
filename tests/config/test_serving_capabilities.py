@@ -120,6 +120,26 @@ def test_phonon_declaration_preserves_speech_without_assuming_chat_prompts():
         assert declaration.get(operation).support == "unsupported"
 
 
+@pytest.mark.parametrize("model_type", ["chatterbox", "chatterbox_turbo"])
+def test_chatterbox_variants_share_speech_without_assuming_chat_prompts(model_type):
+    declaration = resolve_pipeline_config(model_type).serving_capabilities
+    assert declaration is resolve_pipeline_config("chatterbox_turbo").serving_capabilities
+    assert _profile(declaration, "speech", "text_to_speech").support == "supported"
+    audio = _profile(declaration, "chat", "audio_response")
+    assert audio.support == "unknown"
+    assert audio.reason_code == "chat_prompt_contract_undeclared"
+    assert _profile(declaration, "chat", "text_response").support == "unsupported"
+    for operation in ("image_generation", "image_edit", "video_generation", "audio_generation"):
+        assert declaration.get(operation).support == "unsupported"
+
+
+def test_aura_judged_reuses_the_existing_output_contract():
+    declaration = resolve_pipeline_config("aura_omni_judged").serving_capabilities
+    assert declaration is resolve_pipeline_config("aura_omni").serving_capabilities
+    assert _profile(declaration, "chat", "text_response").support == "supported"
+    assert _profile(declaration, "chat", "audio_response").support == "supported"
+
+
 def test_multiview_declaration_does_not_inherit_standard_video_profiles():
     declaration = get_diffusion_model_metadata("Cosmos3MultiviewPipeline").serving_capabilities
     video = declaration.get("video_generation")
