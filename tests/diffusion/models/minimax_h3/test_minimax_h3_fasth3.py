@@ -11,6 +11,7 @@ import torch
 from safetensors.torch import save_file
 
 from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec, OmniDiffusionConfig
+from vllm_omni.diffusion.model_loader.host_weight_plan import build_checkpoint_mmap_plan
 from vllm_omni.diffusion.models.minimax_h3.fasth3 import (
     FASTH3_BASE_MODEL,
     FASTH3_BASE_SCHEDULE,
@@ -620,7 +621,19 @@ def test_only_a_configured_adapter_path_is_read(tmp_path):
 
 
 def test_a_pipeline_that_fused_its_adapter_needs_no_lora_manager(tmp_path):
-    assert _pipeline_stub(_fusion(tmp_path)).lora_is_fused is True
+    fused = _pipeline_stub(_fusion(tmp_path))
+    assert fused.lora_is_fused is True
+    result = build_checkpoint_mmap_plan(
+        fused,
+        dit_modules=(),
+        sources=(),
+        model_path="unused",
+        tensor_parallel_size=1,
+        use_hsdp=False,
+        online_quantization=False,
+    )
+    assert result.plan is None
+    assert result.fallback_reason == "load-time weight fusion requires the ordinary loader"
     assert _pipeline_stub().lora_is_fused is False
 
 

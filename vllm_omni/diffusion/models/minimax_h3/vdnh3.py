@@ -51,7 +51,7 @@ from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
-from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
+from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, OffloadStrategy, resolve_offload
 from vllm_omni.errors import OmniClientError
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.repo_utils import hf_api
@@ -300,7 +300,15 @@ class VDNCheckpoint:
         parallel = od_config.parallel_config
         if any(int(getattr(parallel, key, 1) or 1) != 1 for key in ("ulysses_degree", "ring_degree")):
             raise ValueError("VDN-H3 does not support sequence parallelism; use --tensor-parallel-size")
-        if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+        resolved_offload = resolve_offload(od_config)
+        if resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE and resolved_offload.offloads(
+            DIT_COMPONENT
+        ):
+            if resolved_offload.uses_allgather(DIT_COMPONENT):
+                raise ValueError(
+                    "VDN-H3 supports only rank-local DLO; set --dlo-no-use-allgather or "
+                    "layer_options.dit.weight_transfer='rank-local'"
+                )
             # DLO may stream the fused tensors, but the loader must materialize
             # them through load_weights() first. The host-weight planner rejects
             # a direct-mmap plan for load-time fusion (``lora_is_fused``).

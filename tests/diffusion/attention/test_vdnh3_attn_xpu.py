@@ -3,10 +3,11 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNAttentionImpl, VDNLayout
+from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNAttentionImpl, VDNLayout, windowed_attention
 from vllm_omni.diffusion.models.minimax_h3.vdnh3 import _delta_factors
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -15,21 +16,28 @@ if not hasattr(torch, "xpu") or not torch.xpu.is_available():
     pytest.skip("XPU is unavailable", allow_module_level=True)
 
 
-@hardware_test(res={"xpu": "B70"}, num_cards=1)
-def test_vdn_forward_xpu_window_is_finite():
+def _sdpa(q, k, v):
+    return F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
+
+
+@hardware_test(res={"xpu": "B60"}, num_cards=1)
+def test_vdn_forward_xpu_window_matches_cpu():
+    torch.manual_seed(0)
     window = VDNLayout(
         used=44, text_len=4, video_start=4, num_frames=5, frame_height=2, frame_width=4, chunk=0, radius=1
     )
     impl = VDNAttentionImpl(num_heads=2, head_size=128, softmax_scale=128**-0.5)
-    q = torch.randn(1, 44, 2, 128, dtype=torch.bfloat16, device="xpu")
-    out = impl.forward_xpu(q, q, q, AttentionMetadata(extra={"vdn_window": window}))
+    q = torch.randn(1, 44, 2, 128, dtype=torch.bfloat16)
+    q_xpu = q.to("xpu")
+    out = impl.forward_xpu(q_xpu, q_xpu, q_xpu, AttentionMetadata(extra={"vdn_window": window}))
     torch.xpu.synchronize()
     assert out.shape == q.shape
     assert out.dtype == q.dtype
-    assert torch.isfinite(out).all()
+    ref = windowed_attention(q, q, q, window, _sdpa)
+    torch.testing.assert_close(out.float().cpu(), ref.float(), rtol=2e-2, atol=2e-2)
 
 
-@hardware_test(res={"xpu": "B70"}, num_cards=1)
+@hardware_test(res={"xpu": "B60"}, num_cards=1)
 def test_vdn_delta_factors_xpu_matches_cpu():
     torch.manual_seed(7)
     a = torch.randn(8, 4, 128, 128, dtype=torch.float32)

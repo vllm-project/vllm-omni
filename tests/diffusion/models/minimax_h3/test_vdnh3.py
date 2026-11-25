@@ -204,6 +204,19 @@ def test_vdn_checkpoint_allows_dlo_with_the_fused_loader(tmp_path):
     ckpt.check_serving_contract(partition="fl2va", od_config=od_config)
 
 
+def test_vdn_checkpoint_rejects_dlo_allgather(tmp_path):
+    _write_artifact(tmp_path)
+    ckpt = VDNCheckpoint.from_path(tmp_path, head_dim=4)
+    od_config = OmniDiffusionConfig(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="VDNH3_ATTN")),
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=True,
+    )
+
+    with pytest.raises(ValueError, match="rank-local DLO"):
+        ckpt.check_serving_contract(partition="fl2va", od_config=od_config)
+
+
 def test_vdn_checkpoint_detection(tmp_path):
     assert VDNCheckpoint.from_path(tmp_path, head_dim=4) is None
     _write_artifact(tmp_path / "unsupported", delta_rule="other")
