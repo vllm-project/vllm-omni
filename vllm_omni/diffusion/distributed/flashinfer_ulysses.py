@@ -4,8 +4,9 @@
 
 Selected with ``ulysses_a2a_backend="flashinfer"`` (on top of ``ulysses_a2a_permute``). On NVLink nodes FlashInfer
 runs one-sided kernels; outputs registered with ``allocate_output()`` take its direct route, where every rank writes
-its blocks straight into the peers' outputs. Those outputs belong to the communicator and are reused by every call,
-so a returned tensor stays valid until the next exchange of the same kind on the group.
+its blocks straight into the peers' outputs. Those outputs belong to the communicator and are reused by every call:
+Q/K/V are returned as those outputs because attention consumes them inside the Ulysses strategy, while the attention
+output, which goes back to model code, is copied out.
 """
 
 from __future__ import annotations
@@ -78,14 +79,17 @@ def _(query, key, value, group_name, world_size):
 
 
 @torch.library.custom_op("vllm_omni_a2a::ulysses_fi_o", mutates_args=(), device_types="cuda")
-def ulysses_fi_o(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
+def ulysses_fi_o(y: torch.Tensor, group_name: str, world_size: int, copy_out: bool = True) -> torch.Tensor:
     """(B, S, H/P, D) -> (B, S/P, H, D)."""
     y = y.contiguous()
     comm = _communicator(group_name, y.numel() * y.element_size(), y.dtype)
-    return comm.gather_heads(y, out=_output(comm, group_name, y, "gather_heads", 0))
+    out = comm.gather_heads(y, out=_output(comm, group_name, y, "gather_heads", 0))
+    # The output goes back to model code, so by default it gets its own storage instead of the reused
+    # communicator buffer.
+    return out.clone() if copy_out else out
 
 
 @ulysses_fi_o.register_fake
-def _(y, group_name, world_size):
+def _(y, group_name, world_size, copy_out=True):
     b, s, h, d = y.shape
     return y.new_empty(b, s // world_size, h * world_size, d)

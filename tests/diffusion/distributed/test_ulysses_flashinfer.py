@@ -61,7 +61,14 @@ def _worker(rank, init_method, world_size=2):
                     arbitrary_output = torch.randn_like(q)
                     result = strategy.post_attention(arbitrary_output, ctx)
                     torch.testing.assert_close(result, _reference(arbitrary_output, 1, pg), rtol=0, atol=0)
-                    checks += 4
+                    # The output goes back to model code: it must not alias the reused communicator buffer.
+                    buffers = [t for key, t in flashinfer_ulysses._OUTPUTS.items() if key[1] == "gather_heads"]
+                    assert buffers
+                    assert all(result.untyped_storage().data_ptr() != t.untyped_storage().data_ptr() for t in buffers)
+                    expected = result.clone()
+                    strategy.post_attention(torch.randn_like(q), ctx)
+                    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                    checks += 5
             # gate_compress keeps Q/K/V on the copy engines; the output still returns over FlashInfer.
             gate = x + 3
             q, k, _, metadata, ctx = strategy.pre_attention(

@@ -817,10 +817,12 @@ class UlyssesParallelAttention:
             if ctx.a2a_transport == FLASHINFER:
                 from vllm_omni.diffusion.distributed.flashinfer_ulysses import ulysses_fi_o
 
-                output = ulysses_fi_o(attn_output, ctx.ulysses_pg.group_name, dist.get_world_size(ctx.ulysses_pg))
-                if not self._output_views:
-                    # The output goes back to model code; FlashInfer reuses this buffer on the next gather.
-                    output = output.clone()
+                output = ulysses_fi_o(
+                    attn_output,
+                    ctx.ulysses_pg.group_name,
+                    dist.get_world_size(ctx.ulysses_pg),
+                    not self._output_views,
+                )
             else:
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
 

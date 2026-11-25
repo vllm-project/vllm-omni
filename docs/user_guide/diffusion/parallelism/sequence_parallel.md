@@ -268,6 +268,37 @@ GPUs on one NVLink-connected node; `copy_engine_overlap` also needs strict pure 
 On NPU, the flag retains the existing
 [NPU symmetric-memory requirements](../../../design/feature/sequence_parallel.md#npu-symmetric-memory-ulysses).
 
+### FlashInfer transport
+
+`ulysses_a2a_backend="flashinfer"` (CLI: `--ulysses-a2a-backend flashinfer`) moves the strict Ulysses
+Q/K/V scatter and output gather onto FlashInfer's `UlyssesCommunicator` instead of the copy engines.
+It needs everything the copy-engine path needs, plus a FlashInfer build that provides
+`flashinfer.comm.UlyssesCommunicator`. With the default `auto`, it is selected where the tables say it
+is fastest (8 B200 GPUs); set it explicitly only to force it.
+
+```bash
+vllm serve MiniMaxAI/MiniMax-H3 --omni --ulysses-degree 8 \
+  --ulysses-a2a-backend flashinfer
+```
+
+```python
+parallel_config=DiffusionParallelConfig(
+    ulysses_degree=8,
+    ulysses_a2a_backend="flashinfer",
+)
+```
+
+When to use it: on MiniMax-H3 with B200 it is the fastest transport at 8 GPUs, where each GPU's
+exchange is small and the copy-engine path is dominated by per-copy overhead. At 2 and 4 GPUs it is
+about as fast as the copy-engine path. Outputs are bit-identical to the copy-engine and NCCL paths,
+and the attention output returned to the model is an ordinary tensor (it is copied out of the
+communicator's buffer). FlashInfer's communicator buffers use up to ~0.8 GB of extra memory per GPU;
+communicators are created on first use for each Ulysses group and kept for the life of the process.
+
+Common errors:
+
+- `ulysses_a2a_backend='flashinfer' requires flashinfer with UlyssesCommunicator`: upgrade FlashInfer.
+
 ## Best Practices
 
 ### When to Use
