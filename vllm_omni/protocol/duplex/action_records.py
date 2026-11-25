@@ -65,7 +65,7 @@ class DuplexActionStream:
 
 @dataclass(frozen=True, slots=True)
 class DuplexAction:
-    """One action token with its exact-distribution log-probability and kind."""
+    """One action token with its pre-truncation joint log-probability and kind."""
 
     token_id: int
     logprob: float | None
@@ -301,7 +301,7 @@ def build_unit_payload(
             record, so a unit's decode steps (and the terminator restated at
             the next unit's open under ``reemit``) become that record's actions.
         token_ids / logprobs / action_kinds: Parallel columns; ``logprobs[i]``
-            is the exact-distribution logprob of ``token_ids[i]``, ``None``
+            is the pre-truncation joint logprob of ``token_ids[i]``, ``None``
             only for draws that did not happen (``reemit``).
         reason_codes / stream_names / streams: Per-token reasons and stream
             labels (padded to the token count when omitted).

@@ -162,7 +162,7 @@ class DuplexCapabilities:
     #: a plugin; see :func:`apply_session_stats_capability`.
     supports_session_stats: bool = False
     #: Plugin-declared: the sampler can emit per-action records with
-    #: exact-distribution logprobs (compose via :func:`apply_action_capture_capability`).
+    #: pre-truncation joint logprobs (compose via :func:`apply_action_capture_capability`).
     supports_action_capture: bool = False
 
     def as_dict(self) -> dict[str, object]:
@@ -423,7 +423,7 @@ class DuplexSessionConfig:
     response_format: str = "wav"
     temperature: float | None = None
     max_tokens: int | None = None
-    #: Record per-unit policy actions with exact-distribution logprobs;
+    #: Record per-step policy payloads with pre-truncation joint logprobs;
     #: set when the session opens and immutable afterwards.
     action_capture: bool = False
     #: Seeds the per-request generators; the derived effective seed rides each record.
