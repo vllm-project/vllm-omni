@@ -79,7 +79,10 @@ stages:
       repetition_penalty: 1.0
 
   - stage_id: 1
-    model_runner: v1
+    # Model Runner V2 since vLLM 0.34 removed the V1 runner this stage was
+    # pinned to; the DAC codec stage runs on V2 (validated end-to-end:
+    # voice-clone request generates audio with this config change).
+    model_runner: v2
     max_num_seqs: 128
     gpu_memory_utilization: 0.1
     # The codec decode replays its own CUDA graphs per (batch, frames) bucket.
