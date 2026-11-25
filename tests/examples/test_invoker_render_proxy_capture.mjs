@@ -8,7 +8,7 @@ import {ProxyCapture} from "../../examples/online_serving/invoker_render_game/pr
 
 const profile = {width: 2, height: 1, fps: 24, packet_frames: 17, tail_frames: 5, credit_frames: 56};
 
-test("首窗之前发送两个常规包，结束时保留五个真实采样", () => {
+test("sends two regular packets before the first window and five real samples at EOS", () => {
   const capture = new ProxyCapture(profile);
   const packets = [];
   capture.finish();
@@ -23,7 +23,7 @@ test("首窗之前发送两个常规包，结束时保留五个真实采样", ()
   assert.equal(capture.canCapture, false);
 });
 
-test("待播放帧达到上限时暂停，显示进度推进后继续", () => {
+test("pauses when awaiting playback reaches the credit limit and resumes as playback advances", () => {
   const capture = new ProxyCapture(profile);
   for (let index = 0; index < 56; index++) capture.capture(new Uint8Array(6), index);
   assert.equal(capture.sent, 51);
@@ -33,5 +33,5 @@ test("待播放帧达到上限时暂停，显示进度推进后继续", () => {
   capture.played(25 / 24);
   assert.equal(capture.displayed, 26);
   assert.equal(capture.canCapture, true);
-  assert.throws(() => capture.acknowledge({accepted_frames: 10, credit_frames: 56}), /输入额度无效/);
+  assert.throws(() => capture.acknowledge({accepted_frames: 10, credit_frames: 56}), /Invalid input credit/);
 });

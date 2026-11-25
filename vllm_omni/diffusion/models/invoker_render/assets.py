@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 PROTOCOL = "cwm_causal/v1"
 BUNDLE_SCHEMA = "h3_omni_native/v1"
-PIPELINE = "InvokerRenderPipeline"
+INVOKER_RENDER_PIPELINE_CLASS_NAME = "InvokerRenderPipeline"
 VIDEO_SIZE = (1344, 768)
 FPS = 24
 PACKET_FRAMES = 17
@@ -18,9 +20,31 @@ def is_invoker_render_bundle(model: str) -> bool:
     manifest_path = Path(model) / "native-runtime.json"
     if not manifest_path.is_file():
         return False
-    with manifest_path.open() as source:
-        manifest = json.load(source)
-    return manifest.get("schema") == BUNDLE_SCHEMA and manifest.get("recipe", {}).get("protocol") == PROTOCOL
+    try:
+        with manifest_path.open() as source:
+            manifest = json.load(source)
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(manifest, Mapping):
+        return False
+    recipe = manifest.get("recipe")
+    return (
+        manifest.get("schema") == BUNDLE_SCHEMA and isinstance(recipe, Mapping) and recipe.get("protocol") == PROTOCOL
+    )
+
+
+def load_invoker_render_transformer_config(*, model: str | None, revision: str | None = None) -> dict[str, Any]:
+    del revision
+    if not model:
+        raise ValueError("Invoker-Render bundle requires transformer/config.json")
+    config_path = Path(model) / "transformer" / "config.json"
+    if not config_path.is_file():
+        raise ValueError("Invoker-Render bundle requires transformer/config.json")
+    with config_path.open() as source:
+        config = json.load(source)
+    if not isinstance(config, dict):
+        raise ValueError("Invoker-Render bundle transformer/config.json must be a JSON object")
+    return config
 
 
 def _file(value: str) -> Path:
@@ -107,6 +131,7 @@ class InvokerRenderAssets:
         for shard in shards:
             _file(str(index.parent / shard))
         _file(str(index.parent / "config.json"))
+        load_invoker_render_transformer_config(model=model)
         components = server["component_paths"]
         return cls(
             str(index.parent),

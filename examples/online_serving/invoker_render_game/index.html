@@ -1,14 +1,14 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Invoker-Render 赛车 · vLLM-Omni</title>
+  <title>Invoker-Render Racing · vLLM-Omni</title>
   <link rel="icon" type="image/svg+xml" href="./vllm-omni-mark.svg">
   <style>
     :root {
       color-scheme: dark;
-      font: 1rem/1.5 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+      font: 1rem/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       --page: #131719;
       --surface: #1b2022;
       --screen: #0c1012;
@@ -280,62 +280,62 @@
           <img src="./vllm-omni-mark.svg" width="22" height="23" alt="">
           <span>vLLM-Omni</span>
         </div>
-        <h1>Invoker-Render <span>赛车控制台</span></h1>
+        <h1>Invoker-Render <span>Racing Console</span></h1>
       </div>
       <p id="session-status" class="session-status" role="status">
-        <span id="status">正在载入赛车场景</span>
+        <span id="status">Loading racing scene</span>
       </p>
     </header>
 
     <main class="console">
       <section aria-labelledby="render-title">
         <div class="section-line">
-          <h2 id="render-title">生成画面</h2>
+          <h2 id="render-title">Rendered Output</h2>
           <span id="render-format" class="metadata">1344 × 768 · 24 FPS</span>
         </div>
         <div class="monitor">
-          <video id="vllm-streaming-video-player" aria-label="生成画面" autoplay muted playsinline></video>
-          <div id="render-waiting" class="waiting">开局后在这里播放生成画面</div>
+          <video id="vllm-streaming-video-player" aria-label="Rendered output" autoplay muted playsinline></video>
+          <div id="render-waiting" class="waiting">Generated video will play here once a session starts</div>
         </div>
         <dl class="frame-counts">
-          <div><dt>已发送</dt><dd id="sent-frames">0 帧</dd></div>
-          <div><dt>已播放</dt><dd id="played-frames">0 帧</dd></div>
+          <div><dt>Sent</dt><dd id="sent-frames">0 frames</dd></div>
+          <div><dt>Played</dt><dd id="played-frames">0 frames</dd></div>
         </dl>
       </section>
 
       <div class="side">
         <section aria-labelledby="proxy-title">
           <div class="section-line">
-            <h2 id="proxy-title">游戏代理</h2>
+            <h2 id="proxy-title">Game Proxy</h2>
             <span class="metadata">448 × 256</span>
           </div>
           <div class="monitor">
             <canvas id="proxy" width="448" height="256" tabindex="0" aria-describedby="controls-note"></canvas>
           </div>
           <p id="controls-note" class="controls-note">
-            <span>点击画布后</span>
-            <span><kbd>W</kbd>加速</span>
-            <span><kbd>A</kbd><kbd>D</kbd>转向</span>
-            <span><kbd>S</kbd>刹车</span>
+            <span>Click canvas:</span>
+            <span><kbd>W</kbd>Accelerate</span>
+            <span><kbd>A</kbd><kbd>D</kbd>Steer</span>
+            <span><kbd>S</kbd>Brake</span>
           </p>
         </section>
 
         <form id="inputs" aria-labelledby="settings-title">
-          <h2 id="settings-title">会话设置</h2>
-          <label>vLLM-Omni 服务地址
+          <h2 id="settings-title">Session Settings</h2>
+          <label>vLLM-Omni WebSocket URL
             <input id="endpoint" type="url" value="ws://127.0.0.1:8091/v1/realtime/video" spellcheck="false" required>
           </label>
           <label>
-            <span class="field-label">参考图 <span class="field-note">1344 × 768</span></span>
+            <span class="field-label">Reference Image <span class="field-note">1344 × 768</span></span>
             <input id="reference" type="file" accept="image/*" required>
           </label>
-          <label>冻结提示词
-            <textarea id="prompt" rows="2" placeholder="粘贴 artifact 里的冻结提示词" required></textarea>
+          <label>Frozen Prompt
+            <textarea id="prompt" rows="2" placeholder="Paste the frozen system prompt from the artifact" required></textarea>
           </label>
           <div class="actions">
-            <button id="start" type="submit" disabled>开局</button>
-            <button id="finish" type="button" disabled>结束并排空</button>
-            <button id="cancel" type="button" disabled>取消</button>
+            <button id="start" type="submit" disabled>Start</button>
+            <button id="finish" type="button" disabled>Finish &amp; Drain</button>
+            <button id="cancel" type="button" disabled>Cancel</button>
           </div>
         </form>
       </div>

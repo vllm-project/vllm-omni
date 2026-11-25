@@ -32,7 +32,7 @@ function close(message, state = "error") {
   el("start").disabled = !game;
   el("finish").disabled = true;
   el("cancel").disabled = true;
-  if (!renderWaiting.hidden) renderWaiting.textContent = "开局后在这里播放生成画面";
+  if (!renderWaiting.hidden) renderWaiting.textContent = "Generated video will play here once a session starts";
   status(message, state);
 }
 
@@ -40,17 +40,17 @@ function send(packet) {
   if (!packet) return;
   socket.send(JSON.stringify(packet.header));
   socket.send(packet.pixels);
-  sentFrames.textContent = `${capture.sent} 帧`;
-  if (packet.header.eos) status("正在排空生成视频", "active");
+  sentFrames.textContent = `${capture.sent} frames`;
+  if (packet.header.eos) status("Draining generated video", "active");
 }
 
 function control(message, connection) {
   try {
     if (message.type === "video.start") {
-      if (!message.proxy) throw new Error("请用 Invoker-Render 实时配置启动服务");
+      if (!message.proxy) throw new Error("Start the server with the Invoker-Render streaming config");
       const proxy = message.proxy;
       if (proxy.width !== game.width || proxy.height !== game.height) {
-        throw new Error("该赛车示例需要 448×256 代理画布");
+        throw new Error("This racing demo requires a 448×256 proxy canvas");
       }
       socket = connection;
       capture = new ProxyCapture(proxy);
@@ -61,11 +61,11 @@ function control(message, connection) {
       el("cancel").disabled = false;
       const bounds = proxyCanvas.getBoundingClientRect();
       proxyCanvas.focus({preventScroll: bounds.top >= 0 && bounds.bottom <= window.innerHeight});
-      status("正在采集代理帧", "active");
+      status("Capturing proxy frames", "active");
     } else if (message.type === "session.proxy.credit") {
       capture?.acknowledge(message);
     } else if (message.type === "session.done") {
-      close(message.stopped ? "已取消" : "已完成", "idle");
+      close(message.stopped ? "Cancelled" : "Completed", "idle");
     } else if (message.type === "error") {
       close(message.message);
     }
@@ -105,15 +105,15 @@ el("inputs").addEventListener("submit", async event => {
   inSession = true;
   capture = undefined;
   el("start").disabled = true;
-  sentFrames.textContent = playedFrames.textContent = "0 帧";
+  sentFrames.textContent = playedFrames.textContent = "0 frames";
   renderFormat.textContent = expectedFormat;
-  renderWaiting.textContent = "等待首帧";
+  renderWaiting.textContent = "Waiting for first frame";
   renderWaiting.hidden = false;
-  status("正在连接渲染服务", "active");
+  status("Connecting to render server", "active");
   try {
     const image = await fileUrl(el("reference").files[0]);
     const url = new URL(el("endpoint").value);
-    if (url.protocol !== "ws:" && url.protocol !== "wss:") throw new Error("请输入 WebSocket 地址");
+    if (url.protocol !== "ws:" && url.protocol !== "wss:") throw new Error("Enter a valid ws:// or wss:// URL");
     window.vllmStreamingVideoStart(JSON.stringify({
       url: url.href,
       retain_seconds: 8,
@@ -137,7 +137,7 @@ el("inputs").addEventListener("submit", async event => {
 el("finish").addEventListener("click", () => {
   el("finish").disabled = true;
   if (capture) {
-    status("正在采集尾帧", "active");
+    status("Capturing tail frames", "active");
     send(capture.finish());
   }
 });
@@ -150,7 +150,7 @@ function recordPlayback(mediaTime) {
   if (!capture) return;
   const before = capture.displayed;
   capture.played(mediaTime);
-  if (capture.displayed !== before) playedFrames.textContent = `${capture.displayed} 帧`;
+  if (capture.displayed !== before) playedFrames.textContent = `${capture.displayed} frames`;
 }
 
 video.addEventListener("loadeddata", () => {
@@ -174,8 +174,8 @@ try {
   const {createGame} = await import("./codeworldmodel/game.js");
   game = createGame(proxyCanvas, {width: 448, height: 256, scene: "racing", canReset: () => !inSession});
   el("start").disabled = false;
-  status("选择与起始相机匹配的参考图后开局");
+  status("Select a reference image matching the opening camera view to start");
   requestAnimationFrame(tick);
 } catch (error) {
-  close(`赛车场景载入失败：${error.message}`);
+  close(`Failed to load racing scene: ${error.message}`);
 }

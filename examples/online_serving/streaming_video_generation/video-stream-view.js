@@ -161,7 +161,7 @@
       setStatus("MSE unsupported");
       setStartButton(false, "Restart");
       log("This browser does not support MP4 Media Source Extensions playback.");
-      hooks.error?.("浏览器不支持 MP4 Media Source Extensions 播放");
+      hooks.error?.("This browser does not support MP4 Media Source Extensions playback.");
       return configJson;
     }
 
@@ -248,7 +248,7 @@
         setStatus("Error");
         setStartButton(false, "Restart");
         log("ERROR: WebSocket error");
-        hooks.error?.("WebSocket 连接失败");
+        hooks.error?.("WebSocket connection failed");
         finishStream();
       };
       ws.onclose = () => {
@@ -258,7 +258,7 @@
           setStatus("Closed");
           setStartButton(false, "Restart");
           log("WebSocket closed before session.done");
-          hooks.error?.("WebSocket 在会话结束前已关闭");
+          hooks.error?.("WebSocket closed before session.done");
           finishStream();
         }
       };

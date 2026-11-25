@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.diffusion.model_metadata import DiffusionModelMetadata, get_diffusion_model_metadata
+from vllm_omni.diffusion.models.interface import ProxyStreamSpec
 from vllm_omni.diffusion.utils.media_utils import count_mp4_frames, normalize_preencode_batch_frames
 from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
@@ -46,7 +47,11 @@ from vllm_omni.inputs.data import (
     absorb_attention_schedule_extra_args,
 )
 from vllm_omni.metrics import count_video_frames
-from vllm_omni.model_extras import get_video_generation_defaults, should_preserve_reference_image_size
+from vllm_omni.model_extras import (
+    get_proxy_stream_spec,
+    get_video_generation_defaults,
+    should_preserve_reference_image_size,
+)
 from vllm_omni.model_extras.cosmos3_lidar import lidar_output_requested, serialize_lidar_output
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
 from vllm_omni.outputs.output_metadata import (
@@ -309,15 +314,21 @@ class OmniOpenAIServingVideo:
         _, metadata = self._resolve_diffusion_metadata()
         return any(item.supports_proxy_video_input for item in metadata)
 
-    def live_proxy_canvas(self) -> tuple[int, int] | None:
+    def _resolve_proxy_stream_spec(self) -> ProxyStreamSpec | None:
         od_config = self._resolve_diffusion_od_config()
-        if od_config is None or not od_config.streaming_output or not self.supports_proxy_video_input:
+        if od_config is None or not self.supports_proxy_video_input:
             return None
-        from vllm_omni.diffusion.models.invoker_render.assets import InvokerRenderAssets
+        return get_proxy_stream_spec(
+            od_config.model_class_name,
+            model=od_config.model,
+            revision=od_config.revision,
+        )
 
-        if od_config.model is None:
-            raise RuntimeError("Missing prepared Invoker-Render bundle for streaming")
-        return InvokerRenderAssets.read(od_config.model).proxy_size
+    def live_proxy_spec(self) -> ProxyStreamSpec | None:
+        od_config = self._resolve_diffusion_od_config()
+        if od_config is None or not od_config.streaming_output:
+            return None
+        return self._resolve_proxy_stream_spec()
 
     @property
     def supports_latent_mask_editing(self) -> bool:
@@ -452,9 +463,9 @@ class OmniOpenAIServingVideo:
         fps_provided = self._request_fps_provided(request)
         num_frames_provided = self._request_num_frames_provided(request)
         if self.supports_proxy_video_input and num_frames_provided and request.resolve_video_params().num_frames == 1:
-            raise HTTPException(
-                400, detail="Proxy video rendering requires the source frame count, at least 39 frames."
-            )
+            proxy_spec = self._resolve_proxy_stream_spec()
+            min_frames_detail = f", at least {proxy_spec.min_source_frames} frames." if proxy_spec is not None else "."
+            raise HTTPException(400, detail=f"Proxy video rendering requires the source frame count{min_frames_detail}")
         video_defaults = self._resolve_video_generation_defaults(request)
         if video_defaults is None:
             vp = request.resolve_video_params()

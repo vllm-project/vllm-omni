@@ -19,7 +19,7 @@ export class ProxyCapture {
     if (!Number.isSafeInteger(message.accepted_frames) || message.accepted_frames < this.acknowledged ||
         message.accepted_frames > this.sent || !Number.isSafeInteger(message.credit_frames) ||
         message.credit_frames < 0 || message.credit_frames > this.config.credit_frames) {
-      throw new Error("服务返回的输入额度无效");
+      throw new Error("Invalid input credit returned by server");
     }
     this.acknowledged = message.accepted_frames;
     this.credit = message.credit_frames;
@@ -39,9 +39,9 @@ export class ProxyCapture {
   }
 
   capture(rgb, time) {
-    if (!this.canCapture) throw new Error("代理采集已达到输入或播放额度");
+    if (!this.canCapture) throw new Error("Proxy capture reached the input or playback credit limit");
     if (!(rgb instanceof Uint8Array) || rgb.length !== this.frameBytes || !Number.isFinite(time)) {
-      throw new Error("代理帧尺寸或采集时间无效");
+      throw new Error("Invalid proxy frame size or capture timestamp");
     }
     this.pending.push({rgb, time});
     return this.packet();

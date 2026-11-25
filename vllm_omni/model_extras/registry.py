@@ -8,6 +8,7 @@ from typing import Any, Literal, Protocol
 
 from PIL import Image
 
+from vllm_omni.diffusion.models.interface import ProxyStreamSpec
 from vllm_omni.model_executor.stage_input_processors.glm_image import (
     compute_max_tokens as glm_image_ar_max_tokens,
 )
@@ -49,6 +50,10 @@ from vllm_omni.model_extras.hunyuan_image3 import (
     validate_ar_tokenizer as validate_hunyuan_image3_ar_tokenizer,
 )
 from vllm_omni.model_extras.hy_nomas import HY_NOMAS_EXTRA_BODY_PARAMS, get_hy_nomas_video_generation_defaults
+from vllm_omni.model_extras.invoker_render import (
+    invoker_render_proxy_stream_spec,
+    invoker_render_transformer_config,
+)
 from vllm_omni.model_extras.kandinsky6 import (
     KANDINSKY6_EXTRA_BODY_PARAMS,
     KANDINSKY6_EXTRA_OUTPUT_PARAMS,
@@ -163,6 +168,24 @@ class TransformerConfigSubfolderResolver(Protocol):
         model: str | None,
         revision: str | None = None,
     ) -> str: ...
+
+
+class NativeTransformerConfigLoader(Protocol):
+    def __call__(
+        self,
+        *,
+        model: str | None,
+        revision: str | None = None,
+    ) -> dict[str, Any]: ...
+
+
+class ProxyStreamSpecResolver(Protocol):
+    def __call__(
+        self,
+        *,
+        model: str | None,
+        revision: str | None = None,
+    ) -> ProxyStreamSpec: ...
 
 
 def default_x_to_text_prompt(
@@ -297,6 +320,8 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     },
     "InvokerRenderPipeline": {
         "reference_image_size_resolver": _always_preserve_reference_image_size,
+        "native_transformer_config_loader": invoker_render_transformer_config,
+        "proxy_stream_spec_resolver": invoker_render_proxy_stream_spec,
     },
     "HeliosPyramidPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
@@ -493,6 +518,30 @@ def get_transformer_config_subfolder(
         spec.get("transformer_config_subfolder_resolver") if spec else None
     )
     return resolver(model=model, revision=revision) if resolver else "transformer"
+
+
+def load_native_transformer_config(
+    model_class_name: str | None,
+    *,
+    model: str | None,
+    revision: str | None = None,
+) -> dict[str, Any] | None:
+    """Load a native checkpoint's DiT config when the model declares a loader."""
+    spec = _get_spec(model_class_name)
+    loader: NativeTransformerConfigLoader | None = spec.get("native_transformer_config_loader") if spec else None
+    return loader(model=model, revision=revision) if loader is not None else None
+
+
+def get_proxy_stream_spec(
+    model_class_name: str | None,
+    *,
+    model: str | None,
+    revision: str | None = None,
+) -> ProxyStreamSpec | None:
+    """Return a model's live structural proxy video stream contract, if declared."""
+    spec = _get_spec(model_class_name)
+    resolver: ProxyStreamSpecResolver | None = spec.get("proxy_stream_spec_resolver") if spec else None
+    return resolver(model=model, revision=revision) if resolver is not None else None
 
 
 def should_preserve_reference_image_size(

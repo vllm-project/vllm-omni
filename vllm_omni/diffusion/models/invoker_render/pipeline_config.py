@@ -3,11 +3,11 @@
 
 from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, StagePipelineConfig
 
-from .assets import PIPELINE
+from .assets import INVOKER_RENDER_PIPELINE_CLASS_NAME
 
 INVOKER_RENDER_PIPELINE = PipelineConfig(
     model_type="invoker_render",
-    model_arch=PIPELINE,
+    model_arch=INVOKER_RENDER_PIPELINE_CLASS_NAME,
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -16,7 +16,7 @@ INVOKER_RENDER_PIPELINE = PipelineConfig(
             input_sources=(),
             final_output=True,
             final_output_type="video",
-            model_arch=PIPELINE,
+            model_arch=INVOKER_RENDER_PIPELINE_CLASS_NAME,
         ),
     ),
 )

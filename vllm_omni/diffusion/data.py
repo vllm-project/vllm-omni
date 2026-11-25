@@ -1825,12 +1825,24 @@ class OmniDiffusionConfig:
             self.set_tf_model_config(TransformerConfig())
             return
 
-        from vllm_omni.diffusion.models.invoker_render.assets import PIPELINE, is_invoker_render_bundle
+        native_model_class = resolve_native_diffusion_model_class(self.model)
+        if (
+            native_model_class is not None
+            and self.diffusion_load_format != "diffusers"
+            and self.model_class_name in (None, native_model_class)
+        ):
+            from vllm_omni.model_extras import load_native_transformer_config
 
-        if self.model_class_name in (None, PIPELINE) and is_invoker_render_bundle(self.model):
-            self.model_class_name = PIPELINE
-            if not self._load_component_transformer_config():
-                raise ValueError("Invoker-Render bundle requires transformer/config.json")
+            self.model_class_name = native_model_class
+            tf_config_dict = load_native_transformer_config(
+                native_model_class,
+                model=self.model,
+                revision=self.revision,
+            )
+            if tf_config_dict is not None:
+                self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
+            else:
+                self.set_tf_model_config(TransformerConfig())
             self.update_multimodal_support()
             return
 
@@ -1891,12 +1903,6 @@ class OmniDiffusionConfig:
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
-                    native_model_class = resolve_native_diffusion_model_class(self.model)
-                    if native_model_class is not None:
-                        self.model_class_name = native_model_class
-                        self.set_tf_model_config(TransformerConfig())
-                        self.update_multimodal_support()
-                        return
                     # Lance ships its top-level config.json one directory above
                     # the per-checkpoint subfolders (``Lance_3B/`` or
                     # ``Lance_3B_Video/``).  Try to recover that case before

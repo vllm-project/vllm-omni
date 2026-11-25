@@ -8,19 +8,20 @@ from vllm_omni.diffusion.interaction.modality_handlers.base import InteractionHa
 from vllm_omni.diffusion.interaction.types import InteractionChunkMetadata, InteractionPayload
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
-from .proxy import PROXY_MODALITY, ProxyPacket, ProxySequence
+from .proxy import PROXY_MODALITY, ProxyPacket, ProxySequence, invoker_render_proxy_spec
 
 
 class ProxyQueue:
     def __init__(self, size: tuple[int, int]) -> None:
-        self.size = size
-        self.sequence = ProxySequence()
+        self.spec = invoker_render_proxy_spec(size)
+        self.size = self.spec.size
+        self.sequence = ProxySequence(self.spec)
         self.pending: deque[ProxyPacket] = deque()
 
     def packet(self, payload: InteractionPayload) -> ProxyPacket:
         if not isinstance(payload, Mapping):
             raise ValueError("Invoker-Render proxy packet must be an object")
-        return ProxyPacket.parse(payload, payload.get("rgb"), size=self.size)
+        return ProxyPacket.parse(payload, payload.get("rgb"), spec=self.spec)
 
     def append(self, packet: ProxyPacket) -> None:
         self.sequence.append(packet)

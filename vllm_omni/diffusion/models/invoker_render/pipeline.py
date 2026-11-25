@@ -8,6 +8,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import ClassVar
 
@@ -71,7 +72,7 @@ def read_proxy_video(path: str | Path, size: tuple[int, int]) -> np.ndarray:
                 pts = frame.pts * frame.time_base
                 if start is None:
                     start = pts
-                if abs((pts - start) * FPS - len(frames)) > FPS * frame.time_base:
+                if abs((pts - start) * FPS - len(frames)) > min(FPS * frame.time_base, Fraction(1, 3)):
                     raise OmniClientError("Invoker-Render proxy frame timestamps must follow the 24 FPS timeline")
                 frames.append(frame.to_ndarray(format="rgb24"))
     except (OSError, av.FFmpegError) as exc:

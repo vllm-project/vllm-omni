@@ -5,6 +5,8 @@ import asyncio
 import io
 import json
 import tempfile
+from fractions import Fraction
+from types import SimpleNamespace
 
 import av
 import numpy as np
@@ -15,12 +17,20 @@ from PIL import Image
 from safetensors.torch import save_file
 from starlette.datastructures import Headers
 
+import vllm_omni.diffusion.models.invoker_render as invoker_render_pkg
 from vllm_omni.diffusion.data import OmniDiffusionConfig, resolve_model_class_name
-from vllm_omni.diffusion.models.invoker_render.assets import InvokerRenderAssets
-from vllm_omni.diffusion.models.invoker_render.causal import euler_step, generator
+from vllm_omni.diffusion.models.invoker_render.assets import (
+    INVOKER_RENDER_PIPELINE_CLASS_NAME,
+    InvokerRenderAssets,
+    is_invoker_render_bundle,
+)
+from vllm_omni.diffusion.models.invoker_render.causal import CausalSession, euler_step, generator
 from vllm_omni.diffusion.models.invoker_render.codec import CausalVideoDecoder
-from vllm_omni.diffusion.models.invoker_render.pipeline import get_invoker_render_pre_process_func
-from vllm_omni.diffusion.models.invoker_render.schedule import WindowPlanner
+from vllm_omni.diffusion.models.invoker_render.pipeline import (
+    get_invoker_render_pre_process_func,
+    read_proxy_video,
+)
+from vllm_omni.diffusion.models.invoker_render.schedule import Window, WindowPlanner
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
     VideoRequestResources,
@@ -28,6 +38,7 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
 )
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras import get_proxy_stream_spec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -197,3 +208,82 @@ def test_mixed_matroska_upload_preserves_full_proxy(bundle, monkeypatch):
         np.testing.assert_array_equal(proxy[:, 0, 0, 0], np.arange(39))
     finally:
         resources.cleanup()
+
+
+def test_bundle_detection_handles_malformed_manifest_and_root_config_stub(bundle, tmp_path):
+    assert not hasattr(invoker_render_pkg, "InvokerRenderPipeline")
+    for name, content in (
+        ("bad_json", "{invalid"),
+        ("not_dict", "[]"),
+        ("null_recipe", '{"schema": "h3_omni_native/v1", "recipe": null}'),
+    ):
+        bad = tmp_path / name
+        bad.mkdir()
+        (bad / "native-runtime.json").write_text(content)
+        assert not is_invoker_render_bundle(str(bad))
+
+    (bundle / "config.json").write_text(json.dumps({"architectures": ["MiniMaxH3CausalDiTModel"]}))
+    config = OmniDiffusionConfig.from_kwargs(model=str(bundle))
+    config.enrich_config()
+    assert config.model_class_name == INVOKER_RENDER_PIPELINE_CLASS_NAME
+    assert config.tf_model_config.num_layers == 1
+    spec = get_proxy_stream_spec(config.model_class_name, model=str(bundle))
+    assert spec is not None
+    assert (spec.width, spec.height, spec.fps, spec.min_source_frames) == (448, 256, 24, 39)
+
+
+def test_ulysses_padding_is_zero_when_tokens_divide_degree():
+    seen: list[tuple[tuple[int, ...], int]] = []
+
+    class _FakeDiT:
+        arch = SimpleNamespace(audio_latents_dim=4)
+
+        def __call__(self, *, x, unique_timesteps, packed_seq_params, img_pos_for_infer_output_info, **kwargs):
+            seen.append((packed_seq_params["cu_seqlens_q_host"], int(unique_timesteps.numel())))
+            out_len = int(img_pos_for_infer_output_info["position_ids"].numel())
+            return torch.zeros(out_len, x.shape[-1]), None
+
+    class _FakeCache:
+        def prepare_layer_views(self, media_tokens: int, condition_tokens: int) -> None:
+            return None
+
+    image = torch.zeros(2, 1, 4, 8)  # patch (1,2,2) -> 2*4 = 8 tokens per frame
+    session = CausalSession(
+        _FakeDiT(),
+        features=torch.zeros(3, 4),
+        tags=torch.zeros(3, dtype=torch.long),
+        image=image,
+        seed=42,
+        ulysses=8,
+    )
+    session.append(torch.zeros(2, 5, 4, 8), eos=False)
+    session.append(torch.zeros(2, 5, 4, 8), eos=False)
+    session.predict(_FakeCache(), Window(9, 10, False), torch.zeros(2, 1, 4, 8), step=0)
+    assert seen == [((0, 8), 1)]
+
+
+def test_read_proxy_video_rejects_dropped_frame_at_exact_fps_timebase(monkeypatch):
+    class _FakeFrame:
+        def __init__(self, pts: int):
+            self.pts = pts
+            self.time_base = Fraction(1, 24)
+
+        def to_ndarray(self, format: str) -> np.ndarray:
+            assert format == "rgb24"
+            return np.zeros((32, 32, 3), dtype=np.uint8)
+
+    class _FakeContainer:
+        streams = SimpleNamespace(video=[SimpleNamespace(width=32, height=32, average_rate=Fraction(24, 1))])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def decode(self, stream):
+            return [_FakeFrame(pts) for pts in (0, 2, 3)]
+
+    monkeypatch.setattr(av, "open", lambda path: _FakeContainer())
+    with pytest.raises(OmniClientError, match="24 FPS timeline"):
+        read_proxy_video("dropped.mp4", (32, 32))

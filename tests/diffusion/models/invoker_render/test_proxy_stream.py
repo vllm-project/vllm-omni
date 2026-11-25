@@ -16,7 +16,11 @@ from starlette.testclient import TestClient
 
 from vllm_omni.diffusion.models.invoker_render.interaction import ProxyQueue
 from vllm_omni.diffusion.models.invoker_render.pipeline import InvokerRenderPipeline
-from vllm_omni.diffusion.models.invoker_render.proxy import BOOTSTRAP_KEY, PROXY_MODALITY
+from vllm_omni.diffusion.models.invoker_render.proxy import (
+    BOOTSTRAP_KEY,
+    PROXY_MODALITY,
+    invoker_render_proxy_spec,
+)
 from vllm_omni.diffusion.models.invoker_render.schedule import Window
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
@@ -41,7 +45,7 @@ def header(seq: int, *, eos: bool = False) -> dict:
 
 
 def test_credit_wait_and_unknown_length():
-    proxy = ProxyIngress((32, 32))
+    proxy = ProxyIngress(invoker_render_proxy_spec((32, 32)))
     rgb = bytes(17 * 32 * 32 * 3)
     assert proxy.receive(header(0), rgb) is None
     assert not proxy.bootstrap_ready.is_set()
@@ -126,7 +130,7 @@ def test_websocket_uses_bootstrap_and_muxes_eos(monkeypatch):
 
     handler = OmniStreamingVideoOutputHandler(
         _FakeEngine(submit_interaction_async=submit, abort=abort),
-        proxy_size=(32, 32),
+        proxy_spec=invoker_render_proxy_spec((32, 32)),
         stall_timeout=4,
     )
 
@@ -190,7 +194,11 @@ def test_websocket_can_stop_during_bootstrap():
     async def abort(request_id, *, timeout):
         aborted.append(request_id)
 
-    handler = OmniStreamingVideoOutputHandler(_FakeEngine(abort=abort), proxy_size=(32, 32), stall_timeout=4)
+    handler = OmniStreamingVideoOutputHandler(
+        _FakeEngine(abort=abort),
+        proxy_spec=invoker_render_proxy_spec((32, 32)),
+        stall_timeout=4,
+    )
     app = FastAPI()
     app.add_api_websocket_route("/v1/realtime/video", handler.handle_session)
     with TestClient(app) as client, client.websocket_connect("/v1/realtime/video") as ws:

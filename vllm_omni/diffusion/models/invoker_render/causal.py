@@ -239,7 +239,7 @@ class CausalSession:
         if prefix:
             segments.append((None, cursor))
         used = cursor
-        padding = self.ulysses - used % self.ulysses if self.ulysses > 1 else 0
+        padding = (-used) % self.ulysses if self.ulysses > 1 else 0
         if padding:
             rows.append(rows[0].new_zeros(padding, rows[0].shape[-1]))
             times.append(torch.full((padding,), 0.999, device=self.device))
