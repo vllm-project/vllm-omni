@@ -9,8 +9,11 @@ from vllm_omni.benchmarks.duplex_session_metrics import (
     apply_session_stats_to_request_metrics,
     build_duplex_metrics_report,
     collect_duplex_session_metrics,
+    duplex_chunk_metrics,
     duplex_response_latency_metrics,
+    print_duplex_chunk_metrics,
     print_duplex_response_latency_metrics,
+    session_stats_chunk_metrics,
     session_stats_turn_metrics,
     union_ns,
 )
@@ -320,3 +323,124 @@ def test_collect_attaches_session_stats_and_flattens_busy_rtf(capsys) -> None:
     lines = [" ".join(line.split()) for line in printed.splitlines()]
     assert "Mean busy RTF: 0.200000" in lines
     assert "Mean stall ratio: 0.000000" in lines
+
+
+def _stats_turn(turn_id, chunks, *, final=True, status="done"):
+    return {"epoch": 0, "turn_id": turn_id, "status": status, "final": final, "chunks": chunks, "audio": []}
+
+
+def test_chunk_metrics_time_each_final_chunk_against_the_input_period() -> None:
+    stats = {
+        "turns": [
+            # 300 ms in the engine against a 1000 ms period: on time.
+            _stats_turn(0, [_stats_chunk(1, 0, 300, {0: [(20, 200)]})], status="listen"),
+            # 1300 ms in the engine: the next unit had to wait.
+            _stats_turn(1, [_stats_chunk(2, 1000, 2300, {0: [(1100, 900)], 1: [(1900, 400)]})]),
+            # An open turn: no row of its own, but its submission still counts for the period.
+            _stats_turn(2, [_stats_chunk(3, 2000, None, {})], final=False, status="open"),
+        ]
+    }
+
+    rows = session_stats_chunk_metrics(stats)
+
+    assert [(row["turn_id"], row["seq"]) for row in rows] == [(0, 1), (1, 2)]
+    assert [row["in_engine_ms"] for row in rows] == [300.0, 1300.0]
+    assert [row["queue_ms"] for row in rows] == [20.0, 100.0]
+    assert [row["input_period_ms"] for row in rows] == [1000.0, 1000.0]
+    assert [row["overrun"] for row in rows] == [False, True]
+
+
+def test_an_extra_append_right_behind_a_unit_is_not_an_overrun() -> None:
+    # Units every second; a camera frame appended on its own 3 ms after the
+    # second one. The unit at 1000 is done long before the next second.
+    chunks = [
+        _stats_chunk(1, 0, 100, {0: [(0, 100)]}),
+        _stats_chunk(2, 1000, 1400, {0: [(1000, 400)]}),
+        _stats_chunk(3, 1003, 1100, {0: [(1003, 97)]}),
+        _stats_chunk(4, 2000, 2100, {0: [(2000, 100)]}),
+        _stats_chunk(5, 3000, 3100, {0: [(3000, 100)]}),
+    ]
+
+    rows = session_stats_chunk_metrics({"turns": [_stats_turn(0, chunks)]})
+
+    assert rows[1]["input_period_ms"] == 998.5
+    assert [row["overrun"] for row in rows] == [False] * 5
+
+
+def test_chunk_metrics_leave_spanless_chunks_and_lone_chunks_unjudged() -> None:
+    stats = {
+        "turns": [
+            _stats_turn(
+                0,
+                [
+                    _stats_chunk(1, 0, 40, {0: [(10, 30)]}),
+                    # No stage span: no engine time.
+                    _stats_chunk(2, 1000, 1000, {}),
+                    _stats_chunk(3, 2000, 2050, {0: [(2000, 50)]}),
+                ],
+            )
+        ]
+    }
+
+    rows = session_stats_chunk_metrics(stats)
+
+    assert [row["overrun"] for row in rows] == [False, None, False]
+    assert (rows[1]["in_engine_ms"], rows[1]["queue_ms"]) == (None, None)
+    assert rows[2]["in_engine_ms"] == 50.0
+    # An audio turn without the vocoder's spans would time its chunks short, as busy RTF would read low.
+    speaking = {**_stats_turn(1, [_stats_chunk(4, 3000, 3100, {0: [(3010, 90)]})]), "audio": [_audio(500.0)]}
+    staged = {"stages": [{"stage_id": 0}, {"stage_id": 2}], "turns": [*stats["turns"], speaking]}
+    assert [row["seq"] for row in session_stats_chunk_metrics(staged)] == [1, 2, 3]
+    # One chunk gives no period to judge against.
+    (lone,) = session_stats_chunk_metrics({"turns": [_stats_turn(0, [_stats_chunk(1, 0, 40, {0: [(0, 40)]})])]})
+    assert (lone["in_engine_ms"], lone["input_period_ms"], lone["overrun"]) == (40.0, None, None)
+    assert session_stats_chunk_metrics(None) == []
+    assert session_stats_chunk_metrics({"turns": None}) == []
+
+
+def test_chunk_metrics_pool_sessions_into_flat_keys(capsys) -> None:
+    sessions = [
+        {"chunk_metrics": [{"in_engine_ms": 100.0, "queue_ms": 10.0, "overrun": False}]},
+        {
+            "chunk_metrics": [
+                {"in_engine_ms": 300.0, "queue_ms": None, "overrun": True},
+                {"in_engine_ms": 200.0, "queue_ms": 30.0, "overrun": None},
+            ]
+        },
+        {},
+    ]
+
+    metrics = duplex_chunk_metrics(sessions)
+
+    assert metrics["num_duplex_chunk_in_engine_ms_samples"] == 3
+    assert metrics["mean_duplex_chunk_in_engine_ms"] == 200.0
+    assert metrics["median_duplex_chunk_in_engine_ms"] == 200.0
+    assert metrics["p99_duplex_chunk_in_engine_ms"] == 300.0
+    assert metrics["num_duplex_chunk_queue_ms_samples"] == 2
+    assert metrics["mean_duplex_chunk_queue_ms"] == 20.0
+    assert metrics["num_duplex_chunk_overrun_samples"] == 2
+    assert metrics["duplex_chunk_overrun_ratio"] == 0.5
+    assert duplex_chunk_metrics([{}]) == {}
+
+    report = build_duplex_metrics_report(request_metrics=[], session_metrics=sessions)
+    assert report["duplex_chunk_overrun_ratio"] == 0.5
+
+    print_duplex_chunk_metrics(metrics)
+    lines = [" ".join(line.split()) for line in capsys.readouterr().out.splitlines()]
+    assert "Median chunk in-engine time (ms): 200.00" in lines
+    assert "Chunk overrun ratio: 0.500000" in lines
+    print_duplex_chunk_metrics({})
+    assert capsys.readouterr().out == ""
+
+
+def test_collect_attaches_chunk_metrics_to_the_session_row() -> None:
+    collector = EventCollector()
+    _turn(collector, "r1", 10.0, text_s=0.3, audio_s=0.4)
+    stats = {"turns": [{**_stats_turn(0, [_stats_chunk(1, 0, 20, {0: [(5, 15)]})]), "response_ids": ["r1"]}]}
+
+    bundle = collect_duplex_session_metrics(collector, stream_start=9.0, session_id="s", session_stats=stats)
+
+    (row,) = bundle.session_metrics["chunk_metrics"]
+    assert (row["in_engine_ms"], row["queue_ms"], row["overrun"]) == (20.0, 5.0, None)
+    without = collect_duplex_session_metrics(collector, stream_start=9.0, session_id="s")
+    assert "chunk_metrics" not in without.session_metrics

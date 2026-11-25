@@ -292,7 +292,13 @@ def test_benchmark_result_flattens_duplex_per_response_latency(monkeypatch):
             ttft=0.06,
             latency=1.0,
             duplex_request_metrics=request_metrics,
-            duplex_session_metrics={"ttft_ms": {"count": 2, "mean": 60.0, "p50": 50.0, "p99": 70.0}},
+            duplex_session_metrics={
+                "ttft_ms": {"count": 2, "mean": 60.0, "p50": 50.0, "p99": 70.0},
+                "chunk_metrics": [
+                    {"in_engine_ms": 100.0, "queue_ms": 10.0, "overrun": False},
+                    {"in_engine_ms": 1300.0, "queue_ms": 30.0, "overrun": True},
+                ],
+            },
         )
 
     monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, "test-duplex-result", request_func)
@@ -336,3 +342,7 @@ def test_benchmark_result_flattens_duplex_per_response_latency(monkeypatch):
     assert saved_result["mean_duplex_stall_ratio"] == pytest.approx(0.2)
     assert saved_result["mean_duplex_response_ttft_ms"] == pytest.approx(60.0)
     assert saved_result["p99_duplex_client_ttft_ms"] == pytest.approx(320.0)
+    assert saved_result["num_duplex_chunk_in_engine_ms_samples"] == 2
+    assert saved_result["mean_duplex_chunk_in_engine_ms"] == pytest.approx(700.0)
+    assert saved_result["p99_duplex_chunk_queue_ms"] == pytest.approx(30.0)
+    assert saved_result["duplex_chunk_overrun_ratio"] == pytest.approx(0.5)

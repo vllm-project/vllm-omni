@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -221,6 +222,78 @@ def apply_session_stats_to_request_metrics(
         )
 
 
+#: Per-chunk latencies pooled over every session's final turns, exported as
+#: ``num_/mean_/median_/p99_<name>`` keys like the per-response ones.
+#: ``(row field, flatten name, console label)``.
+DUPLEX_CHUNK_LATENCY_FIELDS = (
+    ("in_engine_ms", "duplex_chunk_in_engine_ms", "chunk in-engine time"),
+    ("queue_ms", "duplex_chunk_queue_ms", "chunk queue time"),
+)
+
+
+def session_stats_chunk_metrics(session_stats: Mapping[str, object] | None) -> list[dict[str, object]]:
+    """One row per chunk of the snapshot's final turns, in submission order.
+
+    ``in_engine_ms`` is the chunk's ``[submitted_ns, done_ns]`` interval and
+    ``queue_ms`` the wait from submission to its first stage span.
+    ``input_period_ms`` is the session's median gap between chunk submissions:
+    with real-time input that is the unit period (about 1 s for MiniCPM-o on
+    Omni-DuplexEval), and an occasional extra append right behind a unit, such as
+    a camera frame sent on its own, does not move it. ``overrun`` is whether the
+    chunk spent longer than one period in the engine, so the units behind it had
+    to wait. For turn-commit plugins a chunk is a whole turn and the period is
+    the gap between turns. A chunk with no stage span has no engine time, and a
+    session with one chunk has no period: those fields are ``None``. Chunks of
+    turns that get no numbers from :func:`session_stats_turn_metrics` (not final,
+    or an audio turn missing a stage's spans) are left out, but their
+    submissions still count for the period.
+    """
+    if session_stats is None or not isinstance(turns := session_stats.get("turns"), list):
+        return []
+    stages = session_stats.get("stages")
+    stage_ids = (
+        [stage["stage_id"] for stage in stages if isinstance(stage, Mapping)] if isinstance(stages, list) else None
+    )
+    submitted: list[int] = []
+    final_chunks: list[tuple[int, Mapping[str, object], Mapping[str, object]]] = []
+    for turn in turns:
+        if not isinstance(turn, Mapping) or not isinstance(chunks := turn.get("chunks"), list):
+            continue
+        final = session_stats_turn_metrics(turn, stage_ids=stage_ids)["final"] is True
+        for chunk in chunks:
+            if isinstance(chunk, Mapping) and isinstance(submitted_ns := chunk.get("submitted_ns"), int):
+                submitted.append(submitted_ns)
+                if final:
+                    final_chunks.append((submitted_ns, turn, chunk))
+    submitted.sort()
+    gaps = [later - earlier for earlier, later in zip(submitted, submitted[1:])]
+    period_ns = statistics.median(gaps) if gaps else None
+    rows: list[dict[str, object]] = []
+    for submitted_ns, turn, chunk in sorted(final_chunks, key=lambda item: item[0]):
+        done_ns = chunk.get("done_ns")
+        if not isinstance(done_ns, int):  # a final turn's chunks all have one
+            continue
+        in_engine_ns = done_ns - submitted_ns
+        starts = [
+            int(span[0])
+            for work in chunk.get("stage_work") or ()
+            if isinstance(work, Mapping)
+            for span in work.get("spans") or ()
+        ]
+        rows.append(
+            {
+                "epoch": turn.get("epoch"),
+                "turn_id": turn.get("turn_id"),
+                "seq": chunk.get("seq"),
+                "in_engine_ms": round(in_engine_ns / 1e6, 3) if starts else None,
+                "queue_ms": round(max(0, min(starts) - submitted_ns) / 1e6, 3) if starts else None,
+                "input_period_ms": round(period_ns / 1e6, 3) if period_ns else None,
+                "overrun": in_engine_ns > period_ns if starts and period_ns else None,
+            }
+        )
+    return rows
+
+
 def _client_response_latencies(
     collector: EventCollector,
     response_id: str,
@@ -324,6 +397,8 @@ def collect_duplex_session_metrics(
         request_metrics,
         session_id=session_id,
     )
+    if chunk_metrics := session_stats_chunk_metrics(session_stats):
+        session_metrics["chunk_metrics"] = chunk_metrics
     from vllm_omni.clients.duplex import distribution_summary
 
     for field in ("client_ttft_ms", "client_ttfp_ms"):
@@ -395,6 +470,48 @@ def print_duplex_response_latency_metrics(metrics: Mapping[str, float | int]) ->
     print("=" * 50)
 
 
+def duplex_chunk_metrics(session_metrics: Sequence[Mapping[str, object]]) -> dict[str, float | int]:
+    """Pool every session's ``chunk_metrics`` into flat chunk latency keys and the overrun ratio."""
+    from vllm_omni.clients.duplex import distribution_summary
+
+    rows = [
+        row
+        for metric in session_metrics
+        if isinstance(chunks := metric.get("chunk_metrics"), list)
+        for row in chunks
+        if isinstance(row, Mapping)
+    ]
+    result: dict[str, float | int] = {}
+    for field, name, _label in DUPLEX_CHUNK_LATENCY_FIELDS:
+        summary = distribution_summary(_finite_nonnegative(rows, field))
+        if summary is None:
+            continue
+        result[f"num_{name}_samples"] = summary["count"]
+        result[f"mean_{name}"] = summary["mean"]
+        result[f"median_{name}"] = summary["p50"]
+        result[f"p99_{name}"] = summary["p99"]
+    overruns = [row["overrun"] for row in rows if isinstance(row.get("overrun"), bool)]
+    if overruns:
+        result["num_duplex_chunk_overrun_samples"] = len(overruns)
+        result["duplex_chunk_overrun_ratio"] = round(sum(overruns) / len(overruns), 6)
+    return result
+
+
+def print_duplex_chunk_metrics(metrics: Mapping[str, float | int]) -> None:
+    """Print the per-chunk block of a benchmark summary."""
+    if not metrics:
+        return
+    print("{s:{c}^{n}}".format(s=" Duplex Per-Chunk Latency ", n=50, c="="))
+    for _field, name, label in DUPLEX_CHUNK_LATENCY_FIELDS:
+        if f"mean_{name}" not in metrics:
+            continue
+        for stat, title in (("mean", "Mean"), ("median", "Median"), ("p99", "P99")):
+            print("{:<40} {:<10.2f}".format(f"{title} {label} (ms):", metrics[f"{stat}_{name}"]))
+    if "duplex_chunk_overrun_ratio" in metrics:
+        print("{:<40} {:<10.6f}".format("Chunk overrun ratio:", metrics["duplex_chunk_overrun_ratio"]))
+    print("=" * 50)
+
+
 def duplex_stream_metrics(session_metrics: Sequence[Mapping[str, object]]) -> dict[str, object]:
     """Summarize finite, non-negative per-session ``stream_*`` values."""
     from vllm_omni.clients.duplex import distribution_summary
@@ -431,6 +548,7 @@ def build_duplex_metrics_report(
     }
     report.update(duplex_stream_metrics(session_metrics))
     report.update(duplex_response_latency_metrics(request_metrics))
+    report.update(duplex_chunk_metrics(session_metrics))
     return report
 
 
