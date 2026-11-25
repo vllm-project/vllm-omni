@@ -2661,7 +2661,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         assert request.is_finished()
         self._record_full_payload_discard(request)
 
-        self._model_input_streams.pop(request.request_id, None)
+        streams = getattr(self, "_model_input_streams", None)
+        if streams is not None:
+            streams.pop(request.request_id, None)
         self._omits_kv_transfer_cache.pop(request.request_id, None)
 
         # [Upstream compat] Discard request from in-flight prefills set added
