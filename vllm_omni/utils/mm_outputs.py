@@ -5,7 +5,7 @@
 payloads, most of which are shared by the prefix cache / no prefix cache path.
 """
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 
 import torch
 from vllm.logger import init_logger
@@ -46,15 +46,29 @@ _CLIENT_MM_META_KEYS: frozenset[str] = frozenset(
 
 def partition_flat_payload(
     payload: Mapping[str, object],
+    *,
+    extra_client_keys: Collection[str] = (),
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Split a flattened per-request payload into inter-stage vs client mm dicts."""
+    """Split a flattened per-request payload into inter-stage vs client mm dicts.
+
+    ``extra_client_keys`` carries the keys a model declares through
+    ``omni_client_multimodal_output_keys`` -- for example Nemotron's
+    ``nvc_function_token``, without which a tool call is projected to nothing
+    and the client never learns the model asked for a tool. Declared keys are
+    copied into the client partition and kept in the inter-stage one, exactly
+    like the ``meta.*`` keys below, so downstream stages are not starved.
+    """
     if not payload:
         return {}, {}
+    declared = frozenset(extra_client_keys)
     inter_stage: dict[str, object] = {}
     client_mm: dict[str, object] = {}
     for key, value in payload.items():
         root = key.split(".", 1)[0]
         if root in _CLIENT_MM_ROOT_KEYS:
+            client_mm[key] = value
+        elif key in declared or root in declared:
+            inter_stage[key] = value
             client_mm[key] = value
         elif root == "meta" and "." in key and key.split(".", 1)[1] in _CLIENT_MM_META_KEYS:
             # Small final-output metadata needed by serving (for example
@@ -70,6 +84,8 @@ def partition_flat_payload(
 
 def partition_payload_list(
     payloads: Sequence[Mapping[str, object]],
+    *,
+    extra_client_keys: Collection[str] = (),
 ) -> tuple[list[dict[str, object] | None] | None, list[dict[str, object] | None] | None]:
     inter_stage_list: list[dict[str, object] | None] = []
     client_mm_list: list[dict[str, object] | None] = []
