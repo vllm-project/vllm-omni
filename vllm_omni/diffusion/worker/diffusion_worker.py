@@ -1652,6 +1652,12 @@ class DiffusionWorker:
             if mgr is None:
                 mgr = getattr(model_runner, "_kv_transfer_manager", None)
             try:
+                prefix_mgr = getattr(model_runner, "prefix_bf16_manager", None)
+                if prefix_mgr is not None:
+                    prefix_mgr.disable()
+            except Exception:
+                logger.exception("Failed to shut down prefix BF16 fallback manager during shutdown")
+            try:
                 offload_backend = getattr(model_runner, "offload_backend", None)
                 if offload_backend is not None:
                     offload_backend.shutdown()

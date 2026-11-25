@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from functools import wraps
+from pathlib import Path
 from types import MethodType
 from typing import TYPE_CHECKING
 
@@ -19,12 +20,21 @@ from torch import nn
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_omni.quantization.int8_config import LazyWeightMixin
+from vllm_omni.quantization.timestep_bf16_fallback import (
+    TimestepBF16FallbackLinearMethod,
+    TimestepBF16Policy,
+    attach_bf16_fallback_weight,
+    create_cpu_bf16_load_parameter,
+    iter_bf16_fallback_layers,
+    unwrap_linear_method,
+)
 
 if TYPE_CHECKING:
-    from .offline_quantization import OfflineComponentCheckpoint
+    from .offline_quantization import OfflineComponentCheckpoint, OfflinePrefixBF16Config
 
 logger = init_logger(__name__)
 _MX4_DUAL = "W4A4_MXFP4_DUALSCALE"
@@ -99,7 +109,8 @@ def native_mx_linear(
     if shape[-1] > padded_k:
         raise ValueError("native MX input exceeds the prepared weight width")
     x = x.reshape(-1, shape[-1]).to(torch.bfloat16)
-    x = nn.functional.pad(x, (0, padded_k - shape[-1]))
+    if padded_k > shape[-1]:
+        x = nn.functional.pad(x, (0, padded_k - shape[-1]))
     mx_dtype = torch_npu.float4_e2m1fn_x2 if bits == 4 else torch_npu.float8_e4m3fn
     xq, xs = torch_npu.npu_dynamic_mx_quant(
         x, dst_type=mx_dtype, axis=-1, block_size=32, round_mode="rint", scale_alg=0
@@ -130,7 +141,9 @@ def native_mx_linear(
             group_sizes=[1, 1, 32],
         )
         outputs.append(y)
-    output = torch.cat(outputs, dim=-1).to(output_dtype)
+    output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+    if output.dtype != output_dtype:
+        output = output.to(output_dtype)
     if bits not in _EXECUTED_BITS:
         logger.info(
             "H3 native MX executed W%dA%d: npu_dynamic_mx_quant + npu_quant_matmul; "
@@ -302,9 +315,22 @@ class H3NativeMXConfig(QuantizationConfig):
 
     delivery_schemes = {_MX4_SINGLE, _MX4_DUAL, _MX8}
 
-    def __init__(self, targets: dict[str, int]) -> None:
+    def __init__(
+        self,
+        targets: dict[str, int],
+        *,
+        prefix_bf16: OfflinePrefixBF16Config | None = None,
+    ) -> None:
         super().__init__()
         self.targets = targets
+        self.prefix_bf16 = prefix_bf16
+        self.prefix_bf16_steps = prefix_bf16.steps if prefix_bf16 is not None else 0
+        self.prefix_bf16_master_mode = prefix_bf16.master_mode if prefix_bf16 is not None else "stream"
+        self._prefix_policy = (
+            TimestepBF16Policy.from_prefix(prefix_bf16.steps, prefix_bf16.master_mode)
+            if prefix_bf16 is not None and prefix_bf16.enabled
+            else None
+        )
 
     def get_name(self) -> str:
         return "h3_native_mx"
@@ -328,13 +354,26 @@ class H3NativeMXConfig(QuantizationConfig):
         if not isinstance(layer, LinearBase):
             return None
         bits = self.targets.get(prefix.removeprefix("transformer."))
-        return NativeMXLinearMethod(bits) if bits else UnquantizedLinearMethod()
+        if not bits:
+            return UnquantizedLinearMethod()
+        method: LinearMethodBase = NativeMXLinearMethod(bits)
+        if self._prefix_policy is not None and self.prefix_bf16 is not None and self.prefix_bf16.matches_bits(bits):
+            return TimestepBF16FallbackLinearMethod(method, self._prefix_policy, quant_config=self)
+        return method
+
+    def prefix_target_modules(self) -> set[str]:
+        if self.prefix_bf16 is None or not self.prefix_bf16.enabled:
+            return set()
+        return {name for name, bits in self.targets.items() if self.prefix_bf16.matches_bits(bits)}
 
     def validate_model_targets(self, model: nn.Module) -> None:
         installed = {
-            name: module.quant_method.bits
+            name: unwrapped.bits
             for name, module in model.named_modules()
-            if isinstance(getattr(module, "quant_method", None), NativeMXLinearMethod)
+            if isinstance(
+                (unwrapped := unwrap_linear_method(getattr(module, "quant_method", None))),
+                NativeMXLinearMethod,
+            )
         }
         if installed != self.targets:
             missing = sorted(self.targets.keys() - installed.keys())
@@ -365,5 +404,125 @@ class H3NativeMXConfig(QuantizationConfig):
                 raise ValueError(f"native MX fused projections must share one delivery scheme: {name}")
             if (bits := _target_bits(next(iter(values)))) is not None:
                 targets[name] = bits
-        logger.info("H3 native MX mode=%s target_modules=%d", checkpoint.execution_mode, len(targets))
-        return cls(targets)
+        prefix_bf16 = getattr(checkpoint, "prefix_bf16", None)
+        logger.info(
+            "H3 native MX mode=%s target_modules=%d prefix_bf16_steps=%d prefix_mode=%s",
+            checkpoint.execution_mode,
+            len(targets),
+            prefix_bf16.steps if prefix_bf16 is not None else 0,
+            prefix_bf16.master_mode if prefix_bf16 is not None else "none",
+        )
+        return cls(targets, prefix_bf16=prefix_bf16)
+
+
+@torch.no_grad()
+def load_h3_bf16_prefix_weights(
+    transformer: nn.Module,
+    source_dir: str | Path,
+    *,
+    diffusers_weights: bool | None = None,
+) -> int:
+    """Load only BF16 delta matrices for wrapped H3 linears using H3's exact row/TP layout."""
+    from .fasth3 import _resolve_native_target
+    from .minimax_h3_transformer import _reorder_grouped_qkv_to_qkv
+    from .offline_quantization import iter_bf16_transformer_delta
+
+    wrapped_layers = {name: layer for name, layer, _ in iter_bf16_fallback_layers(transformer)}
+    if not wrapped_layers:
+        return 0
+
+    cpu_params = {name: create_cpu_bf16_load_parameter(layer) for name, layer in wrapped_layers.items()}
+    loaded_modules: set[str] = set()
+    qkv_parts: dict[str, set[str]] = {}
+    arch = getattr(transformer, "arch", None)
+
+    for raw_name, loaded_weight in iter_bf16_transformer_delta(
+        source_dir,
+        set(wrapped_layers.keys()),
+        diffusers_weights=diffusers_weights,
+    ):
+        layout = "plain"
+        module = raw_name.removesuffix(".weight")
+        is_diffusers = diffusers_weights if diffusers_weights is not None else module.startswith("transformer_blocks.")
+        if is_diffusers:
+            target = _resolve_native_target(module)
+            if target is None:
+                continue
+            module, layout = target[0], target[1]
+        param = cpu_params.get(module)
+        if param is None:
+            continue
+        weight_loader = getattr(param, "weight_loader", None) or default_weight_loader
+        if layout in {"q", "k", "v"}:
+            weight_loader(param, loaded_weight, layout)
+            qkv_parts.setdefault(module, set()).add(layout)
+            if qkv_parts[module] == {"q", "k", "v"}:
+                loaded_modules.add(module)
+        elif module.endswith(".attn.qkv_proj"):
+            if arch is None:
+                raise RuntimeError("MiniMaxH3 transformer arch metadata required to reorder grouped QKV")
+            reordered = _reorder_grouped_qkv_to_qkv(
+                loaded_weight,
+                num_query_groups=arch.num_attention_heads,
+                heads_per_group=1,
+                head_dim=arch.attention_head_dim,
+            )
+            weight_loader(param, reordered)
+            loaded_modules.add(module)
+        elif module.endswith(".mlp.fc1"):
+            if loaded_weight.shape[0] % 2:
+                raise ValueError(
+                    "MiniMax H3 fc1 BF16 prefix rows must split evenly into gate/up matrices, "
+                    f"got {tuple(loaded_weight.shape)}"
+                )
+            first, second = loaded_weight.chunk(2, dim=0)
+            gate, up = (second, first) if layout == "swap_halves" else (first, second)
+            weight_loader(param, gate, 0)
+            weight_loader(param, up, 1)
+            loaded_modules.add(module)
+        else:
+            weight_loader(param, loaded_weight)
+            loaded_modules.add(module)
+
+    if missing := sorted(wrapped_layers.keys() - loaded_modules):
+        raise ValueError(f"Incomplete H3 BF16 prefix delta load; missing={missing[:8]}")
+
+    for name, layer in wrapped_layers.items():
+        attach_bf16_fallback_weight(layer, cpu_params[name].detach())
+
+    # Restore any unquantized FP32 parameters (e.g. patch/time embedders, final
+    # output heads) that the offline exporter silently downcast to BF16.
+    from .offline_quantization import iter_fp32_preserved_tensors
+
+    wrapped_names = set(wrapped_layers.keys())
+    fp32_params = {
+        name: param
+        for name, param in transformer.named_parameters()
+        if param.dtype == torch.float32 and name.rpartition(".")[0] not in wrapped_names
+    }
+    restored_fp32 = 0
+    restored_fp32_bytes = 0
+    if fp32_params:
+        for param_name, fp32_weight in iter_fp32_preserved_tensors(
+            source_dir,
+            set(fp32_params.keys()),
+            diffusers_weights=diffusers_weights,
+        ):
+            param = fp32_params[param_name]
+            loader = getattr(param, "weight_loader", None) or default_weight_loader
+            loader(param, fp32_weight)
+            restored_fp32 += 1
+            restored_fp32_bytes += param.numel() * param.element_size()
+        if restored_fp32 and getattr(transformer, "adaln_cache", None) is not None:
+            transformer.adaln_cache.clear()
+
+    total_bytes = sum(cpu_params[n].numel() * 2 for n in wrapped_layers)
+    logger.info(
+        "Loaded H3 BF16 prefix delta: layers=%d total=%.2f GiB restored_fp32=%d (%.2f MiB) source=%s",
+        len(wrapped_layers),
+        total_bytes / (1024**3),
+        restored_fp32,
+        restored_fp32_bytes / (1024**2),
+        source_dir,
+    )
+    return len(wrapped_layers)

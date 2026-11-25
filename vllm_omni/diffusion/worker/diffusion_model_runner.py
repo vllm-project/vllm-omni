@@ -72,7 +72,7 @@ from vllm_omni.diffusion.models.interface import (
     supports_interaction_apply,
     supports_step_execution,
 )
-from vllm_omni.diffusion.offloader import enable_offload_backend
+from vllm_omni.diffusion.offloader import enable_offload_backend, enable_prefix_bf16_fallback
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
     OffloadStrategy,
@@ -469,6 +469,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         # runner only receives the pipeline/backend pair that is ready to use.
         self.pipeline, self.offload_backend = enable_offload_backend(
             self.od_config,
+            self.pipeline,
+            device=self.device,
+        )
+        self.prefix_bf16_manager = enable_prefix_bf16_fallback(
             self.pipeline,
             device=self.device,
         )

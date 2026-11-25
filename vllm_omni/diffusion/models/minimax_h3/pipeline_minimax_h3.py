@@ -1224,7 +1224,13 @@ class MiniMaxH3Pipeline(
                 raise ValueError("offline dequantize mode requires transformer quantization_config=None")
             if modular or ref2va_model_path is not None or control_path:
                 raise ValueError("offline component overrides currently require a standalone native H3 partition")
+        self._offline_bf16_prefix_source: Path | None = None
         if offline_transformer is not None:
+            if offline_transformer.prefix_bf16.enabled:
+                from .offline_quantization import resolve_bf16_transformer_dir
+
+                prefix_source = offline_transformer.prefix_bf16.source_path or (model_path / transformer_component)
+                self._offline_bf16_prefix_source = resolve_bf16_transformer_dir(prefix_source)
             self.weights_sources[0] = DiffusersPipelineLoader.ComponentSource(
                 model_or_path=str(offline_transformer.path),
                 subfolder=None,
@@ -1556,6 +1562,17 @@ class MiniMaxH3Pipeline(
             if missing_gates := required_gates - transformer_loaded:
                 raise ValueError(f"FastH3 V2 checkpoint is missing compression gates: {sorted(missing_gates)}")
         return loaded_with_prefix
+
+    def load_bf16_prefix_fallback_weights(self) -> int:
+        """Load BF16 delta weights for wrapped offline quantized H3 linears onto CPU."""
+        if self._offline_bf16_prefix_source is None:
+            return 0
+        from .native_mx import load_h3_bf16_prefix_weights
+
+        return load_h3_bf16_prefix_weights(
+            self.transformer,
+            self._offline_bf16_prefix_source,
+        )
 
     @property
     def lora_is_fused(self) -> bool:

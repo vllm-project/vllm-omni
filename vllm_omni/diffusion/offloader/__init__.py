@@ -26,6 +26,10 @@ from .plan_resolver import (
     ResolvedOffloadPlan,
     resolve_offload_plan,
 )
+from .prefix_bf16_streamer import (
+    PrefixBF16FallbackManager,
+    enable_prefix_bf16_fallback,
+)
 from .sequential_backend import (
     ModelLevelOffloadBackend,
     apply_sequential_offload,
@@ -66,6 +70,8 @@ __all__ = [
     "remove_distributed_block_hook",
     "get_offload_backend",
     "enable_offload_backend",
+    "PrefixBF16FallbackManager",
+    "enable_prefix_bf16_fallback",
     "OffloadStartupState",
     "take_offload_startup_state",
     "get_offload_plan",

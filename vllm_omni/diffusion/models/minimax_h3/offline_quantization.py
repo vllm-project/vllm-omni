@@ -105,6 +105,188 @@ class TensorSpec:
     shape: tuple[int, ...]
 
 
+_VALID_PREFIX_BITS = frozenset({"all", "w4_only"})
+
+
+@dataclass(frozen=True)
+class OfflinePrefixBF16Config:
+    """Optional BF16 timestep prefix fallback configuration for offline checkpoints."""
+
+    steps: int = 0
+    master_mode: str = "stream"
+    bits_filter: str = "all"
+    source_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        from vllm_omni.quantization.timestep_bf16_fallback import VALID_MASTER_MODES
+
+        if isinstance(self.steps, bool) or not isinstance(self.steps, int) or self.steps < 0:
+            raise ValueError(f"prefix_bf16_steps must be a non-negative integer, got {self.steps!r}")
+        if self.master_mode not in VALID_MASTER_MODES:
+            raise ValueError(
+                f"prefix_bf16_master_mode must be one of {sorted(VALID_MASTER_MODES)}, got {self.master_mode!r}"
+            )
+        if self.bits_filter not in _VALID_PREFIX_BITS:
+            raise ValueError(f"prefix_bf16_bits must be one of {sorted(_VALID_PREFIX_BITS)}, got {self.bits_filter!r}")
+
+    @property
+    def enabled(self) -> bool:
+        return self.steps > 0
+
+    def matches_bits(self, bits: int) -> bool:
+        return self.enabled and (self.bits_filter == "all" or bits == 4)
+
+
+def resolve_bf16_transformer_dir(source: str | Path) -> Path:
+    """Resolve a BF16 transformer directory from either a component or partition root."""
+    candidate = Path(source).resolve()
+    if not candidate.is_dir():
+        raise ValueError(f"BF16 prefix source directory does not exist: {candidate}")
+    if any(candidate.glob("*.safetensors")):
+        return candidate
+    nested = candidate / "transformer"
+    if nested.is_dir() and any(nested.glob("*.safetensors")):
+        return nested
+    raise ValueError(f"BF16 prefix source contains no safetensors weights: {candidate}")
+
+
+def iter_bf16_transformer_delta(
+    source_dir: str | Path,
+    target_modules: set[str],
+    *,
+    diffusers_weights: bool | None = None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Stream only BF16 weight matrices matching ``target_modules`` from safetensors."""
+    from .fasth3 import _resolve_native_target
+
+    root = resolve_bf16_transformer_dir(source_dir)
+    indices = [
+        root / name
+        for name in (
+            "model.safetensors.index.json",
+            "diffusion_pytorch_model.safetensors.index.json",
+        )
+        if (root / name).is_file()
+    ]
+    index = json.loads(indices[0].read_text(encoding="utf-8"))["weight_map"] if indices else None
+    filenames = sorted(set(index.values())) if index is not None else sorted(p.name for p in root.glob("*.safetensors"))
+    if not filenames:
+        raise ValueError(f"BF16 prefix source has no safetensors files: {root}")
+
+    if diffusers_weights is None:
+        if index is not None:
+            diffusers_weights = any(k.startswith("transformer_blocks.") for k in index)
+        else:
+            with safe_open(str((root / filenames[0]).resolve()), framework="pt", device="cpu") as reader:
+                diffusers_weights = any(k.startswith("transformer_blocks.") for k in reader.keys())
+
+    selected_by_file: dict[Path, list[str]] = {}
+    matched_targets: set[str] = set()
+    for filename in filenames:
+        file = (root / filename).resolve()
+        if not file.is_relative_to(root) or not file.is_file():
+            raise ValueError(f"invalid or missing BF16 prefix shard: {filename}")
+        with safe_open(str(file), framework="pt", device="cpu") as reader:
+            for name in reader.keys():
+                if not name.endswith(".weight"):
+                    continue
+                module = name.removesuffix(".weight")
+                if diffusers_weights:
+                    resolved = _resolve_native_target(module)
+                    if resolved is None:
+                        continue
+                    native_module = resolved[0]
+                else:
+                    native_module = module
+                if native_module not in target_modules:
+                    continue
+                view = reader.get_slice(name)
+                if view.get_dtype() not in _FLOAT_DTYPES:
+                    raise ValueError(
+                        f"BF16 prefix weight {name} in {root} has non-floating dtype {view.get_dtype()!r}; "
+                        "pass the unquantized BF16 checkpoint as prefix_bf16_source"
+                    )
+                selected_by_file.setdefault(file, []).append(name)
+                matched_targets.add(native_module)
+
+    if missing := sorted(target_modules - matched_targets):
+        raise ValueError(f"BF16 prefix source {root} is missing {len(missing)} quantized target weights: {missing[:8]}")
+
+    for file, names in selected_by_file.items():
+        with safe_open(str(file), framework="pt", device="cpu") as reader:
+            for name in names:
+                tensor = reader.get_tensor(name)
+                if tensor.dtype != torch.bfloat16:
+                    tensor = tensor.to(dtype=torch.bfloat16)
+                yield name, tensor
+
+
+def iter_fp32_preserved_tensors(
+    source_dir: str | Path,
+    target_params: set[str],
+    *,
+    diffusers_weights: bool | None = None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Stream exact FP32 tensors from ``source_dir`` matching ``target_params``.
+
+    Offline quantization exports (such as ModelSlim) can serialize non-quantized
+    boundary layers (e.g. patch embedders, timestep embedders, final output
+    projections) in BF16 even though the model declares them FP32. Reloading
+    those small FP32 parameters from the unquantized source checkpoint restores
+    exact step-0..K-1 fidelity without extra device memory.
+    """
+    if not target_params:
+        return
+    from .fasth3 import _resolve_native_target
+
+    root = resolve_bf16_transformer_dir(source_dir)
+    indices = [
+        root / name
+        for name in (
+            "model.safetensors.index.json",
+            "diffusion_pytorch_model.safetensors.index.json",
+        )
+        if (root / name).is_file()
+    ]
+    index = json.loads(indices[0].read_text(encoding="utf-8"))["weight_map"] if indices else None
+    filenames = sorted(set(index.values())) if index is not None else sorted(p.name for p in root.glob("*.safetensors"))
+    if not filenames:
+        return
+
+    if diffusers_weights is None:
+        if index is not None:
+            diffusers_weights = any(k.startswith("transformer_blocks.") for k in index)
+        else:
+            with safe_open(str((root / filenames[0]).resolve()), framework="pt", device="cpu") as reader:
+                diffusers_weights = any(k.startswith("transformer_blocks.") for k in reader.keys())
+
+    selected_by_file: dict[Path, list[tuple[str, str]]] = {}
+    for filename in filenames:
+        file = (root / filename).resolve()
+        if not file.is_relative_to(root) or not file.is_file():
+            raise ValueError(f"invalid or missing BF16 prefix shard: {filename}")
+        with safe_open(str(file), framework="pt", device="cpu") as reader:
+            for raw_name in reader.keys():
+                if diffusers_weights:
+                    module, _, kind = raw_name.rpartition(".")
+                    resolved = _resolve_native_target(module)
+                    if resolved is None or kind not in {"weight", "bias"}:
+                        continue
+                    native_name = f"{resolved[0]}.{kind}"
+                else:
+                    native_name = raw_name
+                if native_name not in target_params:
+                    continue
+                if reader.get_slice(raw_name).get_dtype() != "F32":
+                    continue
+                selected_by_file.setdefault(file, []).append((raw_name, native_name))
+
+    for file, entries in selected_by_file.items():
+        with safe_open(str(file), framework="pt", device="cpu") as reader:
+            for raw_name, native_name in entries:
+                yield native_name, reader.get_tensor(raw_name).to(dtype=torch.float32)
+
+
 class OfflineComponentCheckpoint:
     """Indexed CPU reader; metadata is checked before tensor materialization."""
 
@@ -112,6 +294,7 @@ class OfflineComponentCheckpoint:
         self.path = Path(path).resolve()
         self.execution_mode = "dequantize"
         self.single_scale_mx4 = False
+        self.prefix_bf16 = OfflinePrefixBF16Config()
         if not self.path.is_dir():
             raise ValueError(f"offline component directory does not exist: {self.path}")
         description_path = self.path / "quant_model_description.json"
@@ -271,7 +454,16 @@ def resolve_offline_components(
         return {}, False
     if not isinstance(config, Mapping):
         raise ValueError("offline_quantization must be a mapping")
-    unknown = set(config) - {"path", "components", "execution_mode"}
+    allowed_keys = {
+        "path",
+        "components",
+        "execution_mode",
+        "prefix_bf16_steps",
+        "prefix_bf16_master_mode",
+        "prefix_bf16_bits",
+        "prefix_bf16_source",
+    }
+    unknown = set(config) - allowed_keys
     if unknown:
         raise ValueError(f"unknown offline_quantization options: {sorted(unknown)}")
     mode = config.get("execution_mode", "native_auto")
@@ -283,6 +475,17 @@ def resolve_offline_components(
             mode = "native_" + family
         elif mode != "native_" + family:
             raise ValueError(f"{mode} is incompatible with this NPU (requires {family} weights)")
+
+    raw_prefix_source = config.get("prefix_bf16_source")
+    prefix_cfg = OfflinePrefixBF16Config(
+        steps=config.get("prefix_bf16_steps", 0),  # type: ignore[arg-type]
+        master_mode=str(config.get("prefix_bf16_master_mode", "stream")),
+        bits_filter=str(config.get("prefix_bf16_bits", "all")),
+        source_path=Path(str(raw_prefix_source)) if raw_prefix_source is not None else None,
+    )
+    if prefix_cfg.enabled and mode == "dequantize":
+        raise ValueError("prefix_bf16_steps requires native offline execution, not execution_mode='dequantize'")
+
     if "path" in config and "components" in config:
         raise ValueError("specify offline path or components, not both")
     paths: dict[str, str | Path]
@@ -295,9 +498,13 @@ def resolve_offline_components(
         paths = supplied_paths
     if unknown_components := set(paths) - {"transformer", "video_vae", "audio_vae"}:
         raise ValueError(f"unsupported offline components: {sorted(unknown_components)}")
+    if prefix_cfg.enabled and "transformer" not in paths:
+        raise ValueError("prefix_bf16_steps requires an offline transformer component")
     checkpoints = {name: OfflineComponentCheckpoint(path) for name, path in paths.items()}
     for checkpoint in checkpoints.values():
         checkpoint.execution_mode = str(mode)
+    if "transformer" in checkpoints:
+        checkpoints["transformer"].prefix_bf16 = prefix_cfg
     if mode == "native_mx" and any(not checkpoint.schemes <= _MX_SCHEMES for checkpoint in checkpoints.values()):
         raise ValueError("native_mx requires MXFP8/MXFP4 component checkpoints; format conversion is never implicit")
     return checkpoints, True

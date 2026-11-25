@@ -92,7 +92,7 @@ def requires_prefix_bf16_dlo(quant_config: QuantizationConfig | None) -> bool:
             requires_prefix_bf16_dlo(config)
             for config in (*quant_config.component_configs.values(), quant_config.default_config)
         )
-    if quant_config is None or quant_config.get_name() not in ("mxfp8", "mxfp4"):
+    if quant_config is None:
         return False
     prefix_steps = getattr(quant_config, "prefix_bf16_steps", 0)
     master_mode = getattr(quant_config, "prefix_bf16_master_mode", "cpu")
@@ -1758,16 +1758,23 @@ class OmniDiffusionConfig:
         """Reject an active DLO master without the distributed transport owner."""
         from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload
 
-        if not isinstance(self.quantization_config, QuantizationConfig):
-            return
         if resolve_offload(self).strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
             return
 
-        if requires_prefix_bf16_dlo(self.quantization_config):
+        offline_cfg = (self.additional_config or {}).get("offline_quantization")
+        offline_dlo = (
+            isinstance(offline_cfg, Mapping)
+            and bool(offline_cfg.get("prefix_bf16_steps", 0))
+            and offline_cfg.get("prefix_bf16_master_mode", "stream") == "dlo"
+        )
+        global_dlo = isinstance(self.quantization_config, QuantizationConfig) and requires_prefix_bf16_dlo(
+            self.quantization_config
+        )
+        if global_dlo or offline_dlo:
             raise ValueError(
                 "prefix_bf16_master_mode='dlo' requires distributed layerwise offload; "
                 "select a distributed diffusion_offload_config or enable_distributed_layerwise_offload, "
-                "or use prefix_bf16_master_mode='cpu' or 'resident'"
+                "or use prefix_bf16_master_mode='stream', 'cpu', or 'resident'"
             )
 
     def _propagate_skip_softmax_calibration(self, tf_config: "TransformerConfig") -> None:

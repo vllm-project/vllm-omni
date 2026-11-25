@@ -18,7 +18,7 @@ from torch import nn
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     filter_files_not_needed_for_inference,
@@ -945,6 +945,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             self.load_weights(model)
                     self._maybe_fuse_distilled_lora(model)
                     self._process_weights_after_loading(model, target_device)
+                    load_prefix_weights = getattr(model, "load_bf16_prefix_fallback_weights", None)
+                    if callable(load_prefix_weights):
+                        load_prefix_weights()
 
                 # A warm final-layout hit has already completed all
                 # byte-changing work through the restorer.  Shared runtime
@@ -1115,9 +1118,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             *mxfp4_online_methods,
         )
 
+        from vllm_omni.quantization.timestep_bf16_fallback import unwrap_linear_method
+
         unsupported: set[str] = set()
         for module in model.modules():
-            quant_method = getattr(module, "quant_method", None)
+            quant_method = unwrap_linear_method(getattr(module, "quant_method", None))
             if not getattr(quant_method, "uses_meta_device", False):
                 continue
             if not isinstance(quant_method, allowed_online_methods):
@@ -1543,8 +1548,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
     def _validate_prefix_bf16_offload_components(self, model: nn.Module) -> None:
         """Check actual quantized components before loading any checkpoint weights."""
-        if not isinstance(self.quant_config, QuantizationConfig) or not requires_prefix_bf16_dlo(self.quant_config):
-            return
 
         def uses_dlo_prefix(module: nn.Module) -> bool:
             return any(
