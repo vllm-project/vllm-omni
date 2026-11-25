@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_marks
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [
     pytest.mark.slow,
@@ -27,6 +28,11 @@ VARIANTS = {
         "temporal_scale": 4,
         "frames": 5,
         "max_abs": 1e-6,
+        # MI300 MIOpen differs from the Diffusers VAE by 1.2517e-6 at
+        # this boundary while the relative-L2 and cosine gates still pass.
+        # Preserve the tighter CUDA contract and allow only this measured
+        # ROCm FP32 convolution rounding envelope.
+        "rocm_max_abs": 2e-6,
         "relative_l2": 1e-6,
     },
     "720p": {
@@ -47,7 +53,7 @@ VARIANTS = {
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize(
     "_hardware",
-    [pytest.param(None, marks=hardware_marks(res={"cuda": "H100"}))],
+    [pytest.param(None, marks=hardware_marks(res={"cuda": "H100", "rocm": "MI300"}))],
 )
 def test_sana_video_i2v_first_frame_latents_match_diffusers(variant: str, _hardware) -> None:
     del _hardware
@@ -165,6 +171,13 @@ def test_sana_video_i2v_first_frame_latents_match_diffusers(variant: str, _hardw
         expected[:, :, :1].flatten(),
         dim=0,
     )
-    assert max_abs.item() <= config["max_abs"]
-    assert relative_l2.item() <= config["relative_l2"]
-    assert cosine.item() >= 0.9999
+    max_abs_threshold = (
+        config.get("rocm_max_abs", config["max_abs"]) if current_omni_platform.is_rocm() else config["max_abs"]
+    )
+    metrics = (
+        f"variant={variant}, max_abs={max_abs.item():.9g}, "
+        f"relative_l2={relative_l2.item():.9g}, cosine={cosine.item():.9g}"
+    )
+    assert max_abs.item() <= max_abs_threshold, metrics
+    assert relative_l2.item() <= config["relative_l2"], metrics
+    assert cosine.item() >= 0.9999, metrics

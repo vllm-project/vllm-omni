@@ -57,6 +57,7 @@ def build_parallel_attention_strategy(
     allgather_degree = getattr(p, "allgather_degree", 1)
     ulysses_a2a_permute = getattr(p, "ulysses_a2a_permute", False)
     ulysses_a2a_backend = getattr(p, "ulysses_a2a_backend", "copy_engine")
+    ulysses_overlap_chunks = int(getattr(p, "ulysses_overlap_chunks", 0) or 0)
     if ulysses_a2a_permute:
         from vllm_omni.diffusion.distributed.a2a_permute import validate_a2a_permute_config
 
@@ -129,6 +130,7 @@ def build_parallel_attention_strategy(
             use_sync=use_sync,
             ulysses_a2a_permute=ulysses_a2a_permute,
             ulysses_a2a_backend=ulysses_a2a_backend,
+            ce_overlap_chunks=ulysses_overlap_chunks,
         )
 
     # Pure Ring Attention
