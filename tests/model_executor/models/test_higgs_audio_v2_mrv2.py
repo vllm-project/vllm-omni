@@ -8,6 +8,8 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_talker import (
+    HiggsAudioRMSNorm,
+    HiggsAudioV2DecoderLayer,
     HiggsAudioV2Sampler,
     HiggsAudioV2TalkerForConditionalGeneration,
 )
@@ -17,6 +19,55 @@ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_sampler import OmniSamplingOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class _RoutingTestAttention(torch.nn.Module):
+    def forward(self, positions, hidden_states):
+        return hidden_states
+
+
+class _RoutingTestFinalNorm(torch.nn.Module):
+    def forward(self, hidden_states, residual):
+        return hidden_states + residual
+
+
+@pytest.mark.parametrize("token_ids", [[4, 4], [9, 4], [3, 4], [1, 1]])
+@torch.inference_mode()
+def test_uniform_audio_routing_avoids_layer_indexing_without_rerouting_text(token_ids):
+    """Pure audio skips boolean indexing; BOS and mixed spans keep their experts."""
+    model = object.__new__(HiggsAudioV2TalkerForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.config = _Config()
+    layers = []
+    for _ in range(2):
+        layer = object.__new__(HiggsAudioV2DecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.self_attn = _RoutingTestAttention()
+        layer.input_layernorm = HiggsAudioRMSNorm(4)
+        layer.audio_input_layernorm = HiggsAudioRMSNorm(4)
+        layer.post_attention_layernorm = HiggsAudioRMSNorm(4)
+        layer.audio_post_attention_layernorm = HiggsAudioRMSNorm(4)
+        layer.mlp = torch.nn.Linear(4, 4, bias=False)
+        layer.audio_mlp = torch.nn.Linear(4, 4, bias=False)
+        torch.nn.init.constant_(layer.mlp.weight, 2)
+        torch.nn.init.constant_(layer.audio_mlp.weight, 3)
+        layers.append(layer)
+    model.layers = torch.nn.ModuleList(layers)
+    model.norm = _RoutingTestFinalNorm()
+    input_ids = torch.tensor(token_ids)
+    positions = torch.arange(len(token_ids))
+    embeddings = torch.arange(len(token_ids) * 4, dtype=torch.float32).reshape(-1, 4)
+    mask = model.audio_token_mask(input_ids)
+    expected = embeddings
+    residual = None
+    for layer in model.layers:
+        expected, residual = layer(positions, expected, residual, audio_token_mask=mask)
+    expected = model.norm(expected, residual)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        actual = model(input_ids, positions, inputs_embeds=embeddings)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    if all(token in (4, 9) for token in token_ids):
+        assert not any(event.key == "aten::nonzero" for event in profile.key_averages())
 
 
 @dataclass

@@ -1836,6 +1836,14 @@ stages:
         assert deploy.stages[0].compilation_config == {"pass_config": {"fuse_allreduce_rms": False}}
         assert "compilation_config" not in deploy.stages[0].engine_extras
 
+    def test_glm_tts_stage_zero_scopes_eager_quality_contract_to_rocm(self):
+        deploy_path = Path(get_deploy_config_path("glm_tts.yaml"))
+        cuda_deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        rocm_deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
+
+        assert cuda_deploy.stages[0].enforce_eager is False
+        assert rocm_deploy.stages[0].enforce_eager is True
+
     def test_load_voxcpm2_deploy_config_preserves_engine_extras(self):
         deploy_path = get_deploy_config_path("voxcpm2.yaml")
         raw_stage = get_deploy_config_stage("voxcpm2.yaml", 0)
@@ -3338,9 +3346,10 @@ class TestPlatformOverrides:
         """The only stochastic Qwen3-Omni stage must stay reproducible.
 
         Dropping this seed (as #4986 did) leaves the talker sampling codec
-        tokens unseeded at temperature 0.9, which reopened the audio-vs-text
-        nightly failures in #6090. Pin it so a cleanup cannot remove it again
-        without failing here.
+        tokens unseeded at temperature 0.9, including both codebook 0 and the
+        residual codebooks. That reopened the audio-vs-text nightly failures
+        in #6090. Pin it so a cleanup cannot remove it again without failing
+        here.
         """
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         pipeline = resolve_pipeline_config(
@@ -3440,6 +3449,8 @@ class TestPlatformOverrides:
         [
             ("qwen3_tts.yaml", "qwen3_tts", "v2", ()),
             ("moss_tts_local.yaml", "moss_tts_local", "v2", ()),
+            ("chatterbox_turbo.yaml", "chatterbox_turbo", "v2", ()),
+            ("chatterbox.yaml", "chatterbox", "v2", ()),
             ("moss_tts_nano.yaml", "moss_tts_nano", "v2", ()),
             ("moss_tts_realtime.yaml", "moss_tts_realtime", "v2", ()),
             ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
@@ -3467,8 +3478,18 @@ class TestPlatformOverrides:
             "minicpmo_4_5_duplex_h200.yaml",
         )
         # XPU has no V1 fallback: vLLM 0.34 removed Model Runner V1.
-        xpu_full_mrv2 = platform == "xpu" and filename in ("qwen3_tts.yaml", "moss_tts_nano.yaml")
-        rocm_full_mrv2 = platform == "rocm" and filename in ("qwen3_tts.yaml", "minicpmo_4_5.yaml")
+        xpu_full_mrv2 = platform == "xpu" and filename in (
+            "qwen3_tts.yaml",
+            "moss_tts_nano.yaml",
+            "chatterbox_turbo.yaml",
+            "chatterbox.yaml",
+        )
+        rocm_full_mrv2 = platform == "rocm" and filename in (
+            "qwen3_tts.yaml",
+            "minicpmo_4_5.yaml",
+            "chatterbox_turbo.yaml",
+            "chatterbox.yaml",
+        )
         if platform == "cuda":
             expected_runner = cuda_default_runner
         elif all_platforms_mrv2 or npu_full_mrv2 or xpu_full_mrv2 or rocm_full_mrv2:

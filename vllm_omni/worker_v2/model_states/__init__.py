@@ -33,6 +33,22 @@ def _omni_state_for(vllm_config, model, encoder_cache, device):
     return OmniModelState(vllm_config, model, encoder_cache, device)
 
 
+def _is_encoder_only_model(vllm_config: VllmConfig, model: nn.Module) -> bool:
+    comp_cfg = getattr(vllm_config, "compilation_config", None)
+    if getattr(comp_cfg, "static_forward_context", None) is None:
+        return False
+    from vllm.config import get_layers_from_vllm_config
+    from vllm.model_executor.layers.attention import Attention, CrossAttention
+    from vllm.v1.attention.backend import AttentionType
+
+    if isinstance(model, nn.Module) and any(isinstance(m, CrossAttention) for m in model.modules()):
+        return False
+    return any(
+        layer.attn_type == AttentionType.ENCODER_ONLY
+        for layer in get_layers_from_vllm_config(vllm_config, Attention).values()
+    )
+
+
 def init_omni_model_state(
     vllm_config: VllmConfig,
     model: nn.Module,
@@ -42,9 +58,11 @@ def init_omni_model_state(
     """Create the appropriate ``ModelState`` for *model*.
 
     Returns an ``OmniModelState`` when the model declares Omni lifecycle
-    capabilities, and an ``OmniMambaHybridModelState`` for hybrid models of an
-    Omni stage that do not supply their own state. Otherwise delegates to the
-    upstream v2 factory, wrapping its default state for auxiliary Omni stages.
+    capabilities, an ``OmniMambaHybridModelState`` for hybrid models of an
+    Omni stage that do not supply their own state, and an
+    ``OmniEncoderOnlyModelState`` for encoder-only pooling models of an Omni
+    stage. Otherwise delegates to the upstream v2 factory, wrapping its default
+    state for auxiliary Omni stages.
     """
     factory = getattr(model, "create_omni_model_state", None)
     if factory is not None:
@@ -67,6 +85,18 @@ def init_omni_model_state(
         from vllm_omni.worker_v2.model_states.omni_mamba_hybrid import OmniMambaHybridModelState
 
         return OmniMambaHybridModelState(vllm_config, model, encoder_cache, device)
+    if isinstance(model_config, OmniModelConfig) and not owns_state and _is_encoder_only_model(vllm_config, model):
+        # Upstream picks EncoderOnlyModelState for non-causal encoder layers
+        # (e.g. ModernBERT/LAYA); the Omni runner needs OmniModelState's
+        # lifecycle too.
+        from vllm_omni.worker_v2.model_states.omni_encoder_only import OmniEncoderOnlyModelState
+
+        if (
+            getattr(model_config, "enable_prompt_embeds", False)
+            and not OmniEncoderOnlyModelState.supports_prompt_embeds
+        ):
+            raise ValueError(f"--enable-prompt-embeds not supported with {OmniEncoderOnlyModelState.__name__}.")
+        return OmniEncoderOnlyModelState(vllm_config, model, encoder_cache, device)
     uses_omni_lifecycle = any(
         getattr(model, flag, False) is True for flag in ("has_preprocess", "has_postprocess", "have_multimodal_outputs")
     )

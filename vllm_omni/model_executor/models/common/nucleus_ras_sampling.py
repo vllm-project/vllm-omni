@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared TTS sampling primitives: nucleus (top-p/top-k) and RAS.
 
 Used by CosyVoice3 and GLM-TTS (and any future TTS model with RAS).
@@ -46,7 +46,10 @@ def nucleus_sample_one(
             largest=True,
             sorted=True,
         )
-        sorted_prob = (top_scores - torch.logsumexp(top_scores, dim=0)).exp()
+        # Upstream GLM-TTS computes softmax over the full eligible vocabulary
+        # before applying the top-k cap. Renormalizing only the top-k subset
+        # over-concentrates its mass and changes the top-p boundary.
+        sorted_prob = (top_scores - torch.logsumexp(weighted_scores, dim=0)).exp()
     else:
         probs = weighted_scores.softmax(dim=0)
         sorted_prob, sorted_idx = probs.sort(descending=True, stable=True)

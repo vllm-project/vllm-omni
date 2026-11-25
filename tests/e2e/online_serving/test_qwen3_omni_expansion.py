@@ -155,6 +155,13 @@ def test_text_to_text_audio_001(omni_server, online_client) -> None:
     }
 
     online_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    if os.environ.get("QWEN3_OMNI_EXPECT_AITER_MM_ENCODER") == "1":
+        # Each parameter starts its own stage-CLI server. Check this instance's
+        # stage-0 selection before teardown truncates its logs for display.
+        thinker_log = omni_server.read_stage_logs().get(0, "")
+        assert "Using AttentionBackendEnum.ROCM_AITER_FA for MMEncoderAttention." in thinker_log, (
+            "Stage 0 did not select ROCM_AITER_FA for MMEncoderAttention"
+        )
 
 
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
