@@ -3,8 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 set -euo pipefail
 
-: "${MODEL_ROOT:?Set MODEL_ROOT to the prepared original/thinker-w8a8 model tree}"
-: "${DRAFT_MODEL:?Set DRAFT_MODEL to the MiniCPM-o Thinker DSpark checkpoint}"
+model="${MODEL_ROOT:-openbmb/MiniCPM-o-4_5}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 runtime_dir="${RUNTIME_DIR:-$(mktemp -d -t minicpmo-ascend.XXXXXXXX)}"
@@ -28,27 +27,20 @@ touch "$MINICPMO_NPU_TALKER_HYBRID_CONTEXT_FILE"
 printf '%s deployment\n' "${TALKER_ROUTE:-half}" > "$MINICPMO_C8_TALKER_ROUTE_FILE"
 printf '%s deployment\n' "${VOCODER_ROUTE:-adaptive_secondary}" > "$MINICPMO_C8_VOCODER_ROUTE_FILE"
 
-python3 - "$repo_root" "$runtime_dir" "$MODEL_ROOT" "$DRAFT_MODEL" "${DEPLOY_CONFIG:-}" "${MAX_NUM_SEQS:-}" <<'PY'
-import json
+python3 - "$repo_root" "$runtime_dir" "${DRAFT_MODEL:-}" "${DEPLOY_CONFIG:-}" "${MAX_NUM_SEQS:-}" "${THINKER_W8A8:-0}" <<'PY'
 import sys
 from pathlib import Path
 
 import yaml
 from vllm_omni.config.stage_config import resolve_deploy_yaml
 
-repo, runtime, model, draft = (Path(p).resolve() for p in sys.argv[1:5])
-deployment, seqs_arg = sys.argv[5:7]
+repo, runtime = (Path(p).resolve() for p in sys.argv[1:3])
+draft, deployment, seqs_arg, thinker_w8a8 = sys.argv[3:]
 default_deploy = repo / "vllm_omni/deploy/minicpmo_4_5_2gpu.yaml"
 deploy_path = Path(deployment).resolve() if deployment else default_deploy
 seqs = int(seqs_arg) if seqs_arg else None
 if seqs is not None and seqs <= 0:
     raise ValueError("MAX_NUM_SEQS must be positive")
-for directory in (model, model / "original", model / "thinker-w8a8", draft):
-    if not (directory / "config.json").is_file():
-        raise FileNotFoundError(f"Missing prepared model config: {directory / 'config.json'}")
-quant = json.loads((model / "thinker-w8a8/config.json").read_text()).get("quantization_config", {})
-if quant.get("quant_method") != "compressed-tensors":
-    raise ValueError("thinker-w8a8 must contain the qualified compressed-tensors W8A8 checkpoint")
 config = resolve_deploy_yaml(deploy_path)
 if seqs is not None:
     for stage in config["stages"]:
@@ -56,26 +48,31 @@ if seqs is not None:
 for stage in config["platforms"]["npu"]["stages"]:
     if seqs is not None:
         stage["max_num_seqs"] = seqs
-    thinker = stage["stage_id"] == 0
-    if deploy_path == default_deploy:
-        stage["model_subdir"] = "thinker-w8a8" if thinker else "original"
-    if thinker and deploy_path == default_deploy:
+    if stage["stage_id"] != 0:
+        continue
+    if thinker_w8a8 == "1":
+        stage["model_subdir"] = "thinker-w8a8"
         stage.setdefault("additional_config", {})["minicpmo_visual_a16_prefill"] = True
-        stage["speculative_config"] = {
+    if draft:
+        public_draft = "Qun1023/MiniCPM-o-4_5-thinker-DSpark-mm"
+        local_draft = Path(draft).expanduser()
+        spec = {
             "method": "dspark",
-            "model": str(draft),
+            "model": str(local_draft.resolve()) if local_draft.is_dir() else draft,
             "num_speculative_tokens": 7,
             "draft_tensor_parallel_size": 1,
         }
-    elif thinker and (spec := stage.get("speculative_config")) and spec["method"] == "dspark":
-        spec["model"] = str(draft)
+        if draft == public_draft:
+            spec["revision"] = "c4c310aca2c768343165261cb22c21b90c1f79e0"
+        stage["speculative_config"] = spec
+        stage["async_scheduling"] = False
 (runtime / "deploy.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
 print(f"Rendered deployment: {runtime / 'deploy.yaml'}", flush=True)
 PY
 
 cd "$repo_root"
 exec numactl --cpunodebind="${NUMA_NODE:-0}" --preferred="${NUMA_NODE:-0}" \
-  python3 -m vllm_omni.entrypoints.cli.main serve "$MODEL_ROOT" \
+  python3 -m vllm_omni.entrypoints.cli.main serve "$model" \
   --served-model-name openbmb/MiniCPM-o-4_5 \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-8000}" \
   --omni --trust-remote-code \

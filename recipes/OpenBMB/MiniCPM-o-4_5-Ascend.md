@@ -1,13 +1,11 @@
 # MiniCPM-o 4.5 on two Ascend cards
 
-This recipe runs one 40,960-token Thinker with DSpark 7, two 4,096-token
-Talker replicas with K16, and two Code2Wav replicas with five-step FP32 CFM.
-All stages use MRv2. The shared KV layout is scoped to MiniCPM-o on Ascend and
-uses the stock vLLM-Ascend allocator.
+This recipe runs one 40,960-token Thinker, two 4,096-token Talker replicas
+with K16, and two Code2Wav replicas with five-step FP32 CFM. All stages use
+MRv2 and the stock vLLM-Ascend allocator.
 
 - [Two-card deployment template](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml)
 - [Launcher](serve_minicpmo_ascend.sh)
-- [Checkpoint manifest](minicpmo_ascend_checkpoint_manifest.json)
 
 ## Dependencies
 
@@ -16,81 +14,12 @@ Start with the `quay.nju.edu.cn/atlas-ci/vllm-ascend:v0.34.0` image, the matchin
 Ascend driver, and `numactl`. The measured image digest is
 `sha256:4ec880dc132cc9c3993d914039b2879db5db4f432ef36211417fcdcb9249d590`.
 It contains vLLM `62d4bc3c7`, vLLM-Ascend `19c063b54`, and CANN 9.3.
-The manifest's runtime versions and commit IDs identify this serving image.
-Mount the vLLM-Omni checkout and model assets into the container. Preserve the
-image's CANN environment and Python paths. The launcher prepends this checkout
-to `PYTHONPATH`.
+Mount the checkout and your Hugging Face cache or local models into the
+container. Keep the image's CANN environment and Python paths.
 
-## Checkpoint assets
+## Launch with the original weights
 
-This deployment uses a prepared **W8A8 Thinker checkpoint** in compressed-tensors
-format with symmetric per-channel INT8 weights and dynamic per-token INT8
-activations. The vision/audio encoders, Talker, and Code2Wav retain their
-original weights. Use the checkpoint manifest to verify the model assets.
-
-Prepare this layout, with the original tokenizer/processor assets also present
-at `MODEL_ROOT`:
-
-```text
-MODEL_ROOT/
-  config.json, tokenizer.json, processing_minicpmo.py, ...
-  original/          # original openbmb/MiniCPM-o-4_5 checkpoint
-  thinker-w8a8/      # qualified compressed-tensors checkpoint
-DRAFT_MODEL/
-  config.json
-  model.safetensors
-```
-
-The Thinker draft source is
-`Qun1023/MiniCPM-o-4_5-thinker-DSpark-mm`, revision
-`c4c310aca2c768343165261cb22c21b90c1f79e0`. Its qualified weights have SHA256
-`6189fd34847451de1527a76d68ba5811bbd6228411ecd5c979b14155e8a409ac`.
-The manifest records the exact checkpoint configurations, Python assets and
-weight hashes used for reproduction. Supply the qualified W8A8 artifact;
-the original HF model download alone is insufficient for this deployment.
-
-For example, create a new model root from existing checkpoints:
-
-```bash
-export ORIGINAL_MODEL=/models/MiniCPM-o-4_5
-export QUANTIZED_MODEL=/models/MiniCPM-o-4_5-w8a8
-export MODEL_ROOT=/models/minicpmo-serving
-export DRAFT_MODEL=/models/minicpmo-thinker-dspark
-mkdir -p "$MODEL_ROOT"
-ln -s "$ORIGINAL_MODEL" "$MODEL_ROOT/original"
-ln -s "$QUANTIZED_MODEL" "$MODEL_ROOT/thinker-w8a8"
-for asset in "$ORIGINAL_MODEL"/*; do
-  ln -s "$asset" "$MODEL_ROOT/$(basename "$asset")"
-done
-```
-
-Verify the model assets from the repository root. This reads checkpoint files
-but performs no inference or benchmark:
-
-```bash
-python3 - "$MODEL_ROOT" "$DRAFT_MODEL" <<'PY'
-import hashlib
-import json
-import sys
-from pathlib import Path
-
-manifest = json.loads(Path("recipes/OpenBMB/minicpmo_ascend_checkpoint_manifest.json").read_text())
-roots = {"original": Path(sys.argv[1]) / "original",
-         "thinker-w8a8": Path(sys.argv[1]) / "thinker-w8a8",
-         "draft-thinker": Path(sys.argv[2])}
-for group, files in manifest["assets"].items():
-    for name, expected in files.items():
-        path = roots[group] / name
-        with path.open("rb") as stream:
-            actual = hashlib.file_digest(stream, "sha256").hexdigest()
-        assert actual == expected["sha256"], str(path)
-print("Checkpoint assets match")
-PY
-```
-
-## Launch
-
-Run from the repository root after setting `MODEL_ROOT` and `DRAFT_MODEL`:
+From the repository root, run:
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1
@@ -100,11 +29,92 @@ export PROFILING_MODE=dynamic TASK_QUEUE_ENABLE=1
 bash recipes/OpenBMB/serve_minicpmo_ascend.sh
 ```
 
-The launcher renders `minicpmo_4_5_2gpu.yaml` with the prepared W8A8
-Thinker and local DSpark checkpoint. Using the YAML directly with the original
-checkpoint selects the shared Ngram settings.
-It creates mode files in a per-service temporary directory. Set `RUNTIME_DIR`
-to a unique path to keep the rendered deployment and mode files.
+The default target is the public [OpenBMB MiniCPM-o 4.5 checkpoint][base].
+The service downloads the model on first use if needed. To use an existing
+local snapshot, set `MODEL_ROOT=/models/MiniCPM-o-4_5` before starting the
+launcher. The default Thinker uses Ngram speculation with the target
+weights and committed token history.
+
+## Optional Thinker DSpark
+
+The launcher can switch Thinker speculation to the separate public
+[DSpark draft][draft] and propose up to seven tokens per draft. Native duplex
+WebSocket decoding still skips drafts. The draft can be used by ordinary chat
+requests on the same service.
+
+For automatic download, pass the Hugging Face repository ID:
+
+```bash
+DRAFT_MODEL=Qun1023/MiniCPM-o-4_5-thinker-DSpark-mm \
+  bash recipes/OpenBMB/serve_minicpmo_ascend.sh
+```
+
+The launcher pins the revision below in stage 0's `speculative_config`.
+vLLM downloads it into the Hugging Face cache as needed. For a manual
+download or offline serving, use a local directory:
+
+```bash
+hf download Qun1023/MiniCPM-o-4_5-thinker-DSpark-mm \
+  --revision c4c310aca2c768343165261cb22c21b90c1f79e0 \
+  --local-dir /models/minicpmo-thinker-dspark
+DRAFT_MODEL=/models/minicpmo-thinker-dspark \
+  bash recipes/OpenBMB/serve_minicpmo_ascend.sh
+```
+
+For a custom deploy YAML, set `speculative_config` on the entry with
+`stage_id: 0` under `platforms.npu.stages`. Set `async_scheduling: false`
+on the same entry. The model can be the pinned Hub repo or a local directory.
+Leave out `revision` for a local path.
+
+```yaml
+speculative_config:
+  method: dspark
+  model: Qun1023/MiniCPM-o-4_5-thinker-DSpark-mm
+  revision: c4c310aca2c768343165261cb22c21b90c1f79e0
+  num_speculative_tokens: 7
+  draft_tensor_parallel_size: 1
+```
+
+In a historical Ascend C1 comparison on 32 streaming Seed-TTS requests with
+the same W8A8 Thinker, 16K context, K16 Talker, and five CFM steps, enabling
+DSpark 7 reduced mean RTF from 0.1794 to 0.1580 (11.9%) and mean time to first
+audio from 443 to 347 ms (21.8%). The control used no Thinker speculation.
+The gain over default Ngram or on the original BF16 weights has yet to be
+measured in a matching run.
+
+## Optional INT8 W8A8 Thinker
+
+The five-tier performance report used INT8 Thinker weights with dynamic
+per-token INT8 activation quantization. To export from the pinned public
+checkpoint, run the following on a CPU host with PyTorch and safetensors.
+The conversion processes one shard at a time. Allow space for both
+checkpoints.
+
+```bash
+hf download openbmb/MiniCPM-o-4_5 \
+  --revision a0b28789837801b80ca674a178cc5cb27843fba8 \
+  --local-dir /models/minicpmo-original
+OMP_NUM_THREADS=4 python3 tools/quantize_minicpmo_ascend.py \
+  /models/minicpmo-original /models/minicpmo-original/thinker-w8a8
+MODEL_ROOT=/models/minicpmo-original THINKER_W8A8=1 \
+  DRAFT_MODEL=Qun1023/MiniCPM-o-4_5-thinker-DSpark-mm \
+  bash recipes/OpenBMB/serve_minicpmo_ascend.sh
+```
+
+The exporter quantizes the Thinker attention and MLP projections with
+symmetric per-output-channel scales. Re-exporting the four weight shards
+from the pinned revision reproduced their SHA256 digests from the benchmark.
+The exporter copies the model code and tokenizer from the public snapshot.
+The historical deployment used different model Python assets. See the PR's
+test results for the measured configuration.
+
+[base]: https://huggingface.co/openbmb/MiniCPM-o-4_5
+[draft]: https://huggingface.co/Qun1023/MiniCPM-o-4_5-thinker-DSpark-mm/tree/c4c310aca2c768343165261cb22c21b90c1f79e0
+
+## Operation
+
+Set `RUNTIME_DIR` to a unique path to keep the rendered deployment YAML and
+per-service mode files.
 
 Thinker and Talker allow 16 sequences per worker, and Code2Wav allows 32. The
 Talker splits new requests evenly. Code2Wav routes by weighted active and

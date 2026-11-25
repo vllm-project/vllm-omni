@@ -167,10 +167,10 @@ stages:
 vLLM 0.34 resolves a draft config with `architectures: ["DSparkDraftModel"]`
 and `model_type: qwen3` to `Qwen3DSparkModel`. Drafters that read Thinker
 layers use the Thinker MRv2 auxiliary-hidden-state interface.
-Validation covers CUDA turn sessions with greedy text and speech output.
-Duplex sessions keep their own sampler and are not covered. NPU and ROCm use
-MRv2 but do not inherit this CUDA drafter configuration; XPU and MUSA retain
-the deferred V1 default and cannot run it with vLLM 0.34.
+CUDA turn sessions support DSpark with greedy text and speech output. Ascend
+MRv2 also supports DSpark for ordinary chat, including chat served by a duplex
+deployment. Native duplex requests keep their own sampler and skip drafts.
+ROCm uses MRv2. XPU and MUSA retain the deferred V1 default.
 Greedy text can differ from decoding without drafts at near-tied tokens.
 
 The default single-card and two-card Ascend YAMLs use synchronous MRv2
@@ -194,8 +194,9 @@ to restore asynchronous scheduling for ordinary decoding.
 The Ascend `minicpmo_4_5_2gpu.yaml` profile puts Thinker on the second
 visible NPU and one replica of Talker and Code2Wav on each NPU. It inherits
 the common stage settings from `minicpmo_4_5.yaml`. The
-[Ascend launcher](gh-file:recipes/OpenBMB/serve_minicpmo_ascend.sh) selects
-the prepared W8A8 Thinker and DSpark draft when those checkpoints are available.
+[Ascend deployment recipe](gh-file:recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md)
+uses the original checkpoint and Ngram by default. It documents optional
+Thinker DSpark and INT8 W8A8.
 
 ## Thinker prefix cache with drafts
 
