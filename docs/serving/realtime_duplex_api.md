@@ -11,7 +11,7 @@ with `vllm_omni.clients.duplex.DuplexClient`, and the complete wire contract.
 The endpoint requires a duplex plugin and a deployment with `session_mode: duplex`.
 See [supported models and deployments](full_duplex_api.md#enable-full-duplex),
 the [runtime architecture](../design/fullduplex.md), and the
-[Duplex-MPE multi-party selective participation benchmark](../../benchmarks/duplex_mpe/README.md).
+[Duplex-MPE multi-party selective participation benchmark](gh-file:benchmarks/duplex_mpe/README.md).
 
 ## Qwen3-Omni conversation history
 
