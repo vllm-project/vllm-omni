@@ -432,6 +432,11 @@ class ScheduleCandidate:
     backend_explicit: bool
 
 
+def _is_nvidia_cuda() -> bool:
+    """The copy-engine overlap drives the NVIDIA driver; ROCm tensors also report ``is_cuda``."""
+    return current_omni_platform.is_cuda() and torch.version.hip is None
+
+
 class Attention(nn.Module):
     _scheduler_paged_kv = False
     _has_custom_attention = False
@@ -1215,7 +1220,7 @@ class Attention(nn.Module):
         sp_group = getattr(strategy, "_sp_group", None)
         if sp_group is None or sp_group.ring_world_size != 1 or sp_group.ulysses_world_size <= 1:
             return 0
-        if get_ulysses_mode(default="strict") != "strict" or not query.is_cuda:
+        if get_ulysses_mode(default="strict") != "strict" or not query.is_cuda or not _is_nvidia_cuda():
             return 0
         if query.dim() != 4 or query.shape[0] != 1 or key.shape != query.shape or value.shape != query.shape:
             return 0
