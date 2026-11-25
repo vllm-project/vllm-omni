@@ -36,6 +36,11 @@ def _collective_worker(rank, rendezvous, backend):
         class VisualCodec:
             fail = False
 
+            @property
+            def encoder_component(self):
+                # The resident VAE exposes an encoder proxy; the stub encodes itself.
+                return self
+
             def is_distributed_enabled(self):
                 return True
 
