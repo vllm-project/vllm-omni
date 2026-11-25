@@ -169,6 +169,4 @@ def test_talker_check_keeps_accepting_blank_text():
 @pytest.mark.parametrize("pipeline", [QWEN3_TTS_PIPELINE, QWEN3_TTS_FUSED_PIPELINE])
 def test_talker_stage_runs_the_check(pipeline):
     stage0 = next(stage for stage in pipeline.stages if stage.stage_id == 0)
-    assert stage0.prompt_transform_func == (
-        "vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder.check_text_prompt"
-    )
+    assert stage0.prompt_transform_func == "vllm_omni.model_executor.models.qwen3_tts.prompt_checks.check_tts_prompt"

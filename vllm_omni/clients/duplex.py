@@ -779,6 +779,16 @@ class DuplexClientBase(ABC):
 
     # -- input ----------------------------------------------------------------
 
+    async def append_text(self, text: str, *, force_listen: bool = False) -> None:
+        """Prefill a text fragment; force listening while more input is arriving.
+
+        Requires ``text`` in the session's input modalities. Like audio units,
+        fragments may elicit a model-native response before the next append.
+        """
+        if not text:
+            raise ValueError("append_text requires non-empty text")
+        await self.send({"type": "input.text.append", "text": text, "force_listen": force_listen})
+
     async def append_audio(
         self,
         pcm: bytes,
@@ -1793,7 +1803,7 @@ class EventCollector:
             if isinstance(stage_metrics, dict):
                 for stage_id, stage_snapshot in stage_metrics.items():
                     if isinstance(stage_snapshot, dict):
-                        observed_stage_metrics[str(stage_id)] = stage_snapshot
+                        observed_stage_metrics[str(stage_id)] = dict(stage_snapshot)
 
             event_request_metrics = _event_response_request_metrics(event)
             if event_request_metrics is not None:
@@ -1813,6 +1823,8 @@ class EventCollector:
         result: dict[str, object] = {}
         stage0_metrics = observed_stage_metrics.get("0")
         if observed_stage_metrics:
+            # Preserve raw cumulative snapshots for the shared benchmark aggregator.
+            result["stage_metrics"] = observed_stage_metrics
             stages = {
                 stage_id: _stage_engine_metrics_block(stage_snapshot)
                 for stage_id, stage_snapshot in sorted(

@@ -115,6 +115,11 @@ These stage defaults match the LingBot reference pipeline. Request-level
 values continue to override them, so the smaller smoke request below remains
 unchanged.
 
+The same Dense or MoE service also accepts single-frame text-to-image requests
+at `/v1/images/generations`. Set `"num_frames": 1` in the JSON request to override
+the server's video default of 81, along with `"size": "320x192"` and `"n": 1`
+for a small smoke request. This image capability does not apply to LingBot World.
+
 When serving MoE, replace the request's `model` form value below with
 `robbyant/lingbot-video-moe-30b-a3b`.
 
@@ -244,7 +249,7 @@ Submit the same text-to-video job as above, with
 ## Key Parameters
 
 | Parameter | Suggested smoke value | Notes |
-|-----------|-----------------------|-------|
+| ----------- | ----------------------- | ------- |
 | `height` | `192` | Must be a multiple of 16 |
 | `width` | `320` | Must be a multiple of 16 |
 | `num_frames` | `9` | Must be `1` or `4n + 1`; this PR validates T2V with video outputs |
@@ -294,7 +299,7 @@ Local MoE offload validation on one RTX 5090 (32 GiB) with the offline
 reporting worker peak reserved GPU memory and generation time for one request:
 
 | Offload selector | 9 frames, `192x320`, 2 steps | 25 frames, `480x480`, 20 steps | 81 frames, `480x832`, 4 steps |
-|------------------|------------------------------|--------------------------------|-------------------------------|
+| ------------------ | ------------------------------ | -------------------------------- | ------------------------------- |
 | `--enable-layerwise-offload` | `10192 MiB`, `6.7s` | `9152 MiB`, `47.4s` | `16104 MiB`, `38.4s` |
 | `{"mode":"layer","components":["dit"]}` | `16278 MiB`, `4.8s` | not measured | not measured |
 | `--enable-cpu-offload` | CUDA out-of-memory during warmup | not measured | not measured |
@@ -332,7 +337,7 @@ seed, reporting worker peak reserved GPU memory. Generation times are in the
 H100 table below:
 
 | Offload selector | 9 frames, `192x320`, 2 steps | 25 frames, `480x480`, 20 steps |
-|------------------|------------------------------|--------------------------------|
+| ------------------ | ------------------------------ | -------------------------------- |
 | none | `72314 MiB` | `72314 MiB` |
 | `--enable-cpu-offload` | `63634 MiB` | `63634 MiB` |
 | `{"mode":"module","components":["dit"]}` | `72126 MiB` | not measured |
@@ -352,7 +357,7 @@ Local MoE offload validation on one H100 80GB with the same runner and seed,
 reporting worker peak reserved GPU memory and generation time for one request:
 
 | Offload selector | 9 frames, `192x320`, 2 steps | 25 frames, `480x480`, 20 steps | 81 frames, `480x832`, 4 steps |
-|------------------|------------------------------|--------------------------------|-------------------------------|
+| ------------------ | ------------------------------ | -------------------------------- | ------------------------------- |
 | none | `75224 MiB`, `1.4s` | `75224 MiB`, `10.6s` | not measured |
 | `--enable-cpu-offload` | `66534 MiB`, `3.8s` | `66534 MiB`, `13.7s` | `69896 MiB`, `20.6s` |
 | `{"mode":"module","components":["dit"]}` | `75026 MiB`, `3.3s` | not measured | not measured |

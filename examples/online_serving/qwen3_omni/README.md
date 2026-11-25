@@ -144,21 +144,9 @@ Most engine knobs (`max_num_batched_tokens`, `max_model_len`, `enforce_eager`,
 `gpu_memory_utilization`, `tensor_parallel_size`, …) can be tuned without
 editing the YAML. There are three layers, in increasing specificity:
 
-#### 1. Global CLI flags (apply to every stage)
+#### 1. Pipeline-wide CLI flags
 
 ```bash
-# Tighter memory budget on a smaller GPU
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-    --gpu-memory-utilization 0.85
-
-# Disable cudagraphs (e.g. for debugging)
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-    --enforce-eager
-
-# Reduce context length
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-    --max-model-len 32768
-
 # Toggle prefix caching on every stage (yaml default: off)
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     --enable-prefix-caching
@@ -185,13 +173,10 @@ parser defaults). If you don't pass a flag, the YAML value wins.
 > automatically based on that bool — no extra flag or variant yaml is
 > needed.
 >
-> ⚠️ **For multi-stage models that share GPUs (qwen3_omni_moe by default
-> shares cuda:1 between stages 1 and 2), avoid using global memory flags.**
-> A global `--gpu-memory-utilization 0.85` would apply to every stage and
-> oversubscribe the shared device. Use per-stage overrides instead — see
-> below.
+> Stage 1 and stage 2 share cuda:1 by default. Assign a memory budget to
+> each stage so the combined allocation fits the shared device.
 
-#### 2. Per-stage overrides via `--stage-overrides` (recommended for memory)
+#### 2. Per-stage overrides via `--stage-overrides`
 
 ```bash
 # Lower stage 1's memory budget; leave others at the YAML default
@@ -200,6 +185,10 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
         "1": {"gpu_memory_utilization": 0.5},
         "2": {"max_num_batched_tokens": 65536}
     }'
+
+# Reduce the thinker context length and disable its CUDA graphs for debugging
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --stage-overrides '{"0":{"max_model_len":32768,"enforce_eager":true}}'
 ```
 
 Per-stage values are always treated as explicit and beat YAML defaults for

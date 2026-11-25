@@ -153,7 +153,7 @@ def hardware_contract(settings):
 
     if platform.device_type != settings["platform"] or platform.get_device_count() != settings["dies"]:
         raise RegressionError("Wrong platform or visible device count")
-    from tests.e2e.accuracy.lingbot_world.prepare import verify_inference_runtime
+    from tests.e2e.accuracy.lingbot_world.prepare import inference_runtime_metadata
 
     return {
         "platform": platform.device_type,
@@ -163,7 +163,7 @@ def hardware_contract(settings):
             {"name": platform.get_device_name(i), "total_bytes": platform.get_device_total_memory(i)}
             for i in range(settings["dies"])
         ],
-        **verify_inference_runtime(settings["platform"]),
+        **inference_runtime_metadata(settings["platform"]),
     }
 
 

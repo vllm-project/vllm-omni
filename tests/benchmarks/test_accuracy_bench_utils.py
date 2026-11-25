@@ -53,6 +53,7 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     seed_tts_bench_argv,
     videomme_bench_argv,
 )
+from tests.e2e.accuracy import helpers as acc_helpers
 from tests.e2e.accuracy.helpers import (
     _acc_result_filename,
     _validate_seed_tts,
@@ -270,6 +271,9 @@ def test_sync_dataset_env_preserves_videomme_hf_repo_id(monkeypatch):
 
 def test_validate_seed_tts_floor_fails_closed_when_score_is_missing():
     base = {
+        "seed_tts_session_count": 4,
+        "completed": 4,
+        "failed": 0,
         "seed_tts_content_evaluated": 4,
         "seed_tts_content_error_mean": 0.02,
         "seed_tts_sim_mean": None,
@@ -315,6 +319,9 @@ def test_validate_seed_tts_floor_fails_closed_when_score_is_missing():
 def test_seed_tts_floor_rejects_incomplete_sim_and_utmos_coverage():
     """A mean above the floor must not pass when most utterances were not scored."""
     partial = {
+        "seed_tts_session_count": 1088,
+        "completed": 1088,
+        "failed": 0,
         "seed_tts_content_evaluated": 1088,
         "seed_tts_content_error_mean": 0.02,
         "seed_tts_turn_count": 1088,
@@ -343,6 +350,9 @@ def test_validate_seed_tts_rejects_high_scoring_partial_timeout_result(
     cancelled_after_timeout_requests: int,
 ) -> None:
     partial = {
+        "seed_tts_session_count": 1,
+        "completed": 1,
+        "failed": 0,
         "seed_tts_content_evaluated": 1,
         "seed_tts_content_error_mean": 0.01,
         "seed_tts_turn_count": 1,
@@ -367,9 +377,105 @@ def test_validate_seed_tts_rejects_high_scoring_partial_timeout_result(
     )
 
 
+@pytest.mark.parametrize(
+    "counts",
+    [
+        pytest.param({"completed": 3}, id="missing-success"),
+        pytest.param({"completed": 5}, id="extra-success"),
+        pytest.param({"failed": 1}, id="failed-request"),
+        pytest.param({"seed_tts_request_failed": 1}, id="failed-turn"),
+        pytest.param({"seed_tts_session_count": 0, "completed": 0}, id="no-requests"),
+        pytest.param({"seed_tts_session_count": None}, id="missing-request-count"),
+        pytest.param({"completed": None}, id="missing-success-count"),
+    ],
+)
+def test_seed_tts_rejects_incomplete_request_coverage(counts: dict[str, int | None]) -> None:
+    result = {
+        "seed_tts_session_count": 4,
+        "completed": 4,
+        "failed": 0,
+        "seed_tts_request_failed": 0,
+        "seed_tts_content_evaluated": 4,
+        "seed_tts_content_error_mean": 0.02,
+        **counts,
+    }
+
+    errs = _validate_seed_tts(result, max_mean_wer=0.05, min_mean_sim=None, min_mean_utmos=None)
+
+    assert any("request coverage is incomplete" in err for err in errs)
+
+
+def test_seed_tts_request_coverage_counts_sessions_not_turns() -> None:
+    result = {
+        "seed_tts_session_count": 2,
+        "seed_tts_turn_count": 6,
+        "completed": 2,
+        "failed": 0,
+        "seed_tts_request_failed": 0,
+        "seed_tts_content_evaluated": 6,
+        "seed_tts_content_error_mean": 0.02,
+    }
+
+    assert _validate_seed_tts(result, max_mean_wer=0.05, min_mean_sim=None, min_mean_utmos=None) == []
+
+
+@pytest.mark.parametrize(("completed", "exit_code"), [(902, 1), (1088, 0)])
+def test_seed_tts_accuracy_runner_requires_all_sampled_requests_to_succeed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], completed: int, exit_code: int
+) -> None:
+    """Build #20013 passed with 186 engine failures and good scores on 902 rows."""
+    result = {
+        "num_prompts": 2000,
+        "seed_tts_session_count": 1088,
+        "seed_tts_turn_count": 1088,
+        "completed": completed,
+        "failed": 1088 - completed,
+        "seed_tts_request_failed": 1088 - completed,
+        "seed_tts_content_evaluated": completed,
+        "seed_tts_content_error_mean": 0.021654617247743636,
+        "seed_tts_sim_evaluated": completed,
+        "seed_tts_sim_mean": 0.8647334091282737,
+        "seed_tts_utmos_evaluated": completed,
+        "seed_tts_utmos_mean": 3.3628016609838953,
+    }
+    path = tmp_path / "seed_tts.json"
+    path.write_text(json.dumps(result), encoding="utf-8")
+    monkeypatch.setattr(acc_helpers, "run_seed_tts", lambda ns, vllm: path)
+    monkeypatch.setattr(acc_helpers._omni_acc_bench_core(), "find_vllm_cli", lambda: "vllm")
+    monkeypatch.setattr(acc_helpers, "_accuracy_hardware_label", lambda: "CPU")
+    ns = parse_acc_benchmark_args(
+        [
+            "--model",
+            "openbmb/MiniCPM-o-4_5",
+            "--skip-daily-omni",
+            "--num-prompts",
+            "2000",
+            "--max-seed-tts-mean-wer",
+            "0.05",
+            "--min-seed-tts-mean-sim",
+            "0.80",
+            "--min-seed-tts-mean-utmos",
+            "3.10",
+        ]
+    )
+
+    assert acc_helpers.run_acc_benchmark(ns) == exit_code
+    captured = capsys.readouterr()
+    if exit_code:
+        assert "request coverage is incomplete" in captured.err
+        assert "completed=902" in captured.err
+        assert "seed_tts_session_count=1088" in captured.err
+        assert "All configured accuracy checks passed" not in captured.out
+    else:
+        assert "All configured accuracy checks passed" in captured.out
+
+
 def test_seed_tts_floor_coverage_excludes_rows_the_scorer_never_sees():
     """ASR failures skip SIM, empty audio skips UTMOS; neither is a coverage gap."""
     result = {
+        "seed_tts_session_count": 1088,
+        "completed": 1088,
+        "failed": 0,
         "seed_tts_turn_count": 1088,
         "seed_tts_request_failed": 0,
         "seed_tts_no_pcm": 0,

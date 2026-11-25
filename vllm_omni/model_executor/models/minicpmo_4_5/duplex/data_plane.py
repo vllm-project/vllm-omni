@@ -13,17 +13,15 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneContext
+from vllm_omni.model_executor.common.request_outputs import coerce_int
+from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import TEXT_WITHOUT_AUDIO_KEY
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
 logger = init_logger(__name__)
 
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
-
-
-@dataclass(frozen=True, slots=True)
-class MiniCPMO45DataPlaneContext(DuplexDataPlaneContext):
-    """Serving state needed to project one MiniCPM data-plane output (the framework fields)."""
 
 
 @dataclass(slots=True)
@@ -109,7 +107,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         self,
         result: object,
         *,
-        context: MiniCPMO45DataPlaneContext | None = None,
+        context: DuplexDataPlaneContext | None = None,
     ) -> Iterator[dict[str, object]]:
         if not isinstance(result, dict):
             return
@@ -123,9 +121,9 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         self,
         output: object,
         *,
-        context: MiniCPMO45DataPlaneContext | None = None,
+        context: DuplexDataPlaneContext | None = None,
     ) -> Iterator[dict[str, object]]:
-        context = context or MiniCPMO45DataPlaneContext()
+        context = context or DuplexDataPlaneContext()
         stage_metrics = _output_stage_metrics(output)
 
         def runtime_result(**values: object) -> dict[str, object]:
@@ -170,6 +168,9 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         mm_output = dict(mm_output) if isinstance(mm_output, Mapping) else {}
 
         output_turn_id = output_turn_id_from_metadata(mm_output)
+        text_input = coerce_int(mm_output.get("duplex_text_input")) == 1
+        if text_input and context.model_turn_id is not None:
+            output_turn_id = context.model_turn_id
         output_epoch = output_epoch_from_metadata(mm_output)
         expected_turn_id = context.active_response_turn_id
         stale_turn = expected_turn_id is not None and output_turn_id is not None and output_turn_id < expected_turn_id
@@ -188,21 +189,33 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             text = ""
 
         finished = bool(getattr(output, "finished", False))
-        tts_is_last_chunk = _bool_metadata(mm_output, ("tts_is_last_chunk",), default=False)
+        tts_is_last_chunk = is_last_tts_chunk(mm_output)
         token_ids = _completion_token_ids(completion)
         native_decision = _native_decision(completion, mm_output, token_ids=token_ids, finished=finished)
         if native_decision == "listen":
             listen_result = runtime_result(
                 stage_role="llm",
                 is_listen=True,
-                model_listen=True,
-                listen_source="model_listen",
+                model_listen=mm_output.get("model_listen") is not False,
+                listen_source=mm_output.get("listen_source") or "model_listen",
                 data_plane_request_id=request_id,
                 end_of_turn=False,
+                continue_with_partial_input=text_input,
             )
             if output_turn_id is not None:
                 listen_result["model_turn_id"] = output_turn_id
             yield listen_result
+            return
+
+        if text_input:
+            # Stage0 projection only records continuation ownership. Do not
+            # encode its hidden states or emit its text before Talker output.
+            yield runtime_result(
+                requires_stage_handoff=True,
+                data_plane_request_id=request_id,
+                model_turn_id=output_turn_id,
+                continue_with_partial_input=True,
+            )
             return
 
         raw_audio = next((mm_output[key] for key in ("audio", "model_outputs", "latent") if key in mm_output), None)
@@ -348,6 +361,29 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     yield from pending_audio
                     return
                 request_state.pending_audio_without_text = pending_audio
+
+        if tts_segment_end and _bool_metadata(mm_output, (TEXT_WITHOUT_AUDIO_KEY,), default=False) and text:
+            # Venus text also carries delegation control. Deliver it even
+            # when a mixed speech unit reaches codec EOS without a waveform.
+            delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id, chunk_key=chunk_key)
+            result = runtime_result(
+                stage_role="tts",
+                is_listen=False,
+                data_plane_request_id=request_id,
+                text=delta_text,
+                audio_data="",
+                audio_duration_ms=0,
+                audio_format=context.response_format,
+                audio_text_mark=False,
+                end_of_turn=unit_end_of_turn,
+                abort_data_plane_request=True,
+            )
+            if output_turn_id is not None:
+                result["model_turn_id"] = output_turn_id
+            if delta_text and text_turn_state is not None:
+                text_turn_state.has_text = True
+            yield result
+            return
 
         if tts_segment_end:
             if unit_end_of_turn and request_state is not None and request_state.pending_audio_without_text:
@@ -578,30 +614,6 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         )
 
 
-def coerce_int(value: object) -> int | None:
-    if hasattr(value, "detach"):
-        try:
-            value = value.detach().cpu().reshape(-1)
-            if value.numel() == 0:
-                return None
-            value = value[0].item()
-        except Exception:
-            return None
-    elif hasattr(value, "reshape") and hasattr(value, "size"):
-        try:
-            value = value.reshape(-1)
-            if int(value.size) == 0:
-                return None
-            item = value[0]
-            value = item.item() if hasattr(item, "item") else item
-        except Exception:
-            return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def output_turn_id_from_metadata(mm_output: dict[str, object]) -> int | None:
     return _first_metadata_int(mm_output, "duplex_turn_id", "turn_id")
 
@@ -713,19 +725,6 @@ def _completion_token_ids(completion: object) -> list[int]:
     return []
 
 
-def _coerce_int_list(value: object) -> list[int]:
-    if value is None:
-        return []
-    if hasattr(value, "detach"):
-        try:
-            value = value.detach().cpu().reshape(-1).tolist()
-        except Exception:
-            return []
-    if not isinstance(value, (list, tuple)):
-        return []
-    return [item for raw in value if (item := coerce_int(raw)) is not None]
-
-
 def _audio_num_samples(audio_data: object) -> int | None:
     try:
         import torch
@@ -735,6 +734,11 @@ def _audio_num_samples(audio_data: object) -> int | None:
         return int(np.asarray(audio_data, dtype=np.float32).size)
     except Exception:
         return None
+
+
+def is_last_tts_chunk(mm_output: dict[str, object]) -> bool:
+    """Whether a Code2Wav output carries the connector's flush of a unit's remaining codes (``tts_is_last_chunk``)."""
+    return _bool_metadata(mm_output, ("tts_is_last_chunk",), default=False)
 
 
 def _bool_metadata(
