@@ -35,6 +35,29 @@ local snapshot, set `MODEL_ROOT=/models/MiniCPM-o-4_5` before starting the
 launcher. The default Thinker uses Ngram speculation with the target
 weights and committed token history.
 
+### Default BF16 and Ngram 7 performance
+
+Measured at `16cd73ee4` on two 64 GiB Ascend 910B3 cards with the public BF16
+checkpoint and default Thinker Ngram 7. The model snapshot and Seed-TTS
+dataset were available locally. The run used offline Hub mode, MRv2, a
+40,960-token Thinker context, Talker and Code2Wav replicas on both cards,
+Code2Wav micro-batches of eight and four, and five CFM steps.
+
+After 16 serial Seed-TTS hard warmup requests, one timed English Seed-TTS
+streaming pass ran at each concurrency on the same instance. All 1,376
+formal requests returned audio.
+
+| Concurrency | Requests | Mean RTF | P95 first audio (s) | Requests/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 32 | 0.1076 | 0.297 | 2.33 |
+| 8 | 128 | 0.3235 | 1.081 | 6.32 |
+| 16 | 192 | 0.4632 | 1.538 | 8.60 |
+| 32 | 512 | 0.6358 | 1.781 | 11.66 |
+| 64 | 512 | 1.0572 | 5.217 | 13.41 |
+
+The [PR benchmark results][perf] give the separate optimized W8A8 + DSpark
+measurements and the comparison with this default configuration.
+
 ## Optional Thinker DSpark
 
 The launcher can switch Thinker speculation to the separate public
@@ -79,13 +102,11 @@ In a historical Ascend C1 comparison on 32 streaming Seed-TTS requests with
 the same W8A8 Thinker, 16K context, K16 Talker, and five CFM steps, enabling
 DSpark 7 reduced mean RTF from 0.1794 to 0.1580 (11.9%) and mean time to first
 audio from 443 to 347 ms (21.8%). The control used no Thinker speculation.
-The gain over default Ngram or on the original BF16 weights has yet to be
-measured in a matching run.
 
 ## Optional INT8 W8A8 Thinker
 
-The five-tier performance report used INT8 Thinker weights with dynamic
-per-token INT8 activation quantization. To export from the pinned public
+The optimized W8A8 + DSpark benchmark used INT8 Thinker weights with
+dynamic per-token INT8 activation quantization. To export from the pinned public
 checkpoint, run the following on a CPU host with PyTorch and safetensors.
 The conversion processes one shard at a time. Allow space for both
 checkpoints.
@@ -110,6 +131,7 @@ test results for the measured configuration.
 
 [base]: https://huggingface.co/openbmb/MiniCPM-o-4_5
 [draft]: https://huggingface.co/Qun1023/MiniCPM-o-4_5-thinker-DSpark-mm/tree/c4c310aca2c768343165261cb22c21b90c1f79e0
+[perf]: https://github.com/vllm-project/vllm-omni/pull/10595#default-bf16-and-ngram-7-follow-up
 
 ## Operation
 
