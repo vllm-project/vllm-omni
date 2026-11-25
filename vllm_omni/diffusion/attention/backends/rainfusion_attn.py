@@ -468,6 +468,11 @@ class RainFusionAttentionImpl(AttentionImpl):
             # Tail fallback: keep the last ``end_step`` denoise steps dense.
             if rf.end_step > 0 and total_steps is not None and step_idx >= total_steps - rf.end_step:
                 return None
+        return self._resolve_layout_plan(attn_metadata)
+
+    def _resolve_layout_plan(self, attn_metadata: AttentionMetadata | None) -> RainFusionPlan | None:
+        """Resolve geometry independently of the current denoising step or layer."""
+        rf = self.rainfusion
         if self.qkv_layout is None:
             # The sparse path reads the sequence off dim 1, which the tensors alone
             # do not establish, and the dense fallback resolves an absent layout its

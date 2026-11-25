@@ -12,6 +12,7 @@ import torch
 
 from vllm_omni import platforms
 from vllm_omni.diffusion import forward_context
+from vllm_omni.diffusion.attention.backends import rainfusion_attn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 from vllm_omni.diffusion.attention.parallel.ulysses_allgather import UlyssesAllGatherKVParallelAttention
 from vllm_omni.diffusion.data import MindIEParallelConfig
@@ -71,6 +72,7 @@ def adapter(monkeypatch):
         rainfusion=SimpleNamespace(
             precision="bf16",
             sparse_type="rf_v3",
+            bsa_backend="eagle",
             sparsity=0.8,
             parallel=MindIEParallelConfig(),
         ),
@@ -164,11 +166,7 @@ def test_sparse_routes_reach_the_public_sdk(adapter, sparse_type, precision, bac
     assert adapter.states[0].bsa_backend == backend
 
 
-@pytest.mark.parametrize("ulysses_size,precision,backend", [(4, "mix", "eagle"), (8, "mxfp8", "cann")])
-def test_cp_uses_the_existing_orthogonal_group_and_exact_sdk_keywords(adapter, ulysses_size, precision, backend):
-    adapter.impl.rainfusion.precision = precision
-    adapter.impl.rainfusion.bsa_backend = backend
-    adapter.metadata.video_layout = VideoTokenLayout(pre_rearranged=True)
+def use_cp(adapter, ulysses_size):
     adapter.coordinator.allgather_world_size = 2
     adapter.coordinator.allgather_group = object()
     adapter.coordinator.ulysses_world_size = ulysses_size
@@ -183,6 +181,14 @@ def test_cp_uses_the_existing_orthogonal_group_and_exact_sdk_keywords(adapter, u
         if group is None
         else (2 if group is adapter.coordinator.allgather_group else ulysses_size)
     )
+
+
+@pytest.mark.parametrize("ulysses_size,precision,backend", [(4, "mix", "eagle"), (8, "mxfp8", "cann")])
+def test_cp_uses_the_existing_orthogonal_group_and_exact_sdk_keywords(adapter, ulysses_size, precision, backend):
+    adapter.impl.rainfusion.precision = precision
+    adapter.impl.rainfusion.bsa_backend = backend
+    adapter.metadata.video_layout = VideoTokenLayout(pre_rearranged=True)
+    use_cp(adapter, ulysses_size)
     adapter.plan.used_len = 251
     adapter.plan.video_spans = [{"start": 123, "latent_shape": [2, 8, 8]}]
     dtype = torch.float16 if precision == "fp16" else torch.bfloat16
@@ -230,11 +236,17 @@ def test_rf_hoist_preserves_modalities_and_declines_an_unresolved_plan(adapter, 
         },
     )
     model = SimpleNamespace(blocks=[SimpleNamespace(attn=SimpleNamespace(attention=adapter.attention))])
-    resolve = adapter.impl._resolve_plan
-    adapter.impl._resolve_plan = lambda _: None
+    use_cp(adapter, 4)
+    config = adapter.impl.rainfusion
+    config.enabled, config.skip_layers, config.start_step, config.end_step = True, frozenset(), 1, 0
+    adapter.impl.layer_idx = 0
+    adapter.impl._resolve_plan = lambda metadata: rainfusion_attn.RainFusionAttentionImpl._resolve_plan(
+        adapter.impl, metadata
+    )
+    adapter.impl._resolve_layout_plan = lambda _: None
     assert not helper.maybe_hoist_branch(branch, model)
     assert not branch.static_kwargs["video_token_layout"].pre_rearranged
-    adapter.impl._resolve_plan = resolve
+    adapter.impl._resolve_layout_plan = lambda _: adapter.plan
     assert helper.maybe_hoist_branch(branch, model)
     layout = branch.static_kwargs["video_token_layout"]
     packed = branch.static_kwargs["packed_seq_params"]
@@ -246,6 +258,16 @@ def test_rf_hoist_preserves_modalities_and_declines_an_unresolved_plan(adapter, 
     assert padded.index_select(0, branch.text_pos_dev).tolist() == list(range(4))
     assert torch.equal(branch.token_tags_dev, padded)
     assert torch.equal(branch.static_kwargs["img_position_ids"][0], torch.arange(48).reshape(16, 3)[padded])
+    adapter.metadata.video_layout = layout
+    q = torch.zeros((1, 8, 4, 128), dtype=torch.bfloat16)
+    assert run(adapter, query=q) is None  # No denoise context exists when hoisting runs.
+    ctx = SimpleNamespace(denoise_step_idx=0, total_denoise_steps=3)
+    monkeypatch.setattr(rainfusion_attn, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(rainfusion_attn, "get_forward_context", lambda: ctx)
+    assert run(adapter, query=q) is None
+    ctx.denoise_step_idx = 1
+    assert torch.equal(run(adapter, query=q), q + 1)
+    assert adapter.calls[0][-1]["pre_rearranged"] is True
 
 
 @pytest.mark.parametrize(

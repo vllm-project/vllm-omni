@@ -140,9 +140,27 @@ missing-kernel errors remain startup failures, not runtime fallbacks.
 Use a new backend for a new provider/capability contract. `custom_attention`
 instead owns communication and requires `skip_sequence_parallel=True`.
 
-MiniMax-H3's [MindIE-SD executor](../../user_guide/diffusion/parallelism/mindiesd.md) reuses the effective sparse plan and caller-owned Ulysses/CP groups, owning both A2A directions and BSA before shared dispatch.
-The SP coordinator owns State per group/device/algorithm/precision/provider and drains it before group teardown. Invalid combinations fail before allocation; declined original-order calls retain native dispatch, while admitted errors propagate without collective retry.
-The guide defines the four provider paths, RF-only CP input contract, configuration and complete integration flow.
+## MiniMax-H3 MindIE-SD
+
+The SP coordinator owns `ParallelState` per topology, device, and provider;
+it drains the device before releasing State and communication groups. H3
+relabels modalities before sharding. Step/layer gates still determine whether
+attention is sparse. Admitted calls execute both A2A directions inside SD.
+Incompatible reordered sparse calls raise instead of replaying collectives.
+
+```mermaid
+flowchart LR
+    A[H3 RF layout and modality labels] --> B[Omni Ulysses and optional CP groups]
+    B --> C[SD A2A and CP KV exchange]
+    C --> D[RainFusion, Eagle BSA, Eagle QBSA or native MXFP8 BSA]
+    D --> E[SD reverse A2A and Omni output]
+```
+
+### MindIE-SD benchmarking
+
+Measure synchronized DiT and end-to-end latency after warmup; record model,
+input, precision, topology, SDK/Omni revisions and evidence of SDK dispatch.
+CPU contracts do not qualify native numerics or performance.
 
 ## Adding or changing a backend
 

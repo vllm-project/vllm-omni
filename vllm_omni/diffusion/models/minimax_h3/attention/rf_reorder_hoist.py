@@ -7,7 +7,6 @@ from dataclasses import replace
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.data import resolve_mindie_sparse_backend
 from vllm_omni.platforms import current_omni_platform
 
 from .rainfusion_sdk_dispatch import supports_mindiesd_ulysses
@@ -49,7 +48,8 @@ def maybe_hoist_branch(branch, model) -> bool:
         return False
     records = [layer.effective_attention() for layer in layers]
     configs = [
-        impl.rainfusion.parallel if backend.get_name() == "RAINFUSION_ATTN" else None for impl, backend, _ in records
+        impl.rainfusion.parallel if backend is not None and backend.get_name() == "RAINFUSION_ATTN" else None
+        for impl, backend, _ in records
     ]
     if not any(config is not None and config.rainfusion_reorder_hoist for config in configs):
         return False
@@ -60,9 +60,6 @@ def maybe_hoist_branch(branch, model) -> bool:
     ):
         raise ValueError("RF reorder hoist requires MindIE parallel on every main-DiT attention layer")
     for layer, (impl, _, _) in zip(layers, records, strict=True):
-        resolve_mindie_sparse_backend(
-            impl.rainfusion.sparse_type, impl.rainfusion.precision, getattr(impl.rainfusion, "bsa_backend", None)
-        )
         strategy = layer._get_active_parallel_strategy()
         if (
             not supports_mindiesd_ulysses(strategy)
@@ -76,7 +73,7 @@ def maybe_hoist_branch(branch, model) -> bool:
                 "RF reorder hoist requires a supported MindIE strict Ulysses executor without schedules or cached KV"
             )
     metadata = AttentionMetadata(video_layout=layout, extra={"max_seqlen_q": branch.used_len})
-    plan = records[0][0]._resolve_plan(metadata)
+    plan = records[0][0]._resolve_layout_plan(metadata)
     if plan is None:
         return False
     from mindiesd import build_rf_attention_plan

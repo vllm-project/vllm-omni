@@ -484,7 +484,11 @@ class MiniMaxH3Attention(nn.Module):
                 return parallel_out.squeeze(0)
             if video_layout is not None and video_layout.pre_rearranged:
                 impl, effective_backend, _ = self.attention.effective_attention()
-                if effective_backend.get_name() != "RAINFUSION_ATTN" or impl._resolve_plan(metadata) is not None:
+                if (
+                    effective_backend is None
+                    or effective_backend.get_name() != "RAINFUSION_ATTN"
+                    or impl._resolve_plan(metadata) is not None
+                ):
                     raise ValueError("RF-reordered sparse rows require the admitted MindIE parallel executor")
         return self.attention(
             q.unsqueeze(0),

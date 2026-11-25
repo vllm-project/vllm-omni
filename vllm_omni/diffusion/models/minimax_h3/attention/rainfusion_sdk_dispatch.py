@@ -10,7 +10,6 @@ import torch
 import torch.distributed as dist
 
 from vllm_omni.diffusion.attention.distributed_sparse_attention import MindIEParallelResource
-from vllm_omni.diffusion.data import resolve_mindie_sparse_backend
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
 from vllm_omni.platforms import current_omni_platform
 
@@ -57,14 +56,14 @@ def try_distributed_sparse_attention(
 ) -> torch.Tensor | None:
     """Run the full executor, or decline before state allocation/communication."""
     impl, backend, _ = attention.effective_attention()
-    if not current_omni_platform.is_npu() or backend.get_name() != "RAINFUSION_ATTN":
+    if not current_omni_platform.is_npu() or backend is None or backend.get_name() != "RAINFUSION_ATTN":
         return None
     config = impl.rainfusion.parallel
     if config is None:
         return None
     precision = impl.rainfusion.precision
     sparse_type = impl.rainfusion.sparse_type
-    backend = resolve_mindie_sparse_backend(sparse_type, precision, getattr(impl.rainfusion, "bsa_backend", None))
+    backend = impl.rainfusion.bsa_backend
     allowed_dtypes = (torch.bfloat16, torch.float16) if precision == "fp16" else (torch.bfloat16,)
     if (
         attention.causal
