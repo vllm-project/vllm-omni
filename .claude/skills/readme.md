@@ -71,6 +71,10 @@ self-check.
   optimization, including stage attribution, TTFT / AUDIO_TTFP / AUDIO_RTF
   tuning, async_chunk codec chunking, CUDA graphs, MRv2, replicas, and
   quality-gated A/B evidence
+- [`inference-perf-optimization`](inference-perf-optimization/SKILL.md)
+  helps contributors estimate the end-to-end benefit of a candidate,
+  diagnose an inconclusive experiment, and decide when to revisit it after
+  a bottleneck changes. Includes worked multi-stage inference examples.
 - [`omni-perf-ceiling`](omni-perf-ceiling/SKILL.md): estimates the best
   reachable omni serving performance (for example AUDIO_RTF at a target
   concurrency) from measured cells and per-stage calibrated roofline estimates, and reports the remaining unattributed gap, on CUDA GPUs
