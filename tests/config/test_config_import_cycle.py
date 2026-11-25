@@ -58,6 +58,47 @@ def test_config_package_lazy_exports_still_resolve() -> None:
     assert register_pipeline is direct_register_pipeline
 
 
+def test_minicpmo_code2wav_patch_during_platform_bootstrap() -> None:
+    """Exercise the NPU Code2Wav import order without Ascend hardware.
+
+    NPUOmniPlatform applies this patch while vllm_omni.patch is still importing
+    mrope. Importing the handoff serializer at that point re-enters the config
+    and scheduler packages through the partially initialized SHM connector.
+    """
+    _assert_isolated_import_succeeds(
+        """
+import sys
+
+import pytest
+import vllm.utils.import_utils as import_utils
+
+original_resolve = import_utils.resolve_obj_by_qualname
+
+
+def resolve_with_code2wav_patch(qualname):
+    if qualname.startswith("vllm_omni.platforms."):
+        from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
+            apply_minicpmo_4_5_code2wav_patch,
+        )
+
+        apply_minicpmo_4_5_code2wav_patch()
+        return original_resolve("vllm_omni.platforms.interface.UnspecifiedOmniPlatform")
+    return original_resolve(qualname)
+
+
+assert "vllm_omni" not in sys.modules
+with pytest.MonkeyPatch.context() as patch:
+    patch.setattr(import_utils, "resolve_obj_by_qualname", resolve_with_code2wav_patch)
+    from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+
+from vllm_omni.platforms.npu.models import minicpmo_4_5_code2wav as npu_patch
+
+assert npu_patch._PATCHED
+assert OMNI_PIPELINES
+"""
+    )
+
+
 def test_npu_platform_defers_minimax_h3_encoder_patch() -> None:
     src = (REPO_ROOT / "vllm_omni" / "platforms" / "npu" / "platform.py").read_text(encoding="utf-8")
     init_start = src.index("def __init__(self) -> None:")

@@ -1540,6 +1540,102 @@ def test_preprocess_i2v_image_and_action_video_inputs() -> None:
     assert additional["condition_frame_indexes_vision"] == [0, 1]
 
 
+def test_preprocess_i2v_center_crops_mismatched_aspect_ratio() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    # Portrait 480x800: red top band, green middle, blue bottom band.
+    image = Image.new("RGB", (480, 800), (0, 255, 0))
+    image.paste((255, 0, 0), (0, 0, 480, 200))
+    image.paste((0, 0, 255), (0, 600, 480, 800))
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    request = SimpleNamespace(
+        prompt={"prompt": "A slow camera push.", "multi_modal_data": {"image": image}},
+        sampling_params=make_sampling_params(height=192, width=320, extra_args={}),
+    )
+
+    preprocessed = preprocess(request).prompt["additional_information"]["preprocessed_image"]
+
+    # Scaled to cover 320x192 and center cropped: only the green middle is
+    # kept, so the red and blue bands do not appear.
+    assert tuple(preprocessed.shape[-2:]) == (192, 320)
+    red, green, blue = preprocessed[0].float().mean(dim=(1, 2)).tolist()
+    assert green > 0.9
+    assert red < -0.9
+    assert blue < -0.9
+
+
+def test_preprocess_action_image_with_explicit_size_is_stretched() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    # 16:9 frame with a red bottom band, requested at 4:3.
+    image = Image.new("RGB", (640, 360), (0, 255, 0))
+    image.paste((255, 0, 0), (0, 300, 640, 360))
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    request = SimpleNamespace(
+        prompt={"prompt": "Move the arm.", "multi_modal_data": {"image": image}},
+        sampling_params=make_sampling_params(
+            height=480, width=640, extra_args={"action_mode": "forward_dynamics", "domain_name": "umi"}
+        ),
+    )
+
+    preprocessed = preprocess(request).prompt["additional_information"]["preprocessed_image"]
+
+    # Stretched to 640x480, so the red band stays at the bottom and no
+    # mirrored padding is added below it.
+    assert tuple(preprocessed.shape[-2:]) == (480, 640)
+    bottom_red = preprocessed[0, 0, -40:].float().mean().item()
+    assert bottom_red > 0.9
+
+
+def _action_frame_with_red_bottom_band() -> Image.Image:
+    # 16:10 frame, so the 480p action bucket (832x480) does not match it.
+    image = Image.new("RGB", (640, 400), (0, 255, 0))
+    image.paste((255, 0, 0), (0, 360, 640, 400))
+    return image
+
+
+def test_preprocess_action_image_without_size_is_padded() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    request = SimpleNamespace(
+        prompt={"prompt": "Move the arm.", "multi_modal_data": {"image": _action_frame_with_red_bottom_band()}},
+        sampling_params=make_sampling_params(
+            height=None, width=None, extra_args={"action_mode": "forward_dynamics", "domain_name": "umi"}
+        ),
+    )
+
+    result = preprocess(request)
+    preprocessed = result.prompt["additional_information"]["preprocessed_image"]
+
+    # The size comes from the bucket and the frame is padded, not stretched:
+    # the bottom rows mirror the green content above the red band.
+    assert (result.sampling_params.height, result.sampling_params.width) == (480, 832)
+    assert tuple(preprocessed.shape[-2:]) == (480, 832)
+    bottom_red = preprocessed[0, 0, -20:].float().mean().item()
+    assert bottom_red < -0.9
+
+
+def test_preprocess_action_video_with_explicit_size_is_padded() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    frames = [_action_frame_with_red_bottom_band() for _ in range(3)]
+    request = SimpleNamespace(
+        prompt={"prompt": "Move the arm.", "multi_modal_data": {"video": frames}},
+        sampling_params=make_sampling_params(
+            height=480, width=832, extra_args={"action_mode": "forward_dynamics", "domain_name": "umi"}
+        ),
+    )
+
+    preprocessed = preprocess(request).prompt["additional_information"]["preprocessed_image"]
+
+    # The serving layer never resized video frames, so the first frame is
+    # padded like before.
+    bottom_red = preprocessed[0, 0, -20:].float().mean().item()
+    assert bottom_red < -0.9
+
+
 def test_preprocess_v2v_decodes_uploaded_video_path(tmp_path) -> None:
     """Serving may pass multipart uploads as /tmp/...mp4 path lists (#8073)."""
     imageio = pytest.importorskip("imageio.v3")
@@ -2778,6 +2874,92 @@ def test_diffuse_publishes_exact_seacache_metadata_and_cfg_contexts(make_cosmos3
     assert pipeline.current_sigma is None
 
 
+@pytest.fixture
+def tiny_real_cosmos3_transformer(monkeypatch: pytest.MonkeyPatch) -> nn.Module:
+    """A two-layer fp32 Cosmos3 transformer with random weights, runnable on CPU."""
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+
+    from tests.diffusion.models.cosmos3.test_cosmos3_transformer import _tiny_cosmos3_config
+    from vllm_omni.diffusion.attention import selector
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+    from vllm_omni.platforms import current_omni_platform
+
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(transformer_cosmos3, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    monkeypatch.setattr(
+        current_omni_platform,
+        "get_diffusion_attn_backend_cls",
+        lambda **kwargs: DiffusionAttentionBackendEnum.TORCH_SDPA.get_path(),
+    )
+    selector._cached_get_backend_cls.cache_clear()
+    torch.manual_seed(0)
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        OmniDiffusionConfig(
+            model=None,
+            tf_model_config=TransformerConfig.from_dict(_tiny_cosmos3_config(num_hidden_layers=2)),
+            dtype=torch.float32,
+        )
+    ).eval()
+    with torch.no_grad():
+        for param in model.parameters():
+            param.normal_(0, 0.5)
+    yield model
+    selector._cached_get_backend_cls.cache_clear()
+
+
+@pytest.mark.parametrize("session_state", [False, True])
+@pytest.mark.parametrize(
+    ("guidance_scale", "guidance_interval"),
+    [(3.0, (500.0, 1000.0)), (4.0, None), (1.0, None)],
+    ids=["cfg_interval", "cfg", "no_cfg"],
+)
+def test_diffuse_batched_outputs_match_serial(
+    make_cosmos3_pipeline, tiny_real_cosmos3_transformer, guidance_scale, guidance_interval, session_state
+) -> None:
+    from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
+        FlowUniPCMultistepScheduler,
+    )
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.transformer = tiny_real_cosmos3_transformer
+    pipeline.scheduler = FlowUniPCMultistepScheduler(
+        shift=1.0, use_dynamic_shifting=False, prediction_type="flow_prediction"
+    )
+    if session_state:
+        pipeline._memory_manager = SessionStateManager(max_sessions=4)
+    latents = torch.randn(3, 2, 1, 2, 2)
+
+    def run(start_latents: torch.Tensor) -> torch.Tensor:
+        pipeline.scheduler.set_timesteps(6, device="cpu", shift=3.0)
+        return pipeline.diffuse(
+            latents=start_latents,
+            timesteps=pipeline.scheduler.timesteps,
+            cond_ids=torch.tensor([[1, 2, 3]]),
+            cond_mask=torch.ones(1, 3, dtype=torch.long),
+            uncond_ids=torch.tensor([[4, 5]]),
+            uncond_mask=torch.ones(1, 2, dtype=torch.long),
+            guidance_scale=guidance_scale,
+            shared_kwargs={"video_shape": (1, 2, 2), "fps": 24.0},
+            guidance_interval=guidance_interval,
+            session_id="cosmos3-test" if session_state else None,
+        )
+
+    with torch.inference_mode():
+        serial = torch.cat([run(row) for row in latents.split(1)])
+        batched = run(latents)
+
+    # The prompt's UND K/V stay batch 1 and are broadcast in the GEN layers.
+    # Batch size can select a different CPU GEMM kernel (e.g. MKL on AVX-512),
+    # so batched and serial fp32 results may differ in the last bits.
+    torch.testing.assert_close(batched, serial, atol=1e-5, rtol=1e-5)
+
+
 def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
     pipeline._use_session_state = True
@@ -3454,7 +3636,8 @@ class TestForwardRouting:
                     "key": "image",
                     "is_t2i": True,
                     "flow": [3.0],
-                    "steps": [50, 50],
+                    # num_outputs_per_prompt=2 runs as one batched diffusion.
+                    "steps": [50],
                     "frames": 1,
                 },
             ),
@@ -3493,6 +3676,157 @@ class TestForwardRouting:
         assert captured["flow_shifts"] == expected["flow"]
         assert [call["num_inference_steps"] for call in pipeline.scheduler.set_timesteps_calls] == expected["steps"]
         assert all(call["shift"] == expected["flow"][0] for call in pipeline.scheduler.set_timesteps_calls)
+
+    def _record_t2i_events(self, pipeline) -> list[Any]:
+        """Use the real latent draw and record draws and diffusions in call order."""
+        events: list[Any] = []
+        real_prepare = type(pipeline)._prepare_latents.__get__(pipeline)
+
+        def prepare(height, width, num_frames, generator):
+            events.append("prepare")
+            return real_prepare(height, width, num_frames, generator)
+
+        def diffuse(**kwargs):
+            latents = kwargs["latents"]
+            events.append(("diffuse", latents.clone()))
+            # Tag each row so a permuted output would be visible.
+            return latents + torch.arange(latents.shape[0], dtype=latents.dtype).view(-1, 1, 1, 1, 1)
+
+        pipeline._prepare_latents = prepare
+        pipeline.diffuse = diffuse
+        return events
+
+    @staticmethod
+    def _serial_t2i_draws(num_outputs: int, seed: int = 123) -> list[torch.Tensor]:
+        from diffusers.utils.torch_utils import randn_tensor
+
+        generator = torch.Generator("cpu").manual_seed(seed)
+        return [randn_tensor((1, 2, 1, 2, 2), generator=generator, dtype=torch.float32) for _ in range(num_outputs)]
+
+    @staticmethod
+    def _t2i_od_config(*, additional_config=None, cache_backend=None, offload=None, **parallel_kwargs):
+        from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+
+        return OmniDiffusionConfig(
+            model=None,
+            additional_config=additional_config or {},
+            cache_backend=cache_backend,
+            parallel_config=DiffusionParallelConfig(**parallel_kwargs),
+            **({offload: True} if offload else {}),
+        )
+
+    @pytest.mark.parametrize(
+        "od_config_kwargs",
+        [
+            pytest.param({}, id="default"),
+            pytest.param({"additional_config": {"cosmos3_batch_t2i_outputs": True}}, id="opt_in"),
+            # DP replicas each run the whole GEN forward on one GPU.
+            pytest.param({"data_parallel_size": 2}, id="data_parallel"),
+            # Offload only changes where GEN weights live, not the batched path.
+            pytest.param({"offload": "enable_layerwise_offload"}, id="layerwise_offload"),
+            pytest.param(
+                {"offload": "enable_distributed_layerwise_offload", "data_parallel_size": 2},
+                id="distributed_layerwise_offload",
+            ),
+        ],
+    )
+    def test_t2i_outputs_share_one_batched_diffusion(self, make_cosmos3_pipeline, od_config_kwargs) -> None:
+        pipeline = make_cosmos3_pipeline()
+        pipeline.od_config = self._t2i_od_config(**od_config_kwargs)
+        assert pipeline._can_batch_t2i_outputs()
+        self._install_forward_stubs(pipeline)
+        events = self._record_t2i_events(pipeline)
+
+        output = pipeline.forward(
+            make_request_batch(
+                {"prompt": "A painted robot", "modalities": ["image"]},
+                make_sampling_params(height=16, width=16, num_outputs_per_prompt=3),
+            )
+        )
+
+        assert [event if isinstance(event, str) else event[0] for event in events] == [
+            "prepare",
+            "prepare",
+            "prepare",
+            "diffuse",
+        ]
+        # The batch holds the serial loop's draws, in draw order.
+        expected = torch.cat(self._serial_t2i_draws(3), dim=0)
+        assert torch.equal(events[-1][1], expected)
+        assert len(pipeline.scheduler.set_timesteps_calls) == 1
+        image = output.output["image"]
+        assert image.shape[0] == 3
+        torch.testing.assert_close(
+            image, expected + torch.arange(3, dtype=expected.dtype).view(-1, 1, 1, 1, 1), atol=0, rtol=0
+        )
+
+    @pytest.mark.parametrize(
+        ("fallback", "od_config_kwargs"),
+        [
+            pytest.param("batch_invariant", {}, id="batch_invariant"),
+            pytest.param("distilled", {}, id="distilled"),
+            pytest.param("pipeline_parallel", {}, id="pipeline_parallel"),
+            pytest.param(None, {"additional_config": {"cosmos3_batch_t2i_outputs": False}}, id="opt_out"),
+            pytest.param(None, {"cache_backend": "cache_dit"}, id="cache_dit"),
+            pytest.param(None, {"cache_backend": "sea_cache"}, id="sea_cache"),
+            pytest.param(None, {"ulysses_degree": 2}, id="sequence_parallel"),
+            pytest.param(None, {"tensor_parallel_size": 2}, id="tensor_parallel"),
+            pytest.param(None, {"cfg_parallel_size": 2}, id="cfg_parallel"),
+            pytest.param(None, {"use_hsdp": True, "hsdp_shard_size": 2}, id="hsdp"),
+        ],
+    )
+    def test_t2i_outputs_fall_back_to_serial(
+        self, make_cosmos3_pipeline, monkeypatch, fallback, od_config_kwargs
+    ) -> None:
+        pipeline = make_cosmos3_pipeline()
+        pipeline.od_config = self._t2i_od_config(**od_config_kwargs)
+        self._install_forward_stubs(pipeline)
+        events = self._record_t2i_events(pipeline)
+        if fallback == "batch_invariant":
+            monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+        elif fallback == "distilled":
+            pipeline.is_distilled_model = True
+            pipeline._scheduler_init_t_list = [1.0, 0.5]
+        elif fallback == "pipeline_parallel":
+            monkeypatch.setattr(pipeline, "_pp_parallel_active", lambda: True)
+        assert not pipeline._can_batch_t2i_outputs()
+
+        output = pipeline.forward(
+            make_request_batch(
+                {"prompt": "A painted robot", "modalities": ["image"]},
+                make_sampling_params(height=16, width=16, num_outputs_per_prompt=2),
+            )
+        )
+
+        # The serial loop interleaves draws and diffusions, so a stochastic
+        # scheduler keeps its generator order.
+        assert [event if isinstance(event, str) else event[0] for event in events] == [
+            "prepare",
+            "diffuse",
+            "prepare",
+            "diffuse",
+        ]
+        draws = self._serial_t2i_draws(2)
+        assert [event[1].shape[0] for event in events if not isinstance(event, str)] == [1, 1]
+        assert torch.equal(events[1][1], draws[0])
+        assert torch.equal(events[3][1], draws[1])
+        assert output.output["image"].shape[0] == 2
+
+    def test_t2i_single_output_unchanged(self, make_cosmos3_pipeline) -> None:
+        pipeline = make_cosmos3_pipeline()
+        self._install_forward_stubs(pipeline)
+        events = self._record_t2i_events(pipeline)
+
+        output = pipeline.forward(
+            make_request_batch(
+                {"prompt": "A painted robot", "modalities": ["image"]},
+                make_sampling_params(height=16, width=16, num_outputs_per_prompt=1),
+            )
+        )
+
+        assert [event if isinstance(event, str) else event[0] for event in events] == ["prepare", "diffuse"]
+        assert torch.equal(events[1][1], self._serial_t2i_draws(1)[0])
+        assert output.output["image"].shape[0] == 1
 
     def test_forward_i2v_sound_and_action_routes(self, make_cosmos3_pipeline) -> None:
         pipeline = make_cosmos3_pipeline()
@@ -5090,6 +5424,18 @@ def test_pipeline_parallel_rejects_cache_backends(pp_size, cache_backend, should
         _validate_cosmos3_pp_cache_backend(od_config)
 
 
+@pytest.mark.parametrize(
+    ("cache_backend", "active"),
+    [(None, False), ("none", False), ("None", False), ("", False), ("cache_dit", True), ("sea_cache", True)],
+)
+def test_cosmos3_cache_backend_active(cache_backend, active) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _cosmos3_cache_backend_active
+
+    assert _cosmos3_cache_backend_active(OmniDiffusionConfig(model=None, cache_backend=cache_backend)) is active
+    assert _cosmos3_cache_backend_active(OmniDiffusionConfig(model=None)) is False
+
+
 def test_pipeline_init_rejects_cache_backend_under_pp_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
 
@@ -5104,6 +5450,23 @@ def test_pipeline_init_rejects_cache_backend_under_pp_before_loading(monkeypatch
         parallel_config=SimpleNamespace(pipeline_parallel_size=2, cfg_parallel_size=1, ulysses_degree=1),
     )
     with pytest.raises(ValueError, match="cache_backend='sea_cache'"):
+        pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=od_config)
+
+
+@pytest.mark.parametrize("value", ["false", 0])
+def test_pipeline_init_rejects_non_bool_batch_t2i_outputs_before_loading(
+    monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    monkeypatch.setattr(
+        pipeline_cosmos3.FlowUniPCMultistepScheduler,
+        "load_config",
+        lambda *args, **kwargs: pytest.fail("component loading must not start for a non-bool batching switch"),
+    )
+    od_config = OmniDiffusionConfig(model=None, additional_config={"cosmos3_batch_t2i_outputs": value})
+    with pytest.raises(TypeError, match="cosmos3_batch_t2i_outputs"):
         pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=od_config)
 
 

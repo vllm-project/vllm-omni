@@ -163,8 +163,11 @@ Placement selects an eligible group by its highest reserved-to-capacity ratio,
 then its total reserved count, with round-robin tie-breaking. Sessions keep
 their group across turns, cancellation, epochs and reconnects. Idle sessions
 hold their slots, and closing sessions release them after cleanup completes.
-When no group has capacity, opening a session fails with the retryable
-`resource_exhausted` error containing `replica_capacity_exhausted`.
+If a complete group is still live but session capacity is exhausted, opening
+a session returns the retryable `resource_exhausted` error. If replica failures leave this frontend with no
+complete group, opening a session returns `replica_unavailable`. A frontend
+that starts in this state logs a warning and skips duplex warmup. With multiple
+frontends, the client can reconnect to try another frontend.
 
 `least_sessions` supports replicas attached through distributed runtimes,
 including multiple runtimes serving the same stage across hosts. Declare the
@@ -746,7 +749,10 @@ Its inputs are token IDs, embeddings, previous hidden states and per-row
 conditioning; it returns updated embeddings and prediction codes. Models may
 supply `mtp_sampling_params` and `get_mtp_seed(sampling_params)` for model-local explicit seeds, and declare
 `mtp_accepts_per_row_generators`, `mtp_accepts_req_infos`, or `mtp_sample_uniforms`
-(with `mtp_sample_steps` and `mtp_sample_vocab_size`) as needed. Qwen3-TTS retains
+(with `mtp_sample_steps` and `mtp_sample_vocab_size`) as needed. A model whose
+buffered noise must preserve eager per-step RNG call shapes can also declare
+`mtp_sample_uniforms_preserve_eager_stream`; graph-padding rows then use a
+constant and do not advance any generator. Qwen3-TTS retains
 its existing `talker_mtp` entry point for V1.
 
 ### Selecting one or two Qwen3-TTS stages

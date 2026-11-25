@@ -105,7 +105,7 @@ def _partial_orchestrator(talker_processor: object) -> _PartialOrchestrator:
 
 @dataclass
 class _PartialStreaming:
-    bridge_states: dict[str, object] = field(default_factory=dict)
+    bridge_states: dict[str, dict[str, object]] = field(default_factory=dict)
     enabled: bool = False
 
 
@@ -114,7 +114,7 @@ class _PartialReqState:
     session_owned: bool = True
     final_stage_id: int = 2
     request_id: str = "req-1"
-    prompt: dict[str, object] = field(default_factory=lambda: {"additional_information": {}})
+    prompt: dict[str, dict[str, object]] = field(default_factory=lambda: {"additional_information": {}})
     streaming: _PartialStreaming = field(default_factory=_PartialStreaming)
 
 
@@ -826,6 +826,7 @@ def test_asr_profile_and_sampling_keep_joyai_ownership():
     normal = load_deploy_config(get_deploy_config_path("joyai_vl_interaction_asr.yaml"))
     duplex = load_deploy_config(get_deploy_config_path("joyai_vl_interaction_asr_duplex.yaml"))
     assert normal.stages == duplex.stages and duplex.session_mode == "duplex"
+    assert normal.async_chunk is duplex.async_chunk is False
 
 
 def test_speech_buffer_rolls_back_audio_but_keeps_newest_frame():
@@ -1119,8 +1120,8 @@ async def test_batched_commits_keep_separate_audio_and_transcript_owners(cancel,
                 images = info["deferred_multi_modal_data"]["image"]
                 assert [image.getpixel((0, 0)) for image in images] == [(255, 0, 0)] + [(0, 0, 255)] * (count - 1)
                 history = info["joyai_prompt_context"]["history"]
-                for previous in expected_transcripts[:-1]:
-                    assert ({"role": "user", "content": previous} in history) is bool(previous)
+                for item_id, previous in zip(item_ids, expected_transcripts[:-1]):
+                    assert ({"role": "user", "content": previous, "_item_key": item_id} in history) is bool(previous)
             if cancel:
                 await h.run(CancelResponse())
             h.runner.on_stage_output(
@@ -1515,6 +1516,7 @@ async def test_asr_visuals_stay_on_raw_prompt_across_engine_wire(mocker, monkeyp
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE)
     plugin.processor = Processor()
     plugin.max_model_len = 16384
+    plugin.max_images = 4
     orchestrator, clients, rpc_q, _ = _build(stages=4, plugin=plugin)
 
     async def process_inputs(stage_id, *, request_id, params, **kwargs):
@@ -2332,10 +2334,13 @@ async def test_conversation_images_and_camera_frames_share_input_order():
 def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.processor = Processor()
-    plugin.max_model_len = 1500
     plugin.max_images = 999
     config = DuplexSessionConfig(instructions="Watch the pot.")
     runtime = plugin.runtime_config_for_update(config, {})
+    # Leave room for the current query, one image and output, independently of
+    # the persona's wording (the test tokenizer counts characters as tokens).
+    system_tokens = len(plugin.processor.tokenizer(text=[plugin._system_prompt(runtime)])["input_ids"][0])
+    plugin.max_model_len = system_tokens + 600
     kwargs = dict(
         request_id="r",
         fence=DuplexFence("s"),
@@ -2360,10 +2365,11 @@ def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
     prompt = plan.prompt
     assert "Watch the pot." in prompt["prompt"] and "Any smoke?" in prompt["prompt"]
     assert "old answer" not in prompt["prompt"]
+    assert len(prompt["multi_modal_data"]["image"]) == 1
     assert prompt["multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 0, 255)
     assert (
         len(plugin.processor(text=[prompt["prompt"]], images=prompt["multi_modal_data"]["image"])["input_ids"][0])
-        <= 1436
+        <= plugin.max_model_len - 64
     )
     plugin.max_model_len = 10
     with pytest.raises(DuplexRuntimeConfigError, match="context budget"):
@@ -2377,7 +2383,7 @@ def test_asr_handoff_rebudgets_history_and_handles_empty_transcript(monkeypatch,
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE)
     plugin.processor = Processor()
-    plugin.max_model_len = 2600
+    plugin.max_images = 4
     monkeypatch.setattr(bridge, "cached_processor_from_config", lambda config: plugin.processor, raising=False)
     monkeypatch.setattr(
         bridge,
@@ -2398,6 +2404,10 @@ def test_asr_handoff_rebudgets_history_and_handles_empty_transcript(monkeypatch,
         ]
     )
     runtime = plugin.runtime_config_for_update(DuplexSessionConfig(instructions="Watch the pot."), {})
+    # This tokenizer counts characters. Keep room for the transcript and current
+    # image, but not the outdated turn, independently of the persona's wording.
+    system_tokens = len(plugin.processor.tokenizer(text=[plugin._system_prompt(runtime)])["input_ids"][0])
+    plugin.max_model_len = system_tokens + 1600
     if not transcript:
         runtime["initial_user_text"] = "Describe what you see."
     plan = plugin.plan_append(
@@ -2429,7 +2439,7 @@ def test_asr_handoff_rebudgets_history_and_handles_empty_transcript(monkeypatch,
         assert result["prompt"].count("Describe what you see.") == 1
     assert (
         len(plugin.processor(text=[result["prompt"]], images=result["multi_modal_data"]["image"])["input_ids"][0])
-        <= 2536
+        <= plugin.max_model_len - 64
     )
 
 
