@@ -1719,7 +1719,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             build_unit_payload(
                 session_id=session_id,
                 stage_id=0,
-                unit_index=0,
+                unit_index=self._minicpmo45_duplex_capture_unit_index(row_idx),
                 seq=seq,
                 epoch=epoch if epoch is not None else 0,
                 token_ids=[int(token)],
@@ -1768,6 +1768,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         seeds = getattr(self, "_minicpmo45_duplex_capture_seed_by_key", None) or {}
         return seeds.get(entry[0])
 
+    def _minicpmo45_duplex_capture_unit_index(self, row_idx: int) -> int:
+        """The row's capture ``unit_index``: its session's unit counter.
+
+        ``audio_chunk_idx`` is constant across a unit's decode steps and advances when the next
+        unit opens; a row without a session state stamps 0.
+        """
+        return getattr(self._minicpmo45_duplex_state_for_row(row_idx), "audio_chunk_idx", 0)
+
     def _minicpmo45_duplex_capture_row(
         self,
         row_idx: int,
@@ -1791,6 +1799,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             self._minicpmo45_duplex_capture_effective_seed(row_idx),
             token,
             token_ids,
+            unit_index=self._minicpmo45_duplex_capture_unit_index(row_idx),
             reason=reason,
             boundary_prob=boundary_prob,
             stage2_logprob=stage2_logprob,
@@ -1807,6 +1816,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         token: int,
         token_ids: dict[str, int],
         *,
+        unit_index: int,
         reason: str | None,
         boundary_prob: float | None,
         stage2_logprob: float | None,
@@ -1814,7 +1824,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     ) -> dict[str, Any] | None:
         """Assemble one row's unit payload. The universal ``logprob`` is the two-stage joint
         (``log P(chunk_eos)`` for a boundary hit, else ``log(1-P)`` + the stage-2 pre-truncation
-        logprob); forced rows record no draw."""
+        logprob); forced rows record no draw. ``unit_index`` is the model's monotone per-session
+        unit counter: consecutive payloads sharing it are one unit's decode steps."""
         from vllm_omni.protocol.duplex.action_records import ACTION_FORCED, ACTION_SAMPLED, build_unit_payload
 
         session_id, epoch, seq = identity
@@ -1854,7 +1865,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             build_unit_payload(
                 session_id=session_id,
                 stage_id=0,
-                unit_index=0,
+                unit_index=unit_index,
                 seq=seq,
                 epoch=epoch if epoch is not None else 0,
                 token_ids=[int(token)],
@@ -1904,8 +1915,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         commit, so generators advance as on the synchronous path. Process-wide generator rows can not
         be rewound alone and keep the step synchronous.
 
-        Capture rows never take this path — records must arrive per unit
-        at unit time. The deferred commit runs one sampling step later, so a
+        Capture rows never take this path — payloads must arrive per step
+        at step time. The deferred commit runs one sampling step later, so a
         deferred capture payload would ride the *next* unit's delivery, and
         the response-terminal unit's record would seal into the wrong scope
         or surface as a missing-payload failure. Capture sessions pay the

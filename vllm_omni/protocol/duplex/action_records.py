@@ -246,7 +246,7 @@ class DuplexActionRecordSet:
         )
 
 
-# ---- Model -> engine wire payload (one per model unit) ----
+# ---- Model -> engine wire payload (one per decode step, grouped into units by ``unit_index``) ----
 
 # Top-level keys the wire payload accepts. Unknown top-level keys are a
 # validation error; unknown keys *inside* ``model`` pass through untouched.
@@ -294,8 +294,12 @@ def build_unit_payload(
 
     Args:
         session_id: Session the unit belongs to.
-        stage_id / unit_index / seq / epoch: Delivery identity; ``seq`` is the
-            model-asserted unit key.
+        stage_id / seq / epoch: Delivery identity; ``seq`` is the model-asserted
+            unit key.
+        unit_index: The model's monotone per-session unit counter; the ledger
+            folds consecutive payloads with the same ``unit_index`` into one
+            record, so a unit's decode steps (and the terminator restated at
+            the next unit's open under ``reemit``) become that record's actions.
         token_ids / logprobs / action_kinds: Parallel columns; ``logprobs[i]``
             is the exact-distribution logprob of ``token_ids[i]``, ``None``
             only for draws that did not happen (``reemit``).

@@ -358,7 +358,7 @@ class StreamingSegmentState:
     # processed RequestOutput used by the routing layer.
     token_ids: list[int] = field(default_factory=list)
     output_metadata: dict[str, Any] = field(default_factory=dict)
-    # Serialized per-unit capture payload; also populated on the terminal
+    # Serialized per-step capture payload; also populated on the terminal
     # poll so the response's final unit is never lost.
     capture_payload: bytes | None = None
 
@@ -1153,7 +1153,7 @@ class OrchestratorBase:
                     finished=segment_finished,
                     token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
                     output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
-                    # The payload is part of the delivery contract: per-unit
+                    # The payload is part of the delivery contract: per-step
                     # deliveries are non-finished by design and must keep theirs.
                     capture_payload=bytes(capture_payload) if capture_payload is not None else None,
                 )

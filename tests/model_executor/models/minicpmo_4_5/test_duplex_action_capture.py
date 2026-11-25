@@ -8,8 +8,8 @@ float32 (raw-softmax Bernoulli for stage 1, forbidden-masked logits at the
 row's temperature for stage 2) and must match within tolerance on all sampled
 tokens; a second test pins that truncation and the repetition penalty steer
 the draw but not the record. Taxonomy, seeded replay, cap-without-draw,
-force-listen-without-draw, same-step publication, the generator device and
-the per-unit capture seq are pinned beside it.
+force-listen-without-draw, same-step publication, the generator device, the
+per-unit capture seq and the unit counter stamp are pinned beside it.
 """
 
 from __future__ import annotations
@@ -220,8 +220,9 @@ def test_seeded_capture_replays_identical_tokens_and_logprobs() -> None:
 def test_terminator_reemit_records_no_draw() -> None:
     model, states, md, steps = _setup(3)
     _enable_capture(model)
-    # Row 0's last accepted token is a chunk terminator: the lookahead
-    # re-emits it without consuming RNG and the record says so.
+    # Row 0's last accepted token is a chunk terminator: the lookahead re-emits it
+    # without consuming RNG, under the terminator's unit (the next has not opened).
+    states[0].audio_chunk_idx = 2
     md.output_token_ids[0].append(CHUNK_EOS)
     out = model._sample_minicpmo45_native_duplex_stage0(steps[0].clone(), md, duplex_rows=list(range(6)))
     assert out.sampled_token_ids.squeeze(-1).tolist()[0] == CHUNK_EOS
@@ -229,6 +230,7 @@ def test_terminator_reemit_records_no_draw() -> None:
     assert payload["action_kinds"] == ["reemit"]
     assert payload["logprobs"] == [None]
     assert payload["terminators"] == [{"token_id": CHUNK_EOS, "kind": "chunk_eos"}]
+    assert payload["unit_index"] == 2
 
 
 def test_capture_rows_force_the_synchronous_path() -> None:
@@ -254,6 +256,29 @@ def test_capture_rows_force_the_synchronous_path() -> None:
         else:
             assert payload["reason_codes"][0]
     assert tokens
+
+
+def test_capture_unit_index_is_the_session_unit_counter() -> None:
+    """``unit_index`` is the row's session unit counter, which the ledger folds a unit's steps by.
+
+    The stamp holds across a unit's decode steps and changes only when the session opens its
+    next unit, while the capture ``seq`` advances with every step. A row without a session
+    state stamps 0.
+    """
+    model, states, md, steps = _setup(0)
+    _enable_capture(model)
+    del states[5]
+
+    def sample(logits: torch.Tensor) -> dict[str, dict[str, Any]]:
+        model._sample_minicpmo45_native_duplex_stage0(logits.clone(), md, duplex_rows=list(range(6)))
+        return {k: decode_unit_payload(v) for k, v in _published(model).items()}
+
+    first = sample(steps[0])
+    assert [first[f"req-{row}"]["unit_index"] for row in range(6)] == [0, 1, 2, 3, 4, 0]
+    states[0].audio_chunk_idx = 9  # row 0's session opened its next unit
+    second = sample(steps[1])
+    assert [second[f"req-{row}"]["unit_index"] for row in range(6)] == [9, 1, 2, 3, 4, 0]
+    assert second["req-0"]["seq"] > first["req-0"]["seq"]
 
 
 _DEVICES = [

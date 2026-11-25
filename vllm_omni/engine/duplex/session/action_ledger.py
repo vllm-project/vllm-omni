@@ -50,6 +50,7 @@ class ActionLedgerError(ValueError):
 class _UnitRow:
     stage_id: int
     seq: int
+    unit_index: int
     offset: int
     input_modality: str
     input_origin: str
@@ -70,7 +71,7 @@ class _OpenScope:
     action_kinds: list[str] = field(default_factory=list)
     reason_codes: list[str] = field(default_factory=list)
     stream_names: list[str] = field(default_factory=list)
-    # Unit-level rows, in ingest order.
+    # Unit-level rows, one per model unit, in open order.
     units: list[_UnitRow] = field(default_factory=list)
     streams: dict[tuple[str, int, str], DuplexActionStream] = field(default_factory=dict)
     effective_seed: int | None = None
@@ -173,10 +174,14 @@ class SessionActionLedger:
         input_modality: str = "",
         input_commit_ns: int | None = None,
     ) -> int:
-        """Validate and append one unit payload; returns the scope unit index.
+        """Validate and fold one capture payload into the scope's units; returns the scope unit index.
 
-        ``decode_unit_payload`` owns schema validation; this method owns
-        ordering (model-asserted ``seq``, strictly monotone per scope)."""
+        ``decode_unit_payload`` owns schema validation; this method owns ordering: the
+        model-asserted ``seq`` is strictly monotone per scope and ``unit_index`` monotone
+        non-decreasing. Consecutive payloads sharing a ``unit_index`` are one model unit's
+        decode steps: the first opens the unit's row, the rest extend its columns, and the
+        unit keeps its first step's input annotation and emission time.
+        """
         record = decode_unit_payload(payload)
         if int(record["epoch"]) != int(epoch):
             raise ActionLedgerError(f"capture payload epoch {record['epoch']} != delivery epoch {epoch}")
@@ -187,6 +192,12 @@ class SessionActionLedger:
         if scope.last_seq is not None and seq <= scope.last_seq:
             raise ActionLedgerError(
                 f"capture payload seq {seq} is not after {scope.last_seq} in scope {scope.response_id or 'listening'}"
+            )
+        unit_index = int(record["unit_index"])
+        last = scope.units[-1] if scope.units else None
+        if last is not None and unit_index < last.unit_index:
+            raise ActionLedgerError(
+                f"capture payload unit_index {unit_index} is behind the scope's unit {last.unit_index}"
             )
         scope.last_seq = seq
         modality, origin, commit_ns_from_input = self.input_unit(epoch, seq)
@@ -214,10 +225,14 @@ class SessionActionLedger:
         model_extension = record.get("model") or {}
         if model_extension:
             scope.model.update(model_extension)
+        if last is not None and unit_index == last.unit_index:
+            last.terminators += tuple(dict(term) for term in record.get("terminators") or ())
+            return len(scope.units) - 1
         scope.units.append(
             _UnitRow(
                 stage_id=int(stage_id),
                 seq=seq,
+                unit_index=unit_index,
                 offset=offset,
                 input_modality=str(input_modality) or modality,
                 input_origin=origin,

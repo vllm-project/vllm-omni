@@ -27,6 +27,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def _payload(
     *,
     seq: int,
+    unit_index: int | None = None,
     session_id: str = "s1",
     stage_id: int = 0,
     epoch: int = 0,
@@ -43,7 +44,7 @@ def _payload(
         build_unit_payload(
             session_id=session_id,
             stage_id=stage_id,
-            unit_index=0,
+            unit_index=seq if unit_index is None else unit_index,
             seq=seq,
             epoch=epoch,
             token_ids=list(token_ids),
@@ -59,6 +60,11 @@ def _payload(
     )
 
 
+def _ingest_r1(ledger: SessionActionLedger, payload: bytes) -> int:
+    """Ingest into the ``r1`` scope of epoch 0 / turn 1, as the model channel does."""
+    return ledger.ingest(payload, epoch=0, turn_id=1, response_id="r1", stage_id=0, input_modality="")
+
+
 # ---- wire payload ----
 
 
@@ -67,6 +73,7 @@ def test_payload_roundtrip_and_strict_top_level_keys() -> None:
     decoded = decode_unit_payload(data)
     assert decoded["schema_version"] == ACTION_CAPTURE_WIRE_VERSION
     assert decoded["token_ids"] == [11]
+    assert decoded["unit_index"] == 1  # one model unit per payload unless a test stamps another
 
     bad = dict(decode_unit_payload(data))
     bad["mystery_field"] = 1
@@ -137,6 +144,61 @@ def test_reordering_and_stale_seq_are_session_fatal() -> None:
         ledger.ingest(_payload(seq=5), epoch=0, turn_id=1, response_id=None, stage_id=0, input_modality="")
     with pytest.raises(ActionLedgerError, match="not after"):
         ledger.ingest(_payload(seq=4), epoch=0, turn_id=1, response_id=None, stage_id=0, input_modality="")
+
+
+def test_decode_steps_of_one_unit_fold_into_a_single_record() -> None:
+    """A model unit arrives as one payload per decode step, all stamped with the unit's counter."""
+    ledger = SessionActionLedger(session_id="s1")
+    ledger.bind_response("r1", epoch=0, turn_id=1)
+    ledger.note_input_unit(0, 1, modality="audio", origin="engine", commit_ns=101)
+    boundary = {"token_id": 5, "kind": "chunk_eos"}
+    restated = {"token_id": 5, "kind": "chunk_eos"}
+    steps = (
+        _payload(seq=1, unit_index=4),
+        _payload(seq=2, unit_index=4, token_ids=(12,), logprobs=(-0.5,)),
+        _payload(seq=3, unit_index=4, token_ids=(5,), logprobs=(-0.75,), terminators=(boundary,)),
+        # The next unit's open restates the terminator under the closing unit's counter.
+        _payload(
+            seq=4,
+            unit_index=4,
+            token_ids=(5,),
+            logprobs=(None,),
+            kinds=("reemit",),
+            reasons=("terminator_reemit",),
+            terminators=(restated,),
+        ),
+    )
+    # Each step joins unit 0 of the scope; the unit's row stays its first step's.
+    assert [_ingest_r1(ledger, step) for step in steps] == [0, 0, 0, 0]
+    ledger.seal_active_response("r1")
+    [set_] = ledger.take_terminal_sets()
+    assert set_.num_units() == 1
+    assert set_.token_ids == (11, 12, 5, 5)
+    assert set_.unit_offsets == (0, 4)
+    assert set_.logprobs == (-0.25, -0.5, -0.75, None)
+    assert set_.action_kinds == ("sampled", "sampled", "sampled", "reemit")
+    assert set_.terminators == ((boundary, restated),)
+    # The unannotated later steps leave the unit its first step's input annotation.
+    assert (set_.input_origins, set_.input_commit_ns) == (("engine",), (101,))
+    [record] = set_.records()
+    assert [action.action_kind for action in record.actions] == ["sampled"] * 3 + ["reemit"]
+    assert [action.token_id for action in record.actions] == [11, 12, 5, 5]
+
+
+def test_a_new_unit_counter_opens_a_record_and_a_behind_one_is_fatal() -> None:
+    ledger = SessionActionLedger(session_id="s1")
+    ledger.bind_response("r1", epoch=0, turn_id=1)
+    assert _ingest_r1(ledger, _payload(seq=1, unit_index=7)) == 0
+    assert _ingest_r1(ledger, _payload(seq=2, unit_index=7)) == 0
+    assert _ingest_r1(ledger, _payload(seq=3, unit_index=8, token_ids=(13,), logprobs=(-0.5,))) == 1
+    with pytest.raises(ActionLedgerError, match="unit_index 7 is behind the scope's unit 8") as exc_info:
+        _ingest_r1(ledger, _payload(seq=4, unit_index=7))
+    assert exc_info.value.code == "action_capture_invalid"
+    ledger.seal_active_response("r1")
+    [set_] = ledger.take_terminal_sets()
+    assert set_.num_units() == 2
+    assert set_.unit_offsets == (0, 2, 3)
+    assert set_.token_ids == (11, 11, 13)
 
 
 def test_epoch_mismatch_and_stage_mismatch_are_invalid() -> None:

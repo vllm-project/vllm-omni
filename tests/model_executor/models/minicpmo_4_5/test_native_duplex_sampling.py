@@ -75,7 +75,9 @@ def _setup(seed: int, *, all_greedy: bool = False, max_chars: int = 6, turns_ope
     for logits in steps:
         logits[3, CHUNK_EOS] += 50.0
         logits[1, LISTEN] += 40.0
-    states = {row: SimpleNamespace(generated_tokens=[], current_turn_ended=True) for row in range(6)}
+    states = {
+        row: SimpleNamespace(generated_tokens=[], current_turn_ended=True, audio_chunk_idx=row) for row in range(6)
+    }
     states[1].current_turn_ended, states[5].generated_tokens = not turns_open, [11, 11, 12]
     model = Model.__new__(Model)
     model.model_stage, model.max_new_speak_tokens_per_chunk, model.max_speak_chars_per_chunk = "llm", 5, max_chars

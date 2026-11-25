@@ -1622,21 +1622,26 @@ what forcing* — the two surfaces this contract adds.
   immutable afterwards, like `seed`). A capture request against a non-capable effective
   capability is rejected at admission (`action_capture_unsupported`).
 - **Transport.** With capture on, the duplex sampler attaches one
-  self-describing, versioned payload per sampled unit on the dedicated
+  self-describing, versioned payload per sampled decode step on the dedicated
   `OmniSamplingOutput.action_capture` field — never `multimodal_outputs`,
   whose non-None value would replace the forward's multimodal payload.
   The runner serializes it onto the `OmniEngineCoreOutput.action_capture_payload`
   bytes carrier; orchestrator-side decode and strict schema validation happen
-  at ledger ingest, and the terminal poll recovers the final unit's payload.
+  at ledger ingest, and the terminal poll recovers the final step's payload.
   With capture off, no field is set, nothing is packed, no bytes cross the
   wire: generation behavior and hot-loop work are unchanged.
 - **Semantics.** The session ledger (`engine/duplex/session/action_ledger.py`)
   assembles units into sealed, columnar `DuplexActionRecordSet`s — one per
   response, or per listening period (model-native sessions sample the units
   where they keep listening too; those actions are as much policy as the
-  spoken ones). Each record carries the two-stage policy's joint
-  log-probability of the emitted action under its pre-truncation distribution:
-  stage 1 is the raw `log P(chunk_eos)`; a content token records
+  spoken ones) — holding one record per model unit. A unit's decode steps
+  arrive as one payload per step and fold into that unit's record as
+  multiple actions (per-step `seq` strictly monotone; `unit_index` monotone
+  non-decreasing per scope); the `reemit` row is the previous unit's
+  restated terminator and folds into that unit. Each action carries the
+  two-stage policy's joint log-probability of its token under its
+  pre-truncation distribution: stage 1 is the raw `log P(chunk_eos)`;
+  a content token records
   `log(1 - P(chunk_eos)) + log_softmax(masked logits / T)[token]`, where the
   mask is the forbidden set (`tts_pad`, `bad_token_ids`, `chunk_eos`) and
   `T` the row's temperature (greedy rows: `T = 1`, the argmax token).

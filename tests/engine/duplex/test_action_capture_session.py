@@ -7,7 +7,8 @@ The harness is the real session stack (manager, runner, model channel, MiniCPM-o
 plugin with capture declared); only the stage port is fake and stage outputs are
 scripted, exactly like the session-stats suite beside it. These tests pin the
 Engine-contract criteria: complete, ordered, schema-valid records including
-forced kinds; capture off stamps nothing; validation failure closes the session;
+forced kinds; a spoken unit's per-step deliveries fold into one record; capture
+off stamps nothing; validation failure closes the session;
 retention spills into the terminal cache so a multi-turn episode never overflows;
 the terminating funnel seals its status (close/cancel/interruption) and close
 mid-response returns the partial set sealed.
@@ -40,6 +41,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO4
 from vllm_omni.protocol.duplex.action_records import (
     DuplexActionRecordSet,
     build_unit_payload,
+    decode_unit_payload,
     encode_unit_payload,
 )
 
@@ -61,6 +63,7 @@ def _unit_payload(
     seq: int,
     session_id: str = SESSION_ID,
     epoch: int = 0,
+    unit_index: int | None = None,
     token_ids: tuple[int, ...] = (11, LISTEN_TOKEN_ID),
     logprobs: tuple[float | None, ...] | None = None,
     kinds: tuple[str, ...] | None = None,
@@ -71,7 +74,7 @@ def _unit_payload(
         build_unit_payload(
             session_id=session_id,
             stage_id=0,
-            unit_index=0,
+            unit_index=seq if unit_index is None else unit_index,
             seq=seq,
             epoch=epoch,
             token_ids=list(token_ids),
@@ -245,6 +248,53 @@ async def test_decisionless_unit_delivery_reaches_the_ledger_and_still_forwards(
         assert len(sets) == 1
         record_set = sets[0]
         assert (record_set.token_ids, record_set.num_units()) == ((11, 12), 1)
+    finally:
+        await close_harness(h)
+
+
+def test_unit_payload_fixture_stamps_one_model_unit_per_seq() -> None:
+    """Every scripted delivery is its own model unit unless a test passes ``unit_index``."""
+    assert decode_unit_payload(_unit_payload(seq=3))["unit_index"] == 3
+    assert decode_unit_payload(_unit_payload(seq=3, unit_index=1))["unit_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_spoken_units_decode_steps_fold_into_one_record() -> None:
+    """A spoken model unit reaches the ledger as one delivery per decode step.
+
+    Content, content, then the ``chunk_eos`` boundary share the unit's ``unit_index``; the
+    next unit's listen opens its own record beside it.
+    """
+    h = await open_capture_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        events = []
+        # seq, sampled token, segment closed: content, content, then the chunk_eos boundary.
+        for seq, token, closed in ((1, 20, False), (2, 21, False), (3, 5, True)):
+            events += await h.deliver_and_settle(
+                SimpleNamespace(
+                    request_id=request_id,
+                    finished=False,
+                    outputs=[SimpleNamespace(text="", token_ids=[token], multimodal_output={})],
+                    multimodal_output={},
+                ),
+                stage_id=0,
+                segment_finished=closed,
+                capture_payload=_unit_payload(seq=seq, unit_index=1, token_ids=(token,), kinds=("sampled",)),
+            )
+        events += await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            capture_payload=_unit_payload(seq=4, unit_index=2, token_ids=(LISTEN_TOKEN_ID,)),
+        )
+        assert "error" not in types(events), events
+        [record_set] = await drain_after_close(h)
+        assert record_set.token_ids == (20, 21, 5, LISTEN_TOKEN_ID)
+        assert record_set.unit_offsets == (0, 3, 4)
+        records = list(record_set.records())
+        assert [len(record.actions) for record in records] == [3, 1]
     finally:
         await close_harness(h)
 
