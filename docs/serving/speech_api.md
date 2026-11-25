@@ -483,6 +483,7 @@ Client -> Server:
 | `{"type": "input.text", "text": "..."}` | Text chunk. It is accumulated in `buffered` mode or fed to the readiness policy in `commitment` mode. |
 | `{"type": "input.done"}` | End-of-input for the current utterance. It flushes buffered text or closes and flushes the commitment policy, waits for submitted work, and keeps the connection open. |
 | `{"type": "session.close"}` | Close the connection. In `commitment` mode it cancels active and queued synthesis. In `buffered` mode it discards text not yet submitted, but a close frame cannot be handled while a request is generating, including requests from the linguistic splitter. There is no separate `input.cancel` message. |
+| `{"type": "session.ping"}`| Deliver an optional keep alive message to the server |
 
 Server -> Client:
 
@@ -492,6 +493,7 @@ Server -> Client:
 | Binary frame | A chunk of the current request's continuous byte stream; feed frames to that request's parser (`audio.start` … `audio.done`). With `stream_audio=true`, the stream contains PCM samples; for `wav`, each request starts with its own 44-byte placeholder WAV header. |
 | `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | The corresponding request is complete. `total_bytes` counts all binary bytes sent for that request, including the WAV header when applicable. `error=true` means it failed. |
 | `{"type": "session.done", "utterance_index": 0, "total_sentences": N}` | Terminal marker after `input.done`/EOF and all started requests have settled. It is not a success indicator. `total_sentences` is the number of requests that emitted `audio.start`, despite the compatibility name. |
+| `{"type": "session.pong"}` | Response to `session.ping` message |
 | `{"type": "error", "message": "..."}` | A protocol, limit, validation, or generation error. Some protocol errors are recoverable; a segment failure terminates the current utterance. |
 
 No additional acknowledgment, boundary, or cancellation event is introduced

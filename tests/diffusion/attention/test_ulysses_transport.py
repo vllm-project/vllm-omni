@@ -39,8 +39,9 @@ def test_selected_transport_handles_qkv_and_output(monkeypatch, use_ce):
     monkeypatch.setattr(ulysses.SeqAllToAll4D, "apply", nccl_exchange)
     monkeypatch.setattr(a2a_permute, "ulysses_o_rev", lambda x, g, w: exchange(x, g, w, 1))
 
-    def exchange_qkv(q, k, v, group_name, world_size):
-        assert group_name == "subgroup" and world_size == 2 and use_ce
+    def exchange_qkv(q, k, v, group_name, world_size, zero_copy):
+        # Q/K/V stay views of the workspace: attention consumes them inside the strategy.
+        assert group_name == "subgroup" and world_size == 2 and use_ce and zero_copy
         exchanges.append(2)
         return q.new_empty(q.numel() + k.numel() + v.numel())
 
