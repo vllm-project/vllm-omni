@@ -1223,8 +1223,6 @@ class Attention(nn.Module):
         if attn_metadata is not None:
             if (
                 attn_metadata.attn_mask is not None
-                or attn_metadata.joint_query is not None
-                or attn_metadata.joint_key is not None
                 or attn_metadata.joint_attn_mask is not None
                 or attn_metadata.cross_query_mask is not None
                 or attn_metadata.full_attn_spans is not None
@@ -1232,12 +1230,47 @@ class Attention(nn.Module):
                 or "minimax_h3_reference_kv_post_parallel" in attn_metadata.extra
             ):
                 return 0
+            joint_q, joint_k, joint_v = attn_metadata.joint_query, attn_metadata.joint_key, attn_metadata.joint_value
+            if any(t is not None for t in (joint_q, joint_k, joint_v)):
+                # The output exchange covers target queries only. Accept a
+                # replicated K/V prefix with no prefix queries (Qwen-Image 2.1
+                # cached decode), and keep general joint attention on the
+                # standard path.
+                if (
+                    strategy.overlap_int8
+                    or attn_metadata.joint_strategy != "front"
+                    or attn_metadata.extra
+                    or attn_metadata.query_ranges is not None
+                    or attn_metadata.video_layout is not None
+                    or attn_metadata.packed_padding is not None
+                    or joint_q is None
+                    or joint_k is None
+                    or joint_v is None
+                    or joint_q.shape != (1, 0, *query.shape[2:])
+                    or joint_k.ndim != 4
+                    or joint_k.shape[0] != 1
+                    or joint_k.shape[1] == 0
+                    or joint_k.shape[2:] != query.shape[2:]
+                    or joint_k.shape != joint_v.shape
+                    or query.dtype != torch.bfloat16
+                    or any(
+                        t.device != query.device or t.dtype != query.dtype
+                        for t in (key, value, joint_q, joint_k, joint_v)
+                    )
+                ):
+                    return 0
         return chunks
 
     @torch.compiler.disable
     def _forward_ulysses_overlap(self, strategy, query, key, value, attn_metadata, chunks: int) -> torch.Tensor:
         from vllm_omni.diffusion.attention.parallel.ulysses_overlap import run_ulysses_overlap
 
+        prefix_kv = None
+        if attn_metadata is not None and attn_metadata.joint_key is not None:
+            assert attn_metadata.joint_value is not None
+            prefix_kv = (attn_metadata.joint_key, attn_metadata.joint_value)
+            # The exchange runner prepends the prefix before calling the backend.
+            attn_metadata = None
         attn_metadata = self._with_kv_cache_dtype(attn_metadata)
         return run_ulysses_overlap(
             strategy._ulysses_pg,
@@ -1247,6 +1280,7 @@ class Attention(nn.Module):
             lambda q, k, v: self._run_local_attention(q, k, v, attn_metadata),
             chunks=chunks,
             int8=strategy.overlap_int8,
+            prefix_kv=prefix_kv,
         )
 
     def _forward_impl(

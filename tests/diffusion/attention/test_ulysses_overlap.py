@@ -52,12 +52,15 @@ def test_overlap_config_accepts_strict_pure_ulysses():
 class _Shape:
     """Stands in for a CUDA tensor: the gate only reads shape, rank and device."""
 
-    def __init__(self, shape, is_cuda=True):
+    def __init__(self, shape, is_cuda=True, dtype=torch.bfloat16):
         self.shape = torch.Size(shape)
         self.is_cuda = is_cuda
+        self.ndim = len(self.shape)
+        self.device = torch.device("cuda" if is_cuda else "cpu")
+        self.dtype = dtype
 
     def dim(self):
-        return len(self.shape)
+        return self.ndim
 
 
 def _strategy(chunks=2, int8=False, ulysses=4, ring=1, permute=False, name="ulysses"):
@@ -118,6 +121,34 @@ def test_gate_falls_back_to_standard_path(case, kwargs):
 def test_gate_requires_strict_mode(monkeypatch):
     monkeypatch.setattr(layer_mod, "get_ulysses_mode", lambda default="strict": "advanced_uaa")
     assert _gate(_strategy()) == 0
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("overrides", "int8", "expected"),
+    [
+        ({}, False, 2),
+        ({"joint_query": _Shape((1, 12, 56, 128))}, False, 0),
+        ({"joint_key": _Shape((1, 0, 56, 128))}, False, 0),
+        ({"joint_value": None}, False, 0),
+        ({"joint_value": _Shape((1, 12, 56, 128), dtype=torch.float16)}, False, 0),
+        ({"joint_value": _Shape((1, 12, 56, 128), is_cuda=False)}, False, 0),
+        ({"joint_strategy": "rear"}, False, 0),
+        ({"joint_attn_mask": torch.ones(1, 12, dtype=torch.bool)}, False, 0),
+        ({"full_attn_spans": [[(0, 12)]]}, False, 0),
+        ({"query_ranges": ()}, False, 0),
+        ({"extra": {"valid_kv_length": 12}}, False, 0),
+        ({}, True, 0),
+    ],
+)
+def test_gate_for_replicated_cached_prefix(overrides, int8, expected):
+    tensors = {
+        "joint_query": _Shape((1, 0, 56, 128)),
+        "joint_key": _Shape((1, 12, 56, 128)),
+        "joint_value": _Shape((1, 12, 56, 128)),
+    }
+    metadata = AttentionMetadata(**(tensors | overrides))
+    assert _gate(_strategy(int8=int8), metadata=metadata) == expected
 
 
 # --------------------------------------------------------------------------- int8 pack / unpack (1 GPU)
@@ -212,3 +243,56 @@ def _run_overlap_case(rank: int, world_size: int, init_method: str) -> None:
 def test_overlapped_exchange_matches_full_attention():
     world_size = 2
     torch.multiprocessing.spawn(_run_overlap_case, args=(world_size, get_file_store_init_method()), nprocs=world_size)
+
+
+def _run_cached_prefix_overlap_case(rank: int, world_size: int, init_method: str) -> None:
+    import torch.distributed as dist
+
+    from vllm_omni.diffusion.attention.parallel.ulysses_overlap import run_ulysses_overlap
+
+    current_omni_platform.set_device(torch.device("cuda", rank))
+    dist.init_process_group("nccl", init_method=init_method, world_size=world_size, rank=rank)
+    try:
+        local_tokens, heads, head_dim = 96, 8, 128
+        generator = torch.Generator(device="cuda").manual_seed(21)
+        token_shard = slice(rank * local_tokens, (rank + 1) * local_tokens)
+        q, k, v = (
+            torch.randn(
+                1,
+                world_size * local_tokens,
+                heads,
+                head_dim,
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            for _ in range(3)
+        )
+        for prefix_len in (17, 211):
+            prefix = torch.randn(
+                1, prefix_len, 2, heads, head_dim, device="cuda", dtype=torch.bfloat16, generator=generator
+            )
+            prefix_k, prefix_v = prefix.unbind(dim=2)
+            expected = _sdpa_nhd(q, torch.cat([prefix_k, k], dim=1), torch.cat([prefix_v, v], dim=1))
+            for chunks in (1, 2):
+                result = run_ulysses_overlap(
+                    dist.group.WORLD,
+                    q[:, token_shard],
+                    k[:, token_shard],
+                    v[:, token_shard],
+                    _sdpa_nhd,
+                    chunks=chunks,
+                    int8=False,
+                    prefix_kv=(prefix_k, prefix_v),
+                )
+                torch.testing.assert_close(result.float(), expected[:, token_shard].float(), atol=2e-2, rtol=2e-2)
+    finally:
+        dist.destroy_process_group()
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
+def test_overlapped_exchange_with_replicated_cached_prefix():
+    world_size = 2
+    torch.multiprocessing.spawn(
+        _run_cached_prefix_overlap_case, args=(world_size, get_file_store_init_method()), nprocs=world_size
+    )

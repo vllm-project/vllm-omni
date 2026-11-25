@@ -263,9 +263,15 @@ chunk's transfer then overlaps the attention of its neighbours, and only the
 first chunk's input and the last chunk's output stay exposed.
 
 `k` must divide `num_heads / ulysses_degree`. Attention calls that it does not
-divide, or that use masks, joint tensors, paged KV or a batch larger than one,
-keep the standard path. The option requires CUDA, `ulysses_mode="strict"`,
+divide, or that use masks, paged KV or a batch larger than one, keep the
+standard path. The option requires CUDA, `ulysses_mode="strict"`,
 `ring_degree=1`, `allgather_degree=1` and `ulysses_a2a_permute=False`.
+
+For Qwen-Image 2.1 in BF16, overlap also supports cached denoise steps with a
+replicated K/V prefix and no prefix queries. Each rank takes the prefix heads
+it needs from its local cache and exchanges the target tokens. Prefix prefill
+and other joint attention calls use the standard path. The cached-prefix
+path requires `ulysses_overlap_int8=False`.
 
 Add `ulysses_overlap_int8=True` (CLI: `--ulysses-overlap-int8`) to also send
 Q/K/V as int8 with one fp32 scale per token and head, which roughly halves the

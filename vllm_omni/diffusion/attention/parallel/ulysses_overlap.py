@@ -173,7 +173,9 @@ class UlyssesOverlapRunner:
         *,
         chunks: int,
         int8: bool,
+        prefix_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """Exchange target Q/K/V, optionally using a replicated K/V prefix."""
         P = dist.get_world_size(pg)
         _, S, H, D = query.shape
         assert query.shape[0] == 1 and key.shape == query.shape and value.shape == query.shape
@@ -194,15 +196,31 @@ class UlyssesOverlapRunner:
         if int8:
             send = [torch.empty((P, S, 3, hc, row), dtype=torch.uint8, device=dev) for _ in range(chunks)]
             recv = [torch.empty_like(b) for b in send]
-        else:
-            send = [[torch.empty((P, S, hc, D), dtype=dtype, device=dev) for _ in range(3)] for _ in range(chunks)]
-            recv = [[torch.empty_like(b) for b in grp] for grp in send]
-        if int8:
+            assert prefix_kv is None
             qkv_in = [
                 [torch.empty((1, P * S, hc, D), dtype=dtype, device=dev) for _ in range(3)] for _ in range(chunks)
             ]
-        else:  # the receive buffer already is the contiguous (1, P*S, hc, D) NHD layout
-            qkv_in = [[b.view(1, P * S, hc, D) for b in grp] for grp in recv]
+        else:
+            send = [[torch.empty((P, S, hc, D), dtype=dtype, device=dev) for _ in range(3)] for _ in range(chunks)]
+            if prefix_kv is None:
+                recv = [[torch.empty_like(b) for b in grp] for grp in send]
+                qkv_in = [[b.view(1, P * S, hc, D) for b in grp] for grp in recv]
+            else:
+                prefix_len = prefix_kv[0].shape[1]
+                rank = dist.get_rank(pg)
+                qkv_in = []
+                recv = []
+                for c in range(chunks):
+                    # The prefix is replicated. Select the heads assigned to
+                    # this rank by the chunk-major input exchange.
+                    head_start = (c * P + rank) * hc
+                    q = torch.empty((1, P * S, hc, D), dtype=dtype, device=dev)
+                    kv = [torch.empty((1, prefix_len + P * S, hc, D), dtype=dtype, device=dev) for _ in prefix_kv]
+                    for dest, prefix in zip(kv, prefix_kv):
+                        dest[:, :prefix_len].copy_(prefix.narrow(2, head_start, hc))
+                    qkv_in.append([q, *kv])
+                    # Receive target data into the suffix without a second K/V copy.
+                    recv.append([q.view(P, S, hc, D), *(t[:, prefix_len:].view(P, S, hc, D) for t in kv)])
         out_send: list[torch.Tensor] = []  # keeps each chunk's output alive until the side stream is done
         out_recv = [torch.empty((P, S, hc, D), dtype=dtype, device=dev) for _ in range(chunks)]
         final = torch.empty((1, S, H, D), dtype=dtype, device=dev)
@@ -252,5 +270,15 @@ class UlyssesOverlapRunner:
 _RUNNER = UlyssesOverlapRunner()
 
 
-def run_ulysses_overlap(pg, query, key, value, attn_fn, *, chunks: int, int8: bool) -> torch.Tensor:
-    return _RUNNER.run(pg, query, key, value, attn_fn, chunks=chunks, int8=int8)
+def run_ulysses_overlap(
+    pg,
+    query,
+    key,
+    value,
+    attn_fn,
+    *,
+    chunks: int,
+    int8: bool,
+    prefix_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    return _RUNNER.run(pg, query, key, value, attn_fn, chunks=chunks, int8=int8, prefix_kv=prefix_kv)
