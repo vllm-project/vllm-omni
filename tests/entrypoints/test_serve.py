@@ -85,6 +85,18 @@ def test_serve_parser_accepts_nested_watermark_config() -> None:
     assert args.get_explicit_kwargs_dict()["watermark_config"] == args.watermark_config
 
 
+def test_serve_parser_ulysses_a2a_backend_choices_match_config() -> None:
+    """The CLI keeps its own copy of the backend names so the docs build need not import vllm."""
+    from vllm_omni.diffusion.data import ULYSSES_A2A_BACKENDS
+
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    serve_parser = OmniServeCommand().subparser_init(subparsers)
+    action = next(a for a in serve_parser._actions if "--ulysses-a2a-backend" in a.option_strings)
+
+    assert tuple(action.choices) == ULYSSES_A2A_BACKENDS
+
+
 def test_watermark_config_collision_uses_omni_validation(capsys: pytest.CaptureFixture[str]) -> None:
     """Ensure an upstream watermark argument is extended without a duplicate flag."""
     parser = TrackingArgumentParser()

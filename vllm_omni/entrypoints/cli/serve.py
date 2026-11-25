@@ -371,8 +371,6 @@ class OmniServeCommand(CLISubcommand):
         validate_parsed_serve_args(args)
 
     def subparser_init(self, subparsers: argparse._SubParsersAction) -> FlexibleArgumentParser:
-        from vllm_omni.diffusion.data import ULYSSES_A2A_BACKENDS
-
         serve_parser = subparsers.add_parser(
             self.name,
             description=DESCRIPTION,
@@ -834,7 +832,9 @@ class OmniServeCommand(CLISubcommand):
             "--ulysses-a2a-backend",
             type=str,
             default=None,
-            choices=list(ULYSSES_A2A_BACKENDS),
+            # Kept in sync with vllm_omni.diffusion.data.ULYSSES_A2A_BACKENDS (asserted in tests); importing it here
+            # would pull in vllm when the docs build renders the parser.
+            choices=["auto", "nccl", "copy_engine", "copy_engine_overlap"],
             help=(
                 "Transport for the strict Ulysses all-to-all. 'auto' (default) picks the transport measured fastest "
                 "for the GPU and group size, otherwise 'nccl'; 'copy_engine_overlap' overlaps the copy-engine "
