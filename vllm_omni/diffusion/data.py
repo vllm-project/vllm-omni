@@ -322,29 +322,29 @@ class DiffusionParallelConfig:
       sequence shapes across the ring group.
     """
 
-    ulysses_a2a_backend: str = "auto"
-    """Transport for the strict Ulysses all-to-all.
-
-    - ``"auto"`` (default): on CUDA, probe the Ulysses group once (single node, NVLink between every pair, compute
-      capability, symmetric memory, FlashInfer) and pick the transport measured fastest there; anything else keeps
-      the process-group all-to-all.
-    - ``"nccl"``: the process-group all-to-all.
-    - ``"copy_engine"``: copy engines writing into peers' symmetric memory (single NVLink node).
-    - ``"copy_engine_overlap"``: ``"copy_engine"`` split into head chunks that move while earlier chunks compute
-      (strict pure Ulysses; bit-identical only when the attention kernel's per-head output does not depend on how
-      many heads one call covers).
-    - ``"flashinfer"``: FlashInfer's ``UlyssesCommunicator`` for the Q/K/V scatter and output gather; other
-      exchanges keep the copy engines.
-    """
-
-    ulysses_overlap_chunks: int = 0
-    """Head chunks per rank for ``"copy_engine_overlap"`` (0: two heads per chunk); must divide the rank's heads."""
-
     ulysses_a2a_permute: bool = False
     """Deprecated alias for ``ulysses_a2a_backend="copy_engine"``.
 
-    On NPU this still selects the eager, pure Ulysses implementation over WORLD in one HCCS domain, using TorchNPU's
-    NPUSHMEM allocator, Triton-Ascend and a symmetric-memory runtime.
+    On CUDA, enables CE (copy engines) on a single NVLink-connected node. NPU retains its eager, pure Ulysses
+    implementation over WORLD in one HCCS domain, using TorchNPU's NPUSHMEM
+    allocator, Triton-Ascend and a symmetric-memory runtime.
+    """
+
+    ulysses_a2a_backend: str = "auto"
+    """Transport for the strict Ulysses all-to-all: ``"auto"``, ``"nccl"``, ``"copy_engine"``,
+    ``"copy_engine_overlap"`` or ``"flashinfer"``.
+
+    ``"auto"`` probes the Ulysses group once and picks the transport measured fastest for that GPU and group size,
+    otherwise NCCL. ``"flashinfer"`` runs the strict Q/K/V scatter and output gather through FlashInfer's
+    ``UlyssesCommunicator``; gate and joint exchanges keep the copy engines.
+    """
+
+    ulysses_overlap_chunks: int = 0
+    """Head chunks per rank for ``"copy_engine_overlap"`` (0: two heads per chunk).
+
+    Requires strict pure Ulysses. Each chunk's Q/K/V move to their head owners while
+    earlier chunks compute, and outputs return as each chunk finishes. Results match the unchunked path exactly when
+    the attention backend's per-head output does not depend on the number of heads per call.
     """
 
     cfg_parallel_size: int = 1

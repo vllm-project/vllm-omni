@@ -815,17 +815,26 @@ class OmniServeCommand(CLISubcommand):
             "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
         )
         omni_config_group.add_argument(
+            "--ulysses-a2a-permute",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Deprecated alias for --ulysses-a2a-backend copy_engine "
+                "(CUDA copy engines on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
+                "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
+                "TorchNPU NPUSHMEM and Triton-Ascend, "
+                "with libshmem.so on LD_LIBRARY_PATH. Defaults to disabled."
+            ),
+        )
+        omni_config_group.add_argument(
             "--ulysses-a2a-backend",
             type=str,
             default=None,
             choices=["auto", "nccl", "copy_engine", "copy_engine_overlap", "flashinfer"],
             help=(
-                "Transport for the strict Ulysses all-to-all. 'auto' (default) probes the Ulysses group (single node, "
-                "NVLink between every pair, compute capability, symmetric memory, FlashInfer) and picks the transport "
-                "measured fastest there, otherwise NCCL. 'nccl': process-group all-to-all. 'copy_engine': copy "
-                "engines into peers' symmetric memory. 'copy_engine_overlap': copy-engine exchange in head chunks "
-                "overlapped with attention (strict pure Ulysses). 'flashinfer': FlashInfer UlyssesCommunicator "
-                "NVLink kernels for the Q/K/V scatter and output gather."
+                "Transport for the strict Ulysses all-to-all. 'auto' (default) picks the transport measured fastest "
+                "for the GPU and group size, otherwise 'nccl'; 'copy_engine_overlap' overlaps the copy-engine "
+                "exchange with attention in head chunks; 'flashinfer' uses FlashInfer UlyssesCommunicator kernels."
             ),
         )
         omni_config_group.add_argument(
@@ -833,18 +842,9 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=None,
             help=(
-                "Head chunks for --ulysses-a2a-backend copy_engine_overlap (must divide num_heads / ulysses_degree). "
-                "Defaults to two heads per chunk."
-            ),
-        )
-        omni_config_group.add_argument(
-            "--ulysses-a2a-permute",
-            action=argparse.BooleanOptionalAction,
-            default=None,
-            help=(
-                "Deprecated alias for --ulysses-a2a-backend copy_engine (CUDA copy engines on CUDA, TorchNPU "
-                "symmetric memory on NPU). NPU currently requires --enforce-eager, pure Ulysses over all ranks in one "
-                "HCCS domain, TorchNPU NPUSHMEM and Triton-Ascend, with libshmem.so on LD_LIBRARY_PATH."
+                "With --ulysses-a2a-backend copy_engine_overlap, split each rank's attention heads into this many "
+                "chunks and move them on copy engines while earlier chunks compute (must divide num_heads / "
+                "ulysses_degree). Defaults to two heads per chunk."
             ),
         )
         omni_config_group.add_argument(
