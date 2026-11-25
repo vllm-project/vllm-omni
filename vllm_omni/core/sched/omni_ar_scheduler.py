@@ -1404,6 +1404,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         scheduled_any = False
         original_token_budget = self.max_num_scheduled_tokens if coalescing_enabled else None
         held_terminal_steps = self._hold_minicpmo45_terminal_steps()
+        preemption_reserve = getattr(self, "_preemption_reserve", None)
+        if preemption_reserve is not None:
+            preemption_reserve.begin_step()
         try:
             text_input_waits = self._prepare_text_input_waits(blocked_text_requests)
             defer_generation = False

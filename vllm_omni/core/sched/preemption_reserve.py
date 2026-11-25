@@ -64,7 +64,16 @@ class PreemptionReserve:
         # request_id -> (request, num_tokens when it was admitted)
         self.admitted: dict[str, tuple[Request, int]] = {}
         self.max_growth: int | None = None
+        # Sum of ``_need`` over ``admitted``, or None until the next full scan. Kept
+        # exact: anything that can change one request's need clears it (a new step,
+        # an allocation for an admitted request, a free), and each new admission
+        # adds its own need. Lets a burst of admissions in one step cost one scan.
+        self._total_need: int | None = None
         self._last_log = 0.0
+
+    def begin_step(self) -> None:
+        """Forget the cached total; token counts change between scheduling steps."""
+        self._total_need = None
 
     def blocks(self, tokens: int) -> int:
         return -(-max(0, tokens) // self.block_size)
@@ -77,6 +86,10 @@ class PreemptionReserve:
         target = max(num_tokens_at_admission + self.growth(request), request.num_tokens)
         return self.blocks(min(target, self.max_model_len))
 
+    def _need(self, request_id: str, request: Request, num_tokens_at_admission: int) -> int:
+        """Blocks an admitted request may still need beyond what it holds."""
+        return max(0, self.final_blocks(request, num_tokens_at_admission) - len(self.req_to_blocks.get(request_id, ())))
+
     def reserved_blocks(self, caller_reserved: int = 0) -> int:
         """Blocks the admitted requests may still need beyond what they hold, on top of ``caller_reserved``.
 
@@ -85,17 +98,22 @@ class PreemptionReserve:
         are also admitted here count once, at the larger of the two estimates; the
         rest of the caller's reservation stays on top.
         """
+        if not caller_reserved:
+            if self._total_need is None:
+                self._total_need = sum(self._need(rid, req, at) for rid, (req, at) in self.admitted.items())
+            return self._total_need
         total = overlap = 0
         for rid, (req, at) in self.admitted.items():
-            need = max(0, self.final_blocks(req, at) - len(self.req_to_blocks.get(rid, ())))
+            need = self._need(rid, req, at)
             total += need
-            if caller_reserved:
-                overlap += min(need, self.scheduler_reserved(req))
+            overlap += min(need, self.scheduler_reserved(req))
         # Guard: a caller whose reservation does not cover these requests is never undercut.
         return total - min(overlap, caller_reserved)
 
     def on_free(self, request: Request) -> None:
         entry = self.admitted.pop(request.request_id, None)
+        if entry is not None:
+            self._total_need = None
         if entry is not None and request.status in _NORMAL_FINISH:
             grown = request.num_tokens - entry[1]
             self.max_growth = grown if self.max_growth is None else max(self.max_growth, grown)
@@ -115,8 +133,14 @@ class PreemptionReserve:
     def record(self, request: Request, allocated: bool, held: int) -> None:
         """Track a newly admitted request, or log (rate-limited) that ``held`` blocks kept it waiting."""
         if allocated:
-            if request.request_id not in self.admitted and not request.resumable:
-                self.admitted[request.request_id] = (request, request.num_tokens)
+            rid = request.request_id
+            if rid in self.admitted:
+                # An admitted request now holds more blocks, so its need changed.
+                self._total_need = None
+            elif not request.resumable:
+                self.admitted[rid] = (request, request.num_tokens)
+                if self._total_need is not None:
+                    self._total_need += self._need(rid, request, request.num_tokens)
             return
         now = time.monotonic()
         if held and now - self._last_log >= _LOG_INTERVAL_S:

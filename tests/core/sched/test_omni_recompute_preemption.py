@@ -286,6 +286,67 @@ def test_reserve_admits_requests_that_fit_together_in_one_step(monkeypatch):
     assert set(scheduler.schedule().num_scheduled_tokens) == {"a", "b"}
 
 
+@pytest.mark.parametrize("num_blocks, scheduled", [(6, {"a", "b"}), (7, {"a", "b", "c"})])
+def test_reserve_counts_earlier_admissions_of_the_same_step(monkeypatch, num_blocks, scheduled):
+    # Each request: 1 prompt block, 2 blocks at completion. a enters the empty stage; b keeps 1 block
+    # for a and 1 for itself; c keeps 2 for a and b and 1 for itself on top of its own prompt block,
+    # so it needs 4 free blocks after a and b were allocated earlier in the same step.
+    scheduler = _reserve_scheduler(monkeypatch, num_blocks=num_blocks)
+    for rid in ("a", "b", "c"):
+        scheduler.add_request(_request(rid, 16, 16))
+    assert set(scheduler.schedule().num_scheduled_tokens) == scheduled
+
+
+def test_reserve_total_follows_a_later_allocation_of_an_admitted_request(monkeypatch):
+    # An admitted request can be allocated again while a total is cached, e.g. when its async KV
+    # load completes in the same scheduling pass; the total must then use what it holds now.
+    scheduler = _reserve_scheduler(monkeypatch, num_blocks=101, max_model_len=512, max_num_batched_tokens=512)
+    manager, reserve = scheduler.kv_cache_manager, scheduler._preemption_reserve
+    a = _request("a", 320, 160)
+    assert manager.allocate_slots(a, 160) is not None
+    assert reserve.reserved_blocks() == 20  # 480 tokens at completion = 30 blocks, holds 10
+    a.num_computed_tokens = 160
+    assert manager.allocate_slots(a, 160) is not None  # the rest of the prompt: holds 20
+    assert reserve.reserved_blocks() == 10
+
+
+def test_reserve_total_is_recomputed_after_a_free_and_at_a_new_step(monkeypatch):
+    scheduler = _reserve_scheduler(monkeypatch, num_blocks=101, max_model_len=512, max_num_batched_tokens=512)
+    manager, reserve = scheduler.kv_cache_manager, scheduler._preemption_reserve
+    a, b = _request("a", 160, 160), _request("b", 160, 160)
+    assert manager.allocate_slots(a, 160) is not None
+    assert manager.allocate_slots(b, 160) is not None
+    assert reserve.reserved_blocks() == 20  # each: 320 tokens at completion = 20 blocks, holds 10
+    a.status = RequestStatus.FINISHED_ABORTED
+    reserve.on_free(a)
+    assert reserve.reserved_blocks() == 10
+    # Between steps b grows past its estimate (360 tokens = 23 blocks); the next step recounts it.
+    b.append_output_token_ids([1] * 200)
+    reserve.begin_step()
+    assert reserve.reserved_blocks() == 13
+
+
+def test_reserve_cached_total_matches_a_full_scan(monkeypatch):
+    # The cached total of admitted needs must equal a fresh scan at every admission, across
+    # held admissions, chunked prompts, normal finishes that move the growth estimate, and preemption.
+    original = PreemptionReserve.reserved_blocks
+    checked = 0
+
+    def reserved_blocks(self, caller_reserved=0):
+        nonlocal checked
+        result = original(self, caller_reserved)
+        if not caller_reserved:
+            assert result == sum(self._need(rid, req, at) for rid, (req, at) in self.admitted.items())
+            checked += 1
+        return result
+
+    monkeypatch.setattr(PreemptionReserve, "reserved_blocks", reserved_blocks)
+    scheduler = _reserve_scheduler(monkeypatch, num_blocks=24, max_num_batched_tokens=64)
+    lengths = [(16 + 7 * i % 60, 4 + 11 * i % 44) for i in range(24)]
+    _run(scheduler, [_request(f"r{i}", prompt, out) for i, (prompt, out) in enumerate(lengths)], steps=2000)
+    assert checked > 50
+
+
 def test_reserve_counts_held_blocks_and_adds_the_callers_reservation(monkeypatch):
     scheduler = _reserve_scheduler(monkeypatch, num_blocks=101, max_model_len=512, max_num_batched_tokens=512)
     manager, reserve = scheduler.kv_cache_manager, scheduler._preemption_reserve
