@@ -45,10 +45,10 @@ def test_npu_mixed_prompt_rotary_matches_single_requests():
 @pytest.mark.parametrize(
     "version,hip,device,expected",
     [
-        ("2.13.0+cu130", None, "cuda:1", True),
-        ("2.12.0", None, "cuda:1", False),
-        ("2.13.0", "7.0", "cuda:1", False),
-        ("2.13.0", None, "cpu", False),
+        ("2.13.0+cu130", None, "cuda:1", False),
+        ("2.12.0", None, "cuda:1", None),
+        ("2.13.0", "7.0", "cuda:1", None),
+        ("2.13.0", None, "cpu", None),
     ],
 )
 def test_exact_rope_stack_and_input_device(monkeypatch, version, hip, device, expected):
@@ -57,11 +57,37 @@ def test_exact_rope_stack_and_input_device(monkeypatch, version, hip, device, ex
     monkeypatch.setattr(torch, "get_device_module", Mock(return_value=backend))
     monkeypatch.setattr(torch, "__version__", version)
     monkeypatch.setattr(torch.version, "hip", hip)
-    assert pointwise.supports_exact_rope(torch.device(device)) is expected
-    if expected:
+    assert pointwise.exact_rope_fuse_real_sine(torch.device(device)) is expected
+    if expected is not None:
         backend.get_device_capability.assert_called_once_with(torch.device(device))
     else:
         backend.get_device_capability.assert_not_called()
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "device_name,version,cuda_version,expected",
+    [
+        ("NVIDIA A800-SXM4-80GB", "2.14.0+cu130", "13.0", True),
+        ("NVIDIA A800-SXM4-80GB", "2.14.0+cu128", "12.8", None),
+        ("NVIDIA A800-SXM4-80GB", "2.14.1+cu130", "13.0", None),
+        ("NVIDIA A100-SXM4-80GB", "2.14.0+cu130", "13.0", None),
+    ],
+)
+def test_exact_rope_a800_qualification(monkeypatch, device_name, version, cuda_version, expected):
+    device = torch.device("cuda:1")
+    backend = Mock()
+    backend.get_device_capability.return_value = (8, 0)
+    backend.get_device_name.return_value = device_name
+    monkeypatch.setattr(torch, "get_device_module", Mock(return_value=backend))
+    monkeypatch.setattr(torch, "__version__", version)
+    monkeypatch.setattr(torch.version, "cuda", cuda_version)
+    monkeypatch.setattr(torch.version, "hip", None)
+
+    assert pointwise.exact_rope_fuse_real_sine(device) is expected
+    if expected is not None:
+        backend.get_device_capability.assert_called_once_with(device)
+        backend.get_device_name.assert_called_once_with(device)
 
 
 @pytest.mark.cpu
@@ -95,6 +121,31 @@ def test_unqualified_device_declines_before_allocation(monkeypatch, capability, 
     else:
         assert fused_qk.qk_rotary(q, q, weight, weight, freqs, 1e-6) is None
     backend.get_device_capability.assert_called_once_with(device)
+
+
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
+@pytest.mark.parametrize("fuse_real_sine,expected_bits", [(False, 0xBF34), (True, 0xBF35)])
+@torch.no_grad()
+def test_exact_rope_imaginary_rounding_boundary(monkeypatch, fuse_real_sine, expected_bits):
+    if not pointwise.HAS_TRITON:
+        pytest.skip("Triton required")
+    monkeypatch.setattr(pointwise, "exact_rope_fuse_real_sine", lambda device: fuse_real_sine)
+    monkeypatch.setattr(fused_qk, "exact_rope_fuse_real_sine", lambda device: fuse_real_sine)
+
+    q = torch.ones(1, 1, 1, 128, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    weight = torch.ones_like(q).flatten()
+    weight[0] = -0.71484375
+    weight[1] = -1.375
+    freqs = torch.ones(1, 64, device=DEVICE_TYPE, dtype=torch.complex64)
+    freqs[0, 0] = complex(0.8144440650939941, -0.5802420973777771)
+
+    # The two FMA orders land on opposite sides of a BF16 rounding boundary.
+    rotated = pointwise.rotary(weight.view_as(q), freqs)
+    fused = fused_qk.qk_rotary(q, q, weight, weight, freqs, 1e-6)
+    assert rotated is not None
+    assert fused is not None
+    for output in (rotated, *fused):
+        assert (output.view(torch.int16)[0, 0, 0, 1].item() & 0xFFFF) == expected_bits
 
 
 @pytest.mark.cpu

@@ -23,18 +23,25 @@ def eligible(*values: torch.Tensor) -> bool:
     )
 
 
-def supports_exact_rope(device: torch.device) -> bool:
-    """Qualify the complex-multiply arithmetic on the input tensor's device.
+def exact_rope_fuse_real_sine(device: torch.device) -> bool | None:
+    """Select which imaginary product to fuse, or return None for ATen."""
+    if device.type != "cuda" or torch.version.hip is not None:
+        return None
 
-    SM90 does not match this FMA order exactly. Only SM103 with CUDA PyTorch
-    2.13 has been validated; other architectures/stacks keep the ATen path.
-    """
-    return (
-        device.type == "cuda"
-        and torch.version.hip is None
-        and str(torch.__version__).startswith("2.13.")
-        and torch.get_device_module(device).get_device_capability(device) == (10, 3)
-    )
+    version = str(torch.__version__)
+    torch_213 = version.startswith("2.13.")
+    torch_214_cu130 = version == "2.14.0+cu130" and torch.version.cuda == "13.0"
+    if not (torch_213 or torch_214_cu130):
+        return None
+
+    backend = torch.get_device_module(device)
+    capability = backend.get_device_capability(device)
+    if capability == (10, 3) and torch_213:
+        return False
+    # This wheel rounds the imaginary-times-cosine product first on A800.
+    if capability == (8, 0) and torch_214_cu130 and backend.get_device_name(device) == "NVIDIA A800-SXM4-80GB":
+        return True
+    return None
 
 
 if HAS_TRITON:
@@ -92,6 +99,13 @@ def silu_mul(gate: torch.Tensor, up: torch.Tensor, *, _validated: bool = False) 
 if HAS_TRITON:
 
     @triton.jit
+    def _rope_imag(real, imag, cosine, sine, fuse_real_sine: tl.constexpr):
+        # The product supplied as the third FMA operand rounds separately.
+        if fuse_real_sine:
+            return tl.fma(real, sine, imag * cosine)
+        return tl.fma(imag, cosine, real * sine)
+
+    @triton.jit
     def _rope_kernel(
         input_ptr,
         freq_ptr,
@@ -104,6 +118,7 @@ if HAS_TRITON:
         x_stride2: tl.constexpr,
         freq_stride0: tl.constexpr,
         freq_stride1: tl.constexpr,
+        fuse_real_sine: tl.constexpr,
         block_size: tl.constexpr,
     ):
         index = tl.program_id(0) * block_size + tl.arange(0, block_size)
@@ -116,10 +131,8 @@ if HAS_TRITON:
         imag = tl.load(input_ptr + base + 1, index < elements, 0).to(tl.float32)
         cosine = tl.load(freq_ptr + token * freq_stride0 + pair * freq_stride1, index < elements, 0)
         sine = tl.load(freq_ptr + token * freq_stride0 + pair * freq_stride1 + 1, index < elements, 0)
-        # Match CUDA's complex64 multiply: the real leading product and the
-        # imaginary trailing product use FMA. The other products round first.
         rotated_real = tl.fma(real, cosine, -imag * sine)
-        rotated_imag = tl.fma(imag, cosine, real * sine)
+        rotated_imag = _rope_imag(real, imag, cosine, sine, fuse_real_sine)
         tl.store(output_ptr + index * 2, rotated_real.to(tl.bfloat16), index < elements)
         tl.store(output_ptr + index * 2 + 1, rotated_imag.to(tl.bfloat16), index < elements)
 
@@ -141,7 +154,8 @@ def rotary(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor | None:
         or torch.compiler.is_compiling()
     ):
         return None
-    if not supports_exact_rope(x.device):
+    fuse_real_sine = exact_rope_fuse_real_sine(x.device)
+    if fuse_real_sine is None:
         return None
     output = torch.empty(x.shape, device=x.device, dtype=x.dtype)
     real_freqs = torch.view_as_real(freqs)
@@ -154,6 +168,7 @@ def rotary(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor | None:
         x.shape[1],
         *x.stride()[:3],
         *real_freqs.stride()[:2],
+        fuse_real_sine,
         256,
         enable_fp_fusion=False,
     )

@@ -5,9 +5,10 @@
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
-from vllm_omni.diffusion.layers.exact_bf16_pointwise import supports_exact_rope
+from vllm_omni.diffusion.layers.exact_bf16_pointwise import exact_rope_fuse_real_sine
 
 if HAS_TRITON:
+    from vllm_omni.diffusion.layers.exact_bf16_pointwise import _rope_imag
 
     @triton.jit
     def _full(
@@ -30,6 +31,7 @@ if HAS_TRITON:
         freq_stride0: tl.constexpr,
         freq_stride1: tl.constexpr,
         eps: tl.constexpr,
+        fuse_real_sine: tl.constexpr,
         rows_per_block: tl.constexpr,
     ):
         row = tl.program_id(0) * rows_per_block + tl.arange(0, rows_per_block)
@@ -78,9 +80,9 @@ if HAS_TRITON:
         sb = tl.load(freq_ptr + fi + freq_stride1 + 1, mask, 0)
         out = row[:, None] * 128 + lane[None, :] * 4
         tl.store(output_ptr + out, tl.fma(a, ca, -b * sa).to(tl.bfloat16), mask)
-        tl.store(output_ptr + out + 1, tl.fma(b, ca, a * sa).to(tl.bfloat16), mask)
+        tl.store(output_ptr + out + 1, _rope_imag(a, b, ca, sa, fuse_real_sine).to(tl.bfloat16), mask)
         tl.store(output_ptr + out + 2, tl.fma(c, cb, -d * sb).to(tl.bfloat16), mask)
-        tl.store(output_ptr + out + 3, tl.fma(d, cb, c * sb).to(tl.bfloat16), mask)
+        tl.store(output_ptr + out + 3, _rope_imag(c, d, cb, sb, fuse_real_sine).to(tl.bfloat16), mask)
 
 
 def qk_rotary(
@@ -118,7 +120,8 @@ def qk_rotary(
         or torch.is_grad_enabled()
     ):
         return None
-    if not supports_exact_rope(q.device):
+    fuse_real_sine = exact_rope_fuse_real_sine(q.device)
+    if fuse_real_sine is None:
         return None
 
     oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
@@ -139,6 +142,7 @@ def qk_rotary(
         *k.stride()[:3],
         *ff.stride()[:2],
         eps,
+        fuse_real_sine,
         4,
         enable_fp_fusion=False,
     )
