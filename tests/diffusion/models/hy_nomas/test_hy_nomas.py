@@ -696,13 +696,14 @@ def test_unsupported_engine_features(overrides, match):
 
 @pytest.mark.parametrize("sp_size", [1, 2, 4, 8, 16])
 def test_supported_ulysses_config(sp_size):
-    validate_config(
-        OmniDiffusionConfig(
-            distributed_executor_backend="mp",
-            parallel_config=DiffusionParallelConfig(ulysses_degree=sp_size),
-            dtype=torch.bfloat16,
-        )
+    config = OmniDiffusionConfig(
+        distributed_executor_backend="mp",
+        parallel_config=DiffusionParallelConfig(ulysses_degree=sp_size),
+        dtype=torch.bfloat16,
     )
+    validate_config(config)
+    # The default "auto" transport is pinned to NCCL before any Attention layer is built.
+    assert config.parallel_config.ulysses_a2a_backend == "nccl"
 
 
 @pytest.mark.parametrize("sp_size", [2, 4, 8, 16])

@@ -65,7 +65,7 @@ class UlyssesTransportPlan:
 
     @property
     def symmetric_memory(self) -> bool:
-        return self.copy_engine_min_bytes is not None or self.overlap_chunks > 0
+        return self.copy_engine_min_bytes is not None
 
     def use_overlap(self, chunk_copy_bytes: int) -> bool:
         return self.overlap_chunks > 0 and chunk_copy_bytes >= self.overlap_min_chunk_bytes
@@ -146,12 +146,13 @@ def _peer_access(device: torch.device, uuids: list[str]) -> bool:
     )
 
 
-_TOPOLOGIES: dict[str, UlyssesTopology] = {}
+_TOPOLOGIES: dict[tuple, UlyssesTopology] = {}
 
 
 def probe_ulysses_topology(group: dist.ProcessGroup, world_size: int) -> UlyssesTopology:
     """Collective on ``group``: every rank must call it, and all get the same answer (cached per group)."""
-    key = group.group_name
+    # Group names can be reused after a process group is destroyed, so the key includes the members.
+    key = (group.group_name, world_size, tuple(dist.get_process_group_ranks(group)))
     cached = _TOPOLOGIES.get(key)
     if cached is not None:
         return cached
@@ -319,7 +320,7 @@ def resolve_ulysses_transports(
         )
     for name, reason in reasons.items():
         if reason is not None and topology.cuda:
-            _log_once("warning", "Ulysses a2a transport %r disabled on group %r: %s", name, group_name, reason)
+            _log_once("info", "Ulysses a2a transport %r disabled on group %r: %s", name, group_name, reason)
     plan = auto_plan(
         topology,
         pure_strict=pure_strict,
@@ -346,6 +347,12 @@ def resolve_ulysses_transports(
     return plan
 
 
+def clear_ulysses_transport_state() -> None:
+    """Forget probed topologies and logged decisions, e.g. after the process groups are torn down."""
+    _TOPOLOGIES.clear()
+    _LOGGED.clear()
+
+
 def require_default_ulysses_transport(parallel_config, model: str, error: type[Exception] = ValueError) -> None:
     """For models whose sequence parallelism supports only the process-group all-to-all.
 
@@ -353,7 +360,7 @@ def require_default_ulysses_transport(parallel_config, model: str, error: type[E
     selects one for them.
     """
     backend = getattr(parallel_config, "ulysses_a2a_backend", "auto")
-    if getattr(parallel_config, "ulysses_a2a_permute", False) or backend not in ("auto", NCCL):
+    if backend not in ("auto", NCCL):
         raise error(f"{model} supports only ulysses_a2a_backend='nccl' (got {backend!r}).")
     if backend == "auto":
         parallel_config.ulysses_a2a_backend = NCCL

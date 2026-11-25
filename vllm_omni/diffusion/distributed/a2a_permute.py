@@ -236,6 +236,9 @@ def clear_a2a_permute_workspaces() -> None:
     ce_overlap = sys.modules.get("vllm_omni.diffusion.attention.parallel.ulysses_ce_overlap")
     if ce_overlap is not None:
         ce_overlap.clear_ulysses_ce_overlap_runners()
+    transport = sys.modules.get("vllm_omni.diffusion.distributed.ulysses_transport")
+    if transport is not None:
+        transport.clear_ulysses_transport_state()
     with _WORKSPACE_LOCK:
         if not _SYMM_WORKSPACES:
             return

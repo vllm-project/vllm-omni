@@ -63,7 +63,6 @@ class UlyssesAllGatherKVParallelAttention(AllGatherKVParallelAttention):
         scatter_idx: int,
         gather_idx: int,
         use_sync: bool,
-        ulysses_a2a_permute: bool = False,
         ulysses_a2a_backend: str = "nccl",
     ) -> None:
         super().__init__(sp_group)
@@ -72,7 +71,6 @@ class UlyssesAllGatherKVParallelAttention(AllGatherKVParallelAttention):
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
             use_sync=use_sync,
-            ulysses_a2a_permute=ulysses_a2a_permute,
             ulysses_a2a_backend=ulysses_a2a_backend,
         )
 

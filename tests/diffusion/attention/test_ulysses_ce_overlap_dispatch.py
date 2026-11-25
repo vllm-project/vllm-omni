@@ -119,3 +119,19 @@ def test_eligible_layer_runs_local_attention_per_chunk(monkeypatch):
     output = layer.Attention._forward_ulysses_ce_overlap(attention, strategy, query, query, query, metadata, 2)
     # The runner's output buffer is reused by the next call, so model code gets a copy.
     assert torch.equal(output, query) and output is not query and calls == [metadata]
+
+
+def test_no_overlap_while_capturing_a_cuda_graph(monkeypatch):
+    attention, strategy, args = _case()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert layer.Attention._ulysses_ce_overlap_chunks(attention, strategy, **args) == 0
+
+
+@pytest.mark.parametrize(
+    "scheduled, quant, expected",
+    [(False, {}, "cute-dsl"), (True, {}, None), (False, {"dtype_qk": torch.float8_e4m3fn}, None)],
+)
+def test_overlap_gate_sees_no_impl_for_scheduled_or_fp8_attention(scheduled, quant, expected):
+    impl = SimpleNamespace(**{"flashinfer_backend": "cute-dsl", "dtype_qk": None, "dtype_vo": None, **quant})
+    attention = SimpleNamespace(_schedule_configured=scheduled, attention=impl)
+    assert layer.Attention._overlap_attention_impl(attention) == expected

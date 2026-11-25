@@ -36,8 +36,10 @@ def test_default_does_not_build_optional_extension(monkeypatch, parallel_context
     unavailable.assert_not_called()
 
 
-@pytest.mark.parametrize("backend", ["nccl", "copy_engine", "copy_engine_overlap"])
-@pytest.mark.parametrize("allgather", [1, 2])
+@pytest.mark.parametrize(
+    "backend, allgather",
+    [("nccl", 1), ("copy_engine", 1), ("copy_engine_overlap", 1), ("nccl", 2), ("copy_engine", 2)],
+)
 def test_explicit_backend_is_forwarded(monkeypatch, parallel_context, backend, allgather):
     parallel_context.ulysses_a2a_backend = backend
     parallel_context.allgather_degree = allgather
@@ -52,23 +54,6 @@ def test_explicit_backend_is_forwarded(monkeypatch, parallel_context, backend, a
         assert kwargs["ulysses_a2a_backend"] == backend
     else:
         assert kwargs["transports"] == ulysses_transport.explicit_plan(backend, heads_per_rank=None)
-
-
-@pytest.mark.parametrize("allgather", [1, 2])
-def test_deprecated_permute_selects_copy_engine(monkeypatch, parallel_context, allgather):
-    parallel_context.ulysses_a2a_permute = True
-    parallel_context.allgather_degree = allgather
-    strategy = Mock()
-    name = "UlyssesAllGatherKVParallelAttention" if allgather > 1 else "UlyssesParallelAttention"
-    monkeypatch.setattr(factory, name, strategy)
-
-    factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
-
-    kwargs = strategy.call_args.kwargs
-    if allgather > 1:
-        assert kwargs["ulysses_a2a_backend"] == "copy_engine"
-    else:
-        assert kwargs["transports"] == ulysses_transport.explicit_plan("copy_engine", heads_per_rank=None)
 
 
 def test_auto_keeps_nccl_for_ulysses_allgather(monkeypatch, parallel_context):
@@ -94,17 +79,12 @@ def test_overlap_chunks_are_resolved_per_layer(monkeypatch, parallel_context, ch
     assert strategy.call_args.kwargs["transports"].overlap_chunks == expected
 
 
-def test_model_nccl_pin_reaches_the_strategy(monkeypatch, parallel_context):
-    """Hy-Nomas, LingBot World, SeedVR2 and TaoMate-H3 pin ``auto`` at the start of their pipeline ``__init__``, on
-    the worker's ``od_config``, which is also the forward-context config their Attention layers are built under."""
-    parallel_context.ulysses_a2a_backend = "auto"
-    parallel_context.ulysses_a2a_permute = False
-    ulysses_transport.require_default_ulysses_transport(parallel_context, "model")
+def test_auto_keeps_nccl_with_denoise_cuda_graphs(monkeypatch, parallel_context):
+    factory.get_forward_context().omni_diffusion_config.diffusion_use_graph = True
     monkeypatch.setattr(ulysses_transport, "probe_ulysses_topology", Mock(side_effect=AssertionError("probed")))
     strategy = Mock()
     monkeypatch.setattr(factory, "UlyssesParallelAttention", strategy)
 
     factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
 
-    assert parallel_context.ulysses_a2a_backend == "nccl"
     assert strategy.call_args.kwargs["transports"] == ulysses_transport.NCCL_PLAN

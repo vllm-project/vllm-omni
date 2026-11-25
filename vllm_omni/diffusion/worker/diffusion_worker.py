@@ -671,7 +671,7 @@ class DiffusionWorker:
                 )
             init_workspace_manager(self.device)
             if (
-                parallel_config.ulysses_a2a_permute
+                parallel_config.ulysses_a2a_backend in ("copy_engine", "copy_engine_overlap")
                 and parallel_config.ulysses_degree > 1
                 and parallel_config.ulysses_mode == "strict"
             ):

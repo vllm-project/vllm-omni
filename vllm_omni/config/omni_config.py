@@ -302,7 +302,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     ring_degree: int
     allgather_degree: int
     ulysses_mode: str
-    ulysses_a2a_permute: bool
+    ulysses_a2a_permute: bool | None
     ulysses_overlap_chunks: int
     ulysses_a2a_backend: str
     cfg_parallel_size: int
@@ -906,7 +906,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ring_degree: int = Field(default=1, ge=1)
     allgather_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
-    ulysses_a2a_permute: bool = False
+    ulysses_a2a_permute: bool | None = None
     ulysses_overlap_chunks: int = Field(default=0, ge=0)
     ulysses_a2a_backend: str = "auto"
     cfg_parallel_size: int = Field(default=1, ge=1)
@@ -930,9 +930,10 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             )
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
-        backends = ("auto", "nccl", "copy_engine", "copy_engine_overlap")
-        if self.ulysses_a2a_backend not in backends:
-            raise ValueError(f"ulysses_a2a_backend must be one of {backends}")
+        from vllm_omni.diffusion.data import ULYSSES_A2A_BACKENDS
+
+        if self.ulysses_a2a_backend not in ULYSSES_A2A_BACKENDS:
+            raise ValueError(f"ulysses_a2a_backend must be one of {ULYSSES_A2A_BACKENDS}")
         if self.vae_parallel_mode not in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}:
             raise ValueError(
                 "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "

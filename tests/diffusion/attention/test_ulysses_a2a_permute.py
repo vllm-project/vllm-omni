@@ -328,7 +328,6 @@ def test_transport_config_aliases(values, backend):
     "values, message",
     [
         ({"ulysses_a2a_backend": "nvshmem"}, "ulysses_a2a_backend must be one of"),
-        ({"ulysses_a2a_permute": True, "ulysses_a2a_backend": "nccl"}, "cannot be combined"),
         ({"ulysses_a2a_backend": "copy_engine", "ulysses_overlap_chunks": 2}, "applies only to"),
         ({"ulysses_a2a_backend": "copy_engine_overlap", "ring_degree": 2}, "strict pure Ulysses"),
     ],
@@ -336,5 +335,5 @@ def test_transport_config_aliases(values, backend):
 def test_transport_config_rejects_invalid_values(values, message):
     from vllm_omni.diffusion.data import DiffusionParallelConfig
 
-    with pytest.raises((ValueError, AssertionError), match=message):
+    with pytest.raises(ValueError, match=message):
         DiffusionParallelConfig(**values)

@@ -322,8 +322,9 @@ class DiffusionParallelConfig:
       sequence shapes across the ring group.
     """
 
-    ulysses_a2a_permute: bool = False
-    """Deprecated alias for ``ulysses_a2a_backend="copy_engine"``.
+    ulysses_a2a_permute: bool | None = None
+    """Deprecated: ``True`` maps to ``ulysses_a2a_backend="copy_engine"`` and ``False`` to ``"nccl"`` when the backend
+    is left at ``"auto"``; an explicit ``ulysses_a2a_backend`` takes precedence.
 
     On CUDA, enables CE (copy engines) on a single NVLink-connected node. NPU retains its eager, pure Ulysses
     implementation over WORLD in one HCCS domain, using TorchNPU's NPUSHMEM
@@ -422,17 +423,15 @@ class DiffusionParallelConfig:
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
-        assert self.ulysses_a2a_backend in ULYSSES_A2A_BACKENDS, (
-            f"ulysses_a2a_backend must be one of {ULYSSES_A2A_BACKENDS}, but got {self.ulysses_a2a_backend!r}."
-        )
-        if self.ulysses_a2a_permute:
-            if self.ulysses_a2a_backend == "nccl":
-                raise ValueError("ulysses_a2a_permute cannot be combined with ulysses_a2a_backend='nccl'")
-            if self.ulysses_a2a_backend == "auto":
-                logger.warning_once(
-                    "ulysses_a2a_permute is deprecated; use ulysses_a2a_backend='copy_engine' "
-                    "(the default 'auto' selects a transport from the topology)."
-                )
+        if self.ulysses_a2a_backend not in ULYSSES_A2A_BACKENDS:
+            raise ValueError(
+                f"ulysses_a2a_backend must be one of {ULYSSES_A2A_BACKENDS}, but got {self.ulysses_a2a_backend!r}."
+            )
+        if self.ulysses_a2a_permute is not None and self.ulysses_a2a_backend == "auto":
+            logger.warning_once("ulysses_a2a_permute is deprecated; use ulysses_a2a_backend instead.")
+            if not self.ulysses_a2a_permute:
+                self.ulysses_a2a_backend = "nccl"
+            else:
                 self.ulysses_a2a_backend = "copy_engine_overlap" if self.ulysses_overlap_chunks else "copy_engine"
         assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
             "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "

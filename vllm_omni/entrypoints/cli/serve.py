@@ -371,6 +371,8 @@ class OmniServeCommand(CLISubcommand):
         validate_parsed_serve_args(args)
 
     def subparser_init(self, subparsers: argparse._SubParsersAction) -> FlexibleArgumentParser:
+        from vllm_omni.diffusion.data import ULYSSES_A2A_BACKENDS
+
         serve_parser = subparsers.add_parser(
             self.name,
             description=DESCRIPTION,
@@ -819,18 +821,20 @@ class OmniServeCommand(CLISubcommand):
             action=argparse.BooleanOptionalAction,
             default=None,
             help=(
-                "Deprecated alias for --ulysses-a2a-backend copy_engine "
-                "(CUDA copy engines on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
+                "Deprecated: with --ulysses-a2a-backend auto, --ulysses-a2a-permute selects copy_engine "
+                "(copy_engine_overlap with --ulysses-overlap-chunks) and --no-ulysses-a2a-permute selects nccl; "
+                "an explicit --ulysses-a2a-backend takes precedence. "
+                "CUDA copy engines on CUDA, TorchNPU on NPU. Only strict Ulysses layouts are eligible. "
                 "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
                 "TorchNPU NPUSHMEM and Triton-Ascend, "
-                "with libshmem.so on LD_LIBRARY_PATH. Defaults to disabled."
+                "with libshmem.so on LD_LIBRARY_PATH."
             ),
         )
         omni_config_group.add_argument(
             "--ulysses-a2a-backend",
             type=str,
             default=None,
-            choices=["auto", "nccl", "copy_engine", "copy_engine_overlap"],
+            choices=list(ULYSSES_A2A_BACKENDS),
             help=(
                 "Transport for the strict Ulysses all-to-all. 'auto' (default) picks the transport measured fastest "
                 "for the GPU and group size, otherwise 'nccl'; 'copy_engine_overlap' overlaps the copy-engine "
@@ -842,7 +846,8 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=None,
             help=(
-                "With --ulysses-a2a-backend copy_engine_overlap, split each rank's attention heads into this many "
+                "With --ulysses-a2a-backend copy_engine_overlap (or auto where overlap is selected), split each rank's "
+                "attention heads into this many "
                 "chunks and move them on copy engines while earlier chunks compute (must divide num_heads / "
                 "ulysses_degree). Defaults to two heads per chunk."
             ),

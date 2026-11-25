@@ -139,6 +139,9 @@ class _FakeDist:
         self.hosts, self.uuids, self.remote_features = hosts, uuids, remote_features
         self.ReduceOp = SimpleNamespace(MIN="min")
 
+    def get_process_group_ranks(self, group):
+        return getattr(group, "ranks", [0, 1])
+
     def all_gather_into_tensor(self, out, local, group):
         rows = [torch.tensor([h, *u.bytes], dtype=torch.int64) for h, u in zip(self.hosts, self.uuids)]
         rows[0] = local.cpu()
@@ -193,10 +196,15 @@ def test_probe_takes_the_lowest_compute_capability(monkeypatch):
     assert topology.capability == "9.0"
 
 
-def test_probe_is_cached_per_group(monkeypatch):
-    first, _, _ = _probe(monkeypatch)
-    monkeypatch.setattr(ulysses_transport, "dist", None)
+def test_probe_is_cached_per_group_and_members(monkeypatch):
+    first, checked, _ = _probe(monkeypatch)
     assert ulysses_transport.probe_ulysses_topology(SimpleNamespace(group_name="ulysses"), 2) is first
+    # A reused group name with other members probes again, and teardown forgets the cache.
+    ulysses_transport.probe_ulysses_topology(SimpleNamespace(group_name="ulysses", ranks=[2, 3]), 2)
+    assert len(checked) == 2
+    ulysses_transport.clear_ulysses_transport_state()
+    ulysses_transport.probe_ulysses_topology(SimpleNamespace(group_name="ulysses"), 2)
+    assert len(checked) == 3
 
 
 class _FakeNVML:
@@ -307,11 +315,11 @@ def test_explicit_backend_skips_the_probe(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "backend, permute, expected",
-    [("auto", False, "nccl"), ("nccl", False, "nccl"), ("copy_engine", False, None), ("auto", True, None)],
+    "backend, expected",
+    [("auto", "nccl"), ("nccl", "nccl"), ("copy_engine", None), ("copy_engine_overlap", None)],
 )
-def test_require_default_transport_pins_auto_to_nccl(backend, permute, expected):
-    parallel = SimpleNamespace(ulysses_a2a_backend=backend, ulysses_a2a_permute=permute)
+def test_require_default_transport_pins_auto_to_nccl(backend, expected):
+    parallel = SimpleNamespace(ulysses_a2a_backend=backend)
     if expected is None:
         with pytest.raises(ValueError, match="supports only ulysses_a2a_backend='nccl'"):
             ulysses_transport.require_default_ulysses_transport(parallel, "Model")

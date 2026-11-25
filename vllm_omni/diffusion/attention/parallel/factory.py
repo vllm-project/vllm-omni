@@ -59,11 +59,14 @@ def build_parallel_attention_strategy(
     ulysses_degree = getattr(p, "ulysses_degree", 1)
     ring_degree = getattr(p, "ring_degree", 1)
     allgather_degree = getattr(p, "allgather_degree", 1)
-    ulysses_a2a_permute = getattr(p, "ulysses_a2a_permute", False)
     ulysses_overlap_chunks = int(getattr(p, "ulysses_overlap_chunks", 0) or 0)
     ulysses_a2a_backend = getattr(p, "ulysses_a2a_backend", "auto")
-    if ulysses_a2a_permute and ulysses_a2a_backend == "auto":  # deprecated alias
+    if getattr(p, "ulysses_a2a_permute", None) and ulysses_a2a_backend == "auto":  # deprecated alias
         ulysses_a2a_backend = "copy_engine_overlap" if ulysses_overlap_chunks else "copy_engine"
+    if ulysses_a2a_backend == "auto" and getattr(cfg, "diffusion_use_graph", False):
+        # Symmetric-memory workspaces are bound to one stream and the overlap's flags to host epochs, so neither
+        # survives CUDA-graph capture and replay; graphed denoising keeps NCCL.
+        ulysses_a2a_backend = "nccl"
     if ulysses_a2a_backend not in ("auto", "nccl"):
         from vllm_omni.diffusion.distributed.a2a_permute import validate_a2a_permute_config
 

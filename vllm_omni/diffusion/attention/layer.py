@@ -719,7 +719,7 @@ class Attention(nn.Module):
             cross_parallel_layout=self.cross_parallel_layout if self._explicit_cross_contract else None,
             num_heads=self.num_heads,
             attention_backend=self.attn_backend.get_name() if self.attn_backend is not None else None,
-            attention_impl=getattr(self.attention, "flashinfer_backend", None),
+            attention_impl=self._overlap_attention_impl(),
         )
         # Local strategy when SP is intentionally inactive outside sharded regions.
         self._no_parallel_strategy = NoParallelAttention()
@@ -1225,6 +1225,9 @@ class Attention(nn.Module):
             return 0
         if get_ulysses_mode(default="strict") != "strict" or not query.is_cuda or not _is_nvidia_cuda():
             return 0
+        if torch.cuda.is_current_stream_capturing():
+            # The overlap's cross-rank flags carry host-side epochs that a replayed graph would not advance.
+            return 0
         if query.dim() != 4 or query.shape[0] != 1 or key.shape != query.shape or value.shape != query.shape:
             return 0
         if any(x.dtype != query.dtype or x.stride(-1) != 1 or x.stride(-2) != x.shape[-1] for x in (query, key, value)):
@@ -1250,6 +1253,17 @@ class Attention(nn.Module):
             if not plan.use_overlap(query.shape[1] * heads_per_chunk * query.shape[3] * query.element_size()):
                 return 0
         return chunks
+
+    def _overlap_attention_impl(self) -> str | None:
+        """The attention implementation the auto overlap gate checks, or None when chunking heads may not be exact.
+
+        Scheduled layers can switch kernels per step, and FP8 attention scales per call, so neither qualifies.
+        """
+        if self._schedule_configured:
+            return None
+        if any(getattr(self.attention, name, None) is not None for name in ("dtype_qk", "dtype_vo")):
+            return None
+        return getattr(self.attention, "flashinfer_backend", None)
 
     @torch.compiler.disable
     def _forward_ulysses_ce_overlap(self, strategy, query, key, value, attn_metadata, chunks: int) -> torch.Tensor:
