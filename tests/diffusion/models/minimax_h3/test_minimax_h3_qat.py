@@ -207,6 +207,37 @@ def test_training_only_metadata_cannot_silently_select_runtime_quantization(meta
         )
 
 
+@pytest.mark.parametrize("metadata", [{"quant_scheme": "mxfp4_c7"}, {"use_torch_fake_quant": True}])
+@pytest.mark.parametrize("diffusers_weights", [False, True])
+def test_native_c7_accepts_explicit_training_metadata(metadata, diffusers_weights):
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config({"method": "mxfp4", "mxfp4_recipe": "mxfp4_c7"})
+    resolved = resolve_h3_transformer_quant_config(
+        config, {"quant_method": "mxfp4", **metadata}, diffusers_weights=diffusers_weights, runtime_lora=False
+    )
+    assert resolved is config
+
+
+@pytest.mark.parametrize(
+    "disk,lora,message",
+    [
+        ({"is_checkpoint_mxfp4_serialized": True}, False, "floating checkpoint"),
+        ({"is_checkpoint_serialized": True}, False, "floating checkpoint"),
+        ({"quant_method": "fp8"}, False, "floating MXFP4"),
+        ({"ignored_layers": ["blocks.0.attn.out_proj"]}, False, "ignored_layers"),
+        ("fp8", False, "floating MXFP4"),
+        (None, True, "LoRA to be merged"),
+    ],
+)
+def test_native_c7_rejects_incompatible_checkpoint_metadata(disk, lora, message):
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config({"method": "mxfp4", "mxfp4_recipe": "mxfp4_c7"})
+    with pytest.raises(ValueError, match=message):
+        resolve_h3_transformer_quant_config(config, disk, diffusers_weights=False, runtime_lora=lora)
+
+
 @pytest.mark.parametrize("recipe", ["e2m1_rne", "mxfp4_c7"])
 def test_explicit_fake_recipe_accepts_c7_training_metadata(recipe):
     from vllm_omni.quantization import build_quant_config

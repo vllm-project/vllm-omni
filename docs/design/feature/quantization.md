@@ -194,6 +194,11 @@ artifacts are rejected by this initial path. Floating SLA projections remain
 model-owned parameters; four-step schedule metadata remains release-owned.
 See the [H3 QAT/SLA design](minimax_h3_qat_sla.md) for composition and validation.
 
+The explicit NPU `mxfp4` recipe `mxfp4_c7` encodes floating weights and
+activations into native E2M1/E8M0 operands. It preserves C7 input-dtype
+arithmetic, requires local K divisible by 64, and currently requires DLO to
+be disabled. Default OCP/UOS behavior is unchanged.
+
 The opt-in `mxfp4_fake` method provides explicit E2M1-reference and supplied C7 QDQ recipes through
 ordinary floating weight storage and GEMM. It reuses vLLM linear weight loading,
 applies weight fake quantization after loading and activation fake quantization

@@ -45,8 +45,17 @@ def h3_npu_parallel(tmp_path_factory):
         (True, 2, None),
         (False, 0, "e2m1_rne"),
         (False, 0, "mxfp4_c7"),
+        (False, 0, "native-c7"),
     ],
-    ids=["ocp-online", "ocp-serialized", "uos-online", "uos-serialized", "fake-reference", "fake-c7"],
+    ids=[
+        "ocp-online",
+        "ocp-serialized",
+        "uos-online",
+        "uos-serialized",
+        "fake-reference",
+        "fake-c7",
+        "native-c7-sla-fp8",
+    ],
 )
 @torch.inference_mode()
 def test_h3_mxfp4_linears_and_sla_match_representable_reference(
@@ -66,17 +75,25 @@ def test_h3_mxfp4_linears_and_sla_match_representable_reference(
     from vllm_omni.quantization.mxfp4_fake_config import DiffusionMXFP4FakeConfig, MXFP4FakeLinearMethod
 
     torch_npu = h3_npu_parallel
+    native_c7 = fake == "native-c7"
+    if native_c7:
+        fake = None
     config = (
         DiffusionMXFP4FakeConfig(recipe=fake)
         if fake
         else DiffusionMXFP4Config(
-            is_checkpoint_mxfp4_serialized=serialized, require_smooth_scale=serialized, mxfp4_scale_alg=scale_alg
+            is_checkpoint_mxfp4_serialized=serialized,
+            require_smooth_scale=serialized,
+            mxfp4_scale_alg=scale_alg,
+            mxfp4_recipe="mxfp4_c7" if native_c7 else "default",
         )
     )
     od_config = OmniDiffusionConfig(
         diffusion_attention_config=AttentionConfig(
             default={"backend": "FLASH_ATTN"},
-            per_role={"self": {"backend": "SLA_ATTN", "sla": {"topk": 0.05}}},
+            per_role={
+                "self": {"backend": "SLA_ATTN", "sla": {"topk": 0.05, **({"precision": "fp8"} if native_c7 else {})}}
+            },
         )
     )
     arch = blocks.MiniMaxH3DiTArchConfig(num_attention_heads=2, attention_head_dim=128, hidden_size=256)

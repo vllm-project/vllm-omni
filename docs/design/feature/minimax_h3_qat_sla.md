@@ -202,3 +202,24 @@ attention F4 remain unverified until those artifacts and operators are used.
 - `tests/diffusion/models/minimax_h3/test_minimax_h3_qat.py`: CPU regressions.
 - `tests/diffusion/models/minimax_h3/test_minimax_h3_qat_npu.py`: real MXFP4/SLA composition.
 - `tests/diffusion/attention/test_sla_attn_npu.py`: real MindIE-SD SLA tests.
+
+## Native C7 W4A4 execution
+
+Select transformer `quant_method=mxfp4` and `mxfp4_recipe=mxfp4_c7` for
+floating, offline-merged weights. Weights and activations use the C7 encoder
+to produce low-nibble-first E2M1 bytes and biased E8M0 exponents. The existing
+NPU single-scale method executes `npu_quant_matmul` with FP4 operand dtype
+codes. Local K shards must be divisible by 64. Serialized weights, W4A8
+fallback and a conflicting scale algorithm are rejected for this recipe.
+Default OCP/UOS methods remain unchanged. Encoding uses chunked PyTorch
+operations; native GEMM alone is not an end-to-end speedup claim.
+
+This path requires distributed layerwise offload to be disabled. Nonzero
+storage offsets in pooled packed-byte weights require a separate C7
+compatibility change. It is not included here.
+
+SLA remains optional and comes from PR #11089. With its FP8 extension, the
+native linears can compose with the F8 sparse attention branch; this PR does
+not include the SLA backend. Existing QDQ recipes remain floating numerical
+references. Quality validation must use the delivered QAT weights and their
+quantization exclusions, task adapters and sampling metadata.

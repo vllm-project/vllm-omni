@@ -809,3 +809,24 @@ renaming rules and collect the results.
     BF16 method and that every BF16 entry has original BF16 weights. Account
     for fused modules and, in online DualScale, the leading-block fallback rule;
     the raw length of `ignored_layers` alone is not a reliable layer count.
+
+## Native C7 on Ascend
+
+For a floating H3 transformer with all adapters already merged, select:
+
+```json
+{"transformer": {"quant_method": "mxfp4", "mxfp4_recipe": "mxfp4_c7"}}
+```
+
+Set the final `ignored_layers` policy to match the QAT release. Every quantized
+local K shard must be a multiple of 64. C7 accepts BF16/FP32 finite input and
+retains input-dtype intermediate arithmetic. The weights are encoded once;
+activations are encoded per linear call. FP4 data and E8M0 scales feed the
+native NPU quantized matmul. This is distinct from `mxfp4_fake` floating GEMM.
+The first implementation uses unfused C7 encoding; benchmark complete requests
+before claiming latency improvements.
+
+Use this recipe with distributed layerwise offload disabled. Packed-byte
+weights with nonzero storage offsets need a separate compatibility change.
+SLA is optional and is provided separately by the SLA backend; this recipe
+does not select or implement an attention backend.

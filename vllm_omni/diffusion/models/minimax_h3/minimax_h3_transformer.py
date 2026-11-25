@@ -1175,6 +1175,14 @@ class MiniMaxH3DiTModel(nn.Module):
             else:
                 weight_loader(param, loaded_weight)
             loaded.add(name)
+        # Serialized MXFP4 uses native names; Diffusers RoPE reconstruction
+        # below does not contribute parameters to this completeness check.
+        if getattr(self, "_serialized_mxfp4", False):
+            required_mx = {
+                name for name, param in self.named_parameters() if not getattr(param, "is_checkpoint_optional", False)
+            }
+            if missing_mx := required_mx - loaded:
+                raise ValueError(f"MiniMax-H3 MXFP4 checkpoint is missing weights: {sorted(missing_mx)}")
         if diffusers_weights:
             for name, parts in qkv_parts.items():
                 if parts != {"q", "k", "v"}:
@@ -1188,12 +1196,6 @@ class MiniMaxH3DiTModel(nn.Module):
             )
             default_weight_loader(params["rope.inv_freq"], rope)
             loaded.add("rope.inv_freq")
-        if getattr(self, "_serialized_mxfp4", False):
-            required_mx = {
-                name for name, param in self.named_parameters() if not getattr(param, "is_checkpoint_optional", False)
-            }
-            if missing_mx := required_mx - loaded:
-                raise ValueError(f"MiniMax-H3 MXFP4 checkpoint is missing weights: {sorted(missing_mx)}")
         return loaded
 
     @staticmethod

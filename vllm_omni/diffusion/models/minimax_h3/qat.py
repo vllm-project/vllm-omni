@@ -118,6 +118,21 @@ def resolve_h3_transformer_quant_config(
                 raise ValueError("mxfp4_fake ignored_layers must explicitly match the checkpoint policy")
         return config
 
+    if config is not None and config.get_name() == "mxfp4" and getattr(config, "mxfp4_recipe", None) == "mxfp4_c7":
+        if runtime_lora:
+            raise ValueError("native C7 requires LoRA to be merged before loading")
+        if isinstance(disk_config, dict):
+            if disk_config.get("is_checkpoint_mxfp4_serialized") or disk_config.get("is_checkpoint_serialized"):
+                raise ValueError("native C7 requires floating checkpoint weights")
+            if disk_config.get("quant_method") not in (None, "mxfp4", "mxfp4_fake"):
+                raise ValueError("native C7 requires a floating MXFP4 QAT checkpoint")
+            ignored = disk_config.get("ignored_layers")
+            if ignored is not None and ignored != config.ignored_layers:
+                raise ValueError("native C7 ignored_layers must match the checkpoint policy")
+        elif disk_config not in (None, "mxfp4", "mxfp4_fake"):
+            raise ValueError("native C7 requires a floating MXFP4 QAT checkpoint")
+        return config
+
     if isinstance(disk_config, dict) and (
         disk_config.get("quant_scheme") == "mxfp4_c7" or disk_config.get("use_torch_fake_quant")
     ):
