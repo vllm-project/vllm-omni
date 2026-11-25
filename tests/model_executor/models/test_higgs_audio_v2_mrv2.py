@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import HiggsAudioV2Config
 from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_talker import (
     HiggsAudioRMSNorm,
     HiggsAudioV2DecoderLayer,
@@ -183,7 +184,17 @@ def test_higgs_audio_v2_sampler_publishes_current_step_codes(mocker) -> None:
     assert dispatch_kwargs == {"request_ids": ["second", "first"]}
 
 
-def test_higgs_audio_v2_mrv2_sample_emits_request_keyed_codec_frame() -> None:
+@pytest.mark.parametrize("nvidia,triton_available", [(False, True), (False, False), (True, False)])
+def test_higgs_audio_v2_mrv2_sample_emits_request_keyed_codec_frame(mocker, nvidia, triton_available) -> None:
+    module = "vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_talker"
+    mocker.patch(f"{module}.current_platform.is_cuda", return_value=nvidia)
+    mocker.patch(f"{module}.HAS_TRITON", triton_available)
+
+    class CudaLikeLogits(torch.Tensor):
+        @property
+        def is_cuda(self):
+            return True
+
     model = _model()
     model.config = _Config()
     model._audio_state_uses_request_ids = True
@@ -192,7 +203,8 @@ def test_higgs_audio_v2_mrv2_sample_emits_request_keyed_codec_frame() -> None:
     model._last_step_input_ids = torch.tensor([4])
     model._last_step_query_start_loc = torch.tensor([0, 1])
     model._last_logits_hidden = torch.ones(1, 2)
-    model.__dict__["audio_codebook_logits"] = lambda hidden, mask: torch.zeros((int(mask.sum()), 2, 8))
+    logits = torch.zeros((1, 2, 8)).as_subclass(CudaLikeLogits)
+    model.__dict__["audio_codebook_logits"] = lambda hidden, mask: logits
     model.__dict__["_sample_audio_codes_upstream"] = lambda logits, **_: torch.tensor([1, 2])
     sampler_output = _SamplerOutput(sampled_token_ids=torch.tensor([[4]]))
 
@@ -204,6 +216,11 @@ def test_higgs_audio_v2_mrv2_sample_emits_request_keyed_codec_frame() -> None:
     )
 
     assert result is sampler_output
+    expected_logits = torch.zeros((1, 2, 8))
+    expected_logits[0, 0, 6] = float("-inf")
+    expected_logits[0, 1].fill_(float("-inf"))
+    expected_logits[0, 1, 6] = 0
+    torch.testing.assert_close(logits, expected_logits, atol=0, rtol=0)
     assert model._last_audio_codes.tolist() == [[1, 6]]
     assert model._audio_state["request-a"]["audio_out_ids"].tolist() == [[1], [6]]
 
@@ -331,3 +348,18 @@ def test_higgs_audio_v2_releases_request_keyed_audio_history() -> None:
 
     assert model._audio_state == {"live": {}}
     assert model._slot_output_len == {"live": 2}
+
+
+@pytest.mark.parametrize("field", ["audio_stream_bos_id", "audio_stream_eos_id"])
+@pytest.mark.parametrize("token_id", [-1, 1026, 1027])
+def test_higgs_audio_v2_rejects_out_of_range_stream_tokens(field, token_id):
+    with pytest.raises(ValueError, match=field):
+        HiggsAudioV2Config(codebook_size=1026, **{field: token_id})
+
+
+def test_higgs_audio_v2_stream_token_config_round_trip():
+    config = HiggsAudioV2Config()
+    restored = HiggsAudioV2Config.from_dict(config.to_dict())
+    assert (restored.audio_stream_bos_id, restored.audio_stream_eos_id) == (1024, 1025)
+    boundary = HiggsAudioV2Config(codebook_size=8, audio_stream_bos_id=0, audio_stream_eos_id=7)
+    assert (boundary.audio_stream_bos_id, boundary.audio_stream_eos_id) == (0, 7)
