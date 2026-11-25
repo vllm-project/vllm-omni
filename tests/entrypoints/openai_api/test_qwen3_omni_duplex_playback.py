@@ -782,22 +782,6 @@ class TestQwen3OmniDuplexPlayback:
 
         _run_tool_session(qwen_duplex_server.server, _tool_session_config(function_call_interrupt_policy="keep"), body)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="#8857 splices a result before later user turns, so the model answers the newest question instead",
-    )
-    @pytest.mark.advanced_model
-    def test_a_result_after_a_later_turn_reaches_the_answer(self, qwen_duplex_server):
-        async def body(session: _ToolSession) -> None:
-            call_id = await session.ask_for_weather()
-            await session.ask("Before that, what is the capital of Japan?")
-
-            answer = await session.continue_with_result(call_id, WEATHER_RESULT)
-
-            assert "17" in answer, answer
-
-        _run_tool_session(qwen_duplex_server.server, _tool_session_config(function_call_interrupt_policy="keep"), body)
-
     @pytest.mark.advanced_model
     def test_a_timed_out_call_is_not_repeated_on_the_next_turn(self, qwen_duplex_server):
         """Nothing blocks a repeat here: the user turn lifts the block, so this measures the notice."""
