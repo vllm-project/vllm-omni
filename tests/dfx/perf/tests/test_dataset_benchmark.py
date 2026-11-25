@@ -93,6 +93,8 @@ def _result(params):
             result.update(daily_omni_evaluated_ok=count, daily_omni_accuracy=0.8)
         else:
             result.update(
+                seed_tts_session_count=count,
+                seed_tts_request_failed=0,
                 seed_tts_content_evaluated=count,
                 seed_tts_content_error_mean=0.0,
                 seed_tts_sim_evaluated=count,

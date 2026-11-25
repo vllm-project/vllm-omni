@@ -36,7 +36,23 @@ class _BWEConvVocoder(torch.nn.Module):
         return output
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+def test_ltx_vocoder_rocm_does_not_require_deterministic_miopen(monkeypatch):
+    import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx2_runtime
+
+    class _RocmPlatform:
+        @staticmethod
+        def is_rocm() -> bool:
+            return True
+
+    monkeypatch.setattr(ltx2_runtime, "current_omni_platform", _RocmPlatform())
+    cudnn = torch.backends.cudnn
+    with cudnn.flags(deterministic=True):
+        with ltx2_runtime._deterministic_ltx_vocoder():
+            assert not cudnn.deterministic
+        assert cudnn.deterministic
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI300"}, num_cards=1)
 def test_ltx_bwe_vocoder_runs_real_cuda_autocast_in_fp32():
     from vllm_omni.diffusion.models.ltx2.ltx2_runtime import _run_ltx_vocoder
 
