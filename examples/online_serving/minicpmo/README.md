@@ -12,14 +12,16 @@ capability boundary, and validation scope, see
 
 ## Installation
 
-Install vLLM-Omni with the MiniCPM-o talker dependencies:
+Install vLLM-Omni with the MiniCPM-o Code2Wav dependency:
 
 ```bash
-pip install stepaudio2-minicpmo
+pip install step-audio2==1.0.0
 ```
 
-The `minicpmo` extra installs `stepaudio2-minicpmo` and its audio dependencies,
-including `librosa`.
+`step-audio2` provides the top-level `cosyvoice2` package that the checkpoint's
+`flow.yaml` loads, and pulls in its audio dependencies (`librosa`,
+`hyperpyyaml`, `s3tokenizer`, `onnxruntime`). Do not co-install
+`stepaudio2-minicpmo`; its `stepaudio2` package conflicts with this one.
 
 ## Start the backend server
 

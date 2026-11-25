@@ -3539,6 +3539,7 @@ class TestPlatformOverrides:
             "moss_tts_nano.yaml",
             "chatterbox_turbo.yaml",
             "chatterbox.yaml",
+            "minicpmo_4_5.yaml",
         )
         rocm_full_mrv2 = platform == "rocm" and filename in (
             "qwen3_tts.yaml",

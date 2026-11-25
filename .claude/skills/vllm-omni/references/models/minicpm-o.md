@@ -23,7 +23,7 @@ Duplex plugin: `minicpmo_4_5/duplex/plugin.py`.
 
 | YAML | Use |
 |------|-----|
-| `minicpmo_4_5.yaml` | Default: **duplex**, CUDA llm/code2wav on MRv2 with tts on v1 for multi-frame decode (v1 elsewhere), all stages on GPU 0 (0.55 / 0.15 / 0.18), `max_sessions: 16`, shared-memory connector with `codec_chunk_frames: 25`, `codec_left_context_frames: 3` |
+| `minicpmo_4_5.yaml` | Default: **duplex**, all stages on MRv2 on CUDA, ROCm, NPU and XPU (MUSA rejected until validated), all stages on GPU 0 (0.55 / 0.15 / 0.18), `max_sessions: 16`, shared-memory connector with `codec_chunk_frames: 25`, `codec_left_context_frames: 3` |
 | `minicpmo_4_5_2gpu.yaml` | Recommended production: llm (stage 0) on GPU 0, tts + code2wav on GPU 1 |
 | `minicpmo_4_5_3gpu.yaml` | One GPU per stage |
 | `minicpmo_4_5_{3,4}gpu_stage1_replicas.yaml` | Experimental tts replicas (2 or 3) |

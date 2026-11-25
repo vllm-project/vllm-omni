@@ -1,7 +1,7 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
-# Keep MRv1 as the global default for deferred platforms; CUDA, ROCm and NPU
-# select MRv2 below.
+# Keep MRv1 as the global default for deferred platforms; CUDA, ROCm, NPU and
+# XPU select MRv2 below.
 model_runner: v1
 async_chunk: true
 # Use minicpmo_4_5_turn.yaml to select the ordinary turn-based serving engine.
@@ -362,3 +362,7 @@ platforms:
           # It buys shape-space coverage, not graph memory -- both settings
           # capture up to the pool limit.
           code2wav_max_npu_graphs: 32
+
+  xpu:
+    # Intel XPU builds the omni V2 runners; all three stages run on MRv2.
+    model_runner: v2
