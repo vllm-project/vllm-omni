@@ -504,7 +504,7 @@ class MiniMaxH3Attention(nn.Module):
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
-            vdn=self.vdn is not None,
+            vdn=self.vdn,
         )
 
     def forward(
@@ -584,7 +584,6 @@ class MiniMaxH3Attention(nn.Module):
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
         if self.vdn is not None:
-            assert q_raw is not None and k_raw is not None
             out = self.vdn.add_linear(out, x, q_raw, k_raw, v, vdn_window)
         return out
 

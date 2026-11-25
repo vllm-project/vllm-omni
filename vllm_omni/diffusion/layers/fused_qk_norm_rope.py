@@ -1256,7 +1256,7 @@ def fused_qkv_split_norm_rope(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    vdn: bool = True,
+    vdn: torch.nn.Module | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Split projected QKV, normalize/rotate Q and K, and optionally return their raw views."""
     packed = qkv.unflatten(-1, (-1, head_dim))
@@ -1281,7 +1281,7 @@ def fused_qkv_split_norm_rope(
                 epsilon=eps,
                 output_bnsd=False,
             )
-            if vdn:
+            if vdn is not None:
                 q_raw, k_raw, _ = packed.split(head_counts, dim=1)
                 return q, k, v, q_raw, k_raw
             return q, k, v, None, None
