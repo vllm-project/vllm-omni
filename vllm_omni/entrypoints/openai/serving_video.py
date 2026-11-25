@@ -322,6 +322,12 @@ class OmniOpenAIServingVideo:
         return any(item.supports_latent_continuation for item in metadata)
 
     @property
+    def preencode_mp4_default_fps(self) -> float | None:
+        """Return the worker's MP4 frame rate if complete-MP4 requests pre-encode on the worker by default."""
+        _, metadata = self._resolve_diffusion_metadata()
+        return next((item.preencode_mp4_default_fps for item in metadata if item.preencode_mp4_default_fps), None)
+
+    @property
     def is_minimax_h3(self) -> bool:
         config = self._resolve_diffusion_od_config()
         architectures = set(self._get_model_architectures(config))
@@ -594,11 +600,6 @@ class OmniOpenAIServingVideo:
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail="extra_params must be a JSON object/dict.",
                 )
-            if request.extra_params.get("preencode_mp4") and "preencode_batch_frames" in request.extra_params:
-                try:
-                    normalize_preencode_batch_frames(request.extra_params["preencode_batch_frames"])
-                except ValueError as exc:
-                    raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
             # Merge extra_params into extra_args
             gen_params.extra_args.update(request.extra_params)
             try:
@@ -628,6 +629,27 @@ class OmniOpenAIServingVideo:
             # Server-owned: the job id is the only key a later continue_from can name.
             # A regenerate job is refined at 2K, off the base canvas, and is never cached.
             gen_params.extra_args["latent_cache_key"] = reference_id
+
+        default_fps = self.preencode_mp4_default_fps
+        if (
+            default_fps is not None
+            and "preencode_mp4" not in gen_params.extra_args
+            # The worker muxes at the model's native rate and never hands frames to interpolation.
+            and not gen_params.enable_frame_interpolation
+            and (not fps_provided or vp.fps == default_fps)
+        ):
+            gen_params.extra_args["preencode_mp4"] = True
+        if gen_params.extra_args.get("preencode_mp4"):
+            if gen_params.enable_frame_interpolation:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="preencode_mp4 cannot be combined with enable_frame_interpolation.",
+                )
+            if "preencode_batch_frames" in gen_params.extra_args:
+                try:
+                    normalize_preencode_batch_frames(gen_params.extra_args["preencode_batch_frames"])
+                except ValueError as exc:
+                    raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
 
         self._apply_lora(request.lora, gen_params)
 

@@ -9,6 +9,8 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -51,6 +53,8 @@ def _parse_args() -> argparse.Namespace:
         default="distilled_two_stage",
     )
     parser.add_argument("--enable-layerwise-offload", action="store_true")
+    parser.add_argument("--stage-init-timeout", type=int)
+    parser.add_argument("--init-timeout", type=int)
     return parser.parse_args()
 
 
@@ -156,29 +160,76 @@ def _gemma4_rope_config_for_layer(
 
 def _configure_official_gemma4_rope_compatibility() -> None:
     """Make the pinned official Gemma4 buffer setup heterogeneity-safe."""
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
     from transformers.models.gemma4_unified.modeling_gemma4_unified import (
         Gemma4UnifiedTextRotaryEmbedding,
     )
 
     original = Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters
-    if getattr(original, "_vllm_omni_heterogeneous_head_dim_compat", False):
+    if not getattr(original, "_vllm_omni_heterogeneous_head_dim_compat", False):
+
+        def compute_default_rope_parameters(
+            config: Gemma4UnifiedTextConfig,
+            device: torch.device | None = None,
+            layer_type: str | None = None,
+            **kwargs: object,
+        ) -> tuple[torch.Tensor, float]:
+            layer_config = _gemma4_rope_config_for_layer(config, layer_type)
+            return original(config=layer_config, device=device, layer_type=layer_type, **kwargs)
+
+        setattr(compute_default_rope_parameters, "_vllm_omni_heterogeneous_head_dim_compat", True)
+        setattr(
+            Gemma4UnifiedTextRotaryEmbedding,
+            "compute_default_rope_parameters",
+            staticmethod(compute_default_rope_parameters),
+        )
+
+    proportional = ROPE_INIT_FUNCTIONS["proportional"]
+    if not getattr(proportional, "_vllm_omni_heterogeneous_head_dim_compat", False):
+
+        def compute_proportional_rope_parameters(
+            config: Gemma4UnifiedTextConfig,
+            device: torch.device | None = None,
+            seq_len: int | None = None,
+            layer_type: str | None = None,
+            head_dim_key: str = "head_dim",
+            **kwargs: object,
+        ) -> tuple[torch.Tensor, float]:
+            layer_config = _gemma4_rope_config_for_layer(config, layer_type)
+            # LTX's pinned official loader still requests the legacy
+            # ``global_head_dim`` field. Transformers 5.22 moves that value into
+            # the resolved per-layer config as ``head_dim``.
+            if layer_config is not config and head_dim_key == "global_head_dim":
+                head_dim_key = "head_dim"
+            return proportional(
+                config=layer_config,
+                device=device,
+                seq_len=seq_len,
+                layer_type=layer_type,
+                head_dim_key=head_dim_key,
+                **kwargs,
+            )
+
+        setattr(compute_proportional_rope_parameters, "_vllm_omni_heterogeneous_head_dim_compat", True)
+        ROPE_INIT_FUNCTIONS["proportional"] = compute_proportional_rope_parameters
+
+
+@contextmanager
+def _official_vocoder_deterministic_cudnn(device_type: str) -> Iterator[None]:
+    if device_type != "cuda":
+        yield
         return
 
-    def compute_default_rope_parameters(
-        config: Gemma4UnifiedTextConfig,
-        device: torch.device | None = None,
-        layer_type: str | None = None,
-        **kwargs: object,
-    ) -> tuple[torch.Tensor, float]:
-        layer_config = _gemma4_rope_config_for_layer(config, layer_type)
-        return original(config=layer_config, device=device, layer_type=layer_type, **kwargs)
-
-    setattr(compute_default_rope_parameters, "_vllm_omni_heterogeneous_head_dim_compat", True)
-    setattr(
-        Gemma4UnifiedTextRotaryEmbedding,
-        "compute_default_rope_parameters",
-        staticmethod(compute_default_rope_parameters),
-    )
+    previous = torch.backends.cudnn.deterministic
+    try:
+        # PyTorch exposes ROCm devices through the ``cuda`` device type, but
+        # MIOpen has no deterministic algorithm for the LTX BWE resampler's
+        # grouped conv1d. Keep NVIDIA's reproducible policy without forcing
+        # the unsupported MIOpen path on ROCm.
+        torch.backends.cudnn.deterministic = torch.version.hip is None
+        yield
+    finally:
+        torch.backends.cudnn.deterministic = previous
 
 
 def _configure_official_vocoder_determinism() -> None:
@@ -190,15 +241,8 @@ def _configure_official_vocoder_determinism() -> None:
         return
 
     def deterministic_forward(self: Any, mel_spec: torch.Tensor) -> torch.Tensor:
-        device_type = mel_spec.device.type
-        if device_type != "cuda":
+        with _official_vocoder_deterministic_cudnn(mel_spec.device.type):
             return original_forward(self, mel_spec)
-        previous = torch.backends.cudnn.deterministic
-        try:
-            torch.backends.cudnn.deterministic = True
-            return original_forward(self, mel_spec)
-        finally:
-            torch.backends.cudnn.deterministic = previous
 
     setattr(deterministic_forward, "_vllm_omni_deterministic", True)
     setattr(VocoderWithBWE, "forward", deterministic_forward)
@@ -718,14 +762,19 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request["seed"])
-    omni = Omni(
-        model=args.model,
-        model_class_name=args.model_class_name,
-        enforce_eager=True,
-        enable_layerwise_offload=args.enable_layerwise_offload,
-        diffusion_attention_config=attention_config,
-        parallel_config=DiffusionParallelConfig(),
-    )
+    omni_kwargs = {
+        "model": args.model,
+        "model_class_name": args.model_class_name,
+        "enforce_eager": True,
+        "enable_layerwise_offload": args.enable_layerwise_offload,
+        "diffusion_attention_config": attention_config,
+        "parallel_config": DiffusionParallelConfig(),
+    }
+    if args.stage_init_timeout is not None:
+        omni_kwargs["stage_init_timeout"] = args.stage_init_timeout
+    if args.init_timeout is not None:
+        omni_kwargs["init_timeout"] = args.init_timeout
+    omni = Omni(**omni_kwargs)
     try:
         # The explicit public class argument selects the worker pipeline. The
         # parent Omni proxy can only expose the checkpoint's base class, which
@@ -801,14 +850,19 @@ def _run_omni_t2a(args: argparse.Namespace, request: dict[str, Any]) -> None:
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request["seed"])
-    omni = Omni(
-        model=args.model,
-        model_class_name=args.model_class_name,
-        enforce_eager=True,
-        enable_layerwise_offload=args.enable_layerwise_offload,
-        diffusion_attention_config={"default": {"backend": _omni_attention_backend()}},
-        parallel_config=DiffusionParallelConfig(),
-    )
+    omni_kwargs = {
+        "model": args.model,
+        "model_class_name": args.model_class_name,
+        "enforce_eager": True,
+        "enable_layerwise_offload": args.enable_layerwise_offload,
+        "diffusion_attention_config": {"default": {"backend": _omni_attention_backend()}},
+        "parallel_config": DiffusionParallelConfig(),
+    }
+    if args.stage_init_timeout is not None:
+        omni_kwargs["stage_init_timeout"] = args.stage_init_timeout
+    if args.init_timeout is not None:
+        omni_kwargs["init_timeout"] = args.init_timeout
+    omni = Omni(**omni_kwargs)
     try:
         sampling_params = OmniDiffusionSamplingParams(
             generator=generator,
