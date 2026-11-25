@@ -14,12 +14,17 @@ failed requests. Request latency and time to first output include failed
 attempts and retry delays.
 
 Currently these endpoints are available for `vllm bench serve --omni`:
+
 | Endpoint | Example models |
 | --- | --- |
-| /v1/chat/completions | Qwen3-Omni-30B-A3B-Instruct<br>BAGEL-7B-MoT<br>... |
-| /v1/images/edits | HunyuanImage-3.0-Instruct<br>... |
+| `/v1/chat/completions` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` |
+| `/v1/audio/speech` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` |
+| `/v1/images/edits` | `tencent/HunyuanImage-3.0-Instruct` |
+| `/v1/images/generations` | `Qwen/Qwen-Image` |
+| `/v1/videos` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
+| `/v1/realtime` | `Qwen/Qwen3-Omni-30B-A3B-Instruct`<br>`openbmb/MiniCPM-o-4_5` |
 
- More endpoints are on the way.
+For `/v1/images/generations`, `/v1/images/edits`, and `/v1/videos`, set `--endpoint` to that path and omit `--backend`. The three WebSocket backends use `/v1/realtime`.
 
 ## Basic Parameter Description
 
@@ -92,7 +97,14 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   `--goodput ttft:500 audio_ttfp:1000`.
 
 - `--print-stage`
-Control whether or not per-stage benchmark metrics are printed. Disabled by default.
+  Print per-stage benchmark metrics when the server returns `stage_metrics`. Disabled by default.
+  This flag only controls printing. The client still requests `return_stage_metrics` when
+  `--print-stage` is set, and also for image backends (`openai-image-edits-omni`,
+  `/v1/images/edits`, `/v1/images/generations`) and for `openai-chat-omni` when
+  `extra_body.modalities` includes `"image"` or when `--percentile-metrics` includes `tpot`/`itl`.
+  Latency rows follow `--percentile-metrics` by modality: `ttft`/`tpot`/`itl` for text stages,
+  `ttfc`/`tpoc`/`icl` for internal stream stages, and `tpop` for both text TPOP and
+  internal-stream TPOP.
 
 - `--save-result`
 Specify to save benchmark results to a json file
@@ -1360,11 +1372,8 @@ Stage audio frames generated:            6242730
 Mean Serving AUDIO_TTFP (ms):            1366.16
 Median Serving AUDIO_TTFP (ms):          1367.20
 P99 Serving AUDIO_TTFP (ms):             1368.26
------------------Real Time Factor-----------------
-Mean AUDIO_RTF:                          0.24
-Median AUDIO_RTF:                        0.26
-P99 AUDIO_RTF:                           0.27
 ```
+
 Additional explanation of stage wise metrics:
 
 - stage_gen_time: Time from submitting a request to a specific stage to that stage finishing generation.
@@ -1375,6 +1384,6 @@ Additional explanation of stage wise metrics:
 
 - ICL (Inter-Chunk Latency): Time between two consecutive output chunks produced by the same stage. Keep the name ITL in text stage for easier mapping.
 
-- AUDIO_RTF (Real-Time Factor): `stage_gen_time / audio_duration`
+End-to-end `AUDIO_RTF` is printed in the overall Audio Result, not in `--print-stage`. Which stage block is printed (Text / Audio / Image / Video / Internal Stream) follows `stage_modality_flags(final_output_type, output_unit_type)` in `vllm_omni/metrics/definitions.py`. Internal-stream rows (TTFC/TPOP/ICL) depend on a streaming `output_unit_type` (often `stream`) and non-empty timing samples; see [modality troubleshooting](../../design/feature/multi_stage_benchmark.md#a-stage-appears-but-modality-specific-metrics-are-missing).
 
 </details>
