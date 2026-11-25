@@ -680,7 +680,12 @@ reason once.
 
 On one Ascend 950PR card (256x448, 33 frames, real weights) the streamed path
 produced bit-identical encoder rows and lowered peak allocated device memory
-by about 40 MiB, with latency within 1% of the ordinary path. On 8 ranks
-(448x704, 33/65/97/129 frames) encoder rows stayed bit-identical across all
-ranks, peak HBM dropped by 152-497 MiB as the clip grew, and latency was
-neutral to 0.8% lower.
+by about 40 MiB, with latency within 1% of the ordinary path.
+
+On eight Ascend 950PR cards (public Ref2VA fixture, 1344x768, 124 frames,
+seed 0), encoder rows stayed bit-identical across all ranks and the video VAE
+encode's allocator peak fell by 1.6 GiB allocated and 2.2 GiB reserved
+(31.8%/32.4%) against baseline `085d7dba3` for candidate `5e4f260d`. These are
+PyTorch/NPU allocator high-water marks for the encode stage, not device HBM
+peaks. VAE latency stayed inside the 3% gate with a 95% confidence interval
+that included zero, so no speed-up is claimed.
