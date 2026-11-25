@@ -1191,6 +1191,12 @@ encoded text prefix, so different prompt lengths do not shift the global AV cloc
 T2VA and FL2VA windows each follow their own prompt, as separate `continue_from`
 requests do. Without this list, the request's single prompt is reused as before.
 
+T2VA and FL2VA requests with more than one window prompt are refused while the
+text encoder uses distributed layerwise offload
+(`--enable-distributed-layerwise-offload`): their prompts are text-only encodes
+that run one after another, which that backend does not handle yet. A single
+prompt for all windows works there, and so do Ref2VA window prompts.
+
 T2VA and FL2VA windows carry the preceding AV latent tail as a frame-0 timeline
 guide, the layout [`continue_from`](../../docs/serving/videos_api.md#minimax-h3-continuation-across-requests)
 uses across requests, instead of a Ref2VA `latent_guide` reference. Each window

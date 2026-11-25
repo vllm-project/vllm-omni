@@ -1809,6 +1809,12 @@ class MiniMaxH3Pipeline(
             od_config, TEXT_ENCODER_COMPONENT
         )
 
+    def _text_encoder_uses_distributed_layerwise_offload(self) -> bool:
+        text_encoder = getattr(self, "text_encoder", None)
+        if text_encoder is None or not self._uses_manual_component_offload(text_encoder):
+            return False
+        return resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+
     def enable_omni_model_cpu_offload(
         self,
         *,
@@ -3333,6 +3339,19 @@ class MiniMaxH3Pipeline(
                         or any(not isinstance(prompt, str) or not prompt.strip() for prompt in prompts)
                     ):
                         raise OmniClientError(f"continuation_prompts must contain exactly {count} non-empty strings")
+                    if (
+                        count > 1
+                        and continuation_uses_timeline_guides(task)
+                        and self._text_encoder_uses_distributed_layerwise_offload()
+                    ):
+                        # These windows encode text only, one prompt after another. Under
+                        # distributed layerwise offload a text-only pass that directly follows
+                        # another does not re-fetch the group's first block and runs on
+                        # released placeholders. Ref2VA prompts are separated by a vision pass.
+                        raise OmniClientError(
+                            "MiniMax H3 continuation_prompts for T2VA and FL2VA is not supported while the text "
+                            "encoder uses distributed layerwise offload; send a single prompt"
+                        )
                     prepared = replace(prepared, prompt=prompts[0])
                     # External text belongs to the main prompt, not the first window.
                     text_conditioning = None

@@ -568,6 +568,48 @@ def test_t2va_and_single_window_fl2va_encode_their_prompt_once(monkeypatch):
     assert len(encoded) == 1 and encoded[0].images and "continuation_text_conditioning" not in context
 
 
+@pytest.mark.parametrize("task,images,windows", [("t2va", 0, 3), ("fl2va", 1, 6)])
+def test_window_prompts_are_refused_under_distributed_text_offload(monkeypatch, task, images, windows):
+    prompts = [f"prompt {index}" for index in range(windows)]
+    # Text-only prompt encodes in a row are not safe on that backend, so nothing is encoded.
+    pipeline, encoded, encoded_media = _local_pipeline(monkeypatch, task)
+    pipeline._text_encoder_uses_distributed_layerwise_offload = lambda: True
+    with pytest.raises(OmniClientError, match="distributed layerwise offload; send a single prompt"):
+        pipeline._prepare_request_inputs(*_local_request(task, images=images, continuation_prompts=prompts))
+    assert not encoded and not encoded_media
+    # A single prompt for every window stays available there, and so does a one-window request.
+    pipeline._prepare_request_inputs(*_local_request(task, images=images))
+    assert len(encoded) == (1 if task == "t2va" else 2)
+    pipeline._prepare_request_inputs(*_local_request(task, images=images, duration=5, continuation_prompts=["only"]))
+    # Without that offload the prompts are encoded, one per window.
+    pipeline, encoded, _ = _local_pipeline(monkeypatch, task)
+    pipeline._prepare_request_inputs(*_local_request(task, images=images, continuation_prompts=prompts))
+    assert [item.prompt for item in encoded] == prompts
+
+
+def test_distributed_text_offload_is_read_from_the_offload_policy():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    def refuses(*, text_encoder=True, **config):
+        pipeline = object.__new__(MiniMaxH3Pipeline)
+        torch.nn.Module.__init__(pipeline)
+        if text_encoder:
+            pipeline.text_encoder = torch.nn.Identity()
+        pipeline.od_config = OmniDiffusionConfig(**config)
+        return pipeline._text_encoder_uses_distributed_layerwise_offload()
+
+    assert refuses(enable_distributed_layerwise_offload=True)
+    assert not refuses()
+    assert not refuses(enable_layerwise_offload=True)
+    assert not refuses(enable_distributed_layerwise_offload=True, text_encoder=False)
+    # The compact setting picks the distributed backend through a component's weight transfer.
+    allgather = {"mode": "layer", "layer_options": {"dit": {"weight_transfer": "allgather"}}}
+    assert refuses(diffusion_offload_config={**allgather, "components": ["dit", "text_encoder"]})
+    assert not refuses(diffusion_offload_config={**allgather, "components": ["dit"]})
+    assert not refuses(diffusion_offload_config={"mode": "layer", "components": ["dit", "text_encoder"]})
+
+
 def test_fl2va_windows_need_a_local_text_encoder(monkeypatch):
     pipeline, encoded, _ = _local_pipeline(monkeypatch, "fl2va", load_text_encoder=False)
     with pytest.raises(OmniClientError, match="requires a local text encoder"):
