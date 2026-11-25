@@ -397,6 +397,11 @@ steps:
         artifact_paths:
           - artifacts/rocm-tts-full-model-additions/**/*
         commands:
+          # CosyVoice3's code2wav stage otherwise cold-compiles the unmasked BF16
+          # AITER MHA module on its first request: 1580 s in AMD build 17564,
+          # long enough for the voice-isolation requests to hit their 600 s
+          # timeout twice. Restore the provenance-checked module instead.
+          - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
           - >-
             bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
             tests/e2e/offline_inference/test_yue2.py

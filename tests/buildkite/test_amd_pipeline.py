@@ -1559,7 +1559,14 @@ def test_cuda_function_gap_nightly_jobs_are_nonblocking_burn_in(label: str, argv
     assert step["timeout_in_minutes"] == 150
     assert step["env"]["ROCM_E2E_TIMEOUT_MINUTES"] == "135"
     assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
-    assert split(step["commands"][0]) == ["bash", ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh", *argv]
+    assert split(step["commands"][-1]) == ["bash", ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh", *argv]
+
+
+def test_tts_additions_restore_the_aiter_mha_module_before_running() -> None:
+    step = _find_step("TTS Full-Model Additions · 1-GPU", AMD_NIGHTLY_PIPELINE)
+
+    assert step["commands"][0] == 'eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"'
+    assert len(step["commands"]) == 2
 
 
 def test_qwen3_omni_realtime_merge_job_mirrors_cuda_h100_entrypoints() -> None:
