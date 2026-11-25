@@ -2383,7 +2383,6 @@ def test_asr_handoff_rebudgets_history_and_handles_empty_transcript(monkeypatch,
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE)
     plugin.processor = Processor()
-    plugin.max_model_len = 2600
     plugin.max_images = 4
     monkeypatch.setattr(bridge, "cached_processor_from_config", lambda config: plugin.processor, raising=False)
     monkeypatch.setattr(
@@ -2405,6 +2404,10 @@ def test_asr_handoff_rebudgets_history_and_handles_empty_transcript(monkeypatch,
         ]
     )
     runtime = plugin.runtime_config_for_update(DuplexSessionConfig(instructions="Watch the pot."), {})
+    # This tokenizer counts characters. Keep room for the transcript and current
+    # image, but not the outdated turn, independently of the persona's wording.
+    system_tokens = len(plugin.processor.tokenizer(text=[plugin._system_prompt(runtime)])["input_ids"][0])
+    plugin.max_model_len = system_tokens + 1600
     if not transcript:
         runtime["initial_user_text"] = "Describe what you see."
     plan = plugin.plan_append(
@@ -2436,7 +2439,7 @@ def test_asr_handoff_rebudgets_history_and_handles_empty_transcript(monkeypatch,
         assert result["prompt"].count("Describe what you see.") == 1
     assert (
         len(plugin.processor(text=[result["prompt"]], images=result["multi_modal_data"]["image"])["input_ids"][0])
-        <= 2536
+        <= plugin.max_model_len - 64
     )
 
 
