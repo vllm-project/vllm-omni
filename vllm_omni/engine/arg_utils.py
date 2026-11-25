@@ -118,6 +118,7 @@ def _register_omni_hf_configs() -> None:
             BailingMoeV3AudioConfig,
         )
         from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
+        from vllm_omni.transformers_utils.configs.realtime_venus import RealtimeVenusOmniConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
@@ -153,6 +154,7 @@ def _register_omni_hf_configs() -> None:
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
         ("chatterbox", ChatterboxConfig),
+        ("realtime_venus_omni", RealtimeVenusOmniConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -430,6 +432,7 @@ class OmniEngineArgs(EngineArgs):
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
+    vae_stack_tiles: bool | None = None
     vae_fast_path: str | None = None
     vae_encode_fast_path: str | None = None
     enable_multithread_weight_load: bool | None = None
@@ -866,6 +869,7 @@ class OrchestratorArgs:
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_stack_tiles: bool = True
     vae_fast_path: str = "lossless"
     vae_encode_fast_path: str = "lossless"
     enable_multithread_weight_load: bool = True
@@ -949,6 +953,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "step_execution",
         "vae_use_slicing",
         "vae_use_tiling",
+        "vae_stack_tiles",
         "vae_fast_path",
         "vae_encode_fast_path",
         "enable_multithread_weight_load",

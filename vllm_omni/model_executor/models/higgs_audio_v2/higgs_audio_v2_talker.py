@@ -962,6 +962,9 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             hidden_states = self._maybe_apply_audio_feedback(hidden_states, input_ids)
 
         audio_mask = self.audio_token_mask(input_ids) if input_ids is not None else None
+        # Resolve uniform audio routing once instead of indexing in every layer.
+        if audio_mask is not None and audio_mask.all().item():
+            audio_mask = None
 
         # Fused-residual loop: layers return (hidden, residual)
         # where ``residual`` carries everything up to the post-MLP add.

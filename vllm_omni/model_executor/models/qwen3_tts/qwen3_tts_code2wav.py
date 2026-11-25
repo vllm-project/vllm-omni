@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import functools
 import os
+import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import nullcontext
@@ -812,7 +813,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         )
 
     def capture_auxiliary_graphs(self) -> None:
-        """Set up the decoder CUDA graphs that ``load_weights`` deferred.
+        """Run the decoder initialization that ``load_weights`` deferred.
 
         The worker calls this once ``load_model`` has returned, before the stage
         serves. vLLM's ``load_model`` limits the caching allocator to
@@ -824,6 +825,51 @@ class Qwen3TTSCode2Wav(nn.Module):
         setup, self._pending_decoder_graph_setup = self._pending_decoder_graph_setup, None
         if setup is not None:
             setup()
+
+    def _warmup_eager_decoder(self, device: torch.device) -> None:
+        """Initialize MIOpen shapes with private state before accepting requests."""
+        if not self._decode_batch_max_size:
+            # An uncapped eager backend has no small, deployment-owned shape
+            # set to initialize. Keep its existing on-demand behavior.
+            return
+        max_seqs = self.vllm_config.scheduler_config.max_num_seqs
+        max_batch = min(self._decode_batch_max_size, max_seqs)
+        prefix = self._decoder_sliding_window
+        chunk = self.decoder._incremental_chunk_frames
+        ramp = self.decoder._incremental_chunk_ramp
+        frames = list(ramp) if ramp else [self.decoder._initial_codec_chunk_frames]
+        while sum(frames) < prefix:
+            frames.append(chunk)
+        # Reach the rolling window, then exercise its steady-state transition.
+        frames.extend([chunk, chunk])
+        started = time.perf_counter()
+        with torch.inference_mode():
+            for batch in range(1, max_batch + 1):
+                for mode in self.decoder_cudagraph_modes:
+                    ref_frames = prefix if mode == "icl" else 0
+                    first_audio_flags = [False]
+                    if mode == "xvec" and self.decoder.capture_first_audio_state_only:
+                        first_audio_flags.append(True)
+                    for skip_first in first_audio_flags:
+                        caches = [{"prefix_frames": ref_frames, "skip_first_audio": skip_first} for _ in range(batch)]
+                        for index, new_frames in enumerate(frames):
+                            length = new_frames + (ref_frames if index == 0 else 0)
+                            codes = torch.zeros(batch, self._num_quantizers, length, dtype=torch.long, device=device)
+                            self.decoder.batched_chunked_decode(
+                                codes,
+                                [length] * batch,
+                                caches=caches,
+                                chunk_size=self._decode_chunk_frames,
+                                left_context_size=self._decode_left_context_frames,
+                                max_batch_size=max_batch,
+                            )
+        torch.accelerator.synchronize(device)
+        logger.info(
+            "Qwen3-TTS eager decoder warmup: batches 1..%d, modes=%s, %.3fs",
+            max_batch,
+            self.decoder_cudagraph_modes,
+            time.perf_counter() - started,
+        )
 
     def _setup_decoder_graphs(
         self,
@@ -842,6 +888,17 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         The arguments are the decoder settings ``load_weights`` parsed.
         """
+        if (
+            self._async_chunk
+            and device.type == "cuda"
+            and getattr(self.vllm_config.model_config, "enforce_eager", False)
+        ):
+            from vllm_omni.platforms import current_omni_platform
+
+            if current_omni_platform.is_rocm():
+                # ROCm disables decoder graphs. Its eager path still needs the
+                # same startup shape initialization to avoid first-request stalls.
+                self._warmup_eager_decoder(device)
         if (
             not decode_streaming
             and self.decoder_cudagraph_modes
