@@ -11,6 +11,8 @@ from torch import nn
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.model_executor.models.kimi_audio import kimi_audio_ar_stage
+from vllm_omni.model_executor.models.kimi_audio.prompt import KimiAudioSpecialTokens
+from vllm_omni.model_executor.models.kimi_audio.sampling import KimiAudioSamplingParams, sample_kimi_audio_step
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -183,6 +185,42 @@ def test_sampler_counts_rows_and_falls_back_without_a_handoff(stage, monkeypatch
     assert result.sampled_token_ids.tolist() == [[TEXT_TOKEN], [SPECIAL["kimia_text_blank"]]]
     assert result.num_sampled.tolist() == [1, 0] and result.logprobs_tensors is None
     assert native.calls == 1
+
+
+def test_seeded_request_continues_its_random_stream(stage):
+    # A seeded request must continue one generator across steps, not reseed it.
+    info = _info("seeded")
+    info["sampling_params"] = SamplingParams(temperature=1.0, top_k=0)
+    text_logits, audio_logits = torch.zeros(1, VOCAB), _one_hot(1, AUDIO_TOKEN)
+
+    generator = torch.Generator().manual_seed(info["kimi_audio_generation"]["seed"])
+    params = KimiAudioSamplingParams.from_sampling_params(info["sampling_params"])
+    expected, text_history, audio_history = [], [], []
+    for _ in range(2):
+        result = sample_kimi_audio_step(
+            text_logits[0],
+            audio_logits[0],
+            text_history=text_history,
+            audio_history=audio_history,
+            text_finished=False,
+            output_type="both",
+            special_tokens=KimiAudioSpecialTokens(**SPECIAL),
+            audio_delay=0,
+            params=params,
+            generator=generator,
+        )
+        assert not result.text_finished
+        expected.append(result.text_token)
+        text_history, audio_history = [*text_history, result.text_token], [*audio_history, result.audio_token]
+    # Reseeding every step would repeat the first draw.
+    assert expected[0] != expected[1]
+
+    for _ in range(2):
+        stage.make_omni_output(torch.zeros(1, 4), model_intermediate_buffer=[info], request_sample_eligible=[True])
+        stage._audio_logits = audio_logits.clone()
+        stage.sample(text_logits.clone())
+
+    assert info["kimi_audio_generation"]["text_history"] == expected
 
 
 def test_unvalidated_request_is_rejected(stage):

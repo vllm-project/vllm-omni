@@ -61,6 +61,7 @@ class KimiAudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
                 "requires_request_sample_eligibility",
                 "omni_pooler_payload_include_hidden",
                 "mm_outputs_fresh_per_step",
+                "preprocess_keeps_mm_inputs",
                 "requires_full_prefix_cached_hidden_states",
             ):
                 setattr(self, name, getattr(self.model, name))

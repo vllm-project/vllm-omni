@@ -116,6 +116,7 @@ class KimiAudioInputEncoder(torch.nn.Module):
         from vllm.model_executor.model_loader import DefaultModelLoader
         from vllm.model_executor.models.kimi_audio import KimiAudioWhisperEncoder
         from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
+        from vllm.model_executor.models.whisper import _create_fake_bias_for_k_proj
         from vllm.utils.torch_utils import set_default_torch_dtype
 
         config = self.vllm_config
@@ -128,6 +129,9 @@ class KimiAudioInputEncoder(torch.nn.Module):
             subfolder="whisper-large-v3",
         )
         weights = DefaultModelLoader(config.load_config)._get_weights_iterator(source)
+        # Whisper's k_proj has no bias, but the fused qkv_proj bias has a k
+        # slice. Callers that reuse the encoder supply it as zeros (as glmasr).
+        weights = _create_fake_bias_for_k_proj(weights, ".k_proj.weight")
         # Match vLLM's Kimi parent mapping; the reused encoder handles fused
         # Q/K/V loading itself. Whisper's text decoder is not an input encoder.
         mapper = WeightsMapper(
@@ -256,6 +260,10 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
     omni_pooler_payload_include_hidden = False
     # make_omni_output allocates each step's payload and sampling fills it.
     mm_outputs_fresh_per_step = True
+    # preprocess adds the text stream to the runner's merged audio embeddings.
+    # Without this, Model Runner V2 disables multimodal inputs for preprocess
+    # models, and audio spans would be embedded as their placeholder IDs.
+    preprocess_keeps_mm_inputs = True
     # The packed branch states are only needed for current-step logits. They
     # are not downstream conditioning and have width 2H, unlike the H-wide
     # model activations stored by Omni's full-prefix hidden-state cache.
