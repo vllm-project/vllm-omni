@@ -156,6 +156,10 @@ def test_the_runner_registry_is_isolated_from_the_process_global(platform):
     # The registry is process-global; the fixture hands this test its own set,
     # so a runner another test file left behind is never visited here.
     runner = build_denoise_graph_runner(_od_config(), _affine, "outside")
+    # The registry is a WeakSet, so the local name is what keeps this runner
+    # alive for the assertions below.
+    assert runner in graph_mod._RUNNERS
+    assert runner not in _PROCESS_GLOBAL_RUNNERS
     runner(x=torch.ones(2))
     assert runner.num_graphs == 1
     # Leave it where another test file would have left it.
