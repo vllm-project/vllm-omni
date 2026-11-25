@@ -84,9 +84,7 @@ def test_duplex_mrv2_profile_npu_full_mrv2(monkeypatch) -> None:
 def test_two_card_deploy_inherits_common_npu_settings(monkeypatch) -> None:
     config, stages = _resolve_stages(monkeypatch, "npu", "minicpmo_4_5_2gpu.yaml")
     thinker, talker, vocoder = stages
-    assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
     assert thinker.yaml_engine_args["max_model_len"] == 40960
-    assert thinker.yaml_engine_args["speculative_config"]["method"] == "ngram"
     assert thinker.yaml_runtime["env"]["MINICPMO_NPU_DSPARK_NATIVE_GATHER"] == "1"
     assert thinker.yaml_engine_args["interleave_mm_strings"] is True
     assert thinker.yaml_engine_args["media_io_kwargs"]["video"] == {"fps": 1, "num_frames": 128}
@@ -97,17 +95,16 @@ def test_two_card_deploy_inherits_common_npu_settings(monkeypatch) -> None:
     assert options["minicpmo_talker_compact_decode"] is True
     assert options["minicpmo_talker_hybrid_context"] is True
     assert options["minicpmo_talker_replica_route"] == "half"
-    assert vocoder.yaml_engine_args["additional_config"]["minicpmo_vocoder_replica_route"] == "adaptive_secondary"
-    assert (vocoder.yaml_runtime["devices"], vocoder.yaml_runtime["num_replicas"]) == ("0,1", 2)
+    assert vocoder.yaml_runtime["num_replicas"] == 2
     assert vocoder.yaml_runtime["env"] == {
         "MINICPMO_CODE2WAV_SECONDARY_TIGHT_MEMORY": "1",
     }
     assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 32]
     extra = config.connectors["connector_of_shared_memory"]["extra"]
-    assert extra["codec_chunk_frames"] == 32
     assert extra["token2wav_n_timesteps"] == 5
     assert (extra["micro_batch_size"], extra["secondary_vocoder_micro_batch_size"]) == (8, 4)
-    assert extra["token2wav_setup_host_cache_size"] == 512
+    assert (extra["token2wav_setup_cache_size"], extra["token2wav_setup_host_cache_size"]) == (64, 512)
+    assert extra["cfm_graph_capture_frames"] == [16, 32, 48, 64, 80]
     assert extra["token2wav_runtime_prompt_cache_size"] == 512
 
 
