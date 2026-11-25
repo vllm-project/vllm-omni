@@ -517,7 +517,14 @@ def test_startup_validation_rejects_unsupported_explicit_quant_precision(attenti
 
 
 @pytest.mark.parametrize("spec_precision", [False, True])
-def test_startup_ring_precision_check_applies_only_to_explicit_spec(attention_env, spec_precision):
+@pytest.mark.parametrize(
+    ("skip_sequence_parallel", "explicit_cross"),
+    [(False, False), (True, False), (False, True)],
+    ids=["ring", "local-refiner", "explicit-cross"],
+)
+def test_startup_ring_precision_check_applies_only_to_explicit_spec(
+    attention_env, spec_precision, skip_sequence_parallel, explicit_cross
+):
     baseline = AttentionConfig(
         default=AttentionSpec(backend="FLASH_ATTN", quant={"precision": "fp8"} if spec_precision else None)
     )
@@ -528,15 +535,17 @@ def test_startup_ring_precision_check_applies_only_to_explicit_spec(attention_en
     )
     attention_env.monkeypatch.setattr(_fake_impl("FLASH_ATTN"), "_kv_cache_dtypes_ok", ("fp8",))
     layer = attention_env.build(_make_config(baseline=baseline, schedule=schedule, kv_dtype=global_dtype))
+    layer.skip_sequence_parallel = skip_sequence_parallel
+    layer._explicit_cross_contract = explicit_cross
 
     # Matching identities pass the existing ring identity check, so precision must be checked too.
     assert layer._schedule_candidates["quant"].impl is layer.attention
     config = _ring_config(schedule, baseline=baseline, kv_dtype=global_dtype)
-    if spec_precision:
+    if spec_precision and not skip_sequence_parallel and not explicit_cross:
         with pytest.raises(ValueError, match=r"profile 'quant'.*KV quantization is not compatible with ring attention"):
             layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config)
     else:
-        # Global quantization's ring check remains owned by layer construction.
+        # Non-ring layers accept spec precision; global policy remains checked at construction.
         assert layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config) == 1
 
 

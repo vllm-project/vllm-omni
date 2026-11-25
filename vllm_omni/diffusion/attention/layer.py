@@ -868,7 +868,7 @@ class Attention(nn.Module):
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
         if dtype and dtype != "float":
-            if ring_degree > 1:
+            if ring_degree > 1 and not self._explicit_cross_contract and not self.skip_sequence_parallel:
                 raise ValueError(
                     "KV quantization is not compatible with ring attention "
                     "(ring_degree > 1). Ring kernels do not propagate quantization descale "
@@ -1840,15 +1840,15 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
                     f"explicit selection or backend kwargs differ from it. Align that profile with the "
                     f"baseline or disable scheduler paged KV."
                 )
-            if spec_precision is not None and ring_degree > 1:
-                raise ValueError(
-                    f"attention schedule profile {name!r} requests kv_cache_dtype={kv_dtype!r}, "
-                    "but KV quantization is not compatible with ring attention (ring_degree > 1). "
-                    "Ring kernels do not propagate quantization descale factors. Use Ulysses SP instead."
-                )
             # Layers that can run ring: use_ring at construction (never explicit cross-attention), minus
             # layers that skip sequence parallelism, which always run local attention.
             if ring_degree > 1 and not module._explicit_cross_contract and not module.skip_sequence_parallel:
+                if spec_precision is not None:
+                    raise ValueError(
+                        f"attention schedule profile {name!r} requests kv_cache_dtype={kv_dtype!r}, "
+                        "but KV quantization is not compatible with ring attention (ring_degree > 1). "
+                        "Ring kernels do not propagate quantization descale factors. Use Ulysses SP instead."
+                    )
                 # The ring path bypasses the backend, so a candidate carrying skip_softmax
                 # would be silently ignored (_run_ring_attention only reads the baseline impl). The
                 # ring runner was constructed once from the baseline backend preference and explicit

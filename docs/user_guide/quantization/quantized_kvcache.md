@@ -56,6 +56,13 @@ quality and performance still require validation on the target NPU.
 If neither `diffusion_kv_cache_dtype` nor a backend-specific quantization
 precision is set, attention runs in the native dtype.
 
+Quantized attention is not supported on layers that execute ring attention.
+Enabling ring for the DiT does not block quantization on layers that skip
+sequence parallelism, such as MiniMax-H3's `minimax_h3.token_refiner`, or on
+explicit cross-attention layers that do not use ring. This applies to both
+baseline precision selection and attention schedule profiles; the selected
+backend must still support the precision and input layout.
+
 ## Hardware Support
 
 | Device | Dense FP8 | Dense MXFP8/MXFP4 | BSA FP8/MXFP4 |

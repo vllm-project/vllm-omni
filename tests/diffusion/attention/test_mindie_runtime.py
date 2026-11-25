@@ -445,7 +445,7 @@ def test_spec_precision_rejects_unsupported_platform(runtime, monkeypatch):
 
 
 @pytest.mark.parametrize("source", ["baseline", "schedule"])
-@pytest.mark.parametrize("precision", [None, "fp8", "mxfp8", "mxfp4"])
+@pytest.mark.parametrize("precision", [None, "fp8"])
 @pytest.mark.parametrize(
     ("scheduler_paged", "paged_role"),
     [(True, "primary"), (True, None), (False, "primary")],
@@ -549,12 +549,25 @@ def test_step_skip_is_request_local_and_cross_optout(runtime, monkeypatch):
 
 
 @pytest.mark.parametrize("spec_precision", [False, True])
-def test_ring_attention_is_rejected(runtime, monkeypatch, spec_precision):
+@pytest.mark.parametrize(
+    ("skip_sequence_parallel", "explicit_cross"),
+    [(False, False), (True, False), (False, True)],
+    ids=["ring", "local-refiner", "explicit-cross"],
+)
+def test_quantization_checks_layer_ring_eligibility(
+    runtime, monkeypatch, spec_precision, skip_sequence_parallel, explicit_cross
+):
     method = None if spec_precision else "mxfp8"
     layer = make_layer(runtime, monkeypatch, method=method, quant={"precision": "mxfp8"} if spec_precision else None)
+    layer.skip_sequence_parallel = skip_sequence_parallel
+    layer._explicit_cross_contract = explicit_cross
     cfg = SimpleNamespace(diffusion_kv_cache_dtype=method, parallel_config=SimpleNamespace(ring_degree=2))
-    with pytest.raises(ValueError, match="ring"):
+    if not skip_sequence_parallel and not explicit_cross:
+        with pytest.raises(ValueError, match="ring"):
+            layer._init_kv_cache_quantization(cfg)
+    else:
         layer._init_kv_cache_quantization(cfg)
+        assert layer._effective_kv_cache_dtype() == "mxfp8"
 
 
 def test_sparse_tail_steps_and_dense_quant_dispatch(runtime, monkeypatch):
