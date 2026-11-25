@@ -69,6 +69,10 @@ def _worker(rank, init_method, world_size=2):
                     strategy.post_attention(torch.randn_like(q), ctx)
                     torch.testing.assert_close(result, expected, rtol=0, atol=0)
                     checks += 5
+                # Mixed request shapes keep one output per (op, slot): 3 for Q/K/V and 1 for the output gather.
+                assert len(flashinfer_ulysses._OUTPUTS) <= 4
+                for _, _, comm in flashinfer_ulysses._COMMUNICATORS.values():
+                    assert len(getattr(comm, "_nvlink_outputs", {})) <= 4
             # gate_compress keeps Q/K/V on the copy engines; the output still returns over FlashInfer.
             gate = x + 3
             q, k, _, metadata, ctx = strategy.pre_attention(
