@@ -1,0 +1,27 @@
+name: Trigger docs build on add ready label
+
+# Ensures that we also start builds for read the docs if the ready label was just added.
+# This is useful to avoid having to push an extra commit just to trigger docs.
+on:
+  # Use pull_request_target so fork PRs can use the secret, since the read the docs check
+  # uses the github api, and therefore needs to be authenticated to avoid rate limiting.
+  # There is no additional risk here beyond the normal ready trigger check since we
+  # don't check out and execute code from the PR here and 'ready' is only added by collaborators.
+  pull_request_target:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  trigger:
+    if: github.event.label.name == 'ready'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Read the Docs build for this PR
+        env:
+          RTD_TOKEN: ${{ secrets.RTD_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Token $RTD_TOKEN" \
+            "https://app.readthedocs.org/api/v3/projects/vllm-omni/versions/${PR_NUMBER}/builds/"
