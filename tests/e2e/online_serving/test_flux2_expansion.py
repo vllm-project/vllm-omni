@@ -24,7 +24,7 @@ from tests.helpers.runtime import (
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
-FOUR_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=4)
+FOUR_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4", "rocm": "MI300"}, num_cards=4)
 POSITIVE_PROMPT = "A cat sitting on a windowsill"
 NEGATIVE_PROMPT = "blurry, low quality"
 

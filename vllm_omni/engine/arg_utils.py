@@ -108,6 +108,7 @@ def _register_omni_hf_configs() -> None:
             BailingMoeV3AudioConfig,
         )
         from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
+        from vllm_omni.transformers_utils.configs.realtime_venus import RealtimeVenusOmniConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
@@ -141,6 +142,7 @@ def _register_omni_hf_configs() -> None:
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
         ("chatterbox", ChatterboxConfig),
+        ("realtime_venus_omni", RealtimeVenusOmniConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -455,6 +457,7 @@ class OmniEngineArgs(EngineArgs):
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
     ulysses_a2a_permute: bool | None = None
+    ulysses_overlap_chunks: int | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     use_hsdp: bool | None = None
@@ -825,6 +828,7 @@ class OrchestratorArgs:
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
     ulysses_a2a_permute: bool | None = None
+    ulysses_overlap_chunks: int | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
@@ -967,6 +971,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "ulysses_degree",
         "ulysses_mode",
         "ulysses_a2a_permute",
+        "ulysses_overlap_chunks",
         "ring_degree",
         "allgather_degree",
         "use_hsdp",

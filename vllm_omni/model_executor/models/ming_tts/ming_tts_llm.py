@@ -69,6 +69,7 @@ class MingLLMModel(nn.Module):
     stop_reason_key = KEY_STOP_REASON
     stop_probability_key = "ming_stop_prob"
     stop_reason_codes = STOP_REASON_CODES
+    _dense_single_frame = False
     vectorize_cfm_decode = False
     # Drop the tensor on purpose, otherwise upstream vLLM would reject.
     # The vendor never reaches them either (audio_gate/image_gate never fire)
@@ -117,6 +118,13 @@ class MingLLMModel(nn.Module):
         self.linear_proj_audio.to(dtype=self.fm_dtype)
         self.stop_head.to(dtype=self.fm_dtype)
         self.spk_head.to(dtype=self.fm_dtype)
+        self._request_generators: dict[str, torch.Generator] = {}
+        self._dense_single_frame = self.ming_config.model_variant == "dense" and self.ming_config.patch_size == 1
+        if self.ming_config.model_variant == "dense":
+            self.vectorize_cfm_decode = True
+            for block in (*self.flowloss.cfm.model.blocks, *self.linear_proj_audio.blocks):
+                block.attn.short_attention = True
+                block.mlp.fused_gelu = True
         self._pending_postprocess_updates: dict[str, dict[str, Any]] = {}
         self._last_ming_next_token_ids: list[int] | None = None
         self._last_text_mode = False
@@ -208,14 +216,25 @@ class MingLLMModel(nn.Module):
         decode_step_tokens = has_patch = stop_reason_code_tokens = None
         next_token_ids = [int(self.ming_config.text_eos_token_id)] * len(token_counts)
         pending_updates: dict[str, dict[str, Any]] = {}
-        cursor = 0
-        any_decode = False
+        flow_checks: list[tuple[list[int], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
         vectorized_results = self._vectorized_decode_results(
             hidden_states,
             request_infos,
             token_counts,
             sample_eligible,
+            flow_checks=flow_checks,
         )
+        decoded_rows: list[
+            tuple[
+                int,
+                dict[str, Any],
+                str | None,
+                int,
+                int,
+                tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            ]
+        ] = []
+        cursor = 0
         for req_idx, token_count in enumerate(token_counts):
             end = min(cursor + token_count, total_tokens)
             if end <= cursor:
@@ -244,8 +263,25 @@ class MingLLMModel(nn.Module):
                     sigma=_resolve_runtime_float(req_info, KEY_SIGMA, self.ming_config.sigma),
                     temperature=_resolve_runtime_float(req_info, KEY_TEMPERATURE, self.ming_config.temperature),
                     generator=self._get_request_generator(req_info, hidden_states.device),
+                    check_finite=False,
                 )
-            sampled_token_latent, next_embeds, new_history, stop_probs = decode_result
+                latent, embeds, _, probs = decode_result
+                flow_checks.append(([req_idx], decode_hidden.to(self.fm_dtype), latent, embeds, probs))
+            decoded_rows.append(
+                (
+                    req_idx,
+                    req_info,
+                    req_id if isinstance(req_id, str) else None,
+                    decode_step,
+                    output_index,
+                    decode_result,
+                )
+            )
+            cursor = end
+
+        host_stops = _flow_host_stops(flow_checks)
+        for req_idx, req_info, req_id, decode_step, output_index, decode_result in decoded_rows:
+            sampled_token_latent, next_embeds, new_history, _ = decode_result
             req_max_decode_steps = _resolve_runtime_int(
                 req_info, KEY_MAX_DECODE_STEPS, self.ming_config.max_decode_steps
             )
@@ -261,14 +297,20 @@ class MingLLMModel(nn.Module):
                 decode_step_tokens = torch.zeros((total_tokens,), dtype=torch.int32, device=hidden_states.device)
                 has_patch = torch.zeros((total_tokens,), dtype=torch.bool, device=hidden_states.device)
                 stop_reason_code_tokens = torch.zeros((total_tokens,), dtype=torch.int32, device=hidden_states.device)
+            assert next_embed_tokens is not None
+            assert new_history_tokens is not None
+            assert decode_step_tokens is not None
+            assert has_patch is not None
+            assert stop_reason_code_tokens is not None
             latent_patch_tokens[output_index : output_index + 1] = sampled_token_latent
             next_embed_tokens[output_index : output_index + 1] = next_embeds
             new_history_tokens[output_index : output_index + 1] = new_history
             decode_step_tokens[output_index : output_index + 1] = decode_step
             has_patch[output_index : output_index + 1] = True
+            stop_value = host_stops[req_idx]
             stop_reason, _, _, _, next_token_id = self._resolve_stop_decision(
                 step=decode_step,
-                stop_prob=float(stop_probs.reshape(-1)[0].item()),
+                stop_prob=stop_value,
                 stop_threshold=float(self.ming_config.stop_head_threshold),
                 min_stop_step=int(self.ming_config.stop_head_min_steps),
                 min_decode_steps=req_min_decode_steps,
@@ -279,19 +321,17 @@ class MingLLMModel(nn.Module):
             stop_reason_code_tokens[output_index : output_index + 1] = self.stop_reason_codes[stop_reason]
             self._on_stop_decision(req_info, stop_reason)
             next_token_ids[req_idx] = int(next_token_id)
-            if isinstance(req_id, str):
+            if req_id is not None:
                 pending_updates[req_id] = {
                     KEY_LATENT_HISTORY: new_history,
                     KEY_NEXT_EMBEDS: next_embeds,
                     self.latent_patch_key: sampled_token_latent,
-                    self.stop_probability_key: stop_probs,
+                    self.stop_probability_key: stop_value,
                     self.stop_reason_key: stop_reason,
                 }
-            any_decode = True
-            cursor = end
 
         self._pending_postprocess_updates = pending_updates
-        if not any_decode:
+        if not decoded_rows:
             self._last_ming_next_token_ids = None
             return OmniOutput(
                 text_hidden_states=hidden_states, multimodal_outputs=None, intermediate_tensors=intermediate_tensors
@@ -323,14 +363,44 @@ class MingLLMModel(nn.Module):
     def _resolve_stop_decision(self, **kwargs: Any) -> tuple[str, bool, bool, int, int]:
         return _resolve_ming_stop_decision(**kwargs)
 
-    def _get_request_generator(self, req_info: dict[str, Any], device: torch.device) -> torch.Generator | None:
-        """Return a request-scoped RNG; No-op for this base MingLLMModel - use the default RNG."""
-        del req_info, device
+    @staticmethod
+    def _generator_key(req_info: dict[str, Any]) -> str | None:
+        # Prefer the runner's req_id so on_requests_finished always evicts aborted requests.
+        for key in ("req_id", KEY_REQUEST_ID, "request_id"):
+            value = req_info.get(key)
+            if isinstance(value, str) and value:
+                return value
         return None
 
+    def _get_request_generator(self, req_info: dict[str, Any], device: torch.device) -> torch.Generator | None:
+        if not self._dense_single_frame:
+            return None
+        request_id = self._generator_key(req_info)
+        if request_id is None:
+            return None
+        generator = self._request_generators.get(request_id)
+        if generator is not None:
+            return generator
+        raw_seed = req_info.get("tts_local_seed")
+        if raw_seed is None:
+            # An unseeded request cannot be replayed, so a randomly seeded
+            # generator would only force per-request RNG calls each step.
+            return None
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(raw_seed))
+        self._request_generators[request_id] = generator
+        return generator
+
     def _on_stop_decision(self, req_info: dict[str, Any], stop_reason: str) -> None:
-        """Handle stop-related cleanup; No-op for this base MingLLMModel."""
-        del req_info, stop_reason
+        if stop_reason != "continue":
+            request_id = self._generator_key(req_info)
+            if request_id is not None:
+                self._request_generators.pop(request_id, None)
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        for request_id in finished_req_ids:
+            self._request_generators.pop(request_id, None)
+            self._pending_postprocess_updates.pop(request_id, None)
 
     def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata) -> torch.Tensor | None:
         del sampling_metadata
@@ -446,7 +516,7 @@ class MingLLMModel(nn.Module):
                             self.ming_config.latent_dim,
                         ),
                         device=device,
-                        dtype=torch.float32,
+                        dtype=self.fm_dtype if self._dense_single_frame else torch.float32,
                     )
                     solver_noise = torch.zeros(
                         (
@@ -456,7 +526,7 @@ class MingLLMModel(nn.Module):
                             self.ming_config.latent_dim,
                         ),
                         device=device,
-                        dtype=torch.float32,
+                        dtype=self.fm_dtype if self._dense_single_frame else torch.float32,
                     )
                     self._decode_one_step(
                         hidden_states=hidden_states,
@@ -490,6 +560,8 @@ class MingLLMModel(nn.Module):
         request_infos: list[dict[str, Any]],
         token_counts: list[int],
         sample_eligible: list[bool],
+        *,
+        flow_checks: list[tuple[list[int], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None = None,
     ) -> dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Batch compatible flow-head calls while preserving request RNGs."""
         if not self.vectorize_cfm_decode or len(token_counts) < 2:
@@ -543,22 +615,30 @@ class MingLLMModel(nn.Module):
             )
             groups.setdefault(key, []).append(record_idx)
 
-        results = {}
+        results: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         for record_indices in groups.values():
             if len(record_indices) < 2:
                 continue
             selected = [records[index] for index in record_indices]
             generators = [self._get_request_generator(record[1], hidden_states.device) for record in selected]
             initial_noise, solver_noise = self._draw_request_cfm_noises(generators, hidden_states.device)
+            group_hidden = torch.cat([record[2] for record in selected], dim=0)
+            extra = {"check_finite": False} if flow_checks is not None else {}
             batch_result = self._decode_one_step(
-                hidden_states=torch.cat([record[2] for record in selected], dim=0),
+                hidden_states=group_hidden,
                 latent_history=torch.cat([record[3] for record in selected], dim=0),
                 cfg_scale=selected[0][4],
                 sigma=selected[0][5],
                 temperature=selected[0][6],
                 initial_noise=initial_noise,
                 solver_noise=solver_noise,
+                **extra,
             )
+            if flow_checks is not None:
+                latent, embeds, _, probs = batch_result
+                flow_checks.append(
+                    ([record[0] for record in selected], group_hidden.to(self.fm_dtype), latent, embeds, probs)
+                )
             for batch_idx, record in enumerate(selected):
                 results[record[0]] = tuple(tensor[batch_idx : batch_idx + 1] for tensor in batch_result)
         return results
@@ -569,6 +649,15 @@ class MingLLMModel(nn.Module):
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         shape = (1, self.ming_config.patch_size, self.ming_config.latent_dim)
+        if getattr(self, "_dense_single_frame", False):
+            # Reproduce the release's two BF16 draws per frame, independently per request.
+            initial, solver = [], []
+            for generator in generators:
+                initial.append(torch.randn(shape, device=device, dtype=self.fm_dtype, generator=generator))
+                solver.append(
+                    torch.randn((DEFAULT_CFM_STEPS, *shape), device=device, dtype=self.fm_dtype, generator=generator)
+                )
+            return torch.cat(initial), torch.cat(solver, dim=1)
         if all(generator is None for generator in generators):
             # Unseeded rows share the global RNG, so one draw serves them all.
             count = len(generators)
@@ -649,7 +738,9 @@ class MingLLMModel(nn.Module):
                     logger.warning("Ming CFM torch.compile failed (%s); using uncompiled DiT.", exc)
 
             graph_exec = CFMGraphExecutor(
-                CFMSampler(self.flowloss.cfm.model, steps=DEFAULT_CFM_STEPS),
+                CFMSampler(
+                    self.flowloss.cfm.model, steps=DEFAULT_CFM_STEPS, include_final_noise=self._dense_single_frame
+                ),
                 self.linear_proj_audio,
                 self.stop_head,
                 patch_size=self.ming_config.patch_size,
@@ -704,6 +795,14 @@ class MingLLMModel(nn.Module):
         # cfg < 1e-5 disables CFG; the eager flow head handles this with a
         # dedicated unconditional branch (c=zeros) that the captured graph does
         # not replicate, so fall back to eager there to match FlowLoss.sample.
+        if self._dense_single_frame and (initial_noise is None or solver_noise is None):
+            drawn_initial, drawn_solver = self._draw_request_cfm_noises(
+                [generator] * z_diff_cond.shape[0], z_diff_cond.device
+            )
+            if initial_noise is None:
+                initial_noise = drawn_initial
+            if solver_noise is None:
+                solver_noise = drawn_solver
         graph_exec = self._maybe_build_cfm_graph(z_diff_cond) if cfg_scale >= 1e-5 else None
         if graph_exec is not None:
             try:
@@ -742,6 +841,7 @@ class MingLLMModel(nn.Module):
                 generator=generator,
                 initial_noise=initial_noise,
                 solver_noise=solver_noise,
+                include_final_noise=self._dense_single_frame,
             )
             # Aggregator expects [Batch, Time, Dimension] = [B, 4, 64] and returns [B, 1, H].
             next_embeds = self.linear_proj_audio(sampled_token_latent)
@@ -768,7 +868,33 @@ class MingLLMModel(nn.Module):
         _warn_missing_prefix("linear_proj_audio", params_dict, loaded_params, prefix="linear_proj_audio.")
         _warn_missing_prefix("stop_head", params_dict, loaded_params, prefix="stop_head.")
         _warn_missing_prefix("spk_head", params_dict, loaded_params, prefix="spk_head.")
+        if self.ming_config.model_variant == "dense" and current_omni_platform.is_cuda():
+            self._warmup_cfm_graphs()
         return loaded_params
+
+
+def _flow_host_stops(
+    checks: list[tuple[list[int], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> dict[int, float]:
+    """Read per-row stop probabilities and verify finiteness in one host sync."""
+    if not checks:
+        return {}
+    stops = torch.cat([probs.reshape(-1).float() for _, _, _, _, probs in checks])
+    finite = torch.stack(
+        [
+            torch.isfinite(hidden).all()
+            & torch.isfinite(latent).all()
+            & torch.isfinite(embeds).all()
+            & torch.isfinite(probs).all()
+            for _, hidden, latent, embeds, probs in checks
+        ]
+    ).float()
+    host = torch.cat([stops, finite]).tolist()
+    count = stops.numel()
+    if any(flag != 1.0 for flag in host[count:]):
+        raise RuntimeError("Non-finite Ming flow-head output in decode step.")
+    req_ids = [req_idx for group_ids, *_ in checks for req_idx in group_ids]
+    return dict(zip(req_ids, host[:count], strict=True))
 
 
 def _extract_hidden_states(backbone_out: object) -> torch.Tensor:
