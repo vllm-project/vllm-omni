@@ -15,6 +15,7 @@ import regex as re
 import soundfile as sf
 from vllm.logger import init_logger
 
+from vllm_omni.engine.duplex.response_judge import after_judge, judge_input
 from vllm_omni.engine.duplex.sentence_tts import consume_growing_text
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
@@ -853,3 +854,16 @@ def aura2tts(
             )
         )
     return next_inputs
+
+
+def _judge_transcript(source_output: Any, src_prompt: Mapping[str, Any]) -> str:
+    """ASR text the response judge reads; a vision-follow turn has none and is let through."""
+    additional_info = src_prompt.get("additional_information") or {}
+    if additional_info.get("is_speech") is False:
+        return ""
+    return _normalize_asr_transcript(_extract_text(source_output))
+
+
+# Opt-in ``aura_omni_judged`` pipeline: ASR -> response judge -> AURA.
+asr2judge = judge_input(_judge_transcript)
+judge2aura = after_judge(asr2aura)

@@ -70,6 +70,7 @@ def _make_worker(*, requested_memory: int, kv_cache_memory_bytes: int = 0, model
     worker.cache_config = SimpleNamespace(
         kv_cache_memory_bytes=kv_cache_memory_bytes,
         gpu_memory_utilization=0.8,
+        resolved_gpu_memory_utilization=0.8,
     )
     worker.model_runner = SimpleNamespace(
         profile_run=lambda: None,
@@ -283,6 +284,7 @@ def _reserve_message(monkeypatch, caplog, *, utilization, free, estimate=4 * GIB
     total = 40 * GIB
     worker = _make_worker(requested_memory=requested or math.ceil(total * utilization), model_memory_usage=10 * GIB)
     worker.cache_config.gpu_memory_utilization = utilization
+    worker.cache_config.resolved_gpu_memory_utilization = utilization
     worker.init_snapshot.free_memory = free
     worker.vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
     worker.model_runner.profile_cudagraph_memory = lambda: estimate

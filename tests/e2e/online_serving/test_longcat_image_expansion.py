@@ -26,8 +26,8 @@ TEXT_TO_IMAGE_PROMPT = (
     "A cinematic illustration of a cat typing on a silver laptop, soft window light, highly detailed."
 )
 NEGATIVE_PROMPT = "blurry, low quality, distorted, oversaturated"
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 
 MODEL = "meituan-longcat/LongCat-Image"
 

@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from vllm_omni.model_executor.models.minicpmo_4_5.code2wav_watchdog import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.watchdog import (
     CODE2WAV_WATCHDOG_TIMEOUT_ENV,
     Code2WavWatchdog,
     Code2WavWatchdogReport,
@@ -67,33 +67,14 @@ def test_phase_update_resets_deadline() -> None:
 
     watchdog = Code2WavWatchdog(0.3, reporter=reporter)
     try:
-        with watchdog.watch("decode/encoder"):
+        with watchdog.watch("decode/encoder", {"codec_frames": 12}):
             assert not reported.wait(0.05)
             watchdog.phase("decode/hift", {"batch_size": 2})
             assert not reported.wait(0.1)
             assert reported.wait(0.4)
         assert len(reports) == 1
         assert reports[0].phase == "decode/hift"
-        assert reports[0].details["batch_size"] == 2
-    finally:
-        watchdog.close()
-
-
-def test_phase_update_replaces_previous_phase_details() -> None:
-    reported = threading.Event()
-    reports: list[Code2WavWatchdogReport] = []
-
-    def reporter(report: Code2WavWatchdogReport) -> None:
-        reports.append(report)
-        reported.set()
-
-    watchdog = Code2WavWatchdog(0.05, reporter=reporter)
-    try:
-        with watchdog.watch("decode/encoder", {"codec_frames": 12}):
-            watchdog.phase("decode/cfm", {"batch_size": 2})
-            assert reported.wait(1.0)
-        assert len(reports) == 1
-        assert reports[0].phase == "decode/cfm"
+        # A phase change replaces metadata as well as restarting the deadline.
         assert reports[0].details == {"batch_size": 2}
     finally:
         watchdog.close()

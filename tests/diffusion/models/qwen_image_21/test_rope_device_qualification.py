@@ -16,6 +16,31 @@ from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer a
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
+@hardware_test(res={"npu": "A3"}, num_cards=1)
+def test_npu_mixed_prompt_rotary_matches_single_requests():
+    rope = transformer.QwenImage21Rope(theta=10000, axes_dim=[16, 56, 56])
+    prepare = transformer.QwenImage21SequencePrepare(torch.nn.Identity(), rope)
+    layout = [(1, 2, 2)]
+    image_slots = torch.tensor([[False] * 6 + [True]] * 2, device="npu")
+    text_mask = torch.tensor([[0, 0, 1, 1, 1, 1], [1] * 6], device="npu")
+    device = text_mask.device
+    mask = transformer._qwen_image21_rope_text_mask(text_mask, device, sp_active=False)
+    _, _, _, target_freqs = prepare(
+        torch.zeros(2, 4, 64, device=device), torch.zeros(2, 6, 64, device=device), layout, image_slots, False, mask
+    )
+
+    x = torch.randn(2, 4, 3, 128, dtype=torch.bfloat16, device=device)
+    actual = transformer._apply_qwen_image21_rotary_emb_npu(x, target_freqs)
+    for i, length in enumerate((4, 6)):
+        image_mask = torch.tensor([False] * length + [True] * 4, device=device)
+        single_freqs = rope(layout, image_mask, device)[-4:]
+        expected = transformer._apply_qwen_image21_rotary_emb_npu(x[i : i + 1], single_freqs)
+        torch.testing.assert_close(actual[i : i + 1], expected, rtol=0, atol=0)
+
+    with pytest.raises(ValueError, match="without sequence parallelism"):
+        transformer._qwen_image21_rope_text_mask(text_mask, device, sp_active=True)
+
+
 @pytest.mark.cpu
 @pytest.mark.parametrize(
     "version,hip,device,expected",

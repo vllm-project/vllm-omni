@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""MiniMax-H3 DP2+DLO waves, split across Merge and CUDA Nightly.
+"""MiniMax-H3 DP2+DLO waves, split across Merge and Nightly.
 
 ``--task-type combined`` loads both DiTs. Each full-wave request still
 selects its task through ``extra_params.task`` (``run_fl2va`` /
@@ -10,11 +10,11 @@ selects its task through ``extra_params.task`` (``run_fl2va`` /
 stays equal, and finalizes it when a different value appears. A DLO
 teardown can leave a stale ``resource_tracker`` ``/psm_*`` entry.
 
-The Ref2VA partition case boots ``--task-type ref2va`` so a live CUDA GPU
+The Ref2VA partition case boots ``--task-type ref2va`` so a live accelerator
 still takes the per-partition download, checks ``expected_partition ==
 "ref2va"``, and denoises on ``self.transformer`` (not ``transformers_ref``).
 It is marked ``full_model`` only. The full waves are marked
-``advanced_model`` only. Merge ``-m advanced_model`` and the CUDA Nightly
+``advanced_model`` only. Merge ``-m advanced_model`` and the Nightly
 Function Test ``-m full_model`` therefore never collect them in one
 process. Running this file with no level marker does.
 """
@@ -49,7 +49,7 @@ pytestmark = pytest.mark.diffusion
 TWO_CARD_MARKS = hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)
 # H100 and B200 share the item so the X2V Function Test expression
 # ``H100 and B200 and cards_2`` collects it. The server stays DP2+DLO.
-PARTITION_MARKS = hardware_marks(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=2)
+PARTITION_MARKS = hardware_marks(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=2)
 # One object so the two full-wave tests cannot drift into two boots.
 _COMBINED_SERVER = pytest.param(
     dlo_params("combined"),
@@ -68,7 +68,13 @@ def _partition_params() -> OmniServerParams:
     """DP2+DLO Ref2VA partition. Eager skips inductor compile in this process."""
     return OmniServerParams(
         model=MODEL,
-        server_args=[*DLO_SERVER_ARGS, "--task-type", "ref2va", "--enforce-eager"],
+        server_args=[
+            *DLO_SERVER_ARGS,
+            "--task-type",
+            "ref2va",
+            "--stage-overrides",
+            '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}',
+        ],
         stage_init_timeout=1800,
         init_timeout=1800,
     )
