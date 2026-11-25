@@ -92,16 +92,6 @@ the [Diffusion LoRA guide](../../user_guide/diffusion/lora.md) for formats,
 supported pipelines and checkpoint name mapping
 ([#8001](https://github.com/vllm-project/vllm-omni/issues/8001)).
 
-Runtime PEFT adapters may be composed into one rank-sum adapter. Before
-composition, the manager calls an optional pipeline
-`_validate_diffusion_lora_composition(lora_model=...)` hook for each source,
-immediately after loading or cache lookup. A pipeline may reject a source
-before another transient load prunes its metadata or any weights are composed.
-MiniMax-H3 uses this hook to reject FlashGen native stacks; those adapters also
-reject `merged` application during metadata loading because it cannot enforce
-their sampling contract. See
-[adapter-declared schedules](../../user_guide/diffusion/lora.md#minimax-h3-adapter-declared-schedules).
-
 ### Fixed startup fusion
 
 `startup-merge` is a separate, opt-in MiniMax-H3 loading path. It resolves one
@@ -140,6 +130,18 @@ The mode requires a single H3 checkpoint partition and excludes sleep, HSDP,
 weight transfer, and reusable host artifacts. Additional request adapters are
 rejected. The
 `runtime` default keeps its existing adapter-selection semantics.
+
+### Runtime adapter composition
+
+Runtime PEFT adapters may be composed into one rank-sum adapter. Before
+composition, the manager calls an optional pipeline
+`_validate_diffusion_lora_composition(lora_model=...)` hook for each source,
+immediately after loading or cache lookup. A pipeline may reject a source
+before another transient load prunes its metadata or any weights are composed.
+MiniMax-H3 uses this hook to reject FlashGen native stacks; those adapters also
+reject `merged` application during metadata loading because it cannot enforce
+their sampling contract. See
+[adapter-declared schedules](../../user_guide/diffusion/lora.md#minimax-h3-adapter-declared-schedules).
 
 ## Not supported
 
