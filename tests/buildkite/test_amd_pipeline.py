@@ -4646,7 +4646,10 @@ def test_qwen3_tts_perf_is_one_nonblocking_nightly_job() -> None:
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
     assert step["source_file_dependencies"] == "tts_qwen3_tts_perf"
+    assert step["env"]["MIOPEN_FIND_MODE"] == "FAST"
     assert step["env"]["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] == "1"
+    assert "OMP_NUM_THREADS" not in step["env"]
+    assert "OPENBLAS_NUM_THREADS" not in step["env"]
     assert "VLLM_ROCM_USE_AITER" not in step["env"]
     assert step["artifact_paths"] == ["artifacts/rocm-qwen3-tts-perf/**/*"]
     commands = "\n".join(step["commands"])
