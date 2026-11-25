@@ -3,7 +3,6 @@
 
 """CPU checks for scheduled function rows; no model or CUDA execution."""
 
-import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,8 +14,6 @@ from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_think
     NemotronVoiceChatThinkerForConditionalGeneration as Thinker,
 )
 from vllm_omni.utils.mm_outputs import build_mm_cpu
-from vllm_omni.worker.output.payload_build import build_omni_mm_payload
-from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner, _client_multimodal_output_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -130,30 +127,21 @@ def test_single_row_legacy_projection_is_unambiguous():
     assert int(envelope.multimodal_outputs["nvc_function_token"]) == 0
 
 
-def request_payload(envelope, request_ids, spans, index, *, combined=False):
-    start, end = spans[index]
-    mm_cpu = build_mm_cpu(envelope.multimodal_outputs)
-    _, sparse_index, sparse_audio = resolve_sparse_mm_routing(
-        engine_output_type="audio",
-        req_ids_output_copy=list(request_ids),
-        downstream_req_ids=list(request_ids),
-        multimodal_outputs=envelope.multimodal_outputs,
+def request_payload(envelope, request_ids, spans, index):
+    """Request ``index``'s client payload, split the way the MRv2 async-chunk runner does."""
+    total = spans[-1][1]
+    _, client = OmniARModelRunner._build_async_chunk_outputs_from_mm(
+        build_mm_cpu(envelope.multimodal_outputs),
+        np.array([start for start, _ in spans] + [total]),
+        np.array([end - start for start, end in spans]),
+        len(spans),
+        total,
+        len(envelope.text_hidden_states),
+        list(request_ids),
+        "latent",  # Stage 0's engine_output_type.
+        client_output_keys=_client_multimodal_output_keys(Thinker),
     )
-    assert sparse_audio is False  # This Thinker never declares sparse audio.
-    return build_omni_mm_payload(
-        combined_multimodal_outputs={key: {rid: value for rid in request_ids} for key, value in mm_cpu.items()}
-        if combined
-        else None,
-        mm_cpu=mm_cpu,
-        rid=request_ids[index],
-        idx=index,
-        start=start,
-        end=end,
-        audio_sparse_output=sparse_audio,
-        sparse_mm_index=sparse_index,
-        hidden_seq_len=len(envelope.text_hidden_states),
-        scheduled_seq_len=spans[-1][1],
-    )
+    return (client[index] if client else None) or {}
 
 
 def client_events(projector, request_id, payload):
@@ -165,11 +153,14 @@ def client_events(projector, request_id, payload):
 
 
 @pytest.mark.parametrize("first_rows", [1, 3])
-@pytest.mark.parametrize("request_ids", [("one", "other"), ("other", "one")])
-@pytest.mark.parametrize("combined", [False, True])
-def test_batched_function_boundaries_reach_each_data_plane(first_rows, request_ids, combined):
+@pytest.mark.parametrize("request_ids", [("one",), ("one", "other"), ("other", "one")])
+def test_batched_function_boundaries_reach_each_data_plane(first_rows, request_ids):
+    """Each session's call and tool-result acknowledgement reach its own client through the MRv2 split."""
     thinker = thinker_shell()
-    spans = [(0, first_rows), (first_rows, first_rows + 1)]
+    generations = {"one": 3, "other": 5}
+    for request_id in request_ids:
+        thinker._sessions[request_id]["function_response_generation"] = generations[request_id]
+    spans = [(0, first_rows), (first_rows, first_rows + 1)][: len(request_ids)]
     projectors = {request_id: NemotronVoiceChatDataPlaneSession(lambda *_: None) for request_id in request_ids}
     calls: dict[str, list[dict[str, object]]] = {request_id: [] for request_id in request_ids}
     for request_id, projector in projectors.items():
@@ -190,30 +181,32 @@ def test_batched_function_boundaries_reach_each_data_plane(first_rows, request_i
     vectors = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]])
     # Staggered calls expose cross-request starts, bodies and ends.
     for frame, decisions in enumerate(((0, 2), (2, 0), (1, 2), (2, 1))):
-        hidden = torch.zeros(first_rows + 2, 2)
-        hidden[first_rows - 1], hidden[first_rows] = vectors[list(decisions)]
+        hidden = torch.zeros(spans[-1][1] + 1, 2)
+        for (_, end), decision in zip(spans, decisions):
+            hidden[end - 1] = vectors[decision]
         hidden[-1] = vectors[1]  # Padding must never close either call.
         envelope = thinker.make_omni_output(
             hidden, model_intermediate_buffer=[{"request_id": rid} for rid in request_ids], request_token_spans=spans
         )
         for index, request_id in enumerate(request_ids):
-            payload = request_payload(envelope, request_ids, spans, index, combined=combined)
+            payload = request_payload(envelope, request_ids, spans, index)
             update = thinker.postprocess(
                 hidden[slice(*spans[index])], request_id=request_id, multimodal_outputs=envelope.multimodal_outputs
             )
             assert int(update["nvc_prev_function_token"]) == decisions[index]
-            assert "nvc_function_token" in thinker.omni_client_multimodal_output_keys
             assert int(payload["nvc_function_token"]) == decisions[index]
+            assert int(payload["nvc_function_response_consumed_generation"]) == generations[request_id]
             calls[request_id].extend(
                 event
                 for event in client_events(projectors[request_id], request_id, payload)
                 if event.get("function_call") is True
             )
-        assert [len(calls[rid]) for rid in request_ids] == ([0, 0] if frame < 2 else [1, frame - 2])
+        expected = [0, 0] if frame < 2 else [1, frame - 2]
+        assert [len(calls[rid]) for rid in request_ids] == expected[: len(request_ids)]
     for request_id in request_ids:
         assert calls[request_id][0]["name"] == request_id
         assert calls[request_id][0]["arguments"] == '{"value":37}'
-    assert calls[request_ids[0]][0]["call_id"] != calls[request_ids[1]][0]["call_id"]
+    assert len({calls[rid][0]["call_id"] for rid in request_ids}) == len(request_ids)
 
 
 @pytest.mark.parametrize("forced", [None, 99])
@@ -297,56 +290,3 @@ def test_mixed_prefill_decode_keeps_empty_slots_and_forced_ownership(request_ids
         else:
             assert int(payload["nvc_function_token"]) == int(update["nvc_prev_function_token"]) == 98
             assert thinker._sessions["other"]["forced_function_tokens"] == []
-
-
-def mrv2_client_payloads(thinker, envelope, request_ids, spans):
-    """Split one thinker step the way the MRv2 async-chunk runner does."""
-    total = spans[-1][1]
-    _, client = OmniARModelRunner._build_async_chunk_outputs_from_mm(
-        build_mm_cpu(envelope.multimodal_outputs),
-        np.array([start for start, _ in spans] + [total]),
-        np.array([end - start for start, end in spans]),
-        len(spans),
-        total,
-        len(envelope.text_hidden_states),
-        list(request_ids),
-        "latent",  # Stage 0's engine_output_type.
-        client_output_keys=_client_multimodal_output_keys(thinker),
-    )
-    return client
-
-
-@pytest.mark.parametrize("request_ids", [("one",), ("one", "other")])
-def test_mrv2_async_chunk_split_delivers_function_call_and_ack(request_ids):
-    """Regression for #11146: MRv2 kept the call on the inter-stage channel only."""
-    thinker = thinker_shell()
-    thinker._sessions["one"]["function_response_generation"] = 3
-    spans = [(index, index + 1) for index in range(len(request_ids))]
-    projector = NemotronVoiceChatDataPlaneSession(lambda *_: None)
-    projector.configure_runtime(
-        {
-            "nvc_text_bos_id": 10,
-            "nvc_text_eos_id": 11,
-            "nvc_text_pad_id": 12,
-            "nvc_function_sotc_id": 0,
-            "nvc_function_eotc_id": 1,
-            "nvc_tokenizer_ref": "test",
-        },
-        tokenizer=SimpleNamespace(decode=lambda *_args, **_kwargs: ""),
-    )
-    call = '[{"name": "generate_random_number", "arguments": {"min": 1, "max": 50}}]'
-    projector._decode = lambda ids: call if ids == [2] else ""
-    vectors = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]])
-    calls: list[dict[str, object]] = []
-    for decision in (0, 2, 1):  # <TOOLCALL>, body, </TOOLCALL>
-        hidden = vectors[[decision] + [1] * len(request_ids)]  # Other rows and padding close nothing.
-        envelope = thinker.make_omni_output(
-            hidden, model_intermediate_buffer=[{"request_id": rid} for rid in request_ids], request_token_spans=spans
-        )
-        payload = mrv2_client_payloads(thinker, envelope, request_ids, spans)[0]
-        assert int(payload["nvc_function_token"]) == decision
-        assert int(payload["nvc_function_response_consumed_generation"]) == 3
-        calls.extend(event for event in client_events(projector, "one", payload) if event.get("function_call") is True)
-    assert len(calls) == 1
-    assert calls[0]["name"] == "generate_random_number"
-    assert json.loads(str(calls[0]["arguments"])) == {"min": 1, "max": 50}
