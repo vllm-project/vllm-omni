@@ -1,5 +1,5 @@
 # Optional, diff-aware Intel XPU Ready suites. Uploaded only when
-# INTEL_XPU_READY=1; the existing pipeline-intel.yml remains unchanged.
+# INTEL_XPU_READY=1.
 
 env:
   VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -10,7 +10,7 @@ steps:
   - group: "Intel XPU Ready tests"
     depends_on: upload-intel-xpu-ready-pipeline
     steps:
-      - label: "Intel XPU: Core model"
+      - label: "Intel XPU: Core model · 1 card"
         source_file_dependencies:
           - intel_xpu_diffusion_function
           - diffusion_distributed_attention
@@ -19,19 +19,20 @@ steps:
           - intel_xpu_platform_function
         timeout_in_minutes: 60
         commands:
-          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh core_model
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh core_model 1
         agents:
           queue: intel-gpu-k8s
         plugins: &intel-xpu-k8s-plugins
           - kubernetes:
               checkout:
                 skip: true
-              podSpec:
+              podSpec: &intel-xpu-pod
                 resourceClaims:
                   - name: gpu
                     resourceClaimTemplateName: b70-1
                 containers:
-                  - image: "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:${BUILDKITE_COMMIT}-intel-xpu-ready"
+                  - &intel-xpu-container
+                    image: "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:${BUILDKITE_COMMIT}-intel-xpu-ready"
                     imagePullPolicy: Always
                     env:
                       - name: VLLM_USAGE_SOURCE
@@ -77,16 +78,16 @@ steps:
                       path: /data/huggingface
                       type: DirectoryOrCreate
 
-      - label: "Intel XPU: MXFP8 quantization"
+      - label: "Intel XPU: MXFP8 quantization · 1 card"
         source_file_dependencies: diffusion_quantization
         timeout_in_minutes: 30
         commands:
-          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh quantization
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh quantization 1
         agents:
           queue: intel-gpu-k8s
         plugins: *intel-xpu-k8s-plugins
 
-      - label: "Intel XPU: Advanced model"
+      - label: "Intel XPU: Advanced model · 1 card"
         source_file_dependencies:
           - intel_xpu_diffusion_function
           - diffusion_distributed_attention
@@ -95,16 +96,58 @@ steps:
           - intel_xpu_platform_function
         timeout_in_minutes: 60
         commands:
-          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh advanced_model
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh advanced_model 1
         agents:
           queue: intel-gpu-k8s
         plugins: *intel-xpu-k8s-plugins
 
-      - label: "Intel XPU: Omni"
+      - label: "Intel XPU: Omni · 1 card"
         source_file_dependencies: intel_xpu_omni_tts_function
         timeout_in_minutes: 60
         commands:
-          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh omni
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh omni 1
         agents:
           queue: intel-gpu-k8s
         plugins: *intel-xpu-k8s-plugins
+
+      - label: "Intel XPU: Core model · 2 cards"
+        source_file_dependencies:
+          - intel_xpu_diffusion_function
+          - diffusion_distributed_attention
+          - intel_xpu_omni_tts_function
+          - diffusion_quantization
+          - intel_xpu_platform_function
+        timeout_in_minutes: 35
+        commands:
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh core_model 2
+        agents:
+          queue: intel-gpu-k8s
+        plugins:
+          - kubernetes:
+              checkout:
+                skip: true
+              podSpec:
+                <<: *intel-xpu-pod
+                resourceClaims:
+                  - name: gpu
+                    resourceClaimTemplateName: b70-2
+                containers:
+                  - <<: *intel-xpu-container
+                    resources:
+                      claims:
+                        - name: gpu
+                      requests:
+                        cpu: "16"
+                        memory: 64Gi
+                      limits:
+                        cpu: "64"
+                        memory: 128Gi
+                volumes:
+                  - name: dshm
+                    emptyDir:
+                      medium: Memory
+                      sizeLimit: 16Gi
+                  - name: hf-cache
+                    hostPath:
+                      path: /data/huggingface
+                      type: DirectoryOrCreate

@@ -118,7 +118,8 @@ HF_MOUNT="/root/.cache/huggingface"
 # Each stage also has its own cap, per job:
 #   pr · 1 card   6+13+28+2 = 49m
 #   pr · 2 cards  10m
-#   broad (both card groups in one step)  49+20+10+15 = 94m
+#   broad · 1 card  49+20 = 69m
+#   broad · 2 cards 10+15 = 25m
 # so one runaway stage cannot eat the whole budget, and the stages that run
 # last still get their full cap. Measured end to end in the pr scope:
 # 3m40s dispatch + 10m05s omni + 23m01s core 1-card + 23s mxfp8 on the 1-card
