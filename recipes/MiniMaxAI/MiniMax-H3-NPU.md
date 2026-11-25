@@ -672,10 +672,15 @@ per-clip tile assignment, gather/blend order, temporal padding and one posterior
 sample. The flag follows the legacy preparation flag syntax. It defaults to
 `0`, ignores case and surrounding whitespace, and is disabled by an empty
 value, `0`, `false`, or `off`. Other values, including `1`, `true`, and `on`,
-enable it. Unsupported checkpoint configurations use ordinary preparation.
-`VLLM_OMNI_VAE_ENCODE_LEGACY_PREP=1` takes precedence. On one Ascend 950PR
-card (256x448, 33 frames, real weights) the streamed path produced
-bit-identical encoder rows and lowered peak allocated device memory by about
-40 MiB, with latency within 1% of the ordinary path. On 8 ranks (448x704, 33/65/97/129 frames) encoder rows stayed
-bit-identical across all ranks, peak HBM dropped by 152-497 MiB as the clip
-grew, and latency was neutral to 0.8% lower.
+enable it. The accelerator path has been validated on Ascend NPUs. CUDA
+deployments use ordinary preparation. Unsupported checkpoint configurations
+also use ordinary preparation, and `VLLM_OMNI_VAE_ENCODE_LEGACY_PREP=1` takes
+precedence. If tile streaming is enabled and skipped, the worker logs the
+reason once.
+
+On one Ascend 950PR card (256x448, 33 frames, real weights) the streamed path
+produced bit-identical encoder rows and lowered peak allocated device memory
+by about 40 MiB, with latency within 1% of the ordinary path. On 8 ranks
+(448x704, 33/65/97/129 frames) encoder rows stayed bit-identical across all
+ranks, peak HBM dropped by 152-497 MiB as the clip grew, and latency was
+neutral to 0.8% lower.

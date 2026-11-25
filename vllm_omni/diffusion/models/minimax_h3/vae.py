@@ -1130,8 +1130,12 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         Collectives run once per clip, exactly as in native tiled_encode.
         """
         model = self.model
+        if device.type not in ("cpu", "npu"):
+            logger.info_once("MiniMax H3 video tile streaming skipped on %s.", device.type)
+            return None
         metadata = self._stream_video_prep_metadata(frames)
-        if metadata is None or device.type not in ("cpu", "npu"):
+        if metadata is None:
+            logger.info_once("MiniMax H3 video tile streaming skipped: unsupported frame or preprocessing layout.")
             return None
         if (
             model.training
@@ -1145,32 +1149,38 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 for name in ("isolated_first_frame", "isolated_last_frame", "isolated_key_frame")
             )
         ):
+            logger.info_once("MiniMax H3 video tile streaming skipped: unsupported checkpoint encoder layout.")
             return None
         sample = getattr(model.encode_base, "__func__", model.encode_base).__globals__.get(
             "DiagonalGaussianDistribution"
         )
         if not callable(sample):
+            logger.info_once("MiniMax H3 video tile streaming skipped: checkpoint posterior sampler unavailable.")
             return None
         clip_length, prep_pad, mean, std = metadata
         processor = model.processor
         crop_mode = getattr(processor, "crop_mode", "top_left")
         if crop_mode not in ("top_left", "center"):
+            logger.info_once("MiniMax H3 video tile streaming skipped: unsupported checkpoint crop mode.")
             return None
         used = int(processor.get_suitable_video_length(len(frames) + prep_pad))
         height, width = frames.shape[1:3]
         aligned_h, aligned_w = processor._align_to_total_patch_size(height, width)
         if used <= 0 or not (0 < aligned_h <= height and 0 < aligned_w <= width):
+            logger.info_once("MiniMax H3 video tile streaming skipped: invalid aligned video length or dimensions.")
             return None
         top, left = ((height - aligned_h) // 2, (width - aligned_w) // 2) if crop_mode == "center" else (0, 0)
         y_idx, y_len, y_overlap = model.split_tiles(aligned_h, False)
         x_idx, x_len, x_overlap = model.split_tiles(aligned_w, False)
         if len(set(y_len)) != 1 or len(set(x_len)) != 1:
+            logger.info_once("MiniMax H3 video tile streaming skipped: expected nonempty uniform spatial tiles.")
             return None
         tile_count = len(y_idx) * len(x_idx)
         parallel = bool(getattr(model, "parallel_tiling", False))
         state = self._native_parallel_state() if parallel else {}
         rank, world = int(state.get("sp_rank", 0)), int(state.get("sp_size", 1))
         if tile_count < world:
+            logger.info_once("MiniMax H3 video tile streaming skipped: fewer spatial tiles than participating ranks.")
             return None
         mean_t = torch.as_tensor(mean, dtype=torch.float32, device=device).view(3, 1, 1, 1)
         std_t = torch.as_tensor(std, dtype=torch.float32, device=device).view(3, 1, 1, 1)
@@ -1246,11 +1256,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 latent = None
                 prepared = None
-                if isinstance(frames, np.ndarray) and not _env_flag_enabled(_VAE_ENCODE_LEGACY_PREP_ENV):
-                    if _env_flag_enabled(_VAE_STREAM_TILE_ENV):
+                legacy_prep = _env_flag_enabled(_VAE_ENCODE_LEGACY_PREP_ENV)
+                stream_tile = _env_flag_enabled(_VAE_STREAM_TILE_ENV)
+                if isinstance(frames, np.ndarray) and not legacy_prep:
+                    if stream_tile:
                         latent = self._stream_encode_video_tiles(frames, parameter.device)
                     if latent is None:
                         prepared = self._stream_prepare_video_tensor(frames, parameter.device)
+                elif stream_tile:
+                    reason = "legacy preparation is enabled" if legacy_prep else "expected a NumPy frame array"
+                    logger.info_once("MiniMax H3 video tile streaming skipped: %s.", reason)
                 if latent is None:
                     if prepared is not None:
                         # Preserve the normalized-FP32 checkpoint input contract.

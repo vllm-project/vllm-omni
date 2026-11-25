@@ -238,3 +238,27 @@ def test_enabled_encode_does_not_construct_a_complete_device_video(monkeypatch, 
     rows, shape = vae.encode_video(_frames())
     assert shape == (8, 8, 10)
     assert rows.shape == (8 * 4 * 5, 12)
+
+
+def test_enabled_encode_falls_back_to_whole_video_preparation(monkeypatch):
+    vae, frames = _vae(), _frames()
+    vae.model.stack_tiling = True
+    monkeypatch.setenv("VLLM_OMNI_H3_VAE_STREAM_TILE", "1")
+    monkeypatch.setenv("VLLM_OMNI_VAE_ENCODE_LEGACY_PREP", "0")
+    messages = []
+    monkeypatch.setattr("vllm_omni.diffusion.models.minimax_h3.vae.logger.info_once", messages.append)
+    expected = vae._stream_prepare_video_tensor(frames, torch.device("cpu"))
+
+    def encode_videos(videos, *, use_fp16_latent):
+        assert use_fp16_latent
+        assert isinstance(videos, list)
+        (prepared,) = videos
+        torch.testing.assert_close(prepared, expected, rtol=0, atol=0)
+        return [prepared[:, :, :8, :10].half()]
+
+    vae.model.encode_videos = encode_videos
+    rows, shape = vae.encode_video(frames)
+    assert shape == (8, 8, 10)
+    assert rows.shape == (8 * 4 * 5, 12)
+    assert vae.model.inputs == []
+    assert messages == ["MiniMax H3 video tile streaming skipped: unsupported checkpoint encoder layout."]
