@@ -932,9 +932,7 @@ def test_migrated_amd_gpu_jobs_select_exact_rocm_collections() -> None:
         step = _find_step(label, pipeline_path)
         assert step.get("grade") == grade
 
-        all_collect_commands = [
-            command for command in step["commands"] if AMD_COLLECTION_GUARD.name in command
-        ]
+        all_collect_commands = [command for command in step["commands"] if AMD_COLLECTION_GUARD.name in command]
         assert len(all_collect_commands) == 1 + _ROCM_MIGRATED_AMD_GPU_EXTRA_COLLECTION_GUARDS.get(label, 0)
         collect_commands = [
             command
@@ -1277,9 +1275,7 @@ def test_qwen3_tts_eager_warmup_parity_is_blocking(
     if timeout_minutes is not None:
         assert step["timeout_in_minutes"] == timeout_minutes
 
-    collect_commands = [
-        command for command in commands if AMD_COLLECTION_GUARD.name in command and path in command
-    ]
+    collect_commands = [command for command in commands if AMD_COLLECTION_GUARD.name in command and path in command]
     assert len(collect_commands) == 1
     collect_argv = split(collect_commands[0])
     bash_at = collect_argv.index("bash")
