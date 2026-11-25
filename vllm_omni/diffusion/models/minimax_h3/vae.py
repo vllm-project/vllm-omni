@@ -419,7 +419,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         decoder = getattr(self.remote.model, "decoder", None)
         # LiteVAE retains native transformer blocks and has a separate validation scope.
         if decoder is not None and decoder_path is None and (device.type != "npu" or lightvae_decoder_path is None):
-            install_h3_vae_optimizations(decoder, device=device)
+            install_h3_vae_optimizations(
+                decoder,
+                device=device,
+            )
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
         # The three decoder fast paths below are XPU-only: they were written
         # against the XPU kernels/compile stack and validated there. CUDA and
