@@ -1,6 +1,6 @@
-# Opt-in Ascend TTFT profile measured on 3 x 910B1 with BF16 Instruct weights.
+# Opt-in Ascend graph sizes explored on 3 x 910B1 with BF16 Instruct weights.
 # Thinker uses TP2 on devices 0,1; Talker and Code2Wav share device 2.
-# Pair with --api-server-count 2 for the measured combined deployment.
+# Inherit default Thinker scheduling; --api-server-count 2 shares stage engines.
 # Larger capture sets add startup work and persistent graph buffers.
 base_config: qwen3_omni_moe.yaml
 
@@ -9,8 +9,6 @@ platforms:
     stages:
       - stage_id: 0
         enable_prefix_caching: true
-        # Keep async chunk streaming; this controls the Thinker scheduler only.
-        async_scheduling: false
         compilation_config:
           cudagraph_mode: FULL_AND_PIECEWISE
           decode_cudagraph_capture_request_sizes:
