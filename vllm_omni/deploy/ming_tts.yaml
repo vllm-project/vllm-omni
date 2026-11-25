@@ -1,5 +1,4 @@
 # Ming-omni-tts deploy: stage-0 LLM+flow -> stage-1 audio VAE.
-# Verified legacy settings migrated from ming_tts.yaml and ming_tts_async_chunk.yaml.
 # Default mode is async-chunk streaming on a single GPU.
 # pipeline: required — HF config reports model_type="dense" with no architectures,
 # so auto-detection falls through. This key routes the deploy-config probe in
@@ -18,15 +17,18 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      latent_chunk_size: 25
+      latent_chunk_size: 8
       initial_latent_chunk_size: 4
       latent_left_context: 0
 
 stages:
   - stage_id: 0
-    max_num_seqs: 1
+    max_num_seqs: 64
     gpu_memory_utilization: 0.45
-    enforce_eager: true
+    enforce_eager: false
+    compilation_config:
+      cudagraph_mode: PIECEWISE
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
     enable_prefix_caching: false
     async_scheduling: false
     max_num_batched_tokens: 8192
@@ -42,7 +44,7 @@ stages:
       detokenize: true
 
   - stage_id: 1
-    max_num_seqs: 1
+    max_num_seqs: 64
     gpu_memory_utilization: 0.25
     enforce_eager: true
     enable_prefix_caching: false
