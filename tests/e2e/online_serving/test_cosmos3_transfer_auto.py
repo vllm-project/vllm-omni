@@ -26,7 +26,7 @@ TRANSFER_AUTO_SERVER_ARGS = [
     "--enforce-eager",
 ]
 # Multiview attention is CUDA-only.
-TRANSFER_AUTO_MARKS = hardware_marks(res={"cuda": "H100"})
+TRANSFER_AUTO_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI300"})
 
 
 @pytest.mark.slow

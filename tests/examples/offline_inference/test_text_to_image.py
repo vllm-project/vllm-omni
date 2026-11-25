@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.examples.helpers import EXAMPLES, ExampleRunner, ReadmeSnippet
+from tests.examples.helpers import EXAMPLES, ExampleRunner, ReadmeSnippet, models_in_snippet
 from tests.helpers.assertions import assert_image_valid
 from tests.helpers.mark import hardware_marks
 
@@ -35,7 +35,19 @@ def _skip_readme_snippet(language: str, code: str, h2_title: str) -> tuple[bool,
 README_SNIPPETS = ReadmeSnippet.extract_readme_snippets(README_PATH, skipif=_skip_readme_snippet)
 
 
-@pytest.mark.parametrize("snippet", README_SNIPPETS, ids=lambda snippet: snippet.test_id)
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        pytest.param(
+            snippet,
+            id=snippet.test_id,
+            marks=hardware_marks(res={"rocm": "MI325"})
+            if models_in_snippet(snippet.language, snippet.code) == ("Qwen/Qwen-Image-2.1",)
+            else (),
+        )
+        for snippet in README_SNIPPETS
+    ],
+)
 def test_text_to_image(snippet: ReadmeSnippet, example_runner: ExampleRunner):
     should_skip, reason = snippet.skip
     if should_skip:

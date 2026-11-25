@@ -891,7 +891,8 @@ def test_edge_weight_validation_skips_pp_missing_layers(monkeypatch: pytest.Monk
 
 
 def test_edge_gen_cached_k_is_normalized_but_reasoner_uses_raw_k() -> None:
-    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import RMSNorm
+    from vllm_omni.diffusion.models.cosmos3.norm import QKRMSNorm
+    from vllm_omni.diffusion.models.cosmos3.rope import Cosmos3RotaryEmbedding
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (
         Cosmos3EdgeCausalAttention,
     )
@@ -925,7 +926,8 @@ def test_edge_gen_cached_k_is_normalized_but_reasoner_uses_raw_k() -> None:
     attn.to_k = ScaleProjection(1.0)
     attn.to_v = ScaleProjection(1.0)
     attn.to_out = IdentityOutput()
-    attn.k_norm_und_for_gen = RMSNorm(2, eps=1e-5)
+    attn.k_norm_und_for_gen = QKRMSNorm(2, eps=1e-5)
+    attn.rotary_embedding = Cosmos3RotaryEmbedding()
     attn.attn = RawKAttention()
 
     hidden_states = torch.tensor(
@@ -2043,3 +2045,284 @@ def test_shared_gen_stack_preserves_control_metadata_sharding_and_wrapped_output
     output = model._run_gen_layers(inputs, gather_output=False, **kwargs)
     torch.testing.assert_close(output, torch.full_like(inputs, 4 if already_sharded else 5))
     assert len(gathered) == 1
+
+
+@pytest.mark.parametrize("path", ["und", "gen", "gen_without_qk_norm", "edge"])
+def test_attention_constructs_and_calls_qk_norm(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    """Exercise real constructors and forwards, with only attention math stubbed."""
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3 as model
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3_edge as edge
+    from vllm_omni.diffusion.models.cosmos3.norm import QKRMSNorm
+
+    monkeypatch.setattr(model, "FrameworkAttention", lambda **kwargs: nn.Identity())
+    monkeypatch.setattr(edge, "FrameworkAttention", lambda **kwargs: nn.Identity())
+    monkeypatch.setattr(model, "_is_sp_active", lambda: False)
+    options = dict(hidden_size=8, num_attention_heads=2, num_key_value_heads=1, head_dim=4, rms_norm_eps=1e-5)
+    if path == "und":
+        attn = model.Cosmos3CausalAttention(**options)
+    elif path == "edge":
+        attn = edge.Cosmos3EdgeCausalAttention(**options, use_und_k_norm_for_gen=True)
+    else:
+        attn = model.Cosmos3CrossAttention(**options, qk_norm=path == "gen")
+
+    class QueryAttention(nn.Module):
+        def forward(self, q, k, v):
+            return q
+
+    attn.attn = QueryAttention()
+    for name, size in (("to_q", 8), ("to_k", 4), ("to_v", 4), ("to_out", 8)):
+        projection = nn.Linear(8, size, bias=False)
+        with torch.no_grad():
+            projection.weight.copy_(torch.linspace(-0.2, 0.3, size * 8).reshape(size, 8))
+        setattr(attn, name, projection)
+    if path == "edge":
+        norms = [attn.k_norm_und_for_gen]
+    elif path == "gen_without_qk_norm":
+        assert not hasattr(attn, "norm_q") and not hasattr(attn, "norm_k")
+        norms = []
+    else:
+        norms = [attn.norm_q, attn.norm_k]
+    inputs = []
+    for norm in norms:
+        assert isinstance(norm, QKRMSNorm)
+        norm.register_forward_pre_hook(lambda module, args: inputs.append(args[0].detach().clone()))
+    x = torch.linspace(-1, 2, 24).reshape(1, 3, 8)
+    before = x.clone()
+    cos, sin = torch.ones(1, 3, 1, 4), torch.zeros(1, 3, 1, 4)
+    if path in ("gen", "gen_without_qk_norm"):
+        attn(x, torch.ones(1, 2, 1, 4), torch.ones(1, 2, 1, 4), cos, sin)
+    else:
+        attn(x, cos, sin)
+    expected = (
+        [attn.to_k(x).reshape(1, 3, 1, 4)]
+        if path == "edge"
+        else [attn.to_q(x).reshape(1, 3, 2, 4), attn.to_k(x).reshape(1, 3, 1, 4)]
+    )
+    if path == "gen_without_qk_norm":
+        expected = []
+    assert len(inputs) == len(norms)
+    for actual, reference in zip(inputs, expected, strict=True):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("path", ["und", "gen", "edge"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_decoder_residual_norm_handoff_matches_unfused(path: str, dtype: torch.dtype) -> None:
+    """Assert block wiring, norm tuple order, MLP input and no input mutation."""
+    from vllm_omni.diffusion.models.cosmos3.norm import RMSNorm
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
+        Cosmos3GenDecoderLayer,
+        Cosmos3UndDecoderLayer,
+    )
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import Cosmos3EdgeUndDecoderLayer
+
+    classes = {"und": Cosmos3UndDecoderLayer, "gen": Cosmos3GenDecoderLayer, "edge": Cosmos3EdgeUndDecoderLayer}
+    layer = object.__new__(classes[path])
+    nn.Module.__init__(layer)
+    layer.input_layernorm = RMSNorm(4, eps=1e-5, dtype=dtype)
+    layer.post_attention_layernorm = RMSNorm(4, eps=1e-5, dtype=dtype)
+    with torch.no_grad():
+        layer.post_attention_layernorm.weight.copy_(torch.tensor([0.5, -0.75, 1.25, 2.0], dtype=dtype))
+    k, v = torch.full((1, 2, 1, 4), 3, dtype=dtype), torch.full((1, 2, 1, 4), 5, dtype=dtype)
+
+    class CausalAttention(nn.Module):
+        def forward(self, x, cos, sin):
+            return x * 0.5 + 0.125, k, v
+
+    class CrossAttention(nn.Module):
+        def forward(
+            self, x, *, k_und, v_und, freqs_cos, freqs_sin, control_token_sizes, control_weights, multiview_layout
+        ):
+            assert k_und is k and v_und is v
+            return x * 0.5 + 0.125
+
+    class MLP(nn.Module):
+        def forward(self, x):
+            return x * 0.25 - 0.5
+
+    layer.self_attn = CausalAttention()
+    layer.cross_attention = CrossAttention()
+    layer.mlp = MLP()
+    calls, mlp_inputs = [], []
+    layer.post_attention_layernorm.register_forward_hook(lambda module, args, output: calls.append((args, output)))
+    layer.mlp.register_forward_pre_hook(lambda module, args: mlp_inputs.append(args[0]))
+    x = torch.linspace(-2, 3, 24).reshape(1, 6, 4).to(dtype)
+    before = x.clone()
+    weights = {name: parameter.detach().clone() for name, parameter in layer.named_parameters()}
+    attn_out = layer.input_layernorm.forward_native(x) * 0.5 + 0.125
+    updated = x + attn_out
+    # Old unfused formula: add first in input dtype, then FP32 hidden norm.
+    norm = layer.post_attention_layernorm
+    fp32 = updated.float()
+    normalized = (norm.weight.float() * (fp32 * torch.rsqrt(fp32.square().mean(-1, keepdim=True) + 1e-5))).to(dtype)
+    expected = updated + (normalized * 0.25 - 0.5)
+    cos, sin = torch.ones(1, 6, 1, 4), torch.zeros(1, 6, 1, 4)
+    if path == "gen":
+        actual = layer(x, k_und=k, v_und=v, freqs_cos=cos, freqs_sin=sin)
+    else:
+        actual, actual_k, actual_v = layer(x, (cos, sin))
+        assert actual_k is k and actual_v is v
+    assert len(calls) == 1 and len(mlp_inputs) == 1
+    args, output = calls[0]
+    assert len(args) == 2 and args[1] is x
+    torch.testing.assert_close(args[0], attn_out, rtol=0, atol=0)
+    torch.testing.assert_close(output[0], normalized, rtol=0, atol=0)
+    torch.testing.assert_close(output[1], updated, rtol=0, atol=0)
+    torch.testing.assert_close(mlp_inputs[0], normalized, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+    for name, parameter in layer.named_parameters():
+        torch.testing.assert_close(parameter, weights[name], rtol=0, atol=0)
+
+
+def test_multiview_gen_preserves_chunked_mlp_and_tp_reduction(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3_multiview as multiview
+
+    layer = object.__new__(multiview.Cosmos3MultiviewGenDecoderLayer)
+    nn.Module.__init__(layer)
+    layer._mlp_chunk_size = 2
+    layer.input_layernorm = nn.Identity()
+
+    class CrossAttention(nn.Module):
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states * 2
+
+    layer.cross_attention = CrossAttention()
+    layer.mlp = nn.Identity()
+    layer.mlp.down_proj = nn.Identity()
+    layer.mlp.down_proj.tp_size = 2
+    events = []
+
+    def chunked(hidden_states, chunk_size):
+        events.append(("chunk", chunk_size))
+        return hidden_states * 4
+
+    def reduce(output):
+        events.append(("reduce", None))
+        return output * 2
+
+    monkeypatch.setattr(layer, "_forward_mlp_chunked", chunked)
+    monkeypatch.setattr(multiview, "tensor_model_parallel_all_reduce", reduce)
+    x = torch.ones(1, 3, 4)
+    k = v = torch.zeros(1, 3, 1, 4)
+    cos, sin = torch.ones_like(k), torch.zeros_like(k)
+    actual = layer(x, k_und=k, v_und=v, freqs_cos=cos, freqs_sin=sin)
+    assert events == [("chunk", 2), ("reduce", None)]
+    torch.testing.assert_close(actual, torch.full_like(x, 27))
+    torch.testing.assert_close(x, torch.ones_like(x))
+
+
+@pytest.fixture
+def _cpu_sdpa_attention(monkeypatch: pytest.MonkeyPatch):
+    """Build real GEN/UND attention layers that run on CPU through torch SDPA."""
+    from vllm_omni.diffusion.attention import selector
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    selector._cached_get_backend_cls.cache_clear()
+    monkeypatch.setattr(
+        current_omni_platform,
+        "get_diffusion_attn_backend_cls",
+        lambda **kwargs: DiffusionAttentionBackendEnum.TORCH_SDPA.get_path(),
+    )
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    yield
+    selector._cached_get_backend_cls.cache_clear()
+
+
+@pytest.mark.usefixtures("_cpu_sdpa_attention")
+@pytest.mark.parametrize("batch_size", [2, 3])
+@pytest.mark.parametrize("config_kind", ["base", "edge"])
+def test_gen_layers_broadcast_batch1_und_kv_to_gen_batch(config_kind, batch_size) -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import Cosmos3EdgeVFMTransformer
+
+    torch.manual_seed(0)
+    if config_kind == "edge":
+        model_cls, config = Cosmos3EdgeVFMTransformer, _tiny_cosmos3_edge_config(num_hidden_layers=2)
+        latents, video_shape = torch.randn(batch_size, 48, 1, 4, 4), (1, 4, 4)
+    else:
+        model_cls, config = Cosmos3VFMTransformer, _tiny_cosmos3_config(num_hidden_layers=2)
+        latents, video_shape = torch.randn(batch_size, 2, 1, 2, 2), (1, 2, 2)
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+
+    od_config = OmniDiffusionConfig(
+        model=None, tf_model_config=TransformerConfig.from_dict(config), dtype=torch.float32
+    )
+    model = model_cls(od_config).eval()
+    with torch.no_grad():
+        for param in model.parameters():
+            param.normal_(0, 0.5)
+    kwargs = dict(
+        timestep=torch.tensor([500.0]),
+        text_ids=torch.tensor([[1, 2, 3]]),
+        text_mask=torch.ones(1, 3, dtype=torch.long),
+        video_shape=video_shape,
+        fps=24.0,
+    )
+
+    with torch.inference_mode():
+        serial = []
+        for row in latents.split(1):
+            model.reset_cache()
+            serial.append(model(hidden_states=row, **kwargs))
+        serial = torch.cat(serial)
+
+        model.reset_cache()
+        batched = model(hidden_states=latents, **kwargs)
+        # The cache keeps the batch-1 prompt encoding; only GEN sees the views.
+        assert all(key.shape[0] == 1 and value.shape[0] == 1 for key, value in model.cached_kv)
+        cached = model(hidden_states=latents, **kwargs)
+
+    # Batch size can select a different CPU GEMM kernel (e.g. MKL on AVX-512),
+    # so batched and serial fp32 results may differ in the last bits. Reusing
+    # the batch-1 cache at the same batch size must be exact.
+    torch.testing.assert_close(batched, serial, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(cached, batched, atol=0, rtol=0)
+
+
+def test_broadcast_und_kv_expands_batch1_views_only() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import _broadcast_und_kv
+
+    single = [(torch.randn(1, 3, 2, 4), torch.randn(1, 3, 2, 4)) for _ in range(2)]
+    expanded = _broadcast_und_kv(single, 3)
+    for (key, value), (out_key, out_value) in zip(single, expanded, strict=True):
+        assert out_key.shape == (3, 3, 2, 4) and out_value.shape == (3, 3, 2, 4)
+        assert out_key.data_ptr() == key.data_ptr() and out_value.data_ptr() == value.data_ptr()
+        assert torch.equal(out_key[2], key[0]) and torch.equal(out_value[2], value[0])
+    assert single[0][0].shape[0] == 1
+
+    # Every other cache reaches the layers exactly as before.
+    matching = [(torch.randn(2, 3, 2, 4), torch.randn(2, 3, 2, 4))]
+    assert _broadcast_und_kv(matching, 2) is matching
+    assert _broadcast_und_kv(matching, 3) is matching
+    assert _broadcast_und_kv(single, 1) is single
+
+
+def test_gen_stack_passes_broadcast_und_kv_to_layers() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    model = object.__new__(Cosmos3VFMTransformer)
+    nn.Module.__init__(model)
+    model.cached_kv = [(torch.full((1, 3, 1, 2), float(i)), torch.full((1, 3, 1, 2), i + 10.0)) for i in range(2)]
+    stored = model.cached_kv
+    model.gen_sp_gather = lambda hidden: hidden
+    seen: list[tuple[int, int]] = []
+
+    class Layer(nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.index = index
+
+        def forward(self, hidden, **kwargs):
+            seen.append((kwargs["k_und"].shape[0], kwargs["v_und"].shape[0]))
+            return hidden
+
+    model.gen_layers = nn.ModuleList([Layer(i) for i in range(2)])
+    freqs = (torch.zeros(1, 4, 1, 2), torch.zeros(1, 4, 1, 2))
+    model._run_gen_layers(torch.zeros(2, 4, 8), freqs_gen=freqs)
+
+    assert seen == [(2, 2), (2, 2)]
+    assert model.cached_kv is stored
+    assert all(key.shape[0] == 1 for key, _ in model.cached_kv)

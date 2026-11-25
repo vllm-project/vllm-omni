@@ -125,17 +125,26 @@ second vote succeeds. Recoverable copy failures roll back every rank. Device los
 or a failed rollback requires recreating the engine. This guarantee is scoped to
 one stage's worker group, not a transaction across independently executing stages.
 
-Snapshots remain resident on their original device and are released on adapter
-removal, manager shutdown, or a full-base update. A dense session restores and
-discards the old bank before upstream reload; the next adapter update snapshots
-the new base. Dense-update failure retains upstream's nontransactional semantics.
-Inference weight offloading and HSDP are unsupported. Level-1 sleep leaves the
-bank resident while the original live weights use the normal weights pool.
+Pristine base snapshots remain host-resident for the bank's lifetime (so level-1
+sleep cannot strand them in HBM) and are released on adapter removal, manager
+shutdown, or a full-base update. Prepared values park on device when free HBM
+meets the provisional `2 * M + 4 GiB` headroom threshold and on host otherwise,
+reusing one fp32 merge scratch, one fp32 delta scratch, and one cast scratch per
+device. Pinned host
+allocations fall back from a single arena to chunked pinned buffers and then to
+pageable host memory with a warning rather than failing a sync. Set
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in `omni_lora_ipc` worker
+processes to avoid caching-allocator fragmentation; workers warn once at
+construction when it is inactive. A dense session restores and discards the old
+bank before upstream reload; the next adapter update snapshots the new base.
+Dense-update failure retains upstream's nontransactional semantics. Inference
+weight offloading and HSDP are unsupported.
 
-The steady-state bank holds one extra copy of targeted weights. Preparation and
-rollback also require temporary dense copies plus fp32 per-layer arithmetic.
-Measure peak memory on the intended TP topology before using this in training.
-No throughput or memory improvement is claimed without an end-to-end benchmark.
+Both halves of `omni_lora_ipc` live in `vllm_omni/lora/weight_transfer.py`
+(`MergedLoRAIPCWeightTransferEngine` and `MergedLoRAIPCTrainerWeightTransferEngine`,
+registered in upstream's worker and trainer factories), paired with the
+msgspec-safe IPC handle codec in `vllm_omni/lora/ipc_wire.py`. Legacy raw-tuple
+and pickled IPC payloads remain accepted by `MergedLoRAIPCUpdateInfo`.
 
 ## Configuration and routing
 

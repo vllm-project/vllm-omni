@@ -436,9 +436,11 @@ class HunyuanImage3Pipeline(
             )
         ]
         quant_config = od_config.quantization_config
-        shared_group = getattr(od_config, "weight_sharing", None)
-        # The AR adapter's router contract is FP32; ordinary DiT stays unchanged.
-        shared_router_dtype = torch.float32 if shared_group is not None and shared_group.role == "consumer" else None
+        # MoE routers run in FP32 on both AR and DiT stages, matching the
+        # official Hunyuan code (``HunyuanTopKGate.wg`` uses
+        # ``dtype=torch.float32``). This also keeps the router representation
+        # identical when the backbone is shared across stages.
+        shared_router_dtype = torch.float32
         if backbone_meta:
             from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import validate_supported_layout
 
@@ -520,6 +522,21 @@ class HunyuanImage3Pipeline(
         if full_module_name.startswith("transformer."):
             return [f"model.{full_module_name[len('transformer.') :]}"]
         return []
+
+    def merged_lora_spec(self):
+        """Return the validated merged-LoRA capability contract for HunyuanImage-3."""
+        from vllm_omni.lora.capability import MergedLoRASpec
+
+        return MergedLoRASpec(
+            components=("transformer",),
+            packed_modules_mapping={
+                "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+                "gate_up_proj": ("gate_proj", "up_proj"),
+            },
+            name_aliases=self._get_diffusion_lora_name_aliases,
+            deinterleave_fused_qkv_lora_b=self._deinterleave_fused_qkv_lora_b,
+            unquantized_linear_only=True,
+        )
 
     def _deinterleave_fused_qkv_lora_b(self, lora_b: torch.Tensor) -> torch.Tensor | None:
         """Re-order a fused ``qkv_proj`` LoRA-B from the checkpoint's

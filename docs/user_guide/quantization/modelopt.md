@@ -253,6 +253,15 @@ shrink with the shard count, except with `hsdp_weight_load_strategy="pre_sharded
 which shards them like the other parameters (only scalar global scales stay
 replicated).
 
+ModelOpt FP8 routed experts (`FusedMoE` layers) follow the same schedule. On
+A16 steps, the experts are dequantized from the live FP8 weights and run with
+BF16 activations; middle steps use vLLM's native FP8 MoE kernel. Scheduled
+routed experts require the Triton or FlashInfer CUTLASS MoE backend and no
+expert, tensor, or data parallelism for the expert layers. Monolithic MoE
+kernels and NVFP4 experts fail closed, and LoRA and Cache-DiT are rejected at
+load time when routed experts are scheduled. Shared experts are supported when
+the MoE runner executes them outside the expert kernel.
+
 Without HSDP, the live-weight design is compatible with model-level and
 standard layer-wise offload, but those paths still require GPU end-to-end
 validation. Distributed layer-wise offload is rejected because its direct

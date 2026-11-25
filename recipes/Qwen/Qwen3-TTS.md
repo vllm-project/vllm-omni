@@ -165,7 +165,7 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-ty
 
 ## Notes
 
-- Memory usage: The deploy config allocates `gpu_memory_utilization: 0.3` per stage (talker + code2wav share a single GPU). For the 0.6B variants or constrained GPUs, adjust via `--gpu-memory-utilization`.
+- Memory usage: The deploy config allocates `gpu_memory_utilization: 0.3` per stage (talker + code2wav share a single GPU). For the 0.6B variants or constrained GPUs, adjust each budget via `--stage-overrides` or deploy YAML.
 - Key flags: `--omni` is required. `--deploy-config` points to the bundled two-stage pipeline config.
 - Async chunking: Enabled by default in `qwen3_tts.yaml` for streaming-friendly first-audio latency. Raw audio streaming requires `stream=true`, `stream_format="audio"`, and `response_format="pcm"`.
 - Task/model matching: Each task type requires its matching model checkpoint. Using a CustomVoice model for a Base (voice clone) request will fail.

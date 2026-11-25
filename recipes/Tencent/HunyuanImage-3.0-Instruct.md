@@ -149,8 +149,9 @@ the same checkpoint, parallelism, and image settings.
 
 #### Commands
 
-Start the DiT-only server with one of the following CLI-only configurations.
-These commands use explicit CLI flags for all parallelism and runtime settings.
+Each command selects the DiT-only deploy, which defines one diffusion stage
+on visible devices `0,1,2,3`. Each parallelism configuration below uses all
+four devices.
 
 ##### TP=4 + FP8
 
@@ -158,6 +159,7 @@ These commands use explicit CLI flags for all parallelism and runtime settings.
 vllm serve tencent/HunyuanImage-3.0-Instruct \
   --omni \
   --port 8091 \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
   --tensor-parallel-size 4 \
   --quantization fp8 \
   --distributed-executor-backend mp \
@@ -171,6 +173,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
 vllm serve tencent/HunyuanImage-3.0-Instruct \
   --omni \
   --port 8091 \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
   --tensor-parallel-size 2 \
   --usp 2 \
   --quantization fp8 \
@@ -185,6 +188,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
 vllm serve tencent/HunyuanImage-3.0-Instruct \
   --omni \
   --port 8091 \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
   --tensor-parallel-size 2 \
   --cfg-parallel-size 2 \
   --quantization fp8 \
@@ -384,8 +388,8 @@ Validated checkpoint:
 feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8
 ```
 
-Start the server with CUTLASS selected from the CLI for quantized linear and
-MoE kernels:
+Select the DiT-only deployment and give stage 0 both visible devices. The
+quantized linear and MoE kernels use CUTLASS.
 
 ```bash
 CUDA_VISIBLE_DEVICES=2,3 \
@@ -394,6 +398,8 @@ vllm serve feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8 \
   --host 0.0.0.0 \
   --port 8091 \
   --trust-remote-code \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
+  --stage-overrides '{"0":{"devices":"0,1"}}' \
   --tensor-parallel-size 2 \
   --enable-expert-parallel \
   --linear-backend cutlass \
