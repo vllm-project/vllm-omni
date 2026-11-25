@@ -81,6 +81,7 @@ def _region(
 def _cuda_runtime_prerequisites(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(registration_module.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(registration_module.torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(registration_module.torch.version, "hip", None)
 
 
 def test_platform_dispatch_and_unsupported_device(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -219,6 +220,30 @@ def test_consume_last_cuda_error_falls_back_to_global_symbol(monkeypatch: pytest
     monkeypatch.setattr(registration_module.ctypes, "CDLL", lambda _name: global_runtime)
 
     registration_module._consume_last_cuda_error(SimpleNamespace(), 801)
+
+
+def test_rocm_resolves_missing_runtime_entry_points_as_hip_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ROCm's torch.cuda.cudart() has no cudaGetLastError or cudaDeviceGetAttribute.
+    monkeypatch.setattr(registration_module.torch.version, "hip", "7.0")
+    queries: list[tuple[int, int]] = []
+
+    def hip_device_get_attribute(value, attribute: int, device: int) -> int:
+        queries.append((attribute, device))
+        ctypes.cast(value, ctypes.POINTER(ctypes.c_int)).contents.value = 1
+        return 0
+
+    hip_runtime = SimpleNamespace(hipGetLastError=lambda: 801, hipDeviceGetAttribute=hip_device_get_attribute)
+    monkeypatch.setattr(registration_module.ctypes, "CDLL", lambda _name: hip_runtime)
+    runtime = _FakeRuntime([0])
+    monkeypatch.setattr(runtime, "cudaDeviceGetAttribute", None, raising=False)
+    monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
+
+    registration_module._consume_last_cuda_error(SimpleNamespace(), 801)
+    registration = CudaHostRegistration.create((_region("weights", 0x1000, 4096),), max_bytes=None)
+
+    assert queries == [(registration_module._HIP_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED, 0)]
+    assert runtime.registered == [(0x1000, 4096, registration_module._HIP_EXT_HOST_REGISTER_COARSE_GRAINED)]
+    assert registration.close() == ()
 
 
 def test_clean_rollback_remains_recoverable_when_error_state_cannot_be_cleared(
