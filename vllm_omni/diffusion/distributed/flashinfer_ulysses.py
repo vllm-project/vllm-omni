@@ -15,7 +15,9 @@ import torch
 from torch.distributed.distributed_c10d import _resolve_process_group
 
 _COMMUNICATORS: dict[str, tuple[int, torch.dtype, object]] = {}
-_OUTPUTS: dict[tuple, torch.Tensor] = {}
+# One output per (group, op, slot). On the direct route FlashInfer registers each output at the communicator's full
+# capacity until close(), so new request shapes reuse that allocation instead of registering another one.
+_OUTPUTS: dict[tuple[str, str, int], torch.Tensor] = {}
 
 
 def ensure_flashinfer_ulysses_available() -> None:
@@ -48,11 +50,28 @@ def _communicator(group_name: str, nbytes: int, dtype: torch.dtype):
     return comm
 
 
+def _output_shape(x: torch.Tensor, op: str, world_size: int) -> tuple[int, int, int, int]:
+    b, s, h, d = x.shape
+    if op == "scatter_heads":
+        return b, s * world_size, h // world_size, d
+    return b, s // world_size, h * world_size, d
+
+
 def _output(comm, group_name: str, x: torch.Tensor, op: str, slot: int) -> torch.Tensor:
-    key = (group_name, op, slot, tuple(x.shape), x.dtype)
+    key = (group_name, op, slot)
+    shape = _output_shape(x, op, comm.world_size)
     out = _OUTPUTS.get(key)
-    if out is None:
-        out = _OUTPUTS[key] = comm.allocate_output(x, op)
+    if out is not None and out.dtype == x.dtype:
+        if tuple(out.shape) == shape:
+            return out
+        numel = torch.Size(shape).numel()
+        storage_elems = out.untyped_storage().nbytes() // out.element_size() - out.storage_offset()
+        if numel <= storage_elems:
+            # Same base pointer, so the direct route still recognizes it; every rank re-views it identically.
+            return out.as_strided(shape, torch.empty(shape, device="meta").stride(), out.storage_offset())
+    # First call for this slot, or an output too small to hold the new shape (an unregistered staged output, which
+    # is freed when replaced). The communicator only grows by being rebuilt, which drops every cached output.
+    out = _OUTPUTS[key] = comm.allocate_output(x, op)
     return out
 
 
