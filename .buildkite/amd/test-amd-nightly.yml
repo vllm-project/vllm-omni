@@ -122,9 +122,21 @@ steps:
         grade: NonBlocking
         timeout_in_minutes: 180
         source_file_dependencies: omni_qwen3_omni_function
+        env:
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          PYTHONFAULTHANDLER: "1"
+          QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-function-expansion"
+          VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-function-expansion/failed-audio"
+          QWEN3_OMNI_EXPECTED_GPUS: "2"
+          QWEN3_OMNI_EXPECTED_RESULTS: "0"
+          QWEN3_OMNI_EXPECTED_TESTS: "28"
+          QWEN3_OMNI_MARK_EXPRESSION: "full_model and rocm and MI325 and cards_2"
+          QWEN3_OMNI_TEST_TARGET: tests/e2e/online_serving/test_qwen3_omni_expansion.py
+          QWEN3_OMNI_TIMEOUT: 165m
+        artifact_paths:
+          - artifacts/rocm-qwen3-omni-function-expansion/**/*
         commands:
-          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+          - bash .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
 
       - label: "Qwen3-Omni Accuracy"
         agent_pool: mi300_2
@@ -1463,6 +1475,24 @@ steps:
 
   - group: ":full_moon: Diffusion Collective Parity MI300 Nightly"
     steps:
+      - label: "FLUX TP2 and MOSS-Image SP2 Parity"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 45
+        source_file_dependencies: [diffusion_flux_mossimage_parallel, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-flux-mossimage-parallel/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 3 30m rocm-flux-mossimage-parallel
+            "tests/diffusion/distributed/test_merged_row_parallel_tp2.py::test_flux_merged_row_tp2_parity_device[2-flux1]"
+            "tests/diffusion/distributed/test_merged_row_parallel_tp2.py::test_flux_merged_row_tp2_parity_device[2-flux2]"
+            tests/diffusion/distributed/test_mossimage_sp.py::test_mossimage_sp_matches_single_gpu_with_odd_joint_length
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
+
       - label: "Wan VAE Spatial-Shard Decode Parity"
         agent_pool: mi300_2
         depends_on: amd-build
@@ -1512,6 +1542,23 @@ steps:
             2 5 30m rocm-diffusion-pipeline-parallel-2gpu
             tests/diffusion/distributed/test_pipeline_parallel.py
             -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
+
+      - label: "Diffusion Pipeline Parallel and CFG Parity · 4 GPUs"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 45
+        source_file_dependencies: [diffusion_pipeline_parallel_parity, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-diffusion-pp2-cfg2-4gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 2 30m rocm-diffusion-pp2-cfg2-4gpu
+            'tests/diffusion/distributed/test_pipeline_parallel.py::test_predict_noise_parity[pp2-cfg2-bfloat16]'
+            'tests/diffusion/distributed/test_pipeline_parallel.py::test_scheduler_step_parity[pp2-cfg2-true_cfg]'
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_4"
 
       - label: "Diffusion Exchange and Ring Parity · 4 GPUs"
         agent_pool: mi300_4

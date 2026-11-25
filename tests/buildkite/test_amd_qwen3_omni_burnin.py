@@ -26,6 +26,19 @@ PERF_CONFIGS = {
 RUNNER_COMMAND = "bash .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh"
 
 JOB_SPECS = {
+    "Qwen3-Omni Function Expansion": {
+        "pool": "mi300_2",
+        "timeout": 180,
+        "source_group": "omni_qwen3_omni_function",
+        "artifact": "artifacts/rocm-qwen3-omni-function-expansion/**/*",
+        "gpus": "2",
+        "tests": "28",
+        "results": "0",
+        "marks": "full_model and rocm and MI325 and cards_2",
+        "target": "tests/e2e/online_serving/test_qwen3_omni_expansion.py",
+        "inner_timeout": "165m",
+        "config": None,
+    },
     "Qwen3-Omni Multi-Replica Correctness": {
         "pool": "mi300_4",
         "timeout": 180,
@@ -89,7 +102,7 @@ def _sweep_count(params: dict) -> int:
     return len(request_rate) + len(concurrency)
 
 
-def test_qwen3_omni_correctness_blocks_while_perf_stays_nonblocking() -> None:
+def test_qwen3_omni_nightly_job_contracts() -> None:
     nightly = _pipeline_steps(NIGHTLY_PIPELINE)
     for label, expected in JOB_SPECS.items():
         step = nightly[label]
@@ -99,7 +112,7 @@ def test_qwen3_omni_correctness_blocks_while_perf_stays_nonblocking() -> None:
         assert step["agent_pool"] == expected["pool"]
         assert step["depends_on"] == "amd-build"
         assert step["mirror_hardwares"] == ["amdproduction"]
-        assert step["grade"] == ("Blocking" if expected["config"] is None else "NonBlocking")
+        assert step["grade"] == ("Blocking" if label == "Qwen3-Omni Multi-Replica Correctness" else "NonBlocking")
         assert step["timeout_in_minutes"] == expected["timeout"]
         assert step["source_file_dependencies"] == expected["source_group"]
         assert step["artifact_paths"] == [artifact]
