@@ -21,9 +21,13 @@ from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.fixture(scope="module")
-def deploy() -> dict:
-    return yaml.safe_load(Path(get_deploy_config_path("chatterbox_turbo.yaml")).read_text())
+@pytest.fixture(
+    scope="module",
+    params=["chatterbox_turbo.yaml", "chatterbox.yaml"],
+    ids=["turbo", "original"],
+)
+def deploy(request: pytest.FixtureRequest) -> dict:
+    return yaml.safe_load(Path(get_deploy_config_path(request.param)).read_text())
 
 
 def test_each_variant_has_its_own_pipeline() -> None:
@@ -43,16 +47,15 @@ def test_a_config_less_checkout_is_matched_by_its_directory_name(tmp_path: Path)
         StageConfigFactory.try_infer_model_type.cache_clear()
 
 
-def test_stage_0_stops_on_the_stop_token_and_stage_1_holds_no_slot_between_chunks() -> None:
+def test_stage_0_stops_on_the_stop_token_and_stage_1_retains_stream_state() -> None:
     talker, decoder = CHATTERBOX_TURBO_PIPELINE.stages
     assert talker.sampling_constraints["stop_token_ids"] == [ChatterboxConfig().stop_speech_token]
     # On Model Runner V2 both stages use its native data plane; without the
     # declaration a stage falls back to the scheduler-side transport.
     assert talker.supports_native_mrv2_data_plane and decoder.supports_native_mrv2_data_plane
-    # Read by the generation scheduler from this field. False: a stream holds
-    # a decoder slot for the step that decodes its chunk, not for its
-    # lifetime, so more streams than slots can be live at once.
-    assert decoder.retains_state_across_chunks is False
+    # S3Gen keeps each request's reference and decoder state between chunks.
+    # Declaring that state lets native MRV2 safely coalesce ready chunks.
+    assert decoder.retains_state_across_chunks is True
 
 
 @pytest.mark.parametrize(
@@ -98,7 +101,11 @@ def test_the_deploy_files_context_and_budgets_fit_the_models_needs(deploy: dict)
         "codec_max_chunk_frames",
         "codec_stream_scale_factor",
         "codec_left_context_frames",
+        "generation_min_batch_size",
+        "generation_max_wait_ms",
     }
+    assert extra["generation_min_batch_size"] == 16
+    assert extra["generation_max_wait_ms"] == 6
     # The output cap is the model's, which the API bounds requests by.
     assert talker["default_sampling_params"]["max_tokens"] == config.max_new_tokens
     # Stage 0's context leaves room for text once the speaker slot, the
