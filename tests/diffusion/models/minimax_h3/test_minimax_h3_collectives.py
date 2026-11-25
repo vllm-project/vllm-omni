@@ -261,6 +261,22 @@ def test_object_collectives_use_the_cpu_group_and_tensor_collectives_keep_the_de
     assert cpu_group not in tensor_groups
 
 
+def _is_object_collective(node: ast.Call) -> bool:
+    """Whether ``node`` calls a ``torch.distributed`` object collective."""
+    func = node.func
+    if not isinstance(func, ast.Attribute) or func.attr not in _OBJECT_COLLECTIVE_NAMES:
+        return False
+    owner = func.value
+    if isinstance(owner, ast.Name):
+        return owner.id == "dist"
+    return (
+        isinstance(owner, ast.Attribute)
+        and owner.attr == "distributed"
+        and isinstance(owner.value, ast.Name)
+        and owner.value.id == "torch"
+    )
+
+
 def _object_collective_calls(source: str) -> list[tuple[ast.AST, ast.Call]]:
     """Pair every object-collective call of ``source`` with its enclosing scope."""
     calls: list[tuple[ast.AST, ast.Call]] = []
@@ -278,13 +294,7 @@ def _object_collective_calls(source: str) -> list[tuple[ast.AST, ast.Call]]:
             scope.pop()
 
         def visit_Call(self, node: ast.Call) -> None:
-            func = node.func
-            if (
-                isinstance(func, ast.Attribute)
-                and func.attr in _OBJECT_COLLECTIVE_NAMES
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "dist"
-            ):
+            if _is_object_collective(node):
                 calls.append((scope[-1] if scope else node, node))
             self.generic_visit(node)
 
@@ -318,7 +328,9 @@ def test_every_object_collective_of_the_pipeline_takes_the_cpu_group():
     catch a *new* object collective, because a new site is not driven by that
     case. This case reads the module source instead: every object-collective
     call has to take its group from ``_dit_cpu_rank_world()``, so a new site
-    on the device group fails the case until it is routed host-side.
+    on the device group fails the case until it is routed host-side. Both
+    spellings of the call are covered: ``dist.<name>`` and
+    ``torch.distributed.<name>``.
     """
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
 
