@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """GLM-TTS pipeline: Stage 0 (AR) → Stage 1 (DiT)."""
 
 from vllm_omni.config.stage_config import (
@@ -19,6 +19,7 @@ GLM_TTS_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="glm_tts",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
@@ -37,6 +38,7 @@ GLM_TTS_PIPELINE = PipelineConfig(
             stage_id=1,
             model_stage="glm_tts_dit",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",

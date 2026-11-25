@@ -16,6 +16,7 @@ For the full list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
+| Chatterbox Turbo / Original | `ResembleAI/chatterbox-turbo`, `ResembleAI/chatterbox` | ✓ (`ref_audio`, no transcript) | ✓ (PCM / WAV + WebSocket) | built-in `default` or uploaded audio | ✓ |
 | Fish Audio Drama 3 | `fishaudio/drama-3` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker and event tags in `input` | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
@@ -32,9 +33,43 @@ For the full list of supported architectures across all modalities, see
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
 
+## Chatterbox Turbo and Original
+
+Two-stage English speech synthesis at 24 kHz, with a built-in voice or a single
+reference recording. No reference transcript is needed. Install the conditioning
+extra with `uv pip install -e '.[chatterbox]'`.
+
+```bash
+vllm-omni serve ResembleAI/chatterbox-turbo --omni --port 8091
+# Use ResembleAI/chatterbox for Original.
+```
+
+Use the common curl/SDK and PCM streaming clients above with `voice: default`,
+or supply `ref_audio` as a data URL. Both use the shared one-second minimum;
+Turbo repeats a clip of five seconds or less until it is longer, where
+upstream refuses it. Both expose WAV/PCM/MP3/FLAC
+non-streaming responses and PCM/WAV streaming. Original additionally accepts
+`extra_params: {exaggeration: 0.5, cfg_weight: 0.5}`; Turbo rejects those controls.
+
+For browser playback, install `vllm-omni[demo]` and run the shared
+[speech streaming player](../../../apps/tts_streaming_player/README.md):
+
+```bash
+uv run apps/tts_streaming_player/gradio_demo.py --sample-rate 24000
+```
+
+It does not sentence-segment long text; use the shared WebSocket speech
+frontend for long narration. Multilingual is unsupported.
+
+See the [H100 recipe](../../../recipes/ResembleAI/Chatterbox-H100.md) for
+profiles, qualification scope and concurrency limitations.
+
+---
+
 ## Common Quick Start
 
-Launch the server (defaults shown — adjust `--port`, `--gpu-memory-utilization`, etc. as needed):
+Launch the server with the desired port. For multi-stage models, tune each
+stage's memory budget in the deploy YAML or via `--stage-overrides`.
 
 ```bash
 vllm serve <hf-repo-or-local-path> --omni --port 8091
@@ -536,7 +571,8 @@ Equivalent manual command:
 vllm-omni serve inclusionAI/Ming-omni-tts-0.5B \
     --deploy-config vllm_omni/deploy/ming_tts.yaml \
     --host 0.0.0.0 --port 8091 \
-    --enforce-eager --omni
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
+    --omni
 ```
 
 ### Sending requests
@@ -613,7 +649,7 @@ python examples/online_serving/text_to_speech/ming_flash_omni_tts/speech_client.
 
 - Server uses `use_zero_spk_emb=True` and the cookbook decode defaults (`max_decode_steps=200`, `cfg=2.0`, `sigma=0.25`, `temperature=0.0`). For other caption fields (`语速`, `基频`, `IP`, BGM, etc.) or overriding decode args, use the offline example where `additional_information` is set explicitly.
 - This is the online counterpart of [`examples/offline_inference/text_to_speech/ming_flash_omni_tts/`](../../offline_inference/text_to_speech/ming_flash_omni_tts/).
-- For multimodal Ming-flash-omni online serving, see [`examples/online_serving/ming_flash_omni/`](../../ming_flash_omni/).
+- For multimodal Ming-flash-omni online serving, see [`examples/online_serving/ming_flash_omni/`](../ming_flash_omni/).
 
 ---
 
@@ -805,6 +841,12 @@ Three model variants exposed via separate checkpoints:
 | Base | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Voice cloning from a reference audio |
 
 Each variant ships smaller `0.6B` companions where available.
+
+For the three 1.7B variants on a single Ascend 910B3 64GB, see the
+[Ascend 910B3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-TTS-Ascend910B3.md).
+It records the tested vLLM-Omni 0.28.0 commit, image environment, unchanged
+deployment configuration, and verification scope; its measurements do not
+qualify current main.
 
 ### Launch
 

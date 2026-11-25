@@ -246,6 +246,8 @@ datasets/
 !recipes/cosmos3/negative_prompt.json
 !benchmarks/mammoth_moda2/reference_results.json
 !tests/dfx/perf/tests/*.json
+!tests/e2e/accuracy/lingbot_world/*.lock.json
+!tests/e2e/accuracy/lingbot_world/configs/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 !apps/ComfyUI-ABC-Preview/example_workflows/*.json
 !vllm_omni/model_executor/models/ming_flash_omni/talker_tn/talker_re.json
@@ -254,6 +256,7 @@ datasets/
 !tests/e2e/accuracy/sensenova_u1_reference.json
 !tests/e2e/offline_inference/fixtures/praxis1_droid_h100_reference.json
 !tests/e2e/accuracy/qwen_image_21/thresholds.json
+!tests/dfx/perf/baselines/qwen3_omni.json
 *.jsonl
 # Shared Hunyuan IT2I input for accuracy tests and vllm bench.
 !tests/assets/hunyuan_image3/it2i.jsonl
@@ -297,3 +300,6 @@ lance_compare/
 
 # Linting binaries downloaded by local pre-commit hooks
 shellcheck*/
+
+# LingBot benchmark and accuracy outputs
+lingbot-artifacts/

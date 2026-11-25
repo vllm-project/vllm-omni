@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.graph import build_denoise_graph_runner, invalidate_denoise_graphs
 from vllm_omni.platforms import current_omni_platform
@@ -21,10 +22,15 @@ def _graph_config() -> SimpleNamespace:
         diffusion_use_graph=True,
         enforce_eager=False,
         diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        diffusion_attention_schedule=None,
+        diffusion_graph_release_after_denoise=False,
+        diffusion_kv_cache_dtype=None,
+        diffusion_kv_cache_skip_step_indices=None,
+        diffusion_attention_config=AttentionConfig(),
         cache_backend="none",
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
-        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1, data_parallel_size=1),
     )
 
 

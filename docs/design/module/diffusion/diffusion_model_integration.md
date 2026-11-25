@@ -38,7 +38,9 @@ loading, adapters, shared layers, and model-specific processing.
 ### DIFF-MODEL-INV-001: Pipelines implement one runtime contract
 
 **Rule:** A pipeline MUST declare its supported modalities, configuration,
-inputs, outputs, loading path, and runtime capabilities.
+inputs, outputs, loading path, and runtime capabilities (including its
+merged-LoRA capability via `SupportsMergedLoRA` or an explicit registry entry in
+`vllm_omni/lora/capability.py`).
 
 ### DIFF-MODEL-INV-002: Registration is the selection boundary
 
@@ -58,6 +60,12 @@ cross-stage routing.
 
 Test registry selection, checkpoint loading, minimal inference, input and output
 contracts, and every declared optional capability.
+
+Qwen-Image-Edit-Plus initializes its Qwen2.5-VL encoder on CPU before sharding
+and moving it to the execution device. Its non-persistent FP32 RoPE frequency
+buffers must match Diffusers' CPU initialization: computing them on the
+accelerator can change BF16 conditioning and image accuracy. The DiT retains
+the loader's device context and the selected compilation and attention modes.
 
 HunyuanImage3 uses `OmniDiffusionConfig.revision` for model configuration,
 generation configuration, tokenizer, and weight loading, including preprocessing.

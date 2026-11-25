@@ -18,6 +18,9 @@ from safetensors.torch import save_file
 from vllm_omni.worker.gpu_ar_worker import GPUARWorker
 
 AUDIT_ENV = "VLLM_OMNI_MOONCAKE_TEST_AUDIT_DIR"
+# While this file exists in the audit directory, every HS read fails as a
+# missing object would, after the native KV load has been submitted.
+FAIL_HS_READ = "fail-hs-read"
 
 
 def _record(directory: Path, kind: str, metadata: dict, tensors: dict | None = None) -> None:
@@ -40,7 +43,14 @@ class AuditedGPUARWorker(GPUARWorker):
 
         directory = Path(os.environ[AUDIT_ENV])
         capture_step = OmniMooncakeStoreConnector.capture_step
+        read_blocks = OmniMooncakeStoreConnector._read_hs_blocks
         merge_rows = qwen_handoff._merge_talker_prefill_rows
+
+        def audited_read(connector, attempt, tokens):
+            if (directory / FAIL_HS_READ).exists():
+                _record(directory, "injected_failure", {"request_id": attempt.req_id, "tokens": tokens})
+                raise ValueError("injected HS read failure")
+            return read_blocks(connector, attempt, tokens)
 
         def audited_capture(connector, req_id, attempt_id, start_token, prompt_len, tensors):
             merged = capture_step(connector, req_id, attempt_id, start_token, prompt_len, tensors)
@@ -88,5 +98,6 @@ class AuditedGPUARWorker(GPUARWorker):
             return packed
 
         OmniMooncakeStoreConnector.capture_step = audited_capture
+        OmniMooncakeStoreConnector._read_hs_blocks = audited_read
         qwen_handoff._merge_talker_prefill_rows = audited_merge
         super().init_device()

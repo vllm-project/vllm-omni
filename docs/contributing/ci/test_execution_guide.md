@@ -29,9 +29,9 @@ uv pip check
 apt-get install -y espeak-ng jq
 ```
 
-The CUDA CI image verifies the vLLM 0.33 runtime and imports the rebuilt
-`lmcache.cuda_ops` before model tests. See the installation guide for the
-base-image dependency repairs; metadata checks alone do not verify native ABI.
+The CUDA CI image verifies the official vLLM 0.34.0 runtime and imports the
+rebuilt `lmcache.cuda_ops` before model tests. See the installation guide for
+runtime and dependency setup; metadata checks alone do not verify native ABI.
 
 ## Running Tests
 

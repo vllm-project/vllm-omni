@@ -10,7 +10,7 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_metrics import PROTOCOL_PIN
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import MIX_QUESTION
 
 
-def select_duplex_eval_baseline(accuracy_config: dict, hardware: object) -> dict:
+def select_duplex_eval_baseline(accuracy_config: dict, hardware: object, *, required: bool = False) -> dict:
     """Return this hardware's score floors, or ``{}`` to record scores without gating.
 
     Nested accuracy-config baselines (``{"H100": {...}, "A3": {...}}``) enforce only
@@ -18,10 +18,13 @@ def select_duplex_eval_baseline(accuracy_config: dict, hardware: object) -> dict
     empty ``{}`` entry records scores without a floor. A nested map requires a
     non-empty hardware label: missing or blank labels fail rather than silently
     disabling calibrated gates. Flat metric dicts still apply to every hardware
-    label. Mixing hardware maps with flat metric keys is rejected.
+    label. Mixing hardware maps with flat metric keys is rejected. With
+    ``required=True``, missing or empty floors fail instead of disabling gating.
     """
     baseline = accuracy_config.get("baseline") or {}
     if not isinstance(baseline, dict) or not baseline:
+        if required:
+            raise ValueError(f"No duplex-eval score floors for hardware {hardware!r}")
         return {}
     nested_flags = [isinstance(value, dict) for value in baseline.values()]
     if any(nested_flags) and not all(nested_flags):
@@ -29,11 +32,11 @@ def select_duplex_eval_baseline(accuracy_config: dict, hardware: object) -> dict
     if all(nested_flags):
         if not isinstance(hardware, str) or not hardware:
             raise ValueError("nested duplex-eval baseline requires a runtime hardware label")
-        selected = baseline.get(hardware)
-        if not isinstance(selected, dict) or not selected:
-            return {}
-        return {str(key): value for key, value in selected.items() if value is not None}
-    return {str(key): value for key, value in baseline.items() if value is not None}
+        baseline = baseline.get(hardware) or {}
+    selected = {str(key): value for key, value in baseline.items() if value is not None}
+    if required and not selected:
+        raise ValueError(f"No duplex-eval score floors for hardware {hardware!r}")
+    return selected
 
 
 def load_accuracy_config(path: str, params: dict) -> dict:

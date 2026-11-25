@@ -169,6 +169,8 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     pipeline.load_vae_encoder = False
     pipeline.transformer = model
     pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace(cache_backend="none", additional_config=None)
+    pipeline._cache_dit_runtime = SimpleNamespace(is_enabled=False)
     pipeline._transformer_for_task = lambda task: model
     pipeline._packed_batch_supported = lambda transformer: packed_batch_supported
     return pipeline
@@ -197,7 +199,7 @@ def test_pdd_step_execution_keeps_request_steps_without_backend_warning(steps, m
     warning.assert_not_called()
 
 
-@pytest.mark.parametrize("sampler", ["euler", "res_multistep"])
+@pytest.mark.parametrize("sampler", ["euler", "res_multistep", "heun"])
 @pytest.mark.parametrize("num_steps", [1, 8, 50])
 def test_step_execution_matches_request_mode_denoise_loop(num_steps, sampler, mocker):
     """Stepping through the contract must reproduce the request-mode loop."""
@@ -221,7 +223,7 @@ def test_step_execution_matches_request_mode_denoise_loop(num_steps, sampler, mo
         device=torch.device("cpu"),
     )
 
-    assert model.call_count == num_steps
+    assert model.call_count == (2 * num_steps - 1 if sampler == "heun" else num_steps)
     model.reset_mock()
     pipeline = _step_pipeline(model)
     state = _make_state("req-0", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio, sampler)
@@ -233,7 +235,7 @@ def test_step_execution_matches_request_mode_denoise_loop(num_steps, sampler, mo
         steps += 1
 
     assert steps == num_steps
-    assert model.call_count == num_steps
+    assert model.call_count == (2 * num_steps - 1 if sampler == "heun" else num_steps)
     assert state.total_steps == steps
     torch.testing.assert_close(state.latents, reference_video)
     torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], reference_audio)
@@ -409,7 +411,7 @@ def test_timeline_guides_request_step_batch_parity_and_target_only_unpack(mixed_
         assert target_audio.shape == (2, 32, audio_t)
 
 
-@pytest.mark.parametrize("sampler", ["euler", "res_multistep"])
+@pytest.mark.parametrize("sampler", ["euler", "res_multistep", "heun"])
 def test_step_execution_matches_request_mode_with_latent_edits(sampler):
     """Masked model rows, row timesteps, and scheduler math match both paths."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
@@ -482,6 +484,9 @@ def test_step_execution_matches_request_mode_with_latent_edits(sampler):
         ("euler", "euler"),
         ("res_multistep", "res_multistep"),
         ("euler", "res_multistep"),
+        ("heun", "heun"),
+        ("euler", "heun"),
+        ("res_multistep", "heun"),
     ],
 )
 @pytest.mark.parametrize("lock_audio", [False, True])
@@ -851,7 +856,7 @@ def test_sigma_windows_select_the_latent_refine_pass_by_its_own_tail_sigma():
     assert seen == [(step, total, pytest.approx(tail_video[step]), expected_profiles[step]) for step in range(total)]
 
 
-@pytest.mark.parametrize("sampler", ["euler", "res_multistep"])
+@pytest.mark.parametrize("sampler", ["euler", "res_multistep", "heun"])
 @pytest.mark.parametrize("batch_frames", [1, 33])
 def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames, sampler):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
@@ -928,7 +933,7 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames, sa
     assert state.extra[mod._STEP_AUDIO_EDIT] is audio_edit
     assert state.extra[mod._STEP_SHAPE]["height"] == 96
 
-    pipeline.od_config = SimpleNamespace()
+    pipeline.od_config = SimpleNamespace(step_execution=False, cache_backend="none", additional_config={})
     monkeypatch.setattr(pipeline, "_unpack_denoised_rows", lambda *args, **kwargs: (torch.zeros(1), torch.zeros(1)))
     calls = []
 
@@ -1220,7 +1225,65 @@ def test_locked_driving_audio_is_clean_and_unchanged_during_denoising():
     assert not torch.equal(result_video, video)
 
 
-@pytest.mark.parametrize("sampler", ["euler", "res_multistep"])
+@pytest.mark.parametrize("packed", [True, False])
+def test_heun_batches_correction_and_skips_terminal_requests(packed):
+    model = _SegmentMeanModel()
+    states = []
+    for index, schedule in enumerate(([1.0, 0.5, 0.0], [1.0, 0.7, 0.0], [1.0, 0.0])):
+        branch, video, audio = _make_branch(text_len=5, latent_t=2, latent_h=4, latent_w=4, audio_t=3, seed=index)
+        states.append(_make_state(str(index), model, branch, video, audio, schedule, schedule, "heun"))
+    pipeline = _step_pipeline(model, packed_batch_supported=packed)
+    assert pipeline.denoise_step(SimpleNamespace(states=states)) == {s.request_id: None for s in states}
+    assert len(model.calls) == (2 if packed else 5)
+    if packed:
+        assert len(model.calls[0]["video_rows"]) == sum(len(s.latents) for s in states)
+        assert len(model.calls[1]["video_rows"]) == sum(len(s.latents) for s in states[:2])
+    assert all(s.step_index == 1 for s in states)
+
+
+def test_heun_failed_correction_keeps_both_streams_and_history_retryable():
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    model = _SegmentMeanModel()
+
+    def failing(**kwargs):
+        video, audio = model(**kwargs)
+        if len(model.calls) == 2:
+            raise RuntimeError("correction failed")
+        return video, audio
+
+    branch, video, audio = _make_branch(text_len=5, latent_t=2, latent_h=4, latent_w=4, audio_t=3, seed=7)
+    state = _make_state("req", failing, branch, video, audio, [1.0, 0.5, 0.0], [1.0, 0.2, 0.0], "heun")
+    original = state.extra[mod._STEP_SAMPLING_STATE]
+    original_rows = (state.latents, state.extra[mod._STEP_AUDIO_ROWS])
+    pipeline = _step_pipeline(failing)
+    result = pipeline.denoise_step(SimpleNamespace(states=[state]))
+    assert isinstance(result["req"], RuntimeError)
+    assert state.extra[mod._STEP_SAMPLING_STATE] is original
+    assert state.step_index == original.step_index == 0
+    assert torch.equal(state.latents, video)
+    assert torch.equal(state.extra[mod._STEP_AUDIO_ROWS], audio)
+    buffers = state.extra[mod._STEP_MODEL_ROWS]
+    assert pipeline.denoise_step(SimpleNamespace(states=[state])) == {"req": None}
+    assert state.step_index == 1
+    assert state.latents is original_rows[0]
+    assert state.extra[mod._STEP_AUDIO_ROWS] is original_rows[1]
+    assert state.extra[mod._STEP_MODEL_ROWS] is buffers
+
+
+def test_heun_rejects_prediction_cache_before_model_evaluation():
+    model = _SegmentMeanModel()
+    branch, video, audio = _make_branch(text_len=5, latent_t=2, latent_h=4, latent_w=4, audio_t=3, seed=7)
+    state = _make_state("req", model, branch, video, audio, [1.0, 0.5, 0.0], [1.0, 0.2, 0.0], "heun")
+    pipeline = _step_pipeline(model)
+    pipeline.od_config = SimpleNamespace(cache_backend="cache_dit")
+    error = pipeline.denoise_step(SimpleNamespace(states=[state]))["req"]
+    assert "uncached" in str(error)
+    assert state.step_index == 0
+    assert not model.calls
+
+
+@pytest.mark.parametrize("sampler", ["euler", "res_multistep", "heun"])
 def test_steps_reuse_request_buffers_and_write_into_original_rows(sampler, monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.models.minimax_h3.sampling import MiniMaxH3Model
@@ -1262,7 +1325,7 @@ def test_steps_reuse_request_buffers_and_write_into_original_rows(sampler, monke
             assert state.extra[mod._STEP_AUDIO_ROWS] is rows[1]
     assert len({row.data_ptr() for pair in buffers.values() for row in pair}) == 4
     assert all(s.step_index == 3 for s in states)
-    assert len(model.calls) == 3
+    assert len(model.calls) == (5 if sampler == "heun" else 3)
 
 
 @pytest.mark.parametrize("edited", [False, True])

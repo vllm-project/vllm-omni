@@ -9,8 +9,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.minicpmo_4_5 import config as model_config
 from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex import compat
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
 )
@@ -40,7 +40,7 @@ def test_init_builds_duplex_runtime_only_for_duplex_thinker(
     expected_builds: int,
 ) -> None:
     monkeypatch.setattr(minicpmo_4_5_omni, "init_vllm_registered_model", lambda **kwargs: _StageModel())
-    monkeypatch.setattr(compat, "patch_minicpmo_remote_config", lambda config: None)
+    monkeypatch.setattr(model_config, "patch_minicpmo_remote_config", lambda config: None)
     build_devices: list[torch.device] = []
     monkeypatch.setattr(
         MiniCPMO45OmniForConditionalGeneration,

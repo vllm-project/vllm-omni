@@ -12,11 +12,14 @@ from vllm_omni.lora.layers import (
     DiffusionRowParallelLinearWithLoRA,
 )
 
+from .row_parallel_linear import DiffusionMergedRowParallelLinearWithLoRA
+
 __all__ = [
     "DiffusionBaseLinearLayerWithLoRA",
     "DiffusionColumnParallelLinearWithLoRA",
     "DiffusionMergedColumnParallelLinearWithLoRA",
     "DiffusionMergedQKVParallelLinearWithLoRA",
+    "DiffusionMergedRowParallelLinearWithLoRA",
     "DiffusionQKVParallelLinearWithLoRA",
     "DiffusionReplicatedLinearWithLoRA",
     "DiffusionRowParallelLinearWithLoRA",
