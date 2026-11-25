@@ -26,6 +26,12 @@ change. It then binds the selected operator set, reuses Omni's existing
 dtype already selected by decode autocast. Unsupported model contracts, tensor
 inputs, execution modes, and devices retain the original implementation.
 
+The encoder installer (`install_h3_vae_encoder_fusion`, SM90 only) fuses the layout copy,
+SiLU, and reflect/causal padding in front of each padded encoder convolution into one
+bit-exact Triton kernel; `VLLM_OMNI_H3_VAE_ENCODER_FUSION=0` keeps the checkpoint forwards.
+On H200 the first `encode_video` of a process JIT-compiles its 10 kernel variants: about
++2.9 s with an empty Triton cache and +0.7 s with a populated one (checkpoint encoder: +0.3 s).
+
 Hardware dispatch is an explicit allowlist. SM89, SM90, SM100, and SM103 are enabled;
 other capabilities fall back to the reference path. Bit-exact full-decode and
 operator evidence has been collected on SM89 and SM90, with independent full-decode and

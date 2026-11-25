@@ -13,6 +13,7 @@ import torch.nn as nn
 from vllm_omni.diffusion.layers.activation import SiluAndMul
 
 from .dispatch import resolve_h3_vae_operators
+from .encoder import install_h3_vae_encoder_fusion
 
 
 def _is_boolean_flag(value: Any) -> bool:
@@ -214,4 +215,4 @@ def install_h3_vae_optimizations(
     return True
 
 
-__all__ = ["install_h3_vae_optimizations"]
+__all__ = ["install_h3_vae_encoder_fusion", "install_h3_vae_optimizations"]
