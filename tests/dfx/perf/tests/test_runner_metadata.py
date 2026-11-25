@@ -2781,7 +2781,10 @@ def test_chat_accuracy_gates_daily_omni_and_seed_tts():
     assert_result(daily, {"dataset_name": "daily-omni", "min_daily_omni_accuracy": 0.77}, 1)
 
     seed = {
+        "seed_tts_session_count": 1,
         "completed": 1,
+        "failed": 0,
+        "seed_tts_request_failed": 0,
         "seed_tts_content_evaluated": 1,
         "seed_tts_content_error_mean": 0.2,
         "seed_tts_sim_evaluated": 1,

@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 import torch
+from pydantic import ValidationError
 from vllm import SamplingParams
 from vllm.config import CUDAGraphMode
 
@@ -1447,7 +1448,7 @@ def test_request_cfg_and_temperature_reach_flow_runtime(cfg, cfg_key):
         assert info[KEY_CFG] == update["ming_cfg"] == cfg
 
 
-@pytest.mark.parametrize("key", ["ming3_cfg", "lingv3_cfg", "temperature"])
+@pytest.mark.parametrize("key", ["ming3_cfg", "lingv3_cfg"])
 @pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), "2", True])
 def test_request_sampling_controls_reject_invalid_runtime_values(key, value):
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -1461,6 +1462,14 @@ def test_request_sampling_controls_reject_invalid_runtime_values(key, value):
     adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
     request = OpenAICreateSpeechRequest(input="Bonjour.", instructions="calm", extra_params={key: value})
     assert "finite non-negative" in adapter.validate(request)
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), "2", True])
+def test_request_temperature_rejects_invalid_values_at_admission(value):
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+
+    with pytest.raises(ValidationError, match=r"extra_params\.temperature"):
+        OpenAICreateSpeechRequest(input="Bonjour.", instructions="calm", extra_params={"temperature": value})
 
 
 @pytest.mark.parametrize("temperature", [None, 0.0, 1.5])

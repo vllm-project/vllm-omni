@@ -11,11 +11,11 @@ import socket
 import time
 from pathlib import Path
 
+import av
 import pytest
 import requests
 
-from tests.examples.helpers import EXAMPLES, ExampleRunner, ReadmeSnippet
-from tests.helpers.assertions import assert_video_valid
+from tests.examples.helpers import EXAMPLES, ExampleRunner, ReadmeSnippet, models_in_snippet
 from tests.helpers.mark import hardware_marks
 
 pytestmark = [
@@ -28,6 +28,15 @@ pytestmark = [
 I2V_SCRIPT = EXAMPLES / "offline_inference" / "image_to_video" / "image_to_video.py"
 README_PATH = I2V_SCRIPT.with_name("README.md")
 EXAMPLE_OUTPUT_SUBFOLDER = "example_offline_i2v"
+
+# README positions identify the CUDA cases. Also check the model so that a new
+# example inserted at one of those positions cannot silently change the AMD job.
+_MI325_CLI_MODELS = {
+    "quick_start_002": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+    "more_cli_examples_001": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+    "more_cli_examples_002": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+    "more_cli_examples_003": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v",
+}
 
 _IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/cherry_blossom.jpg"
 _IMAGE_NAME = "cherry_blossom.jpg"
@@ -91,7 +100,22 @@ def _skip_readme_snippet(language: str, code: str, h2_title: str) -> tuple[bool,
 README_SNIPPETS = ReadmeSnippet.extract_readme_snippets(README_PATH, skipif=_skip_readme_snippet)
 
 
-@pytest.mark.parametrize("snippet", README_SNIPPETS, ids=lambda snippet: snippet.test_id)
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        pytest.param(
+            snippet,
+            id=snippet.test_id,
+            marks=hardware_marks(res={"rocm": "MI325"})
+            if (
+                snippet.language == "bash"
+                and models_in_snippet(snippet.language, snippet.code) == (_MI325_CLI_MODELS.get(snippet.test_id),)
+            )
+            else (),
+        )
+        for snippet in README_SNIPPETS
+    ],
+)
 def test_image_to_video(snippet: ReadmeSnippet, example_runner: ExampleRunner, i2v_test_image_dir: Path):
     should_skip, reason = snippet.skip
     if should_skip:
@@ -103,5 +127,7 @@ def test_image_to_video(snippet: ReadmeSnippet, example_runner: ExampleRunner, i
     shutil.copy2(i2v_test_image_dir / _IMAGE_NAME, run_dir / _IMAGE_NAME)
 
     result = example_runner.run(snippet, output_subfolder=Path(EXAMPLE_OUTPUT_SUBFOLDER))
+    assert result.assets, f"No output video for {snippet.test_id}"
     for asset in result.assets:
-        assert_video_valid(asset)
+        with av.open(str(asset)) as container:
+            assert next(container.decode(video=0), None) is not None, f"No decodable video frame in {asset}"
