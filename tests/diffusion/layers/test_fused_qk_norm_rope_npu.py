@@ -207,7 +207,7 @@ def test_npu_qk_norm_rope_ignores_installed_mindiesd(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("options", [{}, {"return_raw_qk": False}], ids=["default-raw", "no-raw"])
+@pytest.mark.parametrize("options", [{}, {"vdn": False}], ids=["default-vdn", "no-vdn"])
 def test_npu_eagle_receives_original_packed_qkv(monkeypatch: pytest.MonkeyPatch, options: dict[str, bool]) -> None:
     from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
 
@@ -241,7 +241,7 @@ def test_npu_eagle_receives_original_packed_qkv(monkeypatch: pytest.MonkeyPatch,
     )
 
     assert q_out is outputs[0] and k_out is outputs[1] and v_out is outputs[2]
-    if options.get("return_raw_qk", True):
+    if options.get("vdn", True):
         (parts,) = splits
         assert q_raw is parts[0] and k_raw is parts[1]
         torch.testing.assert_close(q_raw, q, check_stride=True)
@@ -252,8 +252,8 @@ def test_npu_eagle_receives_original_packed_qkv(monkeypatch: pytest.MonkeyPatch,
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("is_npu", [True, False], ids=["npu-without-eagle", "non-npu-with-eagle"])
-@pytest.mark.parametrize("return_raw_qk", [True, False])
-def test_packed_qkv_fallback(monkeypatch: pytest.MonkeyPatch, is_npu: bool, return_raw_qk: bool) -> None:
+@pytest.mark.parametrize("vdn", [True, False])
+def test_packed_qkv_fallback(monkeypatch: pytest.MonkeyPatch, is_npu: bool, vdn: bool) -> None:
     from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
 
     qkv, q_weight, k_weight, rope_table = _packed_inputs()
@@ -265,7 +265,7 @@ def test_packed_qkv_fallback(monkeypatch: pytest.MonkeyPatch, is_npu: bool, retu
     module = None if is_npu else types.SimpleNamespace(eagle_split_norm_rope_concat=eagle)
     monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", module)
 
-    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, q_weight, k_weight, rope_table, return_raw_qk=return_raw_qk)
+    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, q_weight, k_weight, rope_table, vdn=vdn)
 
     expected_q, expected_k = _reference(q, k, q_weight, k_weight, rope_table)
     torch.testing.assert_close(q_out, expected_q, atol=0, rtol=0)
@@ -273,7 +273,7 @@ def test_packed_qkv_fallback(monkeypatch: pytest.MonkeyPatch, is_npu: bool, retu
     (parts,) = splits
     assert v_out is parts[2]
     torch.testing.assert_close(v_out, v)
-    if return_raw_qk:
+    if vdn:
         assert q_raw is parts[0] and k_raw is parts[1]
 
 

@@ -116,7 +116,7 @@ def test_h3_project_qkv_retains_raw_qk_for_vdn(has_vdn, has_rope):
 
     if has_rope:
         fused.assert_called_once()
-        assert fused.call_args.kwargs["return_raw_qk"] is has_vdn
+        assert fused.call_args.kwargs["vdn"] is has_vdn
         return
 
     fused.assert_not_called()

@@ -486,8 +486,7 @@ class MiniMaxH3Attention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Project/normalize/rotate QKV, retaining raw Q/K for the VDN branch."""
         qkv, _ = self.qkv_proj(x)
-        return_raw_qk = self.vdn is not None
-        if return_raw_qk and vdn_window is None:
+        if self.vdn is not None and vdn_window is None:
             raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
         if rope_table is None:
             packed = qkv.unflatten(-1, (-1, self.head_dim))
@@ -505,7 +504,7 @@ class MiniMaxH3Attention(nn.Module):
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
-            return_raw_qk=return_raw_qk,
+            vdn=self.vdn is not None,
         )
 
     def forward(
