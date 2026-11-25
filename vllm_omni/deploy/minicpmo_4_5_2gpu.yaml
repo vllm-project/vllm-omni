@@ -76,10 +76,12 @@ platforms:
       connector_of_shared_memory:
         extra:
           cfm_max_graphs: 96
+          cfm_graph_capture_frames: [16, 32, 48, 64, 80]
           micro_batch_size: 8
           secondary_vocoder_micro_batch_size: 4
           whole_euler_pad_max_rows: 2
           token2wav_runtime_prompt_cache_size: 512
+          token2wav_setup_cache_size: 64
           token2wav_setup_host_cache_size: 512
           token2wav_ref_cpu_prefetch_workers: 4
           generation_max_regular_batch: 16

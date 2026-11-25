@@ -177,9 +177,12 @@ def test_reference_optimizations_are_cuda_only(monkeypatch, deploy_name, platfor
             "token2wav_float16",
             "token2wav_spk_cuda_graph",
             "token2wav_s3_cuda_graph",
-            "cfm_drop_upstream_att_buffer",
         ):
             assert extra.get(flag, False) is (platform == "cuda")
+        assert extra.get("cfm_drop_upstream_att_buffer", False) is (platform in ("cuda", "npu"))
+        if platform == "npu":
+            assert (extra["token2wav_setup_cache_size"], extra["token2wav_setup_host_cache_size"]) == (4, 64)
+            assert extra["cfm_graph_capture_frames"] == [64, 80]
         assert extra["cfm_npu_cross_reference_batching"] is True
         # The Ascend profile uses 32-frame output chunks.
         assert extra["codec_chunk_frames"] == (32 if platform == "npu" else 25)
