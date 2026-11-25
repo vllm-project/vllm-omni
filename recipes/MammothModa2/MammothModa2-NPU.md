@@ -19,6 +19,13 @@ Successful T2I image generation was validated with the following environment:
 - vLLM: 0.34.0+empty
 - vLLM-Ascend: 0.19.1rc2.dev3635+g19c063b54
 
+This 910B3 smoke test confirms successful image generation only. The same run
+logged `MammothModa2 t2i row has no generated_len; leaving it unconstrained`,
+so it does not verify that AR grid constraints were applied. Current-main MRv2
+T2I can still skip these constraints, as tracked in
+[#10752](https://github.com/vllm-project/vllm-omni/issues/10752), pending the fix in
+[draft #10753](https://github.com/vllm-project/vllm-omni/pull/10753).
+
 ## References
 
 - Related recipe: [MammothModa2](./MammothModa2.md)
