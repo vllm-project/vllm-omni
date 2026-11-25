@@ -166,6 +166,9 @@ python image_to_video.py \
 
 ### Wan2.2-I2V-A14B-Diffusers (MoE)
 
+Cold one-card loads can exceed the default startup limits, so this example
+allows extra time for the orchestrator and its stages to initialize.
+
 ```bash
 python image_to_video.py \
   --model Wan-AI/Wan2.2-I2V-A14B-Diffusers \
@@ -180,6 +183,8 @@ python image_to_video.py \
   --num-inference-steps 40 \
   --boundary-ratio 0.875 \
   --flow-shift 12.0 \
+  --init-timeout 1200 \
+  --stage-init-timeout 900 \
   --fps 16 \
   --output i2v_wan_moe.mp4
 ```
