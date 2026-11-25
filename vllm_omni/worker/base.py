@@ -14,7 +14,7 @@ from contextlib import AbstractContextManager, nullcontext
 
 import torch
 from vllm import envs
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib, memory_profiling
 from vllm.v1.worker.gpu_worker import CompilationTimes
@@ -150,17 +150,81 @@ class OmniGPUWorkerBase(GPUWorker):
 
     def load_model(self, *args, **kwargs):
         weight_transfer = self.vllm_config.weight_transfer_config
-        if (
-            weight_transfer is not None
-            and weight_transfer.backend == "omni_lora_ipc"
-            and self.vllm_config.lora_config is not None
-        ):
+        is_merged_lora = weight_transfer is not None and weight_transfer.backend == "omni_lora_ipc"
+        if is_merged_lora and self.vllm_config.lora_config is not None:
             raise ValueError("omni_lora_ipc requires enable_lora=False on AR stages")
         with self._maybe_get_memory_pool_context("weights"):
             res = super().load_model(*args, **kwargs)
+            if is_merged_lora:
+                from vllm_omni.lora.capability import resolve_merged_lora_spec
+
+                model = self.model_runner.get_model()
+                if isinstance(model, torch.nn.Module):
+                    resolve_merged_lora_spec(model, stage="ar")
             current_omni_platform.synchronize()
             gc.collect()
             return res
+
+    def start_weight_update_with_id(self, update_id: str) -> None:
+        """Start an AR weight update session tagged with a caller-supplied ``update_id``."""
+        if not isinstance(update_id, str) or not update_id.strip():
+            raise ValueError("update_id must be a non-empty string")
+        if hasattr(GPUWorker, "_start_weight_update"):
+            with set_current_vllm_config(self.vllm_config):
+                self._start_weight_update(update_id=update_id)
+        else:
+            self.start_weight_update()
+            self._weight_update_id = update_id
+            engine = getattr(self, "weight_transfer_engine", None)
+            if isinstance(engine, MergedLoRAIPCWeightTransferEngine):
+                engine._update_id = update_id
+
+    def _start_weight_update(self, is_draft: bool = False, update_id: str | None = None) -> None:
+        was_active = getattr(self, "_weight_update_active", False)
+        incomplete = getattr(self, "_incomplete_weight_updates", None)
+        prior_incomplete = isinstance(incomplete, set) and is_draft in incomplete
+        try:
+            super()._start_weight_update(is_draft=is_draft)
+        except BaseException:
+            if (
+                not was_active
+                and not getattr(self, "_weight_update_active", False)
+                and not prior_incomplete
+                and isinstance(incomplete, set)
+                and isinstance(getattr(self, "weight_transfer_engine", None), MergedLoRAIPCWeightTransferEngine)
+            ):
+                incomplete.discard(is_draft)
+            raise
+        self._merged_lora_prior_incomplete: bool | None = prior_incomplete
+        self._weight_update_id: str | None = update_id
+        engine = getattr(self, "weight_transfer_engine", None)
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine):
+            engine._update_id = update_id
+
+    def _maybe_restore_incomplete_after_non_mutating_abort(self) -> None:
+        engine = getattr(self, "weight_transfer_engine", None)
+        prior_incomplete = getattr(self, "_merged_lora_prior_incomplete", None)
+        self._merged_lora_prior_incomplete = None
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine) and getattr(
+            engine, "_last_abort_was_non_mutating", False
+        ):
+            engine._last_abort_was_non_mutating = False
+            if prior_incomplete is False:
+                incomplete = getattr(self, "_incomplete_weight_updates", None)
+                if isinstance(incomplete, set):
+                    incomplete.discard(getattr(self, "_weight_update_is_draft", False))
+
+    def _end_weight_update(self, refresh: bool) -> None:
+        engine = getattr(self, "weight_transfer_engine", None)
+        if not refresh and getattr(engine, "_skip_next_end_weight_update", False):
+            engine._skip_next_end_weight_update = False
+            return
+        super()._end_weight_update(refresh=refresh)
+        self._weight_update_id = None
+        if not refresh:
+            self._maybe_restore_incomplete_after_non_mutating_abort()
+        else:
+            self._merged_lora_prior_incomplete = None
 
     def finish_weight_update(self) -> None:
         """End failed merged sessions so the trainer can publish a new adapter.
@@ -170,11 +234,53 @@ class OmniGPUWorkerBase(GPUWorker):
         """
         try:
             super().finish_weight_update()
+            self._weight_update_id = None
         except Exception:
+            self._merged_lora_prior_incomplete = None
+            self._weight_update_id = None
             if isinstance(self.weight_transfer_engine, MergedLoRAIPCWeightTransferEngine):
                 self._weight_update_active = False
-                self.weight_transfer_engine.reset_weight_update_target()
+                try:
+                    self.weight_transfer_engine.reset_weight_update_target()
+                except Exception:
+                    logger.warning(
+                        "Failed to reset weight update target while cleaning up a failed merged LoRA session.",
+                        exc_info=True,
+                    )
             raise
+
+    def abort_weight_update(self, update_id: str | None = None) -> bool:
+        """Abort an active merged-LoRA update session without committing."""
+        if update_id is not None and (not isinstance(update_id, str) or not update_id.strip()):
+            raise ValueError("update_id must be a non-empty string")
+        if not getattr(self, "_weight_update_active", False):
+            return False
+        if update_id is not None and getattr(self, "_weight_update_id", None) != update_id:
+            return False
+        self._weight_update_active = False
+        self._weight_update_id = None
+        engine = getattr(self, "weight_transfer_engine", None)
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine):
+            engine.abort_weight_update()
+        elif engine is not None:
+            try:
+                engine.reset_weight_update_target()
+            except Exception:
+                logger.warning(
+                    "Failed to reset weight update target during abort_weight_update.",
+                    exc_info=True,
+                )
+        kv_loan = getattr(self, "_weight_update_kv_cache_loan", None)
+        if kv_loan is not None and callable(getattr(kv_loan, "close", None)):
+            try:
+                kv_loan.close()
+            except Exception:
+                logger.warning(
+                    "Failed to close KV cache loan during abort_weight_update.",
+                    exc_info=True,
+                )
+        self._maybe_restore_incomplete_after_non_mutating_abort()
+        return True
 
     def remove_lora(self, lora_id: int) -> bool:
         """Restore the dense base for a merged policy, or remove a runtime adapter.

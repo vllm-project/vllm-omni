@@ -20,9 +20,7 @@ from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
     KEY_REQUEST_ID,
     KEY_STOP_REASON,
     LATENT_CHUNK_SIZE,
-    LATENT_DIM,
     LATENT_LEFT_CONTEXT,
-    PATCH_SIZE,
 )
 
 logger = init_logger(__name__)
@@ -284,13 +282,12 @@ def llm2audio_vae(
             continue
         output = stage_output.outputs[0]
         patches = _extract_all_patches(output.multimodal_output)
-        additional_information = {
-            "ming_latent_patches": patches
-            if patches is not None
-            else torch.zeros((0, PATCH_SIZE, LATENT_DIM), dtype=torch.float32),
+        additional_information: dict[str, Any] = {
             KEY_REQUEST_ID: getattr(stage_output, "request_id", None),
             "finished": torch.tensor(finished, dtype=torch.bool),
         }
+        if patches is not None:
+            additional_information["ming_latent_patches"] = patches
         stop_reason = _decode_stop_reason(_extract_last_value(output.multimodal_output, KEY_STOP_REASON))
         if stop_reason is not None:
             additional_information[KEY_STOP_REASON] = stop_reason

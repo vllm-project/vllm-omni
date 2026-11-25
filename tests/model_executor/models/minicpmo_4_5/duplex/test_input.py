@@ -411,6 +411,36 @@ def test_video_only_bypasses_partial_microphone_audio_and_restores_on_rollback()
     assert not buffer.has_pending()
 
 
+def test_backlog_preserves_vision_order_and_partial_pcm_across_rollback():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    partial = pcm_payload(8000)
+    buffer.prepare_append(partial, operation_id="speech", chunk_period_ms=1000, allow_emit=False)
+    for frame in ("first", "second"):
+        hold = buffer.prepare_append(
+            dict(pcm_payload(0, speech=False), video_frames=[frame], force_listen=True),
+            operation_id=frame,
+            chunk_period_ms=1000,
+            allow_emit=False,
+        )
+        hold.commit()
+    first = buffer.prepare_backlog(operation_id="rollback", chunk_period_ms=1000)
+    assert first is not None and first.payload["video_frames"] == ["first"]
+    first.rollback()
+    for frame in ("first", "second"):
+        unit = buffer.prepare_backlog(operation_id=frame, chunk_period_ms=1000)
+        assert unit is not None
+        assert unit.payload["video_frames"] == [frame]
+        assert not unit.payload["audio"]
+        assert unit.payload["force_listen"] is True
+        unit.commit()
+    assert buffer.prepare_backlog(operation_id="partial", chunk_period_ms=1000) is None
+    assert buffer.pending_byte_count == 8000 * 4
+    tail = pcm_payload(8000)
+    payload = buffer.append(tail, chunk_period_ms=1000)
+    assert _b64_audio(payload) == _b64_audio(partial) + _b64_audio(tail)
+    assert not buffer.has_pending() and not buffer.has_reserved()
+
+
 def test_commit_prefix_rollback_preserves_frames_and_speech_tail():
     buffer = MiniCPMO45PcmAppendBuffer()
     for frame in ("first", "second"):
