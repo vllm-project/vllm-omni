@@ -20,7 +20,8 @@ transformer or generation pipeline is required::
 The latent shape is ``[B, latent_channels, T, 8, 113]``; an unbatched
 ``[3, T, 128, 1800]`` input encodes with ``B = 1``. Decoder channels are
 range in metres, unit intensity, and validity. Full-size neighborhood
-attention requires CUDA; CPU execution is for small correctness fixtures.
+attention runs on CUDA through FlexAttention and on Ascend NPU through an exact
+chunked gather; CPU execution is for small correctness fixtures.
 """
 
 from __future__ import annotations
@@ -280,6 +281,57 @@ def _run_attention(query, key, value, block_mask, scale):
     return output[..., :head_dim] if head_dim < 16 else output
 
 
+#: FP32 elements per gather step: bounds the ``[B, heads, chunk, k_h*k_w, D]``
+#: temporaries, so the exact Ascend path never materializes token-level scores.
+_GATHER_ELEMENT_BUDGET = 1 << 22
+
+
+@lru_cache(maxsize=_CACHE_SIZE)
+def _get_neighborhood_index(
+    device: torch.device, height: int, width: int, kernel: tuple[int, int], dilation: tuple[int, int]
+) -> torch.Tensor:
+    """``[height * width, k_h * k_w]`` key indices of every query's dilated window.
+
+    ``_axis_start`` already clamps each window inside the grid, so the gather
+    needs neither padding nor ``-inf`` masking: every query attends to exactly
+    ``k_h * k_w`` valid keys, the same set the FlexAttention predicate admits.
+    """
+    for length, k, d in zip((height, width), kernel, dilation):
+        if length < k * d:
+            raise ValueError(f"LiDAR attention axis length {length} is smaller than kernel {k} * dilation {d}.")
+    row = torch.arange(height * width, device=device)
+    query_h, query_w = row // width, row % width
+    start_h = _axis_start(query_h, height, kernel[0], dilation[0])[:, None] + torch.arange(kernel[0], device=device)
+    start_w = _axis_start(query_w, width, kernel[1], dilation[1])[:, None] + torch.arange(kernel[1], device=device)
+    key_h = start_h * dilation[0] + (query_h % dilation[0])[:, None]
+    key_w = start_w * dilation[1] + (query_w % dilation[1])[:, None]
+    return (key_h[:, :, None] * width + key_w[:, None, :]).reshape(height * width, kernel[0] * kernel[1])
+
+
+def _neighborhood_attention_gather(query, key, value, *, kernel, dilation, scale):
+    """Exact local attention as a chunked gather plus a per-query softmax.
+
+    Used where no sparse-attention kernel exists (Ascend NPU). Cost is
+    ``O(tokens * k_h * k_w * dim)`` in both time and memory, independent of
+    the token count squared.
+    """
+    batch, height, width, heads, dim = query.shape
+    index = _get_neighborhood_index(query.device, height, width, kernel, dilation)
+    q, k, v = (
+        t.permute(0, 3, 1, 2, 4).reshape(batch, heads, height * width, dim).contiguous() for t in (query, key, value)
+    )
+    window = index.shape[-1]
+    chunk = max(1, _GATHER_ELEMENT_BUDGET // max(1, batch * heads * window * dim))
+    output = torch.empty_like(q)
+    for start in range(0, height * width, chunk):
+        rows = index[start : start + chunk]
+        q_rows = q[:, :, start : start + chunk]
+        k_rows, v_rows = k[:, :, rows], v[:, :, rows]
+        scores = torch.einsum("bhcd,bhcwd->bhcw", q_rows, k_rows) * scale
+        output[:, :, start : start + chunk] = torch.einsum("bhcw,bhcwd->bhcd", scores.softmax(-1), v_rows)
+    return output.reshape(batch, heads, height, width, dim).permute(0, 2, 3, 1, 4).contiguous()
+
+
 @lru_cache(maxsize=_CACHE_SIZE)
 def _get_compiled_runner(device, shape, kernel, dilation, scale):
     # Dynamo caches by code object. A new wrapper around the same code would
@@ -293,18 +345,24 @@ def _get_compiled_runner(device, shape, kernel, dilation, scale):
 def neighborhood_attention_2d(query, key, value, *, kernel_size, dilation, scale):
     """Attend to a fixed 2D window on FP32 [B,H,W,heads,head_dim] tensors.
 
-    CUDA always uses compiled sparse attention and propagates failures. Eager
-    CPU FlexAttention is available only for small correctness fixtures, since
-    PyTorch's eager implementation materializes token-level scores.
+    CUDA always uses compiled sparse attention and propagates failures, Ascend
+    NPU uses the exact chunked gather, and eager CPU FlexAttention is available
+    only for small correctness fixtures, since PyTorch's eager implementation
+    materializes token-level scores.
     """
     if query.ndim != 5 or any(t.shape != query.shape for t in (key, value)) or min(query.shape) < 1:
         raise ValueError("LiDAR attention requires matching nonempty [B,H,W,heads,head_dim] tensors.")
     if any(t.dtype != torch.float32 or t.device != query.device for t in (query, key, value)):
         raise ValueError("LiDAR attention requires FP32 query, key, and value on the same device.")
-    if query.device.type not in {"cpu", "cuda"}:
-        raise RuntimeError(f"LiDAR FlexAttention requires CUDA (or CPU correctness fixtures), got {query.device}.")
+    if query.device.type not in {"cpu", "cuda", "npu"}:
+        raise RuntimeError(
+            f"LiDAR attention requires CUDA, Ascend NPU, or CPU correctness fixtures, got {query.device}."
+        )
     kernel, dilation = _attention_pair(kernel_size, "kernel_size"), _attention_pair(dilation, "dilation")
     batch, height, width, heads, dim = query.shape
+    if query.device.type == "npu":
+        # No FlexAttention or BlockMask on Ascend; the gather path is exact.
+        return _neighborhood_attention_gather(query, key, value, kernel=kernel, dilation=dilation, scale=scale)
     if query.device.type == "cpu" and height * width > 4096:
         raise RuntimeError("Eager CPU LiDAR FlexAttention is limited to 4096 tokens; use CUDA for production grids.")
     # Tensor.device resolves an unindexed 'cuda' to the actual device, so an
