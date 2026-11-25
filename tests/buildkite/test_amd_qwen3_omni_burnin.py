@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
+import shlex
 import stat
 from pathlib import Path
 
@@ -140,6 +141,22 @@ def test_runner_requires_complete_artifacts_and_clean_teardown() -> None:
     ):
         assert required in source
     assert "--assert-baseline" not in source
+
+
+def test_aiter_smoke_requires_three_distinct_server_configurations() -> None:
+    step = _pipeline_steps(NIGHTLY_PIPELINE)["Qwen3-Omni AITER-on Smoke"]
+    assert step["grade"] == "Blocking"
+    assert step["agent_pool"] == "mi300_2"
+    assert step["env"]["QWEN3_OMNI_EXPECT_AITER_MM_ENCODER"] == "1"
+    enable, run = step["commands"]
+    assert enable == "export VLLM_ROCM_USE_AITER=1"
+    command, runner, cards, count, timeout, artifact, *nodes, flag, marks = shlex.split(run)
+    assert (command, runner) == ("bash", ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh")
+    assert (cards, count, timeout) == ("2", "3", "75m")
+    assert step["artifact_paths"] == [f"artifacts/{artifact}/**/*"]
+    target = "tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001"
+    assert nodes == [f"{target}[{param}]" for param in ("default", "async_chunk", "batch_token_2048")]
+    assert (flag, marks) == ("-m", "full_model and rocm and MI325 and cards_2")
 
 
 def test_runner_is_a_dependency_of_function_and_perf_jobs() -> None:
