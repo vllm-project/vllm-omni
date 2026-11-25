@@ -7,12 +7,38 @@ import pytest
 import torch
 from diffusers.models.normalization import RMSNorm
 
+from tests.helpers.device import DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.layers import exact_bf16_pointwise as pointwise
 from vllm_omni.diffusion.layers import exact_bf16_qk_norm_rope as fused_qk
 from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer as transformer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+
+@hardware_test(res={"npu": "A3"}, num_cards=1)
+def test_npu_mixed_prompt_rotary_matches_single_requests():
+    rope = transformer.QwenImage21Rope(theta=10000, axes_dim=[16, 56, 56])
+    prepare = transformer.QwenImage21SequencePrepare(torch.nn.Identity(), rope)
+    layout = [(1, 2, 2)]
+    image_slots = torch.tensor([[False] * 6 + [True]] * 2, device="npu")
+    text_mask = torch.tensor([[0, 0, 1, 1, 1, 1], [1] * 6], device="npu")
+    device = text_mask.device
+    mask = transformer._qwen_image21_rope_text_mask(text_mask, device, sp_active=False)
+    _, _, _, target_freqs = prepare(
+        torch.zeros(2, 4, 64, device=device), torch.zeros(2, 6, 64, device=device), layout, image_slots, False, mask
+    )
+
+    x = torch.randn(2, 4, 3, 128, dtype=torch.bfloat16, device=device)
+    actual = transformer._apply_qwen_image21_rotary_emb_npu(x, target_freqs)
+    for i, length in enumerate((4, 6)):
+        image_mask = torch.tensor([False] * length + [True] * 4, device=device)
+        single_freqs = rope(layout, image_mask, device)[-4:]
+        expected = transformer._apply_qwen_image21_rotary_emb_npu(x[i : i + 1], single_freqs)
+        torch.testing.assert_close(actual[i : i + 1], expected, rtol=0, atol=0)
+
+    with pytest.raises(ValueError, match="without sequence parallelism"):
+        transformer._qwen_image21_rope_text_mask(text_mask, device, sp_active=True)
 
 
 @pytest.mark.cpu
@@ -87,12 +113,12 @@ def test_validated_pointwise_declines_kernels_while_compiling(monkeypatch):
     )
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @torch.no_grad()
 def test_validated_pointwise_compiles_with_inductor():
     """Eager callers may validate once and pass the flag into regionally compiled blocks."""
     torch.manual_seed(0)
-    x, y, gate = (torch.randn(2, 1024, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    x, y, gate = (torch.randn(2, 1024, device=DEVICE_TYPE, dtype=torch.bfloat16) for _ in range(3))
 
     def block(x, y, gate):
         return pointwise.residual(x, pointwise.silu_mul(gate, y, _validated=True), gate, _validated=True)
@@ -110,8 +136,8 @@ def test_validated_pointwise_compiles_with_inductor():
 def test_unqualified_attention_uses_reference_norm_and_rope(monkeypatch):
     sequence = 17
     torch.manual_seed(sequence)
-    projection = torch.randn(2, sequence, 3, 32, 128, device="cuda", dtype=torch.bfloat16)
-    freqs = torch.polar(torch.ones(sequence, 64, device="cuda"), torch.randn(sequence, 64, device="cuda"))
+    projection = torch.randn(2, sequence, 3, 32, 128, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    freqs = torch.polar(torch.ones(sequence, 64, device=DEVICE_TYPE), torch.randn(sequence, 64, device=DEVICE_TYPE))
     attention = object.__new__(transformer.QwenImage21Attention)
     torch.nn.Module.__init__(attention)
     attention.num_heads = attention.num_kv_heads = 32
@@ -147,6 +173,6 @@ def test_unqualified_attention_uses_reference_norm_and_rope(monkeypatch):
 
     raw = projection[:, :, 0]
     torch.testing.assert_close(transformer._apply_qwen_image21_rotary_emb(raw, freqs), reference(raw), rtol=0, atol=0)
-    result = attention(torch.empty(2, sequence, 4096, device="cuda", dtype=torch.bfloat16), freqs)
+    result = attention(torch.empty(2, sequence, 4096, device=DEVICE_TYPE, dtype=torch.bfloat16), freqs)
     assert observed == [True]
     torch.testing.assert_close(result, projection[:, :, 2].flatten(2), rtol=0, atol=0)

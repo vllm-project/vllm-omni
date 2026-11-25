@@ -53,12 +53,22 @@ def test_custom_sampler_falls_back_to_parent(monkeypatch):
     assert state.custom_sampler(sampler) == (sampler, marker)
 
 
+def test_model_sampler_hook_returning_none_keeps_runner_samplers():
+    # Upstream load_model builds its own sampler and rejection sampler when
+    # custom_sampler returns a falsy value.
+    state = object.__new__(OmniModelState)
+    state.model = SimpleNamespace(mrv2_custom_sampler=lambda sampler: None)
+    assert state.custom_sampler(object()) is None
+
+
 def test_logits_vocab_is_adopted_before_parent_sampler_initialization(monkeypatch):
     import vllm.v1.worker.gpu.model_runner as upstream
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 
     from vllm_omni.worker_v2 import omni_model_runner as module
 
     runner = object.__new__(module.OmniGPUModelRunner)
+    runner.jit_warmup_registry = JitWarmupRegistry(None)
     runner.vocab_size = 100
     runner.req_states = SimpleNamespace(vocab_size=100)
     runner.model_config = SimpleNamespace(model_arch_config=SimpleNamespace(vocab_size=100))
@@ -76,4 +86,41 @@ def test_logits_vocab_is_adopted_before_parent_sampler_initialization(monkeypatc
     monkeypatch.setattr(upstream.GPUModelRunner, "load_model", load)
     with pytest.raises(RuntimeError, match="stop before sampler allocation"):
         runner.load_model()
+    assert upstream.init_model_state is original_initializer
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_load_model_binds_request_rng_model(monkeypatch, mocker, enabled):
+    import vllm.v1.worker.gpu.model_runner as upstream
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+
+    from vllm_omni.worker_v2 import omni_model_runner as module
+
+    class RequestRNGModel(torch.nn.Module):
+        supports_mm_request_rng = enabled
+
+    runner = object.__new__(module.OmniGPUModelRunner)
+    runner.jit_warmup_registry = JitWarmupRegistry(None)
+    runner.use_aux_hidden_state_outputs = False
+    runner.vllm_config = None
+    model = RequestRNGModel()
+    model.bind_mm_rng_provider = mocker.Mock()
+    model.advance_mm_rng = mocker.Mock(side_effect=AssertionError("Loading must not draw request RNG"))
+    original_initializer = upstream.init_model_state
+    model_state = object()
+    monkeypatch.setattr(module, "init_omni_model_state", lambda *args: model_state)
+
+    def load(parent):
+        parent.model = model
+        parent.model_state = upstream.init_model_state(None, model, None, None)
+
+    monkeypatch.setattr(upstream.GPUModelRunner, "load_model", load)
+    runner.load_model()
+    assert runner.model is model and runner.model_state is model_state
+    if enabled:
+        model.bind_mm_rng_provider.assert_called_once_with(runner._mm_rng_state.provider)
+    else:
+        assert runner._mm_rng_state is None
+        model.bind_mm_rng_provider.assert_not_called()
+    model.advance_mm_rng.assert_not_called()
     assert upstream.init_model_state is original_initializer

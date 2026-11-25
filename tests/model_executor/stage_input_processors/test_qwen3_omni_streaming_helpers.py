@@ -353,6 +353,20 @@ def test_thinker2talker_token_only_preserves_voice_metadata() -> None:
     }
 
 
+def test_thinker2talker_token_only_accepts_plain_text_prompt() -> None:
+    source_outputs = [
+        SimpleNamespace(
+            request_id="req-plain-text",
+            prompt_token_ids=[1, 2],
+            outputs=[SimpleNamespace(cumulative_token_ids=[3])],
+        )
+    ]
+
+    [talker_prompt] = q3.thinker2talker_token_only(source_outputs, prompt="What is the capital of China?")
+
+    assert talker_prompt["additional_information"] is None
+
+
 def test_accumulator_replaces_keys_in_replace_set() -> None:
     """REPLACE-key semantics: subsequent emissions of the same key replace, not append."""
     from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -1130,3 +1144,18 @@ def test_talker2code2wav_async_chunk_without_validity_keeps_one_row_contract() -
 
     assert payload is not None  # two frames fill the initial chunk
     assert payload.codes.audio.tolist() == [5, 8, 6, 9, 7, 10]
+
+
+def test_qwen3_omni_resumed_codec_segment_restarts_initial_chunk():
+    request_id = "resumed-codec"
+    manager = _codec_transfer_manager(request_id, initial_frames=2, chunk_frames=4)
+    manager.put_req_chunk[request_id] = 8
+    manager.ramp_chunk_count = {}
+    request = _codec_request(request_id)
+    first = torch.tensor([[11, 12, 13]])
+    second = torch.tensor([[21, 22, 23]])
+
+    assert q3.talker2code2wav_async_chunk(manager, {"codes": {"audio": first}}, request) is None
+    chunk = q3.talker2code2wav_async_chunk(manager, {"codes": {"audio": second}}, request)
+    assert chunk.codes.audio.tolist() == [11, 21, 12, 22, 13, 23]
+    assert chunk.meta.left_context_size == 0

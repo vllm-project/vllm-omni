@@ -6,9 +6,34 @@
 """Fused packed-QKV split + per-head LayerNorm of q/k into the CFM KV cache."""
 
 import torch
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
 from .fused_residual_layer_norm import _use_triton
+
+
+def _use_npu_triton(
+    qkv: torch.Tensor,
+    kv: torch.Tensor,
+    q_norm: torch.nn.LayerNorm,
+    k_norm: torch.nn.LayerNorm,
+    head_dim: int,
+) -> bool:
+    """The NPU path preserves the existing FP32, per-head LayerNorm contract."""
+    if not (HAS_TRITON and qkv.device.type == "npu" and kv.device == qkv.device) or torch.is_grad_enabled():
+        return False
+    if qkv.dtype != torch.float32 or kv.dtype != torch.float32:
+        return False
+    for norm in (q_norm, k_norm):
+        if type(norm) is not torch.nn.LayerNorm or norm.normalized_shape != (head_dim,):
+            return False
+        if (norm.weight is None) != (norm.bias is None):
+            return False
+        for value in (norm.weight, norm.bias):
+            if value is not None and (
+                value.device != qkv.device or value.dtype != torch.float32 or not value.is_contiguous()
+            ):
+                return False
+    return True
 
 
 @triton.jit
@@ -42,6 +67,7 @@ def _qkv_head_layer_norm_kernel(
     stride_qn,
     stride_qh,
     stride_qt,
+    stride_kv2,
     stride_kvn,
     stride_kvh,
     stride_kvt,
@@ -82,7 +108,7 @@ def _qkv_head_layer_norm_kernel(
     tl.store(dst, k, mask=mask)
 
     v = tl.load(src + 2 * inner, mask=mask, other=0.0)
-    tl.store(dst + HEAD_DIM, v, mask=mask)
+    tl.store(dst + stride_kv2, v, mask=mask)
 
 
 def qkv_head_layer_norm(
@@ -96,42 +122,46 @@ def qkv_head_layer_norm(
     rows: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Split packed ``qkv``, LayerNorm q/k per head, write q and interleaved ``kv``."""
+    """Split packed ``qkv``, LayerNorm q/k per head, write q and the split ``kv`` cache."""
     batch, frames, width = (int(dim) for dim in qkv.shape)
     inner = num_heads * head_dim
     if width != 3 * inner or qkv.stride(2) != 1:
         raise ValueError(f"qkv_head_layer_norm: qkv must be (N, T, 3*{inner}) with contiguous channels")
     if (
-        kv.dim() != 4
-        or (rows is None and int(kv.shape[0]) != batch)
-        or int(kv.shape[1]) != num_heads
-        or (positions is None and int(kv.shape[2]) < frames)
-        or int(kv.shape[3]) != 2 * head_dim
-        or kv.stride(3) != 1
+        kv.dim() != 5
+        or (rows is None and int(kv.shape[1]) != batch)
+        or int(kv.shape[2]) != num_heads
+        or (positions is None and int(kv.shape[3]) < frames)
+        or int(kv.shape[4]) != head_dim
+        or kv.stride(4) != 1
     ):
-        raise ValueError(f"qkv_head_layer_norm: kv must be (N, H, >= T, 2*D), got {tuple(kv.shape)}")
+        raise ValueError(f"qkv_head_layer_norm: kv must be (2, N, H, >= T, D), got {tuple(kv.shape)}")
     if rows is not None and tuple(rows.shape) != (batch,):
         raise ValueError(f"qkv_head_layer_norm: rows must be ({batch},), got {tuple(rows.shape)}")
     if positions is not None and (tuple(positions.shape) != (batch, frames) or not positions.is_contiguous()):
         raise ValueError(f"qkv_head_layer_norm: positions must be contiguous ({batch}, {frames})")
     q_out = torch.empty((batch, num_heads, frames, head_dim), device=qkv.device, dtype=qkv.dtype)
 
-    if not _use_triton(qkv):
+    npu_triton = rows is None and positions is None and _use_npu_triton(qkv, kv, q_norm, k_norm, head_dim)
+    if not (_use_triton(qkv) or npu_triton):
         heads = qkv.view(batch, frames, 3, num_heads, head_dim)
         q_out.copy_(q_norm(heads[:, :, 0].transpose(1, 2)))
         keys = k_norm(heads[:, :, 1].transpose(1, 2))
         values = heads[:, :, 2].transpose(1, 2)
         if rows is None and positions is None:
-            kv[:, :, :frames, :head_dim].copy_(keys)
-            kv[:, :, :frames, head_dim:].copy_(values)
+            kv[0, :, :, :frames].copy_(keys)
+            kv[1, :, :, :frames].copy_(values)
             return q_out
         pool_rows = rows.tolist() if rows is not None else range(batch)
+        # ``positions`` rows come from ``flatnonzero`` of the free-frame mask, so
+        # frame targets never repeat; a duplicate would make the winning write
+        # undefined here (last wins) and racy in the parallel Triton kernel.
         for n, pool_row in enumerate(pool_rows):
             frame_index = positions[n] if positions is not None else torch.arange(frames, device=kv.device)
             written = frame_index >= 0
             destination = frame_index[written].to(kv.device)
-            kv[pool_row, :, destination, :head_dim] = keys[n][:, written]
-            kv[pool_row, :, destination, head_dim:] = values[n][:, written]
+            kv[0, pool_row, :, destination] = keys[n][:, written]
+            kv[1, pool_row, :, destination] = values[n][:, written]
         return q_out
     if batch * frames == 0:
         return q_out
@@ -139,6 +169,9 @@ def qkv_head_layer_norm(
     k_weight, k_bias, k_eps = k_norm.weight, k_norm.bias, float(k_norm.eps)
     if (q_weight is None) != (q_bias is None) or (k_weight is None) != (k_bias is None):
         raise ValueError("qkv_head_layer_norm: LayerNorm affine needs both weight and bias")
+    # Keep CUDA's launch policy unchanged. Do not introduce implicit
+    # multiply/add contraction in the NPU normalization epilogue.
+    launch_kwargs = {"enable_fp_fusion": False} if npu_triton else {}
     _qkv_head_layer_norm_kernel[(batch * frames,)](
         q_out,
         kv,
@@ -158,6 +191,7 @@ def qkv_head_layer_norm(
         kv.stride(0),
         kv.stride(1),
         kv.stride(2),
+        kv.stride(3),
         q_eps,
         k_eps,
         HEADS=num_heads,
@@ -169,5 +203,6 @@ def qkv_head_layer_norm(
         HAS_ROWS=rows is not None,
         HAS_POSITIONS=positions is not None,
         num_warps=4,
+        **launch_kwargs,
     )
     return q_out

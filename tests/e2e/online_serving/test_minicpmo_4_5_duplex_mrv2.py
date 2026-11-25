@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Real-weight duplex concurrency guard for CUDA MRv2 and ROCm V1 fallback."""
+"""Real-weight duplex concurrency guard for CUDA and ROCm MRv2 defaults."""
 
 import asyncio
 import json
@@ -25,14 +25,14 @@ pytestmark = [pytest.mark.omni, pytest.mark.advanced_model]
 
 _SERVER = OmniServerParams(
     model=MODEL,
-    stage_config_path=get_deploy_config_path("minicpmo_4_5_duplex_mrv2.yaml"),
+    stage_config_path=get_deploy_config_path("minicpmo_4_5.yaml"),
     use_stage_cli=False,
     server_args=["--trust-remote-code"],
 )
 
-# ``minicpmo_4_5_duplex_mrv2.yaml`` opts CUDA into MRv2, while its production
-# platform override deliberately resolves every ROCm stage to V1. The AMD READY
-# lane executes the resolver contract before selecting these real-weight cases.
+# ``minicpmo_4_5.yaml`` resolves all three stages to MRv2 on CUDA and ROCm.
+# The AMD READY lane executes the resolver contract before selecting these
+# real-weight cases.
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)

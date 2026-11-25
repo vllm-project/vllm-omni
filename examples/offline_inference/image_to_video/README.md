@@ -1,7 +1,7 @@
 # Image-To-Video
 
 This shared example generates videos from images with VACE, Wan2.2, LTX-2,
-HunyuanVideo-1.5, SANA-Video, Cosmos3, MAGI-2, Kandinsky 6, and other compatible pipelines.
+HunyuanVideo-1.5, SANA-Video, Cosmos3, MAGI-2, Kandinsky 6, PAN 2, and other compatible pipelines.
 
 - `image_to_video.py`: command-line script for single video generation with advanced options.
 
@@ -166,6 +166,9 @@ python image_to_video.py \
 
 ### Wan2.2-I2V-A14B-Diffusers (MoE)
 
+Cold one-card loads can exceed the default startup limits, so this example
+allows extra time for the orchestrator and its stages to initialize.
+
 ```bash
 python image_to_video.py \
   --model Wan-AI/Wan2.2-I2V-A14B-Diffusers \
@@ -180,6 +183,8 @@ python image_to_video.py \
   --num-inference-steps 40 \
   --boundary-ratio 0.875 \
   --flow-shift 12.0 \
+  --init-timeout 1200 \
+  --stage-init-timeout 900 \
   --fps 16 \
   --output i2v_wan_moe.mp4
 ```
@@ -234,6 +239,22 @@ python image_to_video.py \
 
 See the [LTX-2 recipe](../../../recipes/LTX/LTX-2.md) for all checkpoints,
 pipeline selection, T2V, defaults, and advanced options.
+
+### PAN 2
+
+```bash
+python image_to_video.py \
+  --model IFM/PAN2 \
+  --image cherry_blossom.jpg \
+  --prompt "Cherry blossoms swaying gently in the breeze, petals drifting across the frame" \
+  --output pan2_i2v_output.mp4
+```
+
+PAN 2 needs a structured prompt; the plain prompt above only shows the command.
+See the [PAN 2 recipe](../../../recipes/IFM/PAN2.md) for details.
+
+PAN 2 runs guardrails by default, which need the `pan2-guardrail` package:
+`pip install git+https://github.com/ifm-ai/pan2-guardrail`.
 
 ### SANA-Video-2B
 

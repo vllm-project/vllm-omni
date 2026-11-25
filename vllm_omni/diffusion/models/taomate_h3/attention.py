@@ -31,6 +31,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -39,6 +40,10 @@ from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D, all_to_all_5D
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
 from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import ARDiffusionSegmentedKVState
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.models.minimax_h3.reference_isolation import MiniMaxH3ReferenceIsolation
+    from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import MiniMaxH3ReferenceKVTier2State
 
 
 class StreamMode(str, Enum):
@@ -155,6 +160,10 @@ class TaoMateH3StreamingAttention(MiniMaxH3Attention):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
+        reference_kv_layer_index: int | None = None,
+        reference_kv_compact: bool = False,
+        reference_isolation: MiniMaxH3ReferenceIsolation | None = None,
         vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         context = _STREAM_CONTEXT.get()
@@ -169,8 +178,16 @@ class TaoMateH3StreamingAttention(MiniMaxH3Attention):
                 sp_seq_lens=sp_seq_lens,
                 video_layout=video_layout,
                 vsa_prefix_segments=vsa_prefix_segments,
+                reference_kv_state=reference_kv_state,
+                reference_kv_layer_index=reference_kv_layer_index,
+                reference_kv_compact=reference_kv_compact,
+                reference_isolation=reference_isolation,
                 vdn_window=vdn_window,
             )
+        if reference_isolation is not None:
+            raise ValueError("TaoMate-H3 streaming attention does not support reference isolation")
+        if reference_kv_state is not None or reference_kv_layer_index is not None or reference_kv_compact:
+            raise ValueError("TaoMate-H3 streaming attention does not support reference KV reuse")
         if vdn_window is not None:
             raise ValueError("TaoMate-H3 streaming attention does not support VDN windows")
         if num_requests != 1:

@@ -163,6 +163,10 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     # Duplex session stats (RFC #8325): [epoch, seq, start_ns, duration_ns] step
     # spans of measured duplex chunks, the producing step's chunk last.
     stage_work: list[list[int]] | None = None
+    # Talker/async-chunk segment identity for this poll. Duplex stamp copies it
+    # onto processed outputs so sentence-TTS park can tell leftover 2150 from
+    # the next utterance. Not the chunk-transfer adapter watermark.
+    segment_generation: int | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

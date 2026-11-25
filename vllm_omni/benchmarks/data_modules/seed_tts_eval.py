@@ -169,7 +169,13 @@ def _jiwer_wer(reference: str, hypothesis: str) -> float:
     """Word-level WER; strings are normalized like ``run_wer.process_one``.
 
     jiwer 4.x removed ``compute_measures`` (``ImportError``); fall back to ``process_words``.
+    Empty references retain jiwer 4.x's insertion count with jiwer 3.x as well.
     """
+    if not reference.strip():
+        from jiwer import wer_default
+
+        return float(sum(len(words) for words in wer_default(hypothesis)))
+
     try:
         from jiwer import compute_measures
 

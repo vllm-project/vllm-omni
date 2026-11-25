@@ -113,6 +113,7 @@ def _run_finished_save_step(mocker, request, *, inter_stage_outputs=None):
     adapter._confirmed_num_computed_tokens.return_value = 1
 
     sched = mocker.MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched.requests = {request.request_id: request}
     sched.perf_metrics = None
     sched.defer_block_free = False
@@ -147,7 +148,6 @@ def _run_finished_save_step(mocker, request, *, inter_stage_outputs=None):
 
     model_runner_output = OmniModelRunnerOutput(
         req_ids=[request.request_id],
-        req_id_to_index={request.request_id: 0},
         sampled_token_ids=[[42]],
         logprobs=None,
         prompt_logprobs_dict={},

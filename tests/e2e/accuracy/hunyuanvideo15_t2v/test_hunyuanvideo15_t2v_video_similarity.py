@@ -13,9 +13,12 @@ import pytest
 from tests.e2e.accuracy.helpers import (
     assert_video_metadata,
     assert_video_similarity_metrics,
+    measure_video_similarity_metrics,
+    model_output_dir,
     probe_binary,
     probe_video,
     send_video_request_with_timeout,
+    write_accuracy_result,
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
@@ -40,7 +43,6 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 WORKSPACE_ROOT = REPO_ROOT.parent
 RUNNER_PATH = REPO_ROOT / "examples" / "offline_inference" / "text_to_video" / "text_to_video.py"
 RESULT_ROOT = Path(__file__).parent / "result"
-ARTIFACT_DIR = RESULT_ROOT / "cat_grass"
 VIDEO_TIMEOUT_SECONDS = 60 * 60
 # A cold MI325 load can spend more than ten minutes reading the seven DiT
 # shards (AMD Buildkite #14270). Bound real hangs without failing that path.
@@ -81,8 +83,8 @@ def _runner_env() -> dict[str, str]:
 
 
 def _artifact_paths() -> tuple[Path, Path]:
-    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    return ARTIFACT_DIR / "online.mp4", ARTIFACT_DIR / "offline.mp4"
+    artifact_dir = model_output_dir(RESULT_ROOT, "cat_grass")
+    return artifact_dir / "online.mp4", artifact_dir / "offline.mp4"
 
 
 def _build_offline_command(*, output_path: Path) -> list[str]:
@@ -209,10 +211,28 @@ def test_hunyuanvideo15_t2v_serving_matches_offline_video_similarity() -> None:
         f"offline_path={offline_path}"
     )
     assert_video_metadata(online_metadata, width=WIDTH, height=HEIGHT, fps=FPS, frame_count=NUM_FRAMES)
+    ssim, psnr = measure_video_similarity_metrics(
+        label="hunyuanvideo15_t2v",
+        online_path=online_path,
+        offline_path=offline_path,
+    )
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="video_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": SSIM_THRESHOLD, "psnr": PSNR_THRESHOLD},
+        extra={
+            "label": "hunyuanvideo15_t2v",
+            "online_video": str(online_path),
+            "offline_video": str(offline_path),
+        },
+    )
     assert_video_similarity_metrics(
         label="hunyuanvideo15_t2v",
         online_path=online_path,
         offline_path=offline_path,
         ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )

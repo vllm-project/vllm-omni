@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import random
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -68,7 +68,7 @@ def test_non_dummy_request_is_not_identified_as_dummy_run():
 
 def test_step_scheduler_separates_full_forward_fallback_from_step_requests():
     scheduler = StepScheduler()
-    scheduler.initialize(SimpleNamespace())
+    scheduler.initialize(OmniDiffusionConfig(diffusion_attention_schedule=None))
     scheduler.max_num_running_reqs = 2
     text_request = _make_request()
     text_request.use_step_execution = False

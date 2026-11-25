@@ -41,6 +41,7 @@ class _VoxCPM2RuntimeConfig:
     enable_profiling: bool = False
     enable_nvtx_profile: bool = False
     enable_loc_dit_layer_nvtx: bool = False
+    enable_torch_compile: bool = True
     enable_loc_dit_fused_qkv: bool = True
     enable_loc_dit_fused_mlp: bool = True
     enable_loc_dit_zero_dt_cache: bool = True
@@ -62,7 +63,7 @@ class _VoxCPM2RuntimeConfig:
     deterministic_cfm_noise: bool = False
     deterministic_cfm_seed: int = 20260601
     audio_emit_every: int = 1
-    vae_decode_every: int = 3
+    vae_decode_every: int = 2
     enable_delayed_audio_copy: bool = False
     delayed_audio_copy_use_events: bool = False
     coalesce_audio_d2h: bool = True
@@ -128,14 +129,6 @@ class _VoxCPM2RuntimeConfig:
             # Incremental unified graphs batch VAE themselves; this flag only
             # controls the legacy latent-cohort collection path.
             cfg = dataclasses.replace(cfg, enable_batched_vae_decode=False)
-        if cfg.enable_batched_vae_decode and (
-            cfg.enable_delayed_audio_copy or cfg.audio_emit_every > 1 or cfg.enable_vae_cuda_graph
-        ):
-            logger.warning(
-                "VoxCPM2 batched VAE decode is incompatible with delayed audio copy, "
-                "audio_emit_every > 1, and VAE CUDA Graph; disabling batched VAE decode."
-            )
-            cfg = dataclasses.replace(cfg, enable_batched_vae_decode=False)
         if cfg.enable_unified_decode_graph:
             if cfg.enable_cfm_cuda_graph:
                 logger.info("VoxCPM2 unified decode graph supersedes independent CFM CUDA Graph; disabling it.")
@@ -147,6 +140,19 @@ class _VoxCPM2RuntimeConfig:
 
     def unified_decode_graph_available(self, *, use_cuda_graph: bool) -> bool:
         return bool(use_cuda_graph and self.enable_unified_decode_graph and not self.deterministic_cfm_noise)
+
+    def effective_batched_vae_decode(self, *, use_cuda_graph: bool) -> bool:
+        """Whether the legacy latent-cohort VAE decoder should run.
+
+        The unified decode graph batches VAE decode itself, so running the legacy
+        collection path next to it corrupts concurrent requests (#9738). Keep the
+        legacy path off whenever that graph can run; where it cannot (non-CUDA
+        platforms, ``deterministic_cfm_noise``, or the flag turned off) the legacy
+        path is the only batched decoder and keeps its configured value.
+        """
+        if self.unified_decode_graph_available(use_cuda_graph=use_cuda_graph):
+            return False
+        return self.enable_batched_vae_decode
 
     @staticmethod
     def _coerce_value(key: str, value: Any, default: Any) -> Any:
@@ -168,8 +174,16 @@ class _VoxCPM2RuntimeConfig:
                 return max(1, value)
             return value
         if isinstance(default, float):
-            if key == "cfg_value" and not math.isfinite(float(value)):
-                raise ValueError("VoxCPM2 cfg_value must be finite.")
+            if key == "cfg_value":
+                # a yaml boolean parses as a Python bool, which float()
+                # silently accepts (true -> 1.0 = CFG effectively off);
+                # reject it before the coercion.
+                if isinstance(value, bool):
+                    raise ValueError(
+                        f"voxcpm2_runtime_config.cfg_value={value!r} must be a positive finite float, not a boolean"
+                    )
+                if not math.isfinite(float(value)):
+                    raise ValueError(f"voxcpm2_runtime_config.cfg_value={value!r} must be finite.")
             if key == "cfg_cutoff_ratio":
                 return min(1.0, max(0.0, float(value)))
             return float(value)

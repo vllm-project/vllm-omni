@@ -123,6 +123,7 @@ QUALITY_CONFIGS = [
         model="Tongyi-MAI/Z-Image-Turbo",
         quantization={
             "method": "fp8",
+            **({"online_block_size": 64} if torch.version.hip else {}),
             "ignored_layers": [
                 "img_mlp",
                 *[

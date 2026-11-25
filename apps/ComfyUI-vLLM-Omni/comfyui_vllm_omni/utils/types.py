@@ -3,7 +3,7 @@
 
 from collections.abc import Callable
 from enum import Enum, auto
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TypeAlias, get_args
 
 from typing_extensions import NotRequired, TypedDict
 
@@ -38,6 +38,19 @@ MAX_REFERENCE_IMAGES = 9
 MAX_REFERENCE_VIDEOS = 3
 MAX_REFERENCE_AUDIOS = 3
 MAX_TOTAL_REFERENCES = 12
+MiniMaxH3ControlType: TypeAlias = Literal["canny", "depth", "hed", "mlsd", "pose", "inpaint"]
+MINIMAX_H3_CONTROL_TYPES = get_args(MiniMaxH3ControlType)
+# Per-upload limit of the server's control, source and mask references.
+MAX_MINIMAX_H3_CONTROL_BYTES = 512 * 2**20
+
+
+class MiniMaxH3Control(TypedDict):
+    control_type: MiniMaxH3ControlType
+    control_context_scale: float
+    control_video: NotRequired[Any]
+    source_video: NotRequired[Any]
+    mask: NotRequired[Any]
+    mask_video: NotRequired[Any]
 
 
 class VideoReferences(dict):
