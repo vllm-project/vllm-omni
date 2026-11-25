@@ -403,7 +403,7 @@ def test_serve_native_checkpoint_validation(model_class, exists, native, tmp_pat
     checkpoint = tmp_path / "anima.safetensors"
     if exists:
         checkpoint.touch()
-    argv = ["serve", str(checkpoint), "--omni"]
+    argv = ["serve", str(checkpoint), "--omni", "--revision", "pinned"]
     if model_class is not None:
         argv.extend(["--model-class-name", model_class])
     args = _parse_serve_args(argv)
@@ -416,7 +416,7 @@ def test_serve_native_checkpoint_validation(model_class, exists, native, tmp_pat
         detect_model.assert_not_called()
         validate_llm.assert_not_called()
     else:
-        detect_model.assert_called_once_with(str(checkpoint))
+        detect_model.assert_called_once_with(str(checkpoint), revision="pinned")
         validate_llm.assert_called_once_with(args)
 
 

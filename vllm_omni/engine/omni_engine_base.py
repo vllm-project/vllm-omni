@@ -255,6 +255,7 @@ class OmniEngineBase:
             model=model,
             trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
+            revision=kwargs.get("revision"),
         )
         self.pipeline_config = pipeline_config
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
