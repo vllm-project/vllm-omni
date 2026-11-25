@@ -490,3 +490,37 @@ def test_text_layers_share_position_embeddings(dtype, multimodal):
     )
     for actual, reference in zip((q, k), expected):
         torch.testing.assert_close(actual, reference.flatten(1), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tokens", [1, 7])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_packed_qk_rotation_preserves_attention_inputs(tokens, dtype):
+    dim, q_heads, kv_heads = 128, 4, 2
+    q_size, kv_size = q_heads * dim, kv_heads * dim
+    proj = torch.randn(tokens, q_size + 2 * kv_size, dtype=dtype)
+    q, k, v = proj.split((q_size, kv_size, kv_size), dim=-1)
+    rope = GlmImageRotaryEmbedding(head_dim=dim, partial_rotary_factor=0.5, mrope_section=[8, 12, 12])
+    positions = torch.arange(3 * tokens).reshape(3, tokens)
+    cos, sin = rope.get_cos_sin(positions, dtype)
+
+    def reference(x):
+        x = x.unflatten(-1, (-1, dim))
+        first, second = x[..., :64].chunk(2, dim=-1)
+        rotated = x[..., :64] * cos[:, None] + torch.cat((-second, first), dim=-1) * sin[:, None]
+        return torch.cat((rotated, x[..., 64:]), dim=-1).flatten(1)
+
+    def attention(query, key, value):
+        assert query.is_contiguous() and key.is_contiguous()
+        for actual, expected in ((query, reference(q)), (key, reference(k)), (value, v)):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        return query
+
+    module = types.SimpleNamespace(
+        head_dim=dim,
+        q_size=q_size,
+        kv_size=kv_size,
+        qkv_proj=lambda hidden: (proj, None),
+        attn=attention,
+        o_proj=lambda hidden: (hidden, None),
+    )
+    _ar_mod.GlmImageTextAttention.forward(module, (cos, sin), proj)

@@ -1323,44 +1323,21 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Rotate the leading rotary dimensions of each head, preserving its remaining channels."""
+    rotary_dim = cos.shape[-1]
+    rotated = x[..., :rotary_dim]
+    rotated = rotated * cos.unsqueeze(1) + rotate_half(rotated) * sin.unsqueeze(1)
+    return torch.cat((rotated, x[..., rotary_dim:]), dim=-1)
+
+
 def apply_glm_image_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply GLM-Image rotary position embedding to query and key tensors.
-
-    Args:
-        q: Query tensor [num_tokens, num_heads, head_dim]
-        k: Key tensor [num_tokens, num_kv_heads, head_dim]
-        cos: Cosine values [num_tokens, rotary_dim]
-        sin: Sine values [num_tokens, rotary_dim]
-
-    Returns:
-        Tuple of (rotated_q, rotated_k) with same shapes as input
-    """
-    # cos/sin shape: [num_tokens, rotary_dim]
-    # Need to unsqueeze for broadcasting with heads dimension
-    cos = cos.unsqueeze(1)  # [num_tokens, 1, rotary_dim]
-    sin = sin.unsqueeze(1)  # [num_tokens, 1, rotary_dim]
-
-    rotary_dim = cos.shape[-1]
-
-    # Split into rotary and pass-through parts
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-    # Apply rotary embeddings
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
-
-    # Concatenate back
-    q_embed = torch.cat([q_embed, q_pass], dim=-1)
-    k_embed = torch.cat([k_embed, k_pass], dim=-1)
-
-    return q_embed, k_embed
+    return _apply_rotary(q, cos, sin), _apply_rotary(k, cos, sin)
 
 
 class GlmImageRotaryEmbedding(nn.Module):
@@ -1559,9 +1536,11 @@ class GlmImageTextAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = _rotate_qk(q, k, position_embeddings, self.head_dim)
-        attn_output = self.attn(q, k, v)
+        # Q and K are adjacent in the projection and use the same rotation on every head.
+        qk, v = qkv.split([self.q_size + self.kv_size, self.kv_size], dim=-1)
+        qk = _apply_rotary(qk.unflatten(-1, (-1, self.head_dim)), *position_embeddings).flatten(1)
+        q, k = qk.split([self.q_size, self.kv_size], dim=-1)
+        attn_output = self.attn(q.contiguous(), k.contiguous(), v)
         output, _ = self.o_proj(attn_output)
         return output
 
