@@ -191,6 +191,38 @@ def test_residency_budget_keeps_one_physical_storage(patched_runtime):
     torch.testing.assert_close(left.weight, torch.arange(8, dtype=torch.float32).reshape(2, 4))
 
 
+@pytest.mark.parametrize("master_dtype", [torch.uint8, torch.float32])
+def test_residency_budget_counts_bytes_not_elements(patched_runtime, monkeypatch, master_dtype):
+    left, right = _aliased_modules()
+    storage_bytes = left.weight.untyped_storage().nbytes()
+    budget = storage_bytes // 2
+    assert storage_bytes // left.weight.element_size() < budget < storage_bytes
+
+    snapshot_groups = PinnedModuleStager._snapshot_groups
+
+    def snapshot_with_dtype(*args, **kwargs):
+        groups = snapshot_groups(*args, **kwargs)
+        # Simulate an alternative typed master of the same physical storage.
+        for group in groups:
+            group.master = group.master.view(master_dtype)
+        return groups
+
+    monkeypatch.setattr(PinnedModuleStager, "_snapshot_groups", staticmethod(snapshot_with_dtype))
+    stager = PinnedModuleStager(
+        [left, right],
+        torch.device("cpu"),
+        pin_memory=False,
+        include_buffers=False,
+        resident_weight_bytes=budget,
+    )
+
+    stager.load()
+    stager.offload()
+
+    assert not stager._resident_storages
+    assert not stager._device_storages
+
+
 def test_failed_load_restores_master_and_forces_cache_release(monkeypatch, patched_runtime, mocker):
     module = nn.Linear(2, 2)
     expected = module.weight.detach().clone()

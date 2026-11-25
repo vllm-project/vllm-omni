@@ -488,11 +488,12 @@ class PinnedModuleStager:
         self._resident_storages: dict[int, torch.Tensor] = {}
         if resident_weight_bytes:
             remaining = resident_weight_bytes
-            sizes = [group.master.numel() for group in self._groups]
-            for index in sorted(range(len(sizes)), key=sizes.__getitem__, reverse=True):
-                if 0 < sizes[index] <= remaining:
+            # Count the bytes of each master's view, including when it shares a packed slab.
+            sizes_bytes = [group.master.numel() * group.master.element_size() for group in self._groups]
+            for index in sorted(range(len(sizes_bytes)), key=sizes_bytes.__getitem__, reverse=True):
+                if 0 < sizes_bytes[index] <= remaining:
                     self._resident_indices.append(index)
-                    remaining -= sizes[index]
+                    remaining -= sizes_bytes[index]
             logger.info(
                 "Model-level offload can retain %d bytes for %s between swaps",
                 resident_weight_bytes - remaining,
