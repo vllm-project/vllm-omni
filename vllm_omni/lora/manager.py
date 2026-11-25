@@ -28,11 +28,13 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVPar
 from vllm_omni.lora.binding import (
     MOE_LORA_UNAVAILABLE_ERROR,
     _expand_expected_modules_for_packed_layers,
-    _match_target_modules,
+    build_target_module_matcher,
     detach_moe_lora_context,
     from_layer,
     moe_lora_kernel_requires_context,
+    normalize_target_modules,
 )
+from vllm_omni.lora.capability import MergedLoRASpec, resolve_merged_lora_spec
 from vllm_omni.lora.merged_weights import MergedLinearWeights
 from vllm_omni.lora.request import TensorLoRARequest
 from vllm_omni.lora.utils import round_lora_scale, stable_lora_int_id
@@ -129,6 +131,7 @@ class LoRAManager:
     _max_num_batched_tokens: int | None = None
     lora_application: str = "runtime"
     _merged_bank: MergedLinearWeights | None = None
+    _merged_spec: MergedLoRASpec | None = None
     _defer_moe_wrap: bool = False
 
     def __init__(
@@ -160,6 +163,7 @@ class LoRAManager:
         self.lora_application = lora_application
         self.dtype = torch.float32 if lora_application == "merged" else dtype
         self._merged_bank = MergedLinearWeights() if lora_application == "merged" else None
+        self._merged_spec = self._resolve_merged_spec() if lora_application == "merged" else None
         if max_num_batched_tokens is not None and (
             type(max_num_batched_tokens) is not int or max_num_batched_tokens <= 0
         ):
@@ -349,6 +353,10 @@ class LoRAManager:
 
         return supported
 
+    def _resolve_merged_spec(self) -> MergedLoRASpec:
+        """Resolve and validate the merged-LoRA capability contract."""
+        return resolve_merged_lora_spec(self.pipeline, stage="diffusion")
+
     def _compute_packed_modules_mapping(self) -> dict[str, list[str]]:
         """Collect packed->sublayer mappings from the model.
 
@@ -360,6 +368,8 @@ class LoRAManager:
         mapping in multiple places, we derive packed→sublayer mappings from the
         model's `stacked_params_mapping`.
         """
+        if self._merged_spec is not None:
+            return {name: list(parts) for name, parts in self._merged_spec.packed_modules_mapping.items()}
 
         def _derive_from_stacked_params_mapping(stacked: object) -> dict[str, list[str]]:
             if not isinstance(stacked, (list, tuple)):
@@ -815,12 +825,28 @@ class LoRAManager:
                 raise ValueError("TensorLoRARequest requires lora_application='merged'")
             if not lora_request.lora_tensors or not lora_request.peft_config:
                 raise ValueError("TensorLoRARequest requires lora_tensors and peft_config")
-            peft_helper = PEFTHelper.from_dict(lora_request.peft_config)
+            if not isinstance(lora_request.peft_config, dict):
+                raise ValueError(
+                    f"TensorLoRARequest.peft_config must be a dict, got {type(lora_request.peft_config).__name__}"
+                )
+            # Normalize target_modules once at ingest (fail-closed) before
+            # handing off to upstream's pass-through PEFTHelper.from_dict.
+            normalized_peft_config = dict(lora_request.peft_config)
+            normalized_peft_config["target_modules"] = normalize_target_modules(
+                normalized_peft_config.get("target_modules"),
+                allow_none=False,
+            )
+            peft_helper = PEFTHelper.from_dict(normalized_peft_config)
             peft_helper.validate_legal(
                 LoRAConfig(max_lora_rank=self._get_smallest_valid_max_rank(peft_helper.r), lora_dtype=self.dtype)
             )
             if peft_helper.modules_to_save:
                 raise ValueError("Merged LoRA supports A/B adapters only, without modules_to_save")
+            weights_mapper = (
+                self._merged_spec.weights_mapper
+                if self._merged_spec is not None
+                else getattr(self.pipeline, "hf_to_vllm_mapper", None)
+            )
             lora_model = LoRAModel.from_lora_tensors(
                 lora_model_id=lora_request.lora_int_id,
                 tensors={
@@ -830,7 +856,7 @@ class LoRAManager:
                 peft_helper=peft_helper,
                 device="cpu",
                 dtype=self.dtype,
-                weights_mapper=getattr(self.pipeline, "hf_to_vllm_mapper", None),
+                weights_mapper=weights_mapper,
             )
             for weights in lora_model.loras.values():
                 if weights.lora_a is None or weights.lora_b is None:
@@ -918,6 +944,15 @@ class LoRAManager:
         denoiser is not scanned, adapters can load while applying to zero
         layers and produce base-identical output.
         """
+        if self._merged_spec is not None:
+            for component_name in self._merged_spec.components:
+                if component_name == "":
+                    yield "", self.pipeline
+                elif hasattr(self.pipeline, component_name):
+                    component = getattr(self.pipeline, component_name)
+                    if isinstance(component, nn.Module):
+                        yield component_name, component
+            return
         default_components = (
             "transformer",
             "transformer_2",
@@ -932,27 +967,25 @@ class LoRAManager:
             if isinstance(component, nn.Module):
                 yield component_name, component
 
+    def _get_lora_name_aliases(self, full_module_name: str) -> list[str]:
+        name_aliases = (
+            self._merged_spec.name_aliases
+            if self._merged_spec is not None
+            else getattr(self.pipeline, "_get_diffusion_lora_name_aliases", None)
+        )
+        if callable(name_aliases):
+            return list(name_aliases(full_module_name) or ())
+        return []
+
     def _validate_adapter_targets(self, peft_helper: PEFTHelper) -> None:
         """Reject MoE adapters before cache or layer state is mutated."""
         if self._max_num_batched_tokens is not None:
             return
 
-        target_modules = getattr(peft_helper, "target_modules", None)
-        target_modules_list: list[str] | None = None
-        target_modules_pattern: str | None = None
-        if isinstance(target_modules, str) and target_modules:
-            target_modules_pattern = target_modules
-        elif isinstance(target_modules, list) and target_modules:
-            target_modules_list = target_modules
-
-        def _matches_target(module_name: str) -> bool:
-            if target_modules_pattern is not None:
-                import regex as re
-
-                return re.search(target_modules_pattern, module_name) is not None
-            if target_modules_list is None:
-                return True
-            return _match_target_modules(module_name, target_modules_list)
+        _matches_target, _ = build_target_module_matcher(
+            getattr(peft_helper, "target_modules", None),
+            allow_none=self.lora_application != "merged",
+        )
 
         from vllm.model_executor.layers.fused_moe import MoERunner
 
@@ -970,22 +1003,10 @@ class LoRAManager:
         self._validate_adapter_targets(peft_helper)
         self._ensure_max_lora_rank(peft_helper.r)
 
-        target_modules = getattr(peft_helper, "target_modules", None)
-        target_modules_list: list[str] | None = None
-        target_modules_pattern: str | None = None
-        if isinstance(target_modules, str) and target_modules:
-            target_modules_pattern = target_modules
-        elif isinstance(target_modules, list) and target_modules:
-            target_modules_list = target_modules
-
-        def _matches_target(module_name: str) -> bool:
-            if target_modules_pattern is not None:
-                import regex as re
-
-                return re.search(target_modules_pattern, module_name) is not None
-            if target_modules_list is None:
-                return True
-            return _match_target_modules(module_name, target_modules_list)
+        _matches_target, is_filtered = build_target_module_matcher(
+            getattr(peft_helper, "target_modules", None),
+            allow_none=self.lora_application != "merged",
+        )
 
         # dummy lora config
         lora_config = LoRAConfig(
@@ -1034,15 +1055,21 @@ class LoRAManager:
                 if is_moe_runner:
                     moe_target_names = _moe_lora_target_names(full_module_name, module)
 
-                if target_modules_pattern is not None or target_modules_list is not None:
+                if is_filtered:
                     should_replace = _matches_target(full_module_name)
+                    if not should_replace:
+                        should_replace = any(
+                            _matches_target(alias) for alias in self._get_lora_name_aliases(full_module_name)
+                        )
                     if not should_replace and len(packed_modules_list) > 1:
                         prefix, _, packed_suffix = full_module_name.rpartition(".")
                         sub_suffixes = self._get_packed_sublayer_suffixes(packed_suffix, len(packed_modules_list))
                         if sub_suffixes is not None:
                             for sub_suffix in sub_suffixes:
                                 sub_full_name = f"{prefix}.{sub_suffix}" if prefix else sub_suffix
-                                if _matches_target(sub_full_name):
+                                if _matches_target(sub_full_name) or any(
+                                    _matches_target(alias) for alias in self._get_lora_name_aliases(sub_full_name)
+                                ):
                                     should_replace = True
                                     break
                     if not should_replace and moe_target_names is not None:
@@ -1226,15 +1253,12 @@ class LoRAManager:
         if lora_weights is not None:
             return lora_weights
 
-        # Model-scoped namespace aliases. HunyuanImage-3 registers the DiT
-        # under ``transformer.layers.*`` (``self.transformer`` aliases
-        # ``self.model``) while PEFT adapters use ``model.layers.*``.
-        name_aliases = getattr(self.pipeline, "_get_diffusion_lora_name_aliases", None)
-        if callable(name_aliases):
-            for alias in name_aliases(full_module_name) or []:
-                lora_weights = lora_model.get_lora(alias)
-                if lora_weights is not None:
-                    return lora_weights
+        # Model-scoped namespace aliases (declared on MergedLoRASpec or the
+        # pipeline's _get_diffusion_lora_name_aliases hook).
+        for alias in self._get_lora_name_aliases(full_module_name):
+            lora_weights = lora_model.get_lora(alias)
+            if lora_weights is not None:
+                return lora_weights
 
         return None
 
@@ -1287,7 +1311,11 @@ class LoRAManager:
                 raise ValueError(f"LoRA factor shapes require A[rank, {base.input_size}] and B[{rows}, rank]")
 
     def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> None:
-        binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
+        binding_validator = (
+            self._merged_spec.validate_binding
+            if self._merged_spec is not None
+            else getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
+        )
         # Track successful bindings for generic and model-specific validation.
         lora_names_by_id = {id(weights): name for name, weights in lora_model.loras.items()}
         bound_lora_names: set[str] = set()
@@ -1411,7 +1439,11 @@ class LoRAManager:
                 # [all Q, all K, all V] the QKV output slices expect. The
                 # checkpoint sizes exclude replicated KV heads; set_lora()
                 # selects the appropriate Q shard and shared KV shard.
-                deinterleave = getattr(self.pipeline, "_deinterleave_fused_qkv_lora_b", None)
+                deinterleave = (
+                    self._merged_spec.deinterleave_fused_qkv_lora_b
+                    if self._merged_spec is not None
+                    else getattr(self.pipeline, "_deinterleave_fused_qkv_lora_b", None)
+                )
                 if isinstance(getattr(lora_layer, "base_layer", None), QKVParallelLinear) and callable(deinterleave):
                     deinterleaved = deinterleave(lora_weights.lora_b)
                     base = lora_layer.base_layer
