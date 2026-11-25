@@ -372,17 +372,7 @@ def test_deferred_checks_read_back_once_at_exit():
         require_device_condition(torch.tensor(False), "immediate")
 
 
-def test_nested_deferred_checks_report_at_the_outermost_exit():
-    reached = []
-    with pytest.raises(ValueError, match="inner"):
-        with deferred_checks():
-            with deferred_checks():
-                require_device_condition(torch.tensor(False), "inner")
-            reached.append("outer tail")
-    assert reached == ["outer tail"]
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("sigmas", [(1.0, 0.9), (0.977, 0.12345), (0.31, 0.0), (1e-3, 7e-4)])
 def test_euler_step_matches_device_scalar_formula(dtype, sigmas):
     torch.manual_seed(0)

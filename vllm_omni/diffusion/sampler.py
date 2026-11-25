@@ -28,11 +28,7 @@ _deferred_conditions: ContextVar[list[tuple[torch.Tensor, str]] | None] = Contex
 
 
 def require_device_condition(condition: torch.Tensor, message: str) -> None:
-    """Raise ValueError(message) unless the 0-d bool tensor ``condition`` holds.
-
-    Inside ``deferred_checks()`` the host readback waits until the block exits, so a
-    sampling loop does not stall the device at every check.
-    """
+    """Raise ValueError(message) unless the 0-d bool tensor holds; inside ``deferred_checks()``, at block exit."""
     pending = _deferred_conditions.get()
     if pending is None:
         if not bool(condition.item()):
@@ -43,14 +39,8 @@ def require_device_condition(condition: torch.Tensor, message: str) -> None:
 
 @contextmanager
 def deferred_checks():
-    """Read ``require_device_condition`` checks back once, when the block exits.
-
-    Unlike a plain ``sample()`` call, a failing check inside the block no longer stops the
-    step before its state is published: use it only where a failure abandons the request.
-    """
-    if _deferred_conditions.get() is not None:
-        yield
-        return
+    """Read checks back once at block exit. A failing check no longer stops its step, so use this only where a
+    failure abandons the request."""
     pending: list[tuple[torch.Tensor, str]] = []
     token = _deferred_conditions.set(pending)
     try:
