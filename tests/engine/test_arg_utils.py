@@ -876,7 +876,7 @@ DIFFUSION_PARALLEL_KNBS = [
     ("ulysses_mode", "advanced_uaa"),
     ("ulysses_a2a_permute", True),
     ("ulysses_overlap_chunks", 2),
-    ("ulysses_a2a_backend", "flashinfer"),
+    ("ulysses_a2a_backend", "copy_engine"),
     ("ring_degree", 2),
     ("allgather_degree", 8),
     ("use_hsdp", True),

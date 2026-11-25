@@ -36,7 +36,7 @@ def test_default_does_not_build_optional_extension(monkeypatch, parallel_context
     unavailable.assert_not_called()
 
 
-@pytest.mark.parametrize("backend", ["nccl", "copy_engine", "flashinfer"])
+@pytest.mark.parametrize("backend", ["nccl", "copy_engine", "copy_engine_overlap"])
 @pytest.mark.parametrize("allgather", [1, 2])
 def test_explicit_backend_is_forwarded(monkeypatch, parallel_context, backend, allgather):
     parallel_context.ulysses_a2a_backend = backend

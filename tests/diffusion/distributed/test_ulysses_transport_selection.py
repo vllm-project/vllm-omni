@@ -23,14 +23,13 @@ MiB = 1024 * 1024
 # The shipped tables, captured before the fixture below swaps in synthetic ones.
 _SHIPPED_TABLES = {
     name: getattr(ulysses_transport_tables, name)
-    for name in ("FLASHINFER_MIN_BYTES", "COPY_ENGINE_MIN_BYTES", "COPY_ENGINE_OVERLAP_MIN_CHUNK_BYTES")
+    for name in ("COPY_ENGINE_MIN_BYTES", "COPY_ENGINE_OVERLAP_MIN_CHUNK_BYTES")
 }
 
 
 @pytest.fixture(autouse=True)
 def measured_tables(monkeypatch):
     """Synthetic tables so the tests do not depend on the measured values."""
-    monkeypatch.setattr(ulysses_transport_tables, "FLASHINFER_MIN_BYTES", {"10.0": {8: 32 * MiB}})
     monkeypatch.setattr(ulysses_transport_tables, "COPY_ENGINE_MIN_BYTES", {"10.0": {2: MiB, 4: MiB, 8: MiB}})
     monkeypatch.setattr(
         ulysses_transport_tables, "COPY_ENGINE_OVERLAP_MIN_CHUNK_BYTES", {"10.0": {2: 4 * MiB, 4: 4 * MiB}}
@@ -38,9 +37,7 @@ def measured_tables(monkeypatch):
 
 
 def _topology(world_size=2, **overrides):
-    values = dict(
-        cuda=True, single_node=True, nvlink=True, p2p=True, capability="10.0", symmetric_memory=True, flashinfer=True
-    )
+    values = dict(cuda=True, single_node=True, nvlink=True, p2p=True, capability="10.0", symmetric_memory=True)
     values.update(overrides)
     return UlyssesTopology(world_size, **values)
 
@@ -54,9 +51,9 @@ def _plan(topology, heads=28, invariant=True, pure_strict=True, chunks=0):
 @pytest.mark.parametrize(
     "world_size, heads, expected",
     [
-        (2, 28, UlyssesTransportPlan(None, MiB, 14, 4 * MiB)),
-        (4, 14, UlyssesTransportPlan(None, MiB, 7, 4 * MiB)),
-        (8, 7, UlyssesTransportPlan(32 * MiB, MiB, 0, 0)),
+        (2, 28, UlyssesTransportPlan(MiB, 14, 4 * MiB)),
+        (4, 14, UlyssesTransportPlan(MiB, 7, 4 * MiB)),
+        (8, 7, UlyssesTransportPlan(MiB, 0, 0)),
     ],
 )
 def test_measured_entries_enable_transports(world_size, heads, expected):
@@ -89,7 +86,7 @@ def test_shipped_sm90_rows_pick_the_copy_engine_for_h3_only(monkeypatch, world_s
     topology = _topology(world_size, capability="9.0")
     reasons = eligible_transports(topology, pure_strict=True)
     assert reasons["copy_engine"] is None
-    assert "not measured" in reasons["flashinfer"] and "not measured" in reasons["copy_engine_overlap"]
+    assert "not measured" in reasons["copy_engine_overlap"]
     plan = _plan(topology, heads=56 // world_size)
     assert plan.exchange(int(h3_q_mib * MiB)) == "copy_engine"
     assert plan.exchange(int(h3_q_mib * MiB) // 4) == "nccl"  # smaller messages were not measured on sm9.0
@@ -100,10 +97,7 @@ def test_unmeasured_world_size_is_not_eligible():
     assert reasons == dict.fromkeys(reasons, "not measured for sm10.0 x 3 GPUs")
 
 
-def test_missing_libraries_disable_only_their_transport():
-    reasons = eligible_transports(_topology(8, flashinfer=False), pure_strict=True)
-    assert reasons["flashinfer"] == "FlashInfer UlyssesCommunicator unavailable"
-    assert reasons["copy_engine"] is None
+def test_missing_symmetric_memory_disables_the_copy_engine():
     reasons = eligible_transports(_topology(2, symmetric_memory=False), pure_strict=True)
     assert reasons["copy_engine"] == reasons["copy_engine_overlap"] == "no symmetric memory"
 
@@ -119,9 +113,7 @@ def test_overlap_chunk_count(heads, requested, chunks):
 
 
 def test_dispatch_falls_through_by_message_size():
-    plan = UlyssesTransportPlan(flashinfer_min_bytes=32 * MiB, copy_engine_min_bytes=MiB)
-    assert plan.exchange(64 * MiB) == "flashinfer"
-    assert plan.exchange(64 * MiB, flashinfer_ok=False) == "copy_engine"
+    plan = UlyssesTransportPlan(copy_engine_min_bytes=MiB)
     assert plan.exchange(8 * MiB) == "copy_engine"
     assert plan.exchange(MiB // 2) == "nccl"
     overlap = UlyssesTransportPlan(copy_engine_min_bytes=0, overlap_chunks=14, overlap_min_chunk_bytes=4 * MiB)
@@ -133,7 +125,6 @@ def test_dispatch_falls_through_by_message_size():
     [
         ("nccl", UlyssesTransportPlan()),
         ("copy_engine", UlyssesTransportPlan(copy_engine_min_bytes=0)),
-        ("flashinfer", UlyssesTransportPlan(flashinfer_min_bytes=0, copy_engine_min_bytes=0)),
         ("copy_engine_overlap", UlyssesTransportPlan(copy_engine_min_bytes=0, overlap_chunks=14)),
     ],
 )
@@ -162,7 +153,7 @@ class _CudaPlatform(UnspecifiedOmniPlatform):
     _omni_enum = OmniPlatformEnum.CUDA
 
 
-def _probe(monkeypatch, *, hosts_differ=False, nvlink=True, remote_features=(1, 1, 1, 100, 1, 1)):
+def _probe(monkeypatch, *, hosts_differ=False, nvlink=True, remote_features=(1, 1, 1, 100, 1)):
     local_uuid, peer_uuid = uuid.uuid4(), uuid.uuid4()
     host = ulysses_transport.zlib.crc32(ulysses_transport.socket.gethostname().encode()) & 0x7FFFFFFF
     fake = _FakeDist([host, host + 1 if hosts_differ else host], [local_uuid, peer_uuid], list(remote_features))
@@ -179,17 +170,16 @@ def _probe(monkeypatch, *, hosts_differ=False, nvlink=True, remote_features=(1, 
     monkeypatch.setattr(ulysses_transport, "_nvlink_all_pairs", lambda uuids: checked.append(uuids) or nvlink)
     monkeypatch.setattr(ulysses_transport, "_peer_access", lambda device, uuids: True)
     monkeypatch.setattr(ulysses_transport, "_symmetric_memory_available", lambda: True)
-    monkeypatch.setattr(ulysses_transport, "_flashinfer_available", lambda: True)
     monkeypatch.setattr(ulysses_transport, "_TOPOLOGIES", {})
     topology = ulysses_transport.probe_ulysses_topology(SimpleNamespace(group_name="ulysses"), 2)
     return topology, checked, (local_uuid, peer_uuid)
 
 
 def test_probe_checks_every_pair_and_agrees_on_the_weakest_rank(monkeypatch):
-    topology, checked, uuids = _probe(monkeypatch, remote_features=(1, 1, 1, 100, 1, 0))
+    topology, checked, uuids = _probe(monkeypatch, remote_features=(1, 1, 1, 100, 0))
     assert checked == [[f"GPU-{u}" for u in uuids]]
-    # The peer lacks FlashInfer, so neither rank selects it.
-    assert topology == _topology(2, flashinfer=False)
+    # The peer lacks symmetric memory, so neither rank selects the copy engines.
+    assert topology == _topology(2, symmetric_memory=False)
 
 
 def test_probe_detects_multi_node_groups(monkeypatch):
@@ -199,7 +189,7 @@ def test_probe_detects_multi_node_groups(monkeypatch):
 
 
 def test_probe_takes_the_lowest_compute_capability(monkeypatch):
-    topology, _, _ = _probe(monkeypatch, remote_features=(1, 1, 1, 90, 1, 1))
+    topology, _, _ = _probe(monkeypatch, remote_features=(1, 1, 1, 90, 1))
     assert topology.capability == "9.0"
 
 
@@ -292,11 +282,10 @@ def test_auto_logs_dispatch_order_once(monkeypatch):
     plan, messages = _resolve("auto", monkeypatch, _topology(2))
     assert plan.overlap_chunks == 14
     assert messages == [
-        ("warning", "Ulysses a2a transport 'flashinfer' disabled on group 'sp0': not measured for sm10.0 x 2 GPUs"),
         (
             "info",
             "Using ['copy_engine_overlap', 'copy_engine', 'nccl'] Ulysses a2a transports (in dispatch order) "
-            "for group 'sp0' out of potential: ['flashinfer', 'copy_engine_overlap', 'copy_engine', 'nccl']",
+            "for group 'sp0' out of potential: ['copy_engine_overlap', 'copy_engine', 'nccl']",
         ),
     ]
 

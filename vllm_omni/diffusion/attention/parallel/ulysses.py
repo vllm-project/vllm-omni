@@ -21,7 +21,6 @@ from vllm_omni.diffusion.distributed.packed_qkv import (
     packed_qkv_eligible,
 )
 from vllm_omni.diffusion.distributed.ulysses_transport import (
-    FLASHINFER,
     NCCL,
     UlyssesTransportPlan,
     explicit_plan,
@@ -280,7 +279,6 @@ class UlyssesParallelAttention:
         # Every rank must use the same setting. Unsupported layouts keep their
         # existing exchange, and explicit symmetric memory takes precedence.
         self._packed_qkv = not ulysses_a2a_permute and envs.VLLM_OMNI_PACKED_QKV
-        self._flashinfer_a2a = transports.flashinfer_min_bytes is not None
         if ulysses_a2a_permute:
             from vllm_omni.diffusion.distributed.a2a_permute import (
                 ensure_a2a_permute_available,
@@ -296,10 +294,6 @@ class UlyssesParallelAttention:
             )
             if _a2a_permute_enabled(ulysses_a2a_permute, scatter_idx, gather_idx, sp_group.ulysses_world_size):
                 ensure_a2a_permute_available()
-                if self._flashinfer_a2a:
-                    from vllm_omni.diffusion.distributed.flashinfer_ulysses import ensure_flashinfer_ulysses_available
-
-                    ensure_flashinfer_ulysses_available()
 
     @property
     def enabled(self) -> bool:
@@ -585,28 +579,21 @@ class UlyssesParallelAttention:
                 self._gather_idx,
                 ulysses_world_size,
             ):
-                a2a_transport = self._transports.exchange(
-                    query.numel() * query.element_size(), flashinfer_ok=gate_compress is None
-                )
+                a2a_transport = self._transports.exchange(query.numel() * query.element_size())
             if a2a_transport != NCCL:
                 # Keep optional transports lazy so default Ulysses does not
                 # require the CUDA symmetric-memory or Triton backends.
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd, ulysses_qkv_fwd_group
 
                 group_name = self._ulysses_pg.group_name
-                if a2a_transport == FLASHINFER:
-                    from vllm_omni.diffusion.distributed.flashinfer_ulysses import ulysses_fi_qkv
-
-                    query, key, value = ulysses_fi_qkv(query, key, value, group_name, ulysses_world_size)
-                else:
-                    # Q/K/V come back as views of the shared workspace; attention
-                    # consumes them before the output exchange reuses it. Exchange
-                    # the gate first, since it is copied out and stored in metadata.
-                    if gate_compress is not None:
-                        gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
-                    query, key, value = ulysses_qkv_fwd_group(
-                        query, key, value, group_name, ulysses_world_size, zero_copy=True
-                    )
+                # Q/K/V come back as views of the shared workspace; attention
+                # consumes them before the output exchange reuses it. Exchange
+                # the gate first, since it is copied out and stored in metadata.
+                if gate_compress is not None:
+                    gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
+                query, key, value = ulysses_qkv_fwd_group(
+                    query, key, value, group_name, ulysses_world_size, zero_copy=True
+                )
                 if self._use_sync:
                     current_omni_platform.synchronize()
             elif (
@@ -793,10 +780,7 @@ class UlyssesParallelAttention:
         if ctx.use_packed_qkv:
             return packed_output_all_to_all(ctx.ulysses_pg, attn_output, ctx.use_sync)
         if ctx.a2a_transport != NCCL:
-            if ctx.a2a_transport == FLASHINFER:
-                from vllm_omni.diffusion.distributed.flashinfer_ulysses import ulysses_fi_o as ulysses_o_rev
-            else:
-                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
+            from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
 
             output = ulysses_o_rev(
                 attn_output,

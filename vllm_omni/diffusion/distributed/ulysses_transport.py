@@ -6,7 +6,7 @@ Follows vLLM's all-reduce selection (``CudaCommunicator`` with custom / symmetri
 transport checks its eligibility on the Ulysses group (CUDA, one node, NVLink between every GPU pair, peer access,
 compute capability and world size present in the measured tables, its library importable) and is disabled with a
 logged reason otherwise. Each call then dispatches by message size through a fixed chain, using the first transport
-whose gate passes: FlashInfer -> copy-engine overlap -> copy engine -> NCCL. Explicit backends skip the checks.
+whose gate passes: copy-engine overlap -> copy engine -> NCCL. Explicit backends skip the checks.
 """
 
 from __future__ import annotations
@@ -28,8 +28,7 @@ logger = init_logger(__name__)
 NCCL = "nccl"
 COPY_ENGINE = "copy_engine"
 COPY_ENGINE_OVERLAP = "copy_engine_overlap"
-FLASHINFER = "flashinfer"
-DISPATCH_ORDER = (FLASHINFER, COPY_ENGINE_OVERLAP, COPY_ENGINE, NCCL)
+DISPATCH_ORDER = (COPY_ENGINE_OVERLAP, COPY_ENGINE, NCCL)
 
 # Correctness gate for the head-chunked overlap, like vLLM's batch-invariant kernel list: attention kernels whose
 # per-head output does not depend on how many heads one call covers, as (backend name, implementation).
@@ -50,8 +49,6 @@ class UlyssesTopology:
     capability: str = ""
     """Lowest compute capability in the group, e.g. ``"10.0"``."""
     symmetric_memory: bool = False
-    flashinfer: bool = False
-    """FlashInfer's ``UlyssesCommunicator`` is importable on every rank."""
 
 
 @dataclass(frozen=True)
@@ -61,7 +58,6 @@ class UlyssesTransportPlan:
     A ``None`` gate means the transport is disabled; otherwise it is the minimum message size for using it.
     """
 
-    flashinfer_min_bytes: int | None = None
     copy_engine_min_bytes: int | None = None
     overlap_chunks: int = 0
     """Head chunks per rank for the copy-engine overlap (0: disabled)."""
@@ -69,17 +65,13 @@ class UlyssesTransportPlan:
 
     @property
     def symmetric_memory(self) -> bool:
-        return (
-            self.flashinfer_min_bytes is not None or self.copy_engine_min_bytes is not None or self.overlap_chunks > 0
-        )
+        return self.copy_engine_min_bytes is not None or self.overlap_chunks > 0
 
     def use_overlap(self, chunk_copy_bytes: int) -> bool:
         return self.overlap_chunks > 0 and chunk_copy_bytes >= self.overlap_min_chunk_bytes
 
-    def exchange(self, q_bytes: int, *, flashinfer_ok: bool = True) -> str:
+    def exchange(self, q_bytes: int) -> str:
         """Transport for a Q/K/V exchange whose Q holds ``q_bytes`` on this rank (the output exchange follows it)."""
-        if flashinfer_ok and self.flashinfer_min_bytes is not None and q_bytes >= self.flashinfer_min_bytes:
-            return FLASHINFER
         if self.copy_engine_min_bytes is not None and q_bytes >= self.copy_engine_min_bytes:
             return COPY_ENGINE
         return NCCL
@@ -96,16 +88,6 @@ def overlap_chunk_count(heads_per_rank: int | None, requested: int = 0) -> int:
         return 0
     chunks = requested or heads_per_rank // 2
     return chunks if chunks > 1 and heads_per_rank % chunks == 0 else 0
-
-
-def _flashinfer_available() -> bool:
-    # OSError: FlashInfer is installed but its shared libraries fail to load (e.g. a CUDA version mismatch).
-    try:
-        from flashinfer.comm import UlyssesCommunicator  # noqa: F401
-    except (ImportError, OSError) as error:
-        logger.debug("FlashInfer UlyssesCommunicator unavailable: %s", error)
-        return False
-    return True
 
 
 def _symmetric_memory_available() -> bool:
@@ -199,14 +181,13 @@ def probe_ulysses_topology(group: dist.ProcessGroup, world_size: int) -> Ulysses
             int(p2p),
             props.major * 10 + props.minor,
             int(_symmetric_memory_available()),
-            int(_flashinfer_available()),
         ],
         dtype=torch.int64,
         device=device,
     )
     # Ranks act on the weakest answer so they never pick different transports.
     dist.all_reduce(features, op=dist.ReduceOp.MIN, group=group)
-    single_node, nvlink, p2p, sm, symmetric_memory, flashinfer = features.tolist()
+    single_node, nvlink, p2p, sm, symmetric_memory = features.tolist()
     topology = UlyssesTopology(
         world_size,
         cuda=True,
@@ -215,7 +196,6 @@ def probe_ulysses_topology(group: dist.ProcessGroup, world_size: int) -> Ulysses
         p2p=bool(p2p),
         capability=f"{sm // 10}.{sm % 10}",
         symmetric_memory=bool(symmetric_memory),
-        flashinfer=bool(flashinfer),
     )
     _TOPOLOGIES[key] = topology
     return topology
@@ -244,17 +224,14 @@ def eligible_transports(topology: UlyssesTopology, *, pure_strict: bool) -> dict
     shared = _shared_disabled_reason(topology, pure_strict)
     reasons: dict[str, str | None] = {}
     measured = f"not measured for sm{topology.capability} x {topology.world_size} GPUs"
-    for name, table, library in (
-        (FLASHINFER, tables.FLASHINFER_MIN_BYTES, topology.flashinfer),
-        (COPY_ENGINE_OVERLAP, tables.COPY_ENGINE_OVERLAP_MIN_CHUNK_BYTES, topology.symmetric_memory),
-        (COPY_ENGINE, tables.COPY_ENGINE_MIN_BYTES, topology.symmetric_memory),
+    for name, table in (
+        (COPY_ENGINE_OVERLAP, tables.COPY_ENGINE_OVERLAP_MIN_CHUNK_BYTES),
+        (COPY_ENGINE, tables.COPY_ENGINE_MIN_BYTES),
     ):
         if shared is not None:
             reasons[name] = shared
-        elif not library:
-            reasons[name] = (
-                "FlashInfer UlyssesCommunicator unavailable" if name == FLASHINFER else "no symmetric memory"
-            )
+        elif not topology.symmetric_memory:
+            reasons[name] = "no symmetric memory"
         elif _table_entry(table, topology) is None:
             reasons[name] = measured
         else:
@@ -276,9 +253,6 @@ def auto_plan(
     if reasons[COPY_ENGINE_OVERLAP] is None and reasons[COPY_ENGINE] is None and per_head_invariant:
         chunks = overlap_chunk_count(heads_per_rank, overlap_chunks)
     return UlyssesTransportPlan(
-        flashinfer_min_bytes=_table_entry(tables.FLASHINFER_MIN_BYTES, topology)
-        if reasons[FLASHINFER] is None
-        else None,
         copy_engine_min_bytes=(
             _table_entry(tables.COPY_ENGINE_MIN_BYTES, topology) if reasons[COPY_ENGINE] is None else None
         ),
@@ -293,9 +267,6 @@ def explicit_plan(backend: str, *, heads_per_rank: int | None, overlap_chunks: i
     """An explicitly configured backend, used for every eligible call without size gates."""
     if backend == NCCL:
         return NCCL_PLAN
-    if backend == FLASHINFER:
-        # Exchanges FlashInfer does not carry (e.g. with a sparse-attention gate) keep the copy engines.
-        return UlyssesTransportPlan(flashinfer_min_bytes=0, copy_engine_min_bytes=0)
     if backend == COPY_ENGINE_OVERLAP:
         return UlyssesTransportPlan(
             copy_engine_min_bytes=0, overlap_chunks=overlap_chunk_count(heads_per_rank, overlap_chunks)
@@ -359,7 +330,6 @@ def resolve_ulysses_transports(
     enabled = [
         name
         for name, on in (
-            (FLASHINFER, plan.flashinfer_min_bytes is not None),
             (COPY_ENGINE_OVERLAP, plan.overlap_chunks > 0),
             (COPY_ENGINE, plan.copy_engine_min_bytes is not None),
             (NCCL, True),

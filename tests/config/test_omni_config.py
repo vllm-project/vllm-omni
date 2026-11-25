@@ -2139,7 +2139,7 @@ def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
                 stage_id=0,
                 ulysses_degree=2,
                 ulysses_a2a_permute=True,
-                ulysses_a2a_backend="flashinfer",
+                ulysses_a2a_backend="copy_engine",
             )
         ]
     )
@@ -2148,7 +2148,7 @@ def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.parallel_config.ulysses_a2a_permute is True
-    assert stage.parallel_config.ulysses_a2a_backend == "flashinfer"
+    assert stage.parallel_config.ulysses_a2a_backend == "copy_engine"
 
 
 @pytest.mark.parametrize(

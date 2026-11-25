@@ -909,7 +909,7 @@ def test_unsupported_sp_config_fails_before_component_loading(overrides):
     assert module._loader_state.prefetch_calls == []
 
 
-@pytest.mark.parametrize("backend", ["copy_engine", "copy_engine_overlap", "flashinfer"])
+@pytest.mark.parametrize("backend", ["copy_engine", "copy_engine_overlap"])
 def test_symmetric_memory_ulysses_transport_is_rejected(backend):
     module = _load_pipeline_module()
     config = _od_config().parallel_config

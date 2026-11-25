@@ -930,7 +930,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             )
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
-        backends = ("auto", "nccl", "copy_engine", "copy_engine_overlap", "flashinfer")
+        backends = ("auto", "nccl", "copy_engine", "copy_engine_overlap")
         if self.ulysses_a2a_backend not in backends:
             raise ValueError(f"ulysses_a2a_backend must be one of {backends}")
         if self.vae_parallel_mode not in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}:

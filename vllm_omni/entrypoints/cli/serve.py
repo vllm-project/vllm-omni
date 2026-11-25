@@ -830,11 +830,11 @@ class OmniServeCommand(CLISubcommand):
             "--ulysses-a2a-backend",
             type=str,
             default=None,
-            choices=["auto", "nccl", "copy_engine", "copy_engine_overlap", "flashinfer"],
+            choices=["auto", "nccl", "copy_engine", "copy_engine_overlap"],
             help=(
                 "Transport for the strict Ulysses all-to-all. 'auto' (default) picks the transport measured fastest "
                 "for the GPU and group size, otherwise 'nccl'; 'copy_engine_overlap' overlaps the copy-engine "
-                "exchange with attention in head chunks; 'flashinfer' uses FlashInfer UlyssesCommunicator kernels."
+                "exchange with attention in head chunks."
             ),
         )
         omni_config_group.add_argument(

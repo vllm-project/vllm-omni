@@ -60,7 +60,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-ULYSSES_A2A_BACKENDS = ("auto", "nccl", "copy_engine", "copy_engine_overlap", "flashinfer")
+ULYSSES_A2A_BACKENDS = ("auto", "nccl", "copy_engine", "copy_engine_overlap")
 
 # Accepted values for ``OmniDiffusionConfig.vae_fast_path``.
 VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
@@ -331,12 +331,11 @@ class DiffusionParallelConfig:
     """
 
     ulysses_a2a_backend: str = "auto"
-    """Transport for the strict Ulysses all-to-all: ``"auto"``, ``"nccl"``, ``"copy_engine"``,
-    ``"copy_engine_overlap"`` or ``"flashinfer"``.
+    """Transport for the strict Ulysses all-to-all: ``"auto"``, ``"nccl"``, ``"copy_engine"`` or
+    ``"copy_engine_overlap"``.
 
     ``"auto"`` probes the Ulysses group once and picks the transport measured fastest for that GPU and group size,
-    otherwise NCCL. ``"flashinfer"`` runs the strict Q/K/V scatter and output gather through FlashInfer's
-    ``UlyssesCommunicator``; gate and joint exchanges keep the copy engines.
+    otherwise NCCL.
     """
 
     ulysses_overlap_chunks: int = 0

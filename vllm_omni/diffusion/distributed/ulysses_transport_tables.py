@@ -4,24 +4,16 @@
 
 Keyed by compute capability (``"major.minor"``) and Ulysses world size, like vLLM's ``CUSTOM_ALL_REDUCE_MAX_SIZES``.
 Entries exist only where they were measured; a missing capability or world size makes that transport ineligible, and
-dispatch falls through to the next one (FlashInfer -> copy-engine overlap -> copy engine -> NCCL).
+dispatch falls through to the next one (copy-engine overlap -> copy engine -> NCCL).
 """
 
 MiB = 1024 * 1024
 
 # Minimum bytes of one rank's Q (B * S/N * H * D * itemsize) for which the transport replaces the next one in the chain.
 # B200 (1000 W), 56 heads x 128, BF16, from the sweep: the copy engine beat NCCL by 7-37% from the smallest swept
-# message at every world size, and FlashInfer beat the copy engine by 3-27% at 8 GPUs. At 2 and 4 GPUs the sweep has
-# FlashInfer within 1-2% of the copy engine only at its largest message, while MiniMax-H3 end to end ran slower with
-# it there, so it has no entry.
-FLASHINFER_MIN_BYTES: dict[str, dict[int, int]] = {
-    "10.0": {8: 14 * MiB},
-}
-
-# H100 SXM (700 W, NVLink), MiniMax-H3 end to end only (Q is 259 / 129.5 / 64.75 MiB per rank at 2 / 4 / 8 GPUs): the
-# copy engine beat NCCL by 3.0 / 2.5 / 1.5%, so the entries stop just below those sizes, since nothing smaller was
-# measured. The overlap gained nothing there and FlashInfer was slower than the copy engine at 8 GPUs, so neither has
-# an sm9.0 entry.
+# message at every world size. H100 SXM (700 W, NVLink), MiniMax-H3 end to end only (Q is 259 / 129.5 / 64.75 MiB per
+# rank at 2 / 4 / 8 GPUs): the copy engine beat NCCL by 3.0 / 2.5 / 1.5%, so the entries stop just below those sizes,
+# since nothing smaller was measured. The overlap gained nothing there, so it has no sm9.0 entry.
 COPY_ENGINE_MIN_BYTES: dict[str, dict[int, int]] = {
     "9.0": {2: 256 * MiB, 4: 128 * MiB, 8: 64 * MiB},
     "10.0": {2: 56 * MiB, 4: 28 * MiB, 8: 14 * MiB},
