@@ -880,3 +880,42 @@ class TestFreeRequestHook:
 
         assert "req-cancel" not in dtps._dit_inflight_ids
         assert dtps._ar_only_cache == {}
+
+    def test_errored_downstream_not_registered(self):
+        """FINISHED_ERROR (model/sampling error) never reaches DiT — the
+        orchestrator routes errored outputs to error handling instead of
+        forwarding — so it must not occupy a blind in-flight slot."""
+        dtps = _make_scheduler(threshold=2)
+        sched = _make_finish_hook_scheduler(dtps, kv_transfer=False)
+
+        request = _StubRequest("req-error", ar_only=False, status=RequestStatus.FINISHED_ERROR)
+        sched._free_request(request)
+
+        assert "req-error" not in dtps._dit_inflight_ids
+        assert dtps._ar_only_cache == {}
+
+    def test_ignored_downstream_not_registered(self):
+        """FINISHED_IGNORED produces no tokens and never hands off to DiT
+        (length-capped prompts are rejected before scheduling in vLLM v1;
+        the guard is defensive) — so it must not occupy a blind in-flight
+        slot."""
+        dtps = _make_scheduler(threshold=2)
+        sched = _make_finish_hook_scheduler(dtps, kv_transfer=False)
+
+        request = _StubRequest("req-ignored", ar_only=False, status=RequestStatus.FINISHED_IGNORED)
+        sched._free_request(request)
+
+        assert "req-ignored" not in dtps._dit_inflight_ids
+        assert dtps._ar_only_cache == {}
+
+    def test_length_capped_downstream_registers(self):
+        """FINISHED_LENGTH_CAPPED is a successful AR completion that still
+        hands off to DiT — it must register blind in-flight."""
+        dtps = _make_scheduler(threshold=2)
+        sched = _make_finish_hook_scheduler(dtps, kv_transfer=False)
+
+        request = _StubRequest("req-len", ar_only=False, status=RequestStatus.FINISHED_LENGTH_CAPPED)
+        sched._free_request(request)
+
+        assert "req-len" in dtps._dit_inflight_ids
+        assert dtps._ar_only_cache == {}
