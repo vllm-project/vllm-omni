@@ -64,7 +64,7 @@ def _packed_inputs(device: str = "cpu"):
     return qkv, q_weight, k_weight, rope_table
 
 
-def _run_packed(qkv, q_weight, k_weight, rope_table, eps=_EPS, *, vdn: torch.nn.Module | None = None):
+def _run_packed(qkv, q_weight, k_weight, rope_table, eps=_EPS):
     from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qkv_split_norm_rope
 
     return fused_qkv_split_norm_rope(
@@ -76,7 +76,6 @@ def _run_packed(qkv, q_weight, k_weight, rope_table, eps=_EPS, *, vdn: torch.nn.
         num_heads=_HEAD_COUNTS[0],
         num_kv_heads=_HEAD_COUNTS[1],
         head_dim=q_weight.shape[0],
-        vdn=vdn,
     )
 
 
@@ -207,8 +206,7 @@ def test_npu_qk_norm_rope_ignores_installed_mindiesd(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("vdn", [torch.nn.Sequential(), None], ids=["vdn", "no-vdn"])
-def test_npu_eagle_receives_original_packed_qkv(monkeypatch: pytest.MonkeyPatch, vdn: torch.nn.Module | None) -> None:
+def test_npu_eagle_receives_original_packed_qkv(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
 
     qkv, expected_q_weight, expected_k_weight, rope_table = _packed_inputs()
@@ -221,7 +219,6 @@ def test_npu_eagle_receives_original_packed_qkv(monkeypatch: pytest.MonkeyPatch,
     def eagle(
         qkv, q_weight, k_weight, rope_cos, rope_sin, split_sizes, norm_type, rope_mode, rotary_dim, epsilon, output_bnsd
     ):
-        assert not splits
         assert qkv.data_ptr() == packed.data_ptr()
         torch.testing.assert_close(qkv, packed, check_stride=True)
         assert q_weight is expected_q_weight and k_weight is expected_k_weight
@@ -236,22 +233,16 @@ def test_npu_eagle_receives_original_packed_qkv(monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setattr(fused.current_omni_platform, "is_npu", lambda: True)
     monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", types.SimpleNamespace(eagle_split_norm_rope_concat=eagle))
 
-    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, expected_q_weight, expected_k_weight, rope_table, eps, vdn=vdn)
+    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, expected_q_weight, expected_k_weight, rope_table, eps)
 
     assert q_out is outputs[0] and k_out is outputs[1] and v_out is outputs[2]
-    if vdn is not None:
-        (parts,) = splits
-        assert q_raw is parts[0] and k_raw is parts[1]
-        torch.testing.assert_close(q_raw, q, check_stride=True)
-        torch.testing.assert_close(k_raw, k, check_stride=True)
-    else:
-        assert not splits
+    assert q_raw is None and k_raw is None
+    assert not splits
 
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("is_npu", [True, False], ids=["npu-without-eagle", "non-npu-with-eagle"])
-@pytest.mark.parametrize("vdn", [torch.nn.Sequential(), None], ids=["vdn", "no-vdn"])
-def test_packed_qkv_fallback(monkeypatch: pytest.MonkeyPatch, is_npu: bool, vdn: torch.nn.Module | None) -> None:
+def test_packed_qkv_fallback(monkeypatch: pytest.MonkeyPatch, is_npu: bool) -> None:
     from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
 
     qkv, q_weight, k_weight, rope_table = _packed_inputs()
@@ -263,16 +254,14 @@ def test_packed_qkv_fallback(monkeypatch: pytest.MonkeyPatch, is_npu: bool, vdn:
     module = None if is_npu else types.SimpleNamespace(eagle_split_norm_rope_concat=eagle)
     monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", module)
 
-    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, q_weight, k_weight, rope_table, vdn=vdn)
+    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, q_weight, k_weight, rope_table)
 
     expected_q, expected_k = _reference(q, k, q_weight, k_weight, rope_table)
     torch.testing.assert_close(q_out, expected_q, atol=0, rtol=0)
     torch.testing.assert_close(k_out, expected_k, atol=0, rtol=0)
     (parts,) = splits
-    assert v_out is parts[2]
+    assert q_raw is parts[0] and k_raw is parts[1] and v_out is parts[2]
     torch.testing.assert_close(v_out, v)
-    if vdn is not None:
-        assert q_raw is parts[0] and k_raw is parts[1]
 
 
 @pytest.mark.cpu
@@ -338,12 +327,11 @@ def test_packed_qkv_eagle_npu_matches_reference(monkeypatch: pytest.MonkeyPatch)
     qkv, q_weight, k_weight, rope_table = _packed_inputs("npu")
     q, k, v = qkv.unflatten(-1, (sum(_HEAD_COUNTS), _HEAD_DIM)).split(_HEAD_COUNTS, dim=1)
 
-    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, q_weight, k_weight, rope_table, vdn=torch.nn.Sequential())
+    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, q_weight, k_weight, rope_table)
 
     eagle.assert_called_once()
     expected_q, expected_k = _reference(q, k, q_weight, k_weight, rope_table)
     torch.testing.assert_close(q_out, expected_q, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(k_out, expected_k, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(v_out, v, atol=0, rtol=0)
-    torch.testing.assert_close(q_raw, q, atol=0, rtol=0)
-    torch.testing.assert_close(k_raw, k, atol=0, rtol=0)
+    assert q_raw is None and k_raw is None

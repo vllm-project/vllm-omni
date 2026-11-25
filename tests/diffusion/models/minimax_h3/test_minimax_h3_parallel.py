@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from unittest.mock import Mock, patch
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -97,38 +99,63 @@ def test_denoise_branch_keeps_fast_h3_prefix_geometry_model_local():
 
 
 @pytest.mark.parametrize("has_vdn", [False, True])
-@pytest.mark.parametrize("has_rope", [False, True])
-def test_h3_project_qkv_retains_raw_qk_for_vdn(has_vdn, has_rope):
+@pytest.mark.parametrize("route", ["eagle", "fallback", "no_rope"])
+def test_h3_project_qkv_retains_raw_qk_for_vdn(monkeypatch, has_vdn, route):
+    from tests.diffusion.layers.test_fused_qk_norm_rope_npu import (
+        _EPS,
+        _HEAD_COUNTS,
+        _packed_inputs,
+        _track_packed_splits,
+    )
+    from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
+
+    qkv, q_weight, k_weight, rope_table = _packed_inputs()
+    packed = qkv.unflatten(-1, (sum(_HEAD_COUNTS), q_weight.numel()))
+    q, k, v = packed.split(_HEAD_COUNTS, dim=1)
+    eagle_v = v.clone()
+    splits = _track_packed_splits(monkeypatch, packed)
+
+    def run_eagle(*args, **kwargs):
+        assert not splits
+        return q.neg(), k.square(), eagle_v
+
+    eagle = Mock(side_effect=run_eagle)
+    monkeypatch.setattr(fused.current_omni_platform, "is_npu", lambda: route == "eagle")
+    monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_split_norm_rope_concat=eagle))
 
     attention = object.__new__(blocks.MiniMaxH3Attention)
     nn.Module.__init__(attention)
-    attention.num_heads, attention.num_kv_heads, attention.head_dim = 2, 1, 2
+    attention.num_heads, attention.num_kv_heads, _ = _HEAD_COUNTS
+    attention.head_dim = q_weight.numel()
+    attention._prefix = "test.attn"
     attention.vdn = nn.Identity() if has_vdn else None
-    packed = torch.arange(24, dtype=torch.float32).reshape(3, 8)
-    attention.qkv_proj = Mock(return_value=(packed, None))
-    attention.q_norm = Mock(side_effect=torch.neg)
-    attention.k_norm = Mock(side_effect=torch.square)
+    attention.qkv_proj = Mock(return_value=(qkv, None))
+    attention.q_norm = Mock(side_effect=torch.neg, weight=q_weight, variance_epsilon=_EPS)
+    attention.k_norm = Mock(side_effect=torch.square, weight=k_weight)
+    x = torch.empty(packed.shape[0], 4)
+    table = None if route == "no_rope" else rope_table
 
-    rope_table = torch.ones(3, 2) if has_rope else None
-    with patch.object(blocks, "fused_qkv_split_norm_rope") as fused:
-        result = attention._project_qkv(torch.ones(3, 4), rope_table, vdn_window=object())
+    q_out, k_out, v_out, q_raw, k_raw = attention._project_qkv(x, table, vdn_window=object())
 
-    if has_rope:
-        fused.assert_called_once()
-        assert fused.call_args.kwargs["vdn"] is attention.vdn
-        return
-
-    fused.assert_not_called()
-    attention.q_norm.assert_called_once()
-    attention.k_norm.assert_called_once()
-    q, k, v, q_raw, k_raw = result
-    expected_q, expected_k, expected_v = packed.view(3, 4, 2).split([2, 1, 1], dim=1)
-    torch.testing.assert_close((q, k, v), (-expected_q, expected_k.square(), expected_v))
+    if route == "eagle":
+        eagle.assert_called_once()
+        assert v_out is eagle_v
+        if not has_vdn:
+            assert not splits
+            return
+    else:
+        eagle.assert_not_called()
+        assert v_out is splits[0][2]
+    if route == "no_rope":
+        attention.q_norm.assert_called_once()
+        attention.k_norm.assert_called_once()
+        torch.testing.assert_close((q_out, k_out), (-q, k.square()))
+    (parts,) = splits
     if has_vdn:
-        torch.testing.assert_close((q_raw, k_raw), (expected_q, expected_k), check_stride=True)
-        assert q_raw.data_ptr() == expected_q.data_ptr()
-        assert k_raw.data_ptr() == expected_k.data_ptr()
+        assert q_raw is parts[0] and k_raw is parts[1]
+        with pytest.raises(ValueError, match="received no VDN window"):
+            attention._project_qkv(x, table)
 
 
 def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():

@@ -488,14 +488,15 @@ class MiniMaxH3Attention(nn.Module):
         qkv, _ = self.qkv_proj(x)
         if self.vdn is not None and vdn_window is None:
             raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
+        head_counts = [self.num_heads, self.num_kv_heads, self.num_kv_heads]
         if rope_table is None:
             packed = qkv.unflatten(-1, (-1, self.head_dim))
-            q_raw, k_raw, v = packed.split([self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1)
+            q_raw, k_raw, v = packed.split(head_counts, dim=1)
             q = self.q_norm(q_raw)
             k = self.k_norm(k_raw)
             return q, k, v, q_raw, k_raw
 
-        return fused_qkv_split_norm_rope(
+        q, k, v, q_raw, k_raw = fused_qkv_split_norm_rope(
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,
@@ -504,8 +505,11 @@ class MiniMaxH3Attention(nn.Module):
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
-            vdn=self.vdn,
         )
+        if self.vdn is not None and q_raw is None:
+            packed = qkv.unflatten(-1, (-1, self.head_dim))
+            q_raw, k_raw, _ = packed.split(head_counts, dim=1)
+        return q, k, v, q_raw, k_raw
 
     def forward(
         self,
