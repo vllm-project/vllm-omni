@@ -37,7 +37,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import APPEND_TEXT_TOKEN_IDS_KEY, MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMForConditionalGeneration,
@@ -61,6 +61,9 @@ def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
         duplex_rows.append(duplex_info if isinstance(duplex_info, dict) else {})
 
     outputs: dict[str, Any] = {}
+    # Row-local snapshots replace the previous append's value, including when
+    # audio follows text on the same resumable scheduler request.
+    outputs["duplex_text_input"] = [info.get("text_input") is True for info in duplex_rows]
     prompt_rows = []
     for duplex_info in duplex_rows:
         prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
@@ -748,11 +751,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _optional_int
 
         window = duplex.get("stage0_window")
+        runtime_config = duplex.get("runtime_config")
+        text_token_ids = runtime_config.get(APPEND_TEXT_TOKEN_IDS_KEY) if isinstance(runtime_config, dict) else None
         return {
             "epoch": _optional_int(duplex.get("epoch")),
             "seq": _optional_int(duplex.get("seq")),
             "is_speech": bool(payload.get("is_speech", False)),
+            "input_text_token_ids": payload.get("text_token_ids"),
+            "force_listen": payload.get("force_listen") is True,
             "stage0_window": window if isinstance(window, dict) else None,
+            "text_token_ids": text_token_ids if isinstance(text_token_ids, list) else None,
         }
 
     def _duplex_data_plane_helper(self):

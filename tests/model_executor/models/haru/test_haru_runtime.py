@@ -5,11 +5,15 @@
 from __future__ import annotations
 
 import base64
+from functools import partial
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 from torch import nn
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from tests.model_executor.models.haru.conftest import EOS, TINY_SPEC, build_tiny_codec
 from vllm_omni.model_executor.models.haru import runtime as runtime_module
@@ -17,6 +21,8 @@ from vllm_omni.model_executor.models.haru.haru import AudioProjector, HaruForCon
 from vllm_omni.model_executor.models.haru.meanflow_head import MeanFlowHead
 from vllm_omni.model_executor.models.haru.prompt import prompt_length
 from vllm_omni.model_executor.models.haru.runtime import HaruRuntime
+from vllm_omni.worker_v2.model_states import init_omni_model_state
+from vllm_omni.worker_v2.omni_sampler import sample_with_output
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -33,20 +39,17 @@ class _Backbone(nn.Module):
         return self.embedding(ids)
 
 
-class _TinyHaru(nn.Module):
-    """The attributes HaruRuntime reads from HaruForConditionalGeneration, at toy size."""
-
-    embed_streams = HaruForConditionalGeneration.embed_streams
-    scale_latents = HaruForConditionalGeneration.scale_latents
-    unscale_latents = HaruForConditionalGeneration.unscale_latents
+class _TinyHaru(HaruForConditionalGeneration):
+    """Keep Haru's hooks and replace the checkpoint's network with tiny CPU modules."""
 
     def __init__(self):
-        super().__init__()
+        nn.Module.__init__(self)
         torch.manual_seed(0)
         self.haru_config = TINY_SPEC
         self.embedding = nn.Embedding(VOCAB, HIDDEN)
         self.model = _Backbone(self.embedding)
         self.lm_head = nn.Linear(HIDDEN, VOCAB, bias=False)
+        self.logits_processor = lambda lm_head, hidden: lm_head(hidden)
         self.model_audio_proj = AudioProjector(TINY_SPEC.latent_dim, HIDDEN)
         self.user_audio_proj = AudioProjector(TINY_SPEC.latent_dim, HIDDEN)
         self.head = MeanFlowHead(TINY_SPEC.head)
@@ -69,9 +72,16 @@ PROMPT_LEN = prompt_length(_Tokenizer(), CARD, 0, False, TINY_SPEC.frame_samples
 
 
 @pytest.fixture
-def runtime(monkeypatch) -> HaruRuntime:
+def tiny_haru(monkeypatch) -> _TinyHaru:
     monkeypatch.setattr(runtime_module, "load_tokenizer", lambda _path: _Tokenizer())
-    return HaruRuntime(_TinyHaru(), model_path="unused")
+    model = _TinyHaru()
+    model.runtime = HaruRuntime(model, model_path="unused")
+    return model
+
+
+@pytest.fixture
+def runtime(tiny_haru: _TinyHaru) -> HaruRuntime:
+    return tiny_haru.runtime
 
 
 def _frame(value: float = 0.0) -> dict[str, object]:
@@ -99,8 +109,7 @@ def _step(runtime: HaruRuntime, rows: list[tuple[str, int, dict]], token: int = 
     logits = runtime.adjust_logits(hidden, torch.zeros(len(rows), VOCAB))
     assert logits.dtype == torch.float32
     runtime.record_sampled([[token] for _ in rows])
-    # Haru runs with synchronous scheduling, where vLLM passes no invalid indices and drops a
-    # partial-prefill token itself.
+    # A separate MRv2 test covers vLLM's sampled-token counts and discarded rows.
     return runtime.finish_step([request_id for request_id, _, _ in rows], [])
 
 
@@ -183,3 +192,81 @@ def test_a_chunked_prompt_emits_audio_only_after_its_last_chunk(runtime: HaruRun
     assert [a.shape[0] for a in out["model_outputs"]] == [TINY_SPEC.frame_samples]
     out = _step(runtime, [("r1", 1, _info("r1", PROMPT_LEN, PROMPT_LEN + 1))])
     assert [a.shape[0] for a in out["model_outputs"]] == [TINY_SPEC.frame_samples]
+
+
+def test_mrv2_sampling_emits_audio_and_preserves_conversations(tiny_haru: _TinyHaru) -> None:
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.float32,
+            enable_prompt_embeds=False,
+            get_inputs_embeds_size=lambda: HIDDEN,
+            max_model_len=2 * PROMPT_LEN,
+            uses_mrope=False,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=2 * PROMPT_LEN),
+        cache_config=SimpleNamespace(mamba_cache_mode="none", use_kda_recoverssm=False),
+        use_flashinfer_replayssm=False,
+    )
+    state = init_omni_model_state(config, tiny_haru, None, torch.device("cpu"))
+    runner = SimpleNamespace(model_state=state, batch_sharder=None)
+    standard_sample = partial(GPUModelRunner.sample, runner)
+
+    def run_step(req_ids, slots, spans, computed, sampled_ids):
+        starts = np.cumsum([0, *spans])
+        num_tokens = int(starts[-1])
+        input_ids = torch.zeros(num_tokens, dtype=torch.long)
+        batch = SimpleNamespace(
+            req_ids=req_ids,
+            idx_mapping_np=np.array(slots),
+            num_reqs=len(req_ids),
+            num_tokens=num_tokens,
+            num_draft_tokens=0,
+            input_ids=input_ids,
+            num_scheduled_tokens=np.array(spans),
+            query_start_loc_np=starts,
+            logits_indices=torch.from_numpy(starts[1:] - 1),
+        )
+        req_states = SimpleNamespace(prompt_len=[PROMPT_LEN, PROMPT_LEN], num_computed_tokens=computed)
+        keep = torch.tensor([int(computed[slot] + span >= PROMPT_LEN) for slot, span in zip(slots, spans, strict=True)])
+
+        def sample(logits, input_batch):
+            assert input_batch is batch
+            assert logits.shape == (len(req_ids), VOCAB)
+            return SamplerOutput(torch.tensor(sampled_ids).unsqueeze(1), None, None, keep, torch.zeros_like(keep))
+
+        inputs = {"input_ids": input_ids}
+        state.run_preprocess(batch, inputs, req_states)
+        custom_sampler = state.custom_sampler(sample)
+        runner.sampler = sample if custom_sampler is None else custom_sampler[0]
+        result = sample_with_output(runner.sampler, standard_sample, inputs["inputs_embeds"], batch, req_states, None)
+        return result.multimodal_outputs or {}
+
+    for slot, req_id in enumerate(("a", "b")):
+        info = _info(req_id, 0, PROMPT_LEN, first=True, seed=slot + 7)
+        request = SimpleNamespace(req_id=req_id, mm_features=[], model_intermediate_buffer=info)
+        state.add_request(slot, request)
+
+    with torch.inference_mode():
+        partial_prompt = run_step(["a"], [0], [PROMPT_LEN - 1], [0, 0], [9])
+        assert not partial_prompt.get("model_outputs")
+
+        first = run_step(["a"], [0], [1], [PROMPT_LEN - 1, 0], [3])
+        assert first["meta"]["req_id"] == ["a"]
+
+        # A's live frame needs the previous sample even though B is still in prefill.
+        mixed = run_step(["a", "b"], [0, 1], [1, PROMPT_LEN - 1], [PROMPT_LEN, 0], [3, 9])
+        assert mixed["meta"]["req_id"] == ["a"]
+        assert len(mixed["model_outputs"]) == 1
+        assert tiny_haru.runtime._conversations["b"].token is None
+
+        # B finishes prefill in the opposite order from the runner's request slots.
+        reordered = run_step(["b", "a"], [1, 0], [1, 1], [PROMPT_LEN + 1, PROMPT_LEN - 1], [4, 2])
+        assert reordered["meta"]["req_id"] == ["b", "a"]
+        assert reordered["meta"]["sparse_audio"] == ["1"]
+        assert [audio.shape for audio in reordered["model_outputs"]] == [(TINY_SPEC.frame_samples,)] * 2
+        assert [sr.item() for sr in reordered["sr"]] == [TINY_SPEC.sample_rate] * 2
+        assert tiny_haru.runtime._conversations["a"].token.item() == 2
+        assert tiny_haru.runtime._conversations["b"].token.item() == 4
+
+        next_frame = run_step(["b"], [1], [1], [PROMPT_LEN + 2, PROMPT_LEN], [3])
+        assert next_frame["meta"]["req_id"] == ["b"]

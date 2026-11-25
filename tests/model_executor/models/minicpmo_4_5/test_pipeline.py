@@ -19,6 +19,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from vllm import SamplingParams
+from vllm.v1.core.sched.utils import check_stop
+from vllm.v1.request import RequestStatus
 
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
@@ -29,8 +32,15 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
+from vllm_omni.engine.duplex.config import DuplexSessionConfig
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import (
+    MiniCPMO45DuplexPlugin,
+    _apply_default_scheduler_policy,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import (
     _CODEC_EOS_TOKEN_ID,
+    MINICPMO_4_5_PIPELINE,
+    MINICPMO_4_5_THINKER_ONLY_PIPELINE,
 )
 from vllm_omni.model_executor.models.registry import _OMNI_MODELS
 from vllm_omni.platforms import current_omni_platform
@@ -98,6 +108,7 @@ class TestPipelineTopology:
             "detokenize": True,
             "stop_token_ids": [151704, 151645],
         }
+        assert SamplingParams(**thinker.sampling_constraints).ignore_eos is False
 
     def test_talker_stage(self, pipeline: PipelineConfig) -> None:
         talker = pipeline.get_stage(1)
@@ -168,8 +179,10 @@ class TestDeployTopology:
             "minicpmo_4_5_duplex_h200.yaml",
         }
         talker_backend = "FLASH_ATTN" if platform == "cuda" and filename in cuda_flash_talker_profiles else None
-        assert stages[1].attention_backend == talker_backend
-        assert stages[2].attention_backend is None
+        if 1 in stages:
+            assert stages[1].attention_backend == talker_backend
+        if 2 in stages:
+            assert stages[2].attention_backend is None
 
     @pytest.mark.parametrize(("filename", "devices"), _DEPLOY_LAYOUTS.items())
     @pytest.mark.parametrize("platform", ["cuda", "npu", "cpu"])
@@ -314,6 +327,82 @@ class TestDeployTopology:
 
         assert stages[1].yaml_engine_args["async_chunk"] is False
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(".tts2code2wav_full_payload")
+
+
+_THINKER_ONLY_KEY = "minicpmo_4_5_thinker_only"
+_THINKER_ONLY_DEPLOY = "minicpmo_4_5_duplex_thinker_only.yaml"
+
+
+class TestThinkerOnlyPipeline:
+    def test_registers_a_single_text_stage(self) -> None:
+        pipeline = OMNI_PIPELINES[_THINKER_ONLY_KEY]
+        assert pipeline is MINICPMO_4_5_THINKER_ONLY_PIPELINE
+        assert pipeline.model_type == _THINKER_ONLY_KEY
+        assert len(pipeline.stages) == 1
+        assert pipeline.model_arch == MINICPMO_4_5_PIPELINE.model_arch
+        assert pipeline.duplex_plugin == MINICPMO_4_5_PIPELINE.duplex_plugin
+        # A single final text stage is what makes the deployment text-only.
+        assert pipeline.stages[0].final_output is True
+        assert pipeline.stages[0].final_output_type == "text"
+
+    def test_final_stage0_sampling_stops_only_on_unit_terminators(self) -> None:
+        ids = {"<|tts_eos|>": 151704, "<|listen|>": 151705, "<|chunk_eos|>": 151718, "<|chunk_tts_eos|>": 151721}
+        tokenizer = SimpleNamespace(convert_tokens_to_ids=lambda token: ids.get(token), unk_token_id=0)
+        runtime_config: dict[str, object] = {}
+        _apply_default_scheduler_policy(runtime_config, config=DuplexSessionConfig(), tokenizer=tokenizer)
+        default = SamplingParams(**MINICPMO_4_5_THINKER_ONLY_PIPELINE.stages[0].sampling_constraints)
+
+        plugin = MiniCPMO45DuplexPlugin(lambda *_: None)
+        (params,) = plugin.configure_sampling_params(runtime_config=runtime_config, defaults=(default,))
+
+        terminators = {151705, 151718, 151721}
+        assert set(params.stop_token_ids) == terminators
+        assert params.all_stop_token_ids == terminators
+        params.update_from_generation_config({"eos_token_id": [151645, 151643]}, eos_token_id=151645)
+        assert params.ignore_eos is True
+        assert params.eos_token_id is None
+        assert set(params.stop_token_ids) == terminators
+
+    @pytest.mark.parametrize(
+        ("token_id", "stops"),
+        [(151645, False), (151643, False), (151705, True), (151718, True), (151721, True)],
+    )
+    def test_checkpoint_eos_does_not_stop_a_unit(self, token_id: int, stops: bool) -> None:
+        params = SamplingParams(**MINICPMO_4_5_THINKER_ONLY_PIPELINE.stages[0].sampling_constraints)
+        params.update_from_generation_config({"eos_token_id": [151645, 151643]}, eos_token_id=151645)
+        request = SimpleNamespace(
+            pooling_params=None,
+            sampling_params=params,
+            output_token_ids=[token_id],
+            num_tokens=2,
+            num_output_tokens=1,
+            max_tokens=32,
+            status=RequestStatus.RUNNING,
+            stop_reason=None,
+        )
+        assert check_stop(request, max_model_len=40960) is stops
+        assert request.status == (RequestStatus.FINISHED_STOPPED if stops else RequestStatus.RUNNING)
+
+    def test_deploy_resolves_only_stage_0(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Resolve the CUDA overlay independently of the host.
+        monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+        deploy = load_deploy_config(_DEPLOY_DIR / _THINKER_ONLY_DEPLOY)
+        stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
+
+        assert deploy.pipeline == _THINKER_ONLY_KEY
+        assert deploy.session_mode == "duplex"
+        assert deploy.async_chunk is False
+        assert deploy.connectors is None
+        assert [stage.stage_id for stage in stages] == [0]
+        thinker = stages[0]
+        assert thinker.final_output_type == "text"
+        assert thinker.yaml_runtime["devices"] == "0"
+        assert "input_connectors" not in thinker.yaml_extras
+        assert "output_connectors" not in thinker.yaml_extras
+        assert not thinker.yaml_engine_args.get("custom_process_next_stage_input_func")
+        assert thinker.yaml_engine_args["use_v2_model_runner"] is True
+        assert thinker.yaml_engine_args["kv_cache_memory_bytes"] == 8 * 1024**3
+        assert deploy.duplex_session.max_sessions == thinker.yaml_engine_args["max_num_seqs"]
 
 
 def test_code2wav_model_is_lazily_registered() -> None:
