@@ -175,6 +175,10 @@ Before entering specific testing levels, the project establishes two common spec
 
 ## Notes
 
+For same-commit CUDA/AMD selection and execution comparisons, see
+[Case coverage reporting](./case_coverage.md). Job-count parity alone does not
+establish test-case coverage.
+
 ### L4 cadence (nightly and pre-release)
 
 CUDA **L4** (`full_model`) jobs are defined once in [`.buildkite/cuda/test-nightly.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml). That file is reused at two cadences:

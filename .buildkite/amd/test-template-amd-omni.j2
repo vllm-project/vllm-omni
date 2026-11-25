@@ -151,6 +151,10 @@ steps:
         command: bash .buildkite/amd/scripts/run-amd-test.sh
         env:
           AMD_CI_RUNTIME: "native"
+          VLLM_OMNI_CI_CASE_DIR: "artifacts/ci-case-coverage"
+          VLLM_OMNI_CI_CASE_PLATFORM: "amd"
+          VLLM_OMNI_CI_CASE_TIER: "{{ step_group.group | replace('_TESTS', '') | lower }}"
+          VLLM_OMNI_CI_CASE_BLOCKING: "{{ 'true' if step.grade == 'Blocking' else 'false' }}"
           NATIVE_CI: "true"
           VLLM_CI_DOCKER_DISABLED: "1"
           VLLM_CI_EXPECTED_GPU_COUNT: "{{ step.agent_pool[-1:] }}"
@@ -188,8 +192,9 @@ steps:
 {% if step.parallelism %}
         parallelism: {{ step.parallelism }}
 {% endif %}
-{% if step.artifact_paths %}
         artifact_paths:
+          - "artifacts/ci-case-coverage/*.jsonl"
+{% if step.artifact_paths %}
 {% for path in step.artifact_paths %}
           - "{{ path }}"
 {% endfor %}
@@ -235,6 +240,10 @@ steps:
     command: bash .buildkite/amd/scripts/run-amd-test.sh
     env:
       AMD_CI_RUNTIME: "native"
+      VLLM_OMNI_CI_CASE_DIR: "artifacts/ci-case-coverage"
+      VLLM_OMNI_CI_CASE_PLATFORM: "amd"
+      VLLM_OMNI_CI_CASE_TIER: "unknown"
+      VLLM_OMNI_CI_CASE_BLOCKING: "{{ 'true' if step.grade == 'Blocking' else 'false' }}"
       NATIVE_CI: "true"
       VLLM_CI_DOCKER_DISABLED: "1"
       VLLM_CI_EXPECTED_GPU_COUNT: "{{ step.agent_pool[-1:] }}"
@@ -272,8 +281,9 @@ steps:
 {% if step.parallelism %}
     parallelism: {{ step.parallelism }}
 {% endif %}
-{% if step.artifact_paths %}
     artifact_paths:
+      - "artifacts/ci-case-coverage/*.jsonl"
+{% if step.artifact_paths %}
 {% for path in step.artifact_paths %}
       - "{{ path }}"
 {% endfor %}

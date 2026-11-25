@@ -790,7 +790,34 @@ def _render_test_pipeline(
         pipeline_path=pipeline_path,
     )
     steps = _process_test_steps(steps, changed_files)
+    if pipeline_path and pipeline_path.parent.name == "cuda":
+        tier = pipeline_path.stem.removeprefix("test-")
+        if tier in {"ready", "merge", "nightly", "weekly"}:
+            _add_case_coverage_metadata(steps, tier)
     return {**doc, "steps": steps}
+
+
+def _add_case_coverage_metadata(steps: list[Any], tier: str) -> None:
+    """Attach reporting metadata after filtering/sharding; leave commands/verdicts intact."""
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if isinstance(step.get("steps"), list):
+            _add_case_coverage_metadata(step["steps"], tier)
+        elif "command" in step or "commands" in step:
+            soft_fail = step.get("soft_fail", False)
+            grade = "true" if soft_fail is False else "false" if soft_fail is True else "conditional"
+            step["env"] = {
+                **(step.get("env") or {}),
+                "VLLM_OMNI_CI_CASE_DIR": "artifacts/ci-case-coverage",
+                "VLLM_OMNI_CI_CASE_PLATFORM": "cuda",
+                "VLLM_OMNI_CI_CASE_TIER": tier,
+                "VLLM_OMNI_CI_CASE_BLOCKING": grade,
+            }
+            artifacts = step.get("artifact_paths", [])
+            if isinstance(artifacts, str):
+                artifacts = [artifacts]
+            step["artifact_paths"] = list(dict.fromkeys([*artifacts, "artifacts/ci-case-coverage/*.jsonl"]))
 
 
 # --- Entry (read file → bootstrap or test render → YAML string) ---
