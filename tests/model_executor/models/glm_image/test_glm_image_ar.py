@@ -455,3 +455,38 @@ class TestGlmImageRotaryEmbedding:
         q_out, k_out = rotary_emb(positions, q, k)
         assert q_out.dtype == torch.float32
         assert k_out.dtype == torch.float32
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_text_layers_share_position_embeddings(dtype, multimodal):
+    # Unequal Q/K head counts and a partially rotated head, as in GLM-Image.
+    positions = torch.arange(15).reshape(3, 5) if multimodal else torch.arange(5)
+    rope = GlmImageRotaryEmbedding(head_dim=128, partial_rotary_factor=0.5, mrope_section=[8, 12, 12])
+    layers = [MagicMock() for _ in range(3)]
+    hidden = torch.randn(5, 256, dtype=dtype)
+    for layer in layers:
+        layer.return_value = (hidden, None)
+    model = types.SimpleNamespace(rotary_emb=rope, layers=layers, start_layer=1, end_layer=3, norm=torch.nn.Identity())
+    with (
+        patch.object(
+            _ar_mod, "get_pp_group", return_value=types.SimpleNamespace(is_first_rank=True, is_last_rank=True)
+        ),
+        patch.object(rope, "get_cos_sin", wraps=rope.get_cos_sin) as get_cos_sin,
+    ):
+        _ar_mod.GlmImageTextModel.forward(model, None, positions, inputs_embeds=hidden)
+
+    get_cos_sin.assert_called_once_with(positions, dtype)
+    layers[0].assert_not_called()
+    tables = layers[1].call_args.args[0]
+    assert layers[2].call_args.args[0] is tables
+    pos = positions if multimodal else positions.expand(3, -1)
+    freqs = torch.cat([pos[i, :, None] * part for i, part in enumerate(rope.inv_freq.split([8, 12, 12]))], dim=-1)
+    angles = torch.cat([freqs, freqs], dim=-1)
+    key = torch.randn(5, 128, dtype=dtype)
+    q, k = _ar_mod._rotate_qk(hidden, key, tables, head_dim=128)
+    expected = _ar_mod.apply_glm_image_rotary_pos_emb(
+        hidden.view(5, 2, 128), key.view(5, 1, 128), angles.cos().to(dtype), angles.sin().to(dtype)
+    )
+    for actual, reference in zip((q, k), expected):
+        torch.testing.assert_close(actual, reference.flatten(1), rtol=0, atol=0)

@@ -1434,36 +1434,10 @@ class GlmImageRotaryEmbedding(nn.Module):
 
         return result
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Apply rotary position embeddings to query and key.
-
-        Args:
-            positions: Position IDs
-                - Shape [num_tokens] for 1D positions (text-only)
-                - Shape [3, num_tokens] for 3D M-RoPE positions (T, H, W)
-            query: Query tensor [num_tokens, num_heads * head_dim]
-            key: Key tensor [num_tokens, num_kv_heads * head_dim]
-
-        Returns:
-            Tuple of (rotated_query, rotated_key) with same shapes as input
-        """
-        # Get dimensions
-        if positions.ndim == 1:
-            num_tokens = positions.shape[0]
-        else:
-            num_tokens = positions.shape[1]
-
-        device = positions.device
-        dtype = query.dtype
-
+    def get_cos_sin(self, positions: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the position-dependent tables shared by the local decoder layers."""
         # Ensure inv_freq is on same device
-        inv_freq = self.inv_freq.to(device=device, dtype=torch.float32)
+        inv_freq = self.inv_freq.to(device=positions.device, dtype=torch.float32)
 
         if positions.ndim == 1:
             # 1D positions: expand to 3D with same values
@@ -1501,22 +1475,21 @@ class GlmImageRotaryEmbedding(nn.Module):
         cos = emb.cos().to(dtype)  # [num_tokens, rotary_dim]
         sin = emb.sin().to(dtype)  # [num_tokens, rotary_dim]
 
-        # Reshape query and key for rotary application
-        # query: [num_tokens, num_heads * head_dim] -> [num_tokens, num_heads, head_dim]
-        query_shape = query.shape
-        key_shape = key.shape
+        return cos, sin
 
-        query = query.view(num_tokens, -1, self.head_dim)
-        key = key.view(num_tokens, -1, self.head_dim)
+    def forward(
+        self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _rotate_qk(query, key, self.get_cos_sin(positions, query.dtype), self.head_dim)
 
-        # Apply rotary embeddings
-        query, key = apply_glm_image_rotary_pos_emb(query, key, cos, sin)
 
-        # Reshape back
-        query = query.view(query_shape)
-        key = key.view(key_shape)
-
-        return query, key
+def _rotate_qk(
+    query: torch.Tensor, key: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor], head_dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q, k = apply_glm_image_rotary_pos_emb(
+        query.unflatten(-1, (-1, head_dim)), key.unflatten(-1, (-1, head_dim)), *position_embeddings
+    )
+    return q.flatten(1), k.flatten(1)
 
 
 class GlmImageTextAttention(nn.Module):
@@ -1528,11 +1501,9 @@ class GlmImageTextAttention(nn.Module):
 
     def __init__(
         self,
-        config: GlmImageTextConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        max_position_embeddings: int = 32768,
         quant_config: QuantizationConfig | None = None,
         bias: bool = True,
         cache_config: CacheConfig | None = None,
@@ -1554,7 +1525,6 @@ class GlmImageTextAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.max_position_embeddings = max_position_embeddings
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
@@ -1573,27 +1543,6 @@ class GlmImageTextAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        # M-RoPE for 3D position encoding (temporal, height, width)
-        # Use custom GlmImageRotaryEmbedding instead of vLLM's get_rope
-        # to properly handle 3D positions with mrope_section interleaving
-        rope_parameters = getattr(config, "rope_parameters", None)
-        rope_theta = 10000.0
-        partial_rotary_factor = 1.0
-        mrope_section = [8, 12, 12]  # Default for GLM-Image
-
-        if rope_parameters is not None:
-            rope_theta = rope_parameters.get("rope_theta", rope_theta)
-            partial_rotary_factor = rope_parameters.get("partial_rotary_factor", partial_rotary_factor)
-            mrope_section = rope_parameters.get("mrope_section", mrope_section)
-
-        self.rotary_emb = GlmImageRotaryEmbedding(
-            head_dim=self.head_dim,
-            max_position_embeddings=max_position_embeddings,
-            rope_theta=rope_theta,
-            partial_rotary_factor=partial_rotary_factor,
-            mrope_section=mrope_section,
-        )
-
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -1606,12 +1555,12 @@ class GlmImageTextAttention(nn.Module):
 
     def forward(
         self,
-        positions: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = _rotate_qk(q, k, position_embeddings, self.head_dim)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
@@ -1638,15 +1587,12 @@ class GlmImageTextDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         attention_bias = getattr(config, "attention_bias", True)
 
         self.self_attn = GlmImageTextAttention(
-            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=getattr(config, "num_key_value_heads", config.num_attention_heads),
-            max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             bias=attention_bias,
             cache_config=cache_config,
@@ -1668,7 +1614,7 @@ class GlmImageTextDecoderLayer(nn.Module):
 
     def forward(
         self,
-        positions: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1680,7 +1626,7 @@ class GlmImageTextDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # Self Attention
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states = self.self_attn(position_embeddings, hidden_states)
 
         # Post self-attention norm and residual add
         hidden_states = self.post_self_attn_layernorm(hidden_states)
@@ -1729,6 +1675,15 @@ class GlmImageTextModel(nn.Module):
             )
         else:
             self.embed_tokens = None
+
+        rope = getattr(config, "rope_parameters", None) or {}
+        self.rotary_emb = GlmImageRotaryEmbedding(
+            head_dim=config.hidden_size // config.num_attention_heads,
+            max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
+            rope_theta=rope.get("rope_theta", 10000.0),
+            partial_rotary_factor=rope.get("partial_rotary_factor", 1.0),
+            mrope_section=rope.get("mrope_section"),
+        )
 
         # Decoder layers
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -1782,8 +1737,9 @@ class GlmImageTextModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        position_embeddings = self.rotary_emb.get_cos_sin(positions, hidden_states.dtype)
         for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual = layer(position_embeddings, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
