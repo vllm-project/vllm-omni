@@ -139,13 +139,28 @@ steps:
 
       - label: "Omni · MiniCPM-o 4.5 Perf Test"
         timeout_in_minutes: 60
+        source_file_dependencies: omni_minicpmo_4_5_perf
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
-          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_ready.json -m 'core_model and npu and A3 and omni'
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_ready.json -k test_minicpmo_4_5_ready -m 'core_model and npu and A3 and omni'
+
+      - label: "Omni · MiniCPM-o 4.5 Duplex Perf Test"
+        timeout_in_minutes: 120
+        source_file_dependencies: omni_minicpmo_4_5_duplex_perf
+        mirror_hardwares: a3_npu_2
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+          - tests/dfx/perf/results/omni_duplex_eval_minicpmo_4_5_ready/**/*
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_ready.json -k test_minicpmo_4_5_duplex_ready -m 'core_model and npu and A3 and omni'
 
       - label: "Omni · Qwen3-Omni Test"
         mirror_hardwares: a3_npu_4
