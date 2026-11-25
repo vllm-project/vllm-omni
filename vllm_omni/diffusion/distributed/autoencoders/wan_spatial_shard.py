@@ -911,6 +911,15 @@ def _decoder_upsample_count(decoder: nn.Module) -> int:
     return count
 
 
+def _bind_pending_spatial_fast_path(vae: Any) -> None:
+    from .wan_vae_fastpath.install import SPATIAL_LEVEL_ATTR, install_wan_vae_fastpath
+
+    level = getattr(vae, SPATIAL_LEVEL_ATTR, None)
+    if level is not None:
+        install_wan_vae_fastpath(vae, level=level)
+        delattr(vae, SPATIAL_LEVEL_ATTR)
+
+
 def install_wan_spatial_shard_decode(
     vae: Any,
     group: dist.ProcessGroup,
@@ -957,6 +966,7 @@ def install_wan_spatial_shard_decode(
                 "Wan spatial-shard VAE decoder was already patched for a different process group; "
                 "create a fresh VAE instance to change groups."
             )
+        _bind_pending_spatial_fast_path(vae)
         return
     decoder = getattr(vae, "decoder", None)
     if decoder is None:
@@ -968,14 +978,13 @@ def install_wan_spatial_shard_decode(
     from .wan_vae_fastpath.install import (
         REPORT_ATTR,
         SPATIAL_LEVEL_ATTR,
-        install_wan_vae_fastpath,
         uninstall_wan_vae_fastpath,
     )
 
     report = getattr(vae, REPORT_ATTR, None)
-    fast_level = report.level if report is not None and report.installed else getattr(vae, SPATIAL_LEVEL_ATTR, None)
     if report is not None and report.installed:
         uninstall_wan_vae_fastpath(vae)
+        setattr(vae, SPATIAL_LEVEL_ATTR, report.level)
 
     _patch_decoder_modules(decoder, group, split_dim)
     upsample_count = _decoder_upsample_count(decoder)
@@ -1033,8 +1042,7 @@ def install_wan_spatial_shard_decode(
     vae._vllm_omni_wan_spatial_shard_split_dim = split_dim
     vae._vllm_omni_wan_spatial_shard_dst = dst
     vae._vllm_omni_wan_spatial_shard_group = group
-    if fast_level is not None:
-        install_wan_vae_fastpath(vae, level=fast_level)
+    _bind_pending_spatial_fast_path(vae)
     logger.info("Installed Wan VAE %s-sharded decode.", split_dim)
 
 

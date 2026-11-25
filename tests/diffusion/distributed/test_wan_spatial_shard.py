@@ -574,6 +574,32 @@ def test_install_refuses_to_change_the_assembling_rank(monkeypatch: pytest.Monke
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_spatial_install_retries_failed_fast_path_binding(monkeypatch):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import install
+
+    vae = SimpleNamespace(decoder=_PlainDecoder())
+    setattr(vae, install.SPATIAL_LEVEL_ATTR, "channels_last")
+    group = object()
+    calls = []
+
+    def bind(vae, *, level):
+        calls.append(level)
+        if len(calls) == 1:
+            raise RuntimeError("binding failed")
+
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 2))
+    monkeypatch.setattr(install, "install_wan_vae_fastpath", bind)
+    with pytest.raises(RuntimeError, match="binding failed"):
+        wan_spatial_shard.install_wan_spatial_shard_decode(vae, group)
+    wrapped = vae.decoder.forward
+    wan_spatial_shard.install_wan_spatial_shard_decode(vae, group)
+    wan_spatial_shard.install_wan_spatial_shard_decode(vae, group)
+    assert calls == ["channels_last", "channels_last"]
+    assert vae.decoder.forward is wrapped
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_install_refuses_to_change_process_group(monkeypatch):
     vae, _ = _install_on_plain_decoder(monkeypatch, dst=0)
     original_forward = vae.decoder.forward

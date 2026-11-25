@@ -406,7 +406,11 @@ def main() -> None:
             f"dtype={args.dtype} world_size={world_size}{parallel_desc} "
             f"temporal_chunk_size={args.vae_spatial_temporal_chunk_size}"
         )
-        if parallel and args.vae_spatial_temporal_chunk_size is None:
+        if (
+            parallel
+            and args.vae_parallel_mode.startswith("spatial_shard")
+            and args.vae_spatial_temporal_chunk_size is None
+        ):
             print(
                 "Automatic chunks: off=lossless=1, channels_last=min(4, SP GPU count). "
                 "Set --vae-spatial-temporal-chunk-size explicitly for same-chunk numerical comparisons."
