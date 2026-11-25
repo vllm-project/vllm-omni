@@ -700,7 +700,6 @@ class MiniMaxH3DiTModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["blocks"]
     # Set by enable_vdn for a VDN-H3 checkpoint.
     vdn_config: VDNConfig | None = None
-    _text_cache: tuple[torch.Tensor, torch.Tensor, tuple[int, int], torch.Tensor] | None = None
 
     @staticmethod
     def _is_transformer_block(name: str, module: nn.Module) -> bool:
@@ -1239,40 +1238,6 @@ class MiniMaxH3DiTModel(nn.Module):
             torch.nonzero(text_mask, as_tuple=False).view(-1),
         )
 
-    def _refined_text(
-        self,
-        text_embeddings_selected: torch.Tensor,
-        refiner_cu_seqlens: torch.Tensor,
-        refiner_max_seqlen: int,
-        num_requests: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Text tokens through condition_proj and the token refiner.
-
-        The text branch takes no timestep, so it is identical at every denoising step of
-        a request: reuse it while the same input tensors come back. Holding them keeps
-        their storage from being recycled for another prompt.
-        """
-        key = (refiner_max_seqlen, num_requests)
-        cached = self._text_cache
-        if (
-            cached is not None
-            and cached[0] is text_embeddings_selected
-            and cached[1] is refiner_cu_seqlens
-            and cached[2] == key
-        ):
-            return cached[3]
-        text_rows = text_embeddings_selected.to(device=device, dtype=_BF16_DTYPE)
-        text_embed, _ = self.condition_proj(text_rows)
-        text_embed = self.token_refiner(
-            text_embed,
-            cu_seqlens=refiner_cu_seqlens,
-            max_seqlen=refiner_max_seqlen,
-            num_requests=num_requests,
-        )
-        self._text_cache = (text_embeddings_selected, refiner_cu_seqlens, key, text_embed)
-        return text_embed
-
     def _embed(
         self,
         *,
@@ -1346,8 +1311,13 @@ class MiniMaxH3DiTModel(nn.Module):
         else:
             audio_embed, _ = self.audio_patch_proj(audio_rows)
 
-        text_embed = self._refined_text(
-            text_embeddings_selected, refiner_cu_seqlens, refiner_max_seqlen, num_requests, device
+        text_rows = text_embeddings_selected.to(device=device, dtype=_BF16_DTYPE)
+        text_embed, _ = self.condition_proj(text_rows)
+        text_embed = self.token_refiner(
+            text_embed,
+            cu_seqlens=refiner_cu_seqlens,
+            max_seqlen=refiner_max_seqlen,
+            num_requests=num_requests,
         )
         if text_local_indices is not None:
             text_embed = text_embed.index_select(0, text_local_indices)
