@@ -6,10 +6,7 @@ from __future__ import annotations
 
 import copy
 import random
-import statistics
 from dataclasses import dataclass
-from pathlib import Path
-from time import perf_counter_ns
 
 import torch
 import torch_npu  # noqa: F401 -- registers torch.npu on Ascend
@@ -61,15 +58,6 @@ def prepare_step(runner, talker, batch_desc, model_inputs, batch):
         or runner.use_aux_hidden_state_outputs
         or model_inputs.get("intermediate_tensors") is not None
     ):
-        logger.info_once(
-            "[talker-fused-c1] shape gate: requests=%s desc_requests=%s tokens=%s prefill=%s aux=%s context=%s",
-            batch.num_reqs,
-            batch_desc.num_reqs,
-            batch_desc.num_tokens,
-            batch.has_prefill,
-            runner.use_aux_hidden_state_outputs,
-            runner.model_config.max_model_len,
-        )
         return None
     info = model_inputs.get("model_intermediate_buffer", ())
     if len(info) != 1 or not isinstance(info[0], dict):
@@ -82,7 +70,7 @@ def prepare_step(runner, talker, batch_desc, model_inputs, batch):
     state = talker._request_audio_states.get(request_id)
     sampler = getattr(talker, "_request_host_codec_states", {}).get(request_id)
     if not state or not sampler or not sampler.get("history"):
-        logger.info_once("[talker-fused-c1] host sampling history unavailable at step entry")
+        logger.info_once("[talker-fused-decode] host sampling history unavailable at step entry")
         return None
     eos = talker._codec_eos_id
     if (
@@ -94,7 +82,7 @@ def prepare_step(runner, talker, batch_desc, model_inputs, batch):
         or sampler.get("params") != ((eos,), eos, (), 0.8, 100, 0.8, 0.0, 1.05, 0.0, 0.0, False)
     ):
         logger.info_once(
-            "[talker-fused-c1] request gate: model_step=%s sampler_step=%s settings=%s",
+            "[talker-fused-decode] request gate: model_step=%s sampler_step=%s settings=%s",
             state.get("step"),
             sampler.get("step"),
             sampler.get("params"),
@@ -107,7 +95,7 @@ def prepare_step(runner, talker, batch_desc, model_inputs, batch):
         return None
     first = next(iter(metadata.values()))
     if not hasattr(first, "seq_lens_device"):
-        logger.info_once("[talker-fused-c1] static length tensor unavailable")
+        logger.info_once("[talker-fused-decode] static length tensor unavailable")
         return None
     if not all(
         getattr(m, "seq_lens_device", None) is first.seq_lens_device
@@ -115,7 +103,7 @@ def prepare_step(runner, talker, batch_desc, model_inputs, batch):
         and m.slot_mapping is first.slot_mapping
         for m in metadata.values()
     ):
-        logger.info_once("[talker-fused-c1] layer metadata uses multiple cache groups")
+        logger.info_once("[talker-fused-decode] layer metadata uses multiple cache groups")
         return None
     blocks, slots, lengths = first.block_tables, first.slot_mapping, first.seq_lens_device
     block_size = runner.vllm_config.cache_config.block_size
@@ -127,7 +115,10 @@ def prepare_step(runner, talker, batch_desc, model_inputs, batch):
         or lengths.numel() != 1
     ):
         logger.info_once(
-            "[talker-fused-c1] metadata gate: blocks=%s slots=%s lengths=%s", blocks.shape, slots.shape, lengths.shape
+            "[talker-fused-decode] metadata gate: blocks=%s slots=%s lengths=%s",
+            blocks.shape,
+            slots.shape,
+            lengths.shape,
         )
         return None
     embeds, positions = model_inputs.get("inputs_embeds"), model_inputs.get("positions")
@@ -137,7 +128,7 @@ def prepare_step(runner, talker, batch_desc, model_inputs, batch):
 
 
 class TalkerFusedGraph:
-    def __init__(self, runner, talker, live, sampler_factory, *, split_at_eos=False, capacity=CAPACITY):
+    def __init__(self, runner, talker, live, *, capacity=CAPACITY):
         self.runner = runner
         self.capacity = capacity
         self.talker = talker
@@ -159,7 +150,7 @@ class TalkerFusedGraph:
             (1, talker._tts_config.num_attention_heads, 1, capacity), dtype=live.embeds.dtype, device=device
         )
         self.lse = torch.empty(1, dtype=live.embeds.dtype, device=device)
-        self.sampler = sampler_factory(self.eos, 0.8, 100, 0.8, 1.05, device)
+        self.sampler = make_device_sampler(self.eos, 0.8, 100, 0.8, 1.05, device)
         self.metadata = []
         self.kv = []
         self.layer_names = tuple(live.metadata)
@@ -184,10 +175,7 @@ class TalkerFusedGraph:
             metadata.talker_fused_frame = (self.bias, self.lse, capacity)
             self.metadata.append(dict.fromkeys(live.metadata, metadata))
         self.graph = None
-        self.replay_ms = []
-        self.split_at_eos = split_at_eos
-        self.tail_skips = 0
-        self.tail_steps = 0
+        self.qualified: bool | None = None
         self.desc = BatchDescriptor(num_tokens=1)
 
     def bind(self, live):
@@ -273,32 +261,22 @@ class TalkerFusedGraph:
                 current.wait_stream(warmup)
                 self.restore_kv(saved)
                 graph = torch.npu.NPUGraph()
-                midpoint = WIDTH // 2 if self.split_at_eos else WIDTH
+                midpoint = WIDTH // 2
                 with torch.npu.graph(graph):
                     hidden, packed, state = self.forward(end=midpoint)
-                if self.split_at_eos:
-                    self.midpoint_state = state
-                    self.second_graph = torch.npu.NPUGraph()
-                    with torch.npu.graph(self.second_graph):
-                        self.second_hidden, self.second_packed, _ = self.forward(start=midpoint, state=state)
+                self.midpoint_state = state
+                self.second_graph = torch.npu.NPUGraph()
+                with torch.npu.graph(self.second_graph):
+                    self.second_hidden, self.second_packed, _ = self.forward(start=midpoint, state=state)
             finally:
                 current.wait_stream(warmup)
                 self.restore_kv(saved)
             self.graph, self.hidden, self.packed = graph, hidden, packed
-            logger.info(
-                "[talker-fused-c1] captured %d live-weight frames split=%s capacity=%d",
-                WIDTH,
-                self.split_at_eos,
-                self.capacity,
-            )
+            logger.info("[talker-fused-decode] captured %d frames, context capacity=%d", WIDTH, self.capacity)
         self.graph.replay()
         rows = self.packed.cpu().tolist()
-        if not self.split_at_eos:
-            return self.hidden, rows
-        self.tail_steps += 1
         if rows[-1][2] or any(row[3] for row in rows):
-            self.tail_skips += 1
-            logger.info_once("[talker-fused-c1] first half early exit")
+            logger.info_once("[talker-fused-decode] first half early exit")
             hidden_rows = self.hidden[-1:].expand(WIDTH // 2, -1)
             return torch.cat((self.hidden, hidden_rows)), rows + [[self.eos, 0, 1, 0]] * (WIDTH // 2)
         self.second_graph.replay()
@@ -369,7 +347,7 @@ def check_shadow(talker, result, live, packed, kv, shadow_slots, graph):
     kv_max = torch.stack([(a - b[:draws]).abs().amax() for a, b in zip(actual_kv, kv, strict=True)])
     max_error = float(kv_max.max().item())
     logger.info(
-        "[talker-fused-c1] shadow codes=%d match=%s stop_match=%s guard=%s kv_max_abs=%.6g req=%s",
+        "[talker-fused-decode] shadow codes=%d match=%s stop_match=%s guard=%s kv_max_abs=%.6g req=%s",
         len(codes),
         codes == expected,
         stop_match,
@@ -380,47 +358,12 @@ def check_shadow(talker, result, live, packed, kv, shadow_slots, graph):
     return codes == expected and stop_match and max_error == 0.0
 
 
-def run_fused_step(runner, mode_path, batch_desc, model_inputs, batch, run_model):
+def run_fused_step(runner, batch_desc, model_inputs, batch, run_model):
     def baseline():
         return runner._run_kstep_frames(model_inputs, batch, run_model=run_model)
 
-    if mode_path is None:
-        mode = (runner.vllm_config.additional_config or {}).get("minicpmo_talker_fused_decode")
-    else:
-        try:
-            mode = Path(mode_path).read_text().strip()
-        except FileNotFoundError:
-            return baseline()
-    if mode not in (
-        "shadow",
-        "active",
-        "guard",
-        "shadow_reference",
-        "reference",
-        "shadow_tail",
-        "tail",
-        "shadow_capacity",
-        "tail_capacity",
-        "shadow_prefill_capacity",
-        "tail_prefill_capacity",
-        "shadow_thinker_prefill",
-        "active_thinker_prefill",
-    ) or getattr(runner, "_talker_fused_disabled", False):
+    if getattr(runner, "_talker_fused_disabled", False):
         return baseline()
-    reference = mode in ("shadow_reference", "reference")
-    bucketed = mode in (
-        "shadow_capacity",
-        "tail_capacity",
-        "shadow_prefill_capacity",
-        "tail_prefill_capacity",
-        "shadow_thinker_prefill",
-        "active_thinker_prefill",
-    )
-    tail = bucketed or mode in ("shadow_tail", "tail")
-    shadow = mode in ("shadow_reference", "shadow", "shadow_tail", "shadow_capacity")
-    graph_name = "_talker_fused_reference_graph" if reference else "_talker_fused_graph"
-    if tail:
-        graph_name = "_talker_fused_tail_graph"
     model_len = runner.model_config.max_model_len
     hybrid = hybrid_enabled(runner)
     if model_len != CAPACITY and not hybrid:
@@ -433,41 +376,28 @@ def run_fused_step(runner, mode_path, batch_desc, model_inputs, batch, run_model
     talker = getattr(runner.model, "talker", runner.model)
     live = prepare_step(runner, talker, batch_desc, model_inputs, batch)
     if live is None:
-        logger.info_once("[talker-fused-c1] eligibility declined at least one step")
         return baseline()
 
     capacity = CAPACITY
-    if bucketed:
-        lengths = getattr(batch, "seq_lens_np", None)
-        block_size = runner.vllm_config.cache_config.block_size
-        if lengths is not None and len(lengths) >= 1 and block_size == 128:
-            length = int(lengths[0])
-            if WIDTH <= length <= 256:
-                capacity = 128 if length <= 128 else 256
-                graph_name = f"_talker_fused_tail_graph_{capacity}"
-    accepted = graph_name + "_shadow_passed"
-    rejected = graph_name + "_shadow_failed"
-    if not shadow:
-        if getattr(runner, rejected, False):
-            return baseline()
-        # Active deployments qualify each graph locally on its first use.
-        shadow = not getattr(runner, accepted, False)
-
-    graph = getattr(runner, graph_name, None)
+    lengths = getattr(batch, "seq_lens_np", None)
+    if lengths is not None and len(lengths) >= 1 and runner.vllm_config.cache_config.block_size == 128:
+        length = int(lengths[0])
+        if WIDTH <= length <= 256:
+            capacity = 128 if length <= 128 else 256
+    graphs = getattr(runner, "_talker_fused_graphs", None)
+    if graphs is None:
+        graphs = runner._talker_fused_graphs = {}
+    graph = graphs.get(capacity)
     if graph is None:
-        sampler_factory = make_device_sampler
-        if reference:
-            from vllm_omni.platforms.npu.worker.talker_fused_sampling_reference import (
-                make_device_sampler as sampler_factory,
-            )
         try:
-            graph = TalkerFusedGraph(runner, talker, live, sampler_factory, split_at_eos=tail, capacity=capacity)
+            graph = graphs[capacity] = TalkerFusedGraph(runner, talker, live, capacity=capacity)
         except ValueError:
             runner._talker_fused_disabled = True
-            logger.exception("[talker-fused-c1] graph setup declined")
+            logger.exception("[talker-fused-decode] graph setup declined")
             return baseline()
-        setattr(runner, graph_name, graph)
-    started = perf_counter_ns()
+    if graph.qualified is False:
+        return baseline()
+    shadow = graph.qualified is None
     if tuple(live.metadata) != graph.layer_names:
         return baseline()
     graph.bind(live)
@@ -476,31 +406,20 @@ def run_fused_step(runner, mode_path, batch_desc, model_inputs, batch, run_model
         hidden, packed = graph.run()
         codes, stops, guard, draws = summarize(packed)
         if not shadow:
-            if guard or mode == "guard":
+            if guard:
                 # Every speculative write belongs to this step's reserved
                 # range. The baseline overwrites the consumed prefix and
                 # the scheduler drops the remainder on EOS.
-                logger.info("[talker-fused-c1] numeric fallback req=%s", live.request_id)
+                logger.info("[talker-fused-decode] numeric fallback req=%s", live.request_id)
                 return baseline()
             runner._kstep_ran_last = True
-            graph.replay_ms.append((perf_counter_ns() - started) / 1e6)
-            if len(graph.replay_ms) == 32:
-                logger.info(
-                    "[talker-fused-c1] 32 replay+bind+readback ms p50=%.3f mean=%.3f",
-                    statistics.median(graph.replay_ms),
-                    statistics.mean(graph.replay_ms),
-                )
-                graph.replay_ms.clear()
-                if tail:
-                    logger.info("[talker-fused-c1] split steps=%d early_exits=%d", graph.tail_steps, graph.tail_skips)
-            logger.info_once("[talker-fused-c1] active replay enabled mode=%s", mode)
             return commit(talker, live, hidden, packed, codes, stops, draws)
         assert saved is not None
         slots = saved[0]
         shadow_kv = [cache.index_select(0, slots) for cache in graph.kv]
     except (RuntimeError, TypeError, AttributeError):
         runner._talker_fused_disabled = True
-        logger.exception("[talker-fused-c1] capture or replay failed")
+        logger.exception("[talker-fused-decode] capture or replay failed")
         if saved is not None:
             graph.restore_kv(saved)
         return baseline()
@@ -508,9 +427,7 @@ def run_fused_step(runner, mode_path, batch_desc, model_inputs, batch, run_model
     result = baseline()
     ok = check_shadow(talker, result, live, packed, shadow_kv, slots, graph)
     if not guard:
-        if ok:
-            setattr(runner, accepted, True)
-        else:
-            setattr(runner, rejected, True)
-            logger.warning("[talker-fused-c1] shadow discrepancy requires investigation")
+        graph.qualified = ok
+        if not ok:
+            logger.warning("[talker-fused-decode] graph qualification failed")
     return result

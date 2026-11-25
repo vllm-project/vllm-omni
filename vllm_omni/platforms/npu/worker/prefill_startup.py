@@ -12,16 +12,56 @@ from vllm import SamplingParams
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import pack_handoff_tensor
-from vllm_omni.platforms.npu.worker.prefill_graph import TALKER_STARTUP_LENGTHS, TALKER_STARTUP_PREFIX
+from vllm_omni.platforms.npu.worker.prefill_graph import (
+    TALKER_STARTUP_LENGTHS,
+    TALKER_STARTUP_PREFIX,
+    THINKER_STARTUP_LENGTHS,
+    THINKER_STARTUP_PREFIX,
+)
 
 logger = init_logger(__name__)
 
 
-async def precapture_talker_prefill(engine):
-    """Qualify both Talker replicas on synthetic handoffs before HTTP serving."""
-    marker = Path(os.environ["MINICPMO_NPU_TALKER_PREFILL_STARTUP"])
+async def precapture_prefill(engine):
     if "MiniCPMO45" not in str(engine.model_config.architectures):
-        raise ValueError("Talker prefill precapture requires MiniCPM-o 4.5")
+        raise ValueError("Prefill precapture requires MiniCPM-o 4.5")
+    if marker := os.getenv("MINICPMO_NPU_THINKER_PREFILL_STARTUP"):
+        await _precapture_thinker_prefill(engine, Path(marker))
+    if marker := os.getenv("MINICPMO_NPU_TALKER_PREFILL_STARTUP"):
+        await _precapture_talker_prefill(engine, Path(marker))
+
+
+async def _precapture_thinker_prefill(engine, marker):
+    """Capture and verify bounded single-row prompt lengths before HTTP serving."""
+    tokenizer = await engine.get_tokenizer()
+    tokens = tokenizer.encode(
+        "A harbor pilot watches the wind turn while crews check the channel markers and write their notes.",
+        add_special_tokens=False,
+    )
+    randomizer = random.Random(19)
+    marker.touch(exist_ok=False)
+    try:
+        lengths = list(THINKER_STARTUP_LENGTHS) + [128, 144, 160]
+        for index, length in enumerate(lengths):
+            prompt = {"prompt_token_ids": randomizer.choices(tokens, k=length)}
+            request_id = f"{THINKER_STARTUP_PREFIX}{index}"
+            stream = engine.generate(
+                prompt=prompt,
+                sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
+                request_id=request_id,
+                output_modalities=["text"],
+            )
+            async with aclosing(stream) as outputs:
+                async with asyncio.timeout(30):
+                    async for _ in outputs:
+                        pass
+    finally:
+        marker.unlink()
+    logger.info("[thinker-prefill-startup] finished synthetic prefill requests")
+
+
+async def _precapture_talker_prefill(engine, marker):
+    """Qualify both Talker replicas on synthetic handoffs before HTTP serving."""
     tts_config = engine.model_config.hf_config.tts_config
     llm_dim = int(tts_config["llm_dim"] if isinstance(tts_config, dict) else tts_config.llm_dim)
     tokenizer = await engine.get_tokenizer()

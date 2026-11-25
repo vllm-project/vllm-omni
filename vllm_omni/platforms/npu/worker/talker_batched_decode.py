@@ -2,10 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Batched single-query graph replay for the MiniCPM-o Talker."""
 
-import os
 from contextlib import contextmanager
 from copy import copy
-from pathlib import Path
 
 import torch
 from vllm.config import CUDAGraphMode
@@ -20,10 +18,8 @@ from vllm_omni.platforms.npu.worker.talker_context import (
     hybrid_enabled,
     scheduled_length,
 )
-from vllm_omni.platforms.npu.worker.talker_exact_rotary import fused as exact_bf16_rotary
 
 logger = init_logger(__name__)
-MODE = os.getenv("MINICPMO_NPU_TALKER_NARROW_C8_MODE_FILE")
 
 
 class CompactGraph:
@@ -38,9 +34,6 @@ class CompactGraph:
         rows,
         capacity,
         wide_rows,
-        *,
-        fixed_down_lanes=False,
-        fused_rope=False,
     ):
         self.embed = torch.empty_like(embeds[:rows])
         self.positions = torch.empty_like(positions[:rows])
@@ -77,8 +70,6 @@ class CompactGraph:
         self.desc = BatchDescriptor(num_tokens=rows)
         self.graph = None
         self.down_projections: tuple[torch.nn.Module, ...] = ()
-        self.fixed_down_lanes = fixed_down_lanes
-        self.fused_rope = fused_rope
         if rows > 4:
             if runner.vllm_config.parallel_config.tensor_parallel_size != 1:
                 raise ValueError("Talker hybrid replay needs TP=1")
@@ -87,16 +78,7 @@ class CompactGraph:
             if len(widths) != 1 or any(layer.bias is not None for layer in down):
                 raise ValueError("Talker hybrid replay needs a uniform, bias-free MLP")
             self.down_projections = down
-            down_shape = (wide_rows, widths.pop())
-            if self.fixed_down_lanes:
-                # Keep all original M rows and the original strides. Only
-                # selected outputs escape the projection; inactive rows stay
-                # zero throughout capture and replay.
-                self.down_input = embeds.new_zeros(down_shape)
-            else:
-                self.down_input = embeds.new_empty(down_shape)
-                self.lane_base = torch.arange(rows, dtype=torch.long, device=embeds.device) * 16
-                self.lanes = torch.empty_like(self.lane_base)
+            self.down_input = embeds.new_zeros((wide_rows, widths.pop()))
 
     @contextmanager
     def _original_down_shapes(self):
@@ -111,15 +93,10 @@ class CompactGraph:
                 replaced.append((projection, old, had_local))
 
                 def project(x, call=old):
-                    if self.fixed_down_lanes:
-                        live = slice(0, self.rows * 16, 16)
-                        self.down_input[live].copy_(x)
-                        result, bias = call(self.down_input)
-                        return result[live].contiguous(), bias
-                    self.down_input.zero_()
-                    self.down_input.index_copy_(0, self.lanes, x)
+                    live = slice(0, self.rows * 16, 16)
+                    self.down_input[live].copy_(x)
                     result, bias = call(self.down_input)
-                    return result.index_select(0, self.lanes), bias
+                    return result[live].contiguous(), bias
 
                 projection.forward = project
             yield
@@ -130,58 +107,6 @@ class CompactGraph:
                 else:
                     del projection.forward
 
-    @contextmanager
-    def _exact_rotary(self):
-        if not self.fused_rope:
-            yield
-            return
-        replaced = []
-        try:
-            layers = tuple(self.model.tts_model.layers)
-            if len(layers) != 20:
-                raise ValueError("Exact compact RoPE needs the 20-layer Talker")
-            for layer in layers:
-                rotary = layer.self_attn.rotary_emb
-                if (
-                    not rotary.is_neox_style
-                    or rotary.head_size != 64
-                    or rotary.rotary_dim != 64
-                    or getattr(rotary.apply_rotary_emb, "enable_fp32_compute", False)
-                ):
-                    raise ValueError("Exact compact RoPE needs full-head BF16 NeoX rounding")
-                cache = rotary.cos_sin_cache
-                if cache.ndim != 2 or cache.shape[1] != 64 or not cache.is_contiguous():
-                    raise ValueError("Exact compact RoPE needs a contiguous cosine/sine table")
-                old = rotary.forward
-                replaced.append((rotary, old, "forward" in rotary.__dict__))
-
-                def project(positions, query, key=None, table=cache):
-                    if (
-                        key is None
-                        or query.shape != (self.rows, 768)
-                        or key.shape != query.shape
-                        or query.dtype != torch.bfloat16
-                        or key.dtype != query.dtype
-                        or query.stride(1) != 1
-                        or key.stride(1) != 1
-                        or positions.ndim != 1
-                        or positions.shape[0] != self.rows
-                        or positions.dtype not in (torch.int32, torch.int64)
-                    ):
-                        raise ValueError("Unexpected Q/K shape in compact Talker")
-                    if table.device != query.device or table.dtype != query.dtype:
-                        table = table.to(device=query.device, dtype=query.dtype)
-                    return exact_bf16_rotary(query, key, positions.contiguous(), table)
-
-                rotary.forward = project
-            yield
-        finally:
-            for rotary, old, had_local in reversed(replaced):
-                if had_local:
-                    rotary.forward = old
-                else:
-                    del rotary.forward
-
     def prepare_step(self, first, width, active_rows):
         torch.sub(first.seq_lens_device.reshape(-1)[:active_rows], width - 1, out=self.first_length[:active_rows])
         self.blocks[:active_rows].copy_(first.block_tables[:active_rows, : self.blocks.shape[1]])
@@ -191,8 +116,6 @@ class CompactGraph:
 
     def bind(self, first, embeds, positions, width, frame, active_rows):
         end = active_rows * width
-        if self.down_projections and not self.fixed_down_lanes:
-            torch.add(self.lane_base, frame, out=self.lanes)
         self.embed[:active_rows].copy_(embeds[frame:end:width])
         self.positions[:active_rows].copy_(positions[frame:end:width])
         self.slots[:active_rows].copy_(first.slot_mapping[frame:end:width])
@@ -207,7 +130,6 @@ class CompactGraph:
         static_shape_decode.emit_mask_refresh(self.bias, self.lengths, self.bias.shape[1], self.capacity)
         with (
             self._original_down_shapes(),
-            self._exact_rotary(),
             self.runner._forward_context(
                 self.metadata,
                 self.runner.vllm_config,
@@ -228,7 +150,7 @@ class CompactGraph:
     def replay(self):
         if self.graph is None:
             current = torch.npu.current_stream()
-            warmup = self.runner._c8_talker_warmup
+            warmup = self.runner._talker_compact_warmup
             warmup.wait_stream(current)
             try:
                 with torch.npu.stream(warmup):
@@ -241,8 +163,8 @@ class CompactGraph:
             self.graph = torch.npu.NPUGraph()
             with torch.npu.graph(
                 self.graph,
-                pool=self.runner._c8_talker_shared_capture_pool,
-                stream=self.runner._c8_talker_capture_stream,
+                pool=self.runner._talker_compact_shared_capture_pool,
+                stream=self.runner._talker_compact_capture_stream,
             ):
                 self.output.copy_(self.forward())
         self.graph.replay()
@@ -268,28 +190,9 @@ def prepare(runner, talker, model_inputs, input_batch, width):
     rows = input_batch.num_reqs
     if width != 16 or input_batch.has_prefill or not 2 <= rows <= 16:
         return None
-    if MODE is None:
-        options = runner.vllm_config.additional_config or {}
-        selected_mode = options.get("minicpmo_talker_compact_decode", "")
-    else:
-        try:
-            selected_mode = Path(MODE).read_text().strip()
-        except FileNotFoundError:
-            return None
-    if not isinstance(selected_mode, str):
+    if model_inputs.get("intermediate_tensors") is not None:
         return None
-    mode, _, variant = selected_mode.partition("_")
-    if (
-        mode not in ("shadow", "active")
-        or variant not in ("", "fixed", "fixed_rope", "fixed_wide", "fixed_padded")
-        or model_inputs.get("intermediate_tensors") is not None
-    ):
-        return None
-    padded = 8 < rows < 16 and variant == "fixed_padded"
-    if rows > 8 and not (padded or rows == 16 and variant in ("fixed_wide", "fixed_padded")):
-        return None
-    fixed_down_lanes = variant in ("fixed", "fixed_rope", "fixed_wide", "fixed_padded") and rows > 4
-    fused_rope = variant == "fixed_rope"
+    padded = 8 < rows < 16
     spans = runner.model_state._request_token_spans(input_batch)
     if spans != [(i * width, (i + 1) * width) for i in range(rows)]:
         return None
@@ -341,17 +244,17 @@ def prepare(runner, talker, model_inputs, input_batch, width):
     graph_wide_rows = graph_rows * width if padded else wide_rows
     if wide_rows > graph_wide_rows:
         return None
-    if not hasattr(runner, "_c8_talker_graphs"):
-        runner._c8_talker_graphs = {}
-        runner._c8_talker_ready = set()
-        runner._c8_talker_rejected = set()
-        runner._c8_talker_warmup = torch.npu.Stream()
-        runner._c8_talker_capture_stream = torch.npu.Stream()
-        runner._c8_talker_shared_capture_pool = torch.npu.graph_pool_handle()
-    graphs, ready, rejected = runner._c8_talker_graphs, runner._c8_talker_ready, runner._c8_talker_rejected
-    # MRv2's host seq_lens_np already counts this entire scheduled K-step
-    # window. A bucket that fits it is safe for every frame in the step.
-    # Use 512 on any build that cannot provide a host length vector.
+    if not hasattr(runner, "_talker_compact_graphs"):
+        runner._talker_compact_graphs = {}
+        runner._talker_compact_ready = set()
+        runner._talker_compact_rejected = set()
+        runner._talker_compact_warmup = torch.npu.Stream()
+        runner._talker_compact_capture_stream = torch.npu.Stream()
+        runner._talker_compact_shared_capture_pool = torch.npu.graph_pool_handle()
+    graphs = runner._talker_compact_graphs
+    ready = runner._talker_compact_ready
+    rejected = runner._talker_compact_rejected
+    # The host length includes all slots reserved by this K-step.
     preferred = full_capacity
     # Keep one 16-row capture. A longer sequence takes the existing full-context path.
     if graph_rows == 16:
@@ -369,7 +272,7 @@ def prepare(runner, talker, model_inputs, input_batch, width):
         preferred = static_shape_decode.select_bucket(length, (128, 256, full_capacity))
     candidate_capacities = (preferred, full_capacity) if preferred != full_capacity else (full_capacity,)
     for capacity in candidate_capacities:
-        graph_key = (graph_rows, graph_wide_rows, capacity, fixed_down_lanes, fused_rope)
+        graph_key = (graph_rows, graph_wide_rows, capacity)
         qualification = (*graph_key, rows, wide_rows) if padded else graph_key
         if qualification not in rejected:
             break
@@ -388,18 +291,16 @@ def prepare(runner, talker, model_inputs, input_batch, width):
                 graph_rows,
                 capacity,
                 graph_wide_rows,
-                fixed_down_lanes=fixed_down_lanes,
-                fused_rope=fused_rope,
             )
         except ValueError:
             rejected.add(qualification)
-            logger.exception("[c8-talker-narrow] unsupported geometry rows=%d", rows)
+            logger.exception("[talker-compact-decode] unsupported geometry rows=%d", rows)
             return None
     if tuple(compact.metadata) != tuple(metadata):
         return None
     # Keep the complete first K-step on the reference path while comparing
     # every frame; only subsequent steps may use the qualified graph.
-    shadow = mode == "shadow" or qualification not in ready
+    shadow = qualification not in ready
 
     def frame_forward(frame, wide_forward):
         if frame == 0 and qualification not in rejected:
@@ -408,17 +309,15 @@ def prepare(runner, talker, model_inputs, input_batch, width):
             try:
                 compact.bind(first, embeds, positions, width, frame, rows)
                 logger.info_once(
-                    "[c8-talker-narrow] active replay rows=%d capacity=%d fixed=%s rope=%s",
+                    "[talker-compact-decode] active replay rows=%d capacity=%d",
                     rows,
                     capacity,
-                    fixed_down_lanes,
-                    fused_rope,
                 )
                 output = compact.replay()[:rows]
                 return output
             except (RuntimeError, TypeError, ValueError):
                 rejected.add(qualification)
-                logger.exception("[c8-talker-narrow] replay failed rows=%d", rows)
+                logger.exception("[talker-compact-decode] replay failed rows=%d", rows)
         reference = wide_forward()[frame : rows * width : width].clone()
         if qualification in rejected or not shadow:
             return reference
@@ -436,7 +335,7 @@ def prepare(runner, talker, model_inputs, input_batch, width):
                     for old, cache in zip(expected_kv, compact.kv, strict=True)
                 )
         except (RuntimeError, TypeError, ValueError):
-            logger.exception("[c8-talker-narrow] shadow capture failed rows=%d", rows)
+            logger.exception("[talker-compact-decode] shadow capture failed rows=%d", rows)
             hidden_ok = kv_ok = False
         if not (hidden_ok and kv_ok):
             ready.discard(qualification)
@@ -444,7 +343,7 @@ def prepare(runner, talker, model_inputs, input_batch, width):
             for cache, old in zip(compact.kv, expected_kv, strict=True):
                 cache.index_copy_(0, slots, old)
             logger.warning(
-                "[c8-talker-narrow] shadow mismatch rows=%d capacity=%d frame=%d hidden=%s kv=%s",
+                "[talker-compact-decode] shadow mismatch rows=%d capacity=%d frame=%d hidden=%s kv=%s",
                 rows,
                 capacity,
                 frame,
@@ -454,11 +353,9 @@ def prepare(runner, talker, model_inputs, input_batch, width):
         elif frame == width - 1 and qualification not in ready:
             ready.add(qualification)
             logger.info(
-                "[c8-talker-narrow] shadow exact all frames rows=%d capacity=%d fixed=%s rope=%s",
+                "[talker-compact-decode] shadow exact all frames rows=%d capacity=%d",
                 rows,
                 capacity,
-                fixed_down_lanes,
-                fused_rope,
             )
         return reference
 

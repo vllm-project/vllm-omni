@@ -11,8 +11,6 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass
-from os import environ
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from vllm.logger import init_logger
@@ -302,16 +300,12 @@ class StagePool:
         options = getattr(stage_vllm_config, "additional_config", None)
         if not isinstance(options, Mapping):
             options = {}
-        self._c8_route_mode = options.get("minicpmo_talker_replica_route") if stage_id == 1 else None
-        self._c8_vocoder_route_mode = options.get("minicpmo_vocoder_replica_route") if stage_id == 2 else None
-        mode_file = environ.get("MINICPMO_C8_TALKER_ROUTE_FILE") if stage_id == 1 else None
-        self._c8_route_file = Path(mode_file) if mode_file else None
-        self._c8_route_run = None
-        self._c8_route_counts = [0, 0]
-        c2w_mode_file = environ.get("MINICPMO_C8_VOCODER_ROUTE_FILE") if stage_id == 2 else None
-        self._c8_vocoder_route_file = Path(c2w_mode_file) if c2w_mode_file else None
-        self._c8_vocoder_route_run = None
-        self._c8_vocoder_route_counts = [0, 0]
+        self._balance_talker_replicas = stage_id == 1 and options.get("minicpmo_talker_replica_route") == "half"
+        self._route_code2wav_by_load = (
+            stage_id == 2 and options.get("minicpmo_vocoder_replica_route") == "adaptive_secondary"
+        )
+        self._talker_route_cursor = 0
+        self._code2wav_route_cursor = 0
         self._request_bindings: dict[str, int] = {}
         # Session -> replica. Round-robin would scatter a session's follow-up
         # requests across replicas that do not hold its state. This pool is the
@@ -591,8 +585,7 @@ class StagePool:
         while True:
             candidates = self._collect_serviceable_replicas()
             if candidates:
-                # LB chose an index *into our candidates list*.
-                preferred = self._c8_experimental_talker_replica([rid for _, rid in candidates])
+                preferred = self._select_talker_replica([rid for _, rid in candidates])
                 lb_idx = (
                     self._lb.select(task, [rep for rep, _ in candidates])
                     if preferred is None
@@ -674,7 +667,7 @@ class StagePool:
         if not candidates:
             return None
 
-        preferred = self._c8_experimental_talker_replica([rid for _, rid in candidates])
+        preferred = self._select_talker_replica([rid for _, rid in candidates])
         lb_idx = (
             self._lb.select(selection_task, [rep for rep, _ in candidates])
             if preferred is None
@@ -1087,71 +1080,27 @@ class StagePool:
     def session_binding_count(self) -> int:
         return len(self._session_bindings)
 
-    def _c8_experimental_talker_replica(self, live: list[int]) -> int | None:
-        """Apply the configured split to previously unbound Talker requests."""
-        if self.stage_id != 1 or set(live) != {0, 1}:
+    def _select_talker_replica(self, live: list[int]) -> int | None:
+        if not self._balance_talker_replicas or set(live) != {0, 1}:
             return None
-        mode, arm = self._c8_route_mode, "deployment"
-        if self._c8_route_file is not None:
-            try:
-                mode, arm = self._c8_route_file.read_text().split()
-            except (OSError, ValueError):
-                return None
-        if mode not in ("primary", "quarter", "half", "secondary"):
-            return None
-        if (mode, arm) != self._c8_route_run:
-            self._c8_route_run = (mode, arm)
-            self._c8_route_counts[:] = [0, 0]
-        n = sum(self._c8_route_counts)
-        secondary = mode == "secondary" or (mode == "quarter" and n % 4 == 3) or (mode == "half" and n % 2 == 1)
-        chosen = int(secondary)
-        self._c8_route_counts[chosen] += 1
-        if n + 1 in (4, 24, 32, 48, 72, 96):
-            logger.info(
-                "C8 Talker replica route mode=%s arm=%s primary=%d secondary=%d", mode, arm, *self._c8_route_counts
-            )
-        return chosen
+        replica_id = self._talker_route_cursor
+        self._talker_route_cursor = 1 - replica_id
+        return replica_id
 
-    def select_experimental_code2wav_replica(self, request_id: str) -> int | None:
-        """Pin an HTTP turn at prewarm, before the Talker is assigned at text handoff."""
-        if (self._c8_vocoder_route_file is None and self._c8_vocoder_route_mode is None) or set(
-            self.available_replica_ids()
-        ) != {0, 1}:
+    def select_code2wav_replica(self, request_id: str) -> int | None:
+        """Select a Code2Wav replica before prewarming an unpinned HTTP turn."""
+        if not self._route_code2wav_by_load or set(self.available_replica_ids()) != {0, 1}:
             return None
         existing = self.get_bound_replica_id(request_id)
         if existing is not None:
             return existing
         if request_id in self._requested_replica_ids:
             return None
-        mode, arm = self._c8_vocoder_route_mode, "deployment"
-        if self._c8_vocoder_route_file is not None:
-            try:
-                mode, arm = self._c8_vocoder_route_file.read_text().split()
-            except (OSError, ValueError):
-                return None
-        if mode not in ("primary", "secondary", "eighth", "quarter", "adaptive", "adaptive_secondary"):
-            return None
-        if (mode, arm) != self._c8_vocoder_route_run:
-            self._c8_vocoder_route_run = (mode, arm)
-            self._c8_vocoder_route_counts[:] = [0, 0]
-        n = sum(self._c8_vocoder_route_counts) + 1
-        pick_secondary = mode == "secondary" or (mode == "eighth" and n % 8 == 0) or (mode == "quarter" and n % 4 == 0)
-        if mode in ("adaptive", "adaptive_secondary"):
-            primary_weight = 2.5 if mode == "adaptive_secondary" else 3.0
-            pick_secondary = self._adaptive_code2wav_route(n, primary_weight=primary_weight)
-        chosen = int(pick_secondary)
-        self._c8_vocoder_route_counts[chosen] += 1
-        if n in (4, 32, 96):
-            logger.info(
-                "C8 vocoder route mode=%s arm=%s primary=%d secondary=%d",
-                mode,
-                arm,
-                *self._c8_vocoder_route_counts,
-            )
-        return chosen
+        self._code2wav_route_cursor = (self._code2wav_route_cursor + 1) % 4
+        return int(self._prefer_secondary_code2wav())
 
-    def _adaptive_code2wav_route(self, ordinal: int, *, primary_weight: float) -> bool:
-        """Compare live turns relative to the two replicas' processing capacity."""
+    def _prefer_secondary_code2wav(self) -> bool:
+        """Compare live and reserved turns against each replica's capacity."""
         bindings = {
             **self._requested_replica_ids,
             **{req: self._addr_to_replica_id.get(addr) for req, addr in self._affinity.items()},
@@ -1164,11 +1113,11 @@ class StagePool:
         if secondary >= 16:
             return False
         if primary + secondary >= 8:
-            primary_wait = (primary + 1) / primary_weight
+            primary_wait = (primary + 1) / 2.5
             secondary_wait = secondary + 1
             if abs(primary_wait - secondary_wait) >= 1:
                 return secondary_wait < primary_wait
-        return ordinal % 4 == 0
+        return self._code2wav_route_cursor == 0
 
     def select_replica_id(
         self,
@@ -1201,7 +1150,7 @@ class StagePool:
             live = [r for r in self.live_replica_ids() if self.is_replica_available(r)]
             if not live:
                 raise StageUnavailableError(f"stage {self.stage_id} has no live replicas")
-            chosen = self._c8_experimental_talker_replica(live)
+            chosen = self._select_talker_replica(live)
             if chosen is None:
                 if len(live) == 1:
                     chosen = live[0]

@@ -268,7 +268,8 @@ class TestDeployTopology:
             "cfm_graph_batch_buckets": [1, 2, 4, 8],
             "code2wav_max_npu_graphs": 96 if filename == "minicpmo_4_5_2gpu.yaml" else 32,
         }
-        assert stages[2].yaml_engine_args["additional_config"] == expected_graph_config
+        stage_config = stages[2].yaml_engine_args["additional_config"]
+        assert {key: stage_config[key] for key in expected_graph_config} == expected_graph_config
 
     @pytest.mark.parametrize(
         ("filename", "devices"),

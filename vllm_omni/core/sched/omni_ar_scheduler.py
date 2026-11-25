@@ -2083,12 +2083,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
                 if self._streaming_update_overflows(session, update, projected_len=plan["replacement_prompt_len"]):
                     return
-                logger.info(
-                    "RSI_DUPLEX_TRIM request=%s cached=%d replacement=%d",
-                    req_id,
-                    session.num_computed_tokens,
-                    plan["replacement_prompt_len"],
-                )
                 self._release_replaced_streaming_prompt_cache(session)
                 self._replace_streaming_session(session, update)
                 return

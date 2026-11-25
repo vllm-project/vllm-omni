@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Experimental NumPy-compatible sampler for the Ascend Talker graph."""
+"""NumPy-compatible device sampling for the Ascend Talker graph."""
 
 import numpy as np
 import torch

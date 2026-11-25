@@ -2,18 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Eligibility for replaying a short Talker graph on a full-context worker."""
 
-import os
-
 SHORT_CONTEXT = 512
 MODEL_CONTEXT = 4096
-HYBRID_MODE_FILE = os.getenv("MINICPMO_NPU_TALKER_HYBRID_CONTEXT_FILE")
 
 
 def hybrid_enabled(runner):
     if runner.model_config.max_model_len != MODEL_CONTEXT:
         return False
-    if HYBRID_MODE_FILE is not None:
-        return os.path.isfile(HYBRID_MODE_FILE)
     options = getattr(runner.vllm_config, "additional_config", None) or {}
     return options.get("minicpmo_talker_hybrid_context") is True
 

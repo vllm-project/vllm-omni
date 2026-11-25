@@ -421,33 +421,21 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
             finally:
                 minicpmo_visual_precision.visual_prefill_active = False
                 context.skip_compiled = previous
-        mode_path = os.getenv("MINICPMO_NPU_TALKER_FUSED_MODE_FILE")
         startup_path = self._thinker_prefill_startup_path
-        if self.model_config.model_stage == "llm" and input_batch.has_prefill:
-            if startup_path:
-                if input_batch.num_reqs == 1 and input_batch.req_ids[0] in self._minicpmo_native_rope_reqs:
-                    from vllm_omni.platforms.npu.worker.prefill_graph import run_prefill
+        if (
+            startup_path
+            and input_batch.has_prefill
+            and input_batch.num_reqs == 1
+            and input_batch.req_ids[0] in self._minicpmo_native_rope_reqs
+        ):
+            from vllm_omni.platforms.npu.worker.prefill_graph import run_prefill
 
-                    output = run_prefill(
-                        self,
-                        None,
-                        model_inputs,
-                        input_batch,
-                        batch_desc,
-                        thinker=True,
-                        startup_path=startup_path,
-                    )
-                    if output is not None:
-                        return output
-            elif mode_path and "MiniCPMO45" in str(self.model_config.architectures):
-                from vllm_omni.platforms.npu.worker.prefill_graph import run_prefill
-
-                output = run_prefill(self, mode_path, model_inputs, input_batch, batch_desc, thinker=True)
-                if output is not None:
-                    return output
+            output = run_prefill(self, model_inputs, input_batch, batch_desc, thinker=True, startup_path=startup_path)
+            if output is not None:
+                return output
         if self._kstep_active():
             if input_batch.has_prefill:
-                output = self._call_talker_prefill(mode_path, model_inputs, input_batch, batch_desc)
+                output = self._call_talker_prefill(model_inputs, input_batch, batch_desc)
                 if output is not None:
                     return output
             kstep_output = self._run_kstep_frames(model_inputs, input_batch)
@@ -465,13 +453,10 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
                 context.skip_compiled = previous
         return super()._call_model(model_inputs, input_batch=input_batch, batch_desc=batch_desc)
 
-    def _call_talker_prefill(self, mode_path, model_inputs, input_batch, batch_desc):
-        use_eager = (self.vllm_config.additional_config or {}).get(
-            "minicpmo_talker_prefill_eager"
-        ) is True and not input_batch.is_dummy
+    def _call_talker_prefill(self, model_inputs, input_batch, batch_desc):
+        use_eager = False
         if (
-            not use_eager
-            and (self.vllm_config.additional_config or {}).get("minicpmo_talker_short_prefill_eager") is True
+            (self.vllm_config.additional_config or {}).get("minicpmo_talker_short_prefill_eager") is True
             and not input_batch.is_dummy
             and input_batch.num_reqs == 1
             and 2 <= input_batch.num_tokens <= 32
@@ -483,7 +468,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
                     isinstance(duplex, dict) and duplex.get("data_plane") is True
                 )
                 if use_eager:
-                    logger.info_once("[talker-prefill-c1] eager path for short single-request turn")
+                    logger.info_once("MiniCPM-o Talker uses eager prefill for short single-request turns")
         context = get_forward_context() if use_eager else None
         if context is not None:
             # Avoid blocking the Talker worker on first-use static kernel
@@ -492,10 +477,10 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
             context.skip_compiled = True
         try:
             startup_path = os.getenv("MINICPMO_NPU_TALKER_PREFILL_STARTUP")
-            if startup_path or mode_path:
+            if startup_path:
                 from vllm_omni.platforms.npu.worker.prefill_graph import run_prefill
 
-                output = run_prefill(self, mode_path, model_inputs, input_batch, batch_desc, startup_path=startup_path)
+                output = run_prefill(self, model_inputs, input_batch, batch_desc, startup_path=startup_path)
                 if output is not None:
                     self._kstep_ran_last = False
                     return output
@@ -540,12 +525,11 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
             hidden, _aux = self._split_fullgraph_output(replayed)
             return hidden
 
-        mode_path = os.getenv("MINICPMO_NPU_TALKER_FUSED_MODE_FILE")
         options = self.vllm_config.additional_config or {}
-        if static_replay and (mode_path or options.get("minicpmo_talker_fused_decode")):
+        if static_replay and options.get("minicpmo_talker_fused_decode") is True:
             from vllm_omni.platforms.npu.worker.talker_fused_decode import run_fused_step
 
-            return run_fused_step(self, mode_path, batch_desc, model_inputs, input_batch, run_model)
+            return run_fused_step(self, batch_desc, model_inputs, input_batch, run_model)
         return self._run_kstep_frames(model_inputs, input_batch, run_model=run_model)
 
     def _run_kstep_frames(self, model_inputs, input_batch, run_model=None):
@@ -657,10 +641,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         codec_model = getattr(self.model, "talker", self.model)
         frame_forward = None
         options = self.vllm_config.additional_config or {}
-        if using_full_graph and (
-            options.get("minicpmo_talker_compact_decode")
-            or os.getenv("MINICPMO_NPU_TALKER_NARROW_C8_MODE_FILE") is not None
-        ):
+        if using_full_graph and options.get("minicpmo_talker_compact_decode") is True:
             from vllm_omni.platforms.npu.worker.talker_batched_decode import prepare
 
             frame_forward = prepare(self, codec_model, model_inputs, input_batch, width)

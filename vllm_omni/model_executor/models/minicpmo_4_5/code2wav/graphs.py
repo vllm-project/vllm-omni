@@ -735,7 +735,7 @@ def _copy_attention_cache(target: torch.Tensor, source: torch.Tensor, *, max_cop
     if max_copy_bytes is None:
         tight_npu = (
             target.device.type == "npu"
-            and os.getenv("MINICPMO_C8_SECONDARY_VOCODER_TIGHT_MEMORY") == "1"
+            and os.getenv("MINICPMO_CODE2WAV_SECONDARY_TIGHT_MEMORY") == "1"
             and os.getenv("VLLM_OMNI_REPLICA_ID") == "1"
         )
         max_copy_bytes = 64 * 2**20 if tight_npu else 0

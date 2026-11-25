@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
-import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -207,26 +206,6 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int]:
             f"codec_left_context_frames={left_context_frames}"
         )
     return chunk_frames, left_context_frames
-
-
-def _c8_turn_codec_windows(steady: int) -> tuple[int, int]:
-    # A request keeps its selected windows even when the experiment changes modes.
-    filename = os.environ.get("MINICPMO_C8_CODEC_WINDOW_MODE_FILE")
-    if filename:
-        try:
-            with open(filename, encoding="utf-8") as f:
-                mode = f.read().strip()
-        except OSError:
-            mode = ""
-        if mode == "64":
-            return 64, 64
-        if mode == "32_64":
-            return 32, 64
-        if mode == "96":
-            return 96, 96
-        if mode == "32_96":
-            return 32, 96
-    return steady, steady
 
 
 def _request_intermediate_section(request: object, section: str) -> dict[str, object]:
@@ -442,12 +421,6 @@ def tts2code2wav_async_chunk(
     if finished and condition_key is not None:
         record["last_closed_condition"] = condition_key
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
-    if not native_duplex and os.environ.get("MINICPMO_C8_CODEC_WINDOW_MODE_FILE"):
-        windows = state.get("turn_experiment_windows")
-        if windows is None:
-            windows = _c8_turn_codec_windows(chunk_frames)
-            state["turn_experiment_windows"] = windows
-        chunk_frames = windows[bool(state["codec_end"])]
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end or speech_flush))
     if not flush_pending and len(pending) < chunk_frames:

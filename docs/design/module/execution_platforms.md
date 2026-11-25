@@ -88,8 +88,7 @@ Focused coverage lives in `tests/platforms/npu/test_minicpmo_shared_kv.py`.
 MiniCPM-o qualifies common exact-prefill shapes during startup and other
 eligible graphs on first use. Qualification returns the reference result
 while comparing hidden state and KV or codec, stop and KV state. Successful
-checks enable later replay. The deployment, model assets and launcher controls
-are listed in the [Ascend recipe](gh-file:recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md).
+checks enable later replay. See the [Ascend deployment recipe](gh-file:recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md).
 
 ## MiniMax H3 image NPU adapter
 

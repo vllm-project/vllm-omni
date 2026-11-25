@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Active modes must qualify locally and retain reference outputs on failure."""
+"""Prefill and decode graphs must qualify against the reference path."""
 
 from unittest.mock import Mock
 
@@ -19,18 +19,18 @@ pytestmark = [pytest.mark.core_model, pytest.mark.omni, *hardware_marks(res={"np
 
 
 @pytest.mark.parametrize("mismatch", [None, "hidden", "kv"])
-def test_active_prefill_qualifies_before_replay(tmp_path, monkeypatch, mismatch):
-    mode = tmp_path / "mode"
-    mode.write_text("active_thinker_prefill")
-    output = torch.ones(2, 4, dtype=torch.bfloat16)
-    cache = torch.zeros(2, 4)
+def test_startup_prefill_qualifies_before_replay(tmp_path, monkeypatch, mismatch):
+    marker = tmp_path / "prefill"
+    length = prefill_graph.TALKER_STARTUP_LENGTHS.start
+    output = torch.ones(length, 4, dtype=torch.bfloat16)
+    cache = torch.zeros_like(output)
     metadata = Mock(
         spec=["attn_state", "causal", "actual_seq_lengths_q", "num_actual_tokens", "slot_mapping", "attn_mask"],
         attn_state=prefill_graph.AscendAttentionState.PrefillNoCache,
         causal=True,
-        actual_seq_lengths_q=[2],
-        num_actual_tokens=2,
-        slot_mapping=torch.arange(2),
+        actual_seq_lengths_q=[length],
+        num_actual_tokens=length,
+        slot_mapping=torch.arange(length),
         attn_mask=None,
     )
 
@@ -47,12 +47,20 @@ def test_active_prefill_qualifies_before_replay(tmp_path, monkeypatch, mismatch)
         use_aux_hidden_state_outputs=False,
         model_state=Mock(attn_metadata={"layer": metadata}),
     )
-    batch = Mock(num_reqs=1, has_prefill=True, is_dummy=False, num_tokens=2, num_tokens_after_padding=2)
+    batch = Mock(
+        num_reqs=1,
+        has_prefill=True,
+        is_dummy=False,
+        num_tokens=length,
+        num_tokens_after_padding=length,
+        req_ids=[f"{prefill_graph.TALKER_STARTUP_PREFIX}0"],
+    )
 
     class Graph:
         def __init__(self, *args, **kwargs):
             self.hidden = output + (1 if mismatch == "hidden" else 0)
             self.kv = [("layer", cache)]
+            self.metadata = {"layer": metadata}
             self.graph = Mock()
             self.graph.replay.side_effect = lambda: cache.fill_(1)
             self.replays = 0
@@ -61,29 +69,32 @@ def test_active_prefill_qualifies_before_replay(tmp_path, monkeypatch, mismatch)
             pass
 
     monkeypatch.setattr(prefill_graph, "PrefillGraph", Graph)
+    monkeypatch.setattr(prefill_graph, "get_forward_context", lambda: Mock(slot_mapping={}))
     monkeypatch.setattr(torch.npu, "Stream", lambda: None)
-    inputs = {"model_intermediate_buffer": [{}], "inputs_embeds": output, "positions": torch.arange(2)}
+    monkeypatch.setattr(torch.npu, "mem_get_info", lambda: (8 * 1024**3, 16 * 1024**3))
+    inputs = {"model_intermediate_buffer": [{}], "inputs_embeds": output, "positions": torch.arange(length)}
     descriptor = Mock(cg_mode=CUDAGraphMode.NONE)
-    first = prefill_graph.run_prefill(runner, mode, inputs, batch, descriptor)
+    assert prefill_graph.run_prefill(runner, inputs, batch, descriptor, startup_path=marker) is None
+    marker.touch()
+    first = prefill_graph.run_prefill(runner, inputs, batch, descriptor, startup_path=marker)
     assert first is output and model.call_count == 1
-    second = prefill_graph.run_prefill(runner, mode, inputs, batch, descriptor)
+    marker.unlink()
+    second = prefill_graph.run_prefill(runner, inputs, batch, descriptor, startup_path=marker)
     if mismatch:
         assert runner._exact_prefill_disabled and second is None
         assert not runner._exact_prefill_passed
     else:
-        assert runner._exact_prefill_passed == {2}
+        assert runner._exact_prefill_passed == {length}
         assert torch.equal(second, output) and second.data_ptr() != output.data_ptr()
         assert model.call_count == 1
 
 
 @pytest.mark.parametrize("matches", [False, True])
-def test_active_fused_decode_checks_shadow_before_commit(tmp_path, monkeypatch, matches):
-    mode = tmp_path / "mode"
-    mode.write_text("active_thinker_prefill")
-    graph = Mock(spec=["layer_names", "kv", "replay_ms", "bind", "run", "snapshot_kv", "restore_kv"])
+def test_fused_decode_checks_shadow_before_commit(monkeypatch, matches):
+    graph = Mock(spec=["layer_names", "kv", "bind", "run", "snapshot_kv", "restore_kv", "qualified"])
     graph.layer_names = ("layer",)
     graph.kv = [torch.zeros(2, 1)]
-    graph.replay_ms = []
+    graph.qualified = None
     graph.snapshot_kv.return_value = (torch.tensor([0]),)
     graph.run.return_value = (torch.ones(1), torch.ones(1))
     runner = Mock(spec=["model_config", "model", "vllm_config", "_run_kstep_frames"])
@@ -100,10 +111,10 @@ def test_active_fused_decode_checks_shadow_before_commit(tmp_path, monkeypatch, 
     commit = Mock(return_value="optimized")
     monkeypatch.setattr(talker_fused_decode, "commit", commit)
     batch = Mock(spec=["num_reqs"], num_reqs=1)
-    assert talker_fused_decode.run_fused_step(runner, mode, None, {}, batch, None) == "reference"
+    assert talker_fused_decode.run_fused_step(runner, None, {}, batch, None) == "reference"
     shadow_check.assert_called_once()
     commit.assert_not_called()
-    assert talker_fused_decode.run_fused_step(runner, mode, None, {}, batch, None) == (
+    assert talker_fused_decode.run_fused_step(runner, None, {}, batch, None) == (
         "optimized" if matches else "reference"
     )
     assert commit.call_count == int(matches)
@@ -120,10 +131,7 @@ def test_active_fused_decode_checks_shadow_before_commit(tmp_path, monkeypatch, 
         (16, 256, "kv"),
     ],
 )
-def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, rows, wide_capacity, mismatch):
-    mode = tmp_path / "mode"
-    mode.write_text("active_fixed")
-    monkeypatch.setattr(talker_batched_decode, "MODE", str(mode))
+def test_compact_batch_checks_the_entire_kstep(monkeypatch, rows, wide_capacity, mismatch):
     monkeypatch.setattr(torch.npu, "Stream", lambda: None)
     monkeypatch.setattr(torch.npu, "graph_pool_handle", lambda: None)
     tokens = rows * 16
@@ -147,13 +155,10 @@ def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, rows, wide_
         "positions": torch.arange(tokens),
     }
 
-    if rows > 8:
+    if rows == 12 and mismatch is None:
+        batch.seq_lens_np.fill(wide_capacity + 1)
         assert talker_batched_decode.prepare(runner, None, inputs, batch, 16) is None
-        mode.write_text("active_fixed_wide" if rows == 16 else "active_fixed_padded")
-        if wide_capacity == 256:
-            batch.seq_lens_np.fill(257)
-            assert talker_batched_decode.prepare(runner, None, inputs, batch, 16) is None
-            batch.seq_lens_np.fill(32)
+        batch.seq_lens_np.fill(32)
 
     class Graph:
         def __init__(self, *args, **kwargs):
@@ -189,9 +194,9 @@ def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, rows, wide_
     assert reference.call_count == 16
     assert all(not cache.any() for cache in kv)
     if mismatch is None:
-        assert len(runner._c8_talker_ready) == 1
+        assert len(runner._talker_compact_ready) == 1
         forward = talker_batched_decode.prepare(runner, None, inputs, batch, 16)
         assert torch.equal(forward(0, reference), wide[0:tokens:16])
         assert reference.call_count == 16
     else:
-        assert not runner._c8_talker_ready and runner._c8_talker_rejected
+        assert not runner._talker_compact_ready and runner._talker_compact_rejected

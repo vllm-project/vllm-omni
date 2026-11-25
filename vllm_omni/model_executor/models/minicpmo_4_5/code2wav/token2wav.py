@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 import time
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -540,19 +539,15 @@ class BatchedToken2Wav(nn.Module):
         chunk_frames = int(connector.get("codec_chunk_frames", 25) or 25)
         initial_frames = int(connector.get("initial_codec_chunk_frames", 0) or 0)
         token_widths = {left_context + chunk_frames}
-        token_widths.update(left_context + int(frames) for frames in encoder_cfg.get("extra_codec_chunk_frames", ()))
         if initial_frames:
             token_widths.add(left_context + initial_frames)
         self._chunk_encoder_token_widths = tuple(sorted(width for width in token_widths if width > 0))
         self._chunk_encoder_steady_width = left_context + chunk_frames
-        self._chunk_encoder_singleton_history = encoder_cfg.get("singleton_history_frames")
         self._precapture_encoder_tails = bool(encoder_cfg.get("precapture_tails", False))
         self._padded_flow_history = int(encoder_cfg.get("padded_flow_history", 0))
         self._padded_flow_continuations = bool(encoder_cfg.get("padded_flow_continuations", False))
         self._padded_flow_encoder = None
         self._tail_encoder_graph: FlowEncoderGraphs | None = None
-        self._c8_mixed_tail_checks: dict[tuple, int] = {}
-        self._c8_mixed_tail_replays = 0
         self._chunk_encoder_graph = (
             FlowEncoderGraphs(
                 functools.partial(self._encode_chunk_eager, last_chunk=False),
@@ -1288,8 +1283,6 @@ class BatchedToken2Wav(nn.Module):
         outputs = graphs.run(
             tokens, [flow["conformer_cnn_cache"] for flow in flows], [flow["conformer_att_cache"] for flow in flows]
         )
-        if last_chunk and outputs is not None and (graphs.replays in (1, 4) or graphs.replays % 32 == 0):
-            logger.info("Flow encoder startup tail graph replays=%d", graphs.replays)
         return tuple(value.clone() for value in outputs) if outputs is not None and copy else outputs
 
     @torch.inference_mode()
@@ -1362,15 +1355,6 @@ class BatchedToken2Wav(nn.Module):
         )
         # Prefer steady-state lengths for every width before transient lengths.
         keys = sorted(keys, key=lambda key: (-key[2], key[1]))[: graph.max_graphs]
-        history = self._chunk_encoder_singleton_history
-        width = self._chunk_encoder_steady_width
-        if history is not None and att.device.type == "npu" and 1 in graph.rows and width in widths:
-            # Keep the existing multi-row partition choices. The added history
-            # shapes may only serve a chunk that already has a single row.
-            seeded = set(keys)
-            added = [(1, width, length) for length in history if (1, width, length) not in seeded]
-            keys.extend(added)
-            graph.exact_only_keys = frozenset(added)
         probe = torch.zeros((1, max(widths)), dtype=torch.long, device=att.device)
         probe_att = torch.zeros(
             (*att.shape[:3], max(key[2] for key in keys), att.shape[4]), dtype=att.dtype, device=att.device
@@ -2426,18 +2410,7 @@ class BatchedToken2Wav(nn.Module):
         # after padding has already been chosen for these initial states.
         cache_key = self._setup_cache_key(features)
         state = self._setup_cache.get(cache_key)
-        if os.getenv("MINICPMO_C8_PROMPT_CACHE_BUDGET_FILE") is not None:
-            requests = getattr(self, "_c8_setup_lookups", 0) + 1
-            hits = getattr(self, "_c8_setup_hits", 0) + (state is not None)
-            self._c8_setup_lookups, self._c8_setup_hits = requests, hits
-            if requests % 32 == 0:
-                logger.info(
-                    "[c8-reference-cache] lookups=%d hits=%d entries=%d capacity=%d",
-                    requests,
-                    hits,
-                    len(self._setup_cache),
-                    self._setup_cache_size,
-                )
+
         if state is not None:
             self._setup_cache.move_to_end(cache_key)
         else:
@@ -2781,14 +2754,6 @@ class BatchedToken2Wav(nn.Module):
             )
             encoder_groups.setdefault(key, []).append(row)
 
-        mode = "baseline"
-        mode_file = os.getenv("MINICPMO_C8_MIXED_TAIL_GRAPH_FILE")
-        if mode_file and tokens[0].device.type == "npu" and batch_size > 1:
-            try:
-                with open(mode_file, encoding="utf-8") as stream:
-                    mode = stream.read().strip()
-            except OSError:
-                pass
         hidden_rows: list[torch.Tensor | None] = [None] * batch_size
         conformer_cnn_rows: list[torch.Tensor | None] = [None] * batch_size
         conformer_att_rows: list[torch.Tensor | None] = [None] * batch_size
@@ -2840,22 +2805,7 @@ class BatchedToken2Wav(nn.Module):
                 )
                 # With several groups the next replay rewrites the shared graph results, so they are copied.
                 copy_outputs = len(encoder_groups) > 1
-                graphed = None
-                key = None
-                if not last_chunk:
-                    graphed = self._graph_encode(group_tokens, group_states, copy_outputs)
-                elif len(rows) == 1 and mode in ("shadow", "active"):
-                    flow = group_states[0].flow_cache
-                    att = flow["conformer_att_cache"]
-                    cnn = flow["conformer_cnn_cache"]
-                    key = (int(group_tokens.shape[1]), att.shape, cnn.shape, att.dtype, cnn.dtype)
-                    if mode == "active" and self._c8_mixed_tail_checks.get(key) == 2:
-                        graphed = self._graph_encode(group_tokens, group_states, copy_outputs, last_chunk=True)
-                        if graphed is not None:
-                            self._c8_mixed_tail_replays += 1
-                            n = self._c8_mixed_tail_replays
-                            if n in (1, 32, 96, 192) or n % 256 == 0:
-                                logger.info("[c8-mixed-tail-graph] active replays=%d", n)
+                graphed = None if last_chunk else self._graph_encode(group_tokens, group_states, copy_outputs)
                 # The encoder reads only the conformer caches.
                 if graphed is None:
                     group_cache = self._stack_flow_cache(group_states)
@@ -2866,17 +2816,6 @@ class BatchedToken2Wav(nn.Module):
                         att_cache=group_cache["conformer_att_cache"],
                         precaptured_checked=True,
                     )
-                    if mode == "shadow" and key is not None:
-                        matches = self._c8_mixed_tail_checks.get(key, 0)
-                        if 0 <= matches < 2:
-                            test = self._graph_encode(group_tokens, group_states, copy_outputs, last_chunk=True)
-                            if test is not None:
-                                exact = all(torch.equal(a, b) for a, b in zip(test, graphed, strict=True))
-                                self._c8_mixed_tail_checks[key] = matches + 1 if exact else -1
-                                if not exact or matches == 1:
-                                    logger.info(
-                                        "[c8-mixed-tail-graph] %s shape=%s", "qualified" if exact else "mismatch", key
-                                    )
                 hidden, conformer_cnn, conformer_att = graphed
             for group_row, row in enumerate(rows):
                 hidden_rows[row] = hidden[group_row : group_row + 1]

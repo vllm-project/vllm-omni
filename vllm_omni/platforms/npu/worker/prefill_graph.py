@@ -15,12 +15,11 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_omni.platforms.npu.attention.static_shape_backend import OmniStaticShapeAttentionBackendImpl
 
 logger = init_logger(__name__)
-MAX_PREFILL = 32
 THINKER_STARTUP_PREFIX = "minicpmo-thinker-startup-"
 THINKER_STARTUP_LENGTHS = range(128, 161)
 TALKER_STARTUP_PREFIX = "minicpmo-talker-startup-"
 TALKER_STARTUP_LENGTHS = range(7, 24)
-THINKER_STARTUP_FREE_BYTES = 6 * 1024**3
+PREFILL_CAPTURE_FREE_BYTES = 6 * 1024**3
 
 
 class PrefillGraph:
@@ -35,7 +34,6 @@ class PrefillGraph:
         layers,
         *,
         thinker=False,
-        startup=False,
     ):
         self.embeds = torch.empty_like(embeds)
         self.positions = torch.empty_like(positions)
@@ -86,9 +84,8 @@ class PrefillGraph:
                 static_context.attn_metadata = [{**live_context.attn_metadata[0], **self.metadata}]
             else:
                 static_context.attn_metadata = {**live_context.attn_metadata, **self.metadata}
-            if startup:
-                static_slots = {name: entry.slot_mapping for name, entry in self.metadata.items()}
-                static_context.slot_mapping = {**live_context.slot_mapping, **static_slots}
+            static_slots = {name: entry.slot_mapping for name, entry in self.metadata.items()}
+            static_context.slot_mapping = {**live_context.slot_mapping, **static_slots}
             self.skip_compiled = static_context.skip_compiled
 
         def forward():
@@ -116,7 +113,7 @@ class PrefillGraph:
         finally:
             current.wait_stream(warmup)
         self.graph = torch.npu.NPUGraph()
-        if startup and not thinker:
+        if not thinker:
             if not hasattr(runner, "_talker_prefill_capture_pool"):
                 runner._talker_prefill_capture_pool = torch.npu.graph_pool_handle()
             # Replay is serialized on the model worker and returns a snapshot.
@@ -126,7 +123,7 @@ class PrefillGraph:
             with torch.npu.graph(self.graph):
                 self.hidden = forward()
         self.replays = 0
-        logger.info("[%s-prefill-c1] captured tokens=%d", "thinker" if thinker else "talker", size)
+        logger.info("[%s-prefill-graph] captured tokens=%d", "thinker" if thinker else "talker", size)
 
     def bind(self, embeds, positions, input_ids, metadata):
         if self.input_ids is not None:
@@ -155,58 +152,16 @@ def _kv_rows(kv, indices):
     return [cache.index_select(0, indices[name]) for name, cache in kv]
 
 
-def _first_difference(actual, expected):
-    for index, (a, b) in enumerate(zip(actual, expected, strict=True)):
-        if not torch.equal(a, b):
-            return index, float((a.float() - b.float()).abs().amax().item())
-    return None
-
-
-def run_prefill(runner, mode_path, model_inputs, batch, desc, *, thinker=False, startup_path=None):
-    startup = False
-    if startup_path is not None:
-        lengths = THINKER_STARTUP_LENGTHS if thinker else TALKER_STARTUP_LENGTHS
-        if batch.num_reqs != 1 or batch.num_tokens not in lengths:
-            return None
-        prefix = THINKER_STARTUP_PREFIX if thinker else TALKER_STARTUP_PREFIX
-        startup = batch.req_ids[0].startswith(prefix) and Path(startup_path).is_file()
-        qualified = getattr(runner, "_exact_prefill_passed", ())
-        if not startup and batch.num_tokens not in qualified:
-            return None
-        mode = "active_thinker_prefill" if thinker else "tail_prefill_capacity"
-    else:
-        try:
-            mode = Path(mode_path).read_text().strip()
-        except FileNotFoundError:
-            return None
-    shadow_mode, active_mode = (
-        ("shadow_thinker_prefill", "active_thinker_prefill")
-        if thinker
-        else ("shadow_prefill_capacity", "tail_prefill_capacity")
-    )
-    if not thinker and mode in ("shadow_thinker_prefill", "active_thinker_prefill"):
-        mode = active_mode
-    if mode not in (shadow_mode, active_mode):
+def run_prefill(runner, model_inputs, batch, desc, *, startup_path, thinker=False):
+    lengths = THINKER_STARTUP_LENGTHS if thinker else TALKER_STARTUP_LENGTHS
+    if batch.num_reqs != 1 or batch.num_tokens not in lengths:
         return None
-    if thinker and mode == shadow_mode:
-        logger.info_once(
-            "[thinker-prefill-c1] incoming reqs=%d fresh=%s dummy=%s mode=%s lora=%s aux=%s tokens=%d padded=%d",
-            batch.num_reqs,
-            batch.has_prefill,
-            batch.is_dummy,
-            desc.cg_mode,
-            runner.lora_config is not None,
-            runner.use_aux_hidden_state_outputs,
-            batch.num_tokens,
-            batch.num_tokens_after_padding,
-        )
-        logger.info_once(
-            "[thinker-prefill-c1] intermediate_tensors=%s",
-            type(model_inputs.get("intermediate_tensors")).__name__,
-        )
+    prefix = THINKER_STARTUP_PREFIX if thinker else TALKER_STARTUP_PREFIX
+    startup = batch.req_ids[0].startswith(prefix) and Path(startup_path).is_file()
+    if not startup and batch.num_tokens not in getattr(runner, "_exact_prefill_passed", ()):
+        return None
     if (
-        batch.num_reqs != 1
-        or not batch.has_prefill
+        not batch.has_prefill
         or batch.is_dummy
         or desc.cg_mode != CUDAGraphMode.NONE
         or runner.lora_config is not None
@@ -219,10 +174,8 @@ def run_prefill(runner, mode_path, model_inputs, batch, desc, *, thinker=False, 
     if isinstance(metadata, list) and len(metadata) == 1:
         metadata = metadata[0]
     if not isinstance(metadata, dict) or not metadata:
-        if thinker and mode == shadow_mode:
-            logger.info_once("[thinker-prefill-c1] metadata container=%s", type(metadata).__name__)
         return None
-    if startup_path is not None and not isinstance(get_forward_context().slot_mapping, dict):
+    if not isinstance(get_forward_context().slot_mapping, dict):
         return None
     if thinker:
         target_layers = getattr(runner, "_thinker_prefill_target_attention", None)
@@ -233,29 +186,12 @@ def run_prefill(runner, mode_path, model_inputs, batch, desc, *, thinker=False, 
                 layer.layer_name for layer in runner.model.modules() if isinstance(layer, Attention)
             }
         if not target_layers or not target_layers.issubset(metadata):
-            logger.info_once("[thinker-prefill-c1] target metadata unavailable")
             return None
         metadata = {name: layer for name, layer in metadata.items() if name in target_layers}
     first = next(iter(metadata.values()))
     size = batch.num_tokens
-    min_size, max_size = (128, 160) if thinker else (2, MAX_PREFILL)
-    if thinker and mode == shadow_mode:
-        logger.info_once(
-            "[thinker-prefill-c1] metadata layers=%d state=%s size=%d slots=%s q_lens=%s actual=%d "
-            "causal=%s matches_slot=%s matches_mask=%s",
-            len(metadata),
-            first.attn_state,
-            size,
-            tuple(first.slot_mapping.shape),
-            tuple(first.actual_seq_lengths_q or ()),
-            first.num_actual_tokens,
-            first.causal,
-            all(m.slot_mapping.data_ptr() == first.slot_mapping.data_ptr() for m in metadata.values()),
-            all(m.attn_mask is first.attn_mask for m in metadata.values()),
-        )
     if (
-        not min_size <= size <= max_size
-        or batch.num_tokens_after_padding != size
+        batch.num_tokens_after_padding != size
         or first.slot_mapping.shape != (size,)
         or not all(
             m.attn_state == AscendAttentionState.PrefillNoCache
@@ -275,13 +211,6 @@ def run_prefill(runner, mode_path, model_inputs, batch, desc, *, thinker=False, 
     if isinstance(duplex, dict) and duplex.get("data_plane") is True:
         return None
     embeds, positions = model_inputs.get("inputs_embeds"), model_inputs.get("positions")
-    if thinker and mode == shadow_mode:
-        logger.info_once(
-            "[thinker-prefill-c1] input embed=%s positions=%s ids=%s",
-            (tuple(embeds.shape), embeds.dtype) if embeds is not None else None,
-            tuple(positions.shape) if positions is not None else None,
-            tuple(model_inputs["input_ids"].shape) if model_inputs.get("input_ids") is not None else None,
-        )
     if embeds is None or embeds.dtype != torch.bfloat16 or positions is None or positions.shape != (size,):
         return None
 
@@ -301,12 +230,10 @@ def run_prefill(runner, mode_path, model_inputs, batch, desc, *, thinker=False, 
         runner._prefill_graph_warmup_stream = torch.npu.Stream()
         graphs = runner._exact_prefill_graphs = {}
         runner._exact_prefill_passed = set()
-    # Qualify each exact length in this worker before enabling replay.
-    shadow = startup or mode == shadow_mode or size not in runner._exact_prefill_passed
     try:
         graph = graphs.get(size)
         if graph is None:
-            if startup and torch.npu.mem_get_info()[0] < THINKER_STARTUP_FREE_BYTES:
+            if torch.npu.mem_get_info()[0] < PREFILL_CAPTURE_FREE_BYTES:
                 logger.info_once("[%s-prefill-startup] remaining device memory below capture budget", stage)
                 return None
             layers = runner.vllm_config.compilation_config.static_forward_context
@@ -319,24 +246,22 @@ def run_prefill(runner, mode_path, model_inputs, batch, desc, *, thinker=False, 
                 metadata,
                 layers,
                 thinker=thinker,
-                startup=startup,
             )
         else:
-            if startup_path is not None:
-                if thinker and graph.skip_compiled != get_forward_context().skip_compiled:
-                    return None
-                if any(x.attn_mask is not metadata[name].attn_mask for name, x in graph.metadata.items()):
-                    return None
+            if thinker and graph.skip_compiled != get_forward_context().skip_compiled:
+                return None
+            if any(x.attn_mask is not metadata[name].attn_mask for name, x in graph.metadata.items()):
+                return None
             graph.bind(embeds, positions, input_ids, metadata)
         graph.graph.replay()
     except (RuntimeError, ValueError, TypeError, AttributeError):
         runner._exact_prefill_disabled = True
-        logger.exception("[%s-prefill-c1] capture or replay failed", stage)
+        logger.exception("[%s-prefill-graph] capture or replay failed", stage)
         return None
-    if not shadow:
+    if not startup:
         graph.replays += 1
         if graph.replays == 1:
-            logger.info("[%s-prefill-c1] active replay tokens=%d", stage, size)
+            logger.info("[%s-prefill-graph] active replay tokens=%d", stage, size)
         # A later request can replay the same exact-length graph while
         # output materialization still owns this step's hidden tensor.
         return tree_map(torch.clone, graph.hidden)
@@ -352,7 +277,7 @@ def run_prefill(runner, mode_path, model_inputs, batch, desc, *, thinker=False, 
         for (name, cache), old in zip(graph.kv, captured_kv, strict=True)
     )
     logger.info(
-        "[%s-prefill-c1] shadow tokens=%d hidden=%s kv=%s leaves=%d",
+        "[%s-prefill-graph] shadow tokens=%d hidden=%s kv=%s leaves=%d",
         stage,
         size,
         hidden_match,
@@ -363,13 +288,5 @@ def run_prefill(runner, mode_path, model_inputs, batch, desc, *, thinker=False, 
         runner._exact_prefill_passed.add(size)
     else:
         runner._exact_prefill_disabled = True
-        logger.warning("[%s-prefill-c1] shadow discrepancy", stage)
-        if thinker:
-            kv_delta = _first_difference(captured_kv, _kv_rows(graph.kv, slot_indices))
-            logger.warning(
-                "[thinker-prefill-c1] replay first_hidden=%s first_kv=%s delta=%s",
-                _first_difference(actual_leaves, expected_leaves),
-                graph.kv[kv_delta[0]][0] if kv_delta else None,
-                kv_delta,
-            )
+        logger.warning("[%s-prefill-graph] shadow discrepancy", stage)
     return expected

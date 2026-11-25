@@ -480,16 +480,6 @@ class MiniCPMO45Code2Wav(nn.Module):
             encoder_rows = list(range(1, int(encoder_rows) + 1))
         if not encoder_rows or any(row < 1 for row in encoder_rows):
             raise ValueError("MiniCPM-o code2wav_encoder_graph_rows must be positive")
-        history = extra.get("code2wav_encoder_graph_singleton_history_frames")
-        if history is not None:
-            if (
-                not isinstance(history, (list, tuple))
-                or len(history) != 3
-                or any(type(value) is not int or value < 1 for value in history)
-                or history[0] > history[1]
-            ):
-                raise ValueError("code2wav_encoder_graph_singleton_history_frames must be [start, stop, stride]")
-            history = range(history[0], history[1] + 1, history[2])
         padded_history = int(extra.get("code2wav_encoder_padded_flow_history", 0))
         if padded_history < 0 or padded_history % 2:
             raise ValueError("code2wav_encoder_padded_flow_history must be zero or a positive even number")
@@ -497,13 +487,11 @@ class MiniCPMO45Code2Wav(nn.Module):
             "padded_flow_history": padded_history,
             "padded_flow_continuations": os.getenv("VLLM_OMNI_REPLICA_ID", "0") == "0"
             and read_bool_flag(extra, "code2wav_encoder_padded_flow_continuations", False),
-            "singleton_history_frames": history,
             "enabled": read_bool_flag(extra, "enable_code2wav_encoder_graph", False),
             "max_graphs": int(extra.get("code2wav_encoder_max_graphs", 8)),
             "capture_after": int(extra.get("code2wav_encoder_capture_after", 2)),
             "capture_after_precapture": read_bool_flag(extra, "code2wav_encoder_capture_after_precapture", False),
             "precapture_tails": read_bool_flag(extra, "code2wav_encoder_tail_precapture", False),
-            "extra_codec_chunk_frames": tuple(extra.get("code2wav_encoder_extra_codec_chunk_frames") or ()),
             "rows": [row for row in encoder_rows if not max_num_seqs or row <= int(max_num_seqs)],
         }
         self._cfm_graph_config = {
@@ -628,16 +616,10 @@ class MiniCPMO45Code2Wav(nn.Module):
 
     def _extra_config(self) -> dict[str, Any]:
         result = stage_connector_extra(self.vllm_config)
-        if os.getenv("MINICPMO_C8_SECONDARY_VOCODER_HOST_CACHE") == "1" and os.getenv("VLLM_OMNI_REPLICA_ID") == "1":
-            result["token2wav_setup_cache_size"] = 4
+        if os.getenv("MINICPMO_CODE2WAV_SECONDARY_TIGHT_MEMORY") == "1" and os.getenv("VLLM_OMNI_REPLICA_ID") == "1":
+            result["token2wav_setup_cache_size"] = 2
             result["token2wav_setup_host_cache_size"] = 64
-            if os.getenv("MINICPMO_C8_SECONDARY_VOCODER_TIGHT_MEMORY") == "1":
-                result["token2wav_setup_cache_size"] = 2
-                result["micro_batch_size"] = int(result.get("secondary_vocoder_micro_batch_size", 2))
-                logger.info(
-                    "[c8-vocoder-tight] setup_device=2 setup_host=64 cfm_micro_batch=%d",
-                    result["micro_batch_size"],
-                )
+            result["micro_batch_size"] = int(result.get("secondary_vocoder_micro_batch_size", 2))
         return result
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -764,39 +746,6 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._request_prompt_keys[item.state_id] = cache_key
             self._runtime_prompts.move_to_end(cache_key)
         self._trim_runtime_prompts()
-
-    def _update_c8_prompt_cache_budget(self) -> None:
-        marker = os.getenv("MINICPMO_C8_PROMPT_CACHE_BUDGET_FILE")
-        if marker is None or self.backend is None:
-            return
-        try:
-            mode = Path(marker).read_text().strip()
-        except FileNotFoundError:
-            return
-        if mode not in ("baseline", "capacity64", "fresh64"):
-            return
-        if getattr(self, "_c8_prompt_cache_mode", None) == mode:
-            return
-        self._c8_prompt_cache_mode = mode
-        setup = self.backend._setup_cache
-        if mode == "fresh64":
-            setup.clear()
-            self.backend._setup_host_cache.clear()
-            for key, entry in list(self._runtime_prompts.items()):
-                if not entry.owners and not entry.pins:
-                    self._evict_runtime_prompt(key, entry)
-        budget = 1 if mode == "baseline" else 64
-        self._runtime_prompt_cache_size = 4 if mode == "baseline" else 64
-        self._setup_cache_size = self.backend._setup_cache_size = budget
-        while len(setup) > budget:
-            setup.popitem(last=False)
-        self._trim_runtime_prompts()
-        logger.info(
-            "[c8-reference-cache] mode=%s setup_entries=%d runtime_entries=%d",
-            mode,
-            len(setup),
-            len(self._runtime_prompts),
-        )
 
     def _trim_runtime_prompts(self) -> None:
         """Evict least-recent unowned references, never request-owned or prefetch-pinned state."""
@@ -1261,7 +1210,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        self._update_c8_prompt_cache_budget()
         details = {"batch_size": len(runtime_additional_information or ())}
         with self._watchdog.watch("forward/start", details), _stage_matmul_policy(self._tf32_mode):
             return self._forward_impl(
@@ -2032,7 +1980,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 logger.info("MiniCPM-o Code2Wav: exact-shape S3 CUDA graphs enabled")
         if int(extra.get("token2wav_setup_host_cache_size", 0)):
             logger.info(
-                "[c8-vocoder-replica] host references=%d device references=%d replica=%s",
+                "Code2Wav reference cache: host=%d device=%d replica=%s",
                 int(extra["token2wav_setup_host_cache_size"]),
                 self._setup_cache_size,
                 os.getenv("VLLM_OMNI_REPLICA_ID", "0"),
@@ -2086,7 +2034,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         allocator it warmed instead of
         raising the reserved footprint the way a weight-load-time sweep does.
         """
-        if self._extra_config().get("cfm_graph_precapture_after_load") is not None:
+        if stage_connector_extra(self.vllm_config).get("cfm_graph_precapture_after_load") is not None:
             logger.warning_once(
                 "MiniCPM-o Code2Wav: cfm_graph_precapture_after_load is ignored; "
                 "the startup sweep is controlled by cfm_graph_precapture_at_init"
@@ -2102,7 +2050,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         runners without a warmup forward (Model Runner V2, Ascend) paid for the
         capture on their first real request. Only an explicit ``false`` opts out.
         """
-        return read_bool_flag(self._extra_config(), "cfm_graph_precapture_at_init", True)
+        return read_bool_flag(stage_connector_extra(self.vllm_config), "cfm_graph_precapture_at_init", True)
 
     def _precapture_before_serve(self) -> None:
         """Run the precapture sweep once, under the context ``forward`` uses.
