@@ -353,6 +353,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
     decode_dtype: torch.dtype = torch.float16
     _pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+    stack_decode_tiles: bool = True
+    # Upper bound on the tiles one stacked decoder call takes, so a one-rank
+    # decode (every tile of the grid on one rank) stays near the serial peak.
+    max_stacked_decode_tiles: int | None = 7
 
     def __init__(
         self,
@@ -366,9 +370,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         decoder_source: str | Mapping[str, str] | None = None,
         lightvae_decoder_path: str | None = None,
         allow_decoder_compile: bool = False,
+        stack_decode_tiles: bool = True,
     ) -> None:
         super().__init__()
         self._device_target = device
+        self.stack_decode_tiles = bool(stack_decode_tiles)
         self.encode_only = bool(encode_only)
         self.decode_only = bool(decode_only)
         if self.encode_only and self.decode_only:
@@ -1240,8 +1246,49 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 num_tiles,
                 self.parallel_size,
             )
-            return self._rank_local_tiling()
-        return nullcontext()
+            return self._stacked_decode_tiles(self._rank_local_tiling())
+        return self._stacked_decode_tiles(nullcontext())
+
+    @contextmanager
+    def _stacked_decode_tiles(self, tiling: AbstractContextManager) -> Iterator[None]:
+        """Decode a rank's spatial tiles in batches (the checkpoint's ``stack_tiling``).
+
+        The checkpoint stacks all of a rank's tiles into one decoder call. On
+        one VAE rank that is the whole grid (28 tiles at 720p), so the tiles
+        go through in batches of at most ``max_stacked_decode_tiles``.
+        """
+        model = self.model
+        if not self.stack_decode_tiles or not hasattr(model, "stack_tiling"):
+            with tiling:
+                yield
+            return
+        cap = self.max_stacked_decode_tiles
+        run_tile_tasks = getattr(model, "_run_tile_tasks", None)
+        bound = cap is not None and callable(run_tile_tasks)
+
+        def run_bounded(tiles, tile_indices, forward_fn, stack_tiling, cls_agg=None):
+            if not stack_tiling or cls_agg is not None or len(tile_indices) <= cap:
+                return run_tile_tasks(tiles, tile_indices, forward_fn, stack_tiling, cls_agg)
+            outputs = []
+            for start in range(0, len(tile_indices), cap):
+                outputs.extend(run_tile_tasks(tiles, tile_indices[start : start + cap], forward_fn, True))
+            return outputs
+
+        saved = model.stack_tiling
+        saved_runner = model.__dict__.get("_run_tile_tasks")
+        model.stack_tiling = True
+        if bound:
+            model._run_tile_tasks = run_bounded
+        try:
+            with tiling:
+                yield
+        finally:
+            model.stack_tiling = saved
+            if bound:
+                if saved_runner is None:
+                    del model._run_tile_tasks
+                else:
+                    model._run_tile_tasks = saved_runner
 
     @torch.inference_mode()
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:

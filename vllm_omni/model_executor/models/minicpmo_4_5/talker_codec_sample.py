@@ -16,23 +16,28 @@ different codec distribution than a single-frame deployment would.
 
 Order and defaults follow the engine's single-frame path so that enabling the
 multi-frame (K-step) decode does not change the sampling semantics:
-``vllm/v1/sample/sampler.py`` for the temperature/min-p/top-k/top-p order,
-``logits_processor/builtin.py`` for the censoring, bias and min-p processors and
-``model_executor/layers/utils.py`` for the penalties. Every added knob is a
+``vllm/v1/worker/gpu/sample/sampler.py`` for the logit pipeline and
+``vllm/v1/worker/gpu/sample/logits_processor.py`` for its processors. Every added knob is a
 no-op at its default value.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = init_logger(__name__)
 
 VOCAB_SIZE = 6562
 HISTORY_WINDOW = 16
+# Temperature cutoff for treating a row as greedy.
+_SAMPLING_EPS = 1e-5
 
 # Engine steps 6a+7b run as one Triton kernel on NPU (adopted 2026-10-17 after a
 # 200-case bit-exact verification). Two independent controls:
@@ -202,9 +207,86 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
         gids = tl.load(idx_ptr + offs, mask=cand, other=0)
         tl.store(out_ptr + gids, v, mask=keep)
 
+    @triton.jit
+    def _validate_argmax(probabilities, ratios, output, valid, n: tl.constexpr, block: tl.constexpr):
+        offsets = tl.arange(0, block)
+        p = tl.load(probabilities + offsets, offsets < n, other=0.0)
+        r = tl.load(ratios + offsets, offsets < n, other=-float("inf"))
+        finite_nonnegative = (p >= 0.0) & (p < float("inf"))
+        legal = (tl.sum(finite_nonnegative.to(tl.int32), 0) == block) & (tl.sum(p, 0) > 0.0)
+        token = tl.argmax(r, 0, tie_break_left=True)
+        tl.store(output, token.to(tl.int64))
+        tl.store(valid, legal)
+
     _HAS_TRITON = True
 except Exception:  # pragma: no cover - triton missing/CPU
     _HAS_TRITON = False
+
+
+def _sample_cuda(probabilities: torch.Tensor, generator: torch.Generator | None) -> torch.Tensor:
+    if (
+        _HAS_TRITON
+        and probabilities.is_cuda
+        and probabilities.dtype == torch.float32
+        and probabilities.ndim == 2
+        and probabilities.shape[0] == 1
+        and probabilities.is_contiguous()
+        and 0 < probabilities.shape[1] <= 8192
+    ):
+        noise = torch.empty_like(probabilities).exponential_(1, generator=generator)
+        ratios = probabilities / noise
+        output = torch.empty(1, dtype=torch.long, device=probabilities.device)
+        valid = torch.empty(1, dtype=torch.bool, device=probabilities.device)
+        width = probabilities.shape[1]
+        _validate_argmax[(1,)](probabilities, ratios, output, valid, width, triton.next_power_of_2(width))
+        torch._assert_async(valid, "probability tensor contains inf, nan or a negative value, or has zero mass")
+        return output
+    return torch.multinomial(probabilities, 1, generator=generator).reshape(1)
+
+
+def draw_seeded_codec_ids(
+    processed_logits: torch.Tensor,
+    *,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    temperature: torch.Tensor,
+    host_temperature: np.ndarray,
+    generators: dict[int, torch.Generator],
+    has_topp_only_rows: bool = True,
+    use_fp64_gumbel: bool = False,
+) -> torch.Tensor:
+    """Return one codec id per row using per-request seeded exponential draws.
+
+    MRv2 normally uses a different Triton Gumbel stream. Keep the model
+    exponential stream so a seed produces the same codec sequence.
+
+    ``temperature`` is one value per row, on the same device as
+    ``processed_logits``; ``host_temperature`` holds the same values on the
+    host, so branch decisions never read the device. An all-greedy batch
+    returns the argmax and does not touch ``generators``. A mixed batch draws
+    every row, then restores the argmax on greedy rows.
+    """
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+
+    from vllm_omni.utils.seeded_exponential import categorical_sample as random_sample
+
+    if processed_logits.ndim != 2:
+        raise ValueError(f"codec logits must be 2D, got {tuple(processed_logits.shape)}")
+    num_rows = processed_logits.shape[0]
+    if temperature.shape[0] != num_rows or host_temperature.shape[0] != num_rows:
+        raise ValueError(
+            f"temperature rows {temperature.shape[0]}/{host_temperature.shape[0]} != logit rows {num_rows}"
+        )
+    host_greedy = host_temperature < _SAMPLING_EPS
+    # All-greedy steps must not advance the request generators.
+    if host_greedy.all():
+        return processed_logits.argmax(dim=-1)
+    filtered = apply_top_k_top_p(processed_logits.clone(), top_k, top_p, has_topp_only_rows=has_topp_only_rows)
+    sampled = random_sample(filtered.softmax(dim=-1, dtype=torch.float32), generators, use_fp64_gumbel)
+    if host_greedy.any():
+        greedy = temperature.reshape(-1) < _SAMPLING_EPS
+        sampled = torch.where(greedy, processed_logits.argmax(dim=-1), sampled)
+    return sampled
 
 
 @dataclass(frozen=True)
@@ -464,12 +546,8 @@ class TalkerCudaKStepState:
         for row, (config, generator) in enumerate(zip(sampling, generators)):
             temperature = config[0]
             scores = filtered[row]
-            if temperature and scores.is_cuda and _HAS_TRITON:
-                from .talker_cuda_sample import sample
-
-                token = sample(scores.softmax(-1), generator)
-            elif temperature:
-                token = torch.multinomial(scores.softmax(-1), 1, generator=generator).reshape(1)
+            if temperature:
+                token = _sample_cuda(scores.softmax(-1), generator)
             else:
                 token = scores.argmax(dim=-1)
             sampled.append(token)
@@ -618,7 +696,7 @@ def _repetition_penalty_scaling(
     """Repetition penalty over the codec history window (engine step 6a).
 
     ``alpha = penalty ** frequency`` with the sign-dependent branch, matching the
-    model's single-frame ``_apply_batched_repetition_penalty``.
+    model's single-frame codec-window penalty.
     """
     positions = torch.arange(HISTORY_WINDOW, dtype=torch.int32, device=logits.device).reshape(1, -1)
     valid = positions < state.history_len.reshape(-1, 1)
@@ -1059,7 +1137,7 @@ def greedy_codec_sample(
 
     The engine's greedy branch returns the argmax after the censoring masks, the
     logit bias and the penalties, and skips temperature, min-p, top-k and top-p
-    entirely (``vllm/v1/sample/sampler.py:30-60``), so no top-k mask belongs on
+    entirely, so no top-k mask belongs on
     this path -- masking candidates below the argmax cannot change the argmax
     itself. Every other filter is the same one the random path uses.
 

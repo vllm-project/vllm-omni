@@ -37,6 +37,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION_STATE
 from vllm_omni.diffusion.layers.indexed_modulation import indexed_scale_shift_
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, OffloadStrategy, resolve_offload
@@ -57,6 +58,7 @@ from .minimax_h3_blocks import (
     _norm,
     _ring_sequence_parallel_is_active,
 )
+from .reference_isolation import reference_isolation_enabled
 from .vdnh3 import VDNConfig
 
 if TYPE_CHECKING:
@@ -248,6 +250,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "control_rows",
         "control_context_scale",
         "reference_kv_state",
+        REFERENCE_ISOLATION_STATE,
     }
 )
 
@@ -849,7 +852,7 @@ class MiniMaxH3DiTModel(nn.Module):
             max_bytes=256 * 1024**2 if enabled else 0, offload_weights=offload_adaln
         )
         self.od_config = od_config
-        if getattr(od_config, "kv_offload_config", None) is not None:
+        if reference_isolation_enabled(od_config) or getattr(od_config, "kv_offload_config", None) is not None:
             from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import MiniMaxH3CachedAdapter
 
             self._cache_dit_adapter_config = replace(
@@ -1324,17 +1327,17 @@ class MiniMaxH3DiTModel(nn.Module):
             device=device,
             dtype=_BF16_DTYPE,
         )
-        embeddings.index_add_(
+        embeddings.index_copy_(
             0,
             text_local_pos,
             text_embed.to(_BF16_DTYPE)[: text_local_pos.shape[0]],
         )
-        embeddings.index_add_(
+        embeddings.index_copy_(
             0,
             img_local_pos,
             video_embed.to(_BF16_DTYPE)[: img_local_pos.shape[0]],
         )
-        embeddings.index_add_(
+        embeddings.index_copy_(
             0,
             audio_local_pos,
             audio_embed.to(_BF16_DTYPE)[: audio_local_pos.shape[0]],
@@ -1351,6 +1354,19 @@ class MiniMaxH3DiTModel(nn.Module):
     ) -> MiniMaxH3ReferenceKVTier2State | None:
         from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
 
+        if reference_isolation_enabled(self.od_config):
+            if getattr(self, "vdn_config", None) is not None:
+                raise ValueError("--kv-isolate does not support VDN-H3")
+            if global_reference_rows > 0 and not _supports_reference_kv_compaction(self.blocks):
+                raise ValueError("--kv-isolate requires no SP or pure Ulysses attention")
+            from .reference_isolation_cache import create_isolated_reference_cache
+            from .reference_kv_cache_dit import iter_minimax_h3_blocks
+
+            return create_isolated_reference_cache(
+                num_layers=sum(1 for _ in iter_minimax_h3_blocks(self.blocks)),
+                global_reference_rows=global_reference_rows,
+                device=device,
+            )
         config = parse_reference_kv_config(getattr(self.od_config, "kv_offload_config", None))
         if config is None:
             return None
@@ -1422,6 +1438,14 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
         video_layout = kwargs.get("video_token_layout")
         reference_kv_state = kwargs.get("reference_kv_state")
+        reference_isolation = kwargs.get(REFERENCE_ISOLATION_STATE)
+        if reference_isolation is None and reference_isolation_enabled(getattr(self, "od_config", None)):
+            raise ValueError("--kv-isolate requires full-loop inference; step execution is unsupported")
+        if reference_isolation is not None:
+            if self.vdn_config is not None:
+                raise ValueError("--kv-isolate does not support VDN-H3")
+            if kwargs.get("control_rows") is not None:
+                raise ValueError("--kv-isolate does not support ControlNet")
         vdn_window = None
         if self.vdn_config is not None:
             # Text rows lead the packed document.
@@ -1435,6 +1459,28 @@ class MiniMaxH3DiTModel(nn.Module):
         if inverse_indices.shape[0] != seq_len:
             raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
         device = x.device
+        if reference_isolation is not None:
+            reference_isolation.validate_presentation(
+                sequence_rows=seq_len,
+                used_rows=max_seqlen,
+                num_requests=num_requests,
+            )
+            if not reference_isolation.geometry_ready:
+                dynamic_layout = (
+                    _compact_reference_video_layout(
+                        video_layout,
+                        reference_isolation.reference_positions,
+                        max_seqlen - reference_isolation.reference_rows,
+                    )
+                    if video_layout is not None
+                    else None
+                )
+                kv_layout = (
+                    _reference_kv_video_layout(video_layout, reference_isolation.reference_positions, dynamic_layout)
+                    if video_layout is not None
+                    else None
+                )
+                reference_isolation.set_video_geometry(dynamic_layout, kv_layout)
         local_span = self._rope_local_span(seq_len)
         local_start, local_len = local_span
         compact_reference = False
@@ -1588,11 +1634,19 @@ class MiniMaxH3DiTModel(nn.Module):
             # the final head consume the same embedding. Keep the baseline FP32
             # path unchanged when control is absent or has zero strength.
             t_emb = t_emb.to(hidden.dtype)
+            # Control rows describe the target canvas only. Clean condition rows (Ref2VA
+            # references, guides) keep their hidden state and, like audio, get no hint.
+            control_video_pos = img_pos.to(device)
+            hint_free_pos = audio_pos.to(device)
+            target_rows = update_mask.view(-1).to(device=device, dtype=torch.bool)
+            if not bool(target_rows.all()):
+                hint_free_pos = torch.cat((hint_free_pos, control_video_pos[~target_rows]))
+                control_video_pos = control_video_pos[target_rows]
             hints = self.controlnet(
                 hidden,
                 control_rows,
-                img_pos.to(device),
-                audio_pos.to(device),
+                control_video_pos,
+                hint_free_pos,
                 t_emb=t_emb,
                 combined_indices=block_combined,
                 rope_table=block_rope,
@@ -1604,7 +1658,10 @@ class MiniMaxH3DiTModel(nn.Module):
         if getattr(self, "adaln_cache", None) is not None:
             self.adaln_cache.prepare(t_emb)
 
+        last_block = len(self.blocks) - 1
+        handover = {}
         for block_index, block in enumerate(self.blocks):
+            defer_gate = block_index < last_block and block_index not in hints
             hidden = block(
                 hidden,
                 t_emb=t_emb,
@@ -1618,8 +1675,15 @@ class MiniMaxH3DiTModel(nn.Module):
                 vsa_prefix_segments=(() if compact_reference else vsa_prefix_segments),
                 reference_kv_state=reference_kv_state,
                 reference_kv_compact=compact_reference,
+                reference_isolation=reference_isolation,
                 vdn_window=vdn_window,
+                **handover,
+                **({"defer_gate": True} if defer_gate else {}),
             )
+            handover = {}
+            if defer_gate:
+                hidden, pending_gate = hidden
+                handover = {"pending_gate": pending_gate}
             if block_index in hints:
                 hidden = hidden + hints.pop(block_index) * control_scale
         if local_len == seq_len:

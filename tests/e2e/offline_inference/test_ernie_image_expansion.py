@@ -36,7 +36,7 @@ pytestmark = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=2)
+@hardware_test(res={"cuda": "L4", "rocm": "MI300"}, num_cards=2)
 def test_ernie_image_text_to_image(offline_client: OfflineOmniClient) -> None:
     request_config = {
         "model": offline_client.runner.model_name,
