@@ -232,6 +232,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# A PDD adapter's fused heads are held per adapter ID, while a stack is cached
+# under a composed ID without its sources; and no stacked output has been checked.
+_PDD_NOT_COMPOSABLE = "MiniMax-H3 PDD adapters cannot be composed with other adapters"
+
 if TYPE_CHECKING:
     from vllm.lora.lora_model import LoRAModel
     from vllm.lora.peft_helper import PEFTHelper
@@ -874,6 +878,8 @@ class MiniMaxH3Pipeline(
         # immediately after loading, before another load can prune its spec.
         if lora_model.id in self._native_lora_specs:
             raise OmniClientError("MiniMax-H3 native distilled LoRA cannot be composed with other adapters")
+        if isinstance(self._turbo_lora_specs.get(lora_model.id), PDDSpec):
+            raise OmniClientError(_PDD_NOT_COMPOSABLE)
 
     def _validate_diffusion_lora_binding(
         self,
@@ -917,6 +923,8 @@ class MiniMaxH3Pipeline(
         # Request-time fallback; the manager checks each source before composing.
         if len(adapters) > 1 and any(request.lora_int_id in self._native_lora_specs for request, _ in adapters):
             raise OmniClientError("MiniMax-H3 native distilled LoRA cannot be composed with other adapters")
+        if len(adapters) > 1 and any(isinstance(spec, PDDSpec) for spec in specs):
+            raise OmniClientError(_PDD_NOT_COMPOSABLE)
         return specs[0] if specs else None
 
     def _bind_diffusion_lora_manager(self, manager) -> None:
@@ -926,21 +934,24 @@ class MiniMaxH3Pipeline(
             self._native_lora_specs.clear()
 
     def _prune_lora_specs(self) -> None:
-        """Drop the specs of adapters no request can activate without loading them again.
+        """Drop native and PDD specs whose adapter is no longer in the manager's cache.
 
-        A spec lives as long as the manager's entry for its adapter: a cached
-        adapter, or a source of a cached stack, which is served from the
-        composed entry without a reload. A PDD spec owns its fused heads, so
-        this is also what releases them after eviction, removal or a
-        registration that failed.
+        Neither kind can be a source of a cached stack, so a spec is needed
+        only while its own adapter is cached. A PDD spec owns its fused heads,
+        so this is what releases them after eviction, removal or a failed
+        registration. Other Turbo specs may be stack sources and hold no
+        tensors; a reload under the same ID replaces them.
         """
         ref = getattr(self, "_lora_manager_ref", None)
         manager = ref() if ref is not None else None
-        if manager is not None:
-            reachable = manager.reachable_adapter_ids()
-            for specs in (self._turbo_lora_specs, self._native_lora_specs):
-                for adapter_id in specs.keys() - reachable:
-                    specs.pop(adapter_id)
+        if manager is None:
+            return
+        cached = set(manager.list_adapters())
+        for adapter_id in self._native_lora_specs.keys() - cached:
+            self._native_lora_specs.pop(adapter_id)
+        for adapter_id in self._turbo_lora_specs.keys() - cached:
+            if isinstance(self._turbo_lora_specs[adapter_id], PDDSpec):
+                self._turbo_lora_specs.pop(adapter_id)
 
     def _active_native_spec(self, sampling: Any) -> NativeDistilledLoRASpec | None:
         self._prune_lora_specs()

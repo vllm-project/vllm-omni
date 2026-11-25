@@ -2641,7 +2641,7 @@ def _install_harness(monkeypatch, layer_names: tuple[str, ...], fail_layer: str 
     """A real ``_replace_layers_with_lora`` over fake layers; wrapping ``fail_layer`` above a rank runs out of memory."""
     import vllm_omni.lora.manager as manager_mod
 
-    class _Wrapper(_DummyBaseLayerWithLoRA):
+    class _Wrapper(DummyBaseLayerWithLoRA):
         def __init__(self, base_layer, rank):
             super().__init__(base_layer)
             self.rank = rank
@@ -2659,7 +2659,8 @@ def _install_harness(monkeypatch, layer_names: tuple[str, ...], fail_layer: str 
     def _from_layer(*, layer, lora_config, **_kwargs):
         if not isinstance(layer, _FakeLinearBase):
             return layer
-        if layer is layers.get(state["fail_layer"]) and lora_config.max_lora_rank > fail_above:
+        failing = state["fail_layer"]
+        if failing is not None and layer is layers[failing] and lora_config.max_lora_rank > fail_above:
             raise torch.OutOfMemoryError("buffer allocation failed")
         return _Wrapper(layer, lora_config.max_lora_rank)
 
@@ -2719,38 +2720,3 @@ def test_failed_installation_keeps_earlier_wrappers_at_their_rank(monkeypatch):
     assert pipeline.transformer.b is layers["b"]
     # The buffers were rebuilt at the previous rank, so nothing is uploaded any more.
     assert manager._active_adapter_id is None
-
-
-def test_stack_sources_stay_reachable_for_as_long_as_the_stack_is_cached(monkeypatch):
-    """A pipeline keeps per-adapter state by source ID; a cached stack is served without reloading its sources."""
-    manager, _, load_calls, activations = _composed_harness(monkeypatch, max_cached_adapters=1)
-    during_load: list[set[int]] = []
-    load = manager._load_adapter
-
-    def _load(request):
-        during_load.append(manager.reachable_adapter_ids())
-        return load(request)
-
-    monkeypatch.setattr(manager, "_load_adapter", _load)
-    req1, req2 = _dummy_lora_request(1), _dummy_lora_request(2)
-
-    manager.set_active_adapters([req1, req2], [1.0, 0.5])
-    composed_id = activations[-1][0]
-    # The first source is not cached, yet stays reachable while the second one loads.
-    assert during_load == [{1, 2}, {1, 2}]
-    assert manager.reachable_adapter_ids() == {composed_id, 1, 2}
-
-    manager.set_active_adapters([req1, req2], [1.0, 0.5])
-    assert load_calls == [1, 2], "a cached stack does not reload its sources"
-    assert manager.reachable_adapter_ids() == {composed_id, 1, 2}
-
-    # A single adapter takes the only slot: the stack is evicted and its other source with it.
-    manager.set_active_adapter(req2, 1.0)
-    assert manager.reachable_adapter_ids() == {2}
-
-    # A stack that fails to compose leaves nothing reachable behind.
-    manager.remove_adapter(2)
-    monkeypatch.setattr(manager, "_compose_lora_models", Mock(side_effect=ValueError("cannot compose")))
-    with pytest.raises(ValueError, match="cannot compose"):
-        manager.set_active_adapters([req1, req2], [1.0, 0.5])
-    assert manager.reachable_adapter_ids() == set()

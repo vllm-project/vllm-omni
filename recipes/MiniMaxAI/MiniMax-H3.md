@@ -1830,7 +1830,12 @@ Start a `--task-type ref2va` server with `--lora-backend peft` (`--task-type fl2
 (`flow_shift=12`, `audio_flow_shift=3`) and the adapter in `lora` at `scale=1.0`. Each head is the mean velocity
 of one block of that schedule, so a request with another scale, a sampler other than `euler`, or `latent_refine` is
 rejected. The adapter is refused at load on a combined server and with step execution, `--lora-application merged`
-or `--cache-backend tea_cache`: the heads belong to one DiT and are bound for one request at a time.
+or `--cache-backend tea_cache`: the heads belong to one DiT and are bound for one request at a time. It cannot be
+stacked with other adapters in a `lora` array.
+
+Keep the released filename. It names the DiT the adapter was distilled from, and the server refuses a file whose
+name does not match its `--task-type`. The file's metadata does not record the DiT, so a renamed or differently
+named export (`pdd_ema.safetensors`) is bound to whichever DiT the server runs, without that check.
 
 ### Conditioning features with adapters
 

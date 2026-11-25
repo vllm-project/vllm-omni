@@ -206,8 +206,6 @@ class LoRAManager:
         # Composed multi-adapter LRU: sorted ((adapter_id, rounded_scale), ...)
         # key -> registered adapter id of the composed LoRAModel.
         self._composed_adapters: OrderedDict[tuple[tuple[int, float], ...], int] = OrderedDict()
-        # Sources of the stack being composed: loaded, not yet cached under its key.
-        self._composing_source_ids: frozenset[int] = frozenset()
 
         # track replaced modules
         # key: full module name (component.module.path); value: LoRA layer
@@ -577,17 +575,6 @@ class LoRAManager:
         loaded transiently without entering the LRU cache, so stacking works
         with any ``max_cached_adapters`` value (including the default of 1).
         """
-        self._composing_source_ids = frozenset(request.lora_int_id for request, _ in pairs)
-        try:
-            return self._compose_and_register(key, pairs)
-        finally:
-            self._composing_source_ids = frozenset()
-
-    def _compose_and_register(
-        self,
-        key: tuple[tuple[int, float], ...],
-        pairs: list[tuple[LoRARequest, float]],
-    ) -> int:
         specs: list[tuple[LoRAModel, float]] = []
         validate_composition = getattr(self.pipeline, "_validate_diffusion_lora_composition", None)
         for request, scale in pairs:
@@ -1958,20 +1945,6 @@ class LoRAManager:
     def list_adapters(self) -> list[int]:
         """Return list of registered adapter ids."""
         return list(self._registered_adapters.keys())
-
-    def reachable_adapter_ids(self) -> set[int]:
-        """IDs a request can activate without the adapter being loaded again.
-
-        Besides the cached adapters these are the sources of every cached
-        stack: they were loaded for the composition only, and a later request
-        for the same stack is served from the composed entry. A pipeline that
-        keeps state per adapter ID holds it for exactly these IDs.
-        """
-        reachable = set(self._registered_adapters) | self._composing_source_ids
-        for key, composed_id in self._composed_adapters.items():
-            if composed_id in self._registered_adapters:
-                reachable.update(source_id for source_id, _ in key)
-        return reachable
 
     def pin_adapter(self, adapter_id: int) -> bool:
         """Mark an adapter as pinned so it will not be evicted."""

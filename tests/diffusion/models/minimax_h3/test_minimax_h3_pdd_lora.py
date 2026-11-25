@@ -433,33 +433,39 @@ def _request(adapter_id):
     return LoRARequest(f"adapter-{adapter_id}", adapter_id, f"/models/adapter-{adapter_id}")
 
 
-def test_a_cached_stack_keeps_its_pdd_heads_for_every_request(monkeypatch, adapter):
-    """Cache capacity 1: the stack is cached under a composed ID and its sources are never registered."""
+@pytest.mark.parametrize("pdd_first", [True, False])
+@pytest.mark.parametrize("cached", [False, True])
+def test_pdd_adapters_are_not_stacked(monkeypatch, adapter, pdd_first, cached):
+    """Cache capacity 1: every request for a PDD + LoRA stack is refused, before anything is composed or cached."""
+    from unittest.mock import Mock
+
+    from vllm_omni.errors import OmniClientError
+
     pipeline, manager, loads, bound = _managed_pipeline(monkeypatch, adapter[0])
+    compose = Mock(side_effect=AssertionError("a PDD stack must be refused before composition"))
+    monkeypatch.setattr(manager, "_compose_lora_models", compose)
     pdd, style = _request(1), _request(2)
-    sampling = SimpleNamespace(lora_request=[pdd, style], lora_scale=[1.0, 0.8], extra_args={})
+    if cached:
+        manager.add_adapter(pdd)
+    requests = [pdd, style] if pdd_first else [style, pdd]
 
     for _ in range(2):
-        manager.set_active_adapters(sampling.lora_request, sampling.lora_scale)
-        spec = pipeline._active_turbo_spec(sampling)
-        assert isinstance(spec, PDDSpec)
-        pipeline._validate_pdd_sampling(sampling, spec)
-        pipeline._bind_adapter_heads(spec)
-        assert bound[-1] is spec.pdd_heads
-    # The second request was served from the composed entry: no source was loaded again.
-    assert loads == [1, 2]
-    assert len(manager.list_adapters()) == 1 and not {1, 2} & set(manager.list_adapters())
+        with pytest.raises(OmniClientError, match="PDD adapters cannot be composed"):
+            manager.set_active_adapters(requests, [1.0, 0.8])
+    compose.assert_not_called()
+    assert manager._composed_adapters == {}
+    assert manager.list_adapters() == ([1] if cached else [])
+    assert bound == []
 
-    # Another adapter takes the slot; the stack is evicted and its heads go with it.
-    other = SimpleNamespace(lora_request=_request(4), lora_scale=1.0, extra_args={})
-    manager.set_active_adapters(other.lora_request, other.lora_scale)
-    assert pipeline._active_turbo_spec(other) is None
-    assert pipeline._turbo_lora_specs == {}
-
-    # The stack again: recomposed from freshly loaded sources, heads bound as before.
-    manager.set_active_adapters(sampling.lora_request, sampling.lora_scale)
+    # Request-time fallback for a stack that reached the pipeline another way.
+    pipeline._turbo_lora_specs[1] = PDDSpec("a.safetensors", "ref2v", 4, 12.0, 3.0, 1, 1.0)
+    manager.add_adapter(pdd) if not cached else None
+    sampling = SimpleNamespace(lora_request=requests, lora_scale=[1.0, 0.8], extra_args={})
+    with pytest.raises(OmniClientError, match="PDD adapters cannot be composed"):
+        pipeline._active_turbo_spec(sampling)
+    # At scale 0 the other adapter is not applied, so the PDD adapter runs alone.
+    sampling.lora_scale = [1.0, 0.0] if pdd_first else [0.0, 1.0]
     assert isinstance(pipeline._active_turbo_spec(sampling), PDDSpec)
-    assert loads == [1, 2, 4, 1, 2]
 
 
 def test_pdd_heads_leave_with_the_adapter_entry(monkeypatch, adapter):
