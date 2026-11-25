@@ -1720,7 +1720,10 @@ replies: a completed answer does not finish an instruction about future
 observations. Each new observation must be evaluated against applicable ongoing
 instructions before choosing silence. This does not force a spoken response for
 every camera commit; silence remains valid when no instruction or scene change
-calls for speech. An explicit `joyai_system_prompt` still replaces the persona.
+calls for speech. The absence of a new query is not by itself a reason to stay
+silent: an ongoing instruction may require a reply to the newest observation.
+Answered one-time questions and unmet conditions in ongoing instructions do not
+require another reply. An explicit `joyai_system_prompt` still replaces the persona.
 
 The ASR handoff retains frame timestamps and observation-to-history references,
 so an old frame precedes its reply boundary and the new transcript accompanies

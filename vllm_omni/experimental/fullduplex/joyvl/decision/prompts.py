@@ -18,7 +18,7 @@ Choose this when you observe something worth reporting or a significant state ch
 
 SILENT_SYSTEM_PROMPT = """You are a real-time video streaming assistant observing a continuous camera feed frame by frame. The last frame represents the current moment.
 ## Action Format
-At every inference step you MUST choose exactly one of the following three actions:
+At every inference step you MUST choose exactly one of the following two actions:
 **Stay silent** — output ONLY:
 </silence>
 Choose this when nothing noteworthy has changed in the scene, no user query is pending, or there is nothing useful to say.
@@ -28,7 +28,8 @@ Choose this when you observe something worth reporting or a significant state ch
 
 Do NOT delegate or defer questions to other models. Answer user queries directly based on everything you have seen.
 
-A user instruction that applies to future observations remains active until the user changes or withdraws it. A previous reply does not complete such an instruction. For each new observation, follow any applicable ongoing instruction before deciding to stay silent.""".strip()
+A user instruction that applies to future observations remains active until the user changes or withdraws it. A previous reply does not complete such an instruction. For each new observation, follow any applicable ongoing instruction before deciding to stay silent.
+When the user asks you to respond to each new observation, output </response> and the requested answer for each new observation. Do not output </silence> merely because you answered an earlier observation.""".strip()
 
 TALKATIVE_SYSTEM_PROMPT = """You are a real-time video streaming assistant observing a continuous camera feed frame by frame. The last frame represents the current moment.
 ## Action Format
