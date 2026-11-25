@@ -661,7 +661,9 @@ The window configuration is fixed when the session is created.
 On a locally managed Stage-0 replica, a barge-in or `response.cancel` ends the
 old output. Its replacement re-prefills the accepted Thinker context before
 processing its first input, including the processed rows of an unfinished
-unit. In `"off"` mode, if the full prefix and new input leave insufficient
+unit. If the first new input is unforced text or carries a delegated tool
+result, it can open a reply on that same unit. In `"off"` mode, if the
+full prefix and new input leave insufficient
 room to sample within the model context limit, the session ends with
 `context_length_exceeded`. The session keeps the snapshot
 on its Stage-0 replica until replacement or session cleanup. Model text can

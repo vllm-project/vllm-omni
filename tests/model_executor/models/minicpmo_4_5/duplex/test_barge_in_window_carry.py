@@ -23,8 +23,10 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutput, FinishReason
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
+from tests.model_executor.models.minicpmo_4_5.helpers import stage0_vision_runtime
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.window_policy import WindowOperation
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import APPEND_TEXT_TOKEN_IDS_KEY
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
     MiniCPMO45Stage0DuplexRuntime,
     _MiniCPMO45CarriedWindow,
@@ -715,7 +717,7 @@ def test_restored_window_preserves_native_listen_sampling(raw_leader: str) -> No
     logits = torch.tensor([[0.0, 0.0, 6.0, 5.9, 5.8] + [0.0] * 5])
     reference = logits.clone()
     model.prepare_duplex_sampling(logits, None, (row,))
-    draw = model._minicpmo45_duplex_stage2_draws(
+    draw, early_listen_mask = model._minicpmo45_duplex_stage2_draws(
         logits,
         [0],
         {0: [leader] if raw_leader == "repeated" else []},
@@ -724,6 +726,7 @@ def test_restored_window_preserves_native_listen_sampling(raw_leader: str) -> No
         SimpleNamespace(all_greedy=True),
     )
     assert draw.tolist() == [listen]
+    assert early_listen_mask is None
     assert torch.equal(logits, reference)
     assert torch.equal(model._duplex_boundary_chunk_eos_probs(logits, boundary), reference.softmax(-1)[:, boundary])
 
@@ -1231,6 +1234,77 @@ def test_cut_before_first_decode_closes_seeded_active_turn():
     cut = request._minicpmo45_settled
     assert cut["accepted"] == []
     assert cut["tail"] == [TURN_EOS, LISTEN, UNIT_END]
+
+
+@pytest.mark.parametrize("backend", [False, True], ids=["client-text", "tool-result"])
+@pytest.mark.parametrize("forced", [False, True])
+def test_cancel_at_text_prefill_boundary(backend, forced):
+    policy = _scheduler()._window_policy
+    old = _new_request(_stage0_id("text-cut", 0))
+    duplex = _first_input(old)
+    duplex["payload"] = {"force_listen": forced}
+    if backend:
+        duplex["runtime_config"][APPEND_TEXT_TOKEN_IDS_KEY] = [20, 21]
+    else:
+        duplex["payload"].update(type="text", text_token_ids=[20, 21])
+    policy.prepare_admission(old, 4096)
+    # Observe the same append on both sides of its last input row, before
+    # accepting a decoder token. A partial text prompt cannot open the turn.
+    old.num_computed_tokens = old.num_prompt_tokens - 1
+    policy.observe_progress(old)
+    assert old._minicpmo45_settled["tail"] == [LISTEN, UNIT_END]
+    old.num_computed_tokens += 1
+    policy.observe_progress(old)
+    turn_open = backend or not forced
+    cut = old._minicpmo45_settled
+    assert cut["turn"].pending_speech_context
+    assert cut["tail"] == ([TURN_EOS] if turn_open else []) + [LISTEN, UNIT_END]
+    old._all_token_ids[-1] = CHUNK_EOS
+    policy.observe_progress(old)
+    assert old._minicpmo45_settled["close_on_next_input"] is turn_open
+
+
+@pytest.mark.parametrize("backend", [False, True], ids=["client-text", "tool-result"])
+@pytest.mark.parametrize("parked", [False, True])
+def test_first_text_after_cancel_reopens_the_turn(backend, parked):
+    import numpy as np
+
+    runtime = stage0_vision_runtime()
+    token = runtime._embed_token
+    previous = [31, runtime.chunk_eos_token_id, runtime.unit_end_token_id]
+    kept = _MiniCPMO45CarriedWindow.pack([_MiniCPMO45WindowUnit([token(i) for i in previous], previous)])
+    policy = _scheduler()._window_policy
+    new = _new_request(_stage0_id("text-resume", 1))
+    duplex = _first_input(new, "off")
+    duplex["payload"] = {"is_speech": False} if backend else {"type": "text", "text_token_ids": [20, 21]}
+    if backend:
+        duplex["runtime_config"][APPEND_TEXT_TOKEN_IDS_KEY] = [20, 21]
+    policy.prepare_admission(new, 4096)
+    policy.carry.windows["text-resume"] = {
+        "source": _stage0_id("text-resume", 0),
+        "seq": 1,
+        "units": [{"length": len(previous), "generated_token_ids": []}],
+        "previous": [],
+        "close_on_next_input": parked,
+    }
+    policy.prepare_admission(new, 4096)
+    assert not duplex["payload"].get("force_listen")
+    runtime._replay_windows = {new.request_id: kept}
+    state = _MiniCPMO45Stage0SessionState("text-resume", window_enabled=True)
+    state.context_token_ids = [24, 25, 26]
+    state.context_embeds = [token(i) for i in state.context_token_ids]
+    kwargs = MiniCPMO45OmniForConditionalGeneration._minicpmo45_duplex_prefill_kwargs(duplex, duplex["payload"])
+    audio = np.zeros(4 if backend else 0, dtype=np.float32)
+    result = runtime._stage_prefill_embeddings_only(state, audio, **kwargs)
+    assert result["success"]
+    assert not state.current_turn_ended and state.pending_speech_context and state.pending_speech_response_open
+    closed = [31, *([runtime.turn_eos_token_id] if parked else []), *previous[-2:]]
+    prefix = [*state.context_token_ids, *closed]
+    assert result["input_token_ids"][: duplex["open_input_start"]] == prefix
+    assert result["input_token_ids"][-2:] == [20, 21]
+    assert result["num_input_tokens"] == new.num_prompt_tokens
+    assert new._minicpmo45_window_units[-1]["length"] == len(closed)
+    assert kept.token_ids == [previous]
 
 
 def test_already_listening_at_cancel_does_not_force_next_speech_to_listen():

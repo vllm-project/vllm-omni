@@ -24,6 +24,13 @@ class MiniCPMO45TurnState:
     pending_speech_response_open: bool = False
     explicit_response_awaiting_content: bool = False
 
+    def observe_text_prefill(self, *, force_listen: bool, backend_result: bool) -> None:
+        """Apply the newly accepted client text or delegated result before sampling."""
+        self.pending_speech_context = True
+        if backend_result or (self.current_turn_ended and not force_listen):
+            self.current_turn_ended = False
+            self.pending_speech_response_open = True
+
 
 def record_turn_sample(
     state: MiniCPMO45TurnState, sampled: int, token_ids: dict[str, int], payload: dict, *, terminator: bool

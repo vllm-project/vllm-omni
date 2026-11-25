@@ -817,14 +817,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             if state.pending_window_unit is not None:
                 state.pending_window_unit.embeds.append(text_embeds)
                 state.pending_window_unit.token_ids.extend(text_token_ids)
-            state.pending_speech_context = True
-            state.pending_speech_append_identity = append_identity
-            # A server-owned result resumes the assistant after delegation,
-            # even if the model already ended that turn. Match a seeded
-            # response's open-turn state so silence advances the answer until
-            # its next turn_eos instead of leaving it in the listening loop.
-            state.current_turn_ended = False
-            state.pending_speech_response_open = True
         # Match official streaming_prefill: a unit carries media and optional text.
         # The assistant turn opens once at session init; re-emitting its prefix per chunk
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
@@ -858,17 +850,14 @@ class MiniCPMO45Stage0DuplexRuntime:
         # Standalone VISION input can open a response without speech. Camera
         # frames accompanying silent audio must retain the OMNI speech gate:
         # otherwise every frame can re-open a completed conversation turn.
-        if (is_speech or has_text or (vision_only and num_frames)) and (
-            append_identity is None or state.pending_speech_append_identity != append_identity
-        ):
-            state.pending_speech_context = True
-            state.pending_speech_append_identity = append_identity
-            if has_text and not force_listen and state.current_turn_ended:
-                # Like the initial text prompt, an unforced fragment opens an
-                # assistant turn. Apply this once at prefill, never on each
-                # decode step: turn_eos must keep the turn closed afterward.
-                state.current_turn_ended = False
-                state.pending_speech_response_open = True
+        if append_identity is None or state.pending_speech_append_identity != append_identity:
+            if has_text or text_token_ids:
+                # Restore the previous window first, then apply this unit's text once.
+                state.observe_text_prefill(force_listen=force_listen, backend_result=bool(text_token_ids))
+                state.pending_speech_append_identity = append_identity
+            elif is_speech or (vision_only and num_frames):
+                state.pending_speech_context = True
+                state.pending_speech_append_identity = append_identity
         if append_identity is not None:
             state.prepared_append_identity = append_identity
             state.prepared_inputs_embeds = inputs_embeds
@@ -1083,6 +1072,14 @@ class MiniCPMO45Stage0DuplexRuntime:
             if target:
                 raise _UnrecoverableWindowError(f"Inconsistent admitted MiniCPM-o replay for {target}")
             placed = self._filler_units(lengths if isinstance(lengths, list) else [], carried_units)
+        elif placed and stage0_window.get("close_before_text"):
+            # The parked terminator and </unit> are pending replay. Close the
+            # old turn before that pair so the new text remains the decode position.
+            last = placed[-1]
+            placed[-1] = _MiniCPMO45WindowUnit(
+                [*last.embeds[:-2], self._embed_token(self.turn_eos_token_id), *last.embeds[-2:]],
+                [*last.token_ids[:-2], self.turn_eos_token_id, *last.token_ids[-2:]],
+            )
         elif placed and not stage0_window.get("replay_cut"):
             self._end_carried_speech_with_listen(placed[-1])
         state.window_units[:0] = placed

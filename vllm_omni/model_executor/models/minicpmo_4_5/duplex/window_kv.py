@@ -117,7 +117,11 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowSpec,
 )
 from vllm_omni.model_executor.common.duplex.payload import payload_audio
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45TurnState, record_turn_sample
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
+    APPEND_TEXT_TOKEN_IDS_KEY,
+    MiniCPMO45TurnState,
+    record_turn_sample,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
     CARRIED_WINDOW_MAX_SESSIONS,
     CARRIED_WINDOW_OFFER_TTL_S,
@@ -864,6 +868,9 @@ class MiniCPMO45SchedulerWindowPolicy:
         parked = bool(generated and generated[-1] in terminators)
         active_ids = generated[:-1] if parked else generated[:consumed]
         accepted = generated if parked else active_ids
+        backend_text = bool(cfg.get(APPEND_TEXT_TOKEN_IDS_KEY))
+        if (payload.get("text_token_ids") or backend_text) and settled >= request.num_prompt_tokens:
+            turn.observe_text_prefill(force_listen=payload.get("force_listen") is True, backend_result=backend_text)
         if accepted and payload.get("open_assistant_turn") is True and payload.get("is_speech") is not True:
             if turn.current_turn_ended:
                 turn.current_turn_ended = False
@@ -941,7 +948,13 @@ class MiniCPMO45SchedulerWindowPolicy:
         marker = cfg.get("duplex_window_previous_marker_token_ids", [])
         previous_len = len(marker) + len(previous) if previous and mode == "context" else 0
         carried = sum(unit["length"] for unit in units)
-        extra = carried + previous_len + int(window["close_on_next_input"])
+        payload = duplex["payload"]
+        opens_from_text = bool(cfg.get(APPEND_TEXT_TOKEN_IDS_KEY)) or (
+            bool(payload.get("text_token_ids")) and payload.get("force_listen") is not True
+        )
+        close_before_text = window["close_on_next_input"] and opens_from_text and bool(units)
+        close_on_next_input = window["close_on_next_input"] and not opens_from_text
+        extra = carried + previous_len + int(close_before_text or close_on_next_input)
         length = request.num_prompt_tokens + extra
         config = cfg["duplex_window_config"]
         # If the next prefill crosses the same window watermark as an ordinary
@@ -961,7 +974,8 @@ class MiniCPMO45SchedulerWindowPolicy:
                 limit = max(0, int(config.get("context_previous_max_tokens", 500)))
                 previous = (previous + unit["generated_token_ids"])[-limit:] if limit else []
                 previous_len = len(marker) + len(previous) if previous else 0
-            length = request.num_prompt_tokens + carried + previous_len + int(window["close_on_next_input"])
+            close_before_text = close_before_text and bool(units)
+            length = request.num_prompt_tokens + carried + previous_len + int(close_before_text or close_on_next_input)
         if length > max_prompt_len:
             return length
         prompt_ids = [cfg["duplex_scheduler_token_id"]] * length
@@ -971,6 +985,10 @@ class MiniCPMO45SchedulerWindowPolicy:
         request.num_prompt_tokens = length
         request.block_hashes.clear()
         request.update_block_hashes()
+        source_lengths = [unit["length"] for unit in units]
+        if close_before_text:
+            units[-1] = {**units[-1], "length": units[-1]["length"] + 1}
+            carried += 1
         request._minicpmo45_window_units = units.copy()
         request._minicpmo45_window_previous_token_ids = list(previous)
         request._minicpmo45_window_previous_len = previous_len
@@ -984,13 +1002,14 @@ class MiniCPMO45SchedulerWindowPolicy:
             "replay_cut": request.request_id,
             "carried_units": len(units),
             "evicted_at_cut": skipped,
-            "carried_unit_lengths": [unit["length"] for unit in units],
+            "carried_unit_lengths": source_lengths,
             "replacement_prompt_len": length,
             "previous_token_ids": previous,
             "previous_marker_token_ids": marker,
-            "close_on_next_input": window["close_on_next_input"],
+            "close_on_next_input": close_on_next_input,
+            "close_before_text": close_before_text,
         }
-        if window["close_on_next_input"]:
+        if close_on_next_input:
             duplex["payload"] = {**duplex["payload"], "force_listen": True}
         return None
 
