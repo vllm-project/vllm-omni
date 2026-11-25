@@ -347,14 +347,6 @@ class DiffusionParallelConfig:
     NPUSHMEM allocator, Triton-Ascend and a symmetric-memory runtime.
     """
 
-    ulysses_overlap_chunks: int = 0
-    """Overlap the CUDA copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
-
-    Requires ``ulysses_a2a_permute`` and strict pure Ulysses. Each chunk's Q/K/V move to their head owners while
-    earlier chunks compute, and outputs return as each chunk finishes. Results match the unchunked path exactly when
-    the attention backend's per-head output does not depend on the number of heads per call.
-    """
-
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
 
