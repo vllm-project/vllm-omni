@@ -710,6 +710,56 @@ async def test_video_output_warmup_gates_http_startup(monkeypatch, warmup):
     assert events[-1] == "engine_closed"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group_count", [0, 1], ids=["no-surviving-group", "surviving-group"])
+async def test_duplex_startup_warmup_requires_an_owned_group(monkeypatch, group_count):
+    class _FakeDuplexOmni(_FakeEngineClient):
+        pass
+
+    app = FastAPI()
+    engine = _FakeDuplexOmni()
+    engine.engine.duplex_frontend_group_count = group_count
+    engine.duplex_session_config = SimpleNamespace(warmup_frames=1)
+    warmup_calls = []
+
+    @asynccontextmanager
+    async def build_engine(*_args, **_kwargs):
+        yield engine
+
+    async def init_state(engine_client, state, _args):
+        state.engine_client = engine_client
+        # The duplex handler exists even when no complete group survived.
+        state.openai_serving_duplex = object()
+
+    async def warmup(warmup_app, _args, frames):
+        assert warmup_app is app
+        assert isinstance(app.state.duplex_warmup_done, asyncio.Event)
+        warmup_calls.append(frames)
+        app.state.duplex_warmup_done.set()
+
+    async def serve(_app, **_kwargs):
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(api_server, "DuplexOmni", _FakeDuplexOmni)
+    monkeypatch.setattr(api_server, "build_async_omni", build_engine)
+    monkeypatch.setattr(api_server, "build_openai_app", lambda *_: app)
+    monkeypatch.setattr(api_server, "omni_init_app_state", init_state)
+    monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_: None)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", lambda *, on_expire: asyncio.sleep(0))
+    monkeypatch.setattr(api_server, "lookup_duplex_plugin", lambda _engine: None)
+    monkeypatch.setattr(api_server, "_warmup_duplex_realtime", warmup)
+    monkeypatch.setattr(api_server, "serve_http", serve)
+
+    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
+
+    if group_count:
+        assert app.state.duplex_warmup_done.is_set()
+        assert warmup_calls == [1]
+    else:
+        assert app.state.duplex_warmup_done is None
+        assert warmup_calls == []
+
+
 class _FakeEngineClient:
     config_path: str | None = None
 

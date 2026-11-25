@@ -206,6 +206,50 @@ def test_ready_racing_deadline_waits_for_the_callback(monkeypatch):
     assert kill_calls == [1]
 
 
+def test_handshake_error_racing_deadline_is_reported_as_timeout(monkeypatch):
+    error = RuntimeError("readiness handshake failed")
+    events = []
+
+    class _DeadlineDuringJoin:
+        def __init__(self, interval, callback):
+            self.callback = callback
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            events.append("cancel")
+
+        def join(self):
+            # Model a callback that passed the cancellation check but only
+            # completes while the caller joins it. No wall-clock timing needed.
+            self.callback()
+            events.append("joined")
+
+    def fail_handshake(*_args):
+        events.append("handshake failed")
+        raise error
+
+    monkeypatch.setattr(stage_init_deadline.threading, "Timer", _DeadlineDuringJoin)
+    monkeypatch.setattr(stage_init_deadline, "wait_for_engine_startup", fail_handshake)
+
+    with pytest.raises(TimeoutError, match="stage_init_timeout") as exc_info:
+        wait_for_engine_startup_with_deadline(
+            object(),
+            [],
+            _PARALLEL_CONFIG,
+            False,
+            None,
+            None,
+            timeout=60,
+            kill_processes=lambda: events.append("killed"),
+            stage_label="fake stage",
+        )
+
+    assert exc_info.value.__cause__ is error
+    assert events == ["handshake failed", "cancel", "killed", "joined"]
+
+
 def test_shutdown_cancels_initialization_before_joining_orchestrator():
     """``OmniEngineBase.shutdown`` must cancel stage initialization before it
     waits for the orchestrator thread, otherwise a stage that becomes READY
