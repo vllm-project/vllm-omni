@@ -610,7 +610,8 @@ def _npu_qk_norm_rope(
             from mindiesd.fused_ops import eagle_split_norm_rope_concat
 
             # The caller retains V. Use K to fill Eagle's V slot.
-            packed = torch.cat((q, k, k), dim=1)
+            k_contig = k.contiguous()
+            packed = torch.cat((q, k_contig, k_contig), dim=1)
             cos, sin = rope_table.reshape(q.shape[0], 2, rotary_dim // 2).transpose(0, 1).contiguous().unbind(0)
             q_out, k_out, _ = eagle_split_norm_rope_concat(
                 packed,
