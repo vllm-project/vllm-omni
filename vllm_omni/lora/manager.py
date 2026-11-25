@@ -34,7 +34,7 @@ from vllm_omni.lora.binding import (
     moe_lora_kernel_requires_context,
     normalize_target_modules,
 )
-from vllm_omni.lora.capability import MergedLoRASpec, resolve_merged_lora_spec
+from vllm_omni.lora.capability import MergedLoRASpec, resolve_merged_lora_spec, resolve_spec_component
 from vllm_omni.lora.merged_weights import MergedLinearWeights
 from vllm_omni.lora.request import TensorLoRARequest
 from vllm_omni.lora.utils import round_lora_scale, stable_lora_int_id
@@ -946,12 +946,7 @@ class LoRAManager:
         """
         if self._merged_spec is not None:
             for component_name in self._merged_spec.components:
-                if component_name == "":
-                    yield "", self.pipeline
-                elif hasattr(self.pipeline, component_name):
-                    component = getattr(self.pipeline, component_name)
-                    if isinstance(component, nn.Module):
-                        yield component_name, component
+                yield component_name, resolve_spec_component(self.pipeline, component_name)
             return
         default_components = (
             "transformer",

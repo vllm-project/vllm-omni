@@ -216,24 +216,27 @@ def merged_lora_spec_from_ar_model(model: nn.Module) -> MergedLoRASpec:
     )
 
 
-def _iter_spec_components(model: nn.Module, spec: MergedLoRASpec) -> list[tuple[str, nn.Module]]:
-    resolved: list[tuple[str, nn.Module]] = []
-    for comp_name in spec.components:
-        if comp_name == "":
-            resolved.append(("", model))
-            continue
-        if not hasattr(model, comp_name):
+def resolve_spec_component(model: nn.Module, comp_name: str) -> nn.Module:
+    """Resolve a declared module path without changing its binding key."""
+    if comp_name == "":
+        return model
+    current: object = model
+    for part in comp_name.split("."):
+        if not part or not isinstance(current, nn.Module) or not hasattr(current, part):
             raise MergedLoRACapabilityError(
                 f"{type(model).__name__} merged_lora_spec declares missing component {comp_name!r}"
             )
-        comp = getattr(model, comp_name)
-        if not isinstance(comp, nn.Module):
-            raise MergedLoRACapabilityError(
-                f"{type(model).__name__} merged_lora_spec component {comp_name!r} is "
-                f"{type(comp).__name__}, expected torch.nn.Module"
-            )
-        resolved.append((comp_name, comp))
-    return resolved
+        current = getattr(current, part)
+    if not isinstance(current, nn.Module):
+        raise MergedLoRACapabilityError(
+            f"{type(model).__name__} merged_lora_spec component {comp_name!r} is "
+            f"{type(current).__name__}, expected torch.nn.Module"
+        )
+    return current
+
+
+def _iter_spec_components(model: nn.Module, spec: MergedLoRASpec) -> list[tuple[str, nn.Module]]:
+    return [(name, resolve_spec_component(model, name)) for name in spec.components]
 
 
 def validate_merged_lora_model(model: nn.Module, spec: MergedLoRASpec) -> None:
@@ -488,7 +491,7 @@ DIFFUSION_MERGED_LORA_REGISTRY: dict[str, MergedLoRARegistryEntry] = {
     "LTX2DistilledPipeline": _not_capable(_PENDING_DIFFUSION_MIGRATION),
     "LTX2DistilledTwoStagePipeline": _not_capable(_PENDING_DIFFUSION_MIGRATION),
     "LTX2I2VDMD2Pipeline": _not_capable(_PENDING_DIFFUSION_MIGRATION),
-    "LTX2Pipeline": _not_capable(_PENDING_DIFFUSION_MIGRATION),
+    "LTX2Pipeline": _SUPPORTED,
     "LTX2T2VDMD2Pipeline": _not_capable(_PENDING_DIFFUSION_MIGRATION),
     "LTX2TextToAudioPipeline": _not_capable(_PENDING_DIFFUSION_MIGRATION),
     "LTX2TwoStagePipeline": _not_capable(_PENDING_DIFFUSION_MIGRATION),

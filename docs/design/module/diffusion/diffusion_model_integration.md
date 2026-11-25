@@ -42,6 +42,11 @@ inputs, outputs, loading path, and runtime capabilities (including its
 merged-LoRA capability via `SupportsMergedLoRA` or an explicit registry entry in
 `vllm_omni/lora/capability.py`).
 
+The LTX-2.3 one-stage encoder slice uses that same capability interface with a
+nested `text_encoder.model.language_model` component. Its model-owned projection
+adaptation leaves other pipeline components unchanged; other LTX variants retain
+their explicit unsupported registry entries.
+
 ### DIFF-MODEL-INV-002: Registration is the selection boundary
 
 **Rule:** Runtime code MUST select model implementations through the registry or

@@ -122,6 +122,35 @@ Engine-side merged LoRA updates live dense weights in place (`W = W_base + (B @ 
 - Serving reuse between training steps requires pausing generation across each `start_weight_update` / `update_weights` / `finish_weight_update` session and invalidating caches after sync.
 - Models declare merged-LoRA support through `SupportsMergedLoRA` (`merged_lora_spec()` in `vllm_omni/lora/capability.py`). AR stages compose upstream `SupportsLoRA` declarations (`packed_modules_mapping`, `hf_to_vllm_mapper`). Pipelines that do not yet support merged LoRA or are runtime-only are registered explicitly in `vllm_omni/lora/capability.py` with a named reason.
 
+### LTX-2.3 text-encoder updates
+
+The LTX-2.3 one-stage `LTX2Pipeline` supports an opt-in encoder policy with
+`lora_application="merged"` and weight-transfer backend `omni_lora_ipc`.
+It declares only `text_encoder.model.language_model` in `MergedLoRASpec.components`.
+Components may be nested module paths; validation and the manager resolve the
+same path and retain it as the binding namespace. The DiT, connectors, vision
+tower and LM head are not LoRA targets in this slice.
+
+At construction, plain HF language-model projections become model-owned
+replicated linear layers. They retain the original parameters and tensor-returning
+HF forward, and bind through the shared Omni LoRA wrapper. No additional merge
+bank or transfer protocol is introduced. Tied/shared projection storage, custom
+linear subclasses, hooks and unsupported parameter layouts are rejected before
+the module graph changes.
+
+Tensor adapter names must identify complete projections, for example
+`text_encoder.model.language_model.layers.0.self_attn.q_proj` or the native HF
+name `model.language_model.layers.0.self_attn.q_proj`, with the usual PEFT
+`base_model.model.` prefix and `.lora_A.weight` / `.lora_B.weight` suffixes.
+Bare projection names are rejected to prevent broadcasting one factor pair
+across every matching decoder layer. Unmatched targets fail without committing
+a new dense policy.
+
+The shared session lifecycle still requires inference to be quiescent during
+updates. Replacement starts from the pristine base; removal restores it.
+This does not add per-request adapter switching, a prompt-condition cache,
+other LTX versions/recipes, or a runtime checkpoint-adapter path.
+
 ## Not supported
 
 - One request applying different adapters to different LLM stages, or any

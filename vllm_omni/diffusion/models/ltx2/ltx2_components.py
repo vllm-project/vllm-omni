@@ -726,6 +726,11 @@ def _declare_text_encoder_offload_plan(pipeline: Any) -> None:
 
 def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
     """Build the common LTX component graph selected by ``component_profile``."""
+    merged_encoder = getattr(od_config, "lora_application", "runtime") == "merged"
+    if merged_encoder and (pipeline.model_version != "2.3" or pipeline.pipeline_kind != "one_stage"):
+        from vllm_omni.lora.capability import MergedLoRACapabilityError
+
+        raise MergedLoRACapabilityError("LTX merged text-encoder LoRA requires the LTX2.3 one-stage pipeline")
     profile: LTXComponentProfile = pipeline.component_profile
     pipeline.od_config = od_config
     pipeline.device = get_local_device()
@@ -763,6 +768,10 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             dtype=dtype,
             revision=revision,
         )
+    if merged_encoder:
+        from .ltx2_lora import prepare_ltx23_text_encoder_lora
+
+        prepare_ltx23_text_encoder_lora(pipeline)
     pipeline.connectors = _load_component(
         LTX2TextConnectors,
         model,
