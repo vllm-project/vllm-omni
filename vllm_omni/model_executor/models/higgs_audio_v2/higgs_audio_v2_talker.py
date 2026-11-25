@@ -50,6 +50,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaMLP
+from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON
 from vllm.v1.core.sched.output import GrammarOutput
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -1442,7 +1444,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         #   - emit ``audio_stream_eos_id`` (1025) only during ramp-down.
         bos_pre = int(self.config.audio_stream_bos_id)
         eos_pre = int(self.config.audio_stream_eos_id)
-        if cb_logits.is_cuda:
+        if current_platform.is_cuda() and HAS_TRITON and cb_logits.is_cuda:
             from .delay_pattern_mask import mask_audio_logits_
 
             delay_states = []

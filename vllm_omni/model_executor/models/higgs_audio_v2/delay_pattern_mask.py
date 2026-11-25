@@ -29,8 +29,7 @@ def _mask(
     content = (v != bos) & ((v != eos) | (~ramp & (q == 0)))
     allowed = tl.where(force_eos, v == eos, tl.where(force_bos, v == bos, content))
     ptr = logits_ptr + row * stride_row + q * stride_cb + v * stride_vocab
-    value = tl.load(ptr, v < vocab_size, other=0)
-    tl.store(ptr, tl.where(allowed, value, -float("inf")), v < vocab_size)
+    tl.store(ptr, -float("inf"), (v < vocab_size) & ~allowed)
 
 
 def mask_audio_logits_(logits: torch.Tensor, delay_states: list[tuple[int, int]], bos: int, eos: int) -> None:
