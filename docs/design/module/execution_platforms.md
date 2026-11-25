@@ -73,9 +73,10 @@ tests in a fresh `uv` environment on every affected device platform.
 
 ## MiniMax H3 DiT modulation on Ascend
 
-The indexed modulation layer uses MindIE-SD for eligible BF16 inputs on Ascend
-910 and 950, with Omni Triton as its fallback. With Triton-Ascend 3.6, install a
-MindIE-SD build containing [!917](https://gitcode.com/Ascend/MindIE-SD/pull/917).
+The indexed modulation layer routes eligible BF16 inputs on Ascend 910 and 950
+to the NPU platform's MindIE-SD adapter, with Omni Triton as its fallback. With
+Triton-Ascend 3.6, install a MindIE-SD build containing
+[!917](https://gitcode.com/Ascend/MindIE-SD/pull/917).
 
 ## MiniMax H3 image NPU adapter
 

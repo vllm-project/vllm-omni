@@ -4,10 +4,6 @@
 
 from __future__ import annotations
 
-import math
-from ctypes import c_float
-from functools import cache
-
 import torch
 from vllm.triton_utils import tl, triton
 
@@ -26,31 +22,6 @@ def _launch_row_chunks(kernel, rows: int, device_type: str, *args, **kwargs) -> 
         return
     for row_offset, chunk_rows in _iter_row_chunks(rows):
         kernel[(chunk_rows,)](*args, row_offset, **kwargs)
-
-
-@cache
-def _supports_mindiesd_device(device: torch.device) -> bool:
-    return torch.npu.get_device_name(device).lower().startswith(("ascend910", "ascend950"))
-
-
-def _supports_mindiesd_inputs(
-    x: torch.Tensor, table: torch.Tensor, indices: torch.Tensor, *values: torch.Tensor
-) -> bool:
-    """Select the SDK only when its stricter input contract is satisfied."""
-    return (
-        table.shape[1:] == x.shape[1:]
-        and table.numel() > 0
-        and indices.shape == x.shape[:1]
-        and indices.dtype in (torch.int32, torch.int64)
-        and indices.device == x.device
-        and all(t.device == x.device and t.dtype == torch.bfloat16 and t.stride(-1) == 1 for t in (x, table, *values))
-        and _supports_mindiesd_device(x.device)
-    )
-
-
-def _unit_inner_stride(t: torch.Tensor) -> torch.Tensor:
-    # The native Triton fallback also assumes unit column stride.
-    return t if t.stride(-1) == 1 else t.contiguous()
 
 
 @triton.jit
@@ -242,20 +213,25 @@ def indexed_gate(
     indices: torch.Tensor,
 ) -> torch.Tensor:
     """Return ``x + gate[indices] * other`` without indexed temporaries."""
+    if x.device.type == "npu":
+        from vllm_omni.platforms.npu.layers.indexed_modulation import try_indexed_gate
+
+        output = try_indexed_gate(x, gate, other, indices)
+        if output is not None:
+            return output
+    return _indexed_gate(x, gate, other, indices)
+
+
+def _indexed_gate(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    other: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
     if x.is_cpu:
         return (x + gate.index_select(0, indices) * other).to(x.dtype)
-    rows, hidden_size = x.shape
-    if x.device.type == "npu" and rows:
-        if other.shape == x.shape and _supports_mindiesd_inputs(x, gate, indices, other):
-            try:
-                from mindiesd.layers.index_modulation import indexed_gate as mindiesd_indexed_gate
-            except ImportError:
-                pass
-            else:
-                output = torch.empty_like(x, memory_format=torch.contiguous_format)
-                return mindiesd_indexed_gate(output, x, gate, other, indices)
-        x, gate, other = map(_unit_inner_stride, (x, gate, other))
     output = torch.empty_like(x)
+    rows, hidden_size = x.shape
     if rows == 0:
         return output
     _launch_row_chunks(
@@ -288,6 +264,23 @@ def rms_norm_indexed_scale_shift(
     eps: float,
 ) -> torch.Tensor:
     """Fuse RMSNorm with an indexed affine transform."""
+    if x.device.type == "npu":
+        from vllm_omni.platforms.npu.layers.indexed_modulation import try_rms_norm_indexed_scale_shift
+
+        output = try_rms_norm_indexed_scale_shift(x, weight, shift, scale, indices, eps)
+        if output is not None:
+            return output
+    return _rms_norm_indexed_scale_shift(x, weight, shift, scale, indices, eps)
+
+
+def _rms_norm_indexed_scale_shift(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
     if x.is_cpu:
         input_dtype = x.dtype
         normalized = x.float()
@@ -295,23 +288,8 @@ def rms_norm_indexed_scale_shift(
         normalized = normalized * torch.rsqrt(variance + eps)
         normalized = (weight.float() * normalized).to(input_dtype)
         return (normalized * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(input_dtype)
-    rows, hidden_size = x.shape
-    if x.device.type == "npu" and rows:
-        if (
-            hidden_size <= 8192
-            and weight.shape == (hidden_size,)
-            and scale.shape == shift.shape
-            and 0 < c_float(eps).value < math.inf
-            and _supports_mindiesd_inputs(x, shift, indices, weight, scale)
-        ):
-            try:
-                from mindiesd.layers.index_modulation import rms_norm_indexed_scale_shift as mindiesd_rms
-            except ImportError:
-                pass
-            else:
-                return mindiesd_rms(x, weight, shift, scale, indices, eps)
-        x, weight, shift, scale = map(_unit_inner_stride, (x, weight, shift, scale))
     output = torch.empty_like(x)
+    rows, hidden_size = x.shape
     if rows:
         _launch_row_chunks(
             _rms_norm_indexed_scale_shift_kernel,

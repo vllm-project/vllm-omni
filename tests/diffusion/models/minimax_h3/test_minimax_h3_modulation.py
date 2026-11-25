@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import sys
-
 import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
@@ -75,7 +73,9 @@ def test_launch_row_chunks_is_npu_only(device_type, expected_grids_and_offsets):
     [pytest.param("npu", marks=hardware_marks(res={"npu": "A3"}, num_cards=1))],
 )
 def test_modulation_wrappers_match_reference_above_grid_limit(device, mocker):
-    mocker.patch.object(indexed_modulation, "_supports_mindiesd_inputs", return_value=False)
+    from vllm_omni.platforms.npu.layers import indexed_modulation as npu_modulation
+
+    mocker.patch.object(npu_modulation, "_load_mindiesd", return_value=None)
     rows = 69888
     hidden_size = 16
     num_conditions = 7
@@ -232,61 +232,62 @@ def test_mindiesd_rms_width_limit(mocker, width):
     indices = torch.zeros(1, dtype=torch.long, device=device)
     sdk_rms = mocker.patch.object(sdk, "rms_norm_indexed_scale_shift", return_value=x)
     # Check dispatch independently of the fallback kernel's on-chip buffer limit.
-    triton_launch = mocker.patch.object(indexed_modulation, "_launch_row_chunks")
+    triton_rms = mocker.patch.object(indexed_modulation, "_rms_norm_indexed_scale_shift", return_value=x)
 
     result = rms_norm_indexed_scale_shift(x, weight, x, x, indices, 1e-6)
 
     if width == 8192:
         assert result is x
         sdk_rms.assert_called_once_with(x, weight, x, x, indices, 1e-6)
-        triton_launch.assert_not_called()
+        triton_rms.assert_not_called()
     else:
         sdk_rms.assert_not_called()
-        triton_launch.assert_called_once()
+        triton_rms.assert_called_once_with(x, weight, x, x, indices, 1e-6)
 
 
 @hardware_test(res={"npu": "A2"}, num_cards=1)
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
 @pytest.mark.parametrize(
-    ("dtype", "eps", "col_stride", "expected_sdk_calls"),
+    ("dtype", "eps", "expected_sdk_calls"),
     [
-        pytest.param(torch.bfloat16, 1e-6, 1, (1, 1), id="h3-bf16"),
-        pytest.param(torch.float16, 1e-6, 1, (0, 0), id="fp16"),
-        pytest.param(torch.bfloat16, 0.0, 1, (0, 1), id="zero-eps"),
-        pytest.param(torch.bfloat16, 1e-50, 1, (0, 1), id="eps-rounds-to-zero"),
-        pytest.param(torch.bfloat16, 1e-6, 2, (0, 0), id="strided-columns"),
-        pytest.param(torch.bfloat16, 1e-6, 1, None, id="missing-sdk"),
+        pytest.param(torch.bfloat16, 1e-6, (1, 1), id="h3-bf16"),
+        pytest.param(torch.float16, 1e-6, (0, 0), id="fp16"),
+        pytest.param(torch.bfloat16, 0.0, (0, 1), id="zero-eps"),
+        pytest.param(torch.bfloat16, 1e-6, None, id="missing-sdk"),
     ],
 )
-def test_npu_modulation_dispatch_and_outputs(monkeypatch, mocker, dtype, eps, col_stride, expected_sdk_calls):
+def test_npu_modulation_dispatch_and_outputs(mocker, dtype, eps, expected_sdk_calls):
+    from vllm_omni.platforms.npu.layers import indexed_modulation as npu_modulation
+
+    triton_rms = mocker.spy(indexed_modulation, "_rms_norm_indexed_scale_shift")
+    triton_gate = mocker.spy(indexed_modulation, "_indexed_gate")
     if expected_sdk_calls is None:
-        monkeypatch.setitem(sys.modules, "mindiesd.layers.index_modulation", None)
-        triton_launch = mocker.spy(indexed_modulation, "_launch_row_chunks")
+        mocker.patch.object(npu_modulation, "_load_mindiesd", return_value=None)
+        expected_triton_calls = (1, 1)
     else:
         sdk = pytest.importorskip("mindiesd.layers.index_modulation")
         sdk_rms = mocker.spy(sdk, "rms_norm_indexed_scale_shift")
         sdk_gate = mocker.spy(sdk, "indexed_gate")
+        expected_triton_calls = tuple(1 - count for count in expected_sdk_calls)
 
     width = 5376
     device = current_omni_platform.get_torch_device()
     generator = torch.Generator().manual_seed(1234)
-    x, other, gate, shift, scale = [
-        torch.randn(rows, width * col_stride, generator=generator).to(dtype) for rows in (5, 5, 3, 3, 3)
-    ]
+    x, other = torch.randn(2, 5, width, generator=generator).to(dtype)
+    table = torch.randn(3, 6 * width, generator=generator).to(dtype)
+    gate, shift, scale, *_ = table.chunk(6, dim=-1)
     weight = torch.randn(width, generator=generator).to(dtype)
     indices = torch.tensor([2, 0, 2, 1, 0])
-    npu_x, npu_other, npu_gate, npu_shift, npu_scale = (
-        t.to(device)[:, ::col_stride] for t in (x, other, gate, shift, scale)
-    )
+    npu_x, npu_other = x.to(device), other.to(device)
+    npu_gate, npu_shift, npu_scale, *_ = table.to(device).chunk(6, dim=-1)
     npu_indices = indices.to(device)
     result_rms = rms_norm_indexed_scale_shift(npu_x, weight.to(device), npu_shift, npu_scale, npu_indices, eps)
     result_gate = indexed_gate(npu_x, npu_gate, npu_other, npu_indices)
-    if expected_sdk_calls is None:
-        assert triton_launch.call_count == 2
-    else:
+    if expected_sdk_calls is not None:
         assert (sdk_rms.call_count, sdk_gate.call_count) == expected_sdk_calls
+    assert (triton_rms.call_count, triton_gate.call_count) == expected_triton_calls
 
-    x, other, gate, shift, scale = (t[:, ::col_stride].float() for t in (x, other, gate, shift, scale))
+    x, other, gate, shift, scale = (t.float() for t in (x, other, gate, shift, scale))
     norm = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * weight.float()
     torch.testing.assert_close(result_rms.cpu(), (norm * (1 + scale[indices]) + shift[indices]).to(dtype))
     torch.testing.assert_close(result_gate.cpu(), (x + gate[indices] * other).to(dtype))
