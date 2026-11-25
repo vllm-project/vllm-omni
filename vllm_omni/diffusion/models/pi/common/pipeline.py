@@ -66,7 +66,10 @@ def resolve_device() -> torch.device:
     try:
         return get_local_device()
     except Exception:  # noqa: BLE001
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Standalone use, outside a diffusion worker: the platform's device.
+        from vllm_omni.platforms import current_omni_platform
+
+        return current_omni_platform.get_torch_device()
 
 
 def has_safetensors_checkpoint(model_dir: str | None) -> bool:

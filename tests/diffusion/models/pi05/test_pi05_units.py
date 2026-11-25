@@ -1151,3 +1151,154 @@ def test_request_denoising_steps_must_be_a_positive_integer(bad):
     with pytest.raises(ValueError, match="num_inference_steps must be a positive integer"):
         _spy_pipeline(spy).forward(_spy_request(bad))
     assert spy.seen == []
+
+
+# ── Denoise loop: hoisted step-invariant work, device-graph readiness ──
+def _random_pi05_model(seed: int = 0) -> Pi05ForActionPrediction:
+    """A tiny model with every parameter random (AdaRMS ``dense`` starts at zero)."""
+    model = _tiny_pi05_model().eval()
+    gen = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for param in model.parameters():
+            param.copy_(torch.randn(param.shape, generator=gen) * 0.02)
+    return model
+
+
+def _prefix_cache(model: Pi05ForActionPrediction, bsize: int = 2, prefix_len: int = 6):
+    """Prefix pad masks (one padded token per sample) and the PaliGemma KV cache."""
+    gen = torch.Generator().manual_seed(1)
+    embs = torch.randn(bsize, prefix_len, model.vlm_width, generator=gen)
+    pad = torch.ones(bsize, prefix_len, dtype=torch.bool)
+    pad[1, -1] = False
+    att = torch.zeros(bsize, prefix_len)
+    masks_4d = modeling_pi05.prepare_attention_masks_4d(make_att_2d_masks(pad, att))
+    with torch.no_grad():
+        _, kv = model.paligemma_with_expert.forward(
+            attention_mask=masks_4d,
+            position_ids=torch.cumsum(pad, dim=1) - 1,
+            inputs_embeds=[embs, None],
+            use_cache=True,
+        )
+    return pad, kv
+
+
+def _per_step_reference(model, pad, kv, noise, num_steps):
+    """The pre-hoisting loop: one :meth:`denoise_step` per Euler step."""
+    x_t = noise
+    for t, dt in modeling_pi05.flow_matching.make_euler_schedule(num_steps):
+        v_t = model.denoise_step(pad, kv, x_t, torch.full((noise.shape[0],), t))
+        x_t = x_t + dt * v_t
+    return x_t
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("num_steps", [1, 3, 10])
+def test_denoise_loop_matches_per_step_denoising(num_steps):
+    model = _random_pi05_model()
+    pad, kv = _prefix_cache(model)
+    noise = torch.randn(2, 4, 8, generator=torch.Generator().manual_seed(2))
+    with torch.no_grad():
+        expected = _per_step_reference(model, pad, kv, noise, num_steps)
+        actual = model.denoise_loop(prefix_pad_masks=pad, past_key_values=kv, noise=noise, num_steps=num_steps)
+    # Batched AdaRMS projections only reorder fp32 GEMM accumulation.
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    assert not torch.equal(actual, noise)
+
+
+@pytest.mark.slow
+def test_denoise_loop_makes_no_host_tensors(monkeypatch):
+    """A device graph cannot replay a host→device copy: the loop must not build host tensors."""
+    model = _random_pi05_model()
+    pad, kv = _prefix_cache(model)
+    noise = torch.randn(2, 4, 8)
+
+    def no_host_tensor(*args, **kwargs):
+        raise AssertionError("torch.tensor called inside the denoise loop")
+
+    monkeypatch.setattr(torch, "tensor", no_host_tensor)
+    with torch.no_grad():
+        model.denoise_loop(prefix_pad_masks=pad, past_key_values=kv, noise=noise, num_steps=3)
+
+
+def test_adarms_precomputed_modulation_matches_conditioning():
+    norm = Pi05AdaRMSNorm(8, cond_dim=4)
+    with torch.no_grad():
+        norm.dense.weight.normal_()
+        norm.dense.bias.normal_()
+    x, cond = torch.randn(2, 3, 8), torch.randn(2, 4)
+    expected = norm(x, cond)
+    actual = norm(x, modulation=norm.modulation(cond).unsqueeze(1))
+    for a, b in zip(actual, expected, strict=True):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@pytest.mark.slow
+def test_sample_actions_hands_generation_to_a_graph_runner():
+    model = _random_pi05_model()
+    calls: list[dict] = []
+
+    def runner(**kwargs):
+        calls.append(kwargs)
+        return model.actions_from_noise(**kwargs)
+
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(3)]
+    masks = [torch.tensor([True]), torch.tensor([False]), torch.tensor([False])]
+    inputs = {
+        "images": images,
+        "image_masks": masks,
+        "lang_tokens": torch.zeros(1, 200, dtype=torch.long),
+        "lang_masks": torch.ones(1, 200, dtype=torch.bool),
+        "noise": torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(42)),
+        "num_steps": 2,
+    }
+    with torch.no_grad():
+        eager = model.sample_actions(**inputs)
+        graphed = model.sample_actions(**inputs, graph_runner=runner)
+    assert len(calls) == 1
+    assert set(calls[0]) == {"images", "image_masks", "lang_tokens", "lang_masks", "noise", "num_steps"}
+    assert calls[0]["num_steps"] == 2 and isinstance(calls[0]["num_steps"], int)
+    assert torch.equal(graphed, eager)
+
+
+def test_pipeline_forwards_an_engaged_graph_runner():
+    calls: list = []
+
+    class _RunnerSpy(_SpyModel):
+        def sample_actions(self, *, graph_runner=None, **kwargs):
+            calls.append(graph_runner)
+            return super().sample_actions(**kwargs)
+
+    def runner(**kwargs):
+        raise AssertionError("the spy model never calls the runner")
+
+    pipeline = _spy_pipeline(_RunnerSpy())
+    pipeline._denoise_graph_runner = runner
+    pipeline.forward(_spy_request(2))
+    pipeline._denoise_graph_runner = None
+    pipeline.forward(_spy_request(2))
+    assert calls == [runner, None]
+
+
+@pytest.mark.slow
+def test_actions_from_noise_makes_no_host_tensors(monkeypatch):
+    """The whole graphed path (prefix and denoise loop) must not build host tensors."""
+    model = _random_pi05_model()
+    inputs = {
+        "images": [torch.zeros(1, 3, 224, 224) for _ in range(3)],
+        "image_masks": [
+            torch.ones(1, dtype=torch.bool),
+            torch.zeros(1, dtype=torch.bool),
+            torch.ones(1, dtype=torch.bool),
+        ],
+        "lang_tokens": torch.zeros(1, 200, dtype=torch.long),
+        "lang_masks": torch.ones(1, 200, dtype=torch.bool),
+        "noise": torch.randn(1, 4, 8),
+        "num_steps": 2,
+    }
+
+    def no_host_tensor(*args, **kwargs):
+        raise AssertionError("torch.tensor called inside actions_from_noise")
+
+    monkeypatch.setattr(torch, "tensor", no_host_tensor)
+    with torch.no_grad():
+        model.actions_from_noise(**inputs)

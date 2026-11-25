@@ -32,6 +32,7 @@ from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.graph import build_denoise_graph_runner
 from vllm_omni.diffusion.models.pi.common import inference_dtype
 from vllm_omni.diffusion.models.pi.common import pipeline as pipeline_helpers
 from vllm_omni.diffusion.models.pi.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
@@ -97,6 +98,9 @@ class Pi05Pipeline(nn.Module):
 
         self.tokenizer = self._load_tokenizer()
         self.model = self._initialize_model()
+        # Opt-in (``diffusion_use_graph``): replays a request's prefix and whole
+        # Euler loop as one device graph per (batch, num_steps); None stays eager.
+        self._denoise_graph_runner = build_denoise_graph_runner(od_config, self.model.actions_from_noise, "Pi05")
 
         self.processor = Pi05Processor(self.config, self.tokenizer, self._device)
 
@@ -215,6 +219,8 @@ class Pi05Pipeline(nn.Module):
 
         images, image_masks, lang_tokens, lang_masks = self.processor.build_model_inputs(robot_obs)
 
+        # Only an engaged runner is forwarded; eager keeps the plain call.
+        runner = getattr(self, "_denoise_graph_runner", None)
         actions = self.model.sample_actions(
             images=images,
             image_masks=image_masks,
@@ -222,6 +228,7 @@ class Pi05Pipeline(nn.Module):
             lang_masks=lang_masks,
             num_steps=num_steps,
             generator=req.sampling_params.generator,
+            **({"graph_runner": runner} if runner is not None else {}),
         )
 
         return DiffusionOutput(output={"actions": self.processor.build_model_outputs(actions, robot_obs)})
