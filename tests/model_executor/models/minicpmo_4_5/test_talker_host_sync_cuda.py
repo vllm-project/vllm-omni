@@ -9,13 +9,14 @@ import torch
 import torch.nn as nn
 
 from tests.helpers.mark import hardware_marks
-from tests.model_executor.models.minicpmo_4_5.test_talker_host_sync import _make_talker
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import MiniCPMO45OmniTTSForConditionalGeneration
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
 
 
 def test_talker_condition_upload_does_not_synchronize_cuda() -> None:
-    talker = _make_talker("cuda")
+    talker = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    nn.Module.__init__(talker)
     talker.emb_text = nn.Embedding(16, 4).cuda()
     talker.projector_semantic = nn.Linear(6, 4).cuda()
     talker._normalize = True

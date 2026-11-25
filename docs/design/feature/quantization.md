@@ -166,6 +166,20 @@ quantizable layers are affected. Ordinary `torch.nn` encoder layers, VAEs,
 schedulers, and tokenizers are not rewritten automatically. A component map can
 select a narrower scope, but it cannot add quantization support to a layer.
 
+For checkpoints using `modelopt_fp4`, a transformer module may intentionally
+keep a full-precision parameter even when the checkpoint stores a packed
+`uint8` weight of shape `[N, K/2]`. The checkpoint adapter dequantizes matching
+weights at load time using a per-16-element `weight_scale` and scalar
+`weight_scale_2`; both scales are required and may arrive in any order. Block
+scales must be `float8_e4m3fn` values or their raw `uint8` byte representation;
+other dtypes are rejected. A replicated target has shape `[N, K]`. A
+column-parallel target already holds one rank's `[N/tp, K]` shard; the adapter
+still dequantizes the global packed tensor, and the existing weight loader
+shards the rows. This conversion does not cover `modelopt_mixed` checkpoints,
+row-parallel shards, or fused full-precision targets whose checkpoint tensors
+do not match one parameter. Quantized targets retain their packed weights and
+scale tensors.
+
 Weight quantization and quantized KV cache are separate paths. The former is
 resolved through `quantization_config`; runtime attention/KV-cache quantization
 is configured by the diffusion attention configuration and must be validated
@@ -178,6 +192,12 @@ factory. This keeps configuration parsing portable while allowing CUDA, ROCm, NP
 and XPU methods to select different kernels or reject unsupported execution at
 model construction time. The user guide is the source of truth for the current
 hardware support matrix.
+
+ROCm online FP8 requires each linear layer's local contracted and output
+dimensions to be divisible by 16. When tensor-parallel sharding leaves either
+local dimension non-aligned, that layer remains in its original precision and
+emits an explicit warning; aligned layers in the same model remain quantized.
+CUDA and pre-quantized FP8 paths retain their existing behavior.
 
 Diffusion INT8 routes CUDA and ROCm to the shared vLLM linear methods for both
 online and serialized weights. Omni adapts batched activations to a matrix at

@@ -3,6 +3,12 @@
 Higgs-Audio V3 has two Stage 0 graph profiles. They are intentionally separate
 because the graph paths are mutually exclusive.
 
+The default, high-throughput and low-latency configurations use Model Runner V2.
+Stage 0 enables `async_scheduling` together with `audio_async_prompt_mode` and
+`audio_async_payload` in `hf_overrides`. These options are required by the
+Higgs V2 sampler and its owned audio snapshots; selecting a different graph
+profile must retain all three. Stage 1 keeps synchronous scheduling.
+
 ## High Throughput
 
 Use `higgs_multimodal_qwen3_high_throughput.yaml` for medium/high concurrency
@@ -11,8 +17,9 @@ Higgs-specific local MLP CUDA graph path. It is the default production profile
 for throughput-oriented serving.
 
 `higgs_multimodal_qwen3.yaml` is kept as the auto-discovered default deploy
-config for `model_type=higgs_multimodal_qwen3`, and matches the high-throughput
-profile.
+config for `model_type=higgs_multimodal_qwen3`. It uses the same graph and
+streaming settings, with 16 Stage 0 sequences instead of the high-throughput
+profile's 64.
 
 ```bash
 vllm-omni serve bosonai/higgs-audio-v3-tts-4b \

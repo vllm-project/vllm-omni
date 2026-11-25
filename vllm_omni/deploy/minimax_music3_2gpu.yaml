@@ -6,6 +6,7 @@
 # weights, and the flow-matching solver no longer competes with AR decode for
 # SMs. Everything else (window geometry, CFG contract, sampling defaults)
 # matches minimax_music3.yaml, so the two files stay behaviorally identical.
+# Both stages inherit the vLLM 0.34 Model Runner V2 default.
 pipeline: minimax_music3
 async_chunk: true
 
@@ -83,10 +84,15 @@ stages:
     # input batch, which breaks when chunk arrival staggers requests.
     async_scheduling: false
     enable_prefix_caching: false
-    # One placeholder prompt token per arriving window, so a six-minute song
-    # (90 windows) needs a tiny context.
+    # Each V2 window replaces the stage-1 prompt (200 frames x 8 codebooks
+    # = 1600 tokens), so the context only needs to hold one window.
     max_model_len: 4096
-    max_num_batched_tokens: 4096
+    # On V2 one step should fit a window for every request: a window is 1600
+    # tokens and a song's last window at most 1608, so 16 x 1608 = 25728.
+    # A window is never split, and the scheduler stops at the first window
+    # that does not fit, so a smaller budget lets the same few requests take
+    # every step.
+    max_num_batched_tokens: 32768
     devices: "1"
     input_connectors:
       from_stage_0: connector_of_shared_memory
