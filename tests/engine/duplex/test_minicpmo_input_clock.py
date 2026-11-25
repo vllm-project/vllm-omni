@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from tests.engine.duplex.test_session_runner import (
+    LISTEN_TOKEN_ID,
     _fake_encode_audio,
     append_audio,
     close_harness,
@@ -30,7 +31,7 @@ from vllm_omni.protocol.duplex.events import InputProcessed
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SPEAK, CHUNK_EOS = 151706, 151718
-INPUT_CLOCK = {"clock": "input"}
+INPUT_CLOCK: dict[str, object] = {"clock": "input"}
 
 
 def _plugin() -> MiniCPMO45DuplexPlugin:
@@ -263,7 +264,9 @@ async def test_a_unit_that_opens_with_the_chunk_terminator_is_acknowledged_befor
             request_id=request_id,
             finished=False,
             outputs=[SimpleNamespace(text="", token_ids=[CHUNK_EOS], multimodal_output={})],
-            multimodal_output={},
+            multimodal_output={
+                "special_token_ids": {"listen_token_id": LISTEN_TOKEN_ID, "chunk_eos_token_id": CHUNK_EOS}
+            },
         )
         h.deliver(terminator_only, stage_id=0, segment_finished=True)
         h.deliver(_speak_segment_end(request_id), stage_id=0, segment_finished=True)
@@ -317,7 +320,11 @@ def test_an_input_clocked_session_keeps_only_the_models_clocked_input_modalities
     assert (clocked.required_input_modalities, clocked.optional_input_modalities) == (frozenset(), {"audio"})
     # Without the clock, or for a model that names no clocked modalities, nothing changes.
     assert apply_input_clock_capabilities(capabilities, {}, input_modalities=frozenset({"audio"})) is capabilities
-    assert apply_input_clock_capabilities(capabilities, INPUT_CLOCK).optional_input_modalities == {"audio", "video"}
+    assert apply_input_clock_capabilities(capabilities, INPUT_CLOCK).optional_input_modalities == {
+        "audio",
+        "video",
+        "text",
+    }
 
 
 async def test_an_input_clocked_session_refuses_video_frames_and_acknowledges_the_append() -> None:
