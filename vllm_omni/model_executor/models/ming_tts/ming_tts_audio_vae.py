@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 _STREAM_STATE_TTL_SECONDS = 15 * 60
 _MAX_STREAM_STATES = 1024
+DENSE_PACKED_GRAPH_TOKENS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
 
 class MingAudioVAEModel(nn.Module):
@@ -305,7 +306,11 @@ class MingAudioVAEModel(nn.Module):
             max_seqs = int(getattr(scheduler_cfg, "max_num_seqs", 64))
             max_streams = max(64, 4 * max_seqs)
             self._max_stream_states = max_streams
-            self._batched_decoder = BatchedStreamingVAEDecoder(self.audio.decoder, max_streams=max_streams)
+            self._batched_decoder = BatchedStreamingVAEDecoder(
+                self.audio.decoder,
+                max_streams=max_streams,
+                packed_graph_tokens=DENSE_PACKED_GRAPH_TOKENS,
+            )
         return self._batched_decoder
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

@@ -39,7 +39,7 @@ from .packed_qwen2 import PackedQwen2, PagedKV
 GRAPH_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64)
 GRAPH_LENGTHS = (16, 32, 64, 128)
 # Packed path: tokens of all rows per pass.
-PACKED_GRAPH_TOKENS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+PACKED_GRAPH_TOKENS = (16, 32, 64, 128, 256, 512, 1024, 2048)
 # Decoder tokens one stream may reach (four per latent).
 MAX_STREAM_POSITIONS = 16384
 
@@ -62,6 +62,7 @@ class BatchedStreamingVAEDecoder:
         max_streams: int,
         kv_block_size: int = 64,
         ring_blocks: int = 4,
+        packed_graph_tokens: tuple[int, ...] = PACKED_GRAPH_TOKENS,
     ):
         self.decoder = decoder
         qwen = decoder.decoder
@@ -70,6 +71,9 @@ class BatchedStreamingVAEDecoder:
             raise ValueError("Batched Ming3 VAE decode expects a sliding-window decoder")
         if any(layer_type != "sliding_attention" for layer_type in getattr(config, "layer_types", [])):
             raise ValueError("Batched Ming3 VAE decode expects sliding attention in every layer")
+        self._packed_graph_tokens = tuple(sorted(set(packed_graph_tokens)))
+        if not self._packed_graph_tokens or self._packed_graph_tokens[0] <= 0:
+            raise ValueError("packed_graph_tokens must contain positive token counts")
         self.layers = qwen.layers
         self.norm = qwen.norm
         self.rotary = qwen.rotary_emb
@@ -107,7 +111,7 @@ class BatchedStreamingVAEDecoder:
             first = torch.arange(max_streams, device=parameter.device)[:, None] * ring_blocks
             block_table = (first + logical[None, :] % ring_blocks).to(torch.int32)
             self._paged = (keys, values, block_table)
-            self._token_stager = DeviceStager(torch.long, capacity=2 * PACKED_GRAPH_TOKENS[-1])
+            self._token_stager = DeviceStager(torch.long, capacity=2 * self._packed_graph_tokens[-1])
             self._row_stager = DeviceStager(torch.int32, capacity=2 * max_streams + 1)
             self._packed_graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
             self._packed_static: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
@@ -126,13 +130,17 @@ class BatchedStreamingVAEDecoder:
         self,
         batch_sizes: tuple[int, ...] = GRAPH_BATCH_SIZES,
         lengths: tuple[int, ...] = GRAPH_LENGTHS,
+        packed_tokens: tuple[int, ...] | None = None,
     ) -> None:
         """Capture the layer stack for each (batch, length) bucket; other shapes run eagerly."""
         parameter = next(self.decoder.parameters())
         if parameter.device.type != "cuda":
             return
         if self._packed is not None:
-            self._capture_packed_graphs()
+            tokens = self._packed_graph_tokens if packed_tokens is None else tuple(sorted(set(packed_tokens)))
+            if not tokens or tokens[0] <= 0:
+                raise ValueError("packed_tokens must contain positive token counts")
+            self._capture_packed_graphs(tokens)
             return
         batch_sizes = tuple(sorted({size for size in batch_sizes if size <= self._scratch_slot}))
         lengths = tuple(sorted(set(lengths)))
