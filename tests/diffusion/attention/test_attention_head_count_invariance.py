@@ -13,7 +13,7 @@ import torch
 from tests.helpers.attention_head_invariance import head_chunk_mismatches
 from tests.helpers.mark import hardware_marks
 
-pytestmark = [pytest.mark.diffusion, *hardware_marks(res={"cuda": "H100"})]
+pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "H100"})]
 
 HEAD_SIZE = 128
 
