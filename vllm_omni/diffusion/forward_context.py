@@ -594,6 +594,8 @@ def set_forward_context_denoise_total_steps(total_steps: int | None) -> None:
 
 
 class DenoiseProgressMixin:
+    scheduler: Any  # Supplied by the concrete diffusion pipeline.
+
     def record_denoise_step(
         self,
         step_idx: int | None,
