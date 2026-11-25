@@ -154,12 +154,20 @@ def test_invalidate_denoise_graphs_drops_every_runner_and_keeps_capturing(platfo
 
 def test_the_runner_registry_is_isolated_from_the_process_global(platform):
     # The registry is process-global; the fixture hands this test its own set,
-    # so a runner built by another test file is never visited here.
-    assert graph_mod._RUNNERS is not _PROCESS_GLOBAL_RUNNERS
+    # so a runner another test file left behind is never visited here.
+    runner = build_denoise_graph_runner(_od_config(), _affine, "outside")
+    runner(x=torch.ones(2))
+    assert runner.num_graphs == 1
+    # Leave it where another test file would have left it.
+    graph_mod._RUNNERS.discard(runner)
+    _PROCESS_GLOBAL_RUNNERS.add(runner)
 
-    build_denoise_graph_runner(_od_config(), _affine, "T")
+    invalidate_denoise_graphs("adapter changed")
 
-    assert len(list(graph_mod._RUNNERS)) == 1
+    # The invalidation walked this test's own registry, so the runner outside it
+    # keeps its graph.
+    assert runner.num_graphs == 1
+    assert not list(graph_mod._RUNNERS)
 
 
 def test_invalidate_denoise_graphs_skips_a_member_without_the_graph_interface(platform):

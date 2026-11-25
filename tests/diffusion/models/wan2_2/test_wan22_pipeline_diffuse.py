@@ -715,7 +715,7 @@ def test_diffuse_clears_the_scheduled_step_on_any_exit(fail, kind) -> None:
     published = [(0, pytest.approx(0.007), 3), (1, pytest.approx(0.003), 3), (2, pytest.approx(0.001), 3)]
     assert seen == (published[:2] if fail else published)
     # Sigma windows publish the scheduler noise at each step; step ranges never compute it.
-    expected_sigmas = [1.0, 0.5, 0.25] if kind == "sigma" else [None] * 3
+    expected_sigmas: list[float | None] = [1.0, 0.5, 0.25] if kind == "sigma" else [None] * 3
     assert sigmas_seen == expected_sigmas[: len(seen)]
     assert after == (None, None, None, None)
 
@@ -1305,7 +1305,12 @@ def test_startup_validation_rejects_vsa_candidate_on_self_attention_without_gate
 
 
 class _StubGraphedForward(GraphedForward):
-    """Stands in for the platform graph class: always on, records the step calls."""
+    """Stands in for the platform graph class: always on, records the step calls.
+
+    It captures no graph: ``num_graphs`` stays 0 and ``clear()`` is a no-op,
+    which is what the denoise graph registry expects of a runner without
+    captured graphs.
+    """
 
     def __init__(self, module: nn.Module, *, name: str, **kwargs) -> None:
         super().__init__(module, name=name, **kwargs)
