@@ -446,6 +446,17 @@ def _(x: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
     return npu_fwd(x, group_name, world_size)
 
 
+@torch.compiler.disable
+def _ulysses_qkv_ce_zero_copy(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, group_name: str, world_size: int
+) -> torch.Tensor:
+    # Zero-copy outputs are views of the persistent workspace. Inductor treats a custom op's outputs as buffers it
+    # owns and may reuse their storage for later intermediates or graph outputs, which the next exchange would then
+    # overwrite. At a compile boundary the views reach the following graph as inputs, whose storage Inductor never
+    # reuses. Eager callers pay only the decorator's call overhead.
+    return ulysses_qkv_ce(query, key, value, group_name, world_size, True)
+
+
 def ulysses_qkv_fwd_group(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -460,7 +471,10 @@ def ulysses_qkv_fwd_group(
 
         return npu_fwd_group(query, key, value, group_name, world_size)
     inputs = (query, key, value)
-    packed = ulysses_qkv_ce(*inputs, group_name, world_size, zero_copy)
+    if zero_copy:
+        packed = _ulysses_qkv_ce_zero_copy(*inputs, group_name, world_size)
+    else:
+        packed = ulysses_qkv_ce(*inputs, group_name, world_size)
     if query.shape == key.shape == value.shape:
         b, s, h, d = query.shape
         query, key, value = packed.view(3, b, s * world_size, h // world_size, d).unbind(0)
