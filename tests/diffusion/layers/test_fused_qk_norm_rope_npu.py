@@ -61,20 +61,21 @@ def _packed_inputs(device: str = "cpu"):
     k = k[:, : _HEAD_COUNTS[1]]
     v = -k
     qkv = torch.cat((q, k, v), dim=1).flatten(1)
-
-    def norm(weight: torch.Tensor):
-        return Mock(
-            weight=weight, variance_epsilon=_EPS, side_effect=lambda x: F.rms_norm(x, (_HEAD_DIM,), weight, _EPS)
-        )
-
-    return qkv, norm(q_weight), norm(k_weight), rope_table
+    return qkv, q_weight, k_weight, rope_table
 
 
-def _run_packed(qkv, q_norm, k_norm, rope_table):
+def _run_packed(qkv, q_weight, k_weight, rope_table, eps=_EPS):
     from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qkv_split_norm_rope
 
     return fused_qkv_split_norm_rope(
-        qkv, q_norm, k_norm, rope_table, num_heads=_HEAD_COUNTS[0], num_kv_heads=_HEAD_COUNTS[1], head_dim=_HEAD_DIM
+        qkv,
+        q_weight,
+        k_weight,
+        rope_table,
+        eps,
+        num_heads=_HEAD_COUNTS[0],
+        num_kv_heads=_HEAD_COUNTS[1],
+        head_dim=q_weight.shape[0],
     )
 
 
@@ -193,29 +194,30 @@ def test_npu_qk_norm_rope_ignores_installed_mindiesd(monkeypatch: pytest.MonkeyP
 def test_npu_eagle_receives_original_packed_qkv(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
 
-    qkv, q_norm, k_norm, rope_table = _packed_inputs()
+    qkv, expected_q_weight, expected_k_weight, rope_table = _packed_inputs()
     packed = qkv.unflatten(-1, (sum(_HEAD_COUNTS), _HEAD_DIM))
     q, k, v = packed.split(_HEAD_COUNTS, dim=1)
     outputs = (q.neg(), k.neg(), v.clone())
+    eps = 1e-6
 
     def eagle(
         qkv, q_weight, k_weight, rope_cos, rope_sin, split_sizes, norm_type, rope_mode, rotary_dim, epsilon, output_bnsd
     ):
         assert qkv.data_ptr() == packed.data_ptr()
         torch.testing.assert_close(qkv, packed, check_stride=True)
-        assert q_weight is q_norm.weight and k_weight is k_norm.weight
+        assert q_weight is expected_q_weight and k_weight is expected_k_weight
         cos, sin = rope_table.chunk(2, dim=-1)
         torch.testing.assert_close(rope_cos, cos)
         torch.testing.assert_close(rope_sin, sin)
         assert rope_cos.is_contiguous() and rope_sin.is_contiguous()
         assert tuple(split_sizes) == _HEAD_COUNTS
-        assert (norm_type, rope_mode, rotary_dim, epsilon, output_bnsd) == (3, 1, _ROTARY_DIM, _EPS, False)
+        assert (norm_type, rope_mode, rotary_dim, epsilon, output_bnsd) == (3, 1, _ROTARY_DIM, eps, False)
         return outputs
 
     monkeypatch.setattr(fused.current_omni_platform, "is_npu", lambda: True)
     monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", types.SimpleNamespace(eagle_split_norm_rope_concat=eagle))
 
-    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, q_norm, k_norm, rope_table)
+    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, expected_q_weight, expected_k_weight, rope_table, eps)
 
     assert q_out is outputs[0] and k_out is outputs[1] and v_out is outputs[2]
     assert q_raw.data_ptr() == q.data_ptr() and k_raw.data_ptr() == k.data_ptr()
@@ -224,31 +226,20 @@ def test_npu_eagle_receives_original_packed_qkv(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("is_npu", [True, False])
-@pytest.mark.parametrize("with_rope", [True, False])
-def test_packed_qkv_fallback(monkeypatch: pytest.MonkeyPatch, is_npu: bool, with_rope: bool) -> None:
+@pytest.mark.parametrize("is_npu", [True, False], ids=["npu-without-eagle", "non-npu-with-eagle"])
+def test_packed_qkv_fallback(monkeypatch: pytest.MonkeyPatch, is_npu: bool) -> None:
     from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
 
-    qkv, q_norm, k_norm, rope_table = _packed_inputs()
+    qkv, q_weight, k_weight, rope_table = _packed_inputs()
     q, k, v = qkv.unflatten(-1, (sum(_HEAD_COUNTS), _HEAD_DIM)).split(_HEAD_COUNTS, dim=1)
     monkeypatch.setattr(fused.current_omni_platform, "is_npu", lambda: is_npu)
-    # On NPU with RoPE the optional import fails. In the other cases an installed
-    # operator must still be bypassed.
     eagle = Mock(side_effect=AssertionError("unexpected Eagle invocation"))
-    module = None if is_npu and with_rope else types.SimpleNamespace(eagle_split_norm_rope_concat=eagle)
+    module = None if is_npu else types.SimpleNamespace(eagle_split_norm_rope_concat=eagle)
     monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", module)
 
-    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, q_norm, k_norm, rope_table if with_rope else None)
+    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, q_weight, k_weight, rope_table)
 
-    if with_rope:
-        expected_q, expected_k = _reference(q, k, q_norm.weight, k_norm.weight, rope_table)
-        q_norm.assert_not_called()
-        k_norm.assert_not_called()
-    else:
-        q_norm.assert_called_once()
-        k_norm.assert_called_once()
-        expected_q = F.rms_norm(q, (_HEAD_DIM,), q_norm.weight, _EPS)
-        expected_k = F.rms_norm(k, (_HEAD_DIM,), k_norm.weight, _EPS)
+    expected_q, expected_k = _reference(q, k, q_weight, k_weight, rope_table)
     torch.testing.assert_close(q_out, expected_q, atol=0, rtol=0)
     torch.testing.assert_close(k_out, expected_k, atol=0, rtol=0)
     torch.testing.assert_close(v_out, v)
@@ -271,12 +262,10 @@ def test_packed_qkv_propagates_eagle_failure(
     head_dim, rotary_dim = 32, 16
     width = sum(_HEAD_COUNTS) * head_dim
     qkv = torch.empty((tokens, width), dtype=torch.float32, device="meta")
-    norm = Mock(weight=qkv.new_empty((head_dim,)), variance_epsilon=_EPS)
+    weight = qkv.new_empty((head_dim,))
     rope_table = qkv.new_empty((tokens, rotary_dim))
     with pytest.raises(error_type, match="Eagle execution failed"):
-        fused.fused_qkv_split_norm_rope(
-            qkv, norm, norm, rope_table, num_heads=_HEAD_COUNTS[0], num_kv_heads=_HEAD_COUNTS[1], head_dim=head_dim
-        )
+        _run_packed(qkv, weight, weight, rope_table)
 
 
 @hardware_test(res={"npu": "A3"}, num_cards=1)
@@ -318,13 +307,13 @@ def test_packed_qkv_eagle_npu_matches_reference(monkeypatch: pytest.MonkeyPatch)
         pytest.skip("MindIE-SD Eagle is unavailable")
     eagle = Mock(wraps=ops.eagle_split_norm_rope_concat)
     monkeypatch.setattr(ops, "eagle_split_norm_rope_concat", eagle)
-    qkv, q_norm, k_norm, rope_table = _packed_inputs("npu")
+    qkv, q_weight, k_weight, rope_table = _packed_inputs("npu")
     q, k, v = qkv.unflatten(-1, (sum(_HEAD_COUNTS), _HEAD_DIM)).split(_HEAD_COUNTS, dim=1)
 
-    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, q_norm, k_norm, rope_table)
+    q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, q_weight, k_weight, rope_table)
 
     eagle.assert_called_once()
-    expected_q, expected_k = _reference(q, k, q_norm.weight, k_norm.weight, rope_table)
+    expected_q, expected_k = _reference(q, k, q_weight, k_weight, rope_table)
     torch.testing.assert_close(q_out, expected_q, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(k_out, expected_k, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(v_out, v, atol=0, rtol=0)

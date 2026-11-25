@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
 import torch.nn as nn
@@ -92,6 +94,28 @@ def test_denoise_branch_keeps_fast_h3_prefix_geometry_model_local():
     layout = branch.static_kwargs["video_token_layout"]
     assert not hasattr(layout, "prefix_segments")
     assert branch.static_kwargs["packed_seq_params"]["vsa_prefix_segments"] == (2, 3)
+
+
+def test_h3_project_qkv_without_rope_uses_separate_norms():
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
+
+    attention = object.__new__(blocks.MiniMaxH3Attention)
+    nn.Module.__init__(attention)
+    attention.num_heads, attention.num_kv_heads, attention.head_dim = 2, 1, 2
+    attention.vdn = None
+    packed = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+    attention.qkv_proj = Mock(return_value=(packed, None))
+    attention.q_norm = Mock(side_effect=torch.neg)
+    attention.k_norm = Mock(side_effect=torch.square)
+
+    with patch.object(blocks, "fused_qkv_split_norm_rope") as fused:
+        result = attention._project_qkv(torch.ones(3, 4), rope_table=None)
+
+    fused.assert_not_called()
+    attention.q_norm.assert_called_once()
+    attention.k_norm.assert_called_once()
+    q_raw, k_raw, v = packed.view(3, 4, 2).split([2, 1, 1], dim=1)
+    torch.testing.assert_close(result, (-q_raw, k_raw.square(), v, q_raw, k_raw))
 
 
 def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():

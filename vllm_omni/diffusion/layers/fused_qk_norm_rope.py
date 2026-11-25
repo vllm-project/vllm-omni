@@ -40,8 +40,6 @@ per-stream fused path) keep the default.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 import torch.nn.functional as F
 from torch.library import Library
@@ -51,9 +49,6 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_omni.diffusion import envs
 from vllm_omni.platforms import current_omni_platform
-
-if TYPE_CHECKING:
-    from vllm_omni.diffusion.layers.norm import RMSNorm
 
 _FUSED_HEAD_DIM = 128
 _FUSED_ROTARY_DIM = 96
@@ -1253,9 +1248,10 @@ def fused_qk_norm_rope(
 
 def fused_qkv_split_norm_rope(
     qkv: torch.Tensor,
-    q_norm: RMSNorm,
-    k_norm: RMSNorm,
-    rope_table: torch.Tensor | None,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    rope_table: torch.Tensor,
+    eps: float,
     *,
     num_heads: int,
     num_kv_heads: int,
@@ -1264,7 +1260,7 @@ def fused_qkv_split_norm_rope(
     """Split projected QKV, normalize/rotate Q and K, and retain their raw views for VDN."""
     packed = qkv.unflatten(-1, (-1, head_dim))
     head_counts = [num_heads, num_kv_heads, num_kv_heads]
-    if rope_table is not None and current_omni_platform.is_npu():
+    if current_omni_platform.is_npu():
         try:
             from mindiesd.fused_ops import eagle_split_norm_rope_concat
         except ImportError:
@@ -1273,24 +1269,21 @@ def fused_qkv_split_norm_rope(
             cos, sin = rope_table.tensor_split(2, dim=-1)
             q, k, v = eagle_split_norm_rope_concat(
                 packed,
-                q_norm.weight,
-                k_norm.weight,
+                q_weight,
+                k_weight,
                 cos.contiguous(),
                 sin.contiguous(),
                 head_counts,
                 norm_type=3,
                 rope_mode=1,
                 rotary_dim=rope_table.shape[-1],
-                epsilon=q_norm.variance_epsilon,
+                epsilon=eps,
                 output_bnsd=False,
             )
             return q, k, v, packed[:, :num_heads], packed[:, num_heads : num_heads + num_kv_heads]
 
     q_raw, k_raw, v = packed.split(head_counts, dim=1)
-    if rope_table is None:
-        q, k = q_norm(q_raw), k_norm(k_raw)
-    else:
-        q, k = fused_qk_norm_rope(q_raw, k_raw, q_norm.weight, k_norm.weight, rope_table, q_norm.variance_epsilon)
+    q, k = fused_qk_norm_rope(q_raw, k_raw, q_weight, k_weight, rope_table, eps)
     return q, k, v, q_raw, k_raw
 
 
