@@ -1515,7 +1515,7 @@ class MiniMaxH3AudioVAE(nn.Module):
                 1,
             )
         waveform = waveform[:MINIMAX_H3_AUDIO_CHANNELS]
-        device = next(self.model.parameters()).device
+        device = next(self.model.encoder.parameters()).device
         waveform = waveform.to(device)
 
         with _AudioVAEDeterminismContext():
