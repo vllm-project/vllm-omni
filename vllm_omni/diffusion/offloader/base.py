@@ -80,7 +80,7 @@ class OffloadConfig:
     # a frozenset is an explicit compact-API selection.
     components: frozenset[str] | None = None
     dlo_transfers: dict[str, DLOTransfer] | None = None
-    cache_adaln: bool = False
+    enable_adaln_cache: bool = False
     adaln_cache_max_gib: float = 25.0
     adaln_cache_reserve_gib: float = 8.0
 
@@ -227,7 +227,7 @@ class OffloadConfig:
             dlo_host_registration_limit_gib=dlo_host_registration_limit_gib,
             components=components,
             dlo_transfers=dlo_transfers,
-            cache_adaln=getattr(od_config, "cache_adaln", False),
+            enable_adaln_cache=getattr(od_config, "enable_adaln_cache", False),
             adaln_cache_max_gib=getattr(od_config, "adaln_cache_max_gib", 25.0),
             adaln_cache_reserve_gib=getattr(od_config, "adaln_cache_reserve_gib", 8.0),
         )

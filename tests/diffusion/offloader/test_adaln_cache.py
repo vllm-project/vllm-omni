@@ -142,7 +142,7 @@ def test_backend_installs_cache_or_falls_back_and_preserves_repeated_execution(e
         OffloadConfig(
             strategy=OffloadStrategy.LAYER_WISE,
             pin_cpu_memory=False,
-            cache_adaln=enabled,
+            enable_adaln_cache=enabled,
             adaln_cache_max_gib=budget,
             adaln_cache_reserve_gib=1,
         ),
@@ -174,6 +174,14 @@ def test_backend_installs_cache_or_falls_back_and_preserves_repeated_execution(e
         assert torch.equal(raw(tensor), expected[id(tensor)])
 
 
+def test_startup_prefetch_budget_falls_back_without_cache(monkeypatch):
+    block = DiT().blocks[0]
+    cache = adaln_cache.AdaLNWeightCache(torch.device("cpu"))
+    monkeypatch.setattr(adaln_cache.current_omni_platform, "get_free_memory", lambda _: 1024**3)
+    assert not cache.prepare([block], max_gib=1, reserve_gib=0, startup_bytes=1024**3)
+    assert cache.status.reason == "insufficient_free_memory"
+
+
 def test_a5_rejects_cache_before_tensor_selection_or_allocation(monkeypatch):
     from vllm_omni.platforms import npu
 
@@ -197,7 +205,7 @@ def local_model_paths(monkeypatch):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"cache_adaln": "true"},
+        {"enable_adaln_cache": "true"},
         {"adaln_cache_max_gib": -1},
         {"adaln_cache_max_gib": float("nan")},
         {"adaln_cache_reserve_gib": float("inf")},
@@ -219,5 +227,5 @@ def test_invalid_cache_options_are_rejected_before_loading(kwargs):
     ],
 )
 def test_cache_requires_ordinary_dit_layer_offload(kwargs):
-    with pytest.raises(ValueError, match="cache_adaln requires"):
-        OmniDiffusionConfig(model="fake-model", cache_adaln=True, **kwargs)
+    with pytest.raises(ValueError, match="enable_adaln_cache requires"):
+        OmniDiffusionConfig(model="fake-model", enable_adaln_cache=True, **kwargs)

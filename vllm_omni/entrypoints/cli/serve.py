@@ -1093,7 +1093,7 @@ class OmniServeCommand(CLISubcommand):
 
         # diffusion model offload parameters
         omni_config_group.add_argument(
-            "--cache-adaln",
+            "--enable-adaln-cache",
             action=argparse.BooleanOptionalAction,
             default=False,
             help="Keep DiT AdaLN weights and quantization buffers resident within ordinary layerwise offload. "

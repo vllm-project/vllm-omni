@@ -491,10 +491,26 @@ class LayerWiseOffloadBackend(OffloadBackend):
         logger.info("Applying layer-wise offloading on %s", [component.path for component in resolved.dits])
 
         streamable_dits: Iterable[tuple[ResolvedComponent, BlockStack]] = iter_streamable_dits(resolved, self.device)
-        if self.config.cache_adaln:
+        if self.config.enable_adaln_cache:
             streamable_dits = list(streamable_dits)
+            # Place mandatory resident weights before measuring free memory.
+            for component, stack in streamable_dits:
+                move_non_block_state_to_device(component.module, (stack.blocks,), self.device)
+            # Conservatively reserve the ordinary first-block prefetch for every stack.
+            startup_bytes = sum(
+                spec.storage_numel * spec.value.element_size()
+                for _, stack in streamable_dits
+                for block in [stack.blocks[0]]
+                for weights in group_named_tensors_by_dtype(
+                    _streamed_tensors(block.named_parameters(), self.resident_tensor_ids),
+                    _streamed_tensors(block.named_buffers(), self.resident_tensor_ids),
+                ).values()
+                for spec in describe_tensor_storage(weights)
+            )
             cached_ids = self._adaln_cache.prepare(
-                (component.module for component, _ in streamable_dits),
+                (block for _, stack in streamable_dits for block in stack.blocks),
+                startup_bytes=startup_bytes,
+                resident_ids=self.resident_tensor_ids,
                 max_gib=self.config.adaln_cache_max_gib,
                 reserve_gib=self.config.adaln_cache_reserve_gib,
             )
@@ -508,7 +524,8 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
             # Place the remainder by resolved block tensor identity, just as
             # for encoders. Attribute aliases must not move streamed weights.
-            move_non_block_state_to_device(dit_module, (stack.blocks,), self.device)
+            if not self.config.enable_adaln_cache:
+                move_non_block_state_to_device(dit_module, (stack.blocks,), self.device)
 
             block_hooks = _install_layerwise_hook_group(
                 blocks,

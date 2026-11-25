@@ -45,14 +45,6 @@ def select_adaln_tensors(modules: Iterable[nn.Module]) -> list[tuple[str, torch.
         for name, tensor in list(module.named_parameters()) + buffers:
             if id(tensor) in seen:
                 continue
-            # MiniMax-H3's final quantized projection already remains on device
-            # outside the streamed blocks. Preserve the original 101-tensor
-            # residency scope without filtering quantized tensors in the blocks.
-            if ".final_layer.adaln_proj.linear." in f".{name}" and name.split(".")[-1] in {
-                "weight",
-                "weight_scale",
-            }:
-                continue
             if any("adaln" in part.replace("_", "").casefold() for part in name.split(".")):
                 seen.add(id(tensor))
                 selected.append((f"{index}.{name}", tensor))
@@ -82,7 +74,15 @@ class AdaLNWeightCache:
         )
         return frozenset()
 
-    def prepare(self, modules: Iterable[nn.Module], *, max_gib: float, reserve_gib: float) -> frozenset[int]:
+    def prepare(
+        self,
+        modules: Iterable[nn.Module],
+        *,
+        max_gib: float,
+        reserve_gib: float,
+        startup_bytes: int = 0,
+        resident_ids: frozenset[int] = frozenset(),
+    ) -> frozenset[int]:
         if self._originals:
             return self.resident_ids
         if self.device.type == "npu":
@@ -90,7 +90,7 @@ class AdaLNWeightCache:
 
             if is_a5(self.device):
                 return self._fallback("unsupported_on_a5", 0, 0)
-        tensors = select_adaln_tensors(modules)
+        tensors = [(name, tensor) for name, tensor in select_adaln_tensors(modules) if id(tensor) not in resident_ids]
         if not tensors:
             return self._fallback("no_adaln_tensors", 0, 0)
         if any(is_dtensor(t) or t.is_meta or t.is_quantized or t.numel() == 0 for _, t in tensors):
@@ -98,7 +98,7 @@ class AdaLNWeightCache:
         size = sum(physical_storage_numel(t) * t.element_size() for _, t in tensors)
         if size > int(max_gib * 2**30):
             return self._fallback("cache_budget_exceeded", len(tensors), size)
-        reserve = int(reserve_gib * 2**30)
+        reserve = int(reserve_gib * 2**30) + startup_bytes
         try:
             free = int(current_omni_platform.get_free_memory(self.device))
         except (NotImplementedError, RuntimeError, ValueError, TypeError, OverflowError):

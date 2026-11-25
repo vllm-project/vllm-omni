@@ -47,7 +47,7 @@ this backend.
 
 ## Optional static AdaLN residency
 
-`cache_adaln` is a default-off option for ordinary DiT layerwise offload.
+`enable_adaln_cache` is a default-off option for ordinary DiT layerwise offload.
 Configuration, stage transport and CLI preserve the requested cache limit
 and free-memory reserve. The backend selects materialized parameters and
 buffers within AdaLN-named DiT modules after loading/quantization; selection

@@ -44,7 +44,7 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
 
 ## Optional AdaLN cache
 
-Ordinary DiT layerwise offload supports `--cache-adaln` (default off),
+Ordinary DiT layerwise offload supports `--enable-adaln-cache` (default off),
 `--adaln-cache-max-gib` (25 GiB per device) and `--adaln-cache-reserve-gib`
 (8 GiB free after allocation). Python/stage fields use the corresponding
 underscore names. Model offload, distributed LO and encoder-only selections
@@ -52,8 +52,14 @@ reject the cache option. A5 rejects cache admission before allocation.
 
 ```bash
 vllm serve /path/to/model --omni --enable-layerwise-offload \
-  --cache-adaln --adaln-cache-max-gib 25 --adaln-cache-reserve-gib 8
+  --enable-adaln-cache --adaln-cache-max-gib 25 --adaln-cache-reserve-gib 8
 ```
+
+When the Ascend worker supports CPU binding, an enabled AdaLN cache with
+MindIE-SD CP2×U8 selects NUMA-local binding by default. An explicit
+`additional_config.enable_cpu_binding` setting takes precedence. Automatic
+binding preserves incoming affinity if topology or binding is unavailable.
+
 
 Cached AdaLN weights and scales retain their loaded dtype/stride. Budget,
 telemetry or copy failures leave ordinary LO available. The reserve is a
