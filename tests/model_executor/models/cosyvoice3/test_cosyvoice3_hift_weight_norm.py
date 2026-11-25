@@ -28,11 +28,20 @@ def fixed_seed():
         yield
 
 
+def _select_weight_norm_api(api, monkeypatch):
+    if api == "legacy":
+        monkeypatch.setattr(hifigan, "weight_norm", nn.utils.weight_norm)
+    return api
+
+
 @pytest.fixture(params=["parametrized", "legacy"])
 def weight_norm_api(request, monkeypatch):
-    if request.param == "legacy":
-        monkeypatch.setattr(hifigan, "weight_norm", nn.utils.weight_norm)
-    return request.param
+    return _select_weight_norm_api(request.param, monkeypatch)
+
+
+@pytest.fixture
+def checkpoint_weight_norm_api(request, monkeypatch):
+    return _select_weight_norm_api(request.param, monkeypatch)
 
 
 def _has_weight_norm(module):
@@ -129,11 +138,11 @@ def test_hift_fold_preserves_audio_and_leaves_f0_unchanged(weight_norm_api, caus
 
 
 @pytest.mark.parametrize(
-    "weight_norm_api,legacy_checkpoint",
+    "checkpoint_weight_norm_api,legacy_checkpoint",
     [("parametrized", False), ("parametrized", True), ("legacy", True)],
-    indirect=["weight_norm_api"],
+    indirect=["checkpoint_weight_norm_api"],
 )
-def test_load_weights_folds_loaded_not_initial_weights(tmp_path, weight_norm_api, legacy_checkpoint):
+def test_load_weights_folds_loaded_not_initial_weights(tmp_path, checkpoint_weight_norm_api, legacy_checkpoint):
     from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
 
     # Exercise the real loader with a small vocoder and synthetic checkpoints.
@@ -147,9 +156,9 @@ def test_load_weights_folds_loaded_not_initial_weights(tmp_path, weight_norm_api
     model.hift = _make_hift().train()
     assert model.hift.training
     conv = model.hift.conv_pre
-    assert hasattr(conv, "weight_g") == (weight_norm_api == "legacy")
+    assert hasattr(conv, "weight_g") == (checkpoint_weight_norm_api == "legacy")
     state = {name: value.clone() for name, value in model.hift.state_dict().items()}
-    gain = "weight_g" if weight_norm_api == "legacy" else "parametrizations.weight.original0"
+    gain = "weight_g" if checkpoint_weight_norm_api == "legacy" else "parametrizations.weight.original0"
     state[f"conv_pre.{gain}"].mul_(2)
     expected_weight = conv.weight.detach().clone() * 2
     assert not torch.equal(conv.weight, expected_weight)

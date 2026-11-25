@@ -35,7 +35,7 @@ from tests.dfx.reliability.scenarios import (
     ServeRootCrashAtLaunch,
 )
 from tests.helpers.mark import hardware_marks
-from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image
 from tests.helpers.runtime import dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -143,16 +143,25 @@ def _oom_preflight_request(model: str) -> dict[str, Any]:
 
 
 def _heavy_messages() -> list[dict[str, Any]]:
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 64)['base64']}"
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
+    # Prepare distinct images before pressure; avoid video sampling and the
+    # dimension-based synthetic-image cache. GPU runs must establish actual OOM.
+    image_count = 16
+    width, height = 1280, 720
+    image_data_url = [
+        f"data:image/jpeg;base64,{generate_synthetic_image(width, height, seed=i, force_regenerate=True)['base64']}"
+        for i in range(image_count)
+    ]
     audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(20, 1)['base64']}"
+    print(
+        f"[oom-under-load] Qwen fault payload: images={image_count}, image_size={width}x{height}, "
+        "audio_seconds=20, max_tokens=128; media prepared before pressure",
+        flush=True,
+    )
     return dummy_messages_from_mix_data(
         system_prompt=_system_prompt(),
-        video_data_url=video_data_url,
         image_data_url=image_data_url,
         audio_data_url=audio_data_url,
-        content_text=("Describe the image and video, and summarize the audio. " * 128)
-        + "Answer in one short sentence.",
+        content_text=("Compare all the images, and summarize the audio. " * 128) + "Answer in one short sentence.",
     )
 
 

@@ -71,10 +71,11 @@ Alternatively, use the convenience script:
 ```
 
 The bundled deploy config (`vllm_omni/deploy/qwen3_tts.yaml`) enables async
-chunking for low first-audio latency, and selects the experimental Model
-Runner V2 on CUDA. Copy it and set `model_runner: v1` to run V1; NPU, XPU,
-ROCm and MUSA keep V1 through the `platforms:` sections. For advanced
-deployment tuning, pass a custom deploy config:
+chunking for low first-audio latency and selects Model Runner V2 on CUDA, ROCm,
+NPU and XPU. V1 is unavailable with vLLM 0.34; the retained MUSA V1 override is
+rejected. ROCm keeps Code2Wav eager. XPU selection does not establish
+final-release hardware validation.
+For advanced deployment tuning, pass a custom deploy config:
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
@@ -164,7 +165,7 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-ty
 
 ## Notes
 
-- Memory usage: The deploy config allocates `gpu_memory_utilization: 0.3` per stage (talker + code2wav share a single GPU). For the 0.6B variants or constrained GPUs, adjust via `--gpu-memory-utilization`.
+- Memory usage: The deploy config allocates `gpu_memory_utilization: 0.3` per stage (talker + code2wav share a single GPU). For the 0.6B variants or constrained GPUs, adjust each budget via `--stage-overrides` or deploy YAML.
 - Key flags: `--omni` is required. `--deploy-config` points to the bundled two-stage pipeline config.
 - Async chunking: Enabled by default in `qwen3_tts.yaml` for streaming-friendly first-audio latency. Raw audio streaming requires `stream=true`, `stream_format="audio"`, and `response_format="pcm"`.
 - Task/model matching: Each task type requires its matching model checkpoint. Using a CustomVoice model for a Base (voice clone) request will fail.
@@ -178,15 +179,15 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-ty
   built-in or designed voices can speak much slower per token than a cloned
   reference. Tune them under the Talker stage's `additional_config` in the
   deploy YAML (a number for all tasks, or a `{Base: ..., CustomVoice: ...}`
-  mapping); a rate of `0` disables the ceiling. If the Talker
-  reaches that ceiling without codec EOS, non-streaming serving discards the
-  incomplete audio and retries once with a fresh seed; an explicit `seed` or
-  `max_new_tokens` disables the retry. SSE and WebSocket clients receive
-  structured errors and must discard previously emitted audio when the error
-  contains `"action":"discard"`; raw PCM streams terminate with a connection
-  error after any partial bytes already sent. An explicit `max_new_tokens`
-  always wins; Base rejects audio that exhausts it, while CustomVoice and
-  VoiceDesign return it as before.
+  mapping); a rate of `0` disables the ceiling. An explicit `max_new_tokens`
+  overrides the text-scaled budget. If the Talker reaches a token or context
+  limit without codec EOS, serving returns the generated audio without a
+  retry or a generation error. Non-streaming responses set
+  `X-Audio-Truncated: true`; SSE finishes with `speech.audio.done` and
+  `truncated: true`. Raw PCM and WebSocket streams finish normally but carry
+  no truncation flag. This applies to Base, CustomVoice and VoiceDesign;
+  reaching a limit does not guarantee the entire input was spoken. See
+  [Truncated audio](../../docs/serving/speech_api.md#truncated-audio).
 - Known limitations: The server serves one model variant at a time. To switch task types (e.g., CustomVoice to Base), restart the server with the corresponding model.
 
 ## Hardware Support

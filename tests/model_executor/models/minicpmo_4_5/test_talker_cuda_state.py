@@ -484,8 +484,7 @@ def test_model_binding_commit_and_batch_compaction():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize("eos_frame", [0, 1, 2])
-@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
-def test_native_model_graph_eos_restores_request_rng(eos_frame, use_v2):
+def test_native_model_graph_eos_restores_request_rng(eos_frame):
     from types import MethodType, SimpleNamespace
 
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
@@ -497,12 +496,11 @@ def test_native_model_graph_eos_restores_request_rng(eos_frame, use_v2):
     from vllm_omni.platforms import current_omni_platform
     from vllm_omni.worker.talker_cuda_graph import CUDANarrowStep
 
-    batched_noise = use_v2 and current_omni_platform.is_cuda()
+    batched_noise = current_omni_platform.is_cuda()
 
     generators = {name: torch.Generator(device="cuda").manual_seed(seed) for name, seed in (("a", 123), ("b", 456))}
     references = {name: torch.Generator(device="cuda").manual_seed(seed) for name, seed in (("a", 123), ("b", 456))}
     model = SimpleNamespace(
-        _use_v2_model_runner=use_v2,
         _request_audio_states={},
         _request_codec_history={},
         _codec_temperature=0.8,

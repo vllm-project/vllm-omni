@@ -130,7 +130,7 @@ def test_diffusion_output_exposes_images_at_top_level():
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     """
     End-to-end text-to-image generation with MammothModa2 (AR -> DiT).

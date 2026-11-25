@@ -29,7 +29,7 @@ SMOKE_DEFAULT_SAMPLING_PARAMS = '{"0":{"num_frames":81,"num_inference_steps":2,"
 CPU_OFFLOAD_GPU_MEM_LIMIT_GIB = 65.0
 LAYERWISE_OFFLOAD_GPU_MEM_LIMIT_GIB = 17.0
 
-SINGLE_CARD_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]})
+SINGLE_CARD_MARKS = hardware_marks(res={"cuda": ["H100", "B200"], "rocm": "MI325"})
 
 
 def _make_request_config(omni_server: OmniServer) -> dict:

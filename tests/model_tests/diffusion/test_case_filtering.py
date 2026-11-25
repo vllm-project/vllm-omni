@@ -13,6 +13,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
     ("test_group", "cards_mark", "other_cards_mark"),
     [
         ([DiffusionAccs.HSDP], "cards_2", "cards_4"),
+        ([DiffusionAccs.PIPELINE_PARALLEL], "cards_2", "cards_4"),
         ([DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL], "cards_4", "cards_2"),
     ],
 )

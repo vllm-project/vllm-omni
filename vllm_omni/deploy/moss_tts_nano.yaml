@@ -35,7 +35,6 @@ stages:
 
 platforms:
   rocm:
-    model_runner: v1
     stages:
       - stage_id: 0
         # The root custom config omits the nested GPT-2 attention metadata.
@@ -45,9 +44,3 @@ platforms:
         # it does not alter the model weights or CUDA configuration.
         hf_overrides:
           head_dim: 64
-  npu:
-    model_runner: v1
-  xpu:
-    model_runner: v1
-  musa:
-    model_runner: v1

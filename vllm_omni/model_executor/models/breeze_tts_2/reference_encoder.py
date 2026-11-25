@@ -16,6 +16,13 @@ from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts
     Qwen3TTSTokenizerV2Encoder,
 )
 
+# Reference frames the encoder is compiled for at warmup. Mimi's quantizer calls
+# ``torch.cdist``, which checks whether its input has more than 25 rows (batch
+# times frames), so the compiled graph is guarded on that. A reference of 25
+# frames (2 s) or fewer, encoded alone, would compile again inside its request.
+# Shorter references are padded up to this, as a short row in a batch already is.
+_WARMUP_FRAMES = 32
+
 
 class BreezeReferenceEncoder(nn.Module):
     def __init__(self, vllm_config: VllmConfig) -> None:
@@ -42,6 +49,8 @@ class BreezeReferenceEncoder(nn.Module):
                 self.encoder.get_submodule(parent).add_module(attribute, convolution)
         if hop != config.encode_downsample_rate:
             raise ValueError("Breeze reference convolution strides do not match the codec frame rate")
+        # A plain tuple keeps the parameters registered once under the encoder.
+        self._stages = self.encoder.encoder_stages()
         self.num_quantizers = config.encoder_valid_num_quantizers
         # Reference convolutions have large temporary workspaces. Compile
         # without a graph's permanently reserved workspace for every length.
@@ -58,7 +67,8 @@ class BreezeReferenceEncoder(nn.Module):
     def encode_batch(self, waveforms: list[torch.Tensor], frame_counts: list[int]) -> list[torch.Tensor]:
         device = next(self.encoder.parameters()).device
         waveform = nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
-        waveform = nn.functional.pad(waveform, (0, -waveform.shape[1] % 1920))
+        frames = max(-(-waveform.shape[1] // 1920), _WARMUP_FRAMES)
+        waveform = nn.functional.pad(waveform, (0, frames * 1920 - waveform.shape[1]))
         waveform_frames = waveform.reshape(len(waveforms), -1, 1920).to(device=device, dtype=torch.float32)
         lengths = torch.tensor([waveform.numel() for waveform in waveforms], device=device, dtype=torch.long)
         with torch.backends.cudnn.flags(allow_tf32=False):
@@ -72,8 +82,8 @@ class BreezeReferenceEncoder(nn.Module):
         device = next(self.encoder.parameters()).device
         with torch.backends.cudnn.flags(allow_tf32=False):
             for batch in range(1, max_batch_size + 1):
-                waveform_frames = torch.zeros((batch, 32, 1920), device=device, dtype=torch.float32)
-                lengths = torch.full((batch,), 32 * 1920, device=device, dtype=torch.long)
+                waveform_frames = torch.zeros((batch, _WARMUP_FRAMES, 1920), device=device, dtype=torch.float32)
+                lengths = torch.full((batch,), _WARMUP_FRAMES * 1920, device=device, dtype=torch.long)
                 # Initialize the codec's normalized codebooks before tracing.
                 self._encode_impl(waveform_frames, lengths)
                 self._compiled_encode(waveform_frames, lengths)
@@ -94,13 +104,12 @@ class BreezeReferenceEncoder(nn.Module):
         # configuration or relying on a Transformers-version default.
         for convolution in self._convolutions:
             convolution.sample_lengths = sample_lengths
-        hidden = self.encoder.encoder(waveform.unsqueeze(1)).transpose(1, 2)
+        seanet, transformer, downsample = self._stages
+        hidden = seanet(waveform.unsqueeze(1)).transpose(1, 2)
         length = hidden.shape[1]
         causal_mask = torch.ones((length, length), device=hidden.device, dtype=torch.bool).tril()[None, None]
-        hidden = self.encoder.encoder_transformer(
-            hidden, attention_mask=causal_mask, use_cache=False, return_dict=True
-        ).last_hidden_state
-        hidden = self.encoder.downsample(hidden.transpose(1, 2))
+        hidden = transformer(hidden, attention_mask=causal_mask, use_cache=False, return_dict=True).last_hidden_state
+        hidden = downsample(hidden.transpose(1, 2))
         return self.encoder.quantizer.encode(hidden, self.num_quantizers).transpose(0, 1)
 
     def load_weights(self, vllm_config: VllmConfig) -> set[str]:
@@ -110,19 +119,24 @@ class BreezeReferenceEncoder(nn.Module):
             revision=vllm_config.model_config.revision,
             subfolder="audio_tokenizer",
         )
+        mapper = self.encoder.flat_checkpoint_mapper()
         parameters = dict(self.named_parameters())
         buffers = dict(self.named_buffers())
         loaded: set[str] = set()
         for name, value in loader._get_weights_iterator(source):
             if name.startswith("decoder."):
                 continue
-            if name in parameters:
-                default_weight_loader(parameters[name], value)
-            elif name in buffers:
-                buffers[name].copy_(value)
+            target = name
+            if name.startswith("encoder."):
+                # The codec checkpoint keeps flat Mimi names on every Transformers version.
+                target = f"encoder.{mapper.map_name(name.removeprefix('encoder.'))}"
+            if target in parameters:
+                default_weight_loader(parameters[target], value)
+            elif target in buffers:
+                buffers[target].copy_(value)
             else:
                 raise ValueError(f"Unexpected reference codec weight: {name}")
-            loaded.add(name)
+            loaded.add(target)
         required = set(parameters) | {name for name in buffers if ".quantizer." in name}
         missing = required - loaded
         if missing:
