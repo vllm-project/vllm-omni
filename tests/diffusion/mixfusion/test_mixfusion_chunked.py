@@ -29,7 +29,7 @@ from vllm_omni.diffusion.forward_context import (
     override_forward_context,
 )
 from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion
-from vllm_omni.diffusion.mixfusion.chunked import ChunkedJointAdapter, resolve_mixfusion_adapter
+from vllm_omni.diffusion.mixfusion.adapter import ChunkedJointAdapter, resolve_mixfusion_adapter
 from vllm_omni.diffusion.mixfusion.plan import (
     ChunkedOutput,
     MixFusionChunkOutputs,

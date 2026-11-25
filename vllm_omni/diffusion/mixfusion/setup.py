@@ -17,7 +17,7 @@ from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion, plan_foreign_hooks
-from vllm_omni.diffusion.mixfusion.chunked import resolve_mixfusion_adapter
+from vllm_omni.diffusion.mixfusion.adapter import resolve_mixfusion_adapter
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot, MixFusionSequenceRequest
 from vllm_omni.diffusion.mixfusion.request import prepare_image_request, resolve_image_request_config

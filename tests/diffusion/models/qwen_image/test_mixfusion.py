@@ -34,7 +34,7 @@ from vllm_omni.diffusion.forward_context import (
 )
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion, plan_foreign_hooks
-from vllm_omni.diffusion.mixfusion.chunked import JOINT_TEXT_IMAGE_LAYOUT, ChunkedJointAdapter
+from vllm_omni.diffusion.mixfusion.adapter import JOINT_TEXT_IMAGE_LAYOUT, ChunkedJointAdapter
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.mixfusion.execution_plan import build_execution_plan
 from vllm_omni.diffusion.mixfusion.packed_attention import (

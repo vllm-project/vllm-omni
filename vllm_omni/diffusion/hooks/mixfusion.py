@@ -8,9 +8,8 @@ a ``_mixfusion_plan`` and the MixFusionDriver arms a
 step. The hooks execute the chunk-stacked layout at those boundaries, so
 transformer and block ``forward`` code stays free of MixFusion branching.
 The root hook delegates packing and output restoration to the resolved
-adapter (the framework's chunked adapter for a declarative plan); the
-chunk-outputs hook runs a declared module once per request. All hooks are
-inert unless a ``mixfusion_step`` is armed.
+adapter. The chunk-outputs hook runs a declared module once per request.
+All hooks are inert unless a ``mixfusion_step`` is armed.
 """
 
 from __future__ import annotations
@@ -71,8 +70,7 @@ class MixFusionRootHook(ModelHook):
     """Root (``""``) boundary: pack before forward, reassemble after it.
 
     The driver only arms a step for a scheduler-approved batch,
-    so ``pre_forward`` packs unconditionally. ``adapter`` is the model's
-    explicit ``mixfusion_adapter`` or the framework's chunked one.
+    so ``pre_forward`` packs unconditionally through the resolved adapter.
     """
 
     def __init__(self, adapter) -> None:
@@ -368,15 +366,14 @@ def _plan_modules(module: nn.Module, name: str) -> list[nn.Module]:
 def apply_mixfusion(module: nn.Module, plan: dict, adapter=None) -> None:
     """Register MixFusion boundary hooks on ``module`` per its plan.
 
-    ``adapter`` packs and restores the root call; ``None`` resolves it from
-    the module (an explicit ``mixfusion_adapter``, else the framework's
-    chunked adapter for a declarative ``MixFusionRoot``). Idempotent; stamps
-    ``_mixfusion_hooks_applied`` on the model for pipeline gating.
+    ``adapter`` packs and restores the root call. Passing ``None`` resolves
+    the adapter from the module and its plan. Registration is idempotent and
+    stamps ``_mixfusion_hooks_applied`` on the model for pipeline gating.
     """
     if getattr(module, "_mixfusion_hooks_applied", False):
         return
     if adapter is None:
-        from vllm_omni.diffusion.mixfusion.chunked import resolve_mixfusion_adapter
+        from vllm_omni.diffusion.mixfusion.adapter import resolve_mixfusion_adapter
 
         adapter = resolve_mixfusion_adapter(module, plan)
     if adapter is None and "" in plan:

@@ -1798,7 +1798,7 @@ def test_profile_run_preserves_prepared_packing_contract(monkeypatch):
 def test_preparation_failure_recomputes_layout_for_surviving_request():
     import inspect
 
-    from vllm_omni.diffusion.mixfusion.chunked import ChunkedJointAdapter
+    from vllm_omni.diffusion.mixfusion.adapter import ChunkedJointAdapter
     from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
 
     runner = _make_runner(cache_backend=None, cache_backend_name=None)

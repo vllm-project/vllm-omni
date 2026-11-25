@@ -17,7 +17,7 @@ import pytest
 from torch import nn
 
 from vllm_omni.diffusion.hooks.mixfusion import MixFusionRoot
-from vllm_omni.diffusion.mixfusion.chunked import ChunkedJointAdapter
+from vllm_omni.diffusion.mixfusion.adapter import ChunkedJointAdapter
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.mixfusion.plan import MixFusionImageRequest
 from vllm_omni.diffusion.mixfusion.request import MixFusionImageRequestConfig

@@ -10,8 +10,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.forward_context import ForwardContext, get_forward_context, override_forward_context
-from vllm_omni.diffusion.mixfusion.adapter import PackedInputs
-from vllm_omni.diffusion.mixfusion.chunked import ChunkedJointAdapter
+from vllm_omni.diffusion.mixfusion.adapter import ChunkedJointAdapter, PackedInputs
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
 from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo

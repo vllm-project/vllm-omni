@@ -5,7 +5,7 @@
 Mirrors :mod:`vllm_omni.diffusion.distributed.sp_plan`: models declare *where*
 the chunk-stacked layout starts, ends and has to be expanded, while the hooks
 in :mod:`vllm_omni.diffusion.hooks.mixfusion` and the framework's
-:class:`~vllm_omni.diffusion.mixfusion.chunked.ChunkedJointAdapter` implement
+:class:`~vllm_omni.diffusion.mixfusion.adapter.ChunkedJointAdapter` implement
 *how*. A ``_mixfusion_plan`` maps module names (same syntax as ``_sp_plan``:
 ``""`` for the root, dotted paths, one ``*`` per ModuleList wildcard) to the
 types below.
