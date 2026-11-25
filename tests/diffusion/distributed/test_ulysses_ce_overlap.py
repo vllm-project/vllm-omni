@@ -46,23 +46,26 @@ def _worker(rank, init_method, world_size=2):
         torch.manual_seed(1234 + rank)
         checks = 0
         with torch.inference_mode():
-            # MiniMax-H3's head layout (56 heads of 128) scaled down in sequence length.
-            for heads, chunks in ((56, 1), (56, 2), (56, 7), (16, 4)):
+            # MiniMax-H3's head layout (56 heads of 128) scaled down in sequence length. Mixed shapes share one
+            # grow-only runner: smaller shapes reuse it, a longer sequence or more chunks grow it.
+            shapes = ((384, 56, 1), (384, 56, 2), (384, 56, 7), (256, 56, 7), (384, 16, 4), (512, 56, 2))
+            for seq, heads, chunks in shapes:
                 for step in range(3):
-                    q, k, v = (torch.randn(1, 384, heads, 128, device=device, dtype=torch.bfloat16) for _ in range(3))
+                    q, k, v = (torch.randn(1, seq, heads, 128, device=device, dtype=torch.bfloat16) for _ in range(3))
                     gq, gk, gv, _, ctx = strategy.pre_attention(q, k, v, None)
                     expected = strategy.post_attention(_attention(gq, gk, gv), ctx).clone()
                     actual = ulysses_ce_overlap.run_ulysses_ce_overlap(
                         group.ulysses_group, q, k, v, _attention, chunks=chunks
                     )
                     torch.testing.assert_close(
-                        actual, expected, rtol=0, atol=0, msg=lambda m: f"{heads=} {chunks=}: {m}"
+                        actual, expected, rtol=0, atol=0, msg=lambda m: f"{seq=} {heads=} {chunks=}: {m}"
                     )
                     checks += 1
+            assert len(ulysses_ce_overlap._RUNNERS) == 1
             print(f"CE overlap rank={rank}: {checks} bit-exact checks passed", flush=True)
     finally:
-        ulysses_ce_overlap._RUNNERS.clear()
         a2a_permute.clear_a2a_permute_workspaces()
+        assert not ulysses_ce_overlap._RUNNERS
         destroy_distributed_env()
 
 

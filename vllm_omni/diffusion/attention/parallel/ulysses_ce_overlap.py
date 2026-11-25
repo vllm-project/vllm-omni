@@ -19,7 +19,7 @@ per-head result does not depend on how many heads one call covers. Attention rea
 reads the output from, the symmetric workspace (no copy-out): the output view stays valid until the next call, whose
 first action publishes READY only after earlier work on the compute stream has finished.
 
-Flags (uint32, monotonic epochs, one slot per writer rank) live after the data in each rank's workspace:
+Flags (uint32, monotonic epochs, one slot per writer rank) live at the start of each rank's workspace:
 ``READY[N]``: writer's regions are free for this epoch; ``IN[chunks][N]``: writer's chunk inputs landed here;
 ``OUT[N]``: writer's outputs for every chunk landed here.
 """
@@ -57,77 +57,105 @@ def _check(result: int, what: str) -> None:
 
 
 class CEOverlapUlysses:
-    """One workspace per (group, local shape, chunks); call ``run`` once per attention layer, from one stream."""
+    """One grow-only workspace per (group, device); call ``run`` once per attention layer, from one stream.
 
-    def __init__(
-        self,
-        group: dist.ProcessGroup,
-        *,
-        seq_local: int,
-        heads: int,
-        head_dim: int,
-        chunks: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        n, rank = dist.get_world_size(group), dist.get_rank(group)
+    The workspace is sized for the largest local shape seen and smaller shapes reuse it, so mixed resolutions and
+    durations do not add allocations. Growth is collective (every rank sees the same shapes in lockstep).
+    """
+
+    def __init__(self, group: dist.ProcessGroup, *, device: torch.device) -> None:
+        self.group = group
+        self.n, self.rank = dist.get_world_size(group), dist.get_rank(group)
+        self.device = device
+        self.alloc: torch.Tensor | None = None
+        self.capacity = 0
+        self.max_chunks = 0
+        self.layout: tuple | None = None
+        self.epoch = 0
+        self.peers = [(self.rank + i) % self.n for i in range(1, self.n)]
+        self.t_in = {p: torch.cuda.Stream(device=device) for p in self.peers}
+        self.t_out = {p: torch.cuda.Stream(device=device) for p in self.peers}
+        self.ev_inputs = torch.cuda.Event()
+        self.ev_attn: list[torch.cuda.Event] = []
+        self.ev_in_done = {p: torch.cuda.Event() for p in self.peers}
+        self.ev_out_done = {p: torch.cuda.Event() for p in self.peers}
+        _driver()
+        _ce_runtime()
+
+    def _flag_bytes(self, chunks: int) -> int:
+        # READY[N], OUT[N], IN[chunks][N] at the start of the workspace, so their addresses never hold data.
+        return -(-4 * self.n * (chunks + 2) // _ALIGN) * _ALIGN
+
+    def _configure(self, seq_local: int, heads: int, head_dim: int, chunks: int, dtype: torch.dtype) -> None:
+        layout = (seq_local, heads, head_dim, chunks, dtype)
+        if layout == self.layout:
+            return
+        n, rank = self.n, self.rank
         if heads % (n * chunks):
             raise ValueError(f"heads {heads} not divisible by world size {n} x chunks {chunks}")
-        self.n, self.rank, self.s, self.h, self.d, self.k = n, rank, seq_local, heads, head_dim, chunks
-        self.hc = heads // (n * chunks)
-        self.dtype, self.device = dtype, device
         es = torch.empty((), dtype=dtype).element_size()
-        self.es = es
-        self.tensor_bytes = n * seq_local * self.hc * head_dim * es  # one of q/k/v for one chunk: [N*s, hc, D]
-        self.chunk_bytes = 3 * self.tensor_bytes
-        self.out_off = chunks * self.chunk_bytes
-        self.flag_off = -(-(self.out_off + seq_local * heads * head_dim * es) // _ALIGN) * _ALIGN
-        self.slots = n * (chunks + 2)
-        total = self.flag_off + 4 * self.slots
-        self.alloc = symm_mem._SymmetricMemory.empty_strided_p2p((total,), (1,), torch.uint8, device)
-        self.alloc.zero_()
-        self.handle = symm_mem.rendezvous(self.alloc, group.group_name)
-        torch.accelerator.synchronize(device)
-        dist.barrier(group=group)
-        self.peer_base = [int(p) for p in self.handle.buffer_ptrs]
-        self.local_base = self.alloc.data_ptr()
+        hc = heads // (n * chunks)
+        tensor_bytes = n * seq_local * hc * head_dim * es  # one of q/k/v for one chunk: [N*s, hc, D]
+        chunk_bytes = 3 * tensor_bytes
+        data_bytes = chunks * chunk_bytes + seq_local * heads * head_dim * es
+        max_chunks = max(chunks, self.max_chunks)
+        required = self._flag_bytes(max_chunks) + data_bytes
+        if self.alloc is None or required > self.capacity or max_chunks > self.max_chunks:
+            self._grow(max(required, self.capacity), max_chunks)
+        self.s, self.h, self.d, self.k, self.hc, self.es, self.dtype = seq_local, heads, head_dim, chunks, hc, es, dtype
+        self.tensor_bytes, self.chunk_bytes = tensor_bytes, chunk_bytes
+        self.data_off = self._flag_bytes(self.max_chunks)
+        self.out_off = self.data_off + chunks * chunk_bytes
+        alloc = self.alloc
         self.inputs = [
-            self.alloc[c * self.chunk_bytes : (c + 1) * self.chunk_bytes]
+            alloc[self.data_off + c * chunk_bytes : self.data_off + (c + 1) * chunk_bytes]
             .view(dtype)
-            .view(3, 1, n * seq_local, self.hc, head_dim)
+            .view(3, 1, n * seq_local, hc, head_dim)
             .unbind(0)
             for c in range(chunks)
         ]
         self.output = (
-            self.alloc[self.out_off : self.out_off + seq_local * heads * head_dim * es]
+            alloc[self.out_off : self.out_off + seq_local * heads * head_dim * es]
             .view(dtype)
             .view(1, seq_local, heads, head_dim)
         )
         # This rank's own input rows of every chunk: [chunks, s, hc, D] strided workspace views, one per tensor.
-        elems = self.alloc[: self.out_off].view(dtype)
+        # as_strided takes an absolute storage offset, so it includes the flag region in front of the data.
+        elems = alloc.view(dtype)
         self.self_inputs = [
             elems.as_strided(
-                (chunks, seq_local, self.hc, head_dim),
-                (self.chunk_bytes // es, self.hc * head_dim, head_dim, 1),
-                (t * self.tensor_bytes + rank * seq_local * self.hc * head_dim * es) // es,
+                (chunks, seq_local, hc, head_dim),
+                (chunk_bytes // es, hc * head_dim, head_dim, 1),
+                (self.data_off + t * tensor_bytes + rank * seq_local * hc * head_dim * es) // es,
             )
             for t in range(3)
         ]
-        self.peers = [(rank + i) % n for i in range(1, n)]
-        self.t_in = {p: torch.cuda.Stream(device=device) for p in self.peers}
-        self.t_out = {p: torch.cuda.Stream(device=device) for p in self.peers}
-        self.ev_inputs = torch.cuda.Event()
-        self.ev_attn = [torch.cuda.Event() for _ in range(chunks)]
-        self.ev_in_done = {p: torch.cuda.Event() for p in self.peers}
-        self.ev_out_done = {p: torch.cuda.Event() for p in self.peers}
+        while len(self.ev_attn) < chunks:
+            self.ev_attn.append(torch.cuda.Event())
+        self.layout = layout
+
+    def _grow(self, capacity: int, max_chunks: int) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "ulysses_ce_overlap: cannot grow the symmetric-memory workspace during CUDA graph capture; "
+                "warm up the maximum request shape before capture"
+            )
+        # Like a2a_permute's grow-only workspace: nothing may still use the previous allocation when it is released.
+        torch.accelerator.synchronize(self.device)
+        alloc = symm_mem._SymmetricMemory.empty_strided_p2p((capacity,), (1,), torch.uint8, self.device)
+        alloc.zero_()  # flags start below every epoch
+        handle = symm_mem.rendezvous(alloc, self.group.group_name)
+        torch.accelerator.synchronize(self.device)
+        dist.barrier(group=self.group)
+        self.alloc, self.handle, self.capacity, self.max_chunks = alloc, handle, capacity, max_chunks
+        self.peer_base = [int(p) for p in handle.buffer_ptrs]
+        self.local_base = alloc.data_ptr()
         self.epoch = 0
-        _driver()
-        _ce_runtime()
+        self.layout = None
 
     def _slot(self, kind: str, writer: int, chunk: int = 0) -> int:
         n = self.n
-        index = {"ready": writer, "in": n + chunk * n + writer, "out": n + self.k * n + writer}[kind]
-        return self.flag_off + 4 * index
+        return 4 * {"ready": writer, "out": n + writer, "in": 2 * n + chunk * n + writer}[kind]
 
     def _signal(self, stream: torch.cuda.Stream, peer: int, kind: str, chunk: int = 0) -> None:
         address = self.peer_base[peer] + self._slot(kind, self.rank, chunk)
@@ -180,7 +208,8 @@ class CEOverlapUlysses:
             for c in range(k):
                 head0 = p * hpr + c * hc
                 for t, (ptr, pitch) in enumerate(sources):
-                    dst = self.peer_base[p] + c * self.chunk_bytes + t * self.tensor_bytes + rank * s * width
+                    offset = self.data_off + c * self.chunk_bytes + t * self.tensor_bytes + rank * s * width
+                    dst = self.peer_base[p] + offset
                     self._copy(stream, dst, width, ptr + head0 * d * es, pitch, width, s)
                 self._signal(stream, p, "in", c)
             self.ev_in_done[p].record(stream)
@@ -226,12 +255,22 @@ _RUNNERS: dict[tuple, CEOverlapUlysses] = {}
 
 
 def run_ulysses_ce_overlap(pg, query, key, value, attn_fn, *, chunks: int) -> torch.Tensor:
-    """Cached runner per (group, local shape, chunks); creation is collective and happens in lockstep on all ranks."""
+    """One runner per (group, device), grown to the largest shape seen; growth is collective and happens in lockstep
+    on all ranks."""
     _, s, h, d = query.shape
-    cache_key = (pg.group_name, s, h, d, chunks, query.dtype, query.device)
+    cache_key = (pg.group_name, query.device)
     runner = _RUNNERS.get(cache_key)
     if runner is None:
-        runner = _RUNNERS[cache_key] = CEOverlapUlysses(
-            pg, seq_local=s, heads=h, head_dim=d, chunks=chunks, dtype=query.dtype, device=query.device
-        )
+        runner = _RUNNERS[cache_key] = CEOverlapUlysses(pg, device=query.device)
+    runner._configure(s, h, d, chunks, query.dtype)
     return runner.run(query, key, value, attn_fn)
+
+
+def clear_ulysses_ce_overlap_runners() -> None:
+    """Release the runners' symmetric-memory workspaces during worker shutdown (called by
+    ``a2a_permute.clear_a2a_permute_workspaces``)."""
+    if not _RUNNERS:
+        return
+    for device in {runner.device for runner in _RUNNERS.values()}:
+        torch.accelerator.synchronize(device)
+    _RUNNERS.clear()
