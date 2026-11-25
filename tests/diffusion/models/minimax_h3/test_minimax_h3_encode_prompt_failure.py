@@ -9,16 +9,18 @@ rank 0 used to leave the function before the broadcast while the other ranks
 entered it, so they blocked on a collective nobody would join and the worker
 wedged: every later request failed while ``/health`` kept answering.
 
-The failure now travels through ``_broadcast_rank0_exception``, so all ranks
-raise the same error together.
+The failure is now published to every rank, so all ranks raise the same
+error together.
 
 With ``text_encoder_tp_size > 1`` more than one rank runs the encoder, so
 the failure can come from any of them. ``_broadcast_rank0_exception`` only
 carries rank 0's failure and ignores the payload of every other rank, so a
-non-zero encoder rank's failure was dropped: the ranks continued into the
-output broadcast and the request completed with a missing encoder output.
-``_publish_any_rank_exception`` all-gathers the per-rank failure status
-instead, and the second case below covers a failure injected on rank 1.
+non-zero encoder rank's failure was dropped: the surviving ranks entered the
+output broadcast, which every DiT rank has to join, and blocked there until
+the collective timed out - the same wedge as the rank-0 case, not a request
+that completes with a missing encoder output. ``_publish_any_rank_exception``
+all-gathers the per-rank failure status instead, and the second case below
+covers a failure injected on rank 1.
 """
 
 import os
@@ -159,8 +161,8 @@ def test_two_rank_encoder_failure_on_rank_one_reaches_every_rank(tmp_path):
     """With two encoder ranks, a rank-1 failure must not be dropped.
 
     ``_broadcast_rank0_exception`` only carries rank 0's failure, so before
-    the fix rank 0 continued into the output broadcast and the request
-    completed successfully while rank 1 had failed.
+    the fix rank 1's failure was dropped: the surviving ranks entered the
+    output broadcast and blocked there until the collective timed out.
     """
     _run_encode_prompt(tmp_path, "gloo", encoder_tp_size=2, failing_rank=1)
 

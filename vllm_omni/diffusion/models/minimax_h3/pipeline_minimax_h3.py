@@ -698,9 +698,9 @@ def _publish_any_rank_exception(exc: Exception | None) -> None:
     rank 0, but not for the text encoder forward, which runs on the first
     ``text_encoder_tp_size`` ranks. With more than one encoder rank a
     non-zero encoder rank can fail while rank 0 succeeds, and the rank-0
-    broadcast drops that failure: every rank then continues into the output
-    broadcast, and the request completes with a missing encoder output
-    instead of failing.
+    broadcast drops that failure: the surviving ranks then enter the output
+    broadcast, which every DiT rank has to join, and block there until the
+    collective times out - the same wedge as the rank-0 case.
 
     This helper all-gathers the per-rank failure status instead, so the
     lowest failing rank owns the error and every other rank raises the same
@@ -712,8 +712,11 @@ def _publish_any_rank_exception(exc: Exception | None) -> None:
             raise exc
         return
     # The payload is a Python object, so it has to travel host-side over the
-    # gloo group instead of the device group. This is the access pattern the
-    # rest of the codebase already uses for object transfers.
+    # gloo group instead of the device group: a device-group object collective
+    # allocates device buffers and drives the device backend, which is the
+    # ``EI0006`` failure on ``HcclBroadcast`` that #10645 is about. The other
+    # object collectives in this file still use the device group until #10896
+    # lands; this one is written for the CPU group from the start.
     group = get_world_group().cpu_group
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
@@ -3218,15 +3221,24 @@ class MiniMaxH3Pipeline(
         _broadcast_rank0_exception(error)
         encode_error = None
         if rank < self.text_encoder_tp_size:
-            ids = self._distribute_encode_inputs(ids, vision_kwargs)
-            # The encoder forward is rank-local work that the other DiT ranks
-            # wait for through the broadcasts below. An operator failure here
-            # (an Ascend tiling error, an OOM, a shape mismatch) must reach
-            # every rank the same way a preparation failure does: otherwise
-            # this rank leaves the function while the peers block in
-            # ``_broadcast_tensor`` on a collective nobody will join, and the
-            # whole worker wedges until the collective times out.
+            # The encoder inputs and the encoder forward are rank-local work
+            # that the other DiT ranks wait for through the broadcasts below.
+            # An operator failure here (an Ascend tiling error, an OOM, a
+            # shape mismatch) must reach every rank the same way a
+            # preparation failure does: otherwise this rank leaves the
+            # function while the peers block in ``_broadcast_tensor`` on a
+            # collective nobody will join, and the whole worker wedges until
+            # the collective times out.
+            #
+            # The input distribution is inside the guard because it can fail
+            # before its own collective. A failure *inside* one of its
+            # encoder-group broadcasts leaves the DiT group intact but strands
+            # the peers of that broadcast, so they never reach the
+            # publication below and the request still times out - that is the
+            # known in-collective limitation, not something this guard can
+            # repair.
             try:
+                ids = self._distribute_encode_inputs(ids, vision_kwargs)
                 hidden = self._encode_text_hidden(ids, vision_kwargs)
             except Exception as exc:
                 encode_error = exc
