@@ -31,13 +31,11 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.nemotron_voicechat"
 NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
     model_type="nemotron_voicechat",
     model_arch="NemotronVoiceChatThinkerForConditionalGeneration",
-    duplex_runtime_extension=(
-        "vllm_omni.model_executor.models.nemotron_voicechat.duplex.runtime.NemotronVoiceChatDuplexRuntimeExtension"
-    ),
-    duplex_serving_adapter=(
-        "vllm_omni.model_executor.models.nemotron_voicechat.duplex.serving_adapter.NemotronVoiceChatServingRuntimeAdapter"
-    ),
-    duplex_control_enabled=True,
+    duplex_plugin=("vllm_omni.model_executor.models.nemotron_voicechat.duplex.plugin.NemotronVoiceChatDuplexPlugin"),
+    # Duplex is opt-in per deployment (``nemotron_labs_voicechat_duplex.yaml``
+    # declares ``session_mode: duplex``); the bare/streaming deploys stay
+    # turn-based.
+    default_session_mode="turn",
     # Named after the alias key so the deploy-yaml stem substring-matches the
     # checkpoint directory name (NVIDIA-NemotronLabs-VoiceChat-11B) during
     # bare-path auto-detection.
@@ -47,6 +45,7 @@ NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="thinker",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             final_output=True,
@@ -66,6 +65,8 @@ NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
             stage_id=1,
             model_stage="talker",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             model_arch="NemotronVoiceChatTalkerForConditionalGeneration",
             hf_config_name="talker_config",
             input_sources=(0,),
@@ -79,6 +80,8 @@ NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
             stage_id=2,
             model_stage="code2wav",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             model_arch="NemotronVoiceChatCode2Wav",
             hf_config_name="code2wav_config",
             input_sources=(1,),

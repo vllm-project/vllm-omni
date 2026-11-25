@@ -1,0 +1,23 @@
+pipeline: physis_ltx
+async_chunk: false
+distributed_executor_backend: mp
+dtype: float32
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    enforce_eager: true
+    video_output_transport:
+      enable_device_postprocess: true
+    model_class_name: PhysisLTXPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    default_sampling_params:
+      num_frames: null
+    parallel_config:
+      pipeline_parallel_size: 4
+    model_config:
+      num_denoise_steps: 4
+      ar_diffusion_stage_config:
+        step_replicas: 4
+        max_batch_size: 1
+        max_history_chunks: 18

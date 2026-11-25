@@ -1,0 +1,92 @@
+[
+    {
+        "test_name": "test_lingbot_world_realtime_stability",
+        "description": "LingBot-World 2.0 realtime streaming 24h: 8-GPU Ulysses SP-8 compiled topology (usp4_compiled.yaml base + SP8 stage_overrides), one WS /v1/realtime/video session per batch, 40 chunks/session at 16 fps (12 fps real-time basis).",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "cuda": "H800"
+                    },
+                    "num_cards": 8
+                }
+            },
+            "local_model",
+            "diffusion"
+        ],
+        "server_params": {
+            "model": "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+            "serve_args": {
+                "deploy-config": "benchmarks/lingbot_world/configs/usp4_compiled.yaml"
+            },
+            "stage_overrides": {
+                "0": {
+                    "devices": "0,1,2,3,4,5,6,7",
+                    "parallel_config": {
+                        "ulysses_degree": 8,
+                        "sequence_parallel_size": 8
+                    }
+                }
+            }
+        },
+        "benchmark_params": [
+            {
+                "dataset": "lingbot_world_realtime",
+                "duration_sec": 86400,
+                "max_concurrency": 1,
+                "num_prompts_per_batch": 50,
+                "num_chunks": 40,
+                "fps": 16,
+                "target_fps": 12,
+                "seed": 42,
+                "camera_pattern": "forward",
+                "flow_shift": 5.0
+            }
+        ]
+    },
+    {
+        "test_name": "test_lingbot_world_realtime_stability_a3",
+        "description": "LingBot-World 2.0 realtime streaming 24h on NPU A3: 8-card Ulysses SP-8 eager topology (npu_usp4_eager.yaml base + SP8 stage_overrides), one WS /v1/realtime/video session per batch, 40 chunks/session at 16 fps (12 fps real-time basis).",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "npu": "A3"
+                    },
+                    "num_cards": 8
+                }
+            },
+            "local_model",
+            "diffusion"
+        ],
+        "server_params": {
+            "model": "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+            "serve_args": {
+                "deploy-config": "benchmarks/lingbot_world/configs/npu_usp4_eager.yaml"
+            },
+            "stage_overrides": {
+                "0": {
+                    "devices": "0,1,2,3,4,5,6,7",
+                    "parallel_config": {
+                        "ulysses_degree": 8,
+                        "sequence_parallel_size": 8
+                    }
+                }
+            }
+        },
+        "benchmark_params": [
+            {
+                "dataset": "lingbot_world_realtime",
+                "duration_sec": 86400,
+                "max_concurrency": 1,
+                "num_prompts_per_batch": 50,
+                "num_chunks": 40,
+                "fps": 16,
+                "target_fps": 12,
+                "seed": 42,
+                "camera_pattern": "forward",
+                "flow_shift": 5.0
+            }
+        ]
+    }
+]

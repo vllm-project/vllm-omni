@@ -6,4 +6,4 @@ steps:
     commands:
       - "python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/npu/bootstrap-upload-steps.yml"
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"

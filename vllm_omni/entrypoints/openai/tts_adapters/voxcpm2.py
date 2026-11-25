@@ -3,6 +3,7 @@
 """VoxCPM2 serving adapter (AR base-LM + diffusion side-computation)."""
 
 import time
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -12,9 +13,25 @@ from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechReques
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
+from vllm_omni.entrypoints.openai.tts_adapters.voxcpm2_digits import (
+    normalize_voxcpm2_text,
+    shape_voxcpm2_edge_digits,
+)
 from vllm_omni.utils.speaker_cache import validate_voxcpm2_profile
 
 logger = init_logger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _text_normalizer():
+    """Lazy TextNormalizer singleton (None when unavailable = TN off)."""
+    try:
+        from voxcpm.utils.text_normalize import TextNormalizer
+
+        return TextNormalizer()
+    except Exception:
+        logger.warning("VoxCPM2 TextNormalizer unavailable, TN disabled")
+        return None
 
 
 @register_tts_adapter
@@ -70,17 +87,23 @@ class VoxCPM2Adapter(ARTTSAdapter):
         ref_sr = None
         voice_profile = None
         if request.ref_audio is not None:
-            ref_audio, ref_sr, _ = await server._resolve_ref_audio(request.ref_audio)
+            wav_np, ref_sr, _ = await server._resolve_ref_audio_array(request.ref_audio)
+            ref_audio = np.ascontiguousarray(wav_np, dtype=np.float32).tobytes()
         elif uploaded_ref is not None:
             wav_np, ref_sr = uploaded_ref
-            ref_audio = wav_np.tolist()
+            ref_audio = np.ascontiguousarray(wav_np, dtype=np.float32).tobytes()
         elif request.voice is not None:
             voice_profile = self.capabilities.precomputed_speakers.get(request.voice.lower())
+        # Edge digit-run prosody shaping (comma lead-in / sentence-final stop /
+        # lone-zero sentinel) BEFORE tokenization, then TextNormalizer on the
+        # shaped text; see voxcpm2_digits for the measured rationale.
+        text = shape_voxcpm2_edge_digits(request.input)
+        text = normalize_voxcpm2_text(text, _text_normalizer())
         return build_voxcpm2_prompt(
             hf_config=self.ctx.engine_client.model_config.hf_config,
             tokenizer=self._tokenizer,
             split_map=self._split_map,
-            text=request.input,
+            text=text,
             ref_audio=ref_audio,
             ref_sr=ref_sr,
             ref_text=request.ref_text,
@@ -93,6 +116,11 @@ class VoxCPM2Adapter(ARTTSAdapter):
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
+        if request.ref_audio is not None:
+            fmt_err = server._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
+
         if request.voice is not None:
             request.voice = request.voice.lower()
             available_voices = server._get_available_speakers()
@@ -100,13 +128,7 @@ class VoxCPM2Adapter(ARTTSAdapter):
                 supported = ", ".join(sorted(available_voices)) or "none"
                 return f"Invalid voice '{request.voice}'. Supported: {supported}"
 
-        if request.max_new_tokens is not None:
-            if request.max_new_tokens < self.max_new_tokens_min:
-                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
-            if request.max_new_tokens > self.max_new_tokens_max:
-                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
-
-        return None
+        return self._validate_max_new_tokens(request)
 
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
@@ -127,12 +149,16 @@ class VoxCPM2Adapter(ARTTSAdapter):
                     uploaded_ref = server._load_uploaded_audio(voice_lower)
         prompt = await self._build_prompt(request, uploaded_ref=uploaded_ref)
         tts_params = {}
-        if request.voice:
+        if request.voice and not has_inline_ref_audio:
             voice_lower = request.voice.lower()
             if voice_lower in server.uploaded_speakers or voice_lower in self.capabilities.precomputed_speakers:
+                created_at = server._voice_created_at(voice_lower)
                 additional = prompt.setdefault("additional_information", {})
                 additional["voice_name"] = voice_lower
-                additional["voice_created_at"] = server._voice_created_at(voice_lower)
+                additional["voice_created_at"] = created_at
+                # conditioning_cache_salt() reads voice_created_at from
+                # tts_params, so a re-upload mints a fresh derived salt.
+                tts_params["voice_created_at"] = created_at
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="voxcpm2")
 
     async def warmup(self) -> None:
@@ -174,8 +200,8 @@ class VoxCPM2Adapter(ARTTSAdapter):
             validate_profile=validate_voxcpm2_profile,
         )
 
-    def _load_supported_speakers(self) -> set[str]:
-        return {"default"}
+    def _load_supported_speakers(self) -> list[str]:
+        return ["default"]
 
     def apply_sampling_overrides(
         self,

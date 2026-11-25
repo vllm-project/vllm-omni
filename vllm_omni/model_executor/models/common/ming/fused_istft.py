@@ -8,8 +8,34 @@ The low-precision window rounding follows PyTorch's square, fold, and add
 boundaries; the inverse FFT and the envelope-underflow check remain unchanged.
 """
 
+import contextlib
+import threading
+
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
+
+from .audio_dsp import ISTFTEnvelopeError
+
+_deferred = threading.local()
+
+
+@contextlib.contextmanager
+def deferred_envelope_checks():
+    """Yield checks and report invalid indices with one host sync on exit.
+
+    The check otherwise synchronizes once per call, which serializes the
+    launches of a batch of streaming requests decoded one after another.
+    """
+    checks = _deferred.checks = []
+    try:
+        yield checks
+    finally:
+        _deferred.checks = None
+    if checks:
+        invalid = [index for index, valid in enumerate(torch.stack(checks).tolist()) if not valid]
+        if invalid:
+            raise ISTFTEnvelopeError(invalid)
+
 
 if HAS_TRITON:
 
@@ -172,6 +198,10 @@ def fused_istft(
         block_size=256,
         enable_fp_fusion=False,
     )
-    if not (envelope > 1e-11).all():
-        raise RuntimeError("ISTFT window envelope underflowed; invalid overlap-add state.")
+    valid = (envelope > 1e-11).all()
+    checks = getattr(_deferred, "checks", None)
+    if checks is not None:
+        checks.append(valid)
+    elif not valid:
+        raise ISTFTEnvelopeError()
     return output, next_audio, next_window

@@ -77,6 +77,8 @@ platforms:
     stages:
       # Verified on Intel Arc B60.
       - stage_id: 0
+        # Level Zero cannot record FishSpeechFastAR top-p index assignment.
+        enforce_eager: true
         gpu_memory_utilization: 0.8
         max_model_len: 2048
         max_num_batched_tokens: 2048

@@ -14,7 +14,7 @@ from urllib.parse import unquote, urlparse
 import pytest
 from PIL import Image
 
-from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import _validate_videomme
+from tests.e2e.accuracy.helpers import _validate_videomme
 from vllm_omni.benchmarks.data_modules.videomme_dataset import (
     VideoMMEDataset,
     VideoMMESampleRequest,
@@ -270,7 +270,7 @@ def test_videomme_save_eval_items_cli_sets_env(monkeypatch: pytest.MonkeyPatch) 
         return {"ok": "1"}
 
     monkeypatch.delenv("VIDEOMME_SAVE_EVAL_ITEMS", raising=False)
-    monkeypatch.setattr(serve, "main_async", fake_main_async)
+    monkeypatch.setattr(serve, "vllm_main_async", fake_main_async)
 
     args = Namespace(
         videomme_save_eval_items=True,

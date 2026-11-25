@@ -29,6 +29,7 @@ from collections import defaultdict
 from contextlib import ExitStack
 
 import pytest
+from vllm.device_allocator.cumem import CuMemAllocator
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
@@ -45,9 +46,9 @@ ROUNDS = int(os.environ.get("PAUSE_KEEP_ROUNDS", "2"))
 NUM_INFERENCE_STEPS = 40
 
 
-def _sampling_params() -> OmniDiffusionSamplingParams:
+def _sampling_params(num_inference_steps: int = NUM_INFERENCE_STEPS) -> OmniDiffusionSamplingParams:
     return OmniDiffusionSamplingParams(
-        num_inference_steps=NUM_INFERENCE_STEPS,
+        num_inference_steps=num_inference_steps,
         guidance_scale=0.0,
         height=256,
         width=256,
@@ -56,12 +57,29 @@ def _sampling_params() -> OmniDiffusionSamplingParams:
     )
 
 
-async def _generate(engine: AsyncOmni, request_id: str, events: dict[str, dict[str, float]]):
+def _new_engine(backend: str) -> AsyncOmni:
+    return AsyncOmni(
+        model=MODEL,
+        custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
+        worker_extension_cls=WORKER_EXTENSION_CLASS,
+        enforce_eager=True,
+        enable_sleep_mode=True,
+        distributed_executor_backend=backend,
+    )
+
+
+async def _generate(
+    engine: AsyncOmni,
+    request_id: str,
+    events: dict[str, dict[str, float]],
+    *,
+    num_inference_steps: int = NUM_INFERENCE_STEPS,
+):
     final = None
     async for output in engine.generate(
         prompt={"prompt_ids": list(range(50))},
         request_id=request_id,
-        sampling_params_list=[_sampling_params()],
+        sampling_params_list=[_sampling_params(num_inference_steps)],
         output_modalities=["image"],
     ):
         if is_diffusion_request_started_output(output):
@@ -124,14 +142,7 @@ async def _pause_round(engine: AsyncOmni, events: dict[str, dict[str, float]], r
 @pytest.mark.parametrize("backend", ["uni", "mp"])
 async def test_keep_pause_sleep_wake_resume_lifecycle(backend: str):
     with ExitStack() as after:
-        engine = AsyncOmni(
-            model=MODEL,
-            custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
-            worker_extension_cls=WORKER_EXTENSION_CLASS,
-            enforce_eager=True,
-            enable_sleep_mode=True,
-            distributed_executor_backend=backend,
-        )
+        engine = _new_engine(backend)
         after.callback(engine.shutdown)
         events: dict[str, dict[str, float]] = defaultdict(dict)
 
@@ -155,14 +166,7 @@ async def test_sleep_right_after_keep_pause_keeps_the_running_batch(backend: str
     returns, with the request that was running still un-awaited.
     """
     with ExitStack() as after:
-        engine = AsyncOmni(
-            model=MODEL,
-            custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
-            worker_extension_cls=WORKER_EXTENSION_CLASS,
-            enforce_eager=True,
-            enable_sleep_mode=True,
-            distributed_executor_backend=backend,
-        )
+        engine = _new_engine(backend)
         after.callback(engine.shutdown)
         events: dict[str, dict[str, float]] = defaultdict(dict)
 
@@ -181,3 +185,32 @@ async def test_sleep_right_after_keep_pause_keeps_the_running_batch(backend: str
         await engine.resume_generation()
         b_output = await asyncio.wait_for(_generate(engine, "b", events), 120.0)
         assert b_output.images, "the stage must generate again after wake and resume"
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.asyncio
+async def test_inline_sleep_engine_shutdown_allows_process_reuse():
+    """A second UniProc engine can reuse the process after CuMem teardown."""
+    for engine_index in range(2):
+        engine = _new_engine("uni")
+        try:
+            events: dict[str, dict[str, float]] = defaultdict(dict)
+            output = await asyncio.wait_for(
+                _generate(
+                    engine,
+                    f"reuse-{engine_index}",
+                    events,
+                    num_inference_steps=2,
+                ),
+                120.0,
+            )
+            assert output.images
+            await engine.sleep(level=1)
+            await engine.wake_up()
+        finally:
+            engine.shutdown()
+
+        allocator = CuMemAllocator.get_instance()
+        assert allocator.get_current_usage() == 0

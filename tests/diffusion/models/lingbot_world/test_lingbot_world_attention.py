@@ -74,6 +74,20 @@ def _install_vllm_stubs() -> None:
         _SeqAllToAll4D,
     )
 
+    def _all_to_all_4D(value, scatter_idx=2, gather_idx=1, group=None, use_sync=False, *, _output_destination=None):
+        # Single-rank exchange preserves values, including an owned output buffer.
+        del scatter_idx, gather_idx, group, use_sync
+        if _output_destination is not None:
+            _output_destination.copy_(value)
+            return _output_destination
+        return value
+
+    setattr(
+        sys.modules["vllm_omni.diffusion.distributed.comm"],
+        "all_to_all_4D",
+        _all_to_all_4D,
+    )
+
     def _all_to_all_5D(value, scatter_idx=3, gather_idx=1, group=None, use_sync=False):
         # Single-rank stub: the fused q/k/v exchange is the identity when N == 1.
         del scatter_idx, gather_idx, group, use_sync

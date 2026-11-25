@@ -32,7 +32,7 @@ class OmniCFGARScheduler(OmniARScheduler):
             raise ValueError("Atomic CFG reservations require one full-attention KV group")
         self._capacity = self.kv_cache_manager.block_pool.num_gpu_blocks - 1 - self.kv_cache_manager.watermark_blocks
         pair_pages = 2 * -(-self.max_model_len // self.block_size)
-        if self._capacity < pair_pages or self.max_num_running_reqs < 2:
+        if self._capacity < pair_pages or min(self.max_num_running_reqs, self.max_num_active_reqs) < 2:
             raise ValueError("Atomic CFG requires KV capacity and max_num_seqs for two maximum-length branches")
         if self.max_num_scheduled_tokens < 2 * self.max_model_len:
             raise ValueError("Atomic CFG requires max_num_batched_tokens >= 2 * max_model_len")
@@ -41,6 +41,20 @@ class OmniCFGARScheduler(OmniARScheduler):
         self._prefill_min_output_tokens = int(self.vllm_config.additional_config.get("cfg_prefill_delay_tokens", 0))
         if self._prefill_min_output_tokens < 0:
             raise ValueError("cfg_prefill_delay_tokens cannot be negative")
+
+    def _isolation_unit(self, request: object) -> list[object] | None:
+        """A CFG pair is the isolation unit: both branches must run together."""
+        request_id = getattr(request, "request_id", None)
+        pair_id = self._request_pairs.get(request_id) if request_id is not None else None
+        if pair_id is None:
+            return [request]
+        pair = self._pairs.get(pair_id) or {}
+        if len(pair) != 2:
+            # The companion is not queued: admitting one branch alone would
+            # break the atomic-admission invariant.
+            return None
+        members = [self.requests.get(pair[role]) for role in ("cond", "uncond")]
+        return members if all(member is not None for member in members) else None
 
     def _should_defer_waiting_admission(self) -> bool:
         # Let fresh streaming requests accumulate playback audio before
@@ -81,7 +95,7 @@ class OmniCFGARScheduler(OmniARScheduler):
         admitted = create_request_queue(self.policy)
         pending = {request.request_id: request for request in original_waiting}
         pages = self._capacity - sum(self._reserved_pages(request) for request in self.running)
-        slots = self.max_num_running_reqs - len(self.running)
+        slots = self.max_num_active_reqs - len(self.running)
         tokens = self.max_num_scheduled_tokens - len(self.running)
         chosen: set[str] = set()
         for request in original_waiting:

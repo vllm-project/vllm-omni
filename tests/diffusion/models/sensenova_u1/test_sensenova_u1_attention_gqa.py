@@ -13,13 +13,14 @@ compressed path must compute the same thing the expanded one did.
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer import (
     SenseNovaU1Attention,
     SenseNovaU1Model,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 N_HEADS, N_KV_HEADS, HEAD_DIM, SEQ = 32, 8, 8, 6
 GROUPS = N_HEADS // N_KV_HEADS
@@ -49,6 +50,7 @@ class _AttnHost:
         self.attn = _Recorder()
 
 
+@pytest.mark.cpu
 def test_bhsd_path_hands_the_backend_compressed_kv():
     host = _AttnHost()
     q = torch.randn(1, N_HEADS, SEQ, HEAD_DIM)
@@ -59,6 +61,7 @@ def test_bhsd_path_hands_the_backend_compressed_kv():
     assert key_shape[2] == N_KV_HEADS, f"K reached the backend with {key_shape[2]} heads"
 
 
+@pytest.mark.cpu
 def test_bshd_path_hands_the_backend_compressed_kv():
     host = _AttnHost()
     q = torch.randn(1, SEQ, N_HEADS, HEAD_DIM)
@@ -68,6 +71,7 @@ def test_bshd_path_hands_the_backend_compressed_kv():
     assert key_shape[2] == N_KV_HEADS, f"K reached the backend with {key_shape[2]} heads"
 
 
+@pytest.mark.cpu
 def test_compressed_kv_computes_what_expansion_computed():
     """The backend must return the same tensor either way, or this is a bugfix
     dressed up as a perf change."""
@@ -124,10 +128,12 @@ def _run_model(seq_len: int):
     return probe.masks[-1]
 
 
+@pytest.mark.cpu
 def test_single_token_decode_carries_no_mask():
     assert _run_model(1) is None, "decode still builds the all-zeros mask"
 
 
+@pytest.mark.cpu
 def test_prefill_still_gets_a_causal_mask():
     mask = _run_model(3)
     assert mask is not None and mask.shape == (1, 1, 3, 3)
@@ -153,8 +159,7 @@ def _float64_attention(q, k, v):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused GQA")
-@pytest.mark.cuda
-@pytest.mark.L4
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("kv_len", [271, 512, 2048])
 def test_decode_without_the_no_op_mask_is_closer_to_float64(kv_len):
     """The old decode path expanded K/V and passed an all-zeros mask, which kept

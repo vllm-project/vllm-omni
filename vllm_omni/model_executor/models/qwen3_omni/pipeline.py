@@ -7,6 +7,8 @@ Stage 1: Talker  — text embeddings → RVQ codec codes
 Stage 2: Code2Wav — RVQ codes → audio waveform
 """
 
+from dataclasses import replace
+
 from transformers import Qwen3OmniMoeConfig
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
@@ -45,6 +47,12 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             custom_process_next_stage_input_func=(f"{_PROC}.thinker2talker_full_payload"),
             async_chunk_process_next_stage_input_func=(f"{_PROC}.thinker2talker_async_chunk"),
+            # Takes effect only when the deploy selects model_runner v2 for this stage.
+            # Duplex commits each utterance as a fresh request, so the turn-mode
+            # native data plane also serves duplex. Resumable DFlash speech
+            # acknowledges each segment before publishing to that plane.
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             sampling_constraints={"detokenize": True},
         ),
         StagePipelineConfig(
@@ -57,11 +65,20 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
             custom_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_full_payload"),
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
+            # Each stage can use MRv2 when its deploy selects model_runner v2.
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [2150],
             },
             requires_full_payload_input=True,
+            # A decode step feeds the code predictor's summed embedding plus the
+            # thinker's text_step into PagedAttention, but only the layer-0
+            # codec id enters the token stream. Replaying the prompt after a
+            # preemption cannot rebuild layers 1..7 or last_talker_hidden, so
+            # fail the request instead of resuming it from frame 0.
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=2,
@@ -72,10 +89,20 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             final_output_type="audio",
             hf_config_name="thinker_config",
             engine_output_type="audio",
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             sampling_constraints={"detokenize": True},
             requires_full_payload_input=True,
         ),
     ),
+)
+
+QWEN3_OMNI_RESUMABLE_PIPELINE = replace(
+    QWEN3_OMNI_PIPELINE,
+    model_type="qwen3_omni_moe_resumable",
+    # Scheduler-owned chunk publication confirms the segment boundary before
+    # forwarding Thinker's committed tokens and Talker's codec frames.
+    stages=tuple(replace(stage, supports_native_mrv2_data_plane=False) for stage in QWEN3_OMNI_PIPELINE.stages),
 )
 
 QWEN3_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(

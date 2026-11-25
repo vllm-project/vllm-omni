@@ -17,13 +17,14 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 EDIT_PROMPT = "Transform this modern, geometrist image into a Vincent van Gogh style impressionist painting."
 NEGATIVE_PROMPT = "blurry, low quality, modern, geometrist"
 MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
-BASE_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"})
+BASE_FEATURE_MARKS = hardware_marks(res={"cuda": "L4", "rocm": "MI300"})
 
 
 def _get_diffusion_feature_cases(model: str):
     return [
         pytest.param(
-            OmniServerParams(model=model),
+            # The unsharded transformer alone exceeds the L4's 22 GiB.
+            OmniServerParams(model=model, server_args=["--enable-layerwise-offload"]),
             id="base",
             marks=BASE_FEATURE_MARKS,
         ),

@@ -14,6 +14,12 @@ from vllm_omni.diffusion.attention.parallel import factory, ring
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
+@pytest.fixture(autouse=True)
+def disable_vllm_fa_ring_path(monkeypatch):
+    """Keep fallback-selection tests independent of the installed vLLM wheel."""
+    monkeypatch.setattr(ring, "_can_use_vllm_flash_attn", lambda _device: False)
+
+
 def test_source_build_fa3_is_hopper_only(monkeypatch):
     fake_interface = SimpleNamespace(
         _flash_attn_forward=lambda *args, **kwargs: None,
@@ -53,6 +59,34 @@ def test_can_use_fa3_preserves_unknown_extension_contract(monkeypatch):
     monkeypatch.setattr(ring, "FA3_SUPPORTED_CUDA_MAJORS", None)
 
     assert ring._can_use_fa3(torch.device("cuda"))
+
+
+def test_ring_prefers_vllm_flash_attention(monkeypatch):
+    captured = {}
+
+    def fake_ring_flash_attn_func(*args, **kwargs):
+        captured.update(kwargs)
+        return "output"
+
+    monkeypatch.setattr(ring, "_can_use_vllm_flash_attn", lambda _device: True)
+    monkeypatch.setattr(ring, "_can_use_fa4", lambda _device: True)
+    monkeypatch.setattr(ring, "_can_use_fa3", lambda _device: True)
+    monkeypatch.setattr(ring, "_can_use_fa2", lambda _device: True)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.diffusion.attention.backends.ring_flash_attn",
+        SimpleNamespace(ring_flash_attn_func=fake_ring_flash_attn_func),
+    )
+    query = SimpleNamespace(
+        dtype=torch.bfloat16,
+        shape=(1, 16, 4, 128),
+        device=torch.device("cuda:0"),
+    )
+
+    strategy = ring.RingParallelAttention(SimpleNamespace(ring_group=object()))
+
+    assert strategy.run_attention(query, "key", "value", None) == "output"
+    assert captured["attn_type"].value == "vllm_fa"
 
 
 @pytest.mark.parametrize(

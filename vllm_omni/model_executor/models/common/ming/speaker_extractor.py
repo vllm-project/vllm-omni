@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/spkemb_extractor.py
 """CAM++ speaker-embedding extraction, shared by the Ming model packages."""
 
@@ -30,6 +30,9 @@ class SpeakerEmbeddingExtractor:
 
         self.target_sr = int(target_sr)
         self._core = SpkembExtractor(campplus_path, target_sr=self.target_sr)
+        # Resample kernels depend only on the rate pair; building one per clip
+        # recomputes the sinc kernel.
+        self._resamplers: dict[int, torchaudio.transforms.Resample] = {}
 
     def extract_from_waveform(self, waveform, sample_rate):
         if not isinstance(waveform, torch.Tensor):
@@ -39,7 +42,11 @@ class SpeakerEmbeddingExtractor:
         if tensor.ndim == 1:
             tensor = tensor.unsqueeze(0)
         if int(sample_rate) != self.target_sr:
-            tensor = torchaudio.transforms.Resample(orig_freq=int(sample_rate), new_freq=self.target_sr)(tensor)
+            resampler = self._resamplers.get(int(sample_rate))
+            if resampler is None:
+                resampler = torchaudio.transforms.Resample(orig_freq=int(sample_rate), new_freq=self.target_sr)
+                self._resamplers[int(sample_rate)] = resampler
+            tensor = resampler(tensor)
 
         embedding = self._core._extract_spk_embedding(tensor)
         return embedding.squeeze(0).to(dtype=torch.float32)

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for MossTTSCUDAGraphCodecWrapper numerical equivalence.
 
 Verifies that CUDA Graph-accelerated decoding produces results equivalent
@@ -9,6 +12,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.cudnn import ieee_cudnn_fp32
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.moss_tts.audio_tokenizer import (
     MossAudioTokenizerDecoderOutput,
@@ -19,8 +23,16 @@ from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
 
 pytestmark = [
     pytest.mark.core_model,
-    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
 ]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _ieee_cudnn_fp32():
+    with ieee_cudnn_fp32():
+        yield
+
+
 DEVICE = torch.device("cuda:0")
 NUM_QUANTIZERS = 8
 DOWNSAMPLE_RATE = 4  # synthetic; real checkpoint uses 1920
@@ -92,13 +104,13 @@ class SyntheticCodecModel(nn.Module):
 
 
 @pytest.fixture(scope="module")
-def model():
+def model(_ieee_cudnn_fp32):
     torch.manual_seed(0)
     return SyntheticCodecModel().to(DEVICE).eval()
 
 
 @pytest.fixture(scope="module")
-def wrapper(model):
+def wrapper(model, _ieee_cudnn_fp32):
     w = MossTTSCUDAGraphCodecWrapper(
         model=model,
         capture_sizes=[25, 50, 100],

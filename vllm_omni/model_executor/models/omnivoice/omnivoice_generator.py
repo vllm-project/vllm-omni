@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 OmniVoice Generator (Stage 0) - Iterative unmasking with Qwen3 backbone.
 
@@ -16,6 +16,8 @@ import math
 import random
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
+from functools import cache
 
 import torch
 import torch.nn as nn
@@ -256,11 +258,24 @@ class OmniVoiceRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if _TRITON_AVAILABLE:
+        if _TRITON_AVAILABLE and x.is_cuda:
             return triton_rms_norm(x, self.weight, self.eps)
         variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
         return self.weight * x.to(self.weight.dtype)
+
+
+@cache
+def _vllm_fa2_varlen() -> Callable[..., torch.Tensor] | None:
+    """vLLM's FA2 varlen kernel when this CUDA device supports it, else None."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+        from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
+    except ImportError:
+        return None
+    return flash_attn_varlen_func if is_fa_version_supported(2) else None
 
 
 class OmniVoiceAttention(nn.Module):
@@ -296,6 +311,10 @@ class OmniVoiceAttention(nn.Module):
             skip_sequence_parallel=True,
         )
         self.use_packed_varlen = self.attention_op.attn_backend.supports_multi_doc_packed_varlen()
+        # When the selected backend cannot run packed varlen (for example cuDNN
+        # on sm_12x Blackwell), vLLM's FA2 varlen still keeps the packed
+        # boundaries without building a dense SDPA mask.
+        self.fa2_varlen = None if self.use_packed_varlen else _vllm_fa2_varlen()
 
     def forward(
         self,
@@ -325,6 +344,20 @@ class OmniVoiceAttention(nn.Module):
         q, k, v = (tensor.permute(0, 2, 1, 3).contiguous().to(torch.bfloat16) for tensor in (q, k, v))
         if self.use_packed_varlen:
             out = self.attention_op(q, k, v, attn_metadata)
+        elif self.fa2_varlen is not None:
+            extra = attn_metadata.extra
+            out = self.fa2_varlen(
+                q[0],
+                k[0],
+                v[0],
+                cu_seqlens_q=extra["cu_seqlens_q"],
+                cu_seqlens_k=extra["cu_seqlens_k"],
+                max_seqlen_q=extra["max_seqlen_q"],
+                max_seqlen_k=extra["max_seqlen_k"],
+                softmax_scale=self.scale,
+                causal=False,
+                fa_version=2,
+            ).unsqueeze(0)
         else:
             out = self.attention_op.sdpa_fallback.forward(q, k, v, attn_metadata)
 
@@ -344,7 +377,7 @@ class OmniVoiceMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
-        if _TRITON_AVAILABLE:
+        if _TRITON_AVAILABLE and gate_up.is_cuda:
             return self.down_proj(triton_swiglu(gate_up))
         gate, up = gate_up.chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
@@ -387,7 +420,7 @@ class OmniVoiceTransformerBlock(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        elif _TRITON_AVAILABLE:
+        elif _TRITON_AVAILABLE and hidden_states.is_cuda:
             hidden_states, residual = triton_fused_add_rms_norm(
                 hidden_states,
                 residual,
@@ -401,7 +434,7 @@ class OmniVoiceTransformerBlock(nn.Module):
 
         hidden_states = self.self_attn(hidden_states, rope_table, attn_metadata)
 
-        if _TRITON_AVAILABLE:
+        if _TRITON_AVAILABLE and hidden_states.is_cuda:
             # Fused: (attn_out + residual) + RMSNorm in one kernel
             hidden_states, residual = triton_fused_add_rms_norm(
                 hidden_states,
@@ -771,7 +804,9 @@ class OmniVoiceGenerator(nn.Module):
         self.layers = nn.ModuleList(
             [OmniVoiceTransformerBlock(config, layer_idx) for layer_idx in range(config.llm_num_hidden_layers)]
         )
-        self._needs_sdpa_mask = any(not layer.self_attn.use_packed_varlen for layer in self.layers)
+        self._needs_sdpa_mask = any(
+            not layer.self_attn.use_packed_varlen and layer.self_attn.fa2_varlen is None for layer in self.layers
+        )
         self.norm = OmniVoiceRMSNorm(config.llm_hidden_size, eps=config.llm_rms_norm_eps)
 
         # Prediction head: hidden → 8 * 1025
@@ -968,6 +1003,7 @@ class OmniVoiceGenerator(nn.Module):
         layer_penalty_factor: float = 5.0,
         position_temperature: float = 5.0,
         class_temperature: float = 0.0,
+        generators: list[torch.Generator] | None = None,
     ) -> torch.Tensor:
         """Run the full 32-step iterative unmasking generation.
 
@@ -987,6 +1023,8 @@ class OmniVoiceGenerator(nn.Module):
             position_temperature: Gumbel temperature for position selection.
             class_temperature: Token sampling temperature; zero selects greedy
                 decoding.
+            generators: Optional persistent generator per request, overriding
+                seed to preserve random state across chunks.
 
         Returns:
             Packed generated audio tokens with shape
@@ -997,13 +1035,16 @@ class OmniVoiceGenerator(nn.Module):
         total_target_lens = sum(target_lens)
         mask_id = self.config.audio_mask_id
         num_codebooks = self.config.num_audio_codebook
-        seeds = seed if isinstance(seed, list) else [seed] * B
-        generators = [
-            torch.Generator(device=device).manual_seed(
-                request_seed if request_seed is not None else random.randint(0, 2**63 - 1)
-            )
-            for request_seed in seeds
-        ]
+        if generators is None:
+            seeds = seed if isinstance(seed, list) else [seed] * B
+            generators = [
+                torch.Generator(device=device).manual_seed(
+                    request_seed if request_seed is not None else random.randint(0, 2**63 - 1)
+                )
+                for request_seed in seeds
+            ]
+        elif len(generators) != B:
+            raise ValueError("generators must contain one generator per request")
 
         # Initialize all target tokens as [MASK]
         tokens = torch.full((1, num_codebooks, total_target_lens), mask_id, dtype=torch.long, device=device)

@@ -9,11 +9,14 @@ import asyncio
 import queue
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.commands import Heartbeat
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -23,9 +26,17 @@ from vllm_omni.engine.duplex.messages import (
     ResumeDuplexSessionMessage,
     TouchDuplexSessionMessage,
 )
+from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, validate_duplex_replica_policy
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class _OrchestratorPlugin:
+    """Satisfies ``configure_async_chunk`` without a full duplex plugin."""
+
+    def configure_async_chunk(self, *, enabled: bool) -> None:
+        del enabled
 
 
 class _FakeRpcClient:
@@ -48,7 +59,7 @@ class _FakeSyncQueue:
         self.items: list[Any] = []
         self.full = full
 
-    def put(self, item: Any, timeout: float | None = None) -> None:
+    def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
         if self.full:
             raise queue.Full
         self.items.append(item)
@@ -72,18 +83,41 @@ async def test_open_session_runs_the_correlated_rpc_with_the_typed_config() -> N
     result = _ok("open", capabilities=DuplexCapabilities(), public_session={"id": "sid"}, lease_generation=0)
     engine = _engine(result)
     config = DuplexSessionConfig(model="m")
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
 
-    returned = await engine.open_session_async("sid", config, timeout=3.0)
+    returned = await engine.open_session_async("sid", config, output_buffer=output_buffer, timeout=3.0)
 
     assert returned is result
     ((key, message, timeout),) = engine.rpc_client.calls
     assert key == ("duplex", message.control_id)
     assert isinstance(message, OpenDuplexSessionMessage)
     assert message.session_id == "sid" and message.session_config is config
+    assert message.output_buffer is output_buffer
     assert timeout == 3.0
     # A momentarily full request queue is backpressure, not a failed open: the
     # control RPC blocks rather than raising an untyped queue.Full at the caller.
     assert engine.rpc_client.block_on_submit_flags == [True]
+
+
+@pytest.mark.asyncio
+async def test_open_uses_the_cold_start_budget_and_controls_keep_the_short_one() -> None:
+    # #9072: the first open on a cold engine also initializes per-session runner
+    # state, which can exceed the 10 s control budget. Only open gets the longer
+    # budget; control ops on a live session keep the short one.
+    from vllm_omni.engine.duplex_omni_engine import _DEFAULT_CONTROL_TIMEOUT_S, _DEFAULT_OPEN_TIMEOUT_S
+
+    assert _DEFAULT_OPEN_TIMEOUT_S > _DEFAULT_CONTROL_TIMEOUT_S
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+
+    open_engine = _engine(
+        _ok("open", capabilities=DuplexCapabilities(), public_session={"id": "sid"}, lease_generation=0)
+    )
+    await open_engine.open_session_async("sid", DuplexSessionConfig(), output_buffer=output_buffer)
+    assert open_engine.rpc_client.calls[-1][2] == _DEFAULT_OPEN_TIMEOUT_S
+
+    control_engine = _engine(_ok("close"))
+    await control_engine.close_session_async("sid")
+    assert control_engine.rpc_client.calls[-1][2] == _DEFAULT_CONTROL_TIMEOUT_S
 
 
 @pytest.mark.asyncio
@@ -116,7 +150,9 @@ async def test_failed_control_result_maps_to_a_typed_session_error() -> None:
         )
     )
     with pytest.raises(DuplexSessionError) as excinfo:
-        await engine.open_session_async("sid", DuplexSessionConfig())
+        await engine.open_session_async(
+            "sid", DuplexSessionConfig(), output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+        )
     assert excinfo.value.code == "resource_exhausted"
     assert excinfo.value.retryable is True
     assert excinfo.value.session_id == "sid"
@@ -133,14 +169,18 @@ async def test_engine_error_and_timeout_map_to_session_errors() -> None:
 
     engine = _engine(TimeoutError("duplex open timed out for session sid"))
     with pytest.raises(DuplexSessionError) as excinfo:
-        await engine.open_session_async("sid", DuplexSessionConfig())
+        await engine.open_session_async(
+            "sid", DuplexSessionConfig(), output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+        )
     assert excinfo.value.code == "timeout" and excinfo.value.retryable is True
 
 
 @pytest.mark.asyncio
-async def test_submit_command_is_one_way_on_the_request_queue() -> None:
+async def test_submit_command_is_one_way_on_the_request_queue(monkeypatch) -> None:
     engine = _engine(None)
     command = Heartbeat(event_id="evt-1")
+    executor = Mock(side_effect=AssertionError("uncontended enqueue must not use the executor"))
+    monkeypatch.setattr(asyncio.get_running_loop(), "run_in_executor", executor)
 
     await engine.submit_command_async("sid", command)
 
@@ -148,6 +188,61 @@ async def test_submit_command_is_one_way_on_the_request_queue() -> None:
     assert isinstance(message, DuplexSessionCommandMessage)
     assert message.session_id == "sid" and message.command is command
     assert engine.rpc_client.calls == []
+    executor.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_full_command_queue_offloads_wait_and_preserves_sequential_order(monkeypatch) -> None:
+    engine = _engine(None)
+    sync_q: queue.Queue[object] = queue.Queue(maxsize=1)
+    occupied = object()
+    sync_q.put_nowait(occupied)
+    engine.request_queue.sync_q = sync_q
+    loop = asyncio.get_running_loop()
+    waiting = asyncio.Event()
+    original_submit = engine._submit_command
+    attempts: list[tuple[DuplexSessionCommandMessage, bool]] = []
+
+    def submit_after_full(message: DuplexSessionCommandMessage, *, block: bool = True) -> None:
+        attempts.append((message, block))
+        if block:
+            loop.call_soon_threadsafe(waiting.set)
+        original_submit(message, block=block)
+
+    monkeypatch.setattr(engine, "_submit_command", submit_after_full)
+    first, second = Heartbeat(event_id="first"), Heartbeat(event_id="second")
+
+    async def publish():
+        await engine.submit_command_async("sid", first)
+        await engine.submit_command_async("sid", second)
+
+    async def receive():
+        while True:
+            try:
+                return sync_q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.001)
+
+    task = asyncio.create_task(publish())
+    received = []
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=2)
+        assert not task.done()
+        assert len(attempts) == 2
+        assert attempts[0][1] is False and attempts[1][1] is True
+        assert attempts[0][0] is attempts[1][0]
+        assert sync_q.get_nowait() is occupied
+        for _ in range(2):
+            message = await asyncio.wait_for(receive(), timeout=2)
+            received.append(message.command)
+        await asyncio.wait_for(task, timeout=2)
+        assert received == [first, second]
+    finally:
+        # Release any blocked publisher if an assertion above fails.
+        while not sync_q.empty():
+            sync_q.get_nowait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -172,6 +267,35 @@ def test_duplex_capabilities_come_from_the_loaded_plugin() -> None:
     assert engine.duplex_capabilities is capabilities
 
 
+@pytest.mark.parametrize(("count", "index"), [(1, 0), (4, 0), (4, 3)])
+def test_orchestrator_receives_real_frontend_identity_and_exposes_warmup_budget(monkeypatch, count, index) -> None:
+    engine = object.__new__(DuplexOmniEngine)
+    engine.plugin = _OrchestratorPlugin()
+    engine.async_chunk = False
+    engine.duplex_session_config = DuplexSessionRuntimeConfig(max_sessions=64)
+    engine.pipeline_config = SimpleNamespace(stages=[SimpleNamespace(stage_id=0, owns_tokenizer=True)])
+    engine.stage_pools = []
+    engine._client_config = {"client_count": count, "client_index": index, "stage_addresses": {}}
+    received = {}
+    orchestrator = SimpleNamespace(
+        replica_placement=SimpleNamespace(live_group_count=2),
+        session_manager=SimpleNamespace(admission_limit=16),
+    )
+
+    def create(**kwargs):
+        received.update(kwargs)
+        return orchestrator
+
+    monkeypatch.setattr("vllm_omni.engine.duplex_orchestrator.DuplexOrchestrator", create)
+    assert engine._create_orchestrator() is orchestrator
+    assert received["frontend_count"] == count
+    assert received["frontend_index"] == index
+    assert received["duplex_session_config"].max_sessions == 64
+    assert engine._client_config["client_count"] == count and engine._client_config["client_index"] == index
+    assert engine.duplex_frontend_group_count == 2
+    assert engine.duplex_frontend_max_sessions == 16
+
+
 def test_validate_deployment_requires_a_plugin_and_duplex_session_mode() -> None:
     engine = object.__new__(DuplexOmniEngine)
     engine.model = "plain-model"
@@ -188,6 +312,116 @@ def test_validate_deployment_requires_a_plugin_and_duplex_session_mode() -> None
     engine.deploy_config = None
     with pytest.raises(ValueError, match="none resolved"):
         engine._validate_deployment()
+
+
+def test_duplex_runtime_uses_tokenizer_owner_model_config(monkeypatch):
+    from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import JOYAI_VL_INTERACTION_ASR_PIPELINE
+
+    engine = object.__new__(DuplexOmniEngine)
+    engine.plugin = _OrchestratorPlugin()
+    engine.async_chunk = False
+    engine.pipeline_config = JOYAI_VL_INTERACTION_ASR_PIPELINE
+    engine.duplex_session_config = object()
+    engine._client_config = None
+    configs = [object(), object(), object(), object()]
+    engine.stage_pools = [SimpleNamespace(stage_vllm_config=SimpleNamespace(model_config=config)) for config in configs]
+    received = {}
+    orchestrator = SimpleNamespace(replica_placement=None, session_manager=SimpleNamespace(admission_limit=1))
+
+    def create(**kwargs):
+        received.update(kwargs)
+        return orchestrator
+
+    monkeypatch.setattr("vllm_omni.engine.duplex_orchestrator.DuplexOrchestrator", create)
+    assert engine._create_orchestrator() is orchestrator
+    assert received["model_config"] is configs[1]
+    assert received["frontend_count"] == 1
+    assert received["frontend_index"] == 0
+
+
+@pytest.mark.parametrize(
+    ("replica_policy", "replica_cap", "single_stage_mode", "supports_sharing", "error"),
+    [
+        # Plugin sharing capability is checked in local and distributed mode;
+        # placement validates topology once the stage pools exist.
+        ("least_sessions", 1, True, False, None),
+        ("least_sessions", 2, True, True, None),
+        ("least_sessions", 2, True, False, "set max_sessions_per_replica to 1"),
+        ("least_sessions", 2, False, False, "set max_sessions_per_replica to 1"),
+        ("least_sessions", 1, False, False, None),
+        ("least_sessions", 2, False, True, None),
+        ("legacy", None, True, False, None),
+        ("legacy", 2, False, False, None),
+    ],
+)
+def test_validate_deployment_checks_replica_policy_before_starting_workers(
+    monkeypatch,
+    mocker,
+    replica_policy: str,
+    replica_cap: int | None,
+    single_stage_mode: bool,
+    supports_sharing: bool,
+    error: str | None,
+) -> None:
+    engine = object.__new__(DuplexOmniEngine)
+    engine.model = "fake-duplex-model"
+    engine.pipeline_config = SimpleNamespace(duplex_plugin="fake.Plugin")
+    runtime_config = DuplexSessionRuntimeConfig(
+        max_sessions=11,
+        replica_policy=replica_policy,
+        max_sessions_per_replica=replica_cap,
+    )
+    engine.deploy_config = SimpleNamespace(session_mode="duplex", duplex_session=runtime_config)
+    engine.single_stage_mode = single_stage_mode
+    engine._audio_encoder = object()
+    capability_calls: list[int] = []
+    configure_pipeline_calls: list[object] = []
+
+    def configure_pipeline(pipeline_config) -> None:
+        configure_pipeline_calls.append(pipeline_config)
+
+    def capabilities(*, max_sessions: int) -> DuplexCapabilities:
+        capability_calls.append(max_sessions)
+        return DuplexCapabilities(supports_multi_session_same_replica=supports_sharing)
+
+    plugin = mocker.Mock(spec=DuplexModelPlugin, capabilities=capabilities, configure_pipeline=configure_pipeline)
+
+    def load_plugin(path: str, audio_encoder):
+        assert path == "fake.Plugin"
+        assert audio_encoder is engine._audio_encoder
+        return plugin
+
+    monkeypatch.setattr("vllm_omni.engine.duplex_omni_engine.load_duplex_plugin", load_plugin)
+    validation_calls: list[bool] = []
+
+    def validate_policy(candidate_plugin, candidate_config) -> None:
+        assert candidate_plugin is plugin
+        assert candidate_config is runtime_config
+        assert len(configure_pipeline_calls) == 1
+        assert configure_pipeline_calls[0] is engine.pipeline_config
+        plugin.configure_server.assert_called_once_with(runtime_config)
+        validation_calls.append(engine.single_stage_mode)
+        validate_duplex_replica_policy(candidate_plugin, candidate_config)
+
+    monkeypatch.setattr("vllm_omni.engine.duplex_omni_engine.validate_duplex_replica_policy", validate_policy)
+
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            engine._validate_deployment()
+    else:
+        engine._validate_deployment()
+        assert engine.plugin is plugin
+        assert engine.duplex_session_config is runtime_config
+
+    # Validation uses per-replica capacity whenever least_sessions may share a
+    # replica, including single-stage mode; only legacy or cap<=1 skips it.
+    expected_calls = (
+        [replica_cap] if replica_policy == "least_sessions" and replica_cap is not None and replica_cap > 1 else []
+    )
+    assert capability_calls == expected_calls
+    assert validation_calls == [single_stage_mode]
+    assert len(configure_pipeline_calls) == 1
+    assert configure_pipeline_calls[0] is engine.pipeline_config
 
 
 @pytest.mark.asyncio

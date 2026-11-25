@@ -20,6 +20,13 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.entrypoints.serve.engine.protocol import UsageInfo
 
+from tests.helpers.serving_chat import (
+    build_serving_chat,
+    collect_stream,
+    make_request,
+    make_text_omni_output,
+    parse_sse_chunks,
+)
 from vllm_omni.entrypoints.openai.protocol.audio import AudioChunkMetadata
 from vllm_omni.entrypoints.openai.protocol.chat_completion import (
     OmniChatCompletionResponse,
@@ -28,6 +35,46 @@ from vllm_omni.entrypoints.openai.protocol.chat_completion import (
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.parametrize(
+    "modalities", [("audio", "text"), ("text", "audio"), ("text",)], ids=["audio-first", "audio-last", "missing-audio"]
+)
+async def test_stream_preserves_text_termination_until_last_modality(mocker, finish_reason, modalities):
+    serving = build_serving_chat()
+    request = make_request(modalities=["text", "audio"], n=2)
+
+    async def results():
+        for modality in modalities:
+            for index in range(2):
+                reason = finish_reason if modality == "text" and index == 0 else "stop"
+                output = make_text_omni_output(text="Hello", finish_reason=reason, index=index)
+                output.final_output_type = modality
+                yield output
+
+    lines = await collect_stream(
+        serving.chat_completion_stream_generator(
+            request=request,
+            result_generator=results(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=mocker.Mock(),
+            request_metadata=mocker.Mock(),
+        )
+    )
+    chunks = parse_sse_chunks(lines)
+    assert not any("error" in chunk for chunk in chunks)
+    reasons = [
+        (choice["index"], choice["finish_reason"])
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert reasons == [(0, finish_reason), (1, "stop")]
+    assert lines[-1] == "data: [DONE]\n\n"
 
 
 def _text_choice(index: int, content: str) -> ChatCompletionResponseChoice:

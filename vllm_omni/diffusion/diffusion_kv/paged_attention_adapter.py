@@ -84,14 +84,18 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         attention_config = vllm_config.attention_config
         previous_backend = attention_config.backend
         previous_backend_per_kind = attention_config.backend_per_kind
-        previous_pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+        parallel_config = vllm_config.parallel_config
+        previous_pcp_size = parallel_config.prefill_context_parallel_size
         try:
             # This is a portable vLLM backend request. The active platform
             # resolves it to its native implementation, such as FlashAttention
             # on CUDA or AscendAttentionBackend on NPU.
             attention_config.backend = AttentionBackendEnum.FLASH_ATTN
             attention_config.backend_per_kind = {}
-            vllm_config.parallel_config.prefill_context_parallel_size = 1
+            # Diffusion maps SP to PCP for MoE, not for attention. Omni's
+            # Ulysses hooks gather the sequence and shard heads before this
+            # native kernel, so backend selection must not request PCP.
+            parallel_config.prefill_context_parallel_size = 1
             with set_current_vllm_config(vllm_config):
                 attn_backend = get_attn_backend(
                     head_size=spec.head_size,
@@ -103,7 +107,7 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         finally:
             attention_config.backend = previous_backend
             attention_config.backend_per_kind = previous_backend_per_kind
-            vllm_config.parallel_config.prefill_context_parallel_size = previous_pcp_size
+            parallel_config.prefill_context_parallel_size = previous_pcp_size
         attn_backend = current_omni_platform.get_diffusion_paged_kv_attn_backend(
             attn_backend,
             ulysses_degree=ulysses_degree,
@@ -426,7 +430,10 @@ class DiffusionPagedAttentionAdapter:
         row_indices: list[int],
     ) -> None:
         native_num_blocks = self.block_tables.num_blocks.np
-        blocks_per_kv_block = self.block_tables.blocks_per_kv_block
+        # 02e55d2af3 (#57169): BlockTables pages directly at each group's
+        # block_size; the kernel-block subdivision ratio no longer exists,
+        # so the per-group multiplier below is identity.
+        blocks_per_kv_block = [1] * len(self.block_tables.block_sizes)
         for row, row_index in zip(rows, row_indices, strict=True):
             if type(row_index) is not int or not 0 <= row_index < self.block_tables.max_num_reqs:
                 raise ValueError(f"Paged attention row {row.identity!r} resolved to invalid Worker row {row_index!r}")

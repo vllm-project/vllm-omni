@@ -184,11 +184,12 @@ def _cfg_prediction(
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize(
     "_hardware",
-    [pytest.param(None, marks=hardware_marks(res={"cuda": "H100"}))],
+    [pytest.param(None, marks=hardware_marks(res={"cuda": "H100", "rocm": "MI300"}))],
 )
 def test_sana_video_quick_pipeline_stages_match_diffusers(
     variant: str,
     _hardware,
+    sana_model_parallel,
 ) -> None:
     """Compare the first denoising step without replacing native attention.
 

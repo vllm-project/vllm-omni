@@ -86,6 +86,8 @@ class MoTRowParallelLinear(RowParallelLinear):
         # and process these secondary weights without requiring a dedicated,
         # boilerplate Module subclass just for the VAE pathway.
         self.gen_exp = torch.nn.Module()
+        # Native online loading also reads the config for quantization timing.
+        self.gen_exp.quant_config = self.quant_config
 
         # ``gen_exp`` participates in the same tensor-parallel layout as this
         # layer.  vLLM's online quantizers inspect these attributes while

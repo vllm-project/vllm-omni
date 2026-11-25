@@ -154,6 +154,7 @@ class TestSetTfModelConfig:
         cfg = object.__new__(OmniDiffusionConfig)
         cfg.quantization_config = None
         cfg.tf_model_config = None
+        cfg.diffusion_attention_config = None
         return cfg
 
     def test_propagates_quant_config_when_none(self, mocker: MockerFixture):

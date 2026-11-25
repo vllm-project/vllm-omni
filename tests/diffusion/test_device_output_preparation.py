@@ -102,7 +102,7 @@ def test_device_oom_falls_back_to_request_owned_float_media(monkeypatch: pytest.
     source = torch.randn(2, 3, 2, 4, 5)
     sliced = slice_diffusion_media_output(_media(source), 0, 1)
 
-    def raise_oom(video: torch.Tensor, *, do_denormalize: bool) -> torch.Tensor:
+    def raise_oom(video: torch.Tensor, *, do_denormalize: bool, preserve_input_dtype: bool) -> torch.Tensor:
         raise torch.OutOfMemoryError("injected")
 
     monkeypatch.setattr(device_reduction, "reduce_video_to_uint8_frames", raise_oom)
@@ -122,7 +122,7 @@ def test_device_oom_falls_back_to_request_owned_float_media(monkeypatch: pytest.
 
 
 def test_device_non_oom_error_is_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
-    def raise_runtime_error(video: torch.Tensor, *, do_denormalize: bool) -> torch.Tensor:
+    def raise_runtime_error(video: torch.Tensor, *, do_denormalize: bool, preserve_input_dtype: bool) -> torch.Tensor:
         raise RuntimeError("injected")
 
     monkeypatch.setattr(device_reduction, "reduce_video_to_uint8_frames", raise_runtime_error)

@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import logging
+from typing import Any
 
 import torch
 from vllm.inputs import TextPrompt
@@ -7,11 +11,14 @@ from vllm_omni.data_entry_keys import (
     EmbeddingsStruct,
     HiddenStatesStruct,
     IdsStruct,
-    OmniPayload,
     OmniPayloadStruct,
     to_dict,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_speaker_from_prompt,
+    extract_speaker_from_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,17 +72,19 @@ def _strip_codec_boundaries(token_ids: list[int]) -> list[int]:
 
 def talker2code2wav_token_only(
     source_outputs,
-    _prompt: OmniTokensPrompt | TextPrompt = None,
+    prompt: OmniTokensPrompt | TextPrompt = None,
     _requires_multimodal_data: bool = False,
 ):
     """Sync-side placeholder for Stage-2 input (code2wav).
 
     Returns OmniTokensPrompt sized to the stripped codec token count.
     Actual codec ids are delivered via the worker connector payload built
-    by ``talker2code2wav_full_payload``.
+    by ``talker2code2wav_full_payload``. The requested speaker is copied
+    from the original prompt because Code2Wav selects the voice's
+    conditioning from it.
     """
     code2wav_inputs = []
-    for talker_output in source_outputs:
+    for i, talker_output in enumerate(source_outputs):
         output = talker_output.outputs[0]
         token_ids = _strip_codec_boundaries(list(output.cumulative_token_ids))
         if not token_ids:
@@ -83,7 +92,8 @@ def talker2code2wav_token_only(
         code2wav_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * len(token_ids),
-                additional_information=None,
+                additional_information=to_dict(OmniPayloadStruct(speaker=extract_speaker_from_prompt(prompt, index=i)))
+                or None,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )
@@ -120,10 +130,14 @@ def talker2code2wav_full_payload(
             rid,
         )
         return None
-    return {
+    payload: dict[str, Any] = {
         "codes": {"audio": token_ids},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
+    speaker = extract_speaker_from_request(request)
+    if speaker is not None:
+        payload["speaker"] = speaker
+    return payload
 
 
 # ============================================================================
@@ -153,6 +167,8 @@ def thinker2talker_token_only(
     payload (hidden_states / embed / ids) ships exclusively through
     ``thinker2talker_full_payload`` via the worker connector and lands
     in ``model_intermediate_buffer`` before the talker's forward() runs.
+    The requested speaker is copied from the original prompt so the
+    talker request carries it on to Code2Wav.
 
     Consumer-wait gating is driven by
     ``requires_full_payload_input=True`` in the pipeline topology
@@ -166,14 +182,15 @@ def thinker2talker_token_only(
         thinker_output.request_id: p.get("multi_modal_data", None) for thinker_output, p in zip(thinker_outputs, prompt)
     }
 
-    for thinker_output in thinker_outputs:
+    for i, thinker_output in enumerate(thinker_outputs):
         prompt_token_ids = thinker_output.prompt_token_ids
         talker_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[TALKER_CODEC_START_TOKEN_ID]
                 + [TALKER_CODEC_PAD_TOKEN_ID] * (len(prompt_token_ids))
                 + [TALKER_CODEC_END_TOKEN_ID],
-                additional_information=None,
+                additional_information=to_dict(OmniPayloadStruct(speaker=extract_speaker_from_prompt(prompt, index=i)))
+                or None,
                 multi_modal_data=(
                     multi_modal_data[thinker_output.request_id]
                     if requires_multimodal_data and multi_modal_data is not None
@@ -212,13 +229,14 @@ def thinker2talker_full_payload(
     consumes the same payload layout from either path.
 
     Like ``qwen3_omni.thinker2talker_full_payload``, we apply a
-    finish-reason-aware stop-row trim: vLLM v1 appends the sampled
-    token to ``output_token_ids`` before ``check_stop``, so a request
-    that finished via ``FINISHED_STOPPED`` has one extra accumulated
-    hidden-state row that the talker must not consume.  Max-token
-    finishes need no drop.  Status is read from the request when
-    available; otherwise we fall back to a last-token-in-stop-set
-    heuristic.
+    finish-reason-aware stop-token trim.  The sampled token that closes
+    generation has no subsequent decode forward, so it has no matching
+    hidden-state row.  For ``FINISHED_STOPPED`` that token is the stop token
+    and is removed explicitly.  For a length cap it may be a normal text
+    token, so the final alignment step below trims any trailing token ids that
+    have no captured decode row.  This matches the Hugging Face generation
+    output contract, which conditions the talker only on represented rows and
+    then appends text EOS and pad embeddings.
     """
     del transfer_manager
     rid = getattr(request, "request_id", "?")
@@ -259,7 +277,7 @@ def thinker2talker_full_payload(
 
     # Length-aware trim of accumulated thinker output, finish-reason-aware.
     # Mirror qwen3_omni.thinker2talker_full_payload's logic so a stop-finish
-    # does not leak an extra hidden-state row to the talker.
+    # does not leak a terminal token id without a matching hidden-state row.
     status = getattr(request, "status", None)
     status_name = getattr(status, "name", None) or ""
     if not status_name and status is not None:
@@ -293,10 +311,10 @@ def thinker2talker_full_payload(
                 stop_emission_drop = 1
 
     # Trim accumulated thinker output based on stop_emission_drop computed
-    # above.  Mirror qwen3_omni.thinker2talker_full_payload's contract:
-    #   target_rows = len(all_token_ids) - stop_emission_drop
-    # which excludes the stop-emission row for FINISHED_STOPPED but keeps
-    # all rows for FINISHED_LENGTH_CAPPED (max_tokens) finishes.
+    # above.  This excludes the stop token for FINISHED_STOPPED.  A
+    # FINISHED_LENGTH_CAPPED request is reconciled against the actually
+    # captured decode rows below because its final sampled token has no later
+    # forward pass.
     if stop_emission_drop > 0 and len(output_token_ids) >= stop_emission_drop:
         output_token_ids = output_token_ids[:-stop_emission_drop]
     h = hidden.detach().cpu().to(torch.float32)
@@ -334,10 +352,26 @@ def thinker2talker_full_payload(
         )
         return None
 
-    prefill_hidden = h[:prompt_len]
-    decode_hidden = h[prompt_len:]
+    decode_rows = int(h.shape[0]) - prompt_len
+    if len(output_token_ids) > decode_rows:
+        missing_rows = len(output_token_ids) - decode_rows
+        log_level = logging.DEBUG if status_name == "FINISHED_LENGTH_CAPPED" and missing_rows == 1 else logging.WARNING
+        logger.log(
+            log_level,
+            "qwen2_5_omni.thinker2talker_full_payload: output token ids exceed "
+            "captured decode rows (tokens=%d, rows=%d, status=%s) for req=%s; "
+            "trimming trailing unrepresented token ids",
+            len(output_token_ids),
+            decode_rows,
+            status_name or "unknown",
+            getattr(request, "request_id", "?"),
+        )
+        output_token_ids = output_token_ids[:decode_rows]
 
-    payload: OmniPayload = to_dict(
+    prefill_hidden = h[:prompt_len]
+    decode_hidden = h[prompt_len : prompt_len + len(output_token_ids)]
+
+    payload = to_dict(
         OmniPayloadStruct(
             hidden_states=HiddenStatesStruct(
                 output=decode_hidden,
@@ -356,4 +390,7 @@ def thinker2talker_full_payload(
     # Intentionally omit payload["meta"]: the thinker->talker transition
     # carries no scheduler-relevant metadata (next_stage_prompt_len /
     # left_context_size are not set on this edge).
+    speaker = extract_speaker_from_request(request)
+    if speaker is not None:
+        payload["speaker"] = speaker
     return payload

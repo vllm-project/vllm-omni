@@ -4,15 +4,14 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import get_dcp_group
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
-from vllm.v1.worker import block_table as native_block_table
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec, get_block_table_width
 from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
 
@@ -154,6 +153,7 @@ class DiffusionKVModelRunnerBackend:
 
         if attention_geometry is not None:
             num_heads, num_kv_heads, head_size = attention_geometry
+            assert callable(set_attention_geometry)
             try:
                 set_attention_geometry(
                     num_heads=num_heads,
@@ -245,7 +245,7 @@ class DiffusionKVModelRunnerBackend:
         if any(type(capacity) is not int or capacity <= 0 for capacity in unaligned_max_num_blocks_per_group):
             raise ValueError("native diffusion KV cache groups must have positive row capacities")
         max_num_blocks_per_group = [
-            native_block_table.get_block_table_width(capacity, block_size)
+            get_block_table_width(capacity, block_size)
             for capacity, block_size in zip(unaligned_max_num_blocks_per_group, block_sizes, strict=True)
         ]
 
@@ -277,7 +277,8 @@ class DiffusionKVModelRunnerBackend:
                     max_num_batched_tokens=max_num_batched_tokens,
                     max_num_blocks_per_group=max_num_blocks_per_group,
                     device=self.device,
-                    kernel_block_sizes=kernel_block_sizes,
+                    # 02e55d2af3 (#57169): BlockTables derives the packed
+                    # layout from block_sizes; kernel_block_sizes is gone.
                     cp_size=cp_size,
                     cp_rank=cp_rank,
                     cp_interleave=cp_interleave,
@@ -396,6 +397,15 @@ class DiffusionKVModelRunnerBackend:
         for sequence in metadata.sequences:
             if type(sequence.sequence_id) is not int or sequence.sequence_id < 0:
                 raise ValueError(f"Diffusion KV sequence_id must be a non-negative integer: {sequence.sequence_id!r}")
+            if (
+                type(sequence.cached_prefix_len) is not int
+                or sequence.cached_prefix_len < 0
+                or sequence.cached_prefix_len > sequence.prefix_len
+            ):
+                raise ValueError(
+                    "Diffusion KV cached_prefix_len must lie within the stable prefix: "
+                    f"cached={sequence.cached_prefix_len!r}, prefix={sequence.prefix_len!r}"
+                )
             sequence_identity = (metadata.request_id, sequence.sequence_id, None)
             sequence_install = self._validate_row(
                 identity=sequence_identity,
@@ -410,6 +420,7 @@ class DiffusionKVModelRunnerBackend:
                     sequence.prefix_len,
                     sequence.target_len,
                     sequence.seq_len,
+                    sequence.cached_prefix_len,
                     sequence_install.block_ids,
                     sequence.context_ids,
                 )
@@ -593,7 +604,7 @@ class DiffusionKVModelRunnerBackend:
                     )
         raise RuntimeError(f"Diffusion KV request state is missing logical length for {identity!r}")
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> int:
+    def remove_diffusion_kv_requests(self, request_ids: Sequence[str | tuple[str, int]]) -> int:
         """Retire Worker rows without logically freeing Scheduler-owned blocks."""
         if (
             not is_scheduler_paged_kv_mode(

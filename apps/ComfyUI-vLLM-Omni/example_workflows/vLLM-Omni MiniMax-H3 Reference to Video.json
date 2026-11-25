@@ -412,6 +412,15 @@
             "name": "flow_shift"
           },
           "link": null
+        },
+        {
+          "localized_name": "audio_mode",
+          "name": "audio_mode",
+          "type": "COMBO",
+          "widget": {
+            "name": "audio_mode"
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -429,7 +438,8 @@
       },
       "widgets_values": [
         3.0,
-        12.0
+        12.0,
+        "native"
       ],
       "title": "H3 video/audio flow shifts"
     },

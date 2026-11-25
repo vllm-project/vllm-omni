@@ -50,7 +50,7 @@ def build_acc_benchmark_cli_argv(
     num_prompts: int | None = None,
     max_concurrency: int | None = None,
 ) -> list[str]:
-    """Prefix argv for :func:`run_qwen_omni_acc_benchmark.parse_acc_benchmark_args` + :func:`run_acc_benchmark`.
+    """Prefix argv for :func:`tests.e2e.accuracy.helpers.parse_acc_benchmark_args` + :func:`run_acc_benchmark`.
 
     Wires ``--host`` / ``--port`` / ``--model`` to a running Omni OpenAI server, sets small
     ``--num-prompts`` / ``--max-concurrency`` defaults (overridable via ``ACC_BENCH_NUM_PROMPTS`` /

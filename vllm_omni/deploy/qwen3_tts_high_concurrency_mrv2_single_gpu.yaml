@@ -1,15 +1,36 @@
-# Opt-in single-GPU throughput profile, measured on H200 at concurrency 128
-# with Qwen3-TTS-12Hz-1.7B-Base. Warm the full pipeline before benchmarking.
-# B8 uses more graph memory than B4; this is not a low-latency profile.
-# MPS is optional and is not enabled by this file.
+# Experimental single-GPU CUDA/BF16 throughput profile.
+# Optimizations: frame-local predictor KV, fused sampling, time-major codec
+# convolutions, eager residual prediction and first-frame delivery; B1-B8 codec
+# graphs, FULL Talker graphs and 128 Talker slots. Floating-point results differ:
+# validate audio quality for your workload. Ordinary profiles do not enable MPS.
+# cuda_mps starts one private NVIDIA MPS daemon shared by this pipeline's stages
+# and stops it after they exit. An existing CUDA_MPS_PIPE_DIRECTORY is reused
+# without taking ownership. Requires nvidia-cuda-mps-control on PATH.
+# Set cuda_mps: false in an overlay to disable it.
+# MPS can increase throughput under load but also increase first-packet and
+# first-audible-audio latency. Compare cuda_mps: false for latency-sensitive
+# workloads, especially at low request rates.
+# Warm the full pipeline before measuring latency or throughput.
 #
-# vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
-#   --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml
+# vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
+#   --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml \
+#   --api-server-count 4 --stage-init-timeout 1800 --init-timeout 2400
 base_config: qwen3_tts_high_concurrency_mrv2.yaml
+cuda_mps: true
 
 connectors:
   connector_of_shared_memory:
     extra:
+      talker_first_audio: true
+      codec_chunk_ramp: null
+      codec_chunk_adaptive: false
+      initial_codec_chunk_frames: 1
+      codec_chunk_frames: 25
+      codec_left_context_frames: 72
+      code_predictor_kv_cache: true
+      code_predictor_fused_sampling: true
+      decode_time_major_conv: true
+      decode_cudnn_benchmark: true
       decode_batch_max_size: 8
       decode_cudagraph_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
 
@@ -17,7 +38,11 @@ stages:
   - stage_id: 0
     devices: "0"
     max_num_seqs: 128
+    compilation_config:
+      cudagraph_mode: FULL
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 144, 160, 176, 192, 208, 224, 240, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]
+      max_cudagraph_capture_size: 512
   - stage_id: 1
     devices: "0"
-    # Admission candidates are grouped by codec phase before B8 execution.
-    max_num_seqs: 32
+    max_num_seqs: 64
+    async_scheduling: false

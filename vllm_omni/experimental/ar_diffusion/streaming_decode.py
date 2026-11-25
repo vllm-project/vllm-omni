@@ -51,6 +51,7 @@ device, a checkpoint, or the distributed VAE stack.
 
 from __future__ import annotations
 
+import threading
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
@@ -117,7 +118,14 @@ class SupportsStreamingDecode(Protocol):
         """Create empty decoder state for a new session."""
         ...
 
-    def decode_chunk(self, latent: torch.Tensor, state: StreamingDecodeState) -> torch.Tensor:
+    def decode_chunk(
+        self,
+        latent: torch.Tensor,
+        state: StreamingDecodeState,
+        *,
+        output_format: str = "video",
+        produce_output: bool = True,
+    ) -> torch.Tensor:
         """Decode one committed chunk, advancing ``state`` in place."""
         ...
 
@@ -188,7 +196,14 @@ class WanStreamingDecoder:
             raise ValueError("session_id must be a non-empty string.")
         return StreamingDecodeState(session_id=session_id, feat_map=[None] * self.num_causal_convs)
 
-    def decode_chunk(self, latent: torch.Tensor, state: StreamingDecodeState) -> torch.Tensor:
+    def decode_chunk(
+        self,
+        latent: torch.Tensor,
+        state: StreamingDecodeState,
+        *,
+        output_format: str = "video",
+        produce_output: bool = True,
+    ) -> torch.Tensor:
         """Decode ``latent`` as the continuation of ``state``'s session.
 
         ``latent`` is ``[1, C, T, H, W]`` in latent space, already rescaled by
@@ -199,6 +214,11 @@ class WanStreamingDecoder:
         frame expands to a single raw frame and every later one to the full
         temporal factor.
         """
+        if output_format not in ("video", "planar_uint8") or type(produce_output) is not bool:
+            raise ValueError("Invalid streaming decoder pixel output contract")
+        patch_size = getattr(getattr(self._vae, "config", None), "patch_size", None)
+        if output_format == "planar_uint8" and patch_size is not None:
+            raise ValueError("Planar pixel decode requires an unpatchified decoder output")
         if latent.ndim != 5:
             raise ValueError(f"latent must be [B, C, T, H, W]; got shape {tuple(latent.shape)}.")
         if latent.shape[0] != 1:
@@ -221,6 +241,20 @@ class WanStreamingDecoder:
         if num_frames == 0:
             raise ValueError("latent must carry at least one frame.")
 
+        # Ascend-only, synchronous-path-only: reclaim the denoise loop's cached
+        # allocator blocks before the decode allocates its per-frame buffers.
+        # Scoped to NPU because the reclaim was only measured on 910B3; on
+        # CUDA/XPU empty_cache here is untested and may regress inter-chunk
+        # latency (allocator blocks are returned to the driver and re-faulted
+        # on the next allocation). Skipped on background consumer threads
+        # (the CausVid async path): a cross-thread allocator flush would
+        # steal cached blocks from the concurrently-denoising producer thread,
+        # defeating the decode/denoise overlap that path exists for. Placed
+        # after input validation so rejected calls acquire no device-wide
+        # side effect.
+        if latent.device.type == "npu" and threading.current_thread() is threading.main_thread():
+            torch.npu.empty_cache()
+
         decoded_frames = []
         with self._execution_context():
             for index in range(num_frames):
@@ -229,18 +263,30 @@ class WanStreamingDecoder:
                 # first_chunk marks the session's opening frame, not the call's:
                 # that is what makes chunk N + 1 continue chunk N rather than
                 # restart the causal expansion.
-                decoded_frames.append(
-                    self._vae.decoder(
-                        frame,
-                        feat_cache=state.feat_map,
-                        feat_idx=state.conv_idx,
-                        first_chunk=(state.frames_decoded == 0),
-                    )
+                decoded = self._vae.decoder(
+                    frame,
+                    feat_cache=state.feat_map,
+                    feat_idx=state.conv_idx,
+                    first_chunk=(state.frames_decoded == 0),
                 )
+                if produce_output:
+                    if output_format == "planar_uint8" and (
+                        decoded.dtype != torch.uint8 or decoded.ndim != 4 or decoded.shape[0] != 3
+                    ):
+                        raise ValueError("Final pixel producer did not return planar uint8")
+                    decoded_frames.append(decoded)
+                elif decoded.numel() != 0:
+                    raise ValueError("Non-output decoder rank must return an empty placeholder")
                 state.frames_decoded += 1
 
+        if not produce_output:
+            state.chunks_decoded += 1
+            return latent.new_empty(0)
+        if output_format == "planar_uint8":
+            out = torch.cat(decoded_frames, dim=1)
+            state.chunks_decoded += 1
+            return out
         out = torch.cat(decoded_frames, dim=2)
-        patch_size = getattr(getattr(self._vae, "config", None), "patch_size", None)
         if patch_size is not None:
             from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 
