@@ -1425,15 +1425,17 @@ class MiniMaxH3AudioVAE(nn.Module):
         else:
             encoder = [module for name, module in children.items() if name in encoder_names]
             decoder = [module for name, module in children.items() if name not in encoder_names]
-            storage = [
+            # Distinct empty storages all report address zero. Still guard
+            # tensors registered in both groups, even when they have no storage.
+            storage_keys = [
                 {
-                    tensor.untyped_storage().data_ptr()
+                    tensor.untyped_storage().data_ptr() or ("empty", id(tensor))
                     for module in modules
                     for tensor in (*module.parameters(), *module.buffers())
                 }
                 for modules in (encoder, decoder)
             ]
-            if not storage[0].intersection(storage[1]):
+            if storage_keys[0].isdisjoint(storage_keys[1]):
                 self._encoder_stager = PinnedModuleStager(encoder, device, pin_memory=True)
                 self._decoder_stager = PinnedModuleStager(decoder, device, pin_memory=True)
                 return

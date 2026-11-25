@@ -35,7 +35,14 @@ class _Remote(nn.Module):
         self.model = _AudioModel(projection=projection)
 
 
-def _vae(*, projection: bool = True, root_buffer: bool = False, encode_only: bool = False, tied_storage: bool = False):
+def _vae(
+    *,
+    projection: bool = True,
+    root_buffer: bool = False,
+    encode_only: bool = False,
+    tied_storage: bool = False,
+    extra_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
+):
     vae = object.__new__(MiniMaxH3AudioVAE)
     nn.Module.__init__(vae)
     vae.remote = _Remote(projection=projection)
@@ -46,6 +53,10 @@ def _vae(*, projection: bool = True, root_buffer: bool = False, encode_only: boo
         del vae.model.decoder
     if tied_storage:
         vae.model.decoder.weight = nn.Parameter(vae.model.encoder.weight.detach())
+    if extra_buffers is not None:
+        encoder_buffer, decoder_buffer = extra_buffers
+        vae.model.encoder.register_buffer("extra", encoder_buffer)
+        vae.model.decoder.register_buffer("extra", decoder_buffer)
     vae._device_target = torch.device("cpu")
     vae._stager = vae._encoder_stager = vae._decoder_stager = None
     vae._build_residency_stagers(torch.device("cpu"))
@@ -98,6 +109,27 @@ def test_root_state_and_partial_adapters_keep_whole_staging(options):
     assert vae._stager.loaded
     vae.encoder_component.offload_to_cpu()
     assert not vae._stager.loaded
+
+
+@pytest.mark.parametrize("storage", ["independent", "same_tensor", "shared_backing"])
+def test_empty_buffers_only_fall_back_when_shared(storage):
+    # Synthetic tensors exercise the aliasing cases without checkpoint data.
+    encoder_buffer = torch.ones(1) if storage == "shared_backing" else torch.empty(0)
+    if storage == "independent":
+        decoder_buffer = torch.empty(0)
+    elif storage == "same_tensor":
+        decoder_buffer = encoder_buffer
+    else:
+        decoder_buffer = encoder_buffer[:0]
+
+    vae = _vae(extra_buffers=(encoder_buffer, decoder_buffer))
+    if storage == "independent":
+        assert vae._stager is None
+        assert vae._encoder_stager is not None
+        assert vae._decoder_stager is not None
+    else:
+        assert vae._stager is not None
+        assert vae._encoder_stager is vae._decoder_stager is None
 
 
 def _pipeline(vae):
