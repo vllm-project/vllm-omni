@@ -53,6 +53,7 @@ CHATTERBOX_TURBO_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",
+            retains_state_across_chunks=True,
             sync_process_input_func=f"{_PROC}.chatterbox.t3_to_s3gen",
             supports_native_mrv2_data_plane=True,
         ),
