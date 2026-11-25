@@ -47,6 +47,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_turn_id_from_request_id,
 )
 from vllm_omni.engine.duplex.plugin import (
+    DuplexDataPlaneContext,
     DuplexInputCapacityError,
     DuplexRuntimeConfigError,
     coerce_int,
@@ -190,6 +191,7 @@ class ModelChannel:
         self._schedule_silence_continuation = schedule_silence_continuation
         self._abort_request = abort_request
         self._input_transcriptions: dict[str, CommittedInputContinuation] = {}
+        self._deferred_text_listen: tuple[int, dict[str, object]] | None = None
 
     def is_input_transcription(self, request_id: str) -> bool:
         return request_id in self._input_transcriptions
@@ -625,6 +627,7 @@ class ModelChannel:
     def cancel_data_plane_stream(self) -> bool:
         had_stream = self._ctx.run.stream_request_id is not None
         self._input_transcriptions.clear()
+        self._deferred_text_listen = None
         self._ctx.run.stream_request_id = None
         return had_stream
 
@@ -864,7 +867,7 @@ class ModelChannel:
             session.replace_runtime_config(runtime_config)
         drain_result = {"data_plane_outputs": [engine_output]}
         close_reason, emitted_response = await self._send_model_output_events(
-            drain_result, expected_epoch=expected_epoch
+            drain_result, expected_epoch=expected_epoch, model_turn_id=item.context.model_turn_id
         )
         if self._ctx.run.closing:
             return None
@@ -919,6 +922,7 @@ class ModelChannel:
         result: object,
         *,
         expected_epoch: int | None = None,
+        model_turn_id: int | None = None,
     ) -> tuple[str | None, bool]:
         session = self._ctx.session
         if self._ctx.run.closing or (expected_epoch is not None and session.epoch != expected_epoch):
@@ -931,6 +935,8 @@ class ModelChannel:
         if request_id is not None and session.active_request_id is None:
             session.bind_request(request_id)
         context = self._runtime_data_plane_context()
+        if isinstance(context, DuplexDataPlaneContext) and model_turn_id is not None:
+            context = replace(context, model_turn_id=model_turn_id)
         for model_result in self._ctx.plugin.data_plane.project(result, context=context):
             close_reason_for_result, did_emit = await self._send_one_model_output_event(
                 model_result,
@@ -940,6 +946,17 @@ class ModelChannel:
             close_reason = close_reason or close_reason_for_result
             if self._ctx.run.closing or (expected_epoch is not None and session.epoch != expected_epoch):
                 return None, emitted_response
+        pending = self._deferred_text_listen
+        if pending is not None and session.active_response_id is None:
+            self._deferred_text_listen = None
+            pending_epoch, pending_result = pending
+            pending_turn = coerce_int(pending_result.get("model_turn_id"))
+            if pending_epoch == session.epoch and pending_turn is not None and pending_turn >= session.turn_id:
+                pending_close, pending_emitted = await self._send_one_model_output_event(
+                    pending_result, expected_epoch=pending_epoch
+                )
+                close_reason = close_reason or pending_close
+                emitted_response = emitted_response or pending_emitted
         return close_reason, emitted_response
 
     def _fail_response_from_model_error(self, model_result: dict[str, object]) -> None:
@@ -1074,9 +1091,34 @@ class ModelChannel:
         auto_response = self._out.auto_responds()
         close_reason: str | None = None
         emitted_response = False
+        if (
+            auto_response
+            and model_result.get("continue_with_partial_input") is True
+            and model_turn_id is not None
+            and session.active_response_turn_id is not None
+            and model_turn_id > session.active_response_turn_id
+        ):
+            # The empty next-turn unit has no Talker output to wait for, but
+            # the previous response still owns its outstanding tail audio.
+            # Replay this listen after that response ends, on the same mailbox.
+            self._deferred_text_listen = (session.epoch, model_result)
+            return close_reason, emitted_response
         self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
         if self._ctx.run.closing:
             return close_reason, emitted_response
+        if (
+            auto_response
+            and session.active_response_id is None
+            and model_result.get("continue_with_partial_input") is True
+            and model_turn_id is not None
+        ):
+            # Text can start a new model turn while the previous Talker drains,
+            # and its first unit can be empty. Reserve its own response before
+            # scheduling that unit's continuation.
+            if model_turn_id > session.turn_id:
+                session.complete_model_turn(model_turn_id - 1)
+            opened_response_id = session.begin_response(turn_id=model_turn_id)
+            self._out.emit(self.response_created_payload(opened_response_id, epoch=session.epoch))
         if (
             session.active_response_id is not None
             and model_turn_id is not None
@@ -1341,11 +1383,13 @@ class ModelChannel:
         if isinstance(function_call, dict):
             await self._expose_function_call(function_call)
             return close_reason, True
+        model_turn_id = coerce_int(model_result.get("model_turn_id"))
+        if model_result.get("continue_with_partial_input") is True and model_turn_id is not None:
+            self._ctx.run.partial_input_continuation_turn = (session.epoch, model_turn_id)
         if model_result.get("requires_stage_handoff") is True or model_result.get("requires_tts_stage") is True:
             # Reserve the protocol response only when Stage1 emits text/audio.
             return close_reason, False
         is_listen = model_result.get("is_listen")
-        model_turn_id = coerce_int(model_result.get("model_turn_id"))
         if model_result.get("is_buffering") is True or model_result.get("prefill_success") is False:
             if model_result.get("data_plane_request_id") == session.active_request_id:
                 session.clear_request()
@@ -1395,6 +1439,21 @@ class ModelChannel:
                 and auto_response
                 and (model_turn_id is not None or session.active_response_id is not None)
             ):
+                if (
+                    not draining
+                    and model_turn_id is not None
+                    and self._ctx.run.partial_input_continuation_turn == (session.epoch, model_turn_id)
+                ):
+                    # A text unit can contain only a speech decision and a
+                    # chunk terminator. Its empty Talker boundary needs the
+                    # same response ownership as a direct empty text unit,
+                    # including waiting for the previous response's tail.
+                    return await self._on_model_listen(
+                        dict(model_result, is_listen=True, model_listen=False, continue_with_partial_input=True),
+                        model_turn_id=model_turn_id,
+                        data_plane_request_id=data_plane_request_id,
+                        expected_epoch=expected_epoch,
+                    )
                 request_key = data_plane_request_id if isinstance(data_plane_request_id, str) else None
                 draining_response_id = (
                     session.response_id_for_request(request_key) if session.is_draining_request(request_key) else None

@@ -20,21 +20,40 @@ from tests.helpers.runtime import OmniRunner
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 MODEL_ID = "HiDream-ai/HiDream-O1-Image"
 PROMPT = "A cat is sitting next to a sign that says 'HiDream-O1 vLLM-Omni'"
-BASELINE_PATH = Path(__file__).resolve().parents[2] / "assets" / "hidream_o1" / "hidream_o1_baseline.png"
+BASELINE_DIR = Path(__file__).resolve().parents[2] / "assets" / "hidream_o1"
+H100_BASELINE_PATH = BASELINE_DIR / "hidream_o1_baseline.png"
+MI300_BASELINE_PATH = BASELINE_DIR / "hidream_o1_mi300_baseline.png"
 SSIM_THRESHOLD = 0.8
 PSNR_THRESHOLD = 19.0
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+def baseline_path_for_current_hardware() -> Path:
+    """Select the reviewed baseline for the accelerator that owns this test."""
+    device_name = current_omni_platform.get_device_name()
+    if current_omni_platform.is_rocm():
+        assert "MI300" in device_name, f"HiDream ROCm accuracy requires an MI300, got {device_name}"
+        return MI300_BASELINE_PATH
+    if current_omni_platform.is_cuda():
+        assert "H100" in device_name, f"HiDream CUDA accuracy requires an H100, got {device_name}"
+        return H100_BASELINE_PATH
+    raise AssertionError(f"HiDream accuracy requires an H100 or MI300 accelerator, got {device_name}")
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"}, num_cards=2)
 def test_hidream_o1_image_tp2_matches_baseline(
     accuracy_artifact_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    configured_artifact_root = os.environ.get("HIDREAM_O1_ACCURACY_ARTIFACT_DIR")
+    if configured_artifact_root:
+        accuracy_artifact_root = Path(configured_artifact_root)
+        accuracy_artifact_root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
     model = os.environ.get("HIDREAM_O1_IMAGE_MODEL", MODEL_ID)
     with OmniRunner(
@@ -58,8 +77,9 @@ def test_hidream_o1_image_tp2_matches_baseline(
 
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
     image.save(output_dir / "vllm_omni_tp2.png")
-    assert BASELINE_PATH.exists()
-    baseline = Image.open(BASELINE_PATH).convert("RGB")
+    baseline_path = baseline_path_for_current_hardware()
+    assert baseline_path.exists()
+    baseline = Image.open(baseline_path).convert("RGB")
     resized = image.resize(baseline.size, Image.Resampling.LANCZOS)
     ssim, psnr = measure_image_similarity(
         model_name=MODEL_ID,

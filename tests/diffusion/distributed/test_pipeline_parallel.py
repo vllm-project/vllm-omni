@@ -34,7 +34,7 @@ from vllm_omni.platforms import current_omni_platform
 
 _TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=2)
 _L4_THREE_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=3)
-_L4_FOUR_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=4)
+_FOUR_GPU = hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=4)
 
 DeviceKind = Literal["cpu", "cuda"]
 _UNIT_MARKS = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -817,7 +817,7 @@ _GPU_PREDICT_NOISE_CASES = [
         100,
         1e-2,
         1e-2,
-        marks=_L4_FOUR_GPU,
+        marks=_FOUR_GPU,
         id="pp2-cfg2-bfloat16",
     ),
     pytest.param(
@@ -1037,7 +1037,7 @@ def test_scheduler_step(pp_size, cfg_size, do_true_cfg, input_seed):
     "pp_size, cfg_size, do_true_cfg, input_seed",
     [
         pytest.param(2, 1, False, 300, marks=_TWO_GPU, id="pp2-no_cfg"),
-        pytest.param(2, 2, True, 600, marks=_L4_FOUR_GPU, id="pp2-cfg2-true_cfg"),
+        pytest.param(2, 2, True, 600, marks=_FOUR_GPU, id="pp2-cfg2-true_cfg"),
     ],
 )
 def test_scheduler_step_parity(pp_size, cfg_size, do_true_cfg, input_seed):
