@@ -23,9 +23,10 @@ and [design documents](https://docs.vllm.ai/projects/vllm-omni/en/latest/design/
 
 Apply these rules to new or materially changed production code; do not require
 unrelated cleanup from untouched files.
-Use names, types, and assertions to express routine behavior. Reserve inline
-comments for information the code cannot express, such as a numerical invariant,
-an upstream constraint, or a required tool directive.
+Remove explanatory code comments added or rewritten by the diff. Use names,
+types, and assertions to express behavior. Preserve required license headers,
+shebangs, tool directives, and docstrings. For scored reviews, apply the
+[simplicity rule](../checks/review-score.md#hard-scoring-requirements).
 
 1. Start each source module with a concise module docstring that defines its
    responsibility and boundaries and identifies its primary classes and key

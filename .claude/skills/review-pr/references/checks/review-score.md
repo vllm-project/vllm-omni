@@ -10,9 +10,23 @@ review verdict rules independently of the score.
 | Correctness and safety | 25 | Reachable behavior, compatibility, stage and device contracts, lifecycle, failure paths, and security. |
 | Validation | 20 | Regression tests for changed paths, the relevance of CI, and the scope of runtime checks actually performed. |
 | Claim evidence | 30 | Reproducible performance and quality comparisons, output artifacts, and traceable environment and revision pins. Use [perf-verification](perf-verification.md). |
-| Simplicity | 10 | Focused changes, clear ownership, and avoidable duplication, state, copies, or explanatory comments. |
+| Simplicity | 10 | Focused changes, clear ownership, and avoidable duplication, state, or copies. |
 
-Choose the highest rating supported by the evidence for each applicable dimension.
+## Hard scoring requirements
+
+- **Claim evidence is 0/3** if any required output or benchmark artifact from
+  the [modality matrix](perf-verification.md#required-output-artifacts-by-modality)
+  is missing or inaccessible. Apply the zero even when hashes, metrics, or
+  other validation are available.
+- **Simplicity is 0/3** if the diff adds or rewrites any explanatory code
+  comment. Apply this check to changed source, tests, scripts, and config.
+  License headers, shebangs, tool directives, and required docstrings are exempt.
+  Express the underlying behavior through code, tests, or relevant docs.
+
+## Rating and delivery
+
+Apply the hard scoring requirements first. For each remaining applicable
+dimension, choose the highest rating supported by the evidence.
 
 - **3** — the applicable checks are supported by matching evidence.
 - **2** — the main checks are supported, with a bounded gap.
