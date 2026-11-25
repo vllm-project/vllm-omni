@@ -148,6 +148,22 @@ def _guard_graph_replay_for_pooler_copy(
         main_stream.wait_event(copy_event)
 
 
+def _client_multimodal_output_keys(model: Any) -> tuple[str, ...]:
+    """Payload roots the model requires on the client channel.
+
+    The async-chunk split sends only fixed allowlisted roots to the client.
+    A model whose client-side consumer reads other per-step outputs (for
+    example Nemotron VoiceChat's function-call tokens) declares them in
+    ``omni_client_multimodal_output_keys``.
+    """
+    raw = getattr(model, "omni_client_multimodal_output_keys", ())
+    if not isinstance(raw, tuple) or any(not isinstance(key, str) or not key for key in raw):
+        raise TypeError("omni_client_multimodal_output_keys must be a tuple of non-empty strings")
+    if len(raw) != len(set(raw)):
+        raise ValueError("omni_client_multimodal_output_keys must not contain duplicates")
+    return raw
+
+
 class OmniARModelRunner(OmniGPUModelRunner):
     """AR stage runner. Produces per-request hidden states + multimodal outputs."""
 
@@ -491,6 +507,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             # through pooling_output for llm2tts.
             partition_async_payload=async_chunk and stage_sends_async_output(self.model_config),
             defer_full_payload_d2h=defer_full_payload_d2h,
+            client_output_keys=_client_multimodal_output_keys(self.model),
             finalize_output=finalize_output,
             finalize_multimodal=finalize_multimodal,
             finalize_pooler_payload=finalize_pooler_payload,
@@ -747,8 +764,14 @@ class OmniARModelRunner(OmniGPUModelRunner):
         req_ids: list[str] | None = None,
         engine_output_type: str = "audio",
         finalize_pooler_payload: Any | None = None,
+        client_output_keys: tuple[str, ...] = (),
     ) -> tuple[list[dict[str, Any] | None] | None, list[dict[str, Any] | None] | None]:
-        """Build async-chunk payloads without materializing hidden on CPU."""
+        """Build async-chunk payloads without materializing hidden on CPU.
+
+        ``client_output_keys`` are model-declared roots copied onto the client
+        channel in addition to the fixed allowlist (see
+        :func:`partition_flat_payload`).
+        """
         if not mm_outputs:
             return None, None
 
@@ -784,7 +807,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             flat = flatten_payload(payload)
             if finalize_pooler_payload is not None:
                 flat = flatten_payload(finalize_pooler_payload(flat, multimodal_outputs=mm_outputs, idx=i))
-            inter_stage, client_mm = partition_flat_payload(flat)
+            inter_stage, client_mm = partition_flat_payload(flat, client_output_keys)
             inter_stage_list.append(inter_stage or None)
             client_mm_list.append(client_mm or None)
 
@@ -1076,6 +1099,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         engine_output_type: str = "audio",
         partition_async_payload: bool | None = None,
         defer_full_payload_d2h: bool = False,
+        client_output_keys: tuple[str, ...] = (),
         finalize_output: Any | None = None,
         finalize_multimodal: Any | None = None,
         finalize_pooler_payload: Any | None = None,
@@ -1099,6 +1123,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             self._async_chunk if partition_async_payload is None else bool(partition_async_payload)
         )
         self._defer_full_payload_d2h = bool(defer_full_payload_d2h)
+        self._client_output_keys = client_output_keys
         self._finalize_output = finalize_output
         self._finalize_multimodal = finalize_multimodal
         self._finalize_pooler_payload = finalize_pooler_payload
@@ -1342,6 +1367,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     self._req_ids,
                     self._engine_output_type,
                     self._finalize_pooler_payload,
+                    self._client_output_keys,
                 )
             if self._streaming_audio is not None:
                 pooler_inter, pooler_client = None, self._streaming_audio.get_output()

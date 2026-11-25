@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 
@@ -70,6 +73,25 @@ def test_partition_duplex_audio_transcript_metadata_to_client_mm():
     assert "meta.turn_end" in client
     assert "meta.native_duplex_segment_text" not in client
     assert "meta.native_duplex_segment_text" in inter
+
+
+def test_partition_model_declared_client_keys_reach_both_channels():
+    payload = {
+        "hidden_states.layer_0": torch.zeros(1, 2),
+        "nvc_function_token": torch.tensor([20]),
+        "nvc_function_response_consumed_generation": torch.tensor([3]),
+    }
+    declared = ("nvc_function_token", "nvc_function_response_consumed_generation")
+
+    # The fixed allowlist alone keeps these keys off the client (#11146).
+    assert partition_flat_payload(payload)[1] == {}
+
+    inter, client = partition_flat_payload(payload, declared)
+    assert inter == payload
+    assert client == {key: payload[key] for key in declared}
+    inter_list, client_list = partition_payload_list([payload, {"codes.audio": torch.zeros(1, 2)}], declared)
+    assert client_list == [client, None]
+    assert inter_list[0] == payload
 
 
 def test_snapshot_mm_payload_coalesces_compatible_tensor_list(monkeypatch):

@@ -5,7 +5,7 @@
 payloads, most of which are shared by the prefix cache / no prefix cache path.
 """
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 
 import torch
 from vllm.logger import init_logger
@@ -46,8 +46,15 @@ _CLIENT_MM_META_KEYS: frozenset[str] = frozenset(
 
 def partition_flat_payload(
     payload: Mapping[str, object],
+    client_keys: Collection[str] = (),
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Split a flattened per-request payload into inter-stage vs client mm dicts."""
+    """Split a flattened per-request payload into inter-stage vs client mm dicts.
+
+    ``client_keys`` names model-declared roots (the model's
+    ``omni_client_multimodal_output_keys``) that the client must receive in
+    addition to the fixed allowlists. They stay in the inter-stage payload
+    too, so stage-input processors that read them are unaffected.
+    """
     if not payload:
         return {}, {}
     inter_stage: dict[str, object] = {}
@@ -55,6 +62,9 @@ def partition_flat_payload(
     for key, value in payload.items():
         root = key.split(".", 1)[0]
         if root in _CLIENT_MM_ROOT_KEYS:
+            client_mm[key] = value
+        elif root in client_keys:
+            inter_stage[key] = value
             client_mm[key] = value
         elif root == "meta" and "." in key and key.split(".", 1)[1] in _CLIENT_MM_META_KEYS:
             # Small final-output metadata needed by serving (for example
@@ -70,11 +80,12 @@ def partition_flat_payload(
 
 def partition_payload_list(
     payloads: Sequence[Mapping[str, object]],
+    client_keys: Collection[str] = (),
 ) -> tuple[list[dict[str, object] | None] | None, list[dict[str, object] | None] | None]:
     inter_stage_list: list[dict[str, object] | None] = []
     client_mm_list: list[dict[str, object] | None] = []
     for payload in payloads:
-        inter_stage, client_mm = partition_flat_payload(payload)
+        inter_stage, client_mm = partition_flat_payload(payload, client_keys)
         inter_stage_list.append(inter_stage or None)
         client_mm_list.append(client_mm or None)
     return (

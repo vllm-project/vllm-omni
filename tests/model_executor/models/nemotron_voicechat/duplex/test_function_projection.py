@@ -3,8 +3,10 @@
 
 """CPU checks for scheduled function rows; no model or CUDA execution."""
 
+import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -15,6 +17,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_think
 from vllm_omni.utils.mm_outputs import build_mm_cpu
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
+from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner, _client_multimodal_output_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -294,3 +297,56 @@ def test_mixed_prefill_decode_keeps_empty_slots_and_forced_ownership(request_ids
         else:
             assert int(payload["nvc_function_token"]) == int(update["nvc_prev_function_token"]) == 98
             assert thinker._sessions["other"]["forced_function_tokens"] == []
+
+
+def mrv2_client_payloads(thinker, envelope, request_ids, spans):
+    """Split one thinker step the way the MRv2 async-chunk runner does."""
+    total = spans[-1][1]
+    _, client = OmniARModelRunner._build_async_chunk_outputs_from_mm(
+        build_mm_cpu(envelope.multimodal_outputs),
+        np.array([start for start, _ in spans] + [total]),
+        np.array([end - start for start, end in spans]),
+        len(spans),
+        total,
+        len(envelope.text_hidden_states),
+        list(request_ids),
+        "latent",  # Stage 0's engine_output_type.
+        client_output_keys=_client_multimodal_output_keys(thinker),
+    )
+    return client
+
+
+@pytest.mark.parametrize("request_ids", [("one",), ("one", "other")])
+def test_mrv2_async_chunk_split_delivers_function_call_and_ack(request_ids):
+    """Regression for #11146: MRv2 kept the call on the inter-stage channel only."""
+    thinker = thinker_shell()
+    thinker._sessions["one"]["function_response_generation"] = 3
+    spans = [(index, index + 1) for index in range(len(request_ids))]
+    projector = NemotronVoiceChatDataPlaneSession(lambda *_: None)
+    projector.configure_runtime(
+        {
+            "nvc_text_bos_id": 10,
+            "nvc_text_eos_id": 11,
+            "nvc_text_pad_id": 12,
+            "nvc_function_sotc_id": 0,
+            "nvc_function_eotc_id": 1,
+            "nvc_tokenizer_ref": "test",
+        },
+        tokenizer=SimpleNamespace(decode=lambda *_args, **_kwargs: ""),
+    )
+    call = '[{"name": "generate_random_number", "arguments": {"min": 1, "max": 50}}]'
+    projector._decode = lambda ids: call if ids == [2] else ""
+    vectors = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]])
+    calls: list[dict[str, object]] = []
+    for decision in (0, 2, 1):  # <TOOLCALL>, body, </TOOLCALL>
+        hidden = vectors[[decision] + [1] * len(request_ids)]  # Other rows and padding close nothing.
+        envelope = thinker.make_omni_output(
+            hidden, model_intermediate_buffer=[{"request_id": rid} for rid in request_ids], request_token_spans=spans
+        )
+        payload = mrv2_client_payloads(thinker, envelope, request_ids, spans)[0]
+        assert int(payload["nvc_function_token"]) == decision
+        assert int(payload["nvc_function_response_consumed_generation"]) == 3
+        calls.extend(event for event in client_events(projector, "one", payload) if event.get("function_call") is True)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "generate_random_number"
+    assert json.loads(str(calls[0]["arguments"])) == {"min": 1, "max": 50}
