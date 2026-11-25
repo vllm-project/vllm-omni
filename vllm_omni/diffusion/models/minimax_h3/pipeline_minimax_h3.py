@@ -707,19 +707,12 @@ def _publish_any_rank_exception(exc: Exception | None) -> None:
     failure. It is a collective like its rank-0 counterpart, so every rank
     has to call it before any subsequent collective.
     """
-    if not dist.is_initialized():
-        if exc is not None:
-            raise exc
-        return
     # The payload is a Python object, so it has to travel host-side over the
     # gloo group instead of the device group: a device-group object collective
     # allocates device buffers and drives the device backend, which is the
-    # ``EI0006`` failure on ``HcclBroadcast`` that #10645 is about. The other
-    # object collectives in this file still use the device group until #10896
-    # lands; this one is written for the CPU group from the start.
-    group = get_world_group().cpu_group
-    rank = dist.get_rank(group)
-    world_size = dist.get_world_size(group)
+    # ``EI0006`` failure on ``HcclBroadcast`` that #10645 is about. Every
+    # object collective of this file uses the CPU group view.
+    group, rank, world_size = _dit_cpu_rank_world()
     if world_size == 1:
         if exc is not None:
             raise exc
