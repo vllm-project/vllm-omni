@@ -232,6 +232,10 @@ def clear_a2a_permute_workspaces() -> None:
     npu_transport = sys.modules.get("vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu")
     if npu_transport is not None:
         npu_transport.clear_ulysses_symmetric_memory_workspace()
+    # The copy-engine overlap runners own symmetric allocations too; release them while the groups are alive.
+    ce_overlap = sys.modules.get("vllm_omni.diffusion.attention.parallel.ulysses_ce_overlap")
+    if ce_overlap is not None:
+        ce_overlap.clear_ulysses_ce_overlap_runners()
     with _WORKSPACE_LOCK:
         if not _SYMM_WORKSPACES:
             return
