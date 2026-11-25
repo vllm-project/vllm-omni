@@ -183,18 +183,40 @@ class MiniMaxH3ModelBatch:
                     level(message + " Running %d requests one forward at a time.", len(models))
                     return [self([e])[0] for e in evaluations]
             prepared = [m.prepare(e) for m, e in zip(models, evaluations, strict=True)]
+            hyperflow = hasattr(models[0].transformer, "endpoint_time_embedder")
+            if hyperflow and len(models) > 1:
+                # Pair-unique (t, r) packing is per-request; unpack batch for now.
+                return [self([e])[0] for e in evaluations]
             if len(models) == 1:
                 _, rows, times, cond = prepared[0]
-                kwargs = models[0].branch.forward_kwargs(
-                    video_rows=rows[0][0],
-                    audio_rows=rows[1][0],
-                    t_video=times[0],
-                    t_audio=times[1],
-                    imgvid_cond_timestep=cond[0],
-                    audio_ref_cond_timestep=cond[1],
-                    video_target_timesteps=rows[0][1],
-                    audio_target_timesteps=rows[1][1],
-                )
+                if hyperflow:
+                    # Official: r_i = 1 - sigma_{i+1} on the same t = 1 - sigma axis.
+                    step = evaluations[0].state.step_index
+                    sigmas_v = evaluations[0].state.sigmas[0]
+                    sigmas_a = evaluations[0].state.sigmas[1] if len(evaluations[0].state.sigmas) > 1 else sigmas_v
+                    kwargs = models[0].branch.forward_kwargs_hyperflow(
+                        video_rows=rows[0][0],
+                        audio_rows=rows[1][0],
+                        t_video=times[0],
+                        t_audio=times[1],
+                        r_video=1.0 - float(sigmas_v[step + 1]),
+                        r_audio=1.0 - float(sigmas_a[step + 1]),
+                        imgvid_cond_timestep=cond[0],
+                        audio_ref_cond_timestep=cond[1],
+                        video_target_timesteps=rows[0][1],
+                        audio_target_timesteps=rows[1][1],
+                    )
+                else:
+                    kwargs = models[0].branch.forward_kwargs(
+                        video_rows=rows[0][0],
+                        audio_rows=rows[1][0],
+                        t_video=times[0],
+                        t_audio=times[1],
+                        imgvid_cond_timestep=cond[0],
+                        audio_ref_cond_timestep=cond[1],
+                        video_target_timesteps=rows[0][1],
+                        audio_target_timesteps=rows[1][1],
+                    )
             else:
                 kwargs = minimax_h3_batched_forward_kwargs(
                     branches=[m.branch for m in models],
