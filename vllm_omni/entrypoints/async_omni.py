@@ -1811,13 +1811,20 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         await self._weight_transfer_rpc("init_weight_transfer_engine", (init_info,))
         logger.info("[%s] Weight transfer engine initialized", self._name)
 
-    async def start_weight_update(self) -> None:
+    async def start_weight_update(self, update_id: str | None = None) -> None:
         """Start a new weight update session across configured stages.
 
         Each worker delegates preparation to its configured WTE backend,
-        which owns whether the update uses layerwise reload.
+        which owns whether the update uses layerwise reload. When ``update_id``
+        is supplied, workers tag the active session so an interrupted start can
+        be aborted only by the matching caller.
         """
-        await self._weight_transfer_rpc("start_weight_update")
+        if update_id is None:
+            await self._weight_transfer_rpc("start_weight_update")
+        else:
+            if not isinstance(update_id, str) or not update_id.strip():
+                raise ValueError("update_id must be a non-empty string")
+            await self._weight_transfer_rpc("start_weight_update_with_id", (update_id,))
         logger.info("[%s] Weight update session started", self._name)
 
     async def update_weights(self, update_info: dict) -> None:

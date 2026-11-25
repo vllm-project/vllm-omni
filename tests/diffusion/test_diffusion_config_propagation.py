@@ -91,6 +91,26 @@ class TestParallelConfigPropagation:
         assert od.parallel_config.ring_degree == 1
         assert od.parallel_config.ulysses_a2a_permute is True
 
+    def test_ulysses_ce_overlap_roundtrip(self):
+        pc = DiffusionParallelConfig(ulysses_degree=2, ulysses_a2a_permute=True, ulysses_overlap_chunks=4)
+        od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
+        assert od.parallel_config.ulysses_overlap_chunks == 4
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"ulysses_overlap_chunks": -1},
+            {"ulysses_a2a_permute": False},
+            {"ulysses_mode": "advanced_uaa"},
+            {"ring_degree": 2},
+        ],
+    )
+    def test_ulysses_ce_overlap_rejects_invalid_config(self, overrides):
+        values = dict(ulysses_degree=2, ulysses_a2a_permute=True, ulysses_overlap_chunks=2)
+        values.update(overrides)
+        with pytest.raises(ValueError, match="ulysses_overlap_chunks"):
+            DiffusionParallelConfig(**values)
+
     def test_mask_sp_padding_roundtrip(self):
         pc = DiffusionParallelConfig(ulysses_degree=2, mask_sp_padding=True)
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
@@ -290,6 +310,11 @@ def test_vae_fast_path_roundtrip():
 def test_invalid_vae_fast_path_is_rejected():
     with pytest.raises(ValueError, match="vae_fast_path"):
         OmniDiffusionConfig(model="x", vae_fast_path="fast")
+
+
+def test_vae_stack_tiles_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").vae_stack_tiles is True
+    assert _roundtrip_diffusion_config(model="x", vae_stack_tiles=False).vae_stack_tiles is False
 
 
 def test_vae_encode_fast_path_roundtrip():
