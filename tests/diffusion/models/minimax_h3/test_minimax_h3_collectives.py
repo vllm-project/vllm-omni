@@ -339,7 +339,9 @@ def test_every_object_collective_of_the_pipeline_takes_the_cpu_group():
     for scope, call in calls:
         name = getattr(scope, "name", "<module>")
         group = next((keyword.value for keyword in call.keywords if keyword.arg == "group"), None)
-        assert isinstance(group, ast.Name), f"{name}: the object collective has to pass the group by keyword"
+        assert isinstance(group, ast.Name), (
+            f"{name}: the object collective has to pass a group name that is bound in this scope"
+        )
         cpu_names = _group_names_bound_by(scope, "_dit_cpu_rank_world")
         device_names = _group_names_bound_by(scope, "_dit_rank_world")
         assert group.id in cpu_names, f"{name}: {group.id} does not come from the CPU group view"
