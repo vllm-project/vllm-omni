@@ -36,6 +36,7 @@ from .code2wav.token2wav import (
 )
 from .code2wav.watchdog import Code2WavWatchdog
 from .config import read_bool_flag, resolve_token2wav_trt_config, stage_connector_extra
+from .handoff import TEXT_WITHOUT_AUDIO_KEY
 
 if TYPE_CHECKING:
     from vllm_omni.core.sched.output import OmniRequestPrewarm
@@ -358,6 +359,7 @@ class _WorkItem:
     segment_end: bool
     turn_end: bool
     has_payload: bool = True
+    text_without_audio: bool = False
 
 
 def _slot_resident(item: _WorkItem) -> bool:
@@ -893,6 +895,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             tts_is_last_chunk=tts_is_last_chunk,
             segment_end=bool(_scalar(meta.get("segment_end"), False)),
             turn_end=bool(_scalar(meta.get("turn_end"), False)),
+            text_without_audio=bool(_scalar(meta.get(TEXT_WITHOUT_AUDIO_KEY), False)),
         )
 
     @staticmethod
@@ -1588,6 +1591,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "meta.duplex_audio_chunk_seq": [torch.tensor(item.chunk_seq, dtype=torch.int64) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
                 "meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],
+                f"meta.{TEXT_WITHOUT_AUDIO_KEY}": [
+                    torch.tensor(item.text_without_audio, dtype=torch.bool) for item in items
+                ],
             },
         )
 
