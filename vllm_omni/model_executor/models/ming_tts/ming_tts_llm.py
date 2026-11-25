@@ -714,7 +714,9 @@ class MingLLMModel(nn.Module):
             # TODO(perf): move the compile into a vLLM support_torch_compile
             # adapter once the shared Ming CFM modules are migrated.
             dit_model = self.flowloss.cfm.model
-            if not getattr(dit_model, "_ming_compiled", False):
+            if not self.flowloss.cfm.supports_fast_path_for(z_diff_cond) and not getattr(
+                dit_model, "_ming_compiled", False
+            ):
                 try:
                     # Static shapes compile once per graph bucket (plus once
                     # for the lazily fused QKV weights); past dynamo's
