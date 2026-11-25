@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import ast
+import inspect
 import os
 import time
 from datetime import timedelta
@@ -14,6 +16,17 @@ import torch.multiprocessing as mp
 from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+_OBJECT_COLLECTIVE_NAMES = frozenset(
+    {
+        "all_gather_object",
+        "broadcast_object_list",
+        "gather_object",
+        "recv_object_list",
+        "scatter_object_list",
+        "send_object_list",
+    }
+)
 
 
 def _collective_worker(rank, rendezvous, backend):
@@ -246,6 +259,79 @@ def test_object_collectives_use_the_cpu_group_and_tensor_collectives_keep_the_de
     assert tensor_groups == [device_group, device_group]
     assert device_group not in object_groups
     assert cpu_group not in tensor_groups
+
+
+def _object_collective_calls(source: str) -> list[tuple[ast.AST, ast.Call]]:
+    """Pair every object-collective call of ``source`` with its enclosing scope."""
+    calls: list[tuple[ast.AST, ast.Call]] = []
+    scope: list[ast.AST] = []
+
+    class _Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            scope.append(node)
+            self.generic_visit(node)
+            scope.pop()
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            scope.append(node)
+            self.generic_visit(node)
+            scope.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr in _OBJECT_COLLECTIVE_NAMES
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "dist"
+            ):
+                calls.append((scope[-1] if scope else node, node))
+            self.generic_visit(node)
+
+    _Visitor().visit(ast.parse(source))
+    return calls
+
+
+def _group_names_bound_by(function: ast.AST, helper: str) -> set[str]:
+    """Return the names that ``function`` binds from the ``helper`` group view."""
+    names: set[str] = set()
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        value = node.value
+        if not (isinstance(value.func, ast.Name) and value.func.id == helper):
+            continue
+        for target in node.targets:
+            elements = target.elts if isinstance(target, ast.Tuple) else [target]
+            for element in elements:
+                if isinstance(element, ast.Name):
+                    names.add(element.id)
+    return names
+
+
+@pytest.mark.cpu
+def test_every_object_collective_of_the_pipeline_takes_the_cpu_group():
+    """No object collective of the pipeline may run on the device group.
+
+    The behavioural case above drives the five object collectives that exist
+    today, so a later partial revert of one of them is caught. It cannot
+    catch a *new* object collective, because a new site is not driven by that
+    case. This case reads the module source instead: every object-collective
+    call has to take its group from ``_dit_cpu_rank_world()``, so a new site
+    on the device group fails the case until it is routed host-side.
+    """
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+
+    calls = _object_collective_calls(inspect.getsource(module))
+    assert calls, "the pipeline has no object collective to check"
+    for scope, call in calls:
+        name = getattr(scope, "name", "<module>")
+        group = next((keyword.value for keyword in call.keywords if keyword.arg == "group"), None)
+        assert isinstance(group, ast.Name), f"{name}: the object collective has to pass the group by keyword"
+        cpu_names = _group_names_bound_by(scope, "_dit_cpu_rank_world")
+        device_names = _group_names_bound_by(scope, "_dit_rank_world")
+        assert group.id in cpu_names, f"{name}: {group.id} does not come from the CPU group view"
+        assert group.id not in device_names, f"{name}: {group.id} also comes from the device group view"
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=2)
