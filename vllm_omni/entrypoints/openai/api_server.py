@@ -685,6 +685,7 @@ def _should_serve_duplex(model: str, kwargs: dict[str, Any]) -> bool:
         model=model,
         trust_remote_code=bool(kwargs.get("trust_remote_code")),
         deploy_config_path=kwargs.get("deploy_config"),
+        revision=kwargs.get("revision"),
     )
     if pipeline_config is None or not getattr(pipeline_config, "duplex_plugin", None):
         return False
@@ -755,7 +756,7 @@ async def build_async_omni_from_stage_config(
             saved = os.environ.get("CUDA_VISIBLE_DEVICES")
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
             try:
-                AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+                AutoConfig.from_pretrained(args.model, trust_remote_code=True, revision=getattr(args, "revision", None))
             finally:
                 if saved is not None:
                     os.environ["CUDA_VISIBLE_DEVICES"] = saved
