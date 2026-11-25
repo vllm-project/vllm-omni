@@ -779,6 +779,16 @@ class DuplexClientBase(ABC):
 
     # -- input ----------------------------------------------------------------
 
+    async def append_text(self, text: str, *, force_listen: bool = False) -> None:
+        """Prefill a text fragment; force listening while more input is arriving.
+
+        Requires ``text`` in the session's input modalities. Like audio units,
+        fragments may elicit a model-native response before the next append.
+        """
+        if not text:
+            raise ValueError("append_text requires non-empty text")
+        await self.send({"type": "input.text.append", "text": text, "force_listen": force_listen})
+
     async def append_audio(
         self,
         pcm: bytes,

@@ -9,6 +9,7 @@ from typing import Any, Literal
 import regex as re
 from torch import nn
 from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import RoutedExperts, UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -22,6 +23,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 
 class SerializedPerChannelFp8Config(ModelOptFp8Config):
@@ -140,6 +143,7 @@ class DiffusionFp8Config(OnlineQuantizationConfig):
         self.online_block_size = online_block_size
         self._online_block_weight_key = block_weight_key
         self._online_block_activation_key = block_activation_key
+        self._reported_rocm_alignment_fallback = False
         # `ignored_layers` entries name a layer's full prefix. A pipeline that documents
         # them as short module-name patterns raises this mode, as DiffusionMXFP8Config does.
         self.ignored_layers_match_mode: Literal["exact", "substring", "suffix"] = "exact"
@@ -176,12 +180,46 @@ class DiffusionFp8Config(OnlineQuantizationConfig):
             match_mode=self.ignored_layers_match_mode,
         )
 
+    @staticmethod
+    def _requires_rocm_alignment_fallback(layer: nn.Module) -> bool:
+        """Keep unsupported ROCm FP8 projections in their original precision.
+
+        PyTorch's ROCm ``torch._scaled_mm`` path requires both local matrix
+        dimensions to be divisible by 16. CUDA can route the same online-FP8
+        layer through kernels that pad or otherwise accept a non-aligned shape,
+        but the ROCm fallback fails at runtime. Inspect local shard dimensions
+        when available so tensor-parallel projections are handled correctly.
+        """
+        if not current_platform.is_rocm() or not isinstance(layer, LinearBase):
+            return False
+        input_size = getattr(layer, "input_size_per_partition", None)
+        if input_size is None:
+            input_size = getattr(layer, "input_size", None)
+        output_size = getattr(layer, "output_size_per_partition", None)
+        if output_size is None:
+            output_size = getattr(layer, "output_size", None)
+        return any(isinstance(size, int) and size % 16 != 0 for size in (input_size, output_size))
+
     def get_quant_method(self, layer: nn.Module, prefix: str) -> QuantizeMethodBase | None:
         if self._skips_layer(prefix):
             if isinstance(layer, LinearBase):
                 return UnquantizedLinearMethod()
             if isinstance(layer, RoutedExperts):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
+        if self._requires_rocm_alignment_fallback(layer):
+            if not self._reported_rocm_alignment_fallback:
+                input_size = getattr(layer, "input_size_per_partition", getattr(layer, "input_size", None))
+                output_size = getattr(layer, "output_size_per_partition", getattr(layer, "output_size", None))
+                logger.warning(
+                    "ROCm online FP8 requires local matrix dimensions divisible by 16; "
+                    "keeping non-aligned linear layers in their original precision "
+                    "(first layer: %s, K=%s, N=%s).",
+                    prefix,
+                    input_size,
+                    output_size,
+                )
+                self._reported_rocm_alignment_fallback = True
+            return UnquantizedLinearMethod()
         if self.online_block_size is not None:
             resolved = self.resolve_quant_method_cls(type(layer), prefix)
             if resolved is not None:

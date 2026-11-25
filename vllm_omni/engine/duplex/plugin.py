@@ -159,6 +159,14 @@ class PcmAppendBuffer(ABC):
     @abstractmethod
     def has_pending(self) -> bool: ...
 
+    def has_ready_unit(self, *, chunk_period_ms: int) -> bool:
+        """Whether buffered input can precede a text response's continuation.
+
+        Buffers that distinguish incomplete media from ready units may override
+        this; otherwise every pending input keeps priority over generated silence.
+        """
+        return self.has_pending()
+
     @abstractmethod
     def has_reserved(self) -> bool: ...
 
@@ -201,11 +209,12 @@ class PcmAppendBuffer(ABC):
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None: ...
 
     def prepare_backlog(self, *, operation_id: str, chunk_period_ms: int) -> PcmAppendReservation | None:
-        """Reserve one more whole unit from audio already buffered, if there is one (input-clocked sessions).
+        """Reserve one more complete buffered media unit, leaving partial PCM.
 
         After an append emitted its unit, an input-clocked session calls this
         until it returns ``None``, so an append longer than one unit submits
         every whole unit it completed and is acknowledged after all of them.
+        Text appends also drain these units first, preserving media/text order.
         Default: ``None`` (one unit per append; the rest waits for later
         appends).
         """
@@ -368,6 +377,8 @@ class DuplexDataPlaneContext:
     response_format: str = "wav"
     speed: float | None = None
     modalities: tuple[str, ...] = ()
+    # Producer turn captured at interception, when available (Stage0).
+    model_turn_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -751,6 +762,7 @@ class DuplexModelPlugin(ABC):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None: ...
 
     def project_intermediate_output(
@@ -827,6 +839,7 @@ class DuplexModelPlugin(ABC):
         segment_finished: bool,
         output: object,
         context: object,
+        streaming_context: object | None = None,
     ) -> bool:
         """Return True when the next user commit may start while prior TTS drains.
 
