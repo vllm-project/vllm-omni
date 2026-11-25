@@ -79,16 +79,18 @@ request includes regional compilation; warm the server once before measuring
 steady-state latency.
 
 > [!NOTE]
-> Do not set `HCCL_NPU_SOCKET_PORT_RANGE=auto` here. Automatic NPU-side socket
-> port allocation has been observed to make the first request fail with
-> `EI0006 Communication_Error_Get_Socket` on `HcclBroadcast` on hosts whose
-> NPUs sit in more than one interconnect domain, such as a two-domain
-> 950PR/950DT host. Leave the variable unset; the default port allocation is
-> the workaround for that report.
+> The MiniMax-H3 encoder's object payloads no longer cross HCCL: they travel
+> over the gloo CPU group (issue #10645). Automatic NPU-side socket port
+> allocation (`HCCL_NPU_SOCKET_PORT_RANGE=auto`) was observed to make the
+> first request fail with `EI0006 Communication_Error_Get_Socket` on
+> `HcclBroadcast` on hosts whose NPUs sit in more than one interconnect
+> domain, such as a two-domain 950PR/950DT host.
 >
-> The default allocation on a split-domain host is **not verified here**: the
-> available eight-card 950PR host keeps all eight NPUs in one HCCS domain, so
-> the two-domain first request of issue #10645 was not reproduced.
+> The recipes keep the variable unset because that split-domain case is
+> **not verified here**: the available eight-card 950PR host keeps all eight
+> NPUs in one HCCS domain, so the two-domain first request of issue #10645
+> was not reproduced. The reporter of #10645 could validate `auto` on their
+> two-domain host.
 
 ### Recommended lossy configuration (Ascend 950PR / 950DT)
 
@@ -127,16 +129,18 @@ The recommended lossy configuration uses a **start=8 / end=12** dense-fallback
 window; see below for more aggressive settings.
 
 > [!NOTE]
-> Do not set `HCCL_NPU_SOCKET_PORT_RANGE=auto` here. Automatic NPU-side socket
-> port allocation has been observed to make the first request fail with
-> `EI0006 Communication_Error_Get_Socket` on `HcclBroadcast` on hosts whose
-> NPUs sit in more than one interconnect domain, such as a two-domain
-> 950PR/950DT host. Leave the variable unset; the default port allocation is
-> the workaround for that report.
+> The MiniMax-H3 encoder's object payloads no longer cross HCCL: they travel
+> over the gloo CPU group (issue #10645). Automatic NPU-side socket port
+> allocation (`HCCL_NPU_SOCKET_PORT_RANGE=auto`) was observed to make the
+> first request fail with `EI0006 Communication_Error_Get_Socket` on
+> `HcclBroadcast` on hosts whose NPUs sit in more than one interconnect
+> domain, such as a two-domain 950PR/950DT host.
 >
-> The default allocation on a split-domain host is **not verified here**: the
-> available eight-card 950PR host keeps all eight NPUs in one HCCS domain, so
-> the two-domain first request of issue #10645 was not reproduced.
+> The recipes keep the variable unset because that split-domain case is
+> **not verified here**: the available eight-card 950PR host keeps all eight
+> NPUs in one HCCS domain, so the two-domain first request of issue #10645
+> was not reproduced. The reporter of #10645 could validate `auto` on their
+> two-domain host.
 
 ### Ref2VA on a 950PR that reports ~86 GB HBM
 

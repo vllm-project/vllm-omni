@@ -163,6 +163,11 @@ def test_object_collectives_use_the_cpu_group_and_tensor_collectives_keep_the_de
     The tensor broadcasts are the opposite case: they move device tensors and
     have to stay on the device group. Both directions are pinned here, so a
     later change cannot swap them.
+
+    Every object-collective site of the pipeline is driven, so a later partial
+    revert of one of them is caught: the rank-0 failure broadcast, the media
+    input distribution, the media conditioning broadcast, the local-media
+    error-status gather and the local-conditioning header broadcast.
     """
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
 
@@ -173,12 +178,22 @@ def test_object_collectives_use_the_cpu_group_and_tensor_collectives_keep_the_de
 
     object_groups: list[object] = []
     tensor_groups: list[object] = []
+    state = {"rank": 0, "calls": 0, "stop_at": 1}
+
+    class _StopAtObjectCollectiveError(Exception):
+        """Stops a driven method right after its object collective."""
 
     def fake_broadcast_object_list(obj_list, src=0, group=None, **kwargs):
         object_groups.append(group)
+        state["calls"] += 1
+        if state["calls"] >= state["stop_at"]:
+            raise _StopAtObjectCollectiveError
 
     def fake_all_gather_object(output_list, obj, group=None, **kwargs):
         object_groups.append(group)
+        state["calls"] += 1
+        if state["calls"] >= state["stop_at"]:
+            raise _StopAtObjectCollectiveError
 
     def fake_broadcast(tensor, src=0, group=None, **kwargs):
         tensor_groups.append(group)
@@ -187,14 +202,9 @@ def test_object_collectives_use_the_cpu_group_and_tensor_collectives_keep_the_de
     monkeypatch.setattr(module.dist, "all_gather_object", fake_all_gather_object)
     monkeypatch.setattr(module.dist, "broadcast", fake_broadcast)
     monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(module.dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(module.dist, "get_rank", lambda group: state["rank"])
     monkeypatch.setattr(module.dist, "get_world_size", lambda group: 2)
 
-    module._broadcast_rank0_exception(None)
-    assert object_groups == [cpu_group]
-
-    # The local-media error-status gather moves Python objects too, so it has
-    # to take the same host-side route.
     model = object.__new__(module.MiniMaxH3Pipeline)
     torch.nn.Module.__init__(model)
     model.device = torch.device("cpu")
@@ -203,13 +213,37 @@ def test_object_collectives_use_the_cpu_group_and_tensor_collectives_keep_the_de
     model._broadcast_media_conditioning = lambda conditioning: conditioning
     monkeypatch.setattr(module, "encode_media", lambda media, **kwargs: SimpleNamespace())
 
-    model._encode_local_media(object())
-    assert object_groups == [cpu_group, cpu_group]
+    def drive(stop_at, call):
+        """Run ``call`` until its object collective(s) happened."""
+        state["calls"] = 0
+        state["stop_at"] = stop_at
+        with pytest.raises(_StopAtObjectCollectiveError):
+            call()
+
+    # The rank-0 failure broadcast.
+    drive(1, lambda: module._broadcast_rank0_exception(None))
+    # The media input distribution.
+    media = SimpleNamespace(to_mm_tensors=lambda: [], to_metadata=lambda: {})
+    drive(1, lambda: model._distribute_media_inputs(media))
+    # The media conditioning broadcast.
+    conditioning = module.MiniMaxH3EncoderMediaConditioning(
+        task="t2va", height=1, width=1, num_frames=1, latent_t=1, audio_t=1
+    )
+    drive(1, lambda: module.MiniMaxH3Pipeline._broadcast_media_conditioning(model, conditioning))
+    # The local-media error-status gather.
+    drive(1, lambda: model._encode_local_media(object()))
+    # The local-conditioning header broadcast: the rank-0 failure broadcast runs
+    # first inside the method, so the header is its second object collective.
+    state["rank"] = 1
+    sampling = SimpleNamespace(extra_args={})
+    drive(2, lambda: model._prepare_local_conditioning(None, sampling))
+    state["rank"] = 0
 
     # The tensor broadcasts move device tensors and stay on the device group.
     module._broadcast_tensor(torch.ones(2, 3), dtype=torch.float32, device=torch.device("cpu"))
-    assert tensor_groups == [device_group, device_group]
 
+    assert object_groups == [cpu_group] * 6
+    assert tensor_groups == [device_group, device_group]
     assert device_group not in object_groups
     assert cpu_group not in tensor_groups
 

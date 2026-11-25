@@ -608,6 +608,11 @@ def _dit_cpu_rank_world() -> tuple[Any, int, int]:
     backend differs, so the two views stay consistent.
     """
     if not dist.is_initialized():
+        # A single process has no gloo group at all, and the callers take their
+        # world_size == 1 path, which is the same outcome a single-rank boot
+        # reaches. The device view asserts instead (``get_world_group()``), so
+        # the two views differ here on purpose: an uninitialized process is a
+        # valid state for the object collectives, not for the device ones.
         return None, 0, 1
     group = get_world_group().cpu_group
     return group, dist.get_rank(group), dist.get_world_size(group)

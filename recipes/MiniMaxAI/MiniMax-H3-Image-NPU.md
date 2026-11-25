@@ -235,16 +235,18 @@ dies: its 8-NPU command is 8 dies (4 cards).
 export MODEL=/path/to/MiniMax-H3-Image
 ```
 
-Do not set `HCCL_NPU_SOCKET_PORT_RANGE=auto`. Automatic NPU-side socket port
-allocation has been observed to make the first request fail with `EI0006
-Communication_Error_Get_Socket` on `HcclBroadcast` on hosts whose NPUs sit in
-more than one interconnect domain, such as a host with two four-NPU UB
-domains. Leave the variable unset; the default port allocation is the
-workaround for that report.
+The MiniMax-H3 encoder's object payloads no longer cross HCCL: they travel
+over the gloo CPU group (issue #10645). Automatic NPU-side socket port
+allocation (`HCCL_NPU_SOCKET_PORT_RANGE=auto`) was observed to make the first
+request fail with `EI0006 Communication_Error_Get_Socket` on `HcclBroadcast`
+on hosts whose NPUs sit in more than one interconnect domain, such as a host
+with two four-NPU UB domains.
 
-The default allocation on a split-domain host is **not verified here**: the
-available eight-card 950PR host keeps all eight NPUs in one HCCS domain, so
-the two-domain first request of issue #10645 was not reproduced.
+The recipes keep the variable unset because that split-domain case is **not
+verified here**: the available eight-card 950PR host keeps all eight NPUs in
+one HCCS domain, so the two-domain first request of issue #10645 was not
+reproduced. The reporter of #10645 could validate `auto` on their two-domain
+host.
 
 ### Atlas 800T A3 / Atlas 800I A2
 
