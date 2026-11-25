@@ -10,7 +10,7 @@ from torch import nn
 
 from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3AudioVAE, _AudioVAEPartProxy
+from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3AudioVAE, _VAEPartProxy
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -60,7 +60,7 @@ def _vae(
     vae._device_target = torch.device("cpu")
     vae._stager = vae._encoder_stager = vae._decoder_stager = None
     vae._build_residency_stagers(torch.device("cpu"))
-    vae.encoder_component = _AudioVAEPartProxy(vae, "encoder")
+    vae.encoder_component = _VAEPartProxy(vae, "encoder")
     return vae
 
 

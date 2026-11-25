@@ -345,12 +345,7 @@ class _VAEPartProxy(nn.Module):
         return self._vae
 
 
-class _VideoVAEPartProxy(_VAEPartProxy):
-    """Video encoder/decoder residency with the shared proxy lifecycle."""
-
-
-class _AudioVAEPartProxy(_VAEPartProxy):
-    """Audio encoder/decoder residency with the shared proxy lifecycle."""
+_VideoVAEPartProxy = _VAEPartProxy
 
 
 class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
@@ -1400,7 +1395,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         self._stager = None
         self._encoder_stager = None
         self._decoder_stager = None
-        self.encoder_component = _AudioVAEPartProxy(self, "encoder")
+        self.encoder_component = _VAEPartProxy(self, "encoder")
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._build_residency_stagers(device)
         self.sample_rate = int(self.config_dict["sample_rate"])
