@@ -69,7 +69,7 @@ def _required_managed_blocks(
     capacity: int,
     *,
     num_local_kv_branches: int,
-    segmented: SegmentedStaging | None,
+    segmented: ARDiffusionSegmentedKVSpec | None,
     block_size: int,
     resident_frames: int,
     blocks_per_frame: int,
