@@ -48,3 +48,14 @@ def parse_reference_kv_config(value: dict[str, Any] | None) -> ReferenceKVConfig
     elif maximum is not None:
         raise ValueError("max_refresh_interval requires cache_dit_policy=hit")
     return ReferenceKVConfig(mode, interval, quantization, policy, maximum)
+
+
+REFERENCE_ISOLATION = "minimax_h3_reference_isolation"
+REFERENCE_ISOLATION_METRICS = "minimax_h3_isolation_metrics"
+REFERENCE_ISOLATION_STATE = "reference_isolation"
+
+
+def validate_kv_isolate(value: object) -> None:
+    """Reject truthy strings or integers before serialized stage construction."""
+    if value is not None and type(value) is not bool:
+        raise ValueError("kv_isolate must be a boolean")

@@ -7,11 +7,18 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
+from time import monotonic
 
 import numpy as np
+from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DefaultDuplexModelSessionState, DuplexDataPlane, DuplexDataPlaneContext
+from vllm_omni.engine.duplex.visual_memory import (
+    EncodedVisualImage,
+    VisualMemory,
+    VisualMemorySource,
+)
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action, ParsedAction, parse_action
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import (
     DELEGATION_TOOL_NAME,
@@ -21,11 +28,13 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import Jo
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     RECENT_MESSAGES,
     SUMMARY_CHUNK_MESSAGES,
-    EncodedVisualImage,
     JoyAISummaryMemory,
-    JoyAIVisualMemory,
-    VisualMemorySource,
 )
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+    spoken_text_ready,
+)
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -66,7 +75,7 @@ class JoyAISessionState(DefaultDuplexModelSessionState):
     conversation_images: tuple[str, ...] = ()
     last_response_text: str = ""
     memory: JoyAISummaryMemory = field(default_factory=JoyAISummaryMemory)
-    visual_memory: JoyAIVisualMemory = field(default_factory=JoyAIVisualMemory)
+    visual_memory: VisualMemory = field(default_factory=VisualMemory)
     visual_source: VisualMemorySource | None = None
     observations: list[WorkingObservation] = field(default_factory=list)
     queries: list[QueryReference] = field(default_factory=list)
@@ -111,15 +120,63 @@ class Observation:
     delegation_tools: bool = False
     chunk_id: str | None = None
     text_sent: bool = False
+    audio_sent: bool = False
+    text_emitted: str = ""
+    # Cumulative action text. DELTA sampling gives each output only the new
+    # piece and attaches ``cumulative_text`` at finish, so the projector owns
+    # the running buffer that ``</response>`` and the spoken text are read from.
+    raw_text: str = ""
+    absorbed_key: tuple[object, ...] | None = None
+    stage0_outputs: int = 0
+    stage0_first_at: float = 0.0
+    begin_at: float = 0.0
     call_sent: bool = False
     response_text: str = ""
     query_reference: QueryReference | None = None
     response_frame_id: int = -1
     response_time_s: float = 0.0
 
+    def absorb(self, output: object) -> tuple[str, bool]:
+        """Fold one stage output into the cumulative action text.
+
+        DELTA sampling gives each output only the new piece while
+        ``cumulative_token_ids`` keeps growing; CUMULATIVE/FINAL_ONLY carry the
+        whole text. Idempotent per output, so ``decide_output`` and the
+        projector can both fold the same output.
+        """
+        finished = bool(getattr(output, "finished", False))
+        completion = next(iter(getattr(output, "outputs", None) or ()), None)
+        cumulative_text = getattr(completion, "cumulative_text", None)
+        if not (isinstance(cumulative_text, str) and cumulative_text):
+            cumulative_text = None
+        piece = cumulative_text or getattr(completion, "text", "")
+        piece = piece if isinstance(piece, str) else ""
+        cumulative_ids = getattr(completion, "cumulative_token_ids", None)
+        token_ids = getattr(completion, "token_ids", None)
+        key = (
+            len(cumulative_ids) if isinstance(cumulative_ids, list) else None,
+            len(token_ids) if isinstance(token_ids, list) else None,
+            len(piece),
+            piece[:16],
+        )
+        if key == self.absorbed_key:
+            return self.raw_text, finished
+        self.absorbed_key = key
+        if cumulative_text is not None:
+            # The finish delta carries the whole text, not an increment.
+            self.raw_text = cumulative_text
+            return self.raw_text, finished
+        is_delta = (
+            isinstance(cumulative_ids, list) and isinstance(token_ids, list) and len(cumulative_ids) > len(token_ids)
+        )
+        if is_delta:
+            self.raw_text = self.raw_text + piece
+        elif piece:
+            self.raw_text = piece
+        return self.raw_text, finished
+
     def parse(self, output: object) -> ParsedAction:
-        completion = next(iter(output.outputs or ()), None)
-        raw = getattr(completion, "cumulative_text", None) or getattr(completion, "text", "")
+        raw, _ = self.absorb(output)
         return parse_action(raw)
 
     def is_repeat(self, action: ParsedAction) -> bool:
@@ -135,7 +192,8 @@ class JoyAIDataPlane(DuplexDataPlane):
         self.requests: dict[str, Observation] = {}
 
     def begin_request(self, request_id: str) -> None:
-        self.requests.setdefault(request_id, Observation())
+        observation = self.requests.setdefault(request_id, Observation())
+        observation.begin_at = monotonic()
 
     def is_terminal(self, request_id: str | None) -> bool:
         return request_id is not None and request_id not in self.requests
@@ -173,23 +231,46 @@ class JoyAIDataPlane(DuplexDataPlane):
                 "end_of_turn": False,
             }
             if stage_id == self.joyai_stage_id:
+                raw, finished = observation.absorb(output)
+                now = monotonic()
+                if not observation.stage0_outputs:
+                    observation.stage0_first_at = now
+                observation.stage0_outputs += 1
+                logger.debug(
+                    "[JoyAI] stage0 out n=%d begin+%dms span=%dms raw_len=%d finished=%s",
+                    observation.stage0_outputs,
+                    int((now - observation.begin_at) * 1000) if observation.begin_at else -1,
+                    int((now - observation.stage0_first_at) * 1000),
+                    len(raw),
+                    finished,
+                )
+                # Mid-generation only a ready action may be shown; at finish the
+                # silence/delegation terminal paths still have to run.
+                if not finished and not spoken_text_ready(raw, finished=False):
+                    continue
                 action = observation.parse(output)
                 if observation.delegation_tools and action.action is Action.DELEGATE:
                     # The call is one result of its own: the recognised call
                     # short-circuits the rest of this output, so a spoken note
                     # is projected separately and may still enter TTS.
-                    yield from self._project_delegation(observation, action, event, context)
+                    yield from self._project_delegation(observation, action, event, context, finished=finished)
                     continue
                 if observation.text_sent:
                     continue
-                observation.text_sent = True
                 if action.action is Action.DELEGATE:
+                    observation.text_sent = True
                     event.update(
                         error_code="unsupported_tool_call",
                         error="JoyAI delegation requires the session to declare the delegate tool",
                         end_of_turn=True,
                     )
-                elif action.action is Action.SILENCE or not action.text or observation.is_repeat(action):
+                    # A turn that ends at JoyAI never reaches the Talker, so nothing feeds the
+                    # Code2Wav request async-chunk prewarmed at submit; abort it.
+                    event["abort_data_plane_request"] = True
+                    yield event
+                    continue
+                if action.action is Action.SILENCE or (finished and (not action.text or observation.is_repeat(action))):
+                    observation.text_sent = True
                     # Match JoyVLPolicy: genuine silence resets deduplication;
                     # suppressing a repeat keeps the last spoken response.
                     if observation.state is not None and not observation.is_repeat(action):
@@ -208,46 +289,79 @@ class JoyAIDataPlane(DuplexDataPlane):
                     # A completed observation, not a resumable LISTEN unit:
                     # the ordinary terminal path advances the turn identity.
                     event["end_of_turn"] = True
-                else:
-                    observation.response_text = action.text
-                    if (
-                        observation.state is not None
-                        and observation.visual_generation == observation.state.visual_memory.generation
-                        and context.active_response_id is not None
-                    ):
-                        # Resolve only the Session's committed portion when a
-                        # later prompt is built; generated speech may be unheard.
-                        observation.state.observations = [
-                            replace(item, response_item_id=f"item_{context.active_response_id}")
-                            if item.request_id == request_id
-                            else item
-                            for item in observation.state.observations
-                        ]
-                        if observation.query_reference is not None:
-                            response = ResponseReference(
-                                f"item_{context.active_response_id}",
-                                observation.response_time_s,
-                                observation.response_frame_id,
-                            )
-                            observation.state.queries = [
+                    # A turn that ends at JoyAI never reaches the Talker, so nothing feeds the
+                    # Code2Wav request async-chunk prewarmed at submit; abort it.
+                    event["abort_data_plane_request"] = True
+                    yield event
+                    continue
+                spoken = action.text
+                emitted = observation.text_emitted
+                delta = spoken[len(emitted) :] if spoken.startswith(emitted) else spoken
+                if not delta and not finished:
+                    continue
+                if not finished and observation.previous_response and observation.previous_response.startswith(spoken):
+                    # Still a prefix of the previous answer: it may finish as a
+                    # repeat, which the turn suppresses. Do not type it yet.
+                    continue
+                observation.text_emitted = spoken
+                if finished:
+                    observation.text_sent = True
+                observation.response_text = spoken
+                if (
+                    observation.state is not None
+                    and observation.visual_generation == observation.state.visual_memory.generation
+                    and context.active_response_id is not None
+                ):
+                    # Resolve only the Session's committed portion when a
+                    # later prompt is built; generated speech may be unheard.
+                    observation.state.observations = [
+                        replace(item, response_item_id=f"item_{context.active_response_id}")
+                        if item.request_id == request_id
+                        else item
+                        for item in observation.state.observations
+                    ]
+                    if finished and observation.query_reference is not None:
+                        # Streaming deltas used to append this once per token.
+                        # The query window is 16 slots; copies of the current
+                        # answer would evict earlier replies and be rendered
+                        # repeatedly in ``_archived_qa_prefix``.
+                        item_id = f"item_{context.active_response_id}"
+                        response = ResponseReference(
+                            item_id,
+                            observation.response_time_s,
+                            observation.response_frame_id,
+                        )
+                        queries: list[QueryReference] = []
+                        for query in observation.state.queries:
+                            if (query.item_id, query.text_digest) != (
+                                observation.query_reference.item_id,
+                                observation.query_reference.text_digest,
+                            ):
+                                queries.append(query)
+                                continue
+                            if any(item.item_id == item_id for item in query.responses):
+                                queries.append(query)
+                                continue
+                            queries.append(
                                 replace(
                                     query,
                                     responses=(*query.responses, response)[
                                         -(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES) :
                                     ],
                                 )
-                                if (query.item_id, query.text_digest)
-                                == (observation.query_reference.item_id, observation.query_reference.text_digest)
-                                else query
-                                for query in observation.state.queries
-                            ]
-                    event["text"] = action.text
-                    event["model_context_text"] = action.text
-                    event["text_requires_complete_audio"] = "audio" in context.modalities
-                    if "audio" not in observation.modalities:
-                        event["end_of_turn"] = True
-                        if observation.state is not None:
-                            observation.state.last_response_text = action.text
+                            )
+                        observation.state.queries = queries
+                event["text"] = delta
+                if finished:
+                    event["model_context_text"] = spoken
+                event["text_requires_complete_audio"] = "audio" in context.modalities
+                if finished and "audio" not in observation.modalities:
+                    event["end_of_turn"] = True
+                    if observation.state is not None:
+                        observation.state.last_response_text = spoken
+                # A turn that ends at JoyAI never reaches the Talker, so nothing feeds the
+                # Code2Wav request async-chunk prewarmed at submit; abort it.
+                event["abort_data_plane_request"] = event["end_of_turn"]
                 yield event
             elif stage_id == self.audio_stage_id:
                 completion = next(iter(output.outputs or ()), None)
@@ -269,13 +383,19 @@ class JoyAIDataPlane(DuplexDataPlane):
                     for chunk in chunks
                 ]
                 samples = np.concatenate(arrays) if arrays else np.empty(0, dtype=np.float32)
-                if output.finished and not samples.size:
+                # Streamed (DELTA) outputs carry only new samples; the final one may be empty.
+                # Sentence TTS keeps Code2Wav open across Talker stops; finished is the
+                # close_only sentinel and is therefore the duplex turn end.
+                observation.audio_sent |= bool(samples.size)
+                if output.finished and not observation.audio_sent:
                     event.update(
                         error_code="missing_audio", error="JoyAI Code2Wav completed without audio", end_of_turn=True
                     )
                     yield event
                     continue
-                if output.finished and samples.size and observation.state is not None:
+                if not output.finished and not samples.size:
+                    continue
+                if output.finished and observation.state is not None:
                     observation.state.last_response_text = observation.response_text
                 event.update(
                     audio_data=self.encode_audio(samples, rate, context.response_format, context.speed)
@@ -295,60 +415,92 @@ class JoyAIDataPlane(DuplexDataPlane):
         action: ParsedAction,
         event: dict[str, object],
         context: DuplexDataPlaneContext,
+        *,
+        finished: bool,
     ) -> Iterator[dict[str, object]]:
-        """Project one delegated action as a call plus, at most, its spoken note.
+        """Project a delegated action as streamed note deltas, then one call.
 
-        A recognised call short-circuits the rest of the output, so the call
-        result carries the whole output's ``end_of_turn``: nothing else of this
-        output will carry it. The note is the ordinary spoken reply that
-        follows, so it carries the text of its own response whenever the audio
-        stage is going to render it. A delegation without a note still owes the
-        observation a terminal of its own: the call is published, but the shared
-        call handler returns before the response lifecycle runs, so an empty
-        terminal releases the request instead of leaving it open.
+        ``</delegation>`` can appear before the question is finished. Publishing
+        the call then would set ``call_sent`` on an empty or partial question,
+        so later tokens never reach the solver. Mid-generation only the spoken
+        note is shown; the call is published at finish. The shared call handler
+        returns before the response lifecycle, so a note-free call still owes
+        the observation an empty terminal. A note that was already fully
+        streamed owes the same lifecycle event even when the finish delta is
+        empty: otherwise a text-only session never emits ``response.done``.
         """
-        if observation.call_sent or observation.text_sent:
-            return
+        spoken = action.text or ""
+        emitted = observation.text_emitted
+        delta = spoken[len(emitted) :] if spoken.startswith(emitted) else spoken
         audio = "audio" in context.modalities
-        call_event = dict(event)
-        note_event = dict(event)
-        note_event.update(
-            text=action.text,
-            model_context_text=action.text,
-            # The call already ended the turn; only a text-only observation
-            # has no audio stage left to produce the terminal.
-            end_of_turn=not audio,
-            # Without this the session would commit the note as spoken history
-            # when its audio never completed, e.g. a cancel between projection
-            # and the first Code2Wav output.
-            text_requires_complete_audio=audio,
-        )
+
+        def spoken_note() -> dict[str, object]:
+            item = dict(event)
+            item.update(
+                text=delta,
+                model_context_text=spoken,
+                # The call already ended the turn; only a text-only observation
+                # has no audio stage left to produce the terminal.
+                end_of_turn=not audio,
+                # Without this the session would commit the note as spoken history
+                # when its audio never completed, e.g. a cancel between projection
+                # and the first Code2Wav output.
+                text_requires_complete_audio=audio,
+                # A note that ends the turn here skips the Talker: free the prewarmed Code2Wav request.
+                abort_data_plane_request=not audio,
+            )
+            return item
+
+        if not finished:
+            if observation.call_sent or not delta:
+                return
+            observation.text_emitted = spoken
+            observation.response_text = spoken
+            note_event = dict(event)
+            note_event.update(
+                text=delta,
+                end_of_turn=False,
+                text_requires_complete_audio=audio,
+                abort_data_plane_request=False,
+            )
+            yield note_event
+            return
+        if observation.call_sent:
+            return
         arguments = delegation_arguments(action)
         observation.call_sent = True
-        call_event["end_of_turn"] = True
+        observation.text_sent = True
+        observation.response_text = spoken
+        if delta:
+            observation.text_emitted = spoken
         if arguments is None:
             # Nothing to hand over: the note is an ordinary observation and no
             # call is exposed.
-            observation.text_sent = True
-            if not action.text:
+            if not spoken:
+                note_event = dict(event)
                 note_event.update(
                     text="",
                     model_context_text="",
                     end_of_turn=True,
                     text_requires_complete_audio=False,
+                    abort_data_plane_request=True,
                 )
-            yield note_event
+                yield note_event
+                return
+            # Streamed notes still need the finish lifecycle when there is no
+            # new delta; ``spoken_note`` keeps audio from aborting Code2Wav.
+            yield spoken_note()
             return
-        observation.text_sent = True
-        observation.response_text = action.text
+        call_event = dict(event)
+        call_event["end_of_turn"] = True
         call_event["joyai_function_call"] = {
             "call_id": f"call_{uuid.uuid4().hex}",
             "name": DELEGATION_TOOL_NAME,
             "arguments": arguments,
         }
         yield call_event
-        if action.text:
-            yield note_event
+        if spoken:
+            yield spoken_note()
             return
         # A note-free call still ends its observation. The call result above is
         # published, but nothing else of this output will produce a terminal.
@@ -358,5 +510,7 @@ class JoyAIDataPlane(DuplexDataPlane):
             model_context_text="",
             end_of_turn=True,
             text_requires_complete_audio=False,
+            # No note means no Talker: free the prewarmed Code2Wav request.
+            abort_data_plane_request=True,
         )
         yield terminal_event

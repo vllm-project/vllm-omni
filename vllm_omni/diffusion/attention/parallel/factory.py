@@ -56,6 +56,18 @@ def build_parallel_attention_strategy(
     ring_degree = getattr(p, "ring_degree", 1)
     allgather_degree = getattr(p, "allgather_degree", 1)
     ulysses_a2a_permute = getattr(p, "ulysses_a2a_permute", False)
+    if ulysses_a2a_permute:
+        from vllm_omni.diffusion.distributed.a2a_permute import validate_a2a_permute_config
+
+        validate_a2a_permute_config(
+            enforce_eager=getattr(cfg, "enforce_eager", False),
+            ulysses_mode=getattr(p, "ulysses_mode", "strict"),
+            ulysses_degree=ulysses_degree,
+            ring_degree=ring_degree,
+            allgather_degree=allgather_degree,
+            scatter_idx=scatter_idx,
+            gather_idx=gather_idx,
+        )
 
     sp_configured = ulysses_degree > 1 or ring_degree > 1 or allgather_degree > 1
     if not sp_configured:

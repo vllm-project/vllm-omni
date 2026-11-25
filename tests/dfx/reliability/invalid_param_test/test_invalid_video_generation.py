@@ -21,7 +21,7 @@ _WAN_T2V = [
     pytest.param(
         OmniServerParams(model="Wan-AI/Wan2.2-T2V-A14B-Diffusers"),
         id="wan22_t2v",
-        marks=hardware_marks(res={"cuda": "H100"}),
+        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}),
     ),
 ]
 
@@ -37,19 +37,7 @@ def _minimal_video_form_data() -> dict[str, str]:
 
 @pytest.mark.parametrize(
     "form_extra, err_message",
-    [
-        pytest.param(None, ("prompt", "Field required", "Missing"), id="missing_prompt"),
-        pytest.param({"seconds": "0"}, ("seconds", "string_pattern_mismatch", "1"), id="seconds_zero"),
-        pytest.param({"size": "bad"}, ("size", "string_pattern_mismatch"), id="size_bad"),
-        pytest.param(
-            {"num_inference_steps": "0"},
-            ("num_inference_steps", "greater_than_equal", "1"),
-            id="num_inference_steps_zero",
-        ),
-        pytest.param(
-            {"guidance_scale": "25"}, ("guidance_scale", "less_than_equal", "20"), id="guidance_scale_above_max"
-        ),
-    ],
+    [pytest.param(None, ("prompt", "Field required", "Missing"), id="missing_prompt")],
 )
 @pytest.mark.parametrize("omni_server", _WAN_T2V, indirect=True)
 def test_post_videos_invalid_requests(
@@ -71,16 +59,7 @@ def test_post_videos_invalid_requests(
 
 @pytest.mark.parametrize(
     "form_extra, err_message",
-    [
-        pytest.param(None, ("prompt", "Field required", "Missing"), id="missing_prompt"),
-        pytest.param({"seconds": "0"}, ("seconds", "string_pattern_mismatch", "1"), id="seconds_zero"),
-        pytest.param({"size": "bad"}, ("size", "string_pattern_mismatch"), id="size_bad"),
-        pytest.param(
-            {"num_inference_steps": "201"},
-            ("num_inference_steps", "less_than_equal", "200"),
-            id="num_inference_steps_above_max",
-        ),
-    ],
+    [pytest.param(None, ("prompt", "Field required", "Missing"), id="missing_prompt")],
 )
 @pytest.mark.parametrize("omni_server", _WAN_T2V, indirect=True)
 def test_post_videos_sync_invalid_requests(

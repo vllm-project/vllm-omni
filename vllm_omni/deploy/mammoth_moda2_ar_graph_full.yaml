@@ -1,0 +1,25 @@
+# Opt-in: MammothModa2 AR stage with cudagraph_mode FULL.
+#
+# Use for intentional t2i AR decode graphs. Mixed batches still use the #9764
+# dual-expert + torch.where blend graph. With #9865, Mammoth AR also captures
+# all-und / all-gen specialized graphs. FULL replay
+# (GPUARModelRunner.execute_model) classifies the unpadded scheduled token
+# ids and selects that graph; mixed or unknown batches stay on blend.
+# Padding is not part of the mask: pad ids are usually 0 and would otherwise
+# look like understanding tokens.
+#
+# For und-only / chat AR, prefer mammoth_moda2_ar.yaml (eager) unless you
+# intentionally want FULL. Sampling stays at the base mammoth_moda2.yaml
+# defaults; for #9851 / #9764 routing repros, override temperature/top_k at
+# the client.
+
+base_config: mammoth_moda2.yaml
+
+stages:
+  - stage_id: 0
+    enforce_eager: false
+    compilation_config:
+      # mode 0: CUDA graphs without torch.compile (FULL does not need the
+      # PIECEWISE compile path).
+      mode: 0
+      cudagraph_mode: FULL

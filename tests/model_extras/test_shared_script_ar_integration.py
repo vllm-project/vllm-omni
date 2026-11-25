@@ -97,36 +97,6 @@ def test_text_to_image_only_builds_ar_inputs_for_ar_deployments(monkeypatch, tmp
         assert captured["params"][0].extra_args["bot_task"] == "none"
 
 
-def test_hunyuan_accuracy_offline_cli_contract(monkeypatch, tmp_path):
-    import subprocess
-
-    from PIL import Image
-
-    accuracy = _load_module("_hunyuan_accuracy", "tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py")
-    module = _load_module("_hunyuan_accuracy_cli", "examples/offline_inference/text_to_image/text_to_image.py")
-    output = tmp_path / "offline.png"
-
-    def run(argv, *, check):
-        assert check
-        assert Path(argv[1]).is_file()
-        monkeypatch.setattr(sys, "argv", argv[1:])
-        args = module.parse_args()
-        assert args.enable_expert_parallel
-        assert args.extra_body == {"bot_task": "none"}
-        assert args.use_system_prompt == "en_unified"
-        assert args.trust_remote_code
-        assert args.seed == accuracy.SEED
-        assert args.num_inference_steps == accuracy.NUM_INFERENCE_STEPS
-        assert args.output == str(output)
-        Image.new("RGB", (8, 8)).save(args.output)
-
-    monkeypatch.setattr(subprocess, "run", run)
-    image = accuracy._run_vllm_omni_hunyuan_image3_offline(
-        model="test-hunyuan", deploy_config="deploy.yaml", output_path=output
-    )
-    assert image.size == (8, 8)
-
-
 def _load_module(name: str, relpath: str):
     path = _REPO_ROOT / relpath
     spec = importlib.util.spec_from_file_location(name, path)

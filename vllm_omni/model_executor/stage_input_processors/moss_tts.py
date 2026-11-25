@@ -14,10 +14,12 @@ from typing import Any
 
 import numpy as np
 import torch
-from vllm.inputs import TokensPrompt as OmniTokensPrompt
 from vllm.logger import init_logger
+from vllm.outputs import RequestOutput
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_chunk_size
 
 logger = init_logger(__name__)
@@ -30,21 +32,34 @@ _MOSS_AUDIO_PAD_CODE = 1024
 # ---------------------------------------------------------------------------
 
 
-def _extract_audio_codes(stage_output: Any) -> torch.Tensor | None:
-    """Pull audio codes from a Stage-0 OmniOutput or raw tensor."""
-    if stage_output is None:
+def _extract_audio_codes(stage_output: RequestOutput) -> torch.Tensor | None:
+    """Read the client-facing completion payload, not a model-forward output."""
+    if not stage_output.outputs:
         return None
 
-    # OmniOutput
-    mm = getattr(stage_output, "multimodal_outputs", None)
+    mm = getattr(stage_output.outputs[0], "multimodal_output", None)
     if mm is not None:
         codes_dict = mm.get("codes", {})
         if isinstance(codes_dict, dict):
             ac = codes_dict.get("audio")
             if isinstance(ac, torch.Tensor):
-                return ac
+                return ac[(ac != _MOSS_AUDIO_PAD_CODE).any(dim=-1)]
 
     return None
+
+
+def _continuation_reference(info: dict[str, Any]) -> torch.Tensor | None:
+    """Read the assistant prefix from the tail of the unified prompt grid."""
+    length = (info.get("meta") or {}).get("ref_code_len", 0)
+    if isinstance(length, (list, tuple)):
+        length = length[0] if length else 0
+    length = int(length)
+    if length == 0:
+        return None
+    codes = (info.get("codes") or {}).get("ref")
+    if not isinstance(codes, torch.Tensor) or codes.ndim != 2 or not 0 < length <= codes.shape[0]:
+        raise ValueError("MOSS continuation requires ref_code_len frames in the prompt's codes.ref grid")
+    return codes[-length:]
 
 
 # ---------------------------------------------------------------------------
@@ -53,8 +68,7 @@ def _extract_audio_codes(stage_output: Any) -> torch.Tensor | None:
 
 
 def talker2codec(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    stage_list: list[RequestOutput],
     prompt: Any = None,
     requires_multimodal_data: bool = False,
 ) -> list[Any]:
@@ -67,12 +81,9 @@ def talker2codec(
     """
     results: list[Any] = []
 
-    for src_idx in engine_input_source:
-        if src_idx >= len(stage_list):
-            results.append(OmniTokensPrompt(prompt_token_ids=[]))
-            continue
-
-        stage_out = stage_list[src_idx]
+    info = (prompt.get("additional_information") or {}) if isinstance(prompt, dict) else {}
+    reference = _continuation_reference(deserialize_additional_information(info))
+    for src_idx, stage_out in enumerate(stage_list):
         audio_codes = _extract_audio_codes(stage_out)
 
         if audio_codes is None or audio_codes.numel() == 0:
@@ -80,6 +91,10 @@ def talker2codec(
             results.append(OmniTokensPrompt(prompt_token_ids=[]))
             continue
 
+        left_context = 0
+        if reference is not None:
+            left_context = int(reference.shape[0])
+            audio_codes = torch.cat((reference.to(audio_codes), audio_codes))
         # audio_codes: (T, NQ) → flatten to [NQ, T] → list[int]
         codes_nq_t = audio_codes.transpose(0, 1).contiguous()  # (NQ, T)
         flat = codes_nq_t.reshape(-1).tolist()
@@ -87,7 +102,7 @@ def talker2codec(
         results.append(
             OmniTokensPrompt(
                 prompt_token_ids=flat,
-                multi_modal_data={"codes": {"audio": codes_nq_t}},
+                additional_information={"meta": {"left_context_size": left_context}},
             )
         )
 
@@ -252,7 +267,19 @@ def _record_raw_first_audio(transfer_manager: Any, req_id: str, multimodal_outpu
     if isinstance(first_audio, torch.Tensor):
         first_audio = bool(first_audio.numel() and first_audio.reshape(-1)[-1].item())
     if first_audio:
-        transfer_manager.request_payload[req_id] = {"first_audio": True}
+        transfer_manager.request_payload.setdefault(req_id, {})["first_audio"] = True
+
+
+def _record_raw_reference(transfer_manager: Any, req_id: str, request: Any) -> None:
+    if req_id in transfer_manager.request_payload:
+        return
+    info = deserialize_additional_information(getattr(request, "additional_information", None))
+    reference = _continuation_reference(info)
+    # Own the prefix until the first generated chunk is ready; the request's
+    # tensor can be shared with the reference cache or reused by its producer.
+    transfer_manager.request_payload[req_id] = {
+        "reference": reference.detach().cpu().numpy().copy() if reference is not None else None,
+    }
 
 
 def _raw_new_frames(multimodal_output: Any) -> torch.Tensor | np.ndarray | None:
@@ -353,6 +380,11 @@ def _raw_emit_chunk(
     del pending_frames[:emit_frames]
     chunk_np = np.asarray(chunk_rows, dtype=np.int64)
     finished = bool(is_finished and len(pending_frames) == 0)
+    reference = saved.pop("reference", None) if isinstance(saved, dict) else None
+    left_context = 0
+    if reference is not None:
+        left_context = int(reference.shape[0])
+        chunk_np = np.concatenate((reference, chunk_np))
 
     codec_flat = torch.from_numpy(np.ascontiguousarray(chunk_np.T).reshape(-1))
 
@@ -364,9 +396,9 @@ def _raw_emit_chunk(
         codes=CodesStruct(audio=codec_flat),
         meta=MetaStruct(
             req_id=[req_id],
-            left_context_size=0,
+            left_context_size=left_context,
             codec_chunk_frames=int(chunk_np.shape[0]),
-            codec_left_context_frames=0,
+            codec_left_context_frames=left_context,
             first_audio=torch.tensor(True, dtype=torch.bool) if direct_first else None,
             code_flat_numel=int(codec_flat.numel()),
             stream_finished=torch.tensor(finished, dtype=torch.bool),
@@ -392,6 +424,7 @@ def talker2codec_raw_async_chunk(
     """
     req_id = _raw_request_id(request)
     _init_raw_chunk_state(transfer_manager)
+    _record_raw_reference(transfer_manager, req_id, request)
     _record_raw_first_audio(transfer_manager, req_id, multimodal_output)
     pending_frames = transfer_manager.code_prompt_token_ids[req_id]
 
@@ -403,11 +436,6 @@ def talker2codec_raw_async_chunk(
         valid_rows = (frames_np != _MOSS_AUDIO_PAD_CODE).any(axis=1)
         owned = np.array(frames_np if valid_rows.all() else frames_np[valid_rows], dtype=np.int64)
         pending_frames.extend(owned)
-    # Raw/local streaming should mirror the non-streaming path: the codec
-    # decodes only generated audio rows. Reference audio conditions the
-    # talker, but feeding its codes into the codec streaming state adds a
-    # long first-packet prime step and changes the decoder state relative
-    # to non-streaming output.
 
     return _raw_emit_chunk(transfer_manager, req_id, pending_frames, is_finished, _raw_chunk_config(transfer_manager))
 
@@ -430,6 +458,7 @@ def talker2codec_raw_async_chunk_batch(
     present: list[int] = []
     tensors: list[torch.Tensor | np.ndarray] = []
     for index, output in enumerate(pooling_outputs):
+        _record_raw_reference(transfer_manager, req_ids[index], requests[index])
         _record_raw_first_audio(transfer_manager, req_ids[index], output)
         new_frames = _raw_new_frames(output)
         if new_frames is not None:

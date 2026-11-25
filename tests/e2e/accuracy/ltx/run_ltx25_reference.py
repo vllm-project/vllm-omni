@@ -9,12 +9,25 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
 from PIL import Image
+
+if TYPE_CHECKING:
+    from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
+
+
+def _attention_backend_metadata() -> str:
+    return "torch_sdpa_default_bf16" if torch.version.hip is not None else "torch_sdpa_cudnn_bf16"
+
+
+def _omni_attention_backend() -> str:
+    return "TORCH_SDPA" if torch.version.hip is not None else "CUDNN_ATTN"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -40,6 +53,8 @@ def _parse_args() -> argparse.Namespace:
         default="distilled_two_stage",
     )
     parser.add_argument("--enable-layerwise-offload", action="store_true")
+    parser.add_argument("--stage-init-timeout", type=int)
+    parser.add_argument("--init-timeout", type=int)
     return parser.parse_args()
 
 
@@ -133,6 +148,90 @@ def _insert_official_paths(official_root: Path) -> None:
             sys.path.insert(0, path)
 
 
+def _gemma4_rope_config_for_layer(
+    config: Gemma4UnifiedTextConfig,
+    layer_type: str | None,
+) -> Gemma4UnifiedTextConfig:
+    """Resolve the homogeneous config used to initialize one Gemma4 layer type."""
+    if layer_type is None or not config.is_heterogeneous:
+        return config
+    return cast("Gemma4UnifiedTextConfig", config.per_layer_config[layer_type])
+
+
+def _configure_official_gemma4_rope_compatibility() -> None:
+    """Make the pinned official Gemma4 buffer setup heterogeneity-safe."""
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+    from transformers.models.gemma4_unified.modeling_gemma4_unified import (
+        Gemma4UnifiedTextRotaryEmbedding,
+    )
+
+    original = Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters
+    if not getattr(original, "_vllm_omni_heterogeneous_head_dim_compat", False):
+
+        def compute_default_rope_parameters(
+            config: Gemma4UnifiedTextConfig,
+            device: torch.device | None = None,
+            layer_type: str | None = None,
+            **kwargs: object,
+        ) -> tuple[torch.Tensor, float]:
+            layer_config = _gemma4_rope_config_for_layer(config, layer_type)
+            return original(config=layer_config, device=device, layer_type=layer_type, **kwargs)
+
+        setattr(compute_default_rope_parameters, "_vllm_omni_heterogeneous_head_dim_compat", True)
+        setattr(
+            Gemma4UnifiedTextRotaryEmbedding,
+            "compute_default_rope_parameters",
+            staticmethod(compute_default_rope_parameters),
+        )
+
+    proportional = ROPE_INIT_FUNCTIONS["proportional"]
+    if not getattr(proportional, "_vllm_omni_heterogeneous_head_dim_compat", False):
+
+        def compute_proportional_rope_parameters(
+            config: Gemma4UnifiedTextConfig,
+            device: torch.device | None = None,
+            seq_len: int | None = None,
+            layer_type: str | None = None,
+            head_dim_key: str = "head_dim",
+            **kwargs: object,
+        ) -> tuple[torch.Tensor, float]:
+            layer_config = _gemma4_rope_config_for_layer(config, layer_type)
+            # LTX's pinned official loader still requests the legacy
+            # ``global_head_dim`` field. Transformers 5.22 moves that value into
+            # the resolved per-layer config as ``head_dim``.
+            if layer_config is not config and head_dim_key == "global_head_dim":
+                head_dim_key = "head_dim"
+            return proportional(
+                config=layer_config,
+                device=device,
+                seq_len=seq_len,
+                layer_type=layer_type,
+                head_dim_key=head_dim_key,
+                **kwargs,
+            )
+
+        setattr(compute_proportional_rope_parameters, "_vllm_omni_heterogeneous_head_dim_compat", True)
+        ROPE_INIT_FUNCTIONS["proportional"] = compute_proportional_rope_parameters
+
+
+@contextmanager
+def _official_vocoder_deterministic_cudnn(device_type: str) -> Iterator[None]:
+    if device_type != "cuda":
+        yield
+        return
+
+    previous = torch.backends.cudnn.deterministic
+    try:
+        # PyTorch exposes ROCm devices through the ``cuda`` device type, but
+        # MIOpen has no deterministic algorithm for the LTX BWE resampler's
+        # grouped conv1d. Keep NVIDIA's reproducible policy without forcing
+        # the unsupported MIOpen path on ROCm.
+        torch.backends.cudnn.deterministic = torch.version.hip is None
+        yield
+    finally:
+        torch.backends.cudnn.deterministic = previous
+
+
 def _configure_official_vocoder_determinism() -> None:
     """Make the pinned official LTX-2.5 vocoder a stable reference."""
     from ltx_core.model.audio_vae.vocoder import VocoderWithBWE
@@ -142,27 +241,24 @@ def _configure_official_vocoder_determinism() -> None:
         return
 
     def deterministic_forward(self: Any, mel_spec: torch.Tensor) -> torch.Tensor:
-        device_type = mel_spec.device.type
-        if device_type != "cuda":
+        with _official_vocoder_deterministic_cudnn(mel_spec.device.type):
             return original_forward(self, mel_spec)
-        previous = torch.backends.cudnn.deterministic
-        try:
-            torch.backends.cudnn.deterministic = True
-            return original_forward(self, mel_spec)
-        finally:
-            torch.backends.cudnn.deterministic = previous
 
     setattr(deterministic_forward, "_vllm_omni_deterministic", True)
     setattr(VocoderWithBWE, "forward", deterministic_forward)
 
 
 def _configure_official_sdpa(pipeline: Any) -> None:
-    """Pin official connector and denoiser attention to cuDNN, with MATH fallback."""
+    """Use the same platform-appropriate PyTorch SDPA policy as Omni."""
     from ltx_core.loader.attention_ops import set_attention_module_op
     from ltx_core.model.transformer.attention import PytorchAttention
     from torch.nn.attention import SDPBackend
 
-    attention = PytorchAttention(priority=[SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH])
+    attention = (
+        PytorchAttention()
+        if torch.version.hip is not None
+        else PytorchAttention(priority=[SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH])
+    )
     module_op = set_attention_module_op(
         attention=attention,
         masked_attention=attention,
@@ -248,6 +344,7 @@ def _prepare_official_runtime(args: argparse.Namespace) -> None:
     if args.official_root is None:
         raise ValueError("Official backend requires --official-root")
     _insert_official_paths(args.official_root)
+    _configure_official_gemma4_rope_compatibility()
     _configure_official_vocoder_determinism()
     # Keep Gemma on the same SDPA path in both subprocesses. DiT attention is
     # still pinned independently to the explicit cuDNN backend below.
@@ -311,7 +408,7 @@ def _run_official_t2a(args: argparse.Namespace, request: dict[str, Any]) -> None
         audio_sample_rate=audio.sampling_rate,
         metadata={
             "backend": "official",
-            "attention_backend": "torch_sdpa_cudnn_bf16",
+            "attention_backend": _attention_backend_metadata(),
             "official_revision": os.environ.get("VLLM_TEST_LTX_OFFICIAL_REVISION"),
             "seed": request["seed"],
             "num_frames": request["num_frames"],
@@ -545,7 +642,7 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
         fps=float(request["fps"]),
         metadata={
             "backend": "official",
-            "attention_backend": "torch_sdpa_cudnn_bf16",
+            "attention_backend": _attention_backend_metadata(),
             "official_revision": os.environ.get("VLLM_TEST_LTX_OFFICIAL_REVISION"),
             "seed": request["seed"],
             "sigmas": request.get("sigmas"),
@@ -655,7 +752,7 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
     torch.backends.cuda.enable_cudnn_sdp(False)
     _reset_accelerator_peak_memory_stats()
 
-    attention_config = {"default": {"backend": "CUDNN_ATTN"}}
+    attention_config = {"default": {"backend": _omni_attention_backend()}}
 
     from vllm_omni.diffusion.data import DiffusionParallelConfig
     from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
@@ -665,14 +762,19 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request["seed"])
-    omni = Omni(
-        model=args.model,
-        model_class_name=args.model_class_name,
-        enforce_eager=True,
-        enable_layerwise_offload=args.enable_layerwise_offload,
-        diffusion_attention_config=attention_config,
-        parallel_config=DiffusionParallelConfig(),
-    )
+    omni_kwargs = {
+        "model": args.model,
+        "model_class_name": args.model_class_name,
+        "enforce_eager": True,
+        "enable_layerwise_offload": args.enable_layerwise_offload,
+        "diffusion_attention_config": attention_config,
+        "parallel_config": DiffusionParallelConfig(),
+    }
+    if args.stage_init_timeout is not None:
+        omni_kwargs["stage_init_timeout"] = args.stage_init_timeout
+    if args.init_timeout is not None:
+        omni_kwargs["init_timeout"] = args.init_timeout
+    omni = Omni(**omni_kwargs)
     try:
         # The explicit public class argument selects the worker pipeline. The
         # parent Omni proxy can only expose the checkpoint's base class, which
@@ -716,7 +818,7 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
             fps=float(request["fps"]),
             metadata={
                 "backend": "omni",
-                "attention_backend": "torch_sdpa_cudnn_bf16",
+                "attention_backend": _attention_backend_metadata(),
                 "seed": request["seed"],
                 "sigmas": request.get("sigmas"),
                 "model": args.model,
@@ -748,14 +850,19 @@ def _run_omni_t2a(args: argparse.Namespace, request: dict[str, Any]) -> None:
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request["seed"])
-    omni = Omni(
-        model=args.model,
-        model_class_name=args.model_class_name,
-        enforce_eager=True,
-        enable_layerwise_offload=args.enable_layerwise_offload,
-        diffusion_attention_config={"default": {"backend": "CUDNN_ATTN"}},
-        parallel_config=DiffusionParallelConfig(),
-    )
+    omni_kwargs = {
+        "model": args.model,
+        "model_class_name": args.model_class_name,
+        "enforce_eager": True,
+        "enable_layerwise_offload": args.enable_layerwise_offload,
+        "diffusion_attention_config": {"default": {"backend": _omni_attention_backend()}},
+        "parallel_config": DiffusionParallelConfig(),
+    }
+    if args.stage_init_timeout is not None:
+        omni_kwargs["stage_init_timeout"] = args.stage_init_timeout
+    if args.init_timeout is not None:
+        omni_kwargs["init_timeout"] = args.init_timeout
+    omni = Omni(**omni_kwargs)
     try:
         sampling_params = OmniDiffusionSamplingParams(
             generator=generator,
@@ -778,7 +885,7 @@ def _run_omni_t2a(args: argparse.Namespace, request: dict[str, Any]) -> None:
             audio_sample_rate=audio_sample_rate,
             metadata={
                 "backend": "omni",
-                "attention_backend": "torch_sdpa_cudnn_bf16",
+                "attention_backend": _attention_backend_metadata(),
                 "seed": request["seed"],
                 "num_frames": request["num_frames"],
                 "sigmas": request["sigmas"],

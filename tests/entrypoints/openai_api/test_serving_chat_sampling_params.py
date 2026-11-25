@@ -19,6 +19,7 @@ from vllm.sampling_params import SamplingParams
 
 from tests.helpers.serving_chat import build_serving_chat
 from vllm_omni.entrypoints.openai.stage_params import to_sampling_params_list
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -413,6 +414,7 @@ def mock_request(mocker: MockerFixture):
     request.stop_token_ids = None
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.n = None
     # Must be real Python objects (not MagicMock) so the code's explicit-field
     # and extra_body checks work correctly.
     request.model_fields_set = set()
@@ -441,6 +443,7 @@ def test_openai_sampling_fields_contains_expected_fields():
         "stop_token_ids",
         "frequency_penalty",
         "presence_penalty",
+        "n",
     }
     assert OmniOpenAIServingChat._OPENAI_SAMPLING_FIELDS == expected_fields
 
@@ -544,6 +547,17 @@ def test_request_presence_penalty_overrides(mock_engine_client, mock_request):
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
     assert result[0].presence_penalty == 0.3
+
+
+def test_request_n_overrides(mock_engine_client, mock_request):
+    """Test that request n is forwarded to SamplingParams for parallel completions."""
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
+    mock_request.n = 3
+    mock_request.model_fields_set = {"n"}
+
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
+
+    assert result[0].n == 3
 
 
 def test_non_comprehension_stages_use_cloned_defaults(mock_engine_client, mock_request):
@@ -983,3 +997,156 @@ def test_omitted_pooling_stage_keeps_parameter_type(mock_engine_client):
     assert result[1] is not default
     assert result[1].task == "token_classify"
     assert result[1].requires_token_ids is True
+
+
+@pytest.mark.parametrize(
+    "stage_count", [0, 1, 2], ids=["without-stage-configs", "single-stage", "pure-diffusion-multistage"]
+)
+@pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
+def test_diffusion_chat_inherits_engine_defaults(
+    mock_engine_client, mocker: MockerFixture, explicit: bool, stage_count: int
+) -> None:
+    defaults = [
+        OmniDiffusionSamplingParams(
+            num_inference_steps=50 - index,
+            guidance_scale=3.0 + index,
+            true_cfg_scale=2.0 + index,
+            seed=42 + index,
+            num_outputs_per_prompt=2 + index,
+            extra_args={"stage_default": index, "pipeline_option": "keep"},
+        )
+        for index in range(max(1, stage_count))
+    ]
+    captured: list[list[OmniDiffusionSamplingParams]] = []
+
+    async def generate(**kwargs):
+        captured.append(kwargs["sampling_params_list"])
+        if False:
+            yield None
+
+    server = build_serving_chat(engine_client=mock_engine_client)
+    server._diffusion_model_name = "test"
+    server._diffusion_engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="diffusion") for _ in range(stage_count)],
+        default_sampling_params_list=defaults,
+        generate=generate,
+    )
+    server._diffusion_mode = True
+    server._diffusion_extra_body_params = frozenset()
+    server._extract_diffusion_prompt_and_media = mocker.Mock(return_value=("cat", [], [], []))
+    for override in (explicit, False):
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[],
+            modalities=["image"],
+            **(
+                {
+                    "guidance_scale": 0.0,
+                    "true_cfg_scale": 0.0,
+                    "seed": 0,
+                    "num_outputs_per_prompt": 1,
+                    "num_inference_steps": 4,
+                    "extra_args": {"pipeline_option": "override"},
+                }
+                if override
+                else {}
+            ),
+        )
+        asyncio.run(server._create_chat_completion(request))
+        assert len(captured[-1]) == len(defaults)
+        for index, (params, default) in enumerate(zip(captured[-1], defaults)):
+            assert params.guidance_scale == (0.0 if override else default.guidance_scale)
+            assert params.true_cfg_scale == (0.0 if override else default.true_cfg_scale)
+            assert params.num_inference_steps == (4 if override else default.num_inference_steps)
+            assert params.seed == (0 if override else default.seed)
+            assert params.num_outputs_per_prompt == (1 if override else default.num_outputs_per_prompt)
+            assert params.extra_args == {
+                "stage_default": index,
+                "pipeline_option": "override" if override else "keep",
+            }
+            params.extra_args["stage_default"] = "mutated"
+    for index, default in enumerate(defaults):
+        assert default.extra_args == {"stage_default": index, "pipeline_option": "keep"}
+
+
+def test_diffusion_chat_overrides_leave_non_diffusion_params_unchanged(
+    mock_engine_client, mocker: MockerFixture
+) -> None:
+    llm_defaults = SamplingParams(seed=7)
+    diffusion_defaults = OmniDiffusionSamplingParams(extra_args={"stage_default": "keep"})
+    captured: list[SamplingParams | OmniDiffusionSamplingParams] = []
+
+    async def generate(**kwargs):
+        captured.extend(kwargs["sampling_params_list"])
+        if False:
+            yield None
+
+    server = build_serving_chat(engine_client=mock_engine_client)
+    server._diffusion_model_name = "test"
+    server._diffusion_engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="llm"), SimpleNamespace(stage_type="diffusion")],
+        default_sampling_params_list=[llm_defaults, diffusion_defaults],
+        generate=generate,
+    )
+    server._extract_diffusion_prompt_and_media = mocker.Mock(
+        return_value=("cat", [], ["reference.mp4"], ["reference.wav"])
+    )
+    asyncio.run(
+        server._create_diffusion_chat_completion(
+            ChatCompletionRequest(model="test", messages=[]),
+            normalized_extra_args={"pipeline_option": "override"},
+            diffusion_request_args={"guidance_scale": 0.0, "seed": 0, "num_inference_steps": 4},
+        )
+    )
+    assert len(captured) == 2
+    assert captured[0].seed == 7
+    assert captured[0].extra_args is None
+    assert not hasattr(captured[0], "num_inference_steps")
+    assert captured[1].seed == 0
+    assert captured[1].guidance_scale == 0.0
+    assert captured[1].num_inference_steps == 4
+    assert captured[1].extra_args == {
+        "stage_default": "keep",
+        "pipeline_option": "override",
+        "video_path": "reference.mp4",
+        "audio_path": "reference.wav",
+    }
+    assert llm_defaults.extra_args is None
+    assert diffusion_defaults.extra_args == {"stage_default": "keep"}
+
+
+@pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
+def test_multistage_diffusion_preserves_each_stage_defaults(
+    mock_engine_client, mocker: MockerFixture, explicit: bool
+) -> None:
+    diffusion_defaults = [
+        OmniDiffusionSamplingParams(guidance_scale=3.0, true_cfg_scale=2.0, seed=42, num_outputs_per_prompt=2),
+        OmniDiffusionSamplingParams(guidance_scale=7.0, true_cfg_scale=4.0, seed=43, num_outputs_per_prompt=3),
+    ]
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[SamplingParams(seed=7), *diffusion_defaults],
+    )
+    server = build_serving_chat(engine_client=mock_engine_client)
+    server._diffusion_engine = engine
+    mocker.patch.object(server, "_resolve_multistage_model_class_name", return_value=None)
+    extra_body = {"guidance_scale": 0.0, "true_cfg_scale": 0.0} if explicit else {}
+    _, _, request_params, _ = server._prepare_diffusion_image_request(prompt="cat", extra_body=extra_body)
+    _, params = server._build_multistage_generation_inputs(
+        engine=engine,
+        prompt="cat",
+        extra_body=extra_body,
+        reference_images=[],
+        gen_params=request_params,
+    )
+    assert params[0].seed == 7
+    for stage_params, default in zip(params[1:], diffusion_defaults):
+        assert stage_params.guidance_scale == (0.0 if explicit else default.guidance_scale)
+        assert stage_params.true_cfg_scale == (0.0 if explicit else default.true_cfg_scale)
+        assert stage_params.seed == default.seed
+        assert stage_params.num_outputs_per_prompt == default.num_outputs_per_prompt
+        assert stage_params is not default

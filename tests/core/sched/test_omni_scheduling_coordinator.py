@@ -19,6 +19,7 @@ from vllm import SamplingParams
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
+from vllm_omni.core.sched.duplex_stage_work import request_perf_chunk
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_native_mrv2_data_plane,
@@ -154,6 +155,20 @@ def test_process_pending_chunks_uses_public_receive_gate(mocker, receives_chunks
     assert coordinator.requests_with_ready_chunks == set()
 
 
+@pytest.mark.parametrize("from_running", [False, True])
+def test_chunk_registration_preserves_selected_producer(from_running):
+    coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=4, stage_id=2, async_chunk=True)
+    request = _make_request("receiver", status=RequestStatus.RUNNING if from_running else RequestStatus.WAITING)
+    request.payload_sender_info = {"host": "10.0.0.3", "zmq_port": 52099}
+    waiting = MockQueue([] if from_running else [request])
+    running = [request] if from_running else []
+
+    coordinator.process_pending_chunks(waiting, running, set(), set())
+
+    [handle] = coordinator.pending_chunk_registrations
+    assert handle.payload_sender_info == request.payload_sender_info
+
+
 def test_chunk_registration_ready_and_terminal_lifecycle():
     coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
     req = _make_request("internal", status=RequestStatus.WAITING)
@@ -279,6 +294,25 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req.num_prompt_tokens, 4)
         self.assertEqual(req._all_token_ids, [1, 2, 3, 4])
         self.assertEqual(req._output_token_ids, [])
+
+    def test_native_receive_stamps_duplex_perf_chunk(self):
+        coord = OmniSchedulingCoordinator(stage_id=2, async_chunk=True)
+        req = _make_request("r1")
+        requests = {"r1": req}
+
+        coord.update_request_metadata(
+            requests,
+            {"r1": SchedulingMetadataUpdate(prompt_token_ids=(1, 2), duplex_perf_chunk=(0, 2))},
+        )
+
+        self.assertEqual(request_perf_chunk(req), (0, 2))
+
+        coord.update_request_metadata(
+            requests,
+            {"r1": SchedulingMetadataUpdate(input_terminal=True)},
+        )
+
+        self.assertEqual(request_perf_chunk(req), (0, 2))
 
 
 class TestWaitingForInputTransition(unittest.TestCase):

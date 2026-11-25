@@ -287,16 +287,28 @@ def resolve_vllm_flash_attn_version(requested: str | int | None = None) -> int:
     return _choose_vllm_flash_attn_version(capability.major, requested, supported_versions)
 
 
+@cache
+def _vllm_flash_attn_varlen() -> FlashAttnFn | None:
+    """vLLM's versioned varlen dispatcher, or None where vLLM does not bundle it.
+
+    Cached because this runs on every attention call: Python does not cache a
+    failed import, so without it each call off CUDA (e.g. XPU) repeats the full
+    module search on the filesystem.
+    """
+    try:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_func
+    except ImportError:
+        return None
+    return vllm_func
+
+
 def _is_vllm_flash_attn_varlen(attn_func: FlashAttnFn) -> bool:
     """Return whether ``attn_func`` is vLLM's versioned varlen dispatcher.
 
     Identity by design; compiled-specs variants intentionally fall through.
     """
-    try:
-        from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_func
-    except ImportError:
-        return False
-    return attn_func is vllm_func
+    vllm_func = _vllm_flash_attn_varlen()
+    return vllm_func is not None and attn_func is vllm_func
 
 
 def vllm_varlen_version_kwargs(attn_func: FlashAttnFn | None) -> dict[str, int]:

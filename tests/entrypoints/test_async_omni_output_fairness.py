@@ -36,8 +36,8 @@ async def test_every_message_route_obeys_the_time_slice(mocker, monkeypatch, rou
         await asyncio.Future()
 
     frontend = async_omni_base.AsyncOmniBase.__new__(async_omni_base.AsyncOmniBase)
-    frontend.final_output_task = None
     frontend.engine = mocker.Mock(get_outputs_async=get_outputs_async)
+    frontend._initialize_async_frontend()
     frontend._route_engine_message = route_message
     frontend._handle_output_message = lambda msg: (True, None, None, None)
     frontend.event_resolver = mocker.Mock(resolve=resolve)

@@ -42,7 +42,7 @@ document it in the docstring:
   codec exposes no streaming decode.
 
 If you choose delta, audit the full chain: `forward()` returns the new chunk →
-`_consolidate_multimodal_tensors()` in `vllm_omni/engine/output_processor.py`
+`_consolidate_multimodal_tensors()` in `vllm_omni/outputs/output_processor.py`
 concatenates the audio key into a single tensor at finish → streaming consumers
 receive per-step chunks, offline consumers receive the concatenated tensor. A
 mismatch (consolidator skips the key with `continue`, or consumers expect a list

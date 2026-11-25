@@ -102,6 +102,12 @@ def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: An
     return False
 
 
+def _release_runner_shm_resources(worker: Any, request_ids: list[str]) -> int:
+    worker = getattr(worker, "worker", worker)
+    release = getattr(getattr(worker, "model_runner", None), "release_omni_shm_resources", None)
+    return 0 if release is None else release(request_ids)
+
+
 def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> bool:
     """Bind the TP1 in-process runner control plane directly to its scheduler."""
     if not isinstance(model_executor, UniProcExecutor):
@@ -163,6 +169,13 @@ class StageEngineCoreProc(EngineCoreProc):
         """
         adapter = getattr(getattr(self, "scheduler", None), "chunk_transfer_adapter", None)
         if adapter is None:
+            # The MRv2 native data plane sends from the runner, not the scheduler.
+            if request_ids and getattr(self.scheduler, "_native_data_plane", False):
+                try:
+                    self.model_executor.collective_rpc(_release_runner_shm_resources, args=(list(request_ids),))
+                except Exception as e:
+                    # A failed release leaks the requests' SHM segments.
+                    logger.warning("omni_release_request_resources(%s) failed: %s", request_ids, e)
             return
         for request_id in request_ids or ():
             try:
@@ -336,12 +349,18 @@ class StageEngineCoreProc(EngineCoreProc):
                 engine_core._send_engine_dead()
             raise
         finally:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
-            if signal_callback is not None:
-                signal_callback.stop()
-            if coord_client is not None:
-                with contextlib.suppress(RuntimeError):
-                    coord_client.close()
-            if engine_core is not None:
-                engine_core.shutdown()
+            # Repeated termination signals must not interrupt owner cleanup.
+            # The process manager can still enforce its SIGKILL deadline.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                if signal_callback is not None:
+                    signal_callback.stop()
+                if coord_client is not None:
+                    with contextlib.suppress(RuntimeError):
+                        coord_client.close()
+                if engine_core is not None:
+                    engine_core.shutdown()
+            finally:
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                signal.signal(signal.SIGINT, signal.SIG_DFL)

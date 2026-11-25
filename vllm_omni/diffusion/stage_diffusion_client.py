@@ -35,6 +35,7 @@ from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -543,6 +544,12 @@ class StageDiffusionClient(StageClientBase):
                         self.stage_id,
                         10.0,
                     )
+                    self._proc_manager.shutdown(timeout=10.0)
+            elif current_omni_platform.is_npu() and self._proc_manager.uses_multiproc:
+                # Allow the executor's 60s worker grace, its two 5s escalation
+                # windows, and stage finalization before signalling the tree.
+                stopped = shutdown_requested and self._proc_manager.wait_for_shutdown(timeout=80.0)
+                if not stopped:
                     self._proc_manager.shutdown(timeout=10.0)
             else:
                 self._proc_manager.shutdown(timeout=10.0)
