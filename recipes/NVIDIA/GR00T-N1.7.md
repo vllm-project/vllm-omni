@@ -61,20 +61,42 @@ Notes:
   policy at batch size 1, so a native-kernel port is intentionally out of
   scope for this recipe — the value is the OpenPI serving integration, not
   kernel-level acceleration.
-- The bundled deploy YAML keeps `enforce_eager: true`. To compile the action
-  head with `torch.compile` (the Qwen3-VL backbone stays eager), set these on
-  the stage:
+- The bundled deploy YAML keeps `enforce_eager: true`. Setting
+  `enforce_eager: false` turns on `torch.compile` for the action head; the
+  Qwen3-VL backbone stays eager. Two options shape it:
+    - `diffusion_compile_granularity`: `regional` (the default) compiles only the
+      DiT transformer blocks. `full` compiles the whole DiT plus the action
+      encoder and decoder.
+    - `diffusion_compile_dynamic`: keep the default `true`. With `false` the
+      compiled graphs are specialized to the backbone's token count, which
+      changes with the prompt length, so every new prompt length recompiles.
+
+  The pipeline compiles at startup by running one synthetic observation, so the
+  first request does not pay for compilation. If a module fails to compile, the
+  server logs which one and runs eager.
+
+  On one RTX PRO 6000 Blackwell (batch size 1, 4 denoising steps, vLLM 0.34.0,
+  PyTorch 2.14), with three prompts of 3, 4 and 18 tokens:
+
+  | Setting | Warm p50 | Added startup, warm cache | Added startup, cold cache | Stall on a new prompt length |
+  | --- | ---: | ---: | ---: | ---: |
+  | Eager (bundled YAML) | 93.7 ms | | | |
+  | `enforce_eager: false` only (`regional`, dynamic) | 77.7 ms | 3 s | about 7 s | none |
+  | `regional`, `dynamic: false` | 76.2 ms | 3 s | | 0.25 s (0.7 s cold) |
+  | `full`, dynamic | 62.1 ms | 17 s | about 40 s | none |
+  | `full`, `dynamic: false` | 60.8 ms | 15 s | | 2.4 to 3.2 s (13.6 s cold) |
+
+  For a control loop we recommend `full` with the default `dynamic: true`:
 
   ```yaml
   enforce_eager: false
   diffusion_compile_granularity: full
-  diffusion_compile_dynamic: false
   ```
 
-  On one RTX PRO 6000 Blackwell (batch size 1, 4 denoising steps), this lowered
-  warm p50 latency from 99 ms to 67 ms and added about 22 s of compile time at
-  startup. The default `regional` granularity compiles only the DiT transformer
-  blocks (85 ms).
+  It is 34% faster than eager and 20% faster than `regional`, and it compiles
+  once, at startup. `dynamic: false` is at most 2% faster in steady state and
+  stalls the robot on every new instruction length. "Warm cache" means
+  inductor's on-disk cache already holds the kernels from an earlier start.
 - The WebSocket endpoint is `ws://127.0.0.1:8000/v1/realtime/robot/openpi`.
   The server handshake message (first frame after connect) is a msgpack-encoded
   dict with `action_horizon`, `action_keys`, `embodiment_tag`, and
