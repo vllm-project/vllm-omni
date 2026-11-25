@@ -13,7 +13,8 @@ from vllm_omni.platforms import current_omni_platform
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"npu": "A5"}, num_cards=1)]
 
 
-def test_real_mindiesd_sla_projection_and_padding():
+@pytest.mark.parametrize("precision", ["bf16", "fp8"])
+def test_real_mindiesd_sla_projection_and_padding(precision):
     if not current_omni_platform.is_npu():
         pytest.skip("Ascend NPU is required")
     impl = SLAAttentionImpl(
@@ -23,6 +24,7 @@ def test_real_mindiesd_sla_projection_and_padding():
         prefix="blocks.0.attn",
         role="self",
         qkv_layout="BSND",
+        backend_kwargs={"sla": {"precision": precision}},
     )
     impl.sla_module.to("npu")
     q, k, v = (torch.randn(1, 1536, 2, 128, device="npu", dtype=torch.bfloat16) for _ in range(3))
@@ -46,7 +48,8 @@ def test_real_mindiesd_sla_projection_and_padding():
     torch.testing.assert_close(projected[:, :1280], baseline[:, :1280] + 1, atol=0.02, rtol=0.02)
 
 
-def test_h3_loader_and_shared_dispatch_reach_real_sla(monkeypatch):
+@pytest.mark.parametrize("precision", ["bf16", "fp8"])
+def test_h3_loader_and_shared_dispatch_reach_real_sla(monkeypatch, precision):
     if not current_omni_platform.is_npu():
         pytest.skip("Ascend NPU is required")
     from torch import nn
@@ -63,7 +66,8 @@ def test_h3_loader_and_shared_dispatch_reach_real_sla(monkeypatch):
     monkeypatch.setattr(blocks, "RowParallelLinear", _FakeLinear)
     config = OmniDiffusionConfig(
         diffusion_attention_config=AttentionConfig(
-            default={"backend": "FLASH_ATTN"}, per_role={"self": {"backend": "SLA_ATTN"}}
+            default={"backend": "FLASH_ATTN"},
+            per_role={"self": {"backend": "SLA_ATTN", "sla": {"precision": precision}}},
         )
     )
     with set_current_diffusion_config(config):

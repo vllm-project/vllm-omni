@@ -96,6 +96,10 @@ class SLAAttentionImpl(AttentionImpl):
             feature_map=self.config.feature_map,
             use_bf16=True,
         )
+        if self.config.precision == "fp8":
+            from .sla_fp8 import MindIESDFP8SLA
+
+            self.sla_module = MindIESDFP8SLA(self.sla_module)
 
     def forward_npu(
         self,

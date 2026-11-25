@@ -84,7 +84,9 @@ def test_invalid_topk(topk):
         SLASpec(topk=topk)
 
 
-@pytest.mark.parametrize("options", [{"blkq": 32}, {"blkk": True}, {"feature_map": "unknown"}, {"zero_init": "false"}])
+@pytest.mark.parametrize(
+    "options", [{"blkq": 32}, {"blkk": True}, {"feature_map": "unknown"}, {"zero_init": "false"}, {"precision": "fp4"}]
+)
 def test_invalid_sla_options(options):
     with pytest.raises(ValueError, match="sla."):
         SLASpec(**options)

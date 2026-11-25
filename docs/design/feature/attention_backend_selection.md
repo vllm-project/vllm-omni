@@ -146,6 +146,10 @@ owns the MindIE-SD call, while each H3 attention block registers that same
 provider module as `sla_module` so checkpoint loading and offload include
 `proj_l`. Projection weights are required unless explicit `sla.zero_init`
 permits zero defaults. The text refiner must resolve to a dense backend.
+The default sparse branch is BF16. Explicit `sla.precision=fp8` uses
+block-scaled E4M3 Q/K/V and MindIE-SD quantized BlockSparseAttention, while
+retaining BF16 inputs and the existing linear correction. Missing provider
+FP8 support is an error.
 Only one square BF16 document with structural suffix padding is supported;
 padding is removed before sparse selection and linear reduction. Pure Ulysses
 uses the shared dispatcher. Ring, AllGather-KV, reference isolation/reuse,

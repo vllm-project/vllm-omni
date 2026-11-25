@@ -18,8 +18,11 @@ class SLASpec:
     blkk: int = 64
     feature_map: str = "softmax"
     zero_init: bool = False
+    precision: str = "bf16"
 
     def __post_init__(self) -> None:
+        if self.precision not in ("bf16", "fp8"):
+            raise ValueError("sla.precision must be bf16 or fp8.")
         if isinstance(self.topk, bool) or not isinstance(self.topk, (int, float)):
             raise ValueError("sla.topk must be a number in (0, 1].")
         if not math.isfinite(self.topk) or not 0 < self.topk <= 1:

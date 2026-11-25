@@ -35,6 +35,7 @@ sizes.
 | `blkq`, `blkk` | `64` | Query/key block sizes; each accepts `64` or `128` |
 | `feature_map` | `softmax` | Linear branch feature map: `softmax`, `elu`, or `relu` |
 | `zero_init` | `false` | Allow absent projection tensors and initialize them to zero for wiring checks |
+| `precision` | `bf16` | Sparse branch precision: `bf16` or block-scaled E4M3 `fp8`; the linear correction stays BF16 |
 
 `topk=0.05` requests nominal 95% sparsity for the sparse branch. Block rounding
 changes the actual retained fraction, and the linear branch still runs. This
@@ -106,3 +107,26 @@ Then validate a complete H3 request with the delivered transformer checkpoint,
 check the provider execution log, and assess video/audio quality and measured
 sparsity separately. Neither CPU tests nor zero projection smoke tests replace
 that checkpoint acceptance run.
+
+## FP8 sparse branch
+
+Set `sla.precision` to `fp8` to quantize the sparse branch Q/K/V to
+block-scaled E4M3 and execute MindIE-SD quantized BlockSparseAttention.
+The existing block selection, feature maps, `proj_l` loading and linear
+correction are retained. BF16 is still the default.
+
+```json
+{
+  "default": {"backend": "FLASH_ATTN"},
+  "per_role": {
+    "self": {"backend": "SLA_ATTN", "sla": {"topk": 0.05, "precision": "fp8"}},
+    "minimax_h3.token_refiner": {"backend": "FLASH_ATTN"}
+  }
+}
+```
+
+The NPU runtime must provide MindIE-SD BlockSparseAttention with FP8 and
+dequantization-scale support; missing support raises an error. Attention
+inputs and the linear correction remain BF16. Projection weights are still
+required unless `zero_init=true` is explicitly selected for wiring checks.
+This precision option does not change linear-layer weight quantization.
