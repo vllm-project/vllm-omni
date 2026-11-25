@@ -4,11 +4,6 @@
 
 from __future__ import annotations
 
-from ctypes import c_float
-from functools import cache
-from math import inf
-from types import ModuleType
-
 import torch
 from vllm.triton_utils import tl, triton
 
@@ -211,20 +206,6 @@ def indexed_scale_shift_(
     return x
 
 
-def _load_mindiesd() -> ModuleType | None:
-    try:
-        from mindiesd.layers import index_modulation
-    except ImportError:
-        return None
-    return index_modulation
-
-
-@cache
-def _mindiesd_gate_supported(device: torch.device) -> bool:
-    # MindIE-SD's gate tiling defines buffer sizes for these chip families.
-    return torch.npu.get_device_name(device).lower().startswith(("ascend910", "ascend950"))
-
-
 def indexed_gate(
     x: torch.Tensor,
     gate: torch.Tensor,
@@ -232,11 +213,14 @@ def indexed_gate(
     indices: torch.Tensor,
 ) -> torch.Tensor:
     """Return ``x + gate[indices] * other`` without indexed temporaries."""
-    if x.device.type == "npu" and x.dtype == gate.dtype == other.dtype == torch.bfloat16 and x.numel() > 0:
-        sdk = _load_mindiesd()
-        if sdk is not None and _mindiesd_gate_supported(x.device):
+    if x.device.type == "npu":
+        try:
+            from mindiesd.layers.index_modulation import indexed_gate as mindiesd_indexed_gate
+        except ImportError:
+            pass
+        else:
             output = torch.empty_like(x, memory_format=torch.contiguous_format)
-            return sdk.indexed_gate(output, x, gate, other, indices)
+            return mindiesd_indexed_gate(output, x, gate, other, indices)
     return _indexed_gate(x, gate, other, indices)
 
 
@@ -282,15 +266,13 @@ def rms_norm_indexed_scale_shift(
     eps: float,
 ) -> torch.Tensor:
     """Fuse RMSNorm with an indexed affine transform."""
-    if (
-        x.device.type == "npu"
-        and x.dtype == weight.dtype == shift.dtype == scale.dtype == torch.bfloat16
-        and 0 < x.shape[-1] <= 8192
-        and 0 < c_float(eps).value < inf
-    ):
-        sdk = _load_mindiesd()
-        if sdk is not None:
-            return sdk.rms_norm_indexed_scale_shift(x, weight, shift, scale, indices, eps)
+    if x.device.type == "npu":
+        try:
+            from mindiesd.layers.index_modulation import rms_norm_indexed_scale_shift as mindiesd_rms_norm
+        except ImportError:
+            pass
+        else:
+            return mindiesd_rms_norm(x, weight, shift, scale, indices, eps)
     return _rms_norm_indexed_scale_shift(x, weight, shift, scale, indices, eps)
 
 
