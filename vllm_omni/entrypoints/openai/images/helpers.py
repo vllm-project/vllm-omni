@@ -23,30 +23,86 @@ See ``images/README.md`` (utils vs helpers, no overlap).
 
 import io
 import json
+from collections.abc import Mapping, Sequence
 from http import HTTPStatus
 from numbers import Integral
 from typing import Any
 
-import httpx
+import aiohttp
 import numpy as np
 import pybase64 as base64
 from fastapi import HTTPException, Request, UploadFile
 from PIL import Image
+from vllm.connections import HTTPConnection, global_http_connection
 from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
+from vllm.multimodal.media import MediaConnector
+from vllm.multimodal.media.base import MediaWithBytes
+from vllm.multimodal.media.image import ImageMediaIO
 
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageSegmentationInstance,
     SegmentationMaskFormat,
     SegmentationRLE,
 )
+from vllm_omni.request_capabilities import MaskConstraint
+from vllm_omni.serving_capabilities import ServingCapabilities
 
 logger = init_logger(__name__)
 
 
+def _validate_native_edit_inputs(
+    raw_request: Request,
+    engine_client: Any,
+    *,
+    stage_count: int,
+    image_count: int,
+    has_mask: bool,
+    has_reference: bool,
+) -> MaskConstraint | None:
+    """Reject native fields that would be discarded, before fetching inputs."""
+    if not has_mask and not has_reference:
+        return None
+    fields = [name for name, supplied in (("mask_image", has_mask), ("reference_image", has_reference)) if supplied]
+    if stage_count > 1:
+        raise HTTPException(400, f"{', '.join(fields)} is not supported by the multi-stage image edit route")
+    from vllm_omni.diffusion.data import uses_diffusers_adapter
+
+    config = _get_diffusion_od_config(raw_request, engine_client)
+    if uses_diffusers_adapter(config):
+        # Its worker validates the already-loaded pipeline's actual signature.
+        return None
+    declaration = getattr(getattr(engine_client, "engine", None), "serving_capabilities", None)
+    if not isinstance(declaration, ServingCapabilities):
+        architecture = getattr(config, "model_class_name", None)
+        declaration = get_diffusion_model_metadata(
+            architecture if isinstance(architecture, str) else None
+        ).serving_capabilities
+    if declaration is None:
+        return None
+    profile = next((p for p in declaration.get("image_edit").profiles if p.id == "image_to_image"), None)
+    request = profile.request if profile is not None else None
+    if profile is not None and profile.support == "unsupported":
+        raise HTTPException(400, "This model does not support image editing")
+    if request is None:
+        return None
+    for field in fields:
+        constraint = request.inputs.get(field)
+        if constraint is not None and constraint.support == "unsupported":
+            raise HTTPException(400, f"{field} is not supported by this model")
+    mask = request.mask if has_mask else None
+    if mask is not None and mask.max_source_count is not None and image_count > mask.max_source_count:
+        raise HTTPException(400, f"mask_image requires at most {mask.max_source_count} source image")
+    return mask
+
+
 def _get_max_edit_input_images(raw_request: Request, engine_client: Any) -> int | None:
-    od_config = _get_diffusion_od_config(raw_request, engine_client)
+    return _max_edit_input_images_from_config(_get_diffusion_od_config(raw_request, engine_client))
+
+
+def _max_edit_input_images_from_config(od_config: object | None) -> int | None:
     if od_config is None:
         # Preserve the existing compatibility behavior when the diffusion
         # config is not exposed on the serving surface.
@@ -184,10 +240,40 @@ def _generated_size_str(images: list[Any], fallback: str | None) -> str | None:
     return fallback
 
 
+class _ImageEditHTTPConnection(HTTPConnection):
+    """Use vLLM downloads while retaining the image route's no-redirect policy."""
+
+    async def get_async_response(
+        self,
+        url: str,
+        *,
+        timeout: float | None = None,
+        extra_headers: Mapping[str, str] | None = None,
+        allow_redirects: bool = True,
+    ) -> aiohttp.ClientResponse:
+        response = await (
+            await global_http_connection.get_async_response(
+                url, timeout=timeout, extra_headers=extra_headers, allow_redirects=False
+            )
+        )
+        if 300 <= response.status < 400:
+            response.release()
+            raise ValueError("Image URL redirects are not supported; use the final image URL")
+        return response
+
+
+class _ImageEditMediaIO(ImageMediaIO):
+    """Decode URL bytes like uploads, without EXIF rotation or alpha compositing."""
+
+    def load_bytes(self, data: bytes) -> MediaWithBytes[Image.Image]:
+        return MediaWithBytes(open_image(io.BytesIO(data)), data)
+
+
 async def _load_input_images(
-    inputs: list[str],
+    inputs: Sequence[str | UploadFile],
     *,
     normalize_rgb: bool = True,
+    allowed_media_domains: list[str] | None = None,
 ) -> list[Image.Image]:
     """
     convert to PIL.Image.Image list
@@ -210,17 +296,17 @@ async def _load_input_images(
 
         # 2. URL
         elif isinstance(inp, str) and inp.startswith("http"):
-            async with httpx.AsyncClient(timeout=60) as client:
-                try:
-                    resp = await client.get(inp)
-                    resp.raise_for_status()
-                    img = open_image(io.BytesIO(resp.content))
-                    images.append(img)
-                except Exception as e:
-                    raise ValueError(f"Failed to download image from URL {inp}: {e}")
+            connector = MediaConnector(
+                connection=_ImageEditHTTPConnection(), allowed_media_domains=allowed_media_domains
+            )
+            try:
+                loaded = await connector.load_from_url_async(inp, _ImageEditMediaIO(image_mode=None), fetch_timeout=60)
+                images.append(loaded.media if isinstance(loaded, MediaWithBytes) else loaded)
+            except Exception as e:
+                raise ValueError(f"Failed to download image from URL {inp}: {e}") from e
 
         # 3. UploadFile
-        elif hasattr(inp, "file"):
+        elif not isinstance(inp, str) and hasattr(inp, "file"):
             try:
                 img_data = await inp.read()
                 img = open_image(io.BytesIO(img_data))

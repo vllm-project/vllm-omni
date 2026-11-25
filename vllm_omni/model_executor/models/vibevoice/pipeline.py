@@ -14,11 +14,18 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    declare_capabilities,
+)
 
 # audio BOS / audio EOS / audio placeholder / <|endoftext|>
 VIBEVOICE_VALID_TOKEN_IDS = [151652, 151653, 151654, 151643]
 
 VIBEVOICE_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        unsupported_reason="offline_contract_only",
+        sources=("vllm_omni/model_executor/models/vibevoice/pipeline.py", "recipes/Microsoft/VibeVoice-1.5B-H100.md"),
+    ),
     model_type="vibevoice",
     default_deploy_config_name="vibevoice.yaml",
     model_arch="VibeVoiceForConditionalGeneration",

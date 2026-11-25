@@ -5,7 +5,12 @@
 from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    ARTTSAdapter,
+    PreparedRequest,
+    apply_max_new_tokens,
+    speech_inputs,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -19,6 +24,10 @@ class StepAudio2Adapter(ARTTSAdapter):
     ``<tts_start>`` marker; prompt building is a synchronous chat-template
     construction with no uploaded-voice / ref-audio handling.
     """
+
+    # The HTTP voice placeholder (including "default") is accepted and ignored.
+    # Leave voice selection undeclared so clients can submit ordinary speech.
+    request_constraints = speech_inputs("instructions", unsupported=("reference_audio", "reference_text"))
 
     stage_keys = frozenset({"step_audio2_thinker"})
     name = "step_audio2"

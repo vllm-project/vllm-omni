@@ -16,6 +16,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     PreparedRequest,
     apply_max_new_tokens,
     conditioning_cache_salt,
+    speech_inputs,
 )
 
 if TYPE_CHECKING:
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
 
 @register_tts_adapter
 class FishSpeechAdapter(ARTTSAdapter):
+    request_constraints = speech_inputs("reference_audio", "reference_text", "voice")
+
     stage_keys = frozenset({"fish_speech_slow_ar"})
     name = "fish_tts"
 

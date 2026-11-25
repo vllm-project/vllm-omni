@@ -27,6 +27,7 @@ from vllm_omni.model_executor.models.qwen3_tts.sampling_policy import (
     SUBTALKER_SAMPLING_PARAMS_KEY,
     validate_subtalker_sampling_params,
 )
+from vllm_omni.request_capabilities import RequestConstraints
 from vllm_omni.utils.speaker_cache import validate_qwen3_tts_profile
 
 if TYPE_CHECKING:
@@ -158,6 +159,43 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         retry_failed_segments=False,
     )
     supported_output_sample_rates = frozenset({8000, 24000})
+
+    def get_request_constraints(self) -> RequestConstraints:
+        from vllm_omni.request_capabilities import InputConstraint, ParameterConstraint
+
+        request = super().get_request_constraints()
+        variant = self._get_model_variant()
+        parameters = dict(request.parameters)
+        # These are the values actually checked by validate(), including its
+        # default language set. They describe input acceptance, not quality.
+        parameters["language"] = ParameterConstraint(
+            support="supported",
+            type="string",
+            enum_normalization="title",
+            enum=tuple(sorted(self.capabilities.supported_languages)),
+        )
+        if variant is not None:
+            parameters["task_type"] = ParameterConstraint(support="supported", type="string", enum=(variant,))
+        inputs = dict(request.inputs)
+        required_any_of: tuple[tuple[str, ...], ...] = ()
+        if variant == "Base":
+            inputs.update(
+                {
+                    role: InputConstraint(support="supported", min_count=0)
+                    for role in ("voice", "reference_audio", "reference_text", "speaker_embedding")
+                }
+            )
+            required_any_of = (("voice", "reference_audio", "speaker_embedding"),)
+        elif variant == "VoiceDesign":
+            inputs["instructions"] = InputConstraint(support="supported", min_count=1, max_count=1)
+        elif variant == "CustomVoice":
+            inputs["voice"] = InputConstraint(
+                support="supported", min_count=0 if self.capabilities.default_speaker else 1, max_count=1
+            )
+            inputs["instructions"] = InputConstraint(support="supported", min_count=0, max_count=1)
+        return request.model_copy(
+            update={"inputs": inputs, "parameters": parameters, "required_any_of": required_any_of}
+        )
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)

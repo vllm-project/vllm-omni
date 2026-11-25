@@ -146,9 +146,11 @@ def multistage_handler(monkeypatch):
 @pytest.fixture
 def diffusion_handler(monkeypatch):
     speech_kwargs = {}
+    handler_kwargs = {}
 
     def _for_diffusion_factory(label: str):
         def _factory(cls, *args, **kwargs):
+            handler_kwargs[label] = kwargs
             return _marker(label)
 
         return classmethod(_factory)
@@ -173,7 +175,7 @@ def diffusion_handler(monkeypatch):
         classmethod(lambda cls, *a, **k: _marker("openpi")),
     )
 
-    return {"speech_kwargs": speech_kwargs}
+    return {"speech_kwargs": speech_kwargs, "handler_kwargs": handler_kwargs}
 
 
 def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
@@ -406,6 +408,7 @@ def test_profiler_endpoints_detect_typed_stage_config():
 
 # Exact Omni router census on main. Update intentionally when routes change.
 _EXPECTED_ROUTER_ROUTES = {
+    ("GET", "/v1/omni/capabilities"),
     ("POST", "/v1/chat/completions"),
     ("POST", "/v1/chat/completions/batch"),
     ("POST", "/v1/audio/speech"),
@@ -1750,12 +1753,12 @@ async def test_pure_diffusion_app_state_key_snapshot(diffusion_handler) -> None:
     """
     stage = SimpleNamespace(stage_type="diffusion", engine_args={})
     engine = _FakeEngineClient(stage_configs=[stage])
-
+    handler_kwargs = diffusion_handler["handler_kwargs"]
     state = State()
     await api_server.omni_init_app_state(
         engine,
         state,
-        _minimal_args(),
+        _minimal_args(served_model_name=["image-primary", "image-alias"]),
     )
 
     _assert_app_state_snapshot(
@@ -1765,6 +1768,8 @@ async def test_pure_diffusion_app_state_key_snapshot(diffusion_handler) -> None:
         must_be_none=_DIFFUSION_MUST_BE_NONE,
     )
     assert state.diffusion_engine is engine
+    for label in ("chat", "chat_batch"):
+        assert handler_kwargs[label]["served_model_names"] == ["image-primary", "image-alias"]
     assert isinstance(state.anthropic_serving_messages, api_server._UnsupportedAnthropicMessages)
 
 
@@ -1958,7 +1963,9 @@ _MODALITY_HANDLERS = _CHAT_HANDLERS | {
 async def test_diffusion_supported_tasks_set_handlers(diffusion_handler, tasks, wired):
     engine = _FakeEngineClient(stage_configs=[SimpleNamespace(stage_type="diffusion")], supported_tasks=tasks)
     state = State()
-    await api_server.omni_init_app_state(engine, state, _minimal_args())
+    await api_server.omni_init_app_state(
+        engine, state, _minimal_args(served_model_name=["image-primary", "image-alias"])
+    )
 
     _assert_app_state_snapshot(
         state,
@@ -1967,6 +1974,11 @@ async def test_diffusion_supported_tasks_set_handlers(diffusion_handler, tasks, 
         must_be_none=_DIFFUSION_MUST_BE_NONE | ((_MODALITY_HANDLERS | {"openai_streaming_video_output"}) - wired),
     )
     assert state.supported_tasks == frozenset(tasks)
+    for label in ("chat", "chat_batch"):
+        if f"openai_serving_{label}" in wired:
+            assert diffusion_handler["handler_kwargs"][label]["served_model_names"] == ["image-primary", "image-alias"]
+        else:
+            assert label not in diffusion_handler["handler_kwargs"]
 
 
 @pytest.mark.asyncio

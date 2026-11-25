@@ -26,6 +26,16 @@ def test_detection_requires_codec_stage():
     assert not Lfm3OmniTTSAdapter.stage_serves_speech("lfm3_temporal", {"lfm3_temporal"})
 
 
+@pytest.mark.parametrize("voice", [None, "default", "", "DEFAULT", "alloy"])
+def test_declared_voice_and_reference_constraints_match_validation(voice):
+    adapter = make_adapter()
+    constraints = adapter.get_request_constraints()
+    accepted = adapter.validate(OpenAICreateSpeechRequest(input="Hello", voice=voice)) is None
+    assert accepted == (voice is None or voice in constraints.parameters["voice"].enum)
+    assert constraints.inputs["instructions"].support == "supported"
+    assert constraints.inputs["reference_audio"].support == "unsupported"
+
+
 @pytest.mark.parametrize(
     "fields, message",
     [

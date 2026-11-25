@@ -7,6 +7,9 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    declare_capabilities,
+)
 
 # π0 is one diffusion stage (robot observation -> action chunk via flow
 # matching). It is registered in ``OMNI_PIPELINES`` because π0 is online-served
@@ -14,6 +17,10 @@ from vllm_omni.config.stage_config import (
 # ``pi.pi0`` package: importing a package submodule executes ``pi0.__init__``,
 # which imports the runtime pipeline and ``diffusion.data``.
 PI0_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        unsupported_reason="outside_standard_operations",
+        sources=("vllm_omni/diffusion/models/pi0_pipeline_config.py",),
+    ),
     model_type="pi0",
     model_arch="Pi0Pipeline",
     stages=(

@@ -15,6 +15,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     apply_max_new_tokens,
     conditioning_cache_salt,
     resolve_stage_model_path,
+    speech_inputs,
 )
 
 if TYPE_CHECKING:
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
 
 @register_tts_adapter
 class HiggsAudioV2Adapter(ARTTSAdapter):
+    request_constraints = speech_inputs("reference_audio", "reference_text", "voice", unsupported=("instructions",))
+
     @property
     def engine_client(self):
         return self.ctx.engine_client

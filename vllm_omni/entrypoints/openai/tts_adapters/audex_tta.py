@@ -13,8 +13,14 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    ARTTSAdapter,
+    PreparedRequest,
+    apply_max_new_tokens,
+    speech_inputs,
+)
 from vllm_omni.model_executor.models.audex.prompt import build_tta_cond_prompt
+from vllm_omni.request_capabilities import ParameterConstraint
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -30,6 +36,18 @@ _INTERNAL_KEYS = ("cfg_role", "cfg_pair_id", "cfg_null_prompt", "tta_rvq")
 @register_tts_adapter
 class AudexTTAAdapter(ARTTSAdapter):
     """Caption-conditioned general audio: no voices, no reference audio."""
+
+    request_constraints = speech_inputs(
+        "voice", unsupported=("reference_audio", "reference_text", "instructions")
+    ).model_copy(
+        update={
+            "parameters": {
+                "voice": ParameterConstraint(
+                    support="supported", type="string", enum=("", "default"), enum_normalization="strip_lower"
+                )
+            }
+        }
+    )
 
     stage_keys = frozenset({"audex_tta_thinker"})
     name = "audex_tta"

@@ -4,8 +4,14 @@
 from dataclasses import replace
 
 from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, StagePipelineConfig
+from vllm_omni.serving_capabilities import AUDIO_RESPONSE, TEXT_TO_SPEECH, declare_capabilities
 
 PHONON_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        sources=("vllm_omni/entrypoints/openai/tts_adapters/phonon.py",),
+    ),
     model_type="gradium_phonon_tts",
     default_deploy_config_name="phonon.yaml",
     model_arch="PhononTalkerForConditionalGeneration",

@@ -12,10 +12,17 @@ couples it to vLLM's stop machinery, with ``detokenize=False`` because head0 is
 an audio code. Same idiom as VoxCPM2/MOSS.
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
+)
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_TO_SPEECH,
+    declare_capabilities,
 )
 
 # head0 valid range is 0..7 (its FSQ cardinality is 8); STOP is the sentinel
@@ -23,6 +30,12 @@ from vllm_omni.config.stage_config import (
 _GEPARD_STOP_TOKEN_ID = 8
 
 GEPARD_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/gepard/pipeline.py", "docs/serving/speech_api.md"),
+    ),
     model_type="gepard",
     default_deploy_config_name="gepard.yaml",
     model_arch="GepardTalkerForConditionalGeneration",

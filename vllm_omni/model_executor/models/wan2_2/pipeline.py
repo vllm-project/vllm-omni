@@ -23,11 +23,18 @@ deploy config ``vllm_omni/deploy/wan2_2_eg.yaml``; select it with
 ``--deploy-config``.
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     DiffusionStageRole,
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
+)
+from vllm_omni.serving_capabilities import (
+    IMAGE_TO_VIDEO,
+    TEXT_TO_VIDEO,
+    declare_capabilities,
 )
 
 _WAN_MODEL_ARCH = "WanPipeline"
@@ -46,6 +53,11 @@ _DENOISE_PAYLOAD_KEYS = ("latents",)
 
 # --- Single-stage full pipeline ---------------------------------------------
 WAN2_2_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_VIDEO,
+        replace(IMAGE_TO_VIDEO, support="unknown", reason_code="checkpoint_requires_expand_timesteps"),
+        sources=("vllm_omni/model_executor/models/wan2_2/pipeline.py",),
+    ),
     model_type="wan2_2",
     model_arch=_WAN_MODEL_ARCH,
     default_deploy_config_name="wan2_2.yaml",
@@ -67,6 +79,11 @@ WAN2_2_PIPELINE = PipelineConfig(
 
 # --- Encode/Generation (EG): 2-stage disaggregation -------------------------
 WAN2_2_EG_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_VIDEO,
+        replace(IMAGE_TO_VIDEO, support="unknown", reason_code="checkpoint_requires_expand_timesteps"),
+        sources=("vllm_omni/model_executor/models/wan2_2/pipeline.py",),
+    ),
     model_type="wan2_2_eg",
     model_arch=_WAN_MODEL_ARCH,
     default_deploy_config_name="wan2_2_eg.yaml",
@@ -107,6 +124,11 @@ WAN2_2_EG_PIPELINE = PipelineConfig(
 
 # --- Encode/Denoise/Decode (EGD): 3-stage disaggregation -------------------
 WAN2_2_EGD_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_VIDEO,
+        replace(IMAGE_TO_VIDEO, support="unknown", reason_code="checkpoint_requires_expand_timesteps"),
+        sources=("vllm_omni/model_executor/models/wan2_2/pipeline.py",),
+    ),
     model_type="wan2_2_egd",
     model_arch=_WAN_MODEL_ARCH,
     default_deploy_config_name="wan2_2_egd.yaml",
@@ -158,6 +180,11 @@ WAN2_2_EGD_PIPELINE = PipelineConfig(
 
 # --- Single-stage TI2V pipeline --------------------------------------------
 WAN2_2_TI2V_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_VIDEO,
+        IMAGE_TO_VIDEO,
+        sources=("vllm_omni/model_executor/models/wan2_2/pipeline.py",),
+    ),
     model_type="wan2_2_ti2v",
     model_arch=_WAN_MODEL_ARCH,
     diffusers_class_name="WanPipeline",

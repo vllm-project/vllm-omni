@@ -17,6 +17,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     apply_max_new_tokens,
     conditioning_cache_salt,
     resolve_stage_model_path,
+    speech_inputs,
 )
 
 _REF_CODE_CACHE_MAX_ENTRIES = 256
@@ -28,6 +29,8 @@ if TYPE_CHECKING:
 
 @register_tts_adapter
 class HiggsAudioV3Adapter(ARTTSAdapter):
+    request_constraints = speech_inputs("reference_audio", "reference_text", "voice")
+
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
         self._higgs_audio_v3_ref_code_cache: OrderedDict[str, tuple[torch.Tensor, int]] = OrderedDict()

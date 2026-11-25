@@ -8,7 +8,7 @@ from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, speech_inputs
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import parse_ming_instruction_fields
 
 if TYPE_CHECKING:
@@ -22,6 +22,10 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
     # Ming-flash-omni drives speaker selection via the caption JSON
     # (audio_sequence[0]["说话人"]) rather than a spk_id table, so there
     # is no static speaker list to surface here.
+    request_constraints = speech_inputs(
+        "voice", "instructions", "speaker_embedding", unsupported=("reference_audio", "reference_text")
+    )
+
     stage_keys = frozenset({"ming_tts"})
     name = "ming_flash_omni_tts"
 

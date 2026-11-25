@@ -3,8 +3,10 @@
 """MOSS-Image pipeline topology and default deployment."""
 
 from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, StagePipelineConfig
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
 MOSS_IMAGE_PIPELINE = PipelineConfig(
+    serving_capabilities=get_diffusion_model_metadata("MOSSImagePipeline").serving_capabilities,
     model_type="moss_image",
     model_arch="MOSSImagePipeline",
     diffusers_class_name="MOSSImagePipeline",

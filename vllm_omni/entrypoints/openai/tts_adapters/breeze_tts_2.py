@@ -19,6 +19,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     PreparedRequest,
     SpeechServingContext,
     apply_max_new_tokens,
+    speech_inputs,
 )
 from vllm_omni.model_executor.models.breeze_tts_2.prompt import DEFAULT_INSTRUCTION, build_breeze_prompt
 
@@ -27,6 +28,8 @@ logger = init_logger(__name__)
 
 @register_tts_adapter
 class BreezeTTS2Adapter(ARTTSAdapter):
+    request_constraints = speech_inputs("reference_audio", "reference_text", "instructions", "voice")
+
     name = "breeze_tts_2"
     stage_keys = frozenset({"breeze_tts_2", "breeze_tts_2_codec"})
     model_archs = frozenset({"BreezeForConditionalGeneration"})

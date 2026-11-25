@@ -1,15 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_TO_SPEECH,
+    declare_capabilities,
+)
 
 # Stage 0 decodes its latents with the AudioVAE decoder
 # and returns PCM as the final output.
 MING3_TTS_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/ming3_tts/pipeline.py", "docs/serving/speech_api.md"),
+    ),
     model_type="ming3_tts",
     default_deploy_config_name="ming3_tts.yaml",
     single_stage_async_chunk=True,

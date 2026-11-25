@@ -867,7 +867,8 @@ def test_qwen3_tts_build_constructs_prepared_request():
     assert prepared.model_type == "CustomVoice"
 
 
-def test_covo_audio_build_constructs_tokenized_prompt():
+@pytest.mark.parametrize("voice", [None, "default"])
+def test_covo_audio_build_constructs_tokenized_prompt(voice):
     class FakeTokenizer:
         def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
             assert messages[-1] == {"role": "user", "content": "hello"}
@@ -878,11 +879,18 @@ def test_covo_audio_build_constructs_tokenized_prompt():
     adapter = CovoAudioAdapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
     adapter._tokenizer = FakeTokenizer()
 
-    prepared = asyncio.run(adapter.build(OpenAICreateSpeechRequest(input="hello"), [], False))
+    request = OpenAICreateSpeechRequest(input="hello", voice=voice)
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], False))
 
     assert prepared.prompt == {"prompt_token_ids": [11, 12, 13]}
     assert prepared.tts_params == {}
     assert prepared.model_type == "covo_audio"
+    constraints = adapter.get_request_constraints()
+    assert "voice" not in constraints.inputs
+    assert "voice" not in constraints.parameters
+    assert constraints.inputs["reference_audio"].support == "unsupported"
+    assert constraints.inputs["reference_text"].support == "unsupported"
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -1012,13 +1020,15 @@ def test_ming3_tts_does_not_reinterpret_ip_voice_as_ming2_preset():
     assert prepared.model_type == "ming3_audio_tts"
 
 
+@pytest.mark.parametrize("voice", [None, "default"])
 @pytest.mark.parametrize(
     "instructions,expected_system",
     [(None, "以自然的语速读出下面的文字。"), ("Read warmly.", "Read warmly.")],
 )
-def test_step_audio2_build_constructs_open_assistant_turn(instructions, expected_system):
+def test_step_audio2_build_constructs_open_assistant_turn(voice, instructions, expected_system):
     adapter = StepAudio2Adapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
-    request = OpenAICreateSpeechRequest(input="hello", instructions=instructions)
+    request = OpenAICreateSpeechRequest(input="hello", instructions=instructions, voice=voice)
+    assert adapter.validate(request) is None
 
     prepared = asyncio.run(adapter.build(request, [], False))
 
@@ -1027,6 +1037,11 @@ def test_step_audio2_build_constructs_open_assistant_turn(instructions, expected
     )
     assert prepared.tts_params == {}
     assert prepared.model_type == "step_audio2"
+    constraints = adapter.get_request_constraints()
+    assert "voice" not in constraints.inputs
+    assert "voice" not in constraints.parameters
+    assert constraints.inputs["reference_audio"].support == "unsupported"
+    assert constraints.inputs["reference_text"].support == "unsupported"
 
 
 @pytest.mark.parametrize("limit", [None, 7, 8192])

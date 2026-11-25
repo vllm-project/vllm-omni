@@ -7,11 +7,20 @@ import math
 from vllm.utils.async_utils import make_async
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    ARTTSAdapter,
+    PreparedRequest,
+    apply_max_new_tokens,
+    speech_inputs,
+)
+from vllm_omni.request_capabilities import ParameterConstraint
 
 
 @register_tts_adapter
 class Lfm3OmniTTSAdapter(ARTTSAdapter):
+    request_constraints = speech_inputs("voice", "instructions", unsupported=("reference_audio",)).model_copy(
+        update={"parameters": {"voice": ParameterConstraint(support="supported", type="string", enum=("default",))}}
+    )
     name = "lfm3_omni"
     stage_keys = frozenset({"lfm3_temporal"})
     model_archs = frozenset({"Lfm3OmniForConditionalGeneration", "Lfm3AudioForConditionalGeneration"})
