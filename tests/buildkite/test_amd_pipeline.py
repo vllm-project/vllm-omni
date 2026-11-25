@@ -4638,57 +4638,66 @@ def test_voxtral_tts_nightly_splits_c1_latency_from_throughput_and_stress() -> N
         assert "Voxtral TTS C1 Latency" not in text
 
 
-def test_qwen3_tts_perf_is_one_nonblocking_nightly_job() -> None:
-    step = _find_step("Qwen3-TTS Perf", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_2"
-    assert step["depends_on"] == "amd-build"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 180
-    assert step["source_file_dependencies"] == "tts_qwen3_tts_perf"
-    assert step["env"]["MIOPEN_FIND_MODE"] == "FAST"
-    assert step["env"]["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] == "1"
-    assert "OMP_NUM_THREADS" not in step["env"]
-    assert "OPENBLAS_NUM_THREADS" not in step["env"]
-    assert "VLLM_ROCM_USE_AITER" not in step["env"]
-    assert step["artifact_paths"] == ["artifacts/rocm-qwen3-tts-perf/**/*"]
-    commands = "\n".join(step["commands"])
-    marker = "full_model and tts and rocm and MI325 and cards_2"
-    assert marker in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "exit 5" in commands
-    assert "pytest.xml" in commands
-    assert "tests/dfx/perf/tests/test_tts.json" in commands
-    assert "Expected exactly $${#nodes[@]} Qwen3-TTS perf nodes" in commands
-    assert commands.count("--shard-id=0 --num-shards=1") == 2
-    assert "Expected exactly eight executed Qwen3-TTS perf tests" in commands
-    assert "skipped != 0" in commands
-    assert "Expected exactly 14 Qwen3-TTS result JSON files" in commands
-    assert '"test_qwen3_tts_base": 4' in commands
-    assert '"test_qwen3_tts_customvoice": 5' in commands
-    assert '"test_qwen3_tts_voicedesign": 5' in commands
-    assert "Unreadable Qwen3-TTS result JSON" in commands
-    assert "result_test_qwen3_tts_*.json" in commands
-    assert 'rm -rf "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR"' in commands
-    assert "python3 -c 'import sys, xml.etree.ElementTree as ET" in commands
-    nodes = (
-        "test_qwen3_tts_base-voice_clone_latency_seed-tts",
-        "test_qwen3_tts_base-voice_clone_throughput_seed-tts",
-        "test_qwen3_tts_customvoice-default_voice_latency_seed-tts-text",
-        "test_qwen3_tts_customvoice-default_voice_throughput_seed-tts-text",
-        "test_qwen3_tts_customvoice-default_voice_stress_seed-tts-text",
-        "test_qwen3_tts_voicedesign-voice_design_latency_seed-tts-design",
-        "test_qwen3_tts_voicedesign-voice_design_throughput_seed-tts-design",
-        "test_qwen3_tts_voicedesign-voice_design_stress_seed-tts-design",
+def test_qwen3_tts_nightly_splits_c1_latency_from_throughput_and_stress() -> None:
+    latency = _find_step("Qwen3-TTS C1 Latency Qualification", AMD_NIGHTLY_PIPELINE)
+    remaining = _find_step("Qwen3-TTS Perf", AMD_NIGHTLY_PIPELINE)
+    assert latency["grade"] == "NonBlocking"
+    assert remaining["grade"] == "NonBlocking"
+    expected_nodes = (
+        (
+            "test_qwen3_tts_base-voice_clone_latency_seed-tts",
+            "test_qwen3_tts_customvoice-default_voice_latency_seed-tts-text",
+            "test_qwen3_tts_voicedesign-voice_design_latency_seed-tts-design",
+        ),
+        (
+            "test_qwen3_tts_base-voice_clone_throughput_seed-tts",
+            "test_qwen3_tts_customvoice-default_voice_throughput_seed-tts-text",
+            "test_qwen3_tts_customvoice-default_voice_stress_seed-tts-text",
+            "test_qwen3_tts_voicedesign-voice_design_throughput_seed-tts-design",
+            "test_qwen3_tts_voicedesign-voice_design_stress_seed-tts-design",
+        ),
     )
-    for node in nodes:
-        assert commands.count(node) == 2
-    assert "test_voxtral_tts" not in commands
-    assert "cards_1" not in commands
-    assert "quality" not in commands
-    nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
-    assert nightly.count('label: "Qwen3-TTS Perf"') == 1
+    expected_results = (
+        {
+            "test_qwen3_tts_base": "1",
+            "test_qwen3_tts_customvoice": "1",
+            "test_qwen3_tts_voicedesign": "1",
+        },
+        {
+            "test_qwen3_tts_base": "3",
+            "test_qwen3_tts_customvoice": "4",
+            "test_qwen3_tts_voicedesign": "4",
+        },
+    )
+    for step, cases, results, kind in zip(
+        (latency, remaining), expected_nodes, expected_results, ("latency", "perf"), strict=True
+    ):
+        artifact = f"rocm-qwen3-tts-{kind}"
+        assert step["agent_pool"] == "mi300_2"
+        assert step["depends_on"] == "amd-build"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["timeout_in_minutes"] == 180
+        assert step["source_file_dependencies"] == ["tts_qwen3_tts_perf", "rocm_tts_perf_runner"]
+        assert step["env"] == {
+            "MIOPEN_FIND_MODE": "FAST",
+            "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
+        }
+        assert step["artifact_paths"] == [f"artifacts/{artifact}/**/*"]
+        (command,) = step["commands"]
+        args = split(command)
+        assert args[:6] == [
+            "python3",
+            ".buildkite/amd/scripts/run_rocm_tts_perf.py",
+            "--gpus",
+            "2",
+            "--artifact-name",
+            artifact,
+        ]
+        index = args.index("--cases")
+        assert args[6:index] == [
+            token for model, count in results.items() for token in ("--expect-results", model, count)
+        ]
+        assert tuple(args[index + 1 :]) == cases
     config = json.loads(Path("tests/dfx/perf/tests/test_tts.json").read_text(encoding="utf-8"))
     selected = {
         "test_qwen3_tts_base",
@@ -4710,9 +4719,22 @@ def test_qwen3_tts_perf_is_one_nonblocking_nightly_job() -> None:
             if isinstance(baseline, dict):
                 assert "MI325" not in baseline
     assert seen == selected
+    latency_models = {case.split("-", 1)[0] for case in expected_nodes[0]}
+    latencies = [
+        phase
+        for case in config
+        if case["test_name"] in latency_models
+        for phase in case["benchmark_params"]
+        if phase["eval_phase"] == "latency"
+    ]
+    assert len(latencies) == len(expected_nodes[0])
+    for phase in latencies:
+        assert phase["max_concurrency"] == [1]
+        assert phase["baseline"]["MI300"]
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "Qwen3-TTS Perf" not in text
+        assert "Qwen3-TTS C1 Latency Qualification" not in text
 
 
 def test_minicpmo_accuracy_nightly_jobs_block_on_one_gpu() -> None:
@@ -5112,48 +5134,23 @@ def _assert_nightly_junit_guard(
 @pytest.mark.parametrize(
     (
         "pytest_status",
-        "tests",
-        "skipped",
-        "timeout_status",
         "base_files",
         "customvoice_files",
         "voicedesign_files",
-        "valid_json",
         "expected_status",
     ),
-    [
-        (0, 8, 0, None, 4, 5, 5, True, 0),
-        (0, 8, 1, None, 4, 5, 5, True, 5),
-        (0, 0, 0, None, 4, 5, 5, True, 5),
-        (1, 8, 0, None, 4, 5, 5, True, 1),
-        (0, 8, 0, 124, 4, 5, 5, True, 124),
-        (0, 8, 0, None, 3, 5, 5, True, 5),
-        (0, 8, 0, None, 5, 4, 5, True, 5),
-        (0, 8, 0, None, 4, 5, 5, False, 5),
-    ],
-    ids=(
-        "pass",
-        "skipped",
-        "zero-tests",
-        "pytest-failure",
-        "timeout",
-        "missing-result",
-        "wrong-result-split",
-        "invalid-json",
-    ),
+    [(0, 1, 1, 1, 0), (0, 1, 2, 0, 5), (0, 0, 1, 1, 5), (124, 0, 0, 0, 124)],
 )
 def test_qwen3_tts_perf_executes_evidence_guards_before_exit(
     tmp_path: Path,
     pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
     base_files: int,
     customvoice_files: int,
     voicedesign_files: int,
-    valid_json: bool,
     expected_status: int,
 ) -> None:
+    # Run the configured C1 command with benchmark result files supplied by a
+    # stand-in for the GPU runner. The real runner's JUnit checks have their own suite.
     benchmark_dir = tmp_path / "benchmark-results"
     benchmark_dir.mkdir()
     counts = {
@@ -5161,29 +5158,32 @@ def test_qwen3_tts_perf_executes_evidence_guards_before_exit(
         "test_qwen3_tts_customvoice": customvoice_files,
         "test_qwen3_tts_voicedesign": voicedesign_files,
     }
-    result_paths: list[Path] = []
     for test_name, count in counts.items():
         for index in range(count):
             result_path = benchmark_dir / f"result_{test_name}_{index}.json"
             result_path.write_text("{}\n", encoding="utf-8")
-            result_paths.append(result_path)
-    if not valid_json:
-        result_paths[0].write_text("not-json\n", encoding="utf-8")
-
-    _assert_nightly_junit_guard(
-        tmp_path,
-        step_label="Qwen3-TTS Perf",
-        command_fragment='pytest -s -v -ra "$${nodes[@]}"',
-        expected_message="Expected exactly eight executed Qwen3-TTS perf tests",
-        artifact_env="ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR",
-        job_id_prefix="qwen3-tts-perf-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-        extra_env={"BENCHMARK_DIR": str(benchmark_dir)},
+    guard = tmp_path / ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh"
+    guard.parent.mkdir(parents=True)
+    guard.write_text(
+        'shopt -s nullglob\nfiles=("$INPUT"/*.json)\n'
+        'if ((${#files[@]})); then cp "${files[@]}" "$BENCHMARK_DIR/"; fi\nexit "$FAKE_STATUS"\n',
+        encoding="utf-8",
     )
+    job = _find_step("Qwen3-TTS C1 Latency Qualification", AMD_NIGHTLY_PIPELINE)
+    (command,) = job["commands"]
+    _, script, *args = split(command)
+    result = subprocess.run(
+        [sys.executable, str(Path(script).resolve()), *args],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path),
+            "INPUT": str(benchmark_dir),
+            "FAKE_STATUS": str(pytest_status),
+        },
+        check=False,
+    )
+    assert result.returncode == expected_status
 
 
 @pytest.mark.parametrize(

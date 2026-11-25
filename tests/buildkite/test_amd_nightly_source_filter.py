@@ -176,6 +176,9 @@ def test_voxtral_runtime_changes_keep_voxtral_perf_nightly(changed_file: str) ->
         "vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py",
         "vllm_omni/model_executor/stage_input_processors/qwen3_tts.py",
         "vllm_omni/deploy/qwen3_tts.yaml",
+        ".buildkite/amd/scripts/run_rocm_tts_perf.py",
+        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+        ".buildkite/amd/scripts/assert-pytest-collection.sh",
     ),
 )
 def test_qwen3_tts_runtime_changes_keep_qwen3_tts_perf_nightly(changed_file: str) -> None:
@@ -185,7 +188,7 @@ def test_qwen3_tts_runtime_changes_keep_qwen3_tts_perf_nightly(changed_file: str
         pipeline_path=AMD_NIGHTLY_PIPELINE,
     )
 
-    assert "Qwen3-TTS Perf" in _labels(filtered)
+    assert {"Qwen3-TTS Perf", "Qwen3-TTS C1 Latency Qualification"} <= _labels(filtered)
 
 
 @pytest.mark.parametrize(
