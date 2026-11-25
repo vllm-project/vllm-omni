@@ -1892,6 +1892,30 @@ stages:
         assert thinker.yaml_engine_args["async_chunk"] is False
         assert thinker.yaml_extras["default_sampling_params"]["detokenize"] is True
 
+    @pytest.mark.parametrize(
+        ("deploy_name", "expected_pipeline", "expected_stage_ids"),
+        [
+            (None, "minicpmo_4_5", [0, 1, 2]),
+            ("minicpmo_4_5_duplex_thinker_only.yaml", "minicpmo_4_5_thinker_only", [0]),
+        ],
+        ids=["auto_detect", "thinker_only_deploy"],
+    )
+    def test_minicpmo_thinker_only_is_selected_only_by_deploy_config(
+        self, deploy_name, expected_pipeline, expected_stage_ids
+    ):
+        hf_config = PretrainedConfig(model_type="minicpmo", architectures=["MiniCPMO"], version="4.5")
+        deploy_path = str(Path(get_deploy_config_path(deploy_name))) if deploy_name else None
+        with patch("vllm_omni.config.config_factory.get_config", return_value=hf_config):
+            pipeline = StageConfigFactory.get_pipeline_config(
+                "openbmb/MiniCPM-o-4_5",
+                trust_remote_code=True,
+                deploy_config_path=deploy_path,
+            )
+
+        assert pipeline is not None
+        assert pipeline.model_type == expected_pipeline
+        assert [stage.stage_id for stage in pipeline.stages] == expected_stage_ids
+
     def test_load_voxtral_tts_deploy_config_schema_fields(self):
         deploy_path = Path(get_deploy_config_path("voxtral_tts.yaml"))
         deploy = load_deploy_config(deploy_path)
@@ -1907,6 +1931,14 @@ stages:
         deploy = load_deploy_config(deploy_path)
         assert deploy.stages[0].compilation_config == {"pass_config": {"fuse_allreduce_rms": False}}
         assert "compilation_config" not in deploy.stages[0].engine_extras
+
+    def test_glm_tts_stage_zero_scopes_eager_quality_contract_to_rocm(self):
+        deploy_path = Path(get_deploy_config_path("glm_tts.yaml"))
+        cuda_deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        rocm_deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
+
+        assert cuda_deploy.stages[0].enforce_eager is False
+        assert rocm_deploy.stages[0].enforce_eager is True
 
     def test_load_voxcpm2_deploy_config_preserves_engine_extras(self):
         deploy_path = get_deploy_config_path("voxcpm2.yaml")
@@ -3410,9 +3442,10 @@ class TestPlatformOverrides:
         """The only stochastic Qwen3-Omni stage must stay reproducible.
 
         Dropping this seed (as #4986 did) leaves the talker sampling codec
-        tokens unseeded at temperature 0.9, which reopened the audio-vs-text
-        nightly failures in #6090. Pin it so a cleanup cannot remove it again
-        without failing here.
+        tokens unseeded at temperature 0.9, including both codebook 0 and the
+        residual codebooks. That reopened the audio-vs-text nightly failures
+        in #6090. Pin it so a cleanup cannot remove it again without failing
+        here.
         """
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         pipeline = resolve_pipeline_config(
@@ -3456,6 +3489,23 @@ class TestPlatformOverrides:
         assert structured.stage_by_id(0).cache_config.enable_prefix_caching is False
         assert structured.stage_by_id(2).model_config.enforce_eager is True
 
+    def test_qwen3_omni_npu_uses_mrv2(self):
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+
+        npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert npu.model_runner == "v2"
+
+        legacy = merge_pipeline_deploy(pipeline, npu)
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in legacy] == [True, True, True]
+
+        structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=npu)
+        assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [True, True, True]
+
     @pytest.mark.parametrize("platform", ["cuda", "npu"])
     def test_minicpmo_4_5_caps_talker_kv_cache(self, platform):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
@@ -3495,6 +3545,8 @@ class TestPlatformOverrides:
         [
             ("qwen3_tts.yaml", "qwen3_tts", "v2", ()),
             ("moss_tts_local.yaml", "moss_tts_local", "v2", ()),
+            ("chatterbox_turbo.yaml", "chatterbox_turbo", "v2", ()),
+            ("chatterbox.yaml", "chatterbox", "v2", ()),
             ("moss_tts_nano.yaml", "moss_tts_nano", "v2", ()),
             ("moss_tts_realtime.yaml", "moss_tts_realtime", "v2", ()),
             ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
@@ -3522,8 +3574,18 @@ class TestPlatformOverrides:
             "minicpmo_4_5_duplex_h200.yaml",
         )
         # XPU has no V1 fallback: vLLM 0.34 removed Model Runner V1.
-        xpu_full_mrv2 = platform == "xpu" and filename in ("qwen3_tts.yaml", "moss_tts_nano.yaml")
-        rocm_full_mrv2 = platform == "rocm" and filename in ("qwen3_tts.yaml", "minicpmo_4_5.yaml")
+        xpu_full_mrv2 = platform == "xpu" and filename in (
+            "qwen3_tts.yaml",
+            "moss_tts_nano.yaml",
+            "chatterbox_turbo.yaml",
+            "chatterbox.yaml",
+        )
+        rocm_full_mrv2 = platform == "rocm" and filename in (
+            "qwen3_tts.yaml",
+            "minicpmo_4_5.yaml",
+            "chatterbox_turbo.yaml",
+            "chatterbox.yaml",
+        )
         if platform == "cuda":
             expected_runner = cuda_default_runner
         elif all_platforms_mrv2 or npu_full_mrv2 or xpu_full_mrv2 or rocm_full_mrv2:

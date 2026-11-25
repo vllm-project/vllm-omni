@@ -18,7 +18,7 @@ pytest.importorskip("torch_npu")
 
 from tests.helpers.mark import hardware_marks
 from tests.platforms.npu.test_minicpmo_code2wav_npugraph import _Token2Wav
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import prepare_code2wav_graph_runtime
 from vllm_omni.platforms.npu.models.step_audio2_token2wav import npu_token2wav_sdpa_context
 

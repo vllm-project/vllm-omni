@@ -17,6 +17,12 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.offloader.config import offload_enabled
 
 
+def _uses_merged_lora_backend(od_config: OmniDiffusionConfig) -> bool:
+    wt_cfg = od_config.weight_transfer_config
+    backend = wt_cfg.get("backend") if isinstance(wt_cfg, dict) else getattr(wt_cfg, "backend", None)
+    return backend == "omni_lora_ipc" or getattr(od_config, "lora_application", "runtime") == "merged"
+
+
 def prepare_model_for_weight_reload(
     model: nn.Module,
     od_config: OmniDiffusionConfig,
@@ -25,6 +31,10 @@ def prepare_model_for_weight_reload(
     """Capture construction metadata for an explicitly supported WTE pipeline."""
     if od_config.weight_transfer_config is None:
         return
+    if _uses_merged_lora_backend(od_config):
+        from vllm_omni.lora.capability import resolve_merged_lora_spec
+
+        resolve_merged_lora_spec(model, stage="diffusion", require_protocol=True)
     if not getattr(model, "supports_weight_reload", False):
         raise ValueError(f"{type(model).__name__} has not enabled upstream weight reloading")
     if od_config.quantization_config is not None:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 import copy
@@ -101,8 +101,10 @@ def estimate_decode_steps_for_duration(
     return max(1, int(math.ceil(required_samples / float(samples_per_decode_step))))
 
 
-def estimate_decode_step_window_for_duration(duration_seconds: float) -> tuple[int, int]:
-    target_steps = estimate_decode_steps_for_duration(duration_seconds)
+def estimate_decode_step_window_for_duration(
+    duration_seconds: float, *, patch_size: int = PATCH_SIZE
+) -> tuple[int, int]:
+    target_steps = estimate_decode_steps_for_duration(duration_seconds, patch_size=patch_size)
     min_steps = max(1, target_steps - 3)
     max_steps = max(min_steps, target_steps + 3)
     return min_steps, max_steps
@@ -112,6 +114,7 @@ def resolve_effective_runtime_controls(
     *,
     text: str,
     runtime_controls: dict[str, Any] | None = None,
+    patch_size: int = PATCH_SIZE,
 ) -> dict[str, Any]:
     controls = {} if runtime_controls is None else dict(runtime_controls)
     has_explicit_min = KEY_MIN_DECODE_STEPS in controls and controls[KEY_MIN_DECODE_STEPS] is not None
@@ -121,7 +124,9 @@ def resolve_effective_runtime_controls(
     duration_seconds = parse_duration_seconds(text)
     if duration_seconds is None:
         return controls
-    min_decode_steps, max_decode_steps = estimate_decode_step_window_for_duration(duration_seconds)
+    min_decode_steps, max_decode_steps = estimate_decode_step_window_for_duration(
+        duration_seconds, patch_size=patch_size
+    )
     controls[KEY_MIN_DECODE_STEPS] = min_decode_steps
     controls[KEY_MAX_DECODE_STEPS] = max_decode_steps
     return controls
@@ -136,6 +141,7 @@ def build_dense_prompt_token_ids(
     prompt_text: str | None = None,
     speaker_count: int = 0,
     prompt_patch_count: int = 0,
+    instruction_eos: str = "<|endoftext|>",
 ) -> list[int]:
     speaker_prompt = []
     for idx in range(int(speaker_count)):
@@ -146,7 +152,7 @@ def build_dense_prompt_token_ids(
             + tokenizer.encode("<|vision_end|>\n")
         )
     instruction_prompt = (
-        tokenizer.encode(instruction) + tokenizer.encode("<|endoftext|>") if instruction is not None else []
+        tokenizer.encode(instruction) + tokenizer.encode(instruction_eos) if instruction is not None else []
     )
     prompt_text_tokens = (
         tokenizer.encode(prompt_text) if int(prompt_patch_count) > 0 and prompt_text is not None else []
@@ -230,11 +236,14 @@ def build_moe_prompt_token_ids(
     )
 
 
-def build_prompt_token_ids(model_variant: str, tokenizer: Any, **kwargs: Any) -> list[int]:
+def build_prompt_token_ids(
+    model_variant: str, tokenizer: Any, *, patch_size: int = PATCH_SIZE, **kwargs: Any
+) -> list[int]:
     """Dispatch to the dense or MoE Stage-0 prompt builder by model variant."""
     if model_variant == "moe":
         return build_moe_prompt_token_ids(tokenizer, **kwargs)
-    return build_dense_prompt_token_ids(tokenizer, **kwargs)
+    instruction_eos = "<|im_end|>" if patch_size == 1 else "<|endoftext|>"
+    return build_dense_prompt_token_ids(tokenizer, instruction_eos=instruction_eos, **kwargs)
 
 
 def detect_model_variant(tokenizer: Any) -> str:
@@ -269,6 +278,7 @@ def build_ming_dense_prompt(
     use_zero_spk_emb: bool = False,
     request_id: str | None = None,
     model_variant: str | None = None,
+    patch_size: int = PATCH_SIZE,
 ) -> dict[str, Any]:
     if model_variant is None:
         model_variant = detect_model_variant(tokenizer)
@@ -285,13 +295,15 @@ def build_ming_dense_prompt(
                 f"speaker_count={effective_speaker_count} does not match "
                 f"{len(speaker_embeddings)} provided speaker embeddings"
             )
-    effective_runtime_controls = resolve_effective_runtime_controls(text=text, runtime_controls=runtime_controls)
+    effective_runtime_controls = resolve_effective_runtime_controls(
+        text=text, runtime_controls=runtime_controls, patch_size=patch_size
+    )
 
     prompt_waveform_tensor = None
     prompt_patch_count = 0
     if prompt_waveform is not None:
-        prompt_waveform_tensor = pad_prompt_waveform(prompt_waveform)
-        prompt_patch_count = count_prompt_waveform_patches(prompt_waveform_tensor)
+        prompt_waveform_tensor = pad_prompt_waveform(prompt_waveform, patch_size=patch_size)
+        prompt_patch_count = count_prompt_waveform_patches(prompt_waveform_tensor, patch_size=patch_size)
     if prompt_waveform_tensor is not None and prompt_latents is not None:
         raise ValueError(
             "Ming waveform cloning request provided both raw prompt_waveform and explicit prompt_latents. "
@@ -307,7 +319,7 @@ def build_ming_dense_prompt(
     if prompt_latents is not None:
         prompt_latent_value = torch.as_tensor(prompt_latents)
         prompt_patch_count = count_prompt_latent_patches(
-            prompt_latent_value, patch_size=PATCH_SIZE, latent_dim=LATENT_DIM
+            prompt_latent_value, patch_size=patch_size, latent_dim=LATENT_DIM
         )
 
     prompt_token_ids = build_prompt_token_ids(
@@ -319,6 +331,7 @@ def build_ming_dense_prompt(
         prompt_text=prompt_text if prompt_patch_count > 0 else None,
         speaker_count=effective_speaker_count,
         prompt_patch_count=prompt_patch_count,
+        patch_size=patch_size,
     )
 
     additional_information = {}
