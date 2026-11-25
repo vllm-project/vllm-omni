@@ -18,7 +18,7 @@ It is off by default.
 
 π0.5 records a request's whole action generation, the image and language
 prefix and all denoising steps, as one graph and replays it once per request;
-see [π0.5](../../../recipes/lerobot/Pi05.md#denoise-graphs) for how to enable
+see [π0.5](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi05.md#denoise-graphs) for how to enable
 it with the π0.5 deploy config, which is eager by default.
 
 Capture and replay use the platform's graphed-forward class
