@@ -125,6 +125,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     ming_flash_omni_tts,
     ming_tts,
     minimax_music3,
+    miso_tts,
     moss_tts,
     omnivoice,
     phonon,
