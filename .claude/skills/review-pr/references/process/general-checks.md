@@ -23,6 +23,9 @@ and [design documents](https://docs.vllm.ai/projects/vllm-omni/en/latest/design/
 
 Apply these rules to new or materially changed production code; do not require
 unrelated cleanup from untouched files.
+Use names, types, and assertions to express routine behavior. Reserve inline
+comments for information the code cannot express, such as a numerical invariant,
+an upstream constraint, or a required tool directive.
 
 1. Start each source module with a concise module docstring that defines its
    responsibility and boundaries and identifies its primary classes and key

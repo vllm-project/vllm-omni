@@ -51,6 +51,27 @@ For diffusion accuracy evidence, use the reference-alignment and calibration
 contract in [diffusion-accuracy-test](../../../diffusion-accuracy-test/SKILL.md)
 to assess the claimed comparison scope and threshold evidence.
 
+## Output artifacts by modality
+
+Link the actual output and raw benchmark report for each model, output modality,
+and serving path needed for the claim. Bind artifacts to the compared revisions,
+checkpoint, input, seed, and runtime configuration. Include both sides of the
+comparison and retain relevant failed requests. For a shared change, name the
+affected model families, explain the representative cases, and list untested
+combinations.
+
+| Output | Quality or correctness artifact | Performance artifact |
+| --- | --- | --- |
+| Text and multimodal understanding | Responses or token traces with task scores or a defined parity check. | TTFT, decode latency or token throughput at stated input and output lengths. |
+| Image generation or editing | Paired images and conditioning inputs with a task score or a reproducible pixel or perceptual comparison. | End-to-end latency and peak memory at matching dimensions and steps. |
+| Video and audio-video generation | Paired clips with frame count, FPS, duration, and audio alignment when applicable. | End-to-end latency and peak memory at matching frames, resolution, and steps. |
+| Speech, music, or sound | Audio files with sample rate, duration, and a task-appropriate quality check. For streaming, include received chunks and the final output. | End-to-end latency and real-time factor. For streaming, include the first-packet and continuity measures below. |
+| Multi-stage or interactive outputs | Final outputs and the relevant stage or session trace, including terminal events. | End-to-end time and the applicable stage, handoff, or per-tick timings. |
+
+An artifact can be supplied through a stable result link or a retained record
+with reproducible output checks. Use the existing quality protocol for the
+model and state the scope covered by each check.
+
 ## E2e stage-attribution table
 
 For an end-to-end latency claim, request the stage-attribution table the
