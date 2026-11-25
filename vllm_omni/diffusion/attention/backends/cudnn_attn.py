@@ -76,6 +76,11 @@ class CuDNNAttentionImpl(AttentionImpl):
         # CUDNN_ATTN. The kv_seq_len=1 MATH path is automatic-only.
         self.backend_explicit = bool(extra_impl_args.get("backend_explicit", False))
 
+    def head_count_invariant(self) -> bool:
+        # Per head, cuDNN attention does not depend on how many heads one call covers
+        # (``tests/helpers/attention_head_invariance.py``).
+        return True
+
     def forward_cuda(
         self,
         query: torch.Tensor,

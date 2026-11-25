@@ -31,8 +31,19 @@ def _nvidia_cuda(monkeypatch):
     monkeypatch.setattr(layer, "_is_nvidia_cuda", lambda: True)
 
 
+class _Impl:
+    def __init__(self, invariant):
+        self.invariant = invariant
+
+    def head_count_invariant(self):
+        return self.invariant
+
+
 def _case(**overrides):
-    attention = SimpleNamespace(use_ring=False, _explicit_cross_contract=False)
+    attention = SimpleNamespace(
+        use_ring=False, _explicit_cross_contract=False, _has_custom_attention=False, head_count_invariant=True
+    )
+    attention.effective_attention = lambda: (_Impl(attention.head_count_invariant), None, None)
     strategy = SimpleNamespace(
         name="ulysses",
         ce_overlap_chunks=2,
@@ -61,6 +72,8 @@ def _case(**overrides):
         {"name": "ring"},
         {"use_ring": True},
         {"_explicit_cross_contract": True},
+        {"_has_custom_attention": True},
+        {"head_count_invariant": False},
         {"_ulysses_a2a_permute": False},
         {"_scatter_idx": 1},
         {"_sp_group": SimpleNamespace(ring_world_size=2, ulysses_world_size=2)},
@@ -118,3 +131,28 @@ def test_eligible_layer_runs_local_attention_per_chunk(monkeypatch):
     query = torch.randn(1, 8, 8, 16)
     output = layer.Attention._forward_ulysses_ce_overlap(attention, strategy, query, query, query, metadata, 2)
     assert output is query and calls == [metadata]
+
+
+@pytest.mark.parametrize("match", [True, False])
+def test_overlap_is_verified_once_per_shape(monkeypatch, match):
+    """The first call at a shape runs both paths; the overlap is kept only if every rank is bit-identical."""
+    reduced = []
+    monkeypatch.setattr(layer.torch.distributed, "all_reduce", lambda t, op, group: reduced.append(group))
+    reference = torch.randn(1, 8, 8, 16)
+    paths = []
+
+    def overlap(strategy, q, k, v, m, chunks):
+        paths.append("overlap")
+        return reference.clone() if match else reference + 1
+
+    def standard(q, k, v, m):
+        paths.append("standard")
+        assert attention._ce_overlap_exact[(tuple(q.shape), q.dtype, 2)] is False
+        return reference
+
+    attention = SimpleNamespace(_forward_ulysses_ce_overlap=overlap, _forward_impl=standard)
+    strategy = SimpleNamespace(_ulysses_pg="pg")
+    query = torch.empty(1, 8, 8, 16)
+    output = layer.Attention._verify_ulysses_ce_overlap(attention, strategy, query, query, query, None, 2)
+    assert output is reference and paths == ["overlap", "standard"] and reduced == ["pg"]
+    assert attention._ce_overlap_exact == {((1, 8, 8, 16), torch.float32, 2): match}

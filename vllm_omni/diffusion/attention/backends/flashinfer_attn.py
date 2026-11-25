@@ -582,6 +582,13 @@ class FlashInferAttentionImpl(AttentionImpl):
                 self._sdpa_fallback = fallback
         return fallback.forward_cuda(query, key, value, attn_metadata)
 
+    # FlashInfer backends whose per-head output does not depend on the head count of a call, by
+    # ``tests/helpers/attention_head_invariance.py``.
+    _HEAD_COUNT_INVARIANT_BACKENDS = frozenset({"cute-dsl", "fa2"})
+
+    def head_count_invariant(self) -> bool:
+        return self.flashinfer_backend in self._HEAD_COUNT_INVARIANT_BACKENDS
+
     def forward_cuda(
         self,
         query: torch.Tensor,

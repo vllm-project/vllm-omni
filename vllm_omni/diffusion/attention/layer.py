@@ -1222,6 +1222,12 @@ class Attention(nn.Module):
             return 0
         if get_ulysses_mode(default="strict") != "strict" or not query.is_cuda or not _is_nvidia_cuda():
             return 0
+        if self._has_custom_attention:
+            return 0
+        impl = self.effective_attention()[0]
+        if not cast(AttentionImpl, impl).head_count_invariant():
+            # Chunking heads is exact only when each head's output does not depend on the head count per call.
+            return 0
         if query.dim() != 4 or query.shape[0] != 1 or key.shape != query.shape or value.shape != query.shape:
             return 0
         if any(x.dtype != query.dtype or x.stride(-1) != 1 or x.stride(-2) != x.shape[-1] for x in (query, key, value)):
@@ -1241,6 +1247,30 @@ class Attention(nn.Module):
         ):
             return 0
         return chunks
+
+    @torch.compiler.disable
+    def _verify_ulysses_ce_overlap(self, strategy, query, key, value, attn_metadata, chunks: int) -> torch.Tensor:
+        """Run the overlap and the standard path once per shape; keep the overlap only where every rank matches.
+
+        A head-count invariant kernel can still change its reduction order when a call covers few heads of a short
+        sequence (e.g. by splitting the KV range to fill the GPU), so the declaration alone does not prove a shape.
+        """
+        verdicts = self.__dict__.setdefault("_ce_overlap_exact", {})
+        shape_key = (tuple(query.shape), query.dtype, chunks)
+        overlapped = self._forward_ulysses_ce_overlap(strategy, query, key, value, attn_metadata, chunks).clone()
+        verdicts[shape_key] = False  # the reference below takes the standard exchange
+        reference = self._forward_impl(query, key, value, attn_metadata)
+        same = torch.tensor([int(torch.equal(overlapped, reference))], dtype=torch.int32, device=query.device)
+        torch.distributed.all_reduce(same, op=torch.distributed.ReduceOp.MIN, group=strategy._ulysses_pg)
+        verdicts[shape_key] = bool(same.item())
+        if not verdicts[shape_key]:
+            logger.warning_once(
+                "Ulysses copy-engine overlap disabled for %s with %d chunks: the chunked attention is not "
+                "bit-identical at this shape",
+                tuple(query.shape),
+                chunks,
+            )
+        return reference
 
     @torch.compiler.disable
     def _forward_ulysses_ce_overlap(self, strategy, query, key, value, attn_metadata, chunks: int) -> torch.Tensor:
@@ -1317,7 +1347,11 @@ class Attention(nn.Module):
             isolated_dense = self._reference_isolation_dense_impl()
         chunks = self._ulysses_ce_overlap_chunks(strategy, query, key, value, attn_metadata, use_paged_attention)
         if chunks:
-            return self._forward_ulysses_ce_overlap(strategy, query, key, value, attn_metadata, chunks)
+            exact = self.__dict__.setdefault("_ce_overlap_exact", {}).get((tuple(query.shape), query.dtype, chunks))
+            if exact is None:
+                return self._verify_ulysses_ce_overlap(strategy, query, key, value, attn_metadata, chunks)
+            if exact:
+                return self._forward_ulysses_ce_overlap(strategy, query, key, value, attn_metadata, chunks)
 
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v

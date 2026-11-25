@@ -323,7 +323,8 @@ class DiffusionParallelConfig:
     ulysses_a2a_permute: bool = False
     """Use platform symmetric memory for eligible strict Ulysses exchanges.
 
-    On CUDA, enables CE (copy engines) on a single NVLink-connected node;
+    On CUDA, enables CE (copy engines) on a single node whose GPUs have CUDA
+    peer access (NVLink or PCIe P2P);
     when disabled, Ulysses uses NCCL. NPU retains its eager, pure Ulysses
     implementation over WORLD in one HCCS domain, using TorchNPU's NPUSHMEM
     allocator, Triton-Ascend and a symmetric-memory runtime.
@@ -333,8 +334,10 @@ class DiffusionParallelConfig:
     """Overlap the CUDA copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
 
     Requires ``ulysses_a2a_permute`` and strict pure Ulysses. Each chunk's Q/K/V move to their head owners while
-    earlier chunks compute, and outputs return as each chunk finishes. Results match the unchunked path exactly when
-    the attention backend's per-head output does not depend on the number of heads per call.
+    earlier chunks compute, and outputs return as each chunk finishes. It runs only for attention implementations whose
+    ``head_count_invariant()`` is True (per-head output independent of the heads per call), and each layer checks
+    every new shape once against the standard path before keeping the overlap, so results match the unchunked path
+    exactly; other layers and shapes keep the standard exchange.
     """
 
     cfg_parallel_size: int = 1
