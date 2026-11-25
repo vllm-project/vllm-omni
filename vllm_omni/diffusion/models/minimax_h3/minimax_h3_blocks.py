@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -738,25 +738,18 @@ class MiniMaxH3AdalnProj(nn.Module):
             self._weight_stager = PinnedModuleStager(self.linear, device, cache_retention=BoundedAllocatorCache(device))
             self._host_signature = self._offload_signature()
 
-    @contextmanager
-    def _staged_weight(self):
-        """Device weights for the calls inside: staged from the host when AdaLN weights are offloaded."""
-        if self._weight_stager is None:
-            yield
-            return
-        self._weight_stager.load()
-        try:
-            yield
-        finally:
-            self._weight_stager.offload()
-
     def _project(self, t_emb: torch.Tensor) -> torch.Tensor:
         self._prepare_weight_stager(t_emb.device)
 
         def project() -> torch.Tensor:
             x = nn.functional.silu(t_emb)
-            with self._staged_weight():
+            if self._weight_stager is None:
                 return self.linear(x.to(_BF16_DTYPE))[0]
+            self._weight_stager.load()
+            try:
+                return self.linear(x.to(_BF16_DTYPE))[0]
+            finally:
+                self._weight_stager.offload()
 
         return (
             project()
@@ -769,15 +762,20 @@ class MiniMaxH3AdalnProj(nn.Module):
         self._prepare_weight_stager(t_emb.device)
         x = nn.functional.silu(t_emb).to(_BF16_DTYPE)
         rows = plan.rows()
-        with self._staged_weight():
+        if self._weight_stager is not None:
+            self._weight_stager.load()
+        try:
             per_step = self.linear(x)[0]
             table = self.linear(rows.reshape(-1, rows.shape[-1]))[0].view(rows.shape[0], rows.shape[1], -1)
+        finally:
+            if self._weight_stager is not None:
+                self._weight_stager.offload()
         plan.record(self, table, per_step)
         return per_step
 
     @torch.compiler.disable
     def _project_cached(self, t_emb: torch.Tensor) -> torch.Tensor:
-        # Plan lookups, cache decisions, TP hit voting and CPU storage rebinding are host
+        # Cache decisions, TP hit voting and CPU storage rebinding are host
         # control flow. Keep this small boundary eager while the surrounding
         # norms, attention projections and MLP remain eligible for compilation.
         plan = self._adaln_cache.plan if self._adaln_cache is not None else None

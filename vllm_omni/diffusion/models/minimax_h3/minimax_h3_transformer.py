@@ -854,10 +854,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 raise ValueError("MiniMax H3 AdaLN offload requires unquantized BF16 weights")
             if conflicting_offload:
                 raise ValueError("MiniMax H3 AdaLN offload cannot be combined with DiT offload or HSDP")
-            logger.info(
-                "MiniMax H3 AdaLN weights remain on CPU; %s",
-                "each stages once per request (AdaLN plan)" if plan else "projections stage on cache misses only",
-            )
+            logger.info("MiniMax H3 AdaLN weights remain on CPU; projections stage on cache misses only")
         self.adaln_cache = MiniMaxH3RuntimeAdalnCache(
             max_bytes=256 * 1024**2 if enabled else 0, offload_weights=offload_adaln, plan=plan
         )

@@ -14,7 +14,6 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import torch
-from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.cancellation import check_request_cancellation
@@ -32,8 +31,6 @@ from .adaln_plan import build_adaln_plan
 from .latent_mask import MiniMaxH3LatentEdit
 from .reference_isolation import MiniMaxH3ReferenceIsolation, reference_isolation_enabled
 from .sampling import MiniMaxH3Model, MiniMaxH3ModelBatch
-
-logger = init_logger(__name__)
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -451,7 +448,6 @@ def minimax_h3_denoise_loop(
             device=device,
         )
     reference_kv_state = None
-    adaln_cache = getattr(model, "adaln_cache", None)
     adaln_plan = None
     try:
         if video_edit is None and audio_edit is None:
@@ -463,8 +459,6 @@ def minimax_h3_denoise_loop(
                 sigmas_audio,
                 (imgvid_cond_noise_aug_for_inference, audio_cond_noise_aug_for_inference),
             )
-            if adaln_plan is not None:
-                adaln_cache.plan = adaln_plan
         create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
         if callable(create_reference_kv_state):
             reference_kv_state = create_reference_kv_state(
@@ -528,15 +522,8 @@ def minimax_h3_denoise_loop(
                 step_context=step_context,
             )
     finally:
-        if adaln_plan is not None:
-            logger.debug(
-                "MiniMax H3 AdaLN plan: %d planned steps, %d planned projections, %d per-step projections",
-                adaln_plan.planned_steps,
-                adaln_plan.hits,
-                adaln_plan.misses,
-            )
-            if adaln_cache.plan is adaln_plan:
-                adaln_cache.plan = None
+        if adaln_plan is not None and model.adaln_cache.plan is adaln_plan:
+            model.adaln_cache.plan = None
         minimax_h3_publish_denoise_progress(None, None, None)
         positive.static_kwargs.pop("reference_kv_state", None)
         positive.static_kwargs.pop(REFERENCE_ISOLATION_STATE, None)
