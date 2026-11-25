@@ -394,6 +394,14 @@ steps:
         env:
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           ROCM_E2E_TIMEOUT_MINUTES: "135"
+          # The voice-isolation speaker embedders score on CPU. Cap BLAS/OpenMP
+          # at the pod's four-CPU quota (as the READY CPU suites do): with the
+          # host-visible 96 threads, scoring that takes 0.5 min on CUDA ran for
+          # over 40 min in AMD build 17564.
+          OMP_NUM_THREADS: "4"
+          MKL_NUM_THREADS: "4"
+          OPENBLAS_NUM_THREADS: "4"
+          NUMEXPR_NUM_THREADS: "4"
         artifact_paths:
           - artifacts/rocm-tts-full-model-additions/**/*
         commands:
