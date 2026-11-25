@@ -55,11 +55,12 @@ jobs:
         # --no-sync to avoid resyncing across the project, since we already built the docs env
         run: uv run --no-sync mkdocs build --strict
 
-      - name: Upload preview to Read the Docs
-        # RTD_TOKEN is not available in forks
-        if: github.event.pull_request.head.repo.full_name == github.repository
-        uses: readthedocs/upload-action@v1
+      - name: Upload built docs
+        # Since this is just in PRs and not main and tags, we don't worry about pushing
+        # the preview to ReadTheDocs, but still upload them as an artifact so that they
+        # can be downloaded and served locally if needed.
+        uses: actions/upload-artifact@v7
         with:
-          token: ${{ secrets.RTD_TOKEN }}
-          project-slug: vllm-omni
-          html-dir: site
+          name: docs-site-pr-${{ github.event.pull_request.number }}
+          path: site
+          retention-days: 7
