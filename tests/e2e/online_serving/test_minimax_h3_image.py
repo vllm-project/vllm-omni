@@ -13,19 +13,16 @@ import pytest
 from PIL import Image
 
 from tests.helpers.client import OnlineOmniClient
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_marks, hardware_test
 from tests.helpers.runtime import OmniServer, OmniServerParams
 
 MODEL = os.environ.get("VLLM_TEST_MINIMAX_H3_IMAGE_MODEL", "MiniMaxAI/MiniMax-H3-Image")
 
-pytestmark = [
-    pytest.mark.advanced_model,
-    pytest.mark.diffusion,
-    pytest.mark.parallel,
-    *hardware_marks(res={"cuda": "B200"}, num_cards=4),
-]
 
-
+@pytest.mark.advanced_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@hardware_test(res={"cuda": "B200"}, num_cards=4)
 def test_repeated_native_4k_outputs_complete_with_identical_pixels() -> None:
     """A 2K smoke test misses the repeated 16MP transfer stall on Rubin."""
     base_url = os.environ.get("H3_IMAGE_TEST_BASE_URL")
