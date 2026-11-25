@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
+import shlex
 import stat
 from pathlib import Path
 
@@ -120,6 +121,22 @@ def test_qwen3_omni_correctness_blocks_while_perf_stays_nonblocking() -> None:
         assert JOB_SPECS.keys().isdisjoint(labels)
 
 
+def test_qwen3_omni_perf_bounds_rocm_runtime_resources() -> None:
+    nightly = _pipeline_steps(NIGHTLY_PIPELINE)
+    expected = {
+        "MIOPEN_FIND_MODE": "FAST",
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+    }
+
+    for label in ("Qwen3-Omni No-Async-Chunk Perf", "Qwen3-Omni Async-Chunk Perf"):
+        env = nightly[label]["env"]
+        assert {name: env[name] for name in expected} == expected
+
+    correctness_env = nightly["Qwen3-Omni Multi-Replica Correctness"]["env"]
+    assert expected.keys().isdisjoint(correctness_env)
+
+
 def test_runner_requires_complete_artifacts_and_clean_teardown() -> None:
     source = RUNNER.read_text(encoding="utf-8")
     assert RUNNER.stat().st_mode & stat.S_IXUSR
@@ -140,6 +157,22 @@ def test_runner_requires_complete_artifacts_and_clean_teardown() -> None:
     ):
         assert required in source
     assert "--assert-baseline" not in source
+
+
+def test_aiter_smoke_requires_three_distinct_server_configurations() -> None:
+    step = _pipeline_steps(NIGHTLY_PIPELINE)["Qwen3-Omni AITER-on Smoke"]
+    assert step["grade"] == "Blocking"
+    assert step["agent_pool"] == "mi300_2"
+    assert step["env"]["QWEN3_OMNI_EXPECT_AITER_MM_ENCODER"] == "1"
+    enable, run = step["commands"]
+    assert enable == "export VLLM_ROCM_USE_AITER=1"
+    command, runner, cards, count, timeout, artifact, *nodes, flag, marks = shlex.split(run)
+    assert (command, runner) == ("bash", ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh")
+    assert (cards, count, timeout) == ("2", "3", "75m")
+    assert step["artifact_paths"] == [f"artifacts/{artifact}/**/*"]
+    target = "tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001"
+    assert nodes == [f"{target}[{param}]" for param in ("default", "async_chunk", "batch_token_2048")]
+    assert (flag, marks) == ("-m", "full_model and rocm and MI325 and cards_2")
 
 
 def test_runner_is_a_dependency_of_function_and_perf_jobs() -> None:
