@@ -18,7 +18,7 @@ from tests.helpers.runtime import (
 T2I_PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."
 NEGATIVE_PROMPT = "blurry, low quality"
 MODEL = "baidu/ERNIE-Image"
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=2)
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "L4", "rocm": "MI300"}, num_cards=2)
 
 
 def _get_diffusion_feature_cases(model: str):

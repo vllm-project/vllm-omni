@@ -972,96 +972,86 @@ steps:
             fi
             (exit "$$status")
 
-  # The online owner selects only the MI325 img2img node. H100-only online
-  # Bagel cases stay out of this job.
+  # Exact-node owners close the remaining CUDA weekly diffusion contracts.
+  # Their selectors passed on exact-head MI300 hardware with zero skips,
+  # retries, or leaked processes, so every owner is now blocking.
   - group: "Diffusion E2E Weekly"
     steps:
-      - label: "Bagel img2img · 1-GPU"
+      - label: "Bagel online · 1-GPU"
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
         grade: Blocking
-        timeout_in_minutes: 90
-        source_file_dependencies: diffusion_bagel_weekly
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_bagel_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
-          - artifacts/rocm-bagel-weekly/**/*
+          - artifacts/rocm-bagel-online-weekly-1gpu/**/*
         commands:
-          - export ROCM_BAGEL_WEEKLY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-bagel-weekly"
-          - mkdir -p "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR"
-          - |
-            node="tests/e2e/online_serving/test_bagel.py::test_bagel_img2img_online[omni_server0]"
-            set +e
-            pytest --collect-only -q "$$node" \
-              --shard-id=0 --num-shards=1 \
-              -m "slow and diffusion and rocm and MI325 and cards_1" \
-              --run-level full_model \
-              > "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt" 2>&1
-            collection_status=$$?
-            set -e
-            if [[ "$$collection_status" -ne 0 ]]; then
-              cat "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
-              exit "$$collection_status"
-            fi
-            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
-              "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 1 ]]; then
-              echo "Expected exactly one Bagel weekly ROCm node, found $$count." >&2
-              cat "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
-            fi
-            if ! grep -Fq "$$node" "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt"; then
-              echo "Bagel weekly node was not collected: $$node" >&2
-              cat "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
-            fi
-            if grep -Eq 'test_bagel_text2img_online|test_bagel_image_edit_' \
-              "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt"; then
-              echo "H100-only Bagel nodes were collected." >&2
-              exit 5
-            fi
-          - |
-            if (
-              trap - ERR
-              set +e
-              node="tests/e2e/online_serving/test_bagel.py::test_bagel_img2img_online[omni_server0]"
-              timeout --signal=TERM --kill-after=2m 75m \
-                pytest -s -v -ra "$$node" \
-                --shard-id=0 --num-shards=1 \
-                -m "slow and diffusion and rocm and MI325 and cards_1" \
-                --run-level full_model --durations=20 \
-                --junitxml="$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/pytest.xml" \
-                2>&1 | tee "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/pytest.log"
-              exit "$${PIPESTATUS[0]}"
-            ); then
-              status=0
-            else
-              status=$$?
-            fi
-            tail -n 100 "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/pytest.log" > \
-              "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/pytest-summary.txt"
-            if [[ "$$status" -eq 0 ]]; then
-              if python -c 'import sys, xml.etree.ElementTree as ET
-            root = ET.parse(sys.argv[1]).getroot()
-            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
-            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
-            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 1 or skipped != 0:
-                print(
-                    f"Expected exactly one executed Bagel weekly test; "
-                    f"reported tests={tests}, skipped={skipped}.",
-                    file=sys.stderr,
-                )
-                raise SystemExit(5)
-            ' "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/pytest.xml"
-              then
-                status=0
-              else
-                status=$$?
-              fi
-            fi
-            (exit "$$status")
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 8 285m rocm-bagel-online-weekly-1gpu
+            'tests/e2e/online_serving/test_bagel.py::test_bagel_text2img_online[omni_server0]'
+            'tests/e2e/online_serving/test_bagel.py::test_bagel_img2img_online[omni_server0]'
+            'tests/e2e/online_serving/test_bagel.py::test_bagel_image_edit_honors_explicit_size_two_stage[omni_server0]'
+            'tests/e2e/online_serving/test_bagel.py::test_bagel_image_edit_floors_unaligned_size_two_stage[omni_server0]'
+            'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[single_card_cpu_offload]'
+            'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[single_card_teacache]'
+            'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[single_card_cache_dit]'
+            'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[single_card_layerwise_offload]'
+            -m 'slow and diffusion and rocm and MI300 and cards_1'
 
-      # These offline understanding and LoRA cases explicitly declare MI325.
+      - label: "Bagel online · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_bagel_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-bagel-online-weekly-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 5 285m rocm-bagel-online-weekly-2gpu
+            'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[parallel_cfg_2]'
+            'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[parallel_hsdp_2]'
+            'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[sp_ring_2]'
+            'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[sp_ulysses_2]'
+            'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[tp_vae_patch_parallel_2]'
+            -m 'slow and diffusion and rocm and MI300 and cards_2'
+
+      - label: "Bagel multi-replica · 4-GPU"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_bagel_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-bagel-multi-replica-weekly-4gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 1 285m rocm-bagel-multi-replica-weekly-4gpu
+            'tests/e2e/online_serving/test_bagel_multi_replicas.py::test_multi_stage_diffusion_uses_multi_replica_dit_stage[omni_server0]'
+            -m 'slow and diffusion and rocm and MI300 and cards_4'
+
+      # These offline understanding and LoRA cases explicitly declare MI300.
       # Keep them in one bounded job to avoid consuming three accelerator slots.
       - label: "Bagel offline shared · 1-GPU"
         agent_pool: mi300_1
@@ -1084,7 +1074,7 @@ steps:
             set +e
             pytest --collect-only -q "$${nodes[@]}" \
               --shard-id=0 --num-shards=1 \
-              -m "slow and diffusion and rocm and MI325 and cards_1" \
+              -m "slow and diffusion and rocm and MI300 and cards_1" \
               --run-level full_model \
               > "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/collection.txt" 2>&1
             collection_status=$$?
@@ -1119,7 +1109,7 @@ steps:
               timeout --signal=TERM --kill-after=2m 165m \
                 pytest -s -v -ra "$${nodes[@]}" \
                 --shard-id=0 --num-shards=1 \
-                -m "slow and diffusion and rocm and MI325 and cards_1" \
+                -m "slow and diffusion and rocm and MI300 and cards_1" \
                 --run-level full_model --durations=20 \
                 --junitxml="$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/pytest.xml" \
                 2>&1 | tee "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/pytest.log"
@@ -1153,39 +1143,264 @@ steps:
             fi
             (exit "$$status")
 
-      # Keep the complete Cosmos3 image and T2V/I2V/V2V file as the blocking
-      # weekly owner after scheduled MI325 qualification. This replaces the
-      # narrower nightly T2I-only owner.
+      # Keep the complete Cosmos3 generation owner and add the CUDA weekly
+      # transfer-auto contract without widening to unrelated files.
       - label: "Cosmos3 generation modes · 1-GPU"
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
         grade: Blocking
-        timeout_in_minutes: 300
+        timeout_in_minutes: 390
         source_file_dependencies:
           - diffusion_cosmos3_function
           - .buildkite/amd/scripts/prewarm_cosmos3_aiter.py
-          - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
-          - tests/helpers/
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "1"
+          VLLM_IMAGE_FETCH_TIMEOUT: "60"
         artifact_paths:
           - artifacts/rocm-cosmos3-weekly/**/*
         commands:
           # Cosmos3 starts its server with both masked and unmasked BF16 AITER
           # MHA modules. Compile them before the 900-second orchestrator startup
           # window, then reuse the same job-local cache for both generation tests.
-          - export VLLM_ROCM_USE_AITER=1
+          # Their sequential cold builds nearly exhausted 55 minutes in #17369
+          # and crossed that boundary in #17385, so retain deterministic headroom.
           - export AITER_JIT_DIR="/tmp/vllm-omni-cosmos3-aiter-$$BUILDKITE_JOB_ID"
           - export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-cosmos3-torch-extensions-$$BUILDKITE_JOB_ID"
           - mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"
           - >-
-            timeout --signal=TERM --kill-after=2m 55m
+            timeout --signal=TERM --kill-after=2m 75m
             python .buildkite/amd/scripts/prewarm_cosmos3_aiter.py
           - >-
-            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_RUN_LEVEL=full_model
-            ROCM_E2E_TIMEOUT_MINUTES=210
-            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
-            tests/e2e/online_serving/test_cosmos3.py
-            2 diffusion rocm-cosmos3-weekly
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 3 285m rocm-cosmos3-weekly
+            'tests/e2e/online_serving/test_cosmos3.py::test_text_to_image_001[default]'
+            'tests/e2e/online_serving/test_cosmos3.py::test_video_generation_modes_001[default]'
+            'tests/e2e/online_serving/test_cosmos3_transfer_auto.py::test_transfer_auto_uploaded_control_001[transfer_auto]'
+            -m 'slow and diffusion and rocm and MI300 and cards_1'
+
+      - label: "SANA-Video online and alignment · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_sana_video_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-sana-video-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 12 285m rocm-sana-video-weekly-1gpu
+            'tests/e2e/online_serving/test_sana_video_expansion.py::test_sana_video_t2v_backends[native-480p]'
+            'tests/e2e/online_serving/test_sana_video_expansion.py::test_sana_video_t2v_backends[diffusers-adapter-480p]'
+            'tests/e2e/online_serving/test_sana_video_expansion.py::test_sana_video_t2v_backends[native-720p]'
+            'tests/e2e/online_serving/test_sana_video_expansion.py::test_sana_video_t2v_backends[diffusers-adapter-720p]'
+            'tests/e2e/online_serving/test_sana_video_expansion.py::test_sana_video_i2v_variants[native-480p]'
+            'tests/e2e/online_serving/test_sana_video_expansion.py::test_sana_video_i2v_variants[diffusers-adapter-480p]'
+            'tests/e2e/online_serving/test_sana_video_expansion.py::test_sana_video_i2v_variants[native-720p]'
+            'tests/e2e/online_serving/test_sana_video_expansion.py::test_sana_video_i2v_variants[diffusers-adapter-720p]'
+            'tests/e2e/accuracy/sana_video/test_sana_video_pipeline_alignment.py::test_sana_video_quick_pipeline_stages_match_diffusers[None-480p]'
+            'tests/e2e/accuracy/sana_video/test_sana_video_pipeline_alignment.py::test_sana_video_quick_pipeline_stages_match_diffusers[None-720p]'
+            'tests/e2e/accuracy/sana_video/test_sana_video_i2v_alignment.py::test_sana_video_i2v_first_frame_latents_match_diffusers[None-480p]'
+            'tests/e2e/accuracy/sana_video/test_sana_video_i2v_alignment.py::test_sana_video_i2v_first_frame_latents_match_diffusers[None-720p]'
+            -m 'slow and diffusion and rocm and MI300 and cards_1'
+
+      - label: "SenseNova-U1 functional and accuracy · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 600
+        source_file_dependencies:
+          - diffusion_sensenova_u1_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-sensenova-u1-weekly-*/**/*
+        commands:
+          - |
+            set +e
+            status=0
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh \
+              1 5 255m rocm-sensenova-u1-weekly-smoke \
+              tests/e2e/offline_inference/test_sensenova_u1_expansion.py::test_sensenova_u1_lora_scale_and_deactivation \
+              tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py::test_sensenova_u1_text2img \
+              tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py::test_sensenova_u1_text2img_cache_dit \
+              tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py::test_sensenova_u1_img2img \
+              tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py::test_sensenova_u1_img2img_cache_dit \
+              -m 'slow and diffusion and rocm and MI300 and cards_1'
+            run_status=$$?
+            if [[ "$$status" -eq 0 && "$$run_status" -ne 0 ]]; then status=$$run_status; fi
+
+            SENSENOVA_U1_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-sensenova-u1-weekly-t2i/accuracy" \
+            SENSENOVA_U1_CI_IMAGE="amd-native:$${BUILDKITE_COMMIT:?}" \
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh \
+              1 1 150m rocm-sensenova-u1-weekly-t2i \
+              tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py::test_sensenova_u1_text2img_pixel_accuracy \
+              -m 'slow and diffusion and rocm and MI300 and cards_1'
+            run_status=$$?
+            if [[ "$$status" -eq 0 && "$$run_status" -ne 0 ]]; then status=$$run_status; fi
+
+            SENSENOVA_U1_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-sensenova-u1-weekly-i2i/accuracy" \
+            SENSENOVA_U1_CI_IMAGE="amd-native:$${BUILDKITE_COMMIT:?}" \
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh \
+              1 1 150m rocm-sensenova-u1-weekly-i2i \
+              tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py::test_sensenova_u1_img2img_pixel_accuracy \
+              -m 'slow and diffusion and rocm and MI300 and cards_1'
+            run_status=$$?
+            if [[ "$$status" -eq 0 && "$$run_status" -ne 0 ]]; then status=$$run_status; fi
+            set -e
+            exit "$$status"
+
+      - label: "MammothModa2 functional and FP8 quality · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_mammoth_moda2_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-mammoth-moda2-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 2 285m rocm-mammoth-moda2-weekly-1gpu
+            'tests/e2e/offline_inference/test_mammoth_moda2_expansion.py::test_mammothmoda2_t2i_e2e[omni_runner0]'
+            tests/diffusion/models/mammoth_moda2/test_mammoth_moda2_dit_quantization_quality.py::test_mammoth_moda2_dit_online_fp8_quality_and_memory
+            -m 'slow and diffusion and rocm and MI300 and cards_1'
+
+      - label: "Helios streaming similarity · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_helios_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-helios-weekly-1gpu/**/*
+          - tests/e2e/accuracy/results/result_acc_*.json
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 285m rocm-helios-weekly-1gpu
+            'tests/e2e/accuracy/test_video_streaming_output_similarity.py::test_helios_streaming_output_matches_non_streaming[helios_distilled]'
+            -m 'slow and diffusion and rocm and MI300 and cards_1'
+
+      - label: "GLM-Image online and AutoRound · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 480
+        source_file_dependencies:
+          - diffusion_glm_image_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-glm-image-weekly-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 12 465m rocm-glm-image-weekly-2gpu
+            'tests/e2e/online_serving/test_glm_image_expansion.py::test_glm_image[baseline-t2i]'
+            'tests/e2e/online_serving/test_glm_image_expansion.py::test_glm_image[baseline-i2i]'
+            'tests/e2e/online_serving/test_glm_image_expansion.py::test_glm_image[cachedit-t2i]'
+            'tests/e2e/online_serving/test_glm_image_expansion.py::test_glm_image[cachedit-i2i]'
+            'tests/e2e/online_serving/test_glm_image_expansion.py::test_glm_image[tensor_parallel_2-t2i]'
+            'tests/e2e/online_serving/test_glm_image_expansion.py::test_glm_image[tensor_parallel_2-i2i]'
+            'tests/e2e/online_serving/test_glm_image_expansion.py::test_glm_image[hsdp_2-t2i]'
+            'tests/e2e/online_serving/test_glm_image_expansion.py::test_glm_image[hsdp_2-i2i]'
+            'tests/e2e/online_serving/test_glm_image_expansion.py::test_glm_image[sequence_parallel_2-t2i]'
+            'tests/e2e/online_serving/test_glm_image_expansion.py::test_glm_image[sequence_parallel_2-i2i]'
+            'tests/e2e/offline_inference/test_glm_image_autoround_w4a16_expansion.py::test_glm_image_autoround_w4a16_generates_image[omni_runner0]'
+            'tests/e2e/offline_inference/test_glm_image_autoround_w4a16_expansion.py::test_glm_image_autoround_w4a16_image_to_image[omni_runner0]'
+            -m 'slow and diffusion and rocm and MI300 and cards_2'
+
+      - label: "DreamZero OpenPI · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_dreamzero_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-dreamzero-weekly-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 1 285m rocm-dreamzero-weekly-2gpu
+            'tests/e2e/online_serving/test_dreamzero_expansion.py::test_dreamzero_openpi_online[omni_server0]'
+            -m 'slow and diffusion and rocm and MI300 and cards_2'
+
+      - label: "HiDream-O1 accuracy · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_hidream_o1_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-hidream-o1-weekly-2gpu/**/*
+          - tests/e2e/accuracy/results/result_acc_*.json
+        commands:
+          - >-
+            HIDREAM_O1_ACCURACY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-hidream-o1-weekly-2gpu/accuracy"
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 1 285m rocm-hidream-o1-weekly-2gpu
+            tests/e2e/accuracy/test_hidream_o1_image.py::test_hidream_o1_image_tp2_matches_baseline
+            -m 'slow and diffusion and rocm and MI300 and cards_2'
+
+      - label: "MAGI-2 serving smoke · 4-GPU"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_magi2_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-magi2-weekly-4gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 1 285m rocm-magi2-weekly-4gpu
+            'tests/e2e/online_serving/test_magi2.py::test_magi2_preview_serving_smoke[resident_sp4_272p_one_step]'
+            -m 'slow and diffusion and rocm and MI300 and cards_4'
 
       # Mirror the CUDA weekly Qwen-Image Edit/Layered single-card contract.
       # Keep online and accuracy owners separate so numerical comparisons do
@@ -1582,14 +1797,17 @@ steps:
             -m 'slow and diffusion and rocm and MI325 and cards_2'
 
       # Mirror CUDA's complete one-card LTX functional and official-reference
-      # contract. CUDA keeps NATTEN/cuDNN; ROCm uses bundled Triton na3d and
-      # platform-default PyTorch SDPA without weakening the requested cases.
-      - label: "LTX functional and accuracy · 1-GPU"
+      # contract. Keep the semantic owner exact while isolating each long-lived
+      # reference case so checkpoint cold starts run in parallel instead
+      # of serializing several hours on one GPU. CUDA keeps NATTEN/cuDNN; ROCm
+      # uses bundled Triton na3d and platform-default PyTorch SDPA without
+      # weakening the requested cases.
+      - label: "LTX functional · 1-GPU"
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
         grade: Blocking
-        timeout_in_minutes: 300
+        timeout_in_minutes: 120
         source_file_dependencies:
           - diffusion_ltx_weekly
           - rocm_diffusion_nightly_runner
@@ -1597,17 +1815,164 @@ steps:
           VLLM_ROCM_USE_AITER: "0"
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
-          - artifacts/rocm-ltx-weekly-1gpu/**/*
+          - artifacts/rocm-ltx-functional-weekly-1gpu/**/*
         commands:
           - >-
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
-            1 19 285m rocm-ltx-weekly-1gpu
+            1 9 105m rocm-ltx-functional-weekly-1gpu
             tests/e2e/online_serving/test_ltx.py
             tests/e2e/online_serving/test_ltx25.py
             tests/e2e/online_serving/test_ltx25_audio.py
             tests/e2e/offline_inference/test_ltx25_audio.py
-            tests/e2e/accuracy/ltx/test_ltx_official_similarity.py
-            tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "LTX legacy · LTX-2.3 distilled I2V · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 120
+        source_file_dependencies:
+          - diffusion_ltx_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-ltx23-distilled-i2v-accuracy-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 105m rocm-ltx23-distilled-i2v-accuracy-weekly-1gpu
+            tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx23_distilled_i2v]
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "LTX legacy · LTX-2 two-stage T2V · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 120
+        source_file_dependencies:
+          - diffusion_ltx_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-ltx2-two-stage-t2v-accuracy-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 105m rocm-ltx2-two-stage-t2v-accuracy-weekly-1gpu
+            tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx2_two_stage_layer_fused_t2v]
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "LTX legacy · LTX-2.3 two-stage I2V · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 120
+        source_file_dependencies:
+          - diffusion_ltx_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-ltx23-two-stage-i2v-accuracy-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 105m rocm-ltx23-two-stage-i2v-accuracy-weekly-1gpu
+            tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx23_two_stage_layer_fused_i2v]
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "LTX-2.5 distilled accuracy · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 120
+        source_file_dependencies:
+          - diffusion_ltx_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-ltx25-distilled-accuracy-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 2 105m rocm-ltx25-distilled-accuracy-weekly-1gpu
+            tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_distilled_two_stage_matches_official
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "LTX-2.5 full one-stage accuracy · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 150
+        source_file_dependencies:
+          - diffusion_ltx_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-ltx25-full-one-stage-accuracy-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 2 135m rocm-ltx25-full-one-stage-accuracy-weekly-1gpu
+            'tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_full_matches_official[full_one_stage-t2v]'
+            'tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_full_matches_official[full_one_stage-i2v]'
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "LTX-2.5 full two-stage accuracy · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 180
+        source_file_dependencies:
+          - diffusion_ltx_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-ltx25-full-two-stage-accuracy-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 2 165m rocm-ltx25-full-two-stage-accuracy-weekly-1gpu
+            'tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_full_matches_official[full_two_stage-t2v]'
+            'tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_full_matches_official[full_two_stage-i2v]'
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "LTX-2.5 T2A accuracy · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 120
+        source_file_dependencies:
+          - diffusion_ltx_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-ltx25-t2a-accuracy-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 105m rocm-ltx25-t2a-accuracy-weekly-1gpu
+            tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_t2a_matches_official
             -m 'slow and diffusion and rocm and MI325 and cards_1'
 
       # Preserve CUDA's two-card LTX-2 distilled HSDP owner as an isolated job.
@@ -1632,14 +1997,106 @@ steps:
             tests/e2e/online_serving/test_ltx.py
             -m 'slow and diffusion and rocm and MI325 and cards_2'
 
-      # Probe the exact CUDA-owned Wan2.1 VACE nodes on ROCm before adding
-      # MI325 source marks. Exact node invocation avoids claiming support until
-      # both resource shapes have clean hardware evidence.
-      - label: "Wan2.1 VACE probe · 1-GPU"
+      # CUDA's broad L4 sweeps are represented by exact MI300 whitelists so
+      # unrelated L4 additions cannot silently expand AMD capacity or runtime.
+      - label: "Portable diffusion contracts · 1-GPU"
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_portable_1gpu_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-portable-diffusion-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 13 285m rocm-portable-diffusion-weekly-1gpu
+            'tests/e2e/offline_inference/test_flux2_klein.py::test_flux2_klein_inpaint_deterministic[omni_runner0]'
+            'tests/e2e/offline_inference/test_flux2_klein.py::test_flux2_klein_inpaint_different_seeds_different_output[omni_runner0]'
+            tests/e2e/offline_inference/test_stable_audio_expansion.py::test_stable_audio_quantization_and_teacache
+            tests/e2e/offline_inference/test_stable_audio_expansion.py::test_stable_audio_cpu_offload
+            tests/e2e/offline_inference/test_stable_audio_expansion.py::test_stable_audio_watermarking_opt_out
+            'tests/e2e/online_serving/test_stable_audio_online_expansion.py::test_stable_audio_t2a_online_with_watermarking[t2a]'
+            'tests/e2e/offline_inference/test_z_image.py::test_zimage[omni_runner0-rocm]'
+            'tests/e2e/offline_inference/test_z_image.py::test_zimage_denoise_graph[omni_runner0-rocm]'
+            'tests/e2e/online_serving/test_flux_kontext_expansion.py::test_flux_kontext_text_to_image[base]'
+            'tests/e2e/online_serving/test_flux_kontext_expansion.py::test_flux_kontext_image_edit[base]'
+            'tests/e2e/online_serving/test_flux_kontext_expansion.py::test_flux_kontext_image_edit_no_negative[base]'
+            'tests/e2e/online_serving/test_flux_kontext_expansion.py::test_flux_kontext_high_resolution[base]'
+            'tests/e2e/online_serving/test_flux_kontext_expansion.py::test_flux_kontext_multiple_outputs[base]'
+            -m 'slow and diffusion and rocm and MI300 and cards_1'
+
+      - label: "Portable diffusion contracts · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_portable_2gpu_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-portable-diffusion-weekly-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 4 285m rocm-portable-diffusion-weekly-2gpu
+            'tests/e2e/offline_inference/test_ernie_image_expansion.py::test_ernie_image_text_to_image[omni_runner0]'
+            'tests/e2e/online_serving/test_ernie_image_expansion.py::test_ernie_image[tp_2_cpu_offload]'
+            'tests/e2e/online_serving/test_nextstep_expansion.py::test_nextstep_11[nextstep_tp2_cpu_offload]'
+            'tests/e2e/online_serving/test_nextstep_expansion.py::test_nextstep_11[nextstep_tp4_pipeline]'
+            -m 'slow and diffusion and rocm and MI300 and cards_2'
+
+      - label: "Portable diffusion contracts · 4-GPU"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 360
+        source_file_dependencies:
+          - diffusion_portable_4gpu_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-portable-diffusion-weekly-4gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 14 345m rocm-portable-diffusion-weekly-4gpu
+            'tests/e2e/online_serving/test_flux2_expansion.py::test_flux2_klein[cpu_offload]'
+            'tests/e2e/online_serving/test_flux2_expansion.py::test_flux2_klein[omni_server1]'
+            'tests/e2e/online_serving/test_flux2_expansion.py::test_flux2_klein[layerwise_ulysses2_ring2]'
+            'tests/e2e/online_serving/test_flux2_expansion.py::test_flux2_klein[layerwise_tp2]'
+            'tests/e2e/online_serving/test_flux2_expansion.py::test_flux2_klein[layerwise_hsdp]'
+            'tests/e2e/online_serving/test_sd3_expansion.py::test_sd3_medium[omni_server0]'
+            'tests/e2e/online_serving/test_sd3_expansion.py::test_sd3_medium[omni_server1]'
+            'tests/e2e/online_serving/test_z_image.py::test_basic_001[default]'
+            'tests/e2e/online_serving/test_z_image.py::test_different_sizes_001[default]'
+            'tests/e2e/online_serving/test_zimage_expansion.py::test_zimage[parallel_cachedit_fp8_ring2_tp2]'
+            'tests/e2e/online_serving/test_zimage_expansion.py::test_zimage[parallel_teacache_fp8_ulysses2_ring2]'
+            'tests/e2e/online_serving/test_zimage_expansion.py::test_zimage[layerwise_ulysses2_ring2]'
+            'tests/e2e/online_serving/test_zimage_expansion.py::test_zimage[layerwise_tp2]'
+            'tests/e2e/online_serving/test_zimage_expansion.py::test_zimage[layerwise_hsdp]'
+            -m 'slow and diffusion and rocm and MI300 and cards_4'
+
+      # Block the exact CUDA-owned Wan2.1 VACE nodes after two clean ROCm
+      # hardware runs with exact counts, zero skips/leaks, and no retry masking.
+      - label: "Wan2.1 VACE · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
         timeout_in_minutes: 120
         source_file_dependencies: diffusion_wan2_1_vace_weekly
         artifact_paths:
@@ -1651,11 +2108,11 @@ steps:
             'tests/e2e/online_serving/test_wan_2_1_vace_expansion.py::test_wan_2_1_vace[single_card_cpu_offload]'
             'tests/e2e/online_serving/test_wan_2_1_vace_expansion.py::test_wan_2_1_vace[single_card_001]'
 
-      - label: "Wan2.1 VACE probe · 2-GPU"
+      - label: "Wan2.1 VACE · 2-GPU"
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_wan2_1_vace_weekly
         artifact_paths:

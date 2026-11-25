@@ -48,6 +48,7 @@ from .configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Config,
     Qwen3TTSTokenizerV2DecoderConfig,
 )
+from .mimi_conv import use_integer_padding
 
 logger = logging.get_logger(__name__)
 
@@ -1774,6 +1775,7 @@ class Qwen3TTSTokenizerV2Encoder(MimiModel):
             self.decoder = None
             self.decoder_transformer = None
             self.upsample = None
+        use_integer_padding(self)
 
     def flat_checkpoint_mapper(self) -> WeightsMapper:
         return _NESTED_MIMI_ENCODER_MAPPER if hasattr(self.encoder, "encoder_seanet") else WeightsMapper()
