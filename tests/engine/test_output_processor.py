@@ -481,6 +481,20 @@ def test_delta_drains_audio_chunk_metadata_per_step():
     assert meta2["duplex_turn_id"].tolist() == [2]
 
 
+@pytest.mark.parametrize("as_tensor", [False, True])
+def test_cumulative_text_input_marker_is_replaced_by_the_next_append(as_tensor):
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    # Sync transport tensorizes scalar values; async Thinker handoff keeps the
+    # original bool. Both must reset text ownership on the next audio append.
+    for text_input in (True, False):
+        value = torch.tensor(text_input) if as_tensor else text_input
+        s.add_multimodal_tensor({"duplex_text_input": value}, mm_type="latent")
+        result = s.make_request_output([1], None, None, None)
+        assert result is not None and not isinstance(result, PoolingRequestOutput)
+        observed = result.outputs[0].multimodal_output["duplex_text_input"]
+        assert bool(observed) is text_input
+
+
 def test_cumulative_audio_replaces_chunk_metadata_per_step():
     s = _make_state(RequestOutputKind.CUMULATIVE)
     segment_text = "你好"
@@ -888,6 +902,36 @@ def test_pooling_completion_uses_upstream_output_and_finishes_request(cache_miss
         torch.testing.assert_close(output.outputs.data, timestamps)
     assert request.request_id not in processor.request_states
     assert request.external_req_id not in processor.external_req_ids
+
+
+def test_add_request_normalizes_numpy_prompt_ids_before_upstream_detokenizer(monkeypatch):
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
+    request = OmniEngineCoreRequest(
+        request_id="numpy-prompt",
+        external_req_id="numpy-prompt",
+        prompt_token_ids=np.array([10, 11], dtype=np.int32),
+        mm_features=None,
+        sampling_params=None,
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    captured = {}
+
+    def fake_from_new_request(**kwargs):
+        captured["prompt_token_ids"] = kwargs["request"].prompt_token_ids
+        return SimpleNamespace(
+            external_req_id="numpy-prompt",
+            is_pooling_request=False,
+        )
+
+    monkeypatch.setattr(OmniRequestState, "from_new_request", staticmethod(fake_from_new_request))
+
+    processor.add_request(request, prompt=None)
+
+    assert captured["prompt_token_ids"] == [10, 11]
 
 
 def test_admission_error_returns_external_pause_message():

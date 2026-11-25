@@ -156,6 +156,10 @@ _KEY_ACCUMULATION_OVERRIDES: dict[str, TensorAccumulationStrategy] = {
         "meta.decode_span",
         "meta.consumed_input_span",
         "meta.committed_token_count",
+        # IndexTTS emits this request-wide policy every decode step. Transport
+        # materializes booleans as 0-d tensors, so keep only the latest value
+        # instead of trying to concatenate scalar tensors.
+        "meta.use_gpt_latent",
     )
 }
 

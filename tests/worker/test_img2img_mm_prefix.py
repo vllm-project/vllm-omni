@@ -50,7 +50,8 @@ def bagel_feature(mocker):
     assert mask.device.type == "cpu"
     position = PlaceholderRange(offset=0, length=len(update.content.full), is_embed=mask)
     # Includes the VAE and ViT markers, with one non-embedding separator.
-    assert position.extract_embeds_range() == [(0, 2689), (2691, 7592)]
+    # 1024x672 VAE input; the aspect-preserving ViT input is 980x644.
+    assert position.extract_embeds_range() == [(0, 2689), (2691, 5912)]
     return MultiModalFeatureSpec(
         data=MultiModalKwargsItem({}),
         modality="img2img",
@@ -62,7 +63,7 @@ def bagel_feature(mocker):
 
 def test_real_bagel_img2img_ranges(bagel_feature):
     features = [[bagel_feature]]
-    assert utils.compute_mm_prefix_ranges(features) == {0: [(0, 2689), (2691, 7592)]}
+    assert utils.compute_mm_prefix_ranges(features) == {0: [(0, 2689), (2691, 5912)]}
     assert features[0][0] is bagel_feature
     assert bagel_feature.modality == "img2img"
 
@@ -83,7 +84,7 @@ def test_other_modalities_and_metadata_unchanged(bagel_feature):
     assert utils.compute_mm_prefix_ranges([others, []]) == original([others, []])
     identity = (bagel_feature.data, bagel_feature.mm_position, bagel_feature.identifier, bagel_feature.mm_hash)
     assert utils.compute_mm_prefix_ranges([[bagel_feature], others, []]) == {
-        0: [(0, 2689), (2691, 7592)],
+        0: [(0, 2689), (2691, 5912)],
         1: original([others])[0],
         2: [],
     }

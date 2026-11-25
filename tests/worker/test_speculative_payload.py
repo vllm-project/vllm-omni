@@ -691,3 +691,67 @@ def test_consumed_input_span_rejects_wrong_token_identity():
     }
     with pytest.raises(RuntimeError, match="does not match scheduler"):
         thinker2talker_async_chunk(manager, payload, request, new_token_ids=[12])
+
+
+def test_ngram_gpu_ragged_turn_delivers_every_committed_token():
+    """Draft-free spans with ragged acceptance reach the Talker in order (#5348)."""
+    manager = SimpleNamespace(
+        put_req_chunk={"r1": 0},
+        request_payload={},
+        config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                im_start_token_id=151644,
+                user_token_id=872,
+                talker_config=SimpleNamespace(accept_hidden_layer=24),
+                thinker_config=SimpleNamespace(audio_token_id=151675, image_token_id=151655, video_token_id=151656),
+            )
+        ),
+    )
+    # (inputs, committed samples); K=3 drafts per decode step, 19 is EOS.
+    steps = [
+        ((1, 2, 3), [11]),
+        ((11, 12, 92, 93), [12, 13]),
+        ((13, 14, 15, 94), [14, 15, 16]),
+        ((16, 95, 96, 97), [17]),
+        ((17, 18, 98, 99), [18, 19]),
+    ]
+    history, position, spoken = [], 0, []
+    for i, (inputs, delta) in enumerate(steps):
+        history.extend(delta)
+        finished = i == len(steps) - 1
+        mm = finalize_speculative_payload(
+            _prepare(
+                inputs=inputs,
+                samples=(tuple(delta + [-1] * (4 - len(delta))),),
+                positions=tuple(range(position, position + len(inputs))),
+                offsets=(0, len(inputs)),
+                embed=lambda ids: ids.float().view(-1, 1) * 10,
+            )
+        )
+        raw = {
+            "hidden_states.layer_0": mm["hidden_states"]["layers"][0],
+            "hidden_states.layer_24": mm["hidden_states"]["layers"][24],
+        }
+        payload = deserialize_payload(serialize_payload(apply_speculative_payload(raw, mm, 0)))
+        request = SimpleNamespace(
+            external_req_id="r1",
+            prompt_token_ids=[1, 2, 3],
+            output_token_ids=list(history),
+            all_token_ids=[1, 2, 3] + history,
+            additional_information=None,
+            resumable=False,
+            num_computed_tokens=position + len(inputs),
+        )
+        chunk = thinker2talker_async_chunk(manager, payload, request, is_finished=finished, new_token_ids=delta)
+        position += len(inputs) if i == 0 else len(delta)
+        if chunk is None:
+            assert i == 0
+            continue
+        manager.put_req_chunk["r1"] += 1
+        if chunk.embed.prefill is not None:
+            spoken.extend(chunk.embed.prefill[3:].flatten().tolist())
+        if chunk.embed.decode is not None:
+            spoken.extend(chunk.embed.decode.flatten().tolist())
+    # The final sampled token never enters the Talker prompt.
+    assert spoken == [token * 10 for token in history[:-1]]
+    assert manager.put_req_chunk["r1"] == 4
