@@ -58,6 +58,96 @@ def test_build_quant_config_fp8_uses_native_online_quantization():
     assert config.ignored_layers == ["proj_out"]
 
 
+def _online_linear_cls():
+    """A linear class the online configs resolve a method for, with no weights to allocate.
+
+    Instances come from ``cls.__new__(cls)``: constructing a method needs an active
+    vLLM config, and a skipped layer must return before resolution reaches one.
+    """
+    from vllm.model_executor.layers.linear import LinearBase
+
+    class _Linear(LinearBase):
+        pass
+
+    return _Linear
+
+
+def test_online_fp8_ignored_layers_default_match_mode_is_exact():
+    """`ignored_layers` entries name a full layer prefix, so a short module name covers no block."""
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config("fp8", ignored_layers=["img_mlp"])
+    assert config.ignored_layers_match_mode == "exact"
+    resolved = config.resolve_quant_method_cls(_online_linear_cls(), "transformer_blocks.0.img_mlp.net.0.proj")
+    assert resolved is not None
+
+
+def test_online_fp8_substring_match_mode_covers_short_names():
+    """A pipeline that documents short names as patterns raises the mode to cover every block."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config("fp8", ignored_layers=["img_mlp"])
+    config.ignored_layers_match_mode = "substring"
+    linear_cls = _online_linear_cls()
+
+    method = config.get_quant_method(linear_cls.__new__(linear_cls), "transformer_blocks.0.img_mlp.net.0.proj")
+    assert isinstance(method, UnquantizedLinearMethod)
+    assert config.resolve_quant_method_cls(linear_cls, "transformer_blocks.0.attn.to_qkv") is not None
+
+
+def test_online_fp8_substring_match_mode_covers_text_encoder_subtrees():
+    """Qwen-Image-2.1 keeps the Qwen3-VL vision tower and the unused LM head out of FP8 this way."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config("fp8", ignored_layers=["model.visual", "lm_head"])
+    config.ignored_layers_match_mode = "substring"
+    linear_cls = _online_linear_cls()
+    layer = linear_cls.__new__(linear_cls)
+
+    assert isinstance(config.get_quant_method(layer, "model.visual.blocks.0.mlp.linear_fc1"), UnquantizedLinearMethod)
+    assert isinstance(config.get_quant_method(layer, "lm_head"), UnquantizedLinearMethod)
+
+
+def test_online_fp8_rocm_keeps_non_aligned_local_linear_dimensions_unquantized(monkeypatch):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    import vllm_omni.quantization.fp8_config as fp8_config_module
+    from vllm_omni.quantization import build_quant_config
+
+    class _RocmPlatform:
+        @staticmethod
+        def is_rocm() -> bool:
+            return True
+
+    monkeypatch.setattr(fp8_config_module, "current_platform", _RocmPlatform())
+    config = build_quant_config("fp8")
+    linear_cls = _online_linear_cls()
+    layer = linear_cls.__new__(linear_cls)
+    layer.input_size = 2520
+    layer.input_size_per_partition = 2520
+    layer.output_size = 10240
+    layer.output_size_per_partition = 10240
+
+    method = config.get_quant_method(layer, "gen_transformer.context_refiner.0.attn.to_q")
+
+    assert isinstance(method, UnquantizedLinearMethod)
+    assert config._reported_rocm_alignment_fallback
+
+    layer.input_size = 2528
+    layer.input_size_per_partition = 2528
+    layer.output_size = 2520
+    layer.output_size_per_partition = 2520
+    assert config._requires_rocm_alignment_fallback(layer)
+
+    layer.output_size = 2528
+    layer.output_size_per_partition = 2528
+    assert not config._requires_rocm_alignment_fallback(layer)
+
+
 def test_build_quant_config_upstream_online_fp8_shorthand():
     from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
     from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym

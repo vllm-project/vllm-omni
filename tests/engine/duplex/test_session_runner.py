@@ -218,6 +218,7 @@ class Harness:
         metrics: Any = None,
         stage_work: Sequence[tuple[int, int, int, int, int]] = (),
         output_chunk: tuple[int, int] | None = None,
+        model_turn_id: int | None = None,
     ) -> bool:
         session = self.session
         fence = session.fence if epoch is None else session.fence.__class__(SESSION_ID, epoch=epoch)
@@ -228,6 +229,7 @@ class Harness:
             segment_token_ids=tuple(segment_token_ids),
             segment_output_metadata=dict(segment_output_metadata or {}),
             perf_chunks={(row[1], row[2]) for row in stage_work} | ({output_chunk} if output_chunk else set()),
+            model_turn_id=model_turn_id,
         )
         request_id = getattr(output, "request_id", None)
         if not isinstance(request_id, str):
@@ -464,7 +466,9 @@ async def test_a_retried_append_does_not_take_the_failed_submits_spans() -> None
         # A late span of the failed submit still carries the old id.
         h.runner.on_stage_work([(0, 0, 1, ledger.now_ns(), 1_000_000)])
         (turn,) = ledger.snapshot()["turns"]
-        assert [(chunk["seq"], chunk["stage_work"]) for chunk in turn["chunks"]] == [(1, [])]
+        # The retry drains both the rolled-back audio and the fresh unit;
+        # neither may inherit the failed submission's stage work.
+        assert [(chunk["seq"], chunk["stage_work"]) for chunk in turn["chunks"]] == [(1, []), (2, [])]
     finally:
         await close_harness(h)
 
@@ -1052,6 +1056,9 @@ async def test_input_backpressure_is_rejected_before_the_buffer_is_touched() -> 
 async def test_text_append_is_not_supported_by_the_native_runtime() -> None:
     h = await open_harness()
     try:
+        h.session.capabilities = replace(
+            h.session.capabilities, optional_input_modalities=frozenset({"audio", "video"})
+        )
         events = await h.run(commands.AppendText(text="hello", event_id="evt-text"))
         assert types(events) == ["error"]
         assert events[0].code == "native_text_append_unsupported"

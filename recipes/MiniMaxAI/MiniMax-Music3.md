@@ -110,9 +110,9 @@ response shorter than the cap is the model finishing rather than a truncation.
   returns raw audio bytes, one window at a time with the default
   `async_chunk: true`. Use `response_format: "pcm"` when streaming.
 - **Known limitations:**
-    - `max_model_len` is 10,240, so a maximum-length prompt (5,000 tokens) and a
-      maximum-length song (9,000 frames) cannot both fit. Long captions shorten
-      the maximum song. This is a property of the checkpoint.
+    - Stage 0 reserves one context token to deliver the final audio. With the
+      default 10,240-token context, a 5,000-token prompt leaves room for 5,239
+      audio frames. Shorter prompts can use up to the 9,000-frame song limit.
     - The acoustic stage runs in float32. bfloat16 is accepted but measurably
       degrades the solver.
 

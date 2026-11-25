@@ -118,8 +118,10 @@ _NPU_ROPE: dict[str, object] = {"freqs": None, "tables": None}
 def _npu_rope_tables(freqs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if _NPU_ROPE["freqs"] is freqs:
         return _NPU_ROPE["tables"]  # type: ignore[return-value]
-    cos = torch.real(freqs).float().repeat_interleave(2, dim=-1).unsqueeze(0).unsqueeze(2)
-    sin = torch.imag(freqs).float().repeat_interleave(2, dim=-1).unsqueeze(0).unsqueeze(2)
+    # Interleaved npu_rotary_mul requires [1, tokens, 1, D] tables.
+    table_freqs = freqs.reshape(1, -1, 1, freqs.shape[-1])
+    cos = torch.real(table_freqs).float().repeat_interleave(2, dim=-1)
+    sin = torch.imag(table_freqs).float().repeat_interleave(2, dim=-1)
     tables = (cos, sin)
     _NPU_ROPE["freqs"] = freqs
     _NPU_ROPE["tables"] = tables
@@ -135,8 +137,12 @@ def _apply_qwen_image21_rotary_emb_npu(x: torch.Tensor, freqs: torch.Tensor) -> 
     import torch_npu
 
     rot_cos, rot_sin = _npu_rope_tables(freqs)
-    rotated = torch_npu.npu_rotary_mul(x.float(), rot_cos, rot_sin, rotary_mode="interleave")
-    return rotated.to(dtype=x.dtype)
+    values = x.float()
+    if freqs.ndim == 3:
+        # Fold batch and sequence together so each token uses its own row's frequencies.
+        values = values.reshape(1, -1, *x.shape[2:])
+    rotated = torch_npu.npu_rotary_mul(values, rot_cos, rot_sin, rotary_mode="interleave")
+    return rotated.reshape_as(x).to(dtype=x.dtype)
 
 
 def _apply_qwen_image21_rotary_emb_musa(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -986,10 +992,10 @@ def _qwen_image21_rope_text_mask(
 ) -> torch.Tensor | None:
     if text_mask is None:
         return None
-    if sp_active or device.type != "cuda":
+    if sp_active or device.type not in ("cuda", "npu"):
         if not bool(text_mask.all()):
             raise ValueError(
-                "Qwen-Image-2.1 mixed-length text padding requires CUDA without sequence parallelism "
+                "Qwen-Image-2.1 mixed-length text padding requires CUDA or NPU without sequence parallelism "
                 "for per-request image RoPE."
             )
         return None

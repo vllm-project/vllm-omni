@@ -165,7 +165,6 @@ def _audio_model(device):
     model.apm = MiniCPMWhisperEncoder(config)
     model.audio_projection_layer = MultiModalProjector(32, 48)
     model.audio_avg_pooler = torch.nn.AvgPool1d(5, stride=5)
-    model.audio_encoder_layer = -1
     model.audio_past_key_values = None
     return model.eval().to(device)
 

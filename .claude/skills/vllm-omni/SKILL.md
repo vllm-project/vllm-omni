@@ -48,6 +48,7 @@ file together with the task reference.
 | Task | Skill |
 |------|-------|
 | New thinker/talker/code2wav omni model | `add-omni-model` |
+| New full-duplex speech or multimodal model | `add-fullduplex-model` |
 | Omni latency, throughput, streaming smoothness, or GPU-count optimization | `omni-perf-opt` |
 | New diffusion model / productionizing one | `add-diffusion-model`, `production-add-diffusion-model` |
 | Diffusion performance | `diffusion-perf-opt` |
