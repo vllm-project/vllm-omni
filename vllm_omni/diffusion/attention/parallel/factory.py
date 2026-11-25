@@ -123,7 +123,8 @@ def build_parallel_attention_strategy(
                 scatter_idx=scatter_idx,
                 gather_idx=gather_idx,
                 use_sync=use_sync,
-                ulysses_a2a_backend=_explicit_or_nccl(ulysses_a2a_backend),
+                # Ulysses x AllGather-KV keeps NCCL under "auto".
+                ulysses_a2a_permute=ulysses_a2a_backend == "copy_engine",
             )
         logger.debug(f"Using AllGatherKVParallelAttention (allgather_degree={allgather_degree})")
         return AllGatherKVParallelAttention(sp_group=sp_group)
@@ -163,8 +164,3 @@ def build_parallel_attention_strategy(
         )
 
     return NoParallelAttention()
-
-
-def _explicit_or_nccl(backend: str) -> str:
-    """Ulysses x AllGather-KV keeps NCCL under ``"auto"``; explicit transports apply as configured."""
-    return "nccl" if backend == "auto" else backend

@@ -258,13 +258,10 @@ class UlyssesParallelAttention:
         gather_idx: int,
         use_sync: bool,
         ulysses_a2a_permute: bool = False,
-        ulysses_a2a_backend: str = "nccl",
         transports: UlyssesTransportPlan | None = None,
     ) -> None:
         if transports is None:
-            if ulysses_a2a_permute and ulysses_a2a_backend == "nccl":
-                ulysses_a2a_backend = "copy_engine"  # deprecated alias
-            transports = explicit_plan(ulysses_a2a_backend, heads_per_rank=None)
+            transports = explicit_plan("copy_engine" if ulysses_a2a_permute else NCCL, heads_per_rank=None)
         ulysses_a2a_permute = transports.symmetric_memory
         self._sp_group = sp_group
         self._transports = transports

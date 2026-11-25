@@ -51,7 +51,7 @@ def test_explicit_backend_is_forwarded(monkeypatch, parallel_context, backend, a
 
     kwargs = strategy.call_args.kwargs
     if allgather > 1:
-        assert kwargs["ulysses_a2a_backend"] == backend
+        assert kwargs["ulysses_a2a_permute"] is (backend == "copy_engine")
     else:
         assert kwargs["transports"] == ulysses_transport.explicit_plan(backend, heads_per_rank=None)
 
@@ -63,7 +63,7 @@ def test_auto_keeps_nccl_for_ulysses_allgather(monkeypatch, parallel_context):
 
     factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
 
-    assert strategy.call_args.kwargs["ulysses_a2a_backend"] == "nccl"
+    assert strategy.call_args.kwargs["ulysses_a2a_permute"] is False
 
 
 @pytest.mark.parametrize("chunks, expected", [(0, 2), (4, 4), (3, 0)])
