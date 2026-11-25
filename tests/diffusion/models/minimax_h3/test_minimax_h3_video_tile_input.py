@@ -40,6 +40,8 @@ class _Normalize:
 
 
 class _Processor:
+    patch_size = 2
+
     def __init__(self, crop_mode):
         self.transform = _Normalize()
         self.crop_mode = crop_mode
@@ -48,7 +50,7 @@ class _Processor:
         return length
 
     def _align_to_total_patch_size(self, height, width):
-        return height // 2 * 2, width // 2 * 2
+        return height // self.patch_size * self.patch_size, width // self.patch_size * self.patch_size
 
 
 class _Checkpoint(nn.Module):
@@ -97,8 +99,9 @@ def _vae(crop_mode="top_left"):
     return vae
 
 
-def _frames(length=7):
-    return np.random.default_rng(123).integers(0, 256, (length, 9, 11, 3), dtype=np.uint8)
+def _frames(length=7, *, size=(9, 11)):
+    # Deterministic synthetic RGB frames generated here without media files.
+    return np.random.default_rng(123).integers(0, 256, (length, *size, 3), dtype=np.uint8)
 
 
 def _reference(vae, frames):
@@ -109,11 +112,14 @@ def _reference(vae, frames):
     return result[:, :, top : top + height, left : left + width].unsqueeze(0)
 
 
-@pytest.mark.parametrize("crop_mode", ["top_left", "center"])
+@pytest.mark.parametrize(("crop_mode", "offset"), [("top_left", 0), ("center", 1)])
 @pytest.mark.parametrize("length", [1, 4, 7, 13])
-def test_tile_input_preserves_pixels_padding_and_one_posterior(crop_mode, length):
-    vae, frames = _vae(crop_mode), _frames(length)
-    expected = _reference(vae, frames)
+def test_tile_input_preserves_pixels_padding_and_one_posterior(crop_mode, offset, length):
+    vae, frames = _vae(crop_mode), _frames(length, size=(11, 15))
+    vae.model.processor.patch_size = 4
+    prepared = vae._stream_prepare_video_tensor(frames, torch.device("cpu"))
+    # Alignment trims three pixels on each axis, shifting both center offsets by one.
+    expected = prepared[:, :, offset : offset + 8, offset : offset + 12].unsqueeze(0)
     latent = vae._stream_encode_video_tiles(frames, torch.device("cpu"))
     assert latent is not None
     moments = DiagonalGaussianDistribution.moments
