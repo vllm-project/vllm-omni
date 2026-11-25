@@ -464,6 +464,9 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     # The output-only policy must never remove the hidden states used to sample.
     assert runner.sample.call_args.args[0] is text_hidden
     assert kwargs["client_output_keys"] == ("nvc_function_token",)
+    # Declared client keys reach OmniAsyncOutput from text stages too.
+    assert kwargs["multimodal_outputs"] is multimodal_outputs
+    assert kwargs["input_batch"] is input_batch
     built = kwargs["model_runner_output"]
     assert built.kv_connector_output is connector_output
     torch.testing.assert_close(built.prompt_token_id_logprobs_dict["req"], torch.tensor([[2.0, 1.0], [4.0, 3.0]]))
@@ -817,6 +820,45 @@ def test_async_chunk_output_publishes_model_declared_client_keys(monkeypatch) ->
     assert [payload["nvc_function_token"].tolist() for payload in result.inter_stage_outputs] == [[20], []]
     assert torch.equal(result.inter_stage_outputs[0]["codes.audio"], codes[0:2])
     assert torch.equal(result.inter_stage_outputs[1]["codes.audio"], codes[2:3])
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_text_stage_output_publishes_only_declared_client_keys(monkeypatch, async_chunk) -> None:
+    # V1 let text stages publish declared keys; nothing else may leave a text stage.
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(
+        query_start_loc_np=np.array([0, 2, 3]),
+        num_scheduled_tokens=np.array([2, 1]),
+        num_reqs=2,
+        num_tokens_after_padding=3,
+        num_computed_tokens_np=np.array([0, 4]),
+    )
+    mm = {
+        "audio": torch.zeros(3, 2),
+        "codes": {"audio": torch.zeros(3, 1)},
+        "nvc_function_token": [torch.tensor([20]), torch.empty(0, dtype=torch.long)],
+    }
+
+    def output(client_output_keys):
+        return _async_output(
+            req_ids=("call", "idle"),
+            sampler_output=SamplerOutput(
+                torch.tensor([[1], [2]]), None, None, torch.tensor([1, 1]), torch.tensor([0, 0])
+            ),
+            input_batch=batch,
+            multimodal_outputs=mm,
+            async_chunk=async_chunk,
+            engine_output_type="text",
+            client_output_keys=client_output_keys,
+        ).get_output()
+
+    result = output(("nvc_function_token",))
+    assert [payload["nvc_function_token"].tolist() for payload in result.multimodal_outputs] == [[20], []]
+    assert all(set(payload) == {"nvc_function_token"} for payload in result.multimodal_outputs)
+    assert result.pooler_output is None and result.inter_stage_outputs is None
+    assert result.full_payload_token_ranges is None
+    assert output(("absent",)).multimodal_outputs is None
 
 
 @pytest.mark.cpu

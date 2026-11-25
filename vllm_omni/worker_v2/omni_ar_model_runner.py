@@ -444,6 +444,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # --- Omni: pooler_output ---
         engine_output_type = getattr(self.vllm_config.model_config, "engine_output_type", "text")
         need_pooler = engine_output_type != "text"
+        client_output_keys = _client_multimodal_output_keys(self.model)
+        # A text stage still publishes model-declared client keys (as V1 did),
+        # without hidden states or an inter-stage payload.
+        publish_multimodal = need_pooler or bool(client_output_keys)
         # The model's output contract applies independently of the sampler.
         # Keep text_hidden for logits above even when downstream only needs codes.
         include_hidden = sampling_output.include_hidden_states and bool(
@@ -498,8 +502,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
             text_hidden=text_hidden if need_pooler and include_hidden else None,
-            multimodal_outputs=multimodal_outputs if need_pooler else None,
-            input_batch=input_batch if need_pooler else None,
+            multimodal_outputs=multimodal_outputs if publish_multimodal else None,
+            input_batch=input_batch if publish_multimodal else None,
             async_chunk=async_chunk,
             engine_output_type=engine_output_type,
             # Connector senders drop the orchestrator pooler. Stage 0 still
@@ -507,7 +511,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             # through pooling_output for llm2tts.
             partition_async_payload=async_chunk and stage_sends_async_output(self.model_config),
             defer_full_payload_d2h=defer_full_payload_d2h,
-            client_output_keys=_client_multimodal_output_keys(self.model),
+            client_output_keys=client_output_keys,
             finalize_output=finalize_output,
             finalize_multimodal=finalize_multimodal,
             finalize_pooler_payload=finalize_pooler_payload,
@@ -522,9 +526,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
         _guard_graph_replay_for_pooler_copy(
             self.main_stream,
             async_output.copy_event,
-            need_pooler=need_pooler
-            and not defer_full_payload_d2h
-            and (include_hidden or not sampling_output.owns_multimodal_outputs),
+            need_pooler=(
+                (need_pooler and include_hidden) or (publish_multimodal and not sampling_output.owns_multimodal_outputs)
+            )
+            and not defer_full_payload_d2h,
             async_chunk=async_chunk,
         )
 
@@ -1413,6 +1418,8 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             token_ranges = self._full_payload_token_ranges(num_output_rows)
             if token_ranges is not None:
                 self.model_runner_output.full_payload_token_ranges = token_ranges
+        if self._need_pooler and self._engine_output_type == "text":
+            self._restrict_text_stage_output()
 
         if self._request_errors is not None:
             flags, reason = self._request_errors
@@ -1434,6 +1441,22 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         if self._finalize_output is not None:
             return self._finalize_output(self.model_runner_output)
         return self.model_runner_output
+
+    def _restrict_text_stage_output(self) -> None:
+        """Publish only model-declared client keys from a text stage.
+
+        Text stages have no inter-stage payload; their multimodal outputs reach
+        the runner only because the model declared client keys.
+        """
+        output = self.model_runner_output
+        output.pooler_output = None
+        output.inter_stage_outputs = None
+        output.full_payload_token_ranges = None
+        keys = self._client_output_keys
+        client = [
+            {key: value for key, value in payload.items() if key in keys} for payload in output.multimodal_outputs or ()
+        ]
+        output.multimodal_outputs = client if any(client) else None
 
     def _full_payload_token_ranges(self, num_output_rows: np.ndarray | None) -> dict[str, tuple[int, int]] | None:
         """Input-token span of each request's full-payload rows."""
