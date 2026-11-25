@@ -74,3 +74,30 @@ def test_dtype_change_takes_a_new_output():
     second = flashinfer_ulysses._output(comm, "sp", torch.empty(1, 8, 4, 8, dtype=torch.bfloat16), "scatter_heads", 0)
     assert second.dtype == torch.bfloat16 and first.dtype == torch.float16
     assert len(flashinfer_ulysses._OUTPUTS) == 1
+
+
+def test_growing_the_communicator_synchronizes_before_closing_the_old_one(monkeypatch):
+    events = []
+
+    class _Closable:
+        def __init__(self, group, max_bytes, dtype, backend, device):
+            self.max_bytes = max_bytes
+
+        def close(self):
+            events.append("close")
+
+    flashinfer_comm = pytest.importorskip("flashinfer.comm", exc_type=ImportError)
+    monkeypatch.setattr(flashinfer_comm, "UlyssesCommunicator", _Closable, raising=False)
+    monkeypatch.setattr(flashinfer_ulysses, "_COMMUNICATORS", {})
+    monkeypatch.setattr(flashinfer_ulysses, "_resolve_process_group", lambda name: name)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda device=None: events.append("sync"))
+    flashinfer_ulysses._OUTPUTS[("sp", "scatter_heads", 0)] = torch.empty(4)
+    flashinfer_ulysses._communicator("sp", 1024, torch.bfloat16)
+    assert events == []  # first creation releases nothing
+    flashinfer_ulysses._communicator("sp", 512, torch.bfloat16)
+    assert events == []  # fits: reused
+    flashinfer_ulysses._communicator("sp", 4096, torch.bfloat16)
+    # The previous layer may still read the old registered outputs: synchronize, then drop and close them.
+    assert events == ["sync", "close"]
+    assert ("sp", "scatter_heads", 0) not in flashinfer_ulysses._OUTPUTS
