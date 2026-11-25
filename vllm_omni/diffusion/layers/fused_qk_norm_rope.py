@@ -26,7 +26,9 @@ or rotary-product intermediates. The interleaved mode supports any even
 two); the half-split mode keeps the pre-existing kernel and its MiniMax-H3
 geometry contract (``head_dim == 128``, ``rotary_dim == 96``). Ascend
 composes its RMSNorm and rotary fused primitives on the MiniMax-H3 geometry;
-unsupported inputs use the eager reference.
+unsupported inputs use the eager reference. The packed MiniMax-H3 entry point
+``fused_qkv_split_norm_rope`` uses MindIE-SD's Eagle operator when available
+on Ascend.
 
 ``cuda_rms_norm=True`` (single-stream and joint ops) reproduces the vLLM CUDA
 RMSNorm reduction order and keeps the rotation free of FMA contraction, so for
@@ -38,6 +40,8 @@ per-stream fused path) keep the default.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn.functional as F
 from torch.library import Library
@@ -47,6 +51,9 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_omni.diffusion import envs
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.layers.norm import RMSNorm
 
 _FUSED_HEAD_DIM = 128
 _FUSED_ROTARY_DIM = 96
@@ -603,32 +610,6 @@ def _npu_qk_norm_rope(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Use Ascend RMSNorm and RoPE fused primitives for MiniMax-H3 DiT."""
     import torch_npu
-
-    q_heads, kv_heads = q.shape[1], k.shape[1]
-    if 0 < q.numel() + 2 * k.numel() <= torch.iinfo(torch.int32).max:
-        try:
-            from mindiesd.fused_ops import eagle_split_norm_rope_concat
-
-            # The caller retains V. Use K to fill Eagle's V slot.
-            k_contig = k.contiguous()
-            packed = torch.cat((q, k_contig, k_contig), dim=1)
-            cos, sin = rope_table.reshape(q.shape[0], 2, rotary_dim // 2).transpose(0, 1).contiguous().unbind(0)
-            q_out, k_out, _ = eagle_split_norm_rope_concat(
-                packed,
-                q_weight,
-                k_weight,
-                cos,
-                sin,
-                [q_heads, kv_heads, kv_heads],
-                norm_type=3,
-                rope_mode=1,
-                rotary_dim=rotary_dim,
-                epsilon=eps,
-                output_bnsd=False,
-            )
-            return q_out, k_out
-        except ImportError:
-            pass
 
     q_norm = torch_npu.npu_rms_norm(q, q_weight, epsilon=eps)[0]
     k_norm = torch_npu.npu_rms_norm(k, k_weight, epsilon=eps)[0]
@@ -1270,6 +1251,49 @@ def fused_qk_norm_rope(
     )
 
 
+def fused_qkv_split_norm_rope(
+    qkv: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    rope_table: torch.Tensor | None,
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split projected QKV, normalize/rotate Q and K, and retain their raw views for VDN."""
+    packed = qkv.unflatten(-1, (-1, head_dim))
+    head_counts = [num_heads, num_kv_heads, num_kv_heads]
+    if rope_table is not None and current_omni_platform.is_npu():
+        try:
+            from mindiesd.fused_ops import eagle_split_norm_rope_concat
+        except ImportError:
+            pass
+        else:
+            cos, sin = rope_table.tensor_split(2, dim=-1)
+            q, k, v = eagle_split_norm_rope_concat(
+                packed,
+                q_norm.weight,
+                k_norm.weight,
+                cos.contiguous(),
+                sin.contiguous(),
+                head_counts,
+                norm_type=3,
+                rope_mode=1,
+                rotary_dim=rope_table.shape[-1],
+                epsilon=q_norm.variance_epsilon,
+                output_bnsd=False,
+            )
+            return q, k, v, packed[:, :num_heads], packed[:, num_heads : num_heads + num_kv_heads]
+
+    q_raw, k_raw, v = packed.split(head_counts, dim=1)
+    if rope_table is None:
+        q, k = q_norm(q_raw), k_norm(k_raw)
+    else:
+        q, k = fused_qk_norm_rope(q_raw, k_raw, q_norm.weight, k_norm.weight, rope_table, q_norm.variance_epsilon)
+    return q, k, v, q_raw, k_raw
+
+
 # ``joint_attention_kwargs`` key under which a model forward hands the packed
 # table of the current forward to its attention sites.
 QK_NORM_ROPE_TABLE_KEY = "qk_norm_rope_table"
@@ -1280,5 +1304,6 @@ __all__ = [
     "fused_qk_norm_rope",
     "fused_qk_norm_rope_available",
     "fused_qk_norm_rope_min_tokens",
+    "fused_qkv_split_norm_rope",
     "pack_qk_norm_rope_table",
 ]

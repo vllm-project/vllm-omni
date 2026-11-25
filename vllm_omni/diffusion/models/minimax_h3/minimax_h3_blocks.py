@@ -30,7 +30,7 @@ from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION
 from vllm_omni.diffusion.layers.activation import SiluAndMul
-from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qkv_split_norm_rope
 from vllm_omni.diffusion.layers.indexed_modulation import (
     indexed_gate,
     indexed_gate_rms_norm_scale_shift,
@@ -485,31 +485,18 @@ class MiniMaxH3Attention(nn.Module):
         self, x: torch.Tensor, rope_table: torch.Tensor | None, vdn_window: VDNLayout | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project/normalize/rotate QKV, retaining raw Q/K for the VDN branch."""
-        total = x.shape[0]
         qkv, _ = self.qkv_proj(x)
-        q_size = self.num_heads * self.head_dim
-        kv_size = self.num_kv_heads * self.head_dim
-        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-        q = q.view(total, self.num_heads, self.head_dim)
-        k = k.view(total, self.num_kv_heads, self.head_dim)
-        v = v.view(total, self.num_kv_heads, self.head_dim)
         if self.vdn is not None and vdn_window is None:
             raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
-        # The VDN linear branch reads the raw projections; norm/RoPE are out of place.
-        q_raw, k_raw = q, k
-        if rope_table is None:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-        else:
-            q, k = fused_qk_norm_rope(
-                q,
-                k,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                rope_table,
-                self.q_norm.variance_epsilon,
-            )
-        return q, k, v, q_raw, k_raw
+        return fused_qkv_split_norm_rope(
+            qkv,
+            self.q_norm,
+            self.k_norm,
+            rope_table,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )
 
     def forward(
         self,
