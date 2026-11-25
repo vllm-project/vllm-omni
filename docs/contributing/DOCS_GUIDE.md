@@ -57,7 +57,7 @@ class Omni:
 
 ## Documentation Structure
 
-```
+```text
 docs/
 ├── index.md              # Main documentation page
 ├── getting_started/      # Getting started guides
@@ -102,19 +102,21 @@ The documentation is automatically deployed to GitHub Pages using GitHub Actions
    - `https://vllm-omni.readthedocs.io`
 
 The GitHub Actions workflow (`.github/workflows/docs.yml`) will automatically:
+
 - Build the documentation when you push to `main` branch
 - Deploy it to GitHub Pages
 - Update the documentation whenever you make changes
-
 
 ### Read the Docs (Alternative)
 
 You can also use Read the Docs for hosting:
 
-1. Sign up at https://readthedocs.org/
+1. Sign up at <https://readthedocs.org/>
 2. Import the `vllm-project/vllm-omni` repository
 3. Read the Docs will automatically build using `.readthedocs.yml`
 4. Documentation will be available at: `https://vllm-omni.readthedocs.io/`
+
+Note that currently, PRs without the `ready` label cancel the doc builds to limit the number of builds running at a time.
 
 ## Configuration
 
@@ -123,15 +125,15 @@ The documentation configuration is in `mkdocs.yml` at the project root.
 ## Tips
 
 - **API Documentation**: API docs are automatically generated using `mkdocs-api-autonav` and `mkdocstrings`
-  - No need to manually create API pages - they're generated automatically
-  - Use `[module.name.ClassName][]` syntax for cross-references in Summary pages
+    - No need to manually create API pages - they're generated automatically
+    - Use `[module.name.ClassName][]` syntax for cross-references in Summary pages
 - **Code Snippets**: Use `--8<-- "path/to/file.py"` for including code snippets
 - **Markdown**: Use Markdown for all documentation (no need for RST)
 - **Material Theme**: Use Material theme features like:
-  - Admonitions: `!!! note`, `!!! warning`, etc.
-  - Code blocks with syntax highlighting
-  - Tabs for organizing content
-  - Math formulas using `pymdownx.arithmatex`
+    - Admonitions: `!!! note`, `!!! warning`, etc.
+    - Code blocks with syntax highlighting
+    - Tabs for organizing content
+    - Math formulas using `pymdownx.arithmatex`
 
 ## Troubleshooting
 

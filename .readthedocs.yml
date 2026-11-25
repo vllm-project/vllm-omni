@@ -9,6 +9,7 @@ build:
     python: "3.12"
   jobs:
     post_checkout:
+      - bash docs/pre_run_check.sh
       - git fetch --unshallow || true
     pre_install:
       # `pre_install` runs before RTD upgrades pip, and the seeded pip 23.1
