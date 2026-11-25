@@ -26,6 +26,11 @@ class _CudaTensor:
         return getattr(self._tensor, name)
 
 
+@pytest.fixture(autouse=True)
+def _nvidia_cuda(monkeypatch):
+    monkeypatch.setattr(layer, "_is_nvidia_cuda", lambda: True)
+
+
 def _case(**overrides):
     attention = SimpleNamespace(use_ring=False, _explicit_cross_contract=False)
     strategy = SimpleNamespace(
@@ -80,6 +85,17 @@ def test_ineligible_layers_keep_the_standard_path(monkeypatch, overrides):
 
 def test_non_strict_mode_keeps_the_standard_path(monkeypatch):
     monkeypatch.setattr(layer, "get_ulysses_mode", lambda default: "advanced_uaa")
+    attention, strategy, args = _case()
+    assert layer.Attention._ulysses_ce_overlap_chunks(attention, strategy, **args) == 0
+
+
+@pytest.mark.parametrize("platform_is_cuda, hip", [(False, None), (True, "6.4")])
+def test_rocm_keeps_the_standard_path(monkeypatch, platform_is_cuda, hip):
+    """ROCm tensors report ``is_cuda``; the copy-engine overlap must not load the NVIDIA driver there."""
+    monkeypatch.undo()
+    monkeypatch.setattr(layer, "get_ulysses_mode", lambda default: "strict")
+    monkeypatch.setattr(layer.current_omni_platform, "is_cuda", lambda: platform_is_cuda)
+    monkeypatch.setattr(layer.torch.version, "hip", hip)
     attention, strategy, args = _case()
     assert layer.Attention._ulysses_ce_overlap_chunks(attention, strategy, **args) == 0
 
