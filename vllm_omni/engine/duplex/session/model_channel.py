@@ -1537,8 +1537,10 @@ class ModelChannel:
             if self._ctx.run.closing:
                 return close_reason, emitted_response
         stage_metrics = model_result.get("stage_metrics")
-        response_stage_metrics = session.accumulate_response_stage_metrics(
-            stage_metrics if isinstance(stage_metrics, Mapping) else None
+        session.add_response_stage_metrics(stage_metrics if isinstance(stage_metrics, Mapping) else None)
+        # Only response.speak and audio deltas carry the running totals; copy them just for those.
+        response_stage_metrics = (
+            session.response_stage_metrics_snapshot() if response_created or session.capabilities.emits_audio else None
         )
         if response_created:
             speak_payload = {

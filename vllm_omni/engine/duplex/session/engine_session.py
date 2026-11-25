@@ -111,6 +111,8 @@ class ResponseState:
     stage_metrics: dict[str, dict[str, object]] = field(default_factory=dict)
     stage_metric_tpot_weighted_ms: dict[str, float] = field(default_factory=dict)
     stage_metric_tpot_weight: dict[str, int] = field(default_factory=dict)
+    #: Running sums behind each interval mean, keyed by (stage id, list field).
+    stage_metric_interval_sums: dict[tuple[str, str], float] = field(default_factory=dict)
     request_started_at_s_by_turn: dict[int, float] = field(default_factory=dict)
     active_response_request_started_at_s: float | None = None
     active_response_ttft_ms: float | None = None
@@ -1167,6 +1169,7 @@ class DuplexEngineSession:
         self._response.stage_metrics.clear()
         self._response.stage_metric_tpot_weighted_ms.clear()
         self._response.stage_metric_tpot_weight.clear()
+        self._response.stage_metric_interval_sums.clear()
 
     def _response_aggregator_wall_start_ts(self) -> float:
         now_wall_s = time.time()
@@ -1301,7 +1304,7 @@ class DuplexEngineSession:
         if not snapshot:
             return
         if self.active_response_id is not None:
-            self.accumulate_response_stage_metrics(snapshot)
+            self.add_response_stage_metrics(snapshot)
             return
         self._pending_stage_metrics.append(snapshot)
 
@@ -1309,14 +1312,22 @@ class DuplexEngineSession:
         self,
         stage_metrics: Mapping[Any, Any] | None,
     ) -> dict[str, dict[str, object]]:
+        self.add_response_stage_metrics(stage_metrics)
+        return self.response_stage_metrics_snapshot()
+
+    def response_stage_metrics_snapshot(self) -> dict[str, dict[str, object]]:
+        return copy.deepcopy(self._response.stage_metrics)
+
+    def add_response_stage_metrics(self, stage_metrics: Mapping[Any, Any] | None) -> None:
+        """Fold a stage snapshot into the active response without copying the totals."""
         if self.active_response_id is None:
-            return copy.deepcopy(self._response.stage_metrics)
+            return
         if self._pending_stage_metrics:
             pending, self._pending_stage_metrics = self._pending_stage_metrics, []
             for held in pending:
-                self.accumulate_response_stage_metrics(held)
+                self.add_response_stage_metrics(held)
         if not isinstance(stage_metrics, Mapping):
-            return copy.deepcopy(self._response.stage_metrics)
+            return
 
         additive_fields = (
             "num_tokens_in",
@@ -1367,13 +1378,18 @@ class DuplexEngineSession:
             for list_name, mean_name in interval_fields:
                 values = raw_values.get(list_name)
                 if isinstance(values, list):
-                    existing = current.get(list_name, [])
-                    combined = list(existing) if isinstance(existing, list) else []
-                    combined.extend(
+                    combined = current.get(list_name)
+                    if not isinstance(combined, list):
+                        combined = current[list_name] = []
+                    added = [
                         value for value in values if isinstance(value, int | float) and not isinstance(value, bool)
-                    )
-                    current[list_name] = combined
-                    current[mean_name] = sum(combined) / len(combined) if combined else 0.0
+                    ]
+                    combined.extend(added)
+                    # Keep a running sum so each update costs its own samples, not the whole reply.
+                    key = (stage_id, list_name)
+                    total = self._response.stage_metric_interval_sums.get(key, 0.0) + sum(added)
+                    self._response.stage_metric_interval_sums[key] = total
+                    current[mean_name] = total / len(combined) if combined else 0.0
 
             tpot_ms = raw_values.get("vllm_tpot_ms")
             token_count = raw_values.get("num_tokens_out")
@@ -1392,8 +1408,6 @@ class DuplexEngineSession:
             for name, value in raw_values.items():
                 if name not in handled_fields:
                     current[str(name)] = copy.deepcopy(value)
-
-        return copy.deepcopy(self._response.stage_metrics)
 
     def accumulate_overlap_speech(self, duration_ms: int) -> int:
         self._input.overlap_speech_ms += max(0, int(duration_ms))
