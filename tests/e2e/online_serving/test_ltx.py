@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Online-serving smoke tests for the public LTX-2 pipeline entries."""
 
 import os
@@ -15,8 +15,8 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 DISTILLED_MODEL = os.getenv("VLLM_TEST_LTX23_DISTILLED_MODEL", "diffusers/LTX-2.3-Distilled-Diffusers")
 BASE_MODEL = os.getenv("VLLM_TEST_LTX23_MODEL", "diffusers/LTX-2.3-Diffusers")
 PROMPT = "A serene lake at sunset with mountains in the background."
-SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
-HSDP_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
+HSDP_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 
 
 def _server(

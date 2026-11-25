@@ -45,7 +45,7 @@ def _thinker() -> Any:
     thinker.apm = MiniCPMWhisperEncoder(config).eval()
     thinker.audio_projection_layer = MultiModalProjector(in_dim=32, out_dim=24)  # takes ffn // 4, as the checkpoint
     thinker.audio_avg_pooler = nn.AvgPool1d(POOL, stride=POOL)
-    thinker.audio_encoder_layer, thinker.audio_past_key_values = -1, None
+    thinker.audio_past_key_values = None
     thinker.config = SimpleNamespace(audio_pool_step=POOL, duplex_audio_kv_page_positions=16)
     return thinker
 
@@ -97,13 +97,40 @@ def test_graph_build_honors_eager_without_engine_config() -> None:
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_graph_build_captures_on_cuda() -> None:
+def test_graph_build_captures_on_cuda(mocker) -> None:
     thinker = _thinker().cuda()
+    reference = _thinker().cuda()
     thinker._enforce_eager = False
     thinker.config.duplex_audio_encoder_cuda_graph_batch_sizes = [1, 2]
-    thinker.config.duplex_audio_encoder_cuda_graph_cache_buckets = [8]
+    thinker.config.duplex_audio_encoder_cuda_graph_cache_buckets = [8, 24]
     assert thinker.build_streaming_audio_graph_encoder(unit_frames=24) is True
     assert thinker._duplex_audio_cuda_graph_encoder is not None
+    replay = mocker.spy(thinker._duplex_audio_cuda_graph_encoder, "_replay")
+
+    graph_caches, eager_caches = [None] * 4, [None] * 4
+    previous_outputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for round_index, frames_per_session in enumerate(_SCHEDULE):
+        active, graph_chunks, eager_chunks = [], [], []
+        for session, frames in enumerate(frames_per_session):
+            if frames is None:
+                continue
+            mel = torch.randn((1, N_MELS, frames), generator=torch.Generator().manual_seed(100 * round_index + session))
+            extra = dict(prefix_extra_frames=0 if round_index == 0 else 2, suffix_extra_frames=2)
+            active.append(session)
+            graph_chunks.append(StreamingAudioChunk(mel, graph_caches[session], **extra))
+            eager_chunks.append(StreamingAudioChunk(mel, eager_caches[session], **extra))
+        outputs, caches = thinker.get_audio_embedding_streaming_batch(graph_chunks)
+        expected, reference_caches = reference.get_audio_embedding_streaming_batch(eager_chunks)
+        for session, output, cache, want, reference_cache in zip(active, outputs, caches, expected, reference_caches):
+            torch.testing.assert_close(output, want, rtol=1e-4, atol=1e-5)
+            assert cache.length == reference_cache.length
+            torch.testing.assert_close(cache.history(cache.length), reference_cache.history(cache.length))
+            graph_caches[session], eager_caches[session] = cache, reference_cache
+        # Reusing static graph buffers must not overwrite outputs returned by previous replays.
+        for output, saved in previous_outputs:
+            torch.testing.assert_close(output, saved, rtol=0, atol=0)
+        previous_outputs.extend((output, output.clone()) for output in outputs)
+    assert replay.call_count > 0
 
 
 @pytest.mark.cpu

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -255,7 +256,11 @@ def test_diffusion_config_enables_moe_backend_lora_selection_before_model_load(
     is_moe,
     lora_backend,
     expects_lora,
+    monkeypatch,
 ) -> None:
+    # The bridge is platform-neutral except on XPU, which builds it only for a
+    # startup adapter (see test_xpu_moe_lora_bridge_requires_a_startup_adapter).
+    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: False)
     config = diffusion_vllm_config.create_diffusion_vllm_config(
         torch.device("cpu"),
         _od_config(
@@ -307,6 +312,39 @@ def test_online_mxfp4_moe_lora_requires_a_startup_adapter_on_accelerators(
     )
 
     assert (config.lora_config is not None) is expects_lora
+
+
+@pytest.mark.parametrize(
+    ("is_xpu", "lora_path", "expects_lora"),
+    [
+        (True, None, False),
+        (True, "/adapter", True),
+        (False, None, True),
+    ],
+)
+def test_xpu_moe_lora_bridge_requires_a_startup_adapter(is_xpu, lora_path, expects_lora, monkeypatch, caplog) -> None:
+    """On XPU a LoRAConfig would push every MoE layer off the native XPU experts onto
+    the EMULATION backend, so the bridge is built only for a startup LoRA. This covers
+    quantization schemes the online-MXFP4 gate does not (online MXFP8, BF16).
+
+    Dropping the bridge also drops runtime MoE LoRA, so it has to be logged."""
+    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_cuda", lambda: not is_xpu)
+    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: is_xpu)
+    with caplog.at_level(logging.INFO, logger="vllm_omni.diffusion.vllm_config"):
+        config = diffusion_vllm_config.create_diffusion_vllm_config(
+            torch.device("cpu"),
+            _od_config(
+                diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+                is_moe=True,
+                lora_backend="peft",
+                lora_path=lora_path,
+                quantization_config=build_quant_config("mxfp8"),
+            ),
+        )
+
+    assert (config.lora_config is not None) is expects_lora
+    logged_xpu_gate = "Disabling MoE LoRA on XPU" in caplog.text
+    assert logged_xpu_gate is not expects_lora
 
 
 @pytest.mark.parametrize(
@@ -399,6 +437,69 @@ def test_online_non_mxfp4_moe_lora_is_preserved(monkeypatch) -> None:
     assert config.lora_config is not None
 
 
+def _modelopt_mixed_config(dense, experts):
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig
+
+    layers = {"model.layers.0.self_attn.qkv_proj": dense, "model.layers.0.mlp.experts.0.down_proj": experts}
+    return ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "group_size": 16,
+            "exclude_modules": [],
+            "quantized_layers": {name: {"quant_algo": algo} for name, algo in layers.items() if algo},
+        }
+    )
+
+
+def _modelopt_nvfp4_config(quant_method="NVFP4"):
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+
+    return ModelOptNvFp4Config(quant_method=quant_method, is_checkpoint_nvfp4_serialized=True)
+
+
+@pytest.mark.parametrize(
+    ("quant_config", "native_fp4", "lora_path", "moe_backend", "expects_lora"),
+    [
+        (lambda: _modelopt_nvfp4_config(), True, None, "auto", False),
+        (lambda: _modelopt_nvfp4_config(), True, None, "cutlass", False),
+        (lambda: _modelopt_mixed_config("FP8", "NVFP4"), True, None, "auto", False),
+        (lambda: _modelopt_mixed_config("NVFP4", "FP8"), True, None, "auto", True),
+        (lambda: _modelopt_mixed_config("NVFP4", None), True, None, "auto", True),
+        (lambda: _modelopt_nvfp4_config(), False, None, "auto", True),
+        (lambda: _modelopt_nvfp4_config(), True, "/adapter", "auto", True),
+        (lambda: _modelopt_nvfp4_config(), True, None, "marlin", True),
+        (lambda: _modelopt_nvfp4_config("W4A16_NVFP4"), True, None, "auto", True),
+        (lambda: _modelopt_mixed_config("FP8", "FP8"), True, None, "auto", True),
+        (lambda: None, True, None, "auto", True),
+    ],
+)
+def test_modelopt_nvfp4_moe_lora_requires_a_startup_adapter_on_native_devices(
+    quant_config,
+    native_fp4,
+    lora_path,
+    moe_backend,
+    expects_lora,
+    monkeypatch,
+) -> None:
+    from vllm.model_executor.layers.quantization.utils import nvfp4_utils
+
+    monkeypatch.setattr(nvfp4_utils, "cutlass_fp4_supported", lambda: native_fp4)
+    config = diffusion_vllm_config.create_diffusion_vllm_config(
+        torch.device("cpu"),
+        _od_config(
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+            is_moe=True,
+            lora_backend="peft",
+            lora_path=lora_path,
+            moe_backend=moe_backend,
+            quantization_config=quant_config(),
+        ),
+    )
+
+    assert (config.lora_config is not None) is expects_lora
+
+
 def test_online_mxfp4_moe_lora_gate_is_scoped_to_moe(monkeypatch) -> None:
     monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: False)
@@ -438,6 +539,9 @@ def test_moe_lora_token_capacity_uses_effective_diffusion_config(
 ) -> None:
     import vllm_omni.diffusion.worker.diffusion_worker as worker_module
 
+    # XPU builds the MoE LoRA bridge only for a startup adapter; this test is about
+    # the capacity the bridge gets, so keep it on.
+    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: False)
     od_config = _od_config(
         diffusion_kv_mode=mode,
         is_moe=True,

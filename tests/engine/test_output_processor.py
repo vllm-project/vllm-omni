@@ -481,6 +481,20 @@ def test_delta_drains_audio_chunk_metadata_per_step():
     assert meta2["duplex_turn_id"].tolist() == [2]
 
 
+@pytest.mark.parametrize("as_tensor", [False, True])
+def test_cumulative_text_input_marker_is_replaced_by_the_next_append(as_tensor):
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    # Sync transport tensorizes scalar values; async Thinker handoff keeps the
+    # original bool. Both must reset text ownership on the next audio append.
+    for text_input in (True, False):
+        value = torch.tensor(text_input) if as_tensor else text_input
+        s.add_multimodal_tensor({"duplex_text_input": value}, mm_type="latent")
+        result = s.make_request_output([1], None, None, None)
+        assert result is not None and not isinstance(result, PoolingRequestOutput)
+        observed = result.outputs[0].multimodal_output["duplex_text_input"]
+        assert bool(observed) is text_input
+
+
 def test_cumulative_audio_replaces_chunk_metadata_per_step():
     s = _make_state(RequestOutputKind.CUMULATIVE)
     segment_text = "你好"

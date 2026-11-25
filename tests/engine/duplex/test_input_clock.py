@@ -1160,6 +1160,23 @@ def test_a_reserved_turn_settled_by_a_timeout_stays_submittable() -> None:
     assert clock.turn_submittable("turn-a") is True
 
 
+def test_a_timed_out_deferred_turn_released_by_a_cancel_is_not_submittable() -> None:
+    """Releasing a deferred turn after its slot timed out blocks late promotion without a second acknowledgement."""
+    now = [0.0]
+    clock, sent = _clock(now=now)
+    clock.reserve_unit("turn-a")
+    clock.end_input(_begin(clock, COMMIT))
+    now[0] = DEFAULT_UNIT_TIMEOUT_S
+    assert clock.expire() is True and _decisions(sent) == [[("timed_out", "no_progress")]]
+    assert clock.placeholder_turns() == ["turn-a"]
+
+    clock.release_placeholder("turn-a", "output_audio_buffer_clear")
+
+    assert clock.turn_submittable("turn-a") is False
+    assert clock.placeholder_turns() == []
+    assert len(sent) == 1, "already settled by timeout: release does not emit a duplicate acknowledgement"
+
+
 def test_output_of_a_cancelled_epoch_does_not_reset_the_liveness_valve() -> None:
     """A cancelled request still draining must not keep the live epoch's units from timing out."""
     now = [0.0]

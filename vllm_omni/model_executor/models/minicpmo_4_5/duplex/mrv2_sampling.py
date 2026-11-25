@@ -19,8 +19,8 @@ def _keep_thinker_payload(payload: dict[str, Any], num_sampled: list[int]) -> di
     return payload
 
 
-def _v1_shaped_runner(input_batch: Any, infos: dict[str, Any]) -> SimpleNamespace:
-    """Present MRv2 request params in the V1 runner shape DuplexSamplingHelper reads."""
+def _sampling_context(input_batch: Any, infos: dict[str, Any]) -> SimpleNamespace:
+    """Present request parameters and intermediate payloads to DuplexSamplingHelper."""
     params = [
         (infos.get(str(request_id)) or {}).get("sampling_params") or SimpleNamespace()
         for request_id in input_batch.req_ids
@@ -142,7 +142,7 @@ class MiniCPMO45DuplexSampler(OmniSampler):
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> SamplerOutput:
         infos = getattr(self.model, "_mrv2_sampling_infos", {})
         helper = self._helper
-        runner = _v1_shaped_runner(input_batch, infos)
+        runner = _sampling_context(input_batch, infos)
         for request_id in input_batch.req_ids:
             helper.refresh_active_request(runner, request_id)
         rows = helper.rows(runner)
@@ -162,7 +162,7 @@ class MiniCPMO45DuplexSampler(OmniSampler):
         row_idxs = [row.row_idx for row in rows]
         if logits.shape[0] == input_batch.num_reqs and row_idxs == list(range(input_batch.num_reqs)):
             # Every row follows the policy: skip the index upload and the
-            # full-vocabulary gather. As on V1, the policy's force-listen mask
+            # full-vocabulary gather. The policy's force-listen mask
             # then lands on the logits a fallback sampler would read.
             selected, policy_logits = None, logits
         else:

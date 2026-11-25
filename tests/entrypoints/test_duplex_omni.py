@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import replace
 from typing import Any
 
@@ -30,6 +31,7 @@ from vllm_omni.engine.duplex.messages import (
 )
 from vllm_omni.engine.messages import ErrorMessage
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni, DuplexSessionHandle
+from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -392,6 +394,39 @@ async def test_shutdown_closes_every_handle(monkeypatch) -> None:
     assert first.close_reason == "shutdown"
     assert omni.sessions == {}
     assert engine.shutdown_called
+
+
+@pytest.mark.asyncio
+async def test_executor_shutdown_closes_session_opened_before_admission_closes(monkeypatch) -> None:
+    omni, engine = _make_omni(monkeypatch)
+    first = await omni.open_session()
+    loop = asyncio.get_running_loop()
+    at_handoff = asyncio.Event()
+    proceed = threading.Event()
+    shutdown_frontend = omni._shutdown_frontend_from_executor
+
+    def hold_handoff(serving_loop):
+        loop.call_soon_threadsafe(at_handoff.set)
+        assert proceed.wait(timeout=5)
+        shutdown_frontend(serving_loop)
+
+    monkeypatch.setattr(omni, "_shutdown_frontend_from_executor", hold_handoff)
+    shutdown = asyncio.create_task(asyncio.to_thread(omni.shutdown))
+    try:
+        await asyncio.wait_for(at_handoff.wait(), timeout=5)
+        late = await omni.open_session()
+        proceed.set()
+        await asyncio.wait_for(shutdown, timeout=5)
+        for handle in (first, late):
+            assert await asyncio.wait_for(handle.wait_closed(), timeout=1) == "shutdown"
+        assert not omni.sessions
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await omni.open_session()
+        assert len(engine.opened) == 2
+    finally:
+        proceed.set()
+        await shutdown
+        omni.shutdown()
 
 
 @pytest.mark.asyncio
