@@ -909,12 +909,11 @@ def test_unsupported_sp_config_fails_before_component_loading(overrides):
     assert module._loader_state.prefetch_calls == []
 
 
-@pytest.mark.parametrize("backend", ["copy_engine", "copy_engine_overlap"])
-def test_symmetric_memory_ulysses_transport_is_rejected(backend):
+def test_copy_engine_ulysses_transport_is_rejected():
     module = _load_pipeline_module()
     config = _od_config().parallel_config
     config.sequence_parallel_size = config.ulysses_degree = 2
-    config.ulysses_a2a_backend = backend
+    config.ulysses_a2a_backend = "copy_engine"
     with pytest.raises(NotImplementedError, match="ulysses_a2a_backend='nccl'"):
         module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=config))
 

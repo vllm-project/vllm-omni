@@ -1,328 +1,157 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import uuid
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm_omni.diffusion.distributed import ulysses_transport, ulysses_transport_tables
-from vllm_omni.diffusion.distributed.ulysses_transport import (
-    UlyssesTopology,
-    UlyssesTransportPlan,
-    auto_plan,
-    eligible_transports,
-    explicit_plan,
-)
-from vllm_omni.platforms.interface import OmniPlatformEnum, UnspecifiedOmniPlatform
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.distributed import ulysses_transport
+from vllm_omni.diffusion.distributed.ulysses_transport import select_transport
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
-MiB = 1024 * 1024
-# The shipped tables, captured before the fixture below swaps in synthetic ones.
-_SHIPPED_TABLES = {
-    name: getattr(ulysses_transport_tables, name)
-    for name in ("COPY_ENGINE_MIN_BYTES", "COPY_ENGINE_OVERLAP_MIN_CHUNK_BYTES")
-}
-
-
-@pytest.fixture(autouse=True)
-def measured_tables(monkeypatch):
-    """Synthetic tables so the tests do not depend on the measured values."""
-    monkeypatch.setattr(ulysses_transport_tables, "COPY_ENGINE_MIN_BYTES", {"10.0": {2: MiB, 4: MiB, 8: MiB}})
-    monkeypatch.setattr(
-        ulysses_transport_tables, "COPY_ENGINE_OVERLAP_MIN_CHUNK_BYTES", {"10.0": {2: 4 * MiB, 4: 4 * MiB}}
-    )
-
-
-def _topology(world_size=2, **overrides):
-    values = dict(cuda=True, single_node=True, nvlink=True, p2p=True, capability="10.0", symmetric_memory=True)
-    values.update(overrides)
-    return UlyssesTopology(world_size, **values)
-
-
-def _plan(topology, heads=28, invariant=True, pure_strict=True, chunks=0):
-    return auto_plan(
-        topology, pure_strict=pure_strict, heads_per_rank=heads, per_head_invariant=invariant, overlap_chunks=chunks
-    )
-
-
-@pytest.mark.parametrize(
-    "world_size, heads, expected",
-    [
-        (2, 28, UlyssesTransportPlan(MiB, 14, 4 * MiB)),
-        (4, 14, UlyssesTransportPlan(MiB, 7, 4 * MiB)),
-        (8, 7, UlyssesTransportPlan(MiB, 0, 0)),
-    ],
-)
-def test_measured_entries_enable_transports(world_size, heads, expected):
-    assert _plan(_topology(world_size), heads=heads) == expected
-
-
-@pytest.mark.parametrize(
-    "overrides, pure_strict, reason",
-    [
-        ({"cuda": False}, True, "not CUDA"),
-        ({}, False, "not strict pure Ulysses"),
-        ({"single_node": False}, True, "spans nodes"),
-        ({"nvlink": False}, True, "NVLink"),
-        ({"p2p": False}, True, "peer access"),
-        ({"capability": "9.0"}, True, "not measured for sm9.0"),
-        ({"capability": "12.0"}, True, "not measured for sm12.0"),
-    ],
-)
-def test_ineligible_groups_fall_through_to_nccl(overrides, pure_strict, reason):
-    topology = _topology(**overrides)
-    reasons = eligible_transports(topology, pure_strict=pure_strict)
-    assert all(reason in r for r in reasons.values())
-    assert _plan(topology, pure_strict=pure_strict) == ulysses_transport.NCCL_PLAN
-
-
-@pytest.mark.parametrize("world_size, h3_q_mib", [(2, 259), (4, 129.5), (8, 64.75)])
-def test_shipped_sm90_rows_pick_the_copy_engine_for_h3_only(monkeypatch, world_size, h3_q_mib):
-    for name, table in _SHIPPED_TABLES.items():
-        monkeypatch.setattr(ulysses_transport_tables, name, table)
-    topology = _topology(world_size, capability="9.0")
-    reasons = eligible_transports(topology, pure_strict=True)
-    assert reasons["copy_engine"] is None
-    assert "not measured" in reasons["copy_engine_overlap"]
-    plan = _plan(topology, heads=56 // world_size)
-    assert plan.exchange(int(h3_q_mib * MiB)) == "copy_engine"
-    assert plan.exchange(int(h3_q_mib * MiB) // 4) == "nccl"  # smaller messages were not measured on sm9.0
-
-
-def test_unmeasured_world_size_is_not_eligible():
-    reasons = eligible_transports(_topology(3), pure_strict=True)
-    assert reasons == dict.fromkeys(reasons, "not measured for sm10.0 x 3 GPUs")
-
-
-def test_missing_symmetric_memory_disables_the_copy_engine():
-    reasons = eligible_transports(_topology(2, symmetric_memory=False), pure_strict=True)
-    assert reasons["copy_engine"] == reasons["copy_engine_overlap"] == "no symmetric memory"
-
-
-def test_overlap_requires_per_head_invariant_attention():
-    plan = _plan(_topology(2), invariant=False)
-    assert plan.overlap_chunks == 0 and plan.copy_engine_min_bytes == MiB
-
-
-@pytest.mark.parametrize("heads, requested, chunks", [(1, 0, 0), (3, 0, 0), (28, 4, 4), (28, 3, 0)])
-def test_overlap_chunk_count(heads, requested, chunks):
-    assert _plan(_topology(2), heads=heads, chunks=requested).overlap_chunks == chunks
-
-
-def test_dispatch_falls_through_by_message_size():
-    plan = UlyssesTransportPlan(copy_engine_min_bytes=MiB)
-    assert plan.exchange(8 * MiB) == "copy_engine"
-    assert plan.exchange(MiB // 2) == "nccl"
-    overlap = UlyssesTransportPlan(copy_engine_min_bytes=0, overlap_chunks=14, overlap_min_chunk_bytes=4 * MiB)
-    assert overlap.use_overlap(4 * MiB) and not overlap.use_overlap(4 * MiB - 1)
-
-
-@pytest.mark.parametrize(
-    "backend, expected",
-    [
-        ("nccl", UlyssesTransportPlan()),
-        ("copy_engine", UlyssesTransportPlan(copy_engine_min_bytes=0)),
-        ("copy_engine_overlap", UlyssesTransportPlan(copy_engine_min_bytes=0, overlap_chunks=14)),
-    ],
-)
-def test_explicit_backends_have_no_size_gates(backend, expected):
-    assert explicit_plan(backend, heads_per_rank=28) == expected
+GROUP = SimpleNamespace(group_name="sp0")
 
 
 class _FakeDist:
-    """The peer's contributions to the collective topology probe."""
+    """The peer ranks' contributions to the probe's collectives."""
 
-    def __init__(self, hosts, uuids, remote_features):
-        self.hosts, self.uuids, self.remote_features = hosts, uuids, remote_features
-        self.ReduceOp = SimpleNamespace(MIN="min")
+    ReduceOp = SimpleNamespace(MIN="min")
+
+    def __init__(self, world_size, hosts=None, peer_features=None):
+        self.world_size, self.hosts, self.peer_features = world_size, hosts, peer_features
 
     def get_process_group_ranks(self, group):
-        return getattr(group, "ranks", [0, 1])
+        return getattr(group, "ranks", list(range(self.world_size)))
 
     def all_gather_into_tensor(self, out, local, group):
-        rows = [torch.tensor([h, *u.bytes], dtype=torch.int64) for h, u in zip(self.hosts, self.uuids)]
-        rows[0] = local.cpu()
-        out.copy_(torch.cat(rows))
+        hosts = self.hosts or [int(local[0])] * self.world_size
+        out.copy_(torch.tensor([[h, i] for i, h in enumerate(hosts)]).flatten())
 
     def all_reduce(self, tensor, op, group):
-        assert op == "min"
-        tensor.copy_(torch.minimum(tensor, torch.tensor(self.remote_features, dtype=tensor.dtype)))
+        if self.peer_features is not None:
+            tensor.copy_(torch.minimum(tensor, torch.tensor(self.peer_features)))
 
 
-class _CudaPlatform(UnspecifiedOmniPlatform):
-    _omni_enum = OmniPlatformEnum.CUDA
+@pytest.fixture
+def probe(monkeypatch):
+    """Run the probe on a fake group; returns the reason (None: copy engine) and what was logged under auto."""
+
+    def run(world_size, *, nvlink=True, p2p=True, nvml_error=False, hosts=None, peer_features=None, **select):
+        def fully_connected(ids):
+            if nvml_error:
+                raise RuntimeError("NVML Shared Library Not Found")
+            return nvlink
+
+        platform = SimpleNamespace(is_fully_connected=fully_connected, visible_device_id_to_physical_device_id=int)
+        monkeypatch.setattr(ulysses_transport, "current_platform", platform)
+        monkeypatch.setattr(ulysses_transport, "dist", _FakeDist(world_size, hosts, peer_features))
+        monkeypatch.setattr(ulysses_transport, "_is_nvidia_cuda", lambda: True)
+        monkeypatch.setattr(ulysses_transport, "_probe_device", lambda: SimpleNamespace(index=0, type="cpu"))
+        monkeypatch.setattr(ulysses_transport.torch, "tensor", _cpu(torch.tensor))
+        monkeypatch.setattr(ulysses_transport.torch, "empty", _cpu(torch.empty))
+        monkeypatch.setattr(ulysses_transport.torch.accelerator, "device_count", lambda: world_size)
+        monkeypatch.setattr(ulysses_transport.torch.cuda, "can_device_access_peer", lambda a, b: p2p)
+        monkeypatch.setattr(ulysses_transport, "_symmetric_memory_available", lambda: True)
+        monkeypatch.setattr(ulysses_transport, "_GROUPS", {})
+        monkeypatch.setattr(ulysses_transport, "_LOGGED", set())
+        messages = []
+        monkeypatch.setattr(ulysses_transport.logger, "info", messages.append)
+        options = dict(cuda_graphs=False, strict_pure=True) | select
+        requested = options.pop("requested", "auto")
+        transports = [select_transport(requested, GROUP, world_size, **options) for _ in range(3)]
+        assert len(set(transports)) == 1 and len(messages) <= 1  # decided and logged once per group
+        return transports[0], messages
+
+    return run
 
 
-def _probe(monkeypatch, *, hosts_differ=False, nvlink=True, remote_features=(1, 1, 1, 100, 1)):
-    local_uuid, peer_uuid = uuid.uuid4(), uuid.uuid4()
-    host = ulysses_transport.zlib.crc32(ulysses_transport.socket.gethostname().encode()) & 0x7FFFFFFF
-    fake = _FakeDist([host, host + 1 if hosts_differ else host], [local_uuid, peer_uuid], list(remote_features))
-    checked = []
-    monkeypatch.setattr(ulysses_transport, "dist", fake)
-    monkeypatch.setattr(ulysses_transport, "current_omni_platform", _CudaPlatform())
-    monkeypatch.setattr(ulysses_transport.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(
-        ulysses_transport.torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(uuid=str(local_uuid), major=10, minor=0),
-    )
-    monkeypatch.setattr(ulysses_transport, "_probe_device", lambda: torch.device("cpu"))
-    monkeypatch.setattr(ulysses_transport, "_nvlink_all_pairs", lambda uuids: checked.append(uuids) or nvlink)
-    monkeypatch.setattr(ulysses_transport, "_peer_access", lambda device, uuids: True)
-    monkeypatch.setattr(ulysses_transport, "_symmetric_memory_available", lambda: True)
-    monkeypatch.setattr(ulysses_transport, "_TOPOLOGIES", {})
-    topology = ulysses_transport.probe_ulysses_topology(SimpleNamespace(group_name="ulysses"), 2)
-    return topology, checked, (local_uuid, peer_uuid)
-
-
-def test_probe_checks_every_pair_and_agrees_on_the_weakest_rank(monkeypatch):
-    topology, checked, uuids = _probe(monkeypatch, remote_features=(1, 1, 1, 100, 0))
-    assert checked == [[f"GPU-{u}" for u in uuids]]
-    # The peer lacks symmetric memory, so neither rank selects the copy engines.
-    assert topology == _topology(2, symmetric_memory=False)
-
-
-def test_probe_detects_multi_node_groups(monkeypatch):
-    topology, checked, _ = _probe(monkeypatch, hosts_differ=True)
-    assert checked == []
-    assert not topology.single_node and not topology.nvlink
-
-
-def test_probe_takes_the_lowest_compute_capability(monkeypatch):
-    topology, _, _ = _probe(monkeypatch, remote_features=(1, 1, 1, 90, 1))
-    assert topology.capability == "9.0"
-
-
-def test_probe_is_cached_per_group_and_members(monkeypatch):
-    first, checked, _ = _probe(monkeypatch)
-    assert ulysses_transport.probe_ulysses_topology(SimpleNamespace(group_name="ulysses"), 2) is first
-    # A reused group name with other members probes again, and teardown forgets the cache.
-    ulysses_transport.probe_ulysses_topology(SimpleNamespace(group_name="ulysses", ranks=[2, 3]), 2)
-    assert len(checked) == 2
-    ulysses_transport.clear_ulysses_transport_state()
-    ulysses_transport.probe_ulysses_topology(SimpleNamespace(group_name="ulysses"), 2)
-    assert len(checked) == 3
-
-
-class _FakeNVML:
-    class NVMLError(Exception):
-        pass
-
-    NVML_P2P_CAPS_INDEX_NVLINK = 0
-    NVML_P2P_STATUS_OK = 0
-
-    def __init__(self, init_fails=False, status=0):
-        self.init_fails = init_fails
-        self.status = status
-        self.shutdowns = 0
-
-    def nvmlInit(self):
-        if self.init_fails:
-            raise self.NVMLError("NVML not available in this container")
-
-    def nvmlShutdown(self):
-        self.shutdowns += 1
-
-    def nvmlDeviceGetHandleByUUID(self, gpu):
-        return gpu
-
-    def nvmlDeviceGetP2PStatus(self, a, b, index):
-        return self.status
-
-
-def _patch_nvml(monkeypatch, nvml):
-    import vllm.utils.import_utils as import_utils
-
-    def load():
-        if isinstance(nvml, BaseException):
-            raise nvml
-        return nvml
-
-    monkeypatch.setattr(import_utils, "import_pynvml", load)
-
-
-@pytest.mark.parametrize("status, expected", [(0, True), (1, False)])
-def test_nvlink_probe_checks_pairs_and_shuts_nvml_down(monkeypatch, status, expected):
-    nvml = _FakeNVML(status=status)
-    _patch_nvml(monkeypatch, nvml)
-    assert ulysses_transport._nvlink_all_pairs(["GPU-a", "GPU-b", "GPU-c"]) is expected
-    assert nvml.shutdowns == 1
-
-
-def test_nvlink_probe_treats_failed_nvml_init_as_no_nvlink(monkeypatch):
-    nvml = _FakeNVML(init_fails=True)
-    _patch_nvml(monkeypatch, nvml)
-    assert ulysses_transport._nvlink_all_pairs(["GPU-a", "GPU-b"]) is False
-    assert nvml.shutdowns == 0
-
-
-@pytest.mark.parametrize("error", [ImportError("no pynvml"), OSError("libnvidia-ml.so.1 not found")])
-def test_nvlink_probe_treats_missing_pynvml_as_no_nvlink(monkeypatch, error):
-    _patch_nvml(monkeypatch, error)
-    assert ulysses_transport._nvlink_all_pairs(["GPU-a", "GPU-b"]) is False
-
-
-def _resolve(requested, monkeypatch, topology, backend="FLASHINFER_ATTN", impl="cute-dsl"):
-    messages = []
-    monkeypatch.setattr(ulysses_transport, "_LOGGED", set())
-    monkeypatch.setattr(ulysses_transport.logger, "info", lambda m, *args: messages.append(("info", m % args)))
-    monkeypatch.setattr(ulysses_transport.logger, "warning", lambda m, *args: messages.append(("warning", m % args)))
-    monkeypatch.setattr(ulysses_transport, "probe_ulysses_topology", lambda group, world_size: topology)
-    plans = [
-        ulysses_transport.resolve_ulysses_transports(
-            requested=requested,
-            group=SimpleNamespace(group_name="sp0"),
-            world_size=2,
-            pure_strict=True,
-            num_heads=56,
-            attention_backend=backend,
-            attention_impl=impl,
-        )
-        for _ in range(3)
-    ]
-    return plans[0], messages
-
-
-def test_auto_logs_dispatch_order_once(monkeypatch):
-    plan, messages = _resolve("auto", monkeypatch, _topology(2))
-    assert plan.overlap_chunks == 14
-    assert messages == [
-        (
-            "info",
-            "Using ['copy_engine_overlap', 'copy_engine', 'nccl'] Ulysses a2a transports (in dispatch order) "
-            "for group 'sp0' out of potential: ['copy_engine_overlap', 'copy_engine', 'nccl']",
-        ),
-    ]
-
-
-def test_auto_skips_overlap_for_variant_attention(monkeypatch):
-    plan, messages = _resolve("auto", monkeypatch, _topology(2), backend="TORCH_SDPA", impl=None)
-    assert plan.overlap_chunks == 0
-    skipped = (
-        "Ulysses a2a transport 'copy_engine_overlap' skipped for TORCH_SDPA attention on group 'sp0': "
-        "not per-head invariant"
-    )
-    assert ("info", skipped) in messages
-
-
-def test_explicit_backend_skips_the_probe(monkeypatch):
-    plan, messages = _resolve("nccl", monkeypatch, None)
-    assert plan == ulysses_transport.NCCL_PLAN
-    assert messages == [("info", "Using Ulysses a2a transport 'nccl' for group 'sp0' (explicit)")]
+def _cpu(make):
+    return lambda *args, device=None, **kwargs: make(*args, **kwargs)
 
 
 @pytest.mark.parametrize(
-    "backend, expected",
-    [("auto", "nccl"), ("nccl", "nccl"), ("copy_engine", None), ("copy_engine_overlap", None)],
+    "world_size, settings, transport, log",
+    [
+        (2, {}, "copy_engine", "(auto: 2 GPUs fully NVLink-connected)"),
+        (8, {}, "copy_engine", "(auto: 8 GPUs fully NVLink-connected)"),
+        (2, {"nvlink": False}, "copy_engine", "(auto: 2 GPUs with PCIe P2P)"),
+        (4, {"nvlink": False}, "nccl", "copy engine needs full NVLink for more than two PCIe GPUs"),
+        (4, {"nvml_error": True}, "nccl", "copy engine needs full NVLink for more than two PCIe GPUs"),
+        (2, {"nvml_error": True}, "copy_engine", "(auto: 2 GPUs with PCIe P2P)"),
+        (2, {"p2p": False}, "nccl", "GPU P2P access unavailable"),
+        (2, {"hosts": [1, 2]}, "nccl", "group spans nodes"),
+        (2, {"peer_features": [1, 1, 1, 0]}, "nccl", "torch symmetric memory unavailable"),  # agreed with the peer
+        (2, {"cuda_graphs": True}, "nccl", "CUDA-graphed denoising"),
+        (2, {"strict_pure": False}, "nccl", "layer is not strict pure Ulysses"),
+        (2, {"p2p": False, "overlap_chunks": 4}, "nccl", "ulysses_overlap_chunks ignored"),
+        (2, {"requested": "nccl"}, "nccl", None),
+        (2, {"requested": "copy_engine"}, "copy_engine", "(explicit)"),
+        (2, {"requested": "copy_engine", "strict_pure": False}, "copy_engine", "(explicit)"),  # per-call fallback
+        (2, {"requested": "copy_engine", "p2p": False}, ValueError, None),
+        (4, {"requested": "copy_engine", "nvlink": False}, ValueError, None),
+    ],
 )
-def test_require_default_transport_pins_auto_to_nccl(backend, expected):
+def test_select_transport(probe, world_size, settings, transport, log):
+    if transport is ValueError:
+        with pytest.raises(ValueError, match="ulysses_a2a_backend='copy_engine' is not supported here"):
+            probe(world_size, **settings)
+        return
+    chosen, messages = probe(world_size, **settings)
+    assert chosen == transport
+    assert (log is None and not messages) or (log in messages[0] and f"Using '{transport}'" in messages[0])
+
+
+def test_outside_nvidia_cuda_auto_is_nccl_without_a_probe(monkeypatch):
+    monkeypatch.setattr(ulysses_transport, "_is_nvidia_cuda", lambda: False)
+    monkeypatch.setattr(ulysses_transport, "_group_probe", pytest.fail)
+    assert select_transport("auto", GROUP, 2, cuda_graphs=False, strict_pure=True) == "nccl"
+    # Explicit symmetric memory on other platforms (NPU) keeps its own validation.
+    assert select_transport("copy_engine", GROUP, 2, cuda_graphs=False, strict_pure=True) == "copy_engine"
+
+
+def test_probe_is_cached_per_group_and_members(monkeypatch):
+    probes = []
+    monkeypatch.setattr(ulysses_transport, "_GROUPS", {})
+    monkeypatch.setattr(ulysses_transport, "dist", _FakeDist(2))
+    monkeypatch.setattr(ulysses_transport, "_probe", lambda group, world_size: probes.append(group) or (None, ""))
+    for group in (GROUP, GROUP, SimpleNamespace(group_name="sp0", ranks=[2, 3])):
+        ulysses_transport._group_probe(group, 2)
+    assert len(probes) == 2
+    ulysses_transport.clear_ulysses_transport_state()
+    ulysses_transport._group_probe(GROUP, 2)
+    assert len(probes) == 3
+
+
+@pytest.mark.parametrize(
+    "values, backend",
+    [
+        ({}, "auto"),
+        ({"ulysses_a2a_permute": True}, "copy_engine"),
+        ({"ulysses_a2a_permute": False}, "nccl"),
+        ({"ulysses_a2a_permute": True, "ulysses_a2a_backend": "nccl"}, "nccl"),
+        ({"ulysses_overlap_chunks": 7}, "auto"),
+        ({"ulysses_overlap_chunks": 7, "ulysses_a2a_backend": "copy_engine"}, "copy_engine"),
+        ({"ulysses_overlap_chunks": 7, "ulysses_a2a_backend": "nccl"}, ValueError),
+        ({"ulysses_a2a_backend": "copy_engine_overlap"}, ValueError),
+    ],
+)
+def test_config_and_deprecated_flags(values, backend):
+    if backend is ValueError:
+        with pytest.raises(ValueError):
+            DiffusionParallelConfig(ulysses_degree=2, **values)
+    else:
+        assert DiffusionParallelConfig(ulysses_degree=2, **values).ulysses_a2a_backend == backend
+
+
+@pytest.mark.parametrize("backend, pinned", [("auto", "nccl"), ("nccl", "nccl"), ("copy_engine", ValueError)])
+def test_models_without_copy_engine_support(backend, pinned):
     parallel = SimpleNamespace(ulysses_a2a_backend=backend)
-    if expected is None:
+    if pinned is ValueError:
         with pytest.raises(ValueError, match="supports only ulysses_a2a_backend='nccl'"):
             ulysses_transport.require_default_ulysses_transport(parallel, "Model")
     else:
         ulysses_transport.require_default_ulysses_transport(parallel, "Model")
-        assert parallel.ulysses_a2a_backend == expected
+        assert parallel.ulysses_a2a_backend == pinned

@@ -20,9 +20,8 @@ def parallel_context(monkeypatch):
     monkeypatch.setattr(factory, "get_forward_context", lambda: SimpleNamespace(omni_diffusion_config=config))
     monkeypatch.setattr(factory, "get_sp_group", lambda: Mock(ulysses_world_size=2))
     monkeypatch.setattr(factory, "get_sequence_parallel_world_size", lambda: 2 * parallel.allgather_degree)
-    # "auto" probes the group collectively; these tests have no process group.
-    no_cuda = ulysses_transport.UlyssesTopology(2, cuda=False)
-    monkeypatch.setattr(ulysses_transport, "probe_ulysses_topology", lambda group, world_size: no_cuda)
+    # "auto" probes the group collectively; these tests have no process group, so the copy engine is unsupported.
+    monkeypatch.setattr(ulysses_transport, "_is_nvidia_cuda", lambda: False)
     return parallel
 
 
@@ -36,12 +35,10 @@ def test_default_does_not_build_optional_extension(monkeypatch, parallel_context
     unavailable.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "backend, allgather",
-    [("nccl", 1), ("copy_engine", 1), ("copy_engine_overlap", 1), ("nccl", 2), ("copy_engine", 2)],
-)
-def test_explicit_backend_is_forwarded(monkeypatch, parallel_context, backend, allgather):
-    parallel_context.ulysses_a2a_backend = backend
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("allgather", [1, 2])
+def test_explicit_exchange_setting_is_forwarded(monkeypatch, parallel_context, enabled, allgather):
+    parallel_context.ulysses_a2a_permute = enabled
     parallel_context.allgather_degree = allgather
     strategy = Mock()
     name = "UlyssesAllGatherKVParallelAttention" if allgather > 1 else "UlyssesParallelAttention"
@@ -49,42 +46,16 @@ def test_explicit_backend_is_forwarded(monkeypatch, parallel_context, backend, a
 
     factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
 
-    kwargs = strategy.call_args.kwargs
-    if allgather > 1:
-        assert kwargs["ulysses_a2a_permute"] is (backend == "copy_engine")
-    else:
-        assert kwargs["transports"] == ulysses_transport.explicit_plan(backend, heads_per_rank=None)
+    assert strategy.call_args.kwargs["ulysses_a2a_permute"] is enabled
 
 
-def test_auto_keeps_nccl_for_ulysses_allgather(monkeypatch, parallel_context):
-    parallel_context.allgather_degree = 2
-    strategy = Mock()
-    monkeypatch.setattr(factory, "UlyssesAllGatherKVParallelAttention", strategy)
-
-    factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
-
-    assert strategy.call_args.kwargs["ulysses_a2a_permute"] is False
-
-
-@pytest.mark.parametrize("chunks, expected", [(0, 2), (4, 4), (3, 0)])
-def test_overlap_chunks_are_resolved_per_layer(monkeypatch, parallel_context, chunks, expected):
-    parallel_context.ulysses_a2a_backend = "copy_engine_overlap"
+@pytest.mark.parametrize("chunks", [0, 4])
+def test_ce_overlap_chunks_are_forwarded_to_pure_ulysses(monkeypatch, parallel_context, chunks):
     parallel_context.ulysses_overlap_chunks = chunks
-    strategy = Mock()
-    monkeypatch.setattr(factory, "UlyssesParallelAttention", strategy)
-
-    # 8 heads over 2 ranks: 4 heads per rank, two heads per chunk by default.
-    factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False, num_heads=8)
-
-    assert strategy.call_args.kwargs["transports"].overlap_chunks == expected
-
-
-def test_auto_keeps_nccl_with_denoise_cuda_graphs(monkeypatch, parallel_context):
-    factory.get_forward_context().omni_diffusion_config.diffusion_use_graph = True
-    monkeypatch.setattr(ulysses_transport, "probe_ulysses_topology", Mock(side_effect=AssertionError("probed")))
+    parallel_context.ulysses_a2a_backend = "copy_engine"  # the overlap runs on the copy-engine exchange only
     strategy = Mock()
     monkeypatch.setattr(factory, "UlyssesParallelAttention", strategy)
 
     factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
 
-    assert strategy.call_args.kwargs["transports"] == ulysses_transport.NCCL_PLAN
+    assert strategy.call_args.kwargs["ce_overlap_chunks"] == chunks

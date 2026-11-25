@@ -95,7 +95,7 @@ class TestParallelConfigPropagation:
         pc = DiffusionParallelConfig(ulysses_degree=2, ulysses_a2a_permute=True, ulysses_overlap_chunks=4)
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.parallel_config.ulysses_overlap_chunks == 4
-        assert od.parallel_config.ulysses_a2a_backend == "copy_engine_overlap"
+        assert od.parallel_config.ulysses_a2a_backend == "copy_engine"
 
     @pytest.mark.parametrize(
         "overrides",
@@ -103,12 +103,13 @@ class TestParallelConfigPropagation:
             {"ulysses_overlap_chunks": -1},
             {"ulysses_mode": "advanced_uaa"},
             {"ring_degree": 2},
+            {"ulysses_a2a_permute": False},
         ],
     )
     def test_ulysses_ce_overlap_rejects_invalid_config(self, overrides):
         values = dict(ulysses_degree=2, ulysses_a2a_permute=True, ulysses_overlap_chunks=2)
         values.update(overrides)
-        with pytest.raises(ValueError, match="ulysses_overlap_chunks|copy_engine_overlap"):
+        with pytest.raises(ValueError, match="ulysses_overlap_chunks"):
             DiffusionParallelConfig(**values)
 
     @pytest.mark.parametrize(

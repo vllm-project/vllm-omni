@@ -11,7 +11,7 @@ import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel import factory, ulysses
-from vllm_omni.diffusion.distributed import a2a_permute
+from vllm_omni.diffusion.distributed import a2a_permute, ulysses_transport
 from vllm_omni.diffusion.forward_context import set_forward_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -268,6 +268,7 @@ def test_direct_npu_strategy_validates_initialized_groups(
 
 def test_npu_strategy_checks_each_forward_context_mode(monkeypatch):
     monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
+    monkeypatch.setattr(ulysses_transport, "_is_nvidia_cuda", lambda: False)
     monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: None)
     group = SimpleNamespace(ulysses_group=object(), ulysses_world_size=2, ring_world_size=1, allgather_world_size=1)
     monkeypatch.setattr(factory, "get_sp_group", lambda: group)
@@ -290,13 +291,16 @@ def test_cuda_backend_does_not_require_eager(monkeypatch):
         parallel_config=SimpleNamespace(ulysses_a2a_permute=True, ulysses_degree=2), enforce_eager=False
     )
     monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: False))
+    # The GPUs support the copy engine; this test is about the eager requirement only.
+    monkeypatch.setattr(ulysses_transport, "copy_engine_unsupported_reason", lambda *args, **kwargs: None)
     monkeypatch.setattr(factory, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(factory, "get_forward_context", lambda: SimpleNamespace(omni_diffusion_config=config))
-    monkeypatch.setattr(factory, "get_sp_group", lambda: object())
+    sp_group = SimpleNamespace(ulysses_group=SimpleNamespace(group_name="sp"), ulysses_world_size=2)
+    monkeypatch.setattr(factory, "get_sp_group", lambda: sp_group)
     monkeypatch.setattr(factory, "get_sequence_parallel_world_size", lambda: 2)
     monkeypatch.setattr(factory, "UlyssesParallelAttention", lambda **kwargs: kwargs)
     result = factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
-    assert result["transports"].copy_engine_min_bytes == 0
+    assert result["ulysses_a2a_permute"] is True
 
 
 def test_disabled_optimization_does_not_load_backend(monkeypatch):
@@ -307,33 +311,3 @@ def test_disabled_optimization_does_not_load_backend(monkeypatch):
     group = SimpleNamespace(ulysses_group=object(), ulysses_world_size=2, ring_world_size=1)
     strategy = ulysses.UlyssesParallelAttention(group, 2, 1, False)
     assert strategy.name == "ulysses"
-
-
-@pytest.mark.parametrize(
-    "values, backend",
-    [
-        ({}, "auto"),
-        ({"ulysses_a2a_permute": True}, "copy_engine"),
-        ({"ulysses_a2a_permute": True, "ulysses_a2a_backend": "copy_engine"}, "copy_engine"),
-        ({"ulysses_a2a_backend": "copy_engine_overlap", "ulysses_overlap_chunks": 7}, "copy_engine_overlap"),
-    ],
-)
-def test_transport_config_aliases(values, backend):
-    from vllm_omni.diffusion.data import DiffusionParallelConfig
-
-    assert DiffusionParallelConfig(**values).ulysses_a2a_backend == backend
-
-
-@pytest.mark.parametrize(
-    "values, message",
-    [
-        ({"ulysses_a2a_backend": "nvshmem"}, "ulysses_a2a_backend must be one of"),
-        ({"ulysses_a2a_backend": "copy_engine", "ulysses_overlap_chunks": 2}, "applies only to"),
-        ({"ulysses_a2a_backend": "copy_engine_overlap", "ring_degree": 2}, "strict pure Ulysses"),
-    ],
-)
-def test_transport_config_rejects_invalid_values(values, message):
-    from vllm_omni.diffusion.data import DiffusionParallelConfig
-
-    with pytest.raises(ValueError, match=message):
-        DiffusionParallelConfig(**values)

@@ -20,11 +20,6 @@ from vllm_omni.diffusion.distributed.packed_qkv import (
     packed_qkv_all_to_all,
     packed_qkv_eligible,
 )
-from vllm_omni.diffusion.distributed.ulysses_transport import (
-    NCCL,
-    UlyssesTransportPlan,
-    explicit_plan,
-)
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     get_ulysses_mode,
@@ -236,8 +231,6 @@ class _UlyssesCtx(ParallelAttentionContext):
     orig_head_cnt: int = 0
     joint_orig_head_cnt: int = 0
     use_packed_qkv: bool = False
-    # Transport of this call's Q/K/V exchange; the output exchange uses the same one.
-    a2a_transport: str = "nccl"
 
 
 class UlyssesParallelAttention:
@@ -258,15 +251,10 @@ class UlyssesParallelAttention:
         gather_idx: int,
         use_sync: bool,
         ulysses_a2a_permute: bool = False,
-        transports: UlyssesTransportPlan | None = None,
+        ce_overlap_chunks: int = 0,
     ) -> None:
-        if transports is None:
-            transports = explicit_plan("copy_engine" if ulysses_a2a_permute else NCCL, heads_per_rank=None)
-        ulysses_a2a_permute = transports.symmetric_memory
         self._sp_group = sp_group
-        self._transports = transports
-        # Head chunks for the copy-engine overlap, run by the attention layer when the call is eligible.
-        self.ce_overlap_chunks = transports.overlap_chunks
+        self.ce_overlap_chunks = int(ce_overlap_chunks)
         self._ulysses_pg = sp_group.ulysses_group
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx
@@ -324,7 +312,6 @@ class UlyssesParallelAttention:
             validate_a2a_permute_config(ulysses_mode=mode)
         ulysses_world_size = self._sp_group.ulysses_world_size
         use_packed_qkv = False
-        a2a_transport = NCCL
         gate_compress = None
         if attn_metadata is not None:
             candidate = attn_metadata.extra.get("gate_compress")
@@ -575,8 +562,6 @@ class UlyssesParallelAttention:
                 self._gather_idx,
                 ulysses_world_size,
             ):
-                a2a_transport = self._transports.exchange(query.numel() * query.element_size())
-            if a2a_transport != NCCL:
                 # Keep optional transports lazy so default Ulysses does not
                 # require the CUDA symmetric-memory or Triton backends.
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd, ulysses_qkv_fwd_group
@@ -660,7 +645,6 @@ class UlyssesParallelAttention:
             orig_head_cnt=int(orig_head_cnt) if mode == "advanced_uaa" else 0,
             joint_orig_head_cnt=int(joint_orig_head_cnt) if mode == "advanced_uaa" else 0,
             use_packed_qkv=use_packed_qkv,
-            a2a_transport=a2a_transport,
         )
         use_2d_mask = False
         if attn_metadata is not None:
@@ -731,7 +715,12 @@ class UlyssesParallelAttention:
                 )
             elif ctx.use_packed_qkv:
                 output_img = packed_output_all_to_all(ctx.ulysses_pg, output_img, ctx.use_sync)
-            elif ctx.a2a_transport != NCCL:
+            elif _a2a_permute_enabled(
+                self._ulysses_a2a_permute,
+                ctx.scatter_idx,
+                ctx.gather_idx,
+                dist.get_world_size(ctx.ulysses_pg),
+            ):
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
 
                 output_img = ulysses_o_rev(
@@ -775,7 +764,12 @@ class UlyssesParallelAttention:
             )
         if ctx.use_packed_qkv:
             return packed_output_all_to_all(ctx.ulysses_pg, attn_output, ctx.use_sync)
-        if ctx.a2a_transport != NCCL:
+        if _a2a_permute_enabled(
+            self._ulysses_a2a_permute,
+            ctx.scatter_idx,
+            ctx.gather_idx,
+            dist.get_world_size(ctx.ulysses_pg),
+        ):
             from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
 
             output = ulysses_o_rev(
