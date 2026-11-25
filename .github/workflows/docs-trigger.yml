@@ -37,6 +37,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@v10.4.0
@@ -50,7 +52,8 @@ jobs:
           uv pip install -e ".[docs]"
 
       - name: Build documentation
-        run: uv run mkdocs build --strict
+        # --no-sync to avoid resyncing across the project, since we already built the docs env
+        run: uv run --no-sync mkdocs build --strict
 
       - name: Upload preview to Read the Docs
         # RTD_TOKEN is not available in forks
