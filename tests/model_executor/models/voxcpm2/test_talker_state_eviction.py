@@ -358,6 +358,27 @@ class TestStateEvictionContract:
         assert _platform_copies_to_host_async() is expected
 
     @pytest.mark.cpu
+    @pytest.mark.parametrize(
+        ("device_type", "is_npu", "expected"),
+        [
+            ("cuda", False, True),
+            ("npu", True, True),
+            ("xpu", False, True),
+            ("musa", False, True),
+            ("mps", False, False),
+            ("cpu", False, False),
+        ],
+    )
+    def test_stop_mask_side_stream_platforms(self, monkeypatch, device_type, is_npu, expected) -> None:
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import _platform_uses_stop_mask_side_stream
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "device_type", device_type)
+        monkeypatch.setattr(current_omni_platform, "is_npu", lambda: is_npu)
+
+        assert _platform_uses_stop_mask_side_stream() is expected
+
+    @pytest.mark.cpu
     def test_stop_precompute_uses_side_stream_and_pinned_copy_on_cuda_or_npu(self, monkeypatch) -> None:
         device_module, calls = _use_async_host_copies(monkeypatch)
         _, RState, _ = _voxcpm2_talker_mod()
@@ -384,6 +405,38 @@ class TestStateEvictionContract:
         assert calls.pinned == [True]
         assert calls.non_blocking == [True]
         assert [state.pending_stop_mask_event for state in states] == [copy_done, copy_done]
+        assert copy_done.recorded_on is side_stream
+        assert talker._should_stop_from_cached_logits(states[0]) is True
+        assert talker._should_stop_from_cached_logits(states[1]) is False
+
+    @pytest.mark.cpu
+    def test_stop_precompute_uses_side_stream_with_blocking_copy_on_xpu_or_musa(self, monkeypatch) -> None:
+        from vllm_omni.model_executor.models.voxcpm2 import voxcpm2_talker
+        from vllm_omni.platforms import current_omni_platform
+
+        device_module, calls = _use_async_host_copies(monkeypatch)
+        # CPU tensors stand in for XPU/MUSA ones: side stream, no pinned copy.
+        monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+        monkeypatch.setattr(voxcpm2_talker, "_platform_uses_stop_mask_side_stream", lambda: True)
+        _, RState, _ = _voxcpm2_talker_mod()
+        talker = _make_bare_talker()
+        talker._vae_decode_every = 3
+        states = [
+            RState(request_id="stop", precomputed_stop_logits=torch.tensor([[0.0, 1.0]])),
+            RState(request_id="keep", precomputed_stop_logits=torch.tensor([[1.0, 0.0]])),
+        ]
+
+        talker._precompute_stop_flags_for_audio_collect(states)
+
+        side_stream = talker._stop_mask_stream
+        copy_done = states[0].pending_stop_mask_event
+        assert isinstance(side_stream, _FakeStream)
+        assert device_module.entered == [side_stream]
+        (fork,) = side_stream.waited
+        assert fork.recorded_on is None
+        assert fork is not copy_done
+        assert calls.pinned == [False]
+        assert calls.non_blocking == [False]
         assert copy_done.recorded_on is side_stream
         assert talker._should_stop_from_cached_logits(states[0]) is True
         assert talker._should_stop_from_cached_logits(states[1]) is False

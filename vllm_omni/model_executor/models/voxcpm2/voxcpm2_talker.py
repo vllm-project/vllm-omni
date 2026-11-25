@@ -386,13 +386,23 @@ def build_voxcpm2_prompt(
 
 
 def _platform_copies_to_host_async() -> bool:
-    """Whether device-to-host copies here use pinned memory and a side stream.
+    """Whether device-to-host copies here use pinned memory and a non-blocking copy.
 
     The stop-mask and delayed-audio copies allocate pinned host memory whenever
     this returns True, so it must stay limited to platforms that support it.
     """
     platform = omni_platform.current_omni_platform
     return platform.device_type == "cuda" or getattr(platform, "is_npu", lambda: False)()
+
+
+def _platform_uses_stop_mask_side_stream() -> bool:
+    """Whether the stop-mask copy runs on a side stream.
+
+    CUDA and NPU overlap a pinned copy there; XPU and MUSA keep the side stream
+    with a blocking copy. Other platforms, such as MPS, whose streams and events
+    do not interoperate, read the mask synchronously.
+    """
+    return _platform_copies_to_host_async() or omni_platform.current_omni_platform.device_type in ("xpu", "musa")
 
 
 @lru_cache(maxsize=32)
@@ -3565,8 +3575,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         else:
             stacked = torch.stack([stop_logits[0] for _, stop_logits in pending], dim=0)
 
-        if not _platform_copies_to_host_async():
-            # No pinned async copy to overlap; MPS streams and events also do
+        if not _platform_uses_stop_mask_side_stream():
+            # No pinned async copy to overlap, and MPS streams and events do
             # not interoperate, so read the mask synchronously.
             stop_mask_cpu = (stacked[:, 1] > stacked[:, 0]).cpu()
             for i, (state, _) in enumerate(pending):
@@ -3574,6 +3584,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 state.pending_stop_mask_event = None
             return
 
+        pinned = _platform_copies_to_host_async()
         device_module = torch.get_device_module(current_omni_platform.get_torch_device())
 
         # Compute the mask and stage the D2H copy on a dedicated side stream:
@@ -3594,14 +3605,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 stop_logits.record_stream(self._stop_mask_stream)
             if model_state is not None:
                 stacked.record_stream(self._stop_mask_stream)
-            # Pinned: only CUDA/NPU reach here (_platform_copies_to_host_async).
-            stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=True)
+            # Pinned only on CUDA/NPU (_platform_copies_to_host_async); XPU and
+            # MUSA copy through the side stream without pinning.
+            stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=pinned)
             # Canary: a host read that races ahead of the DMA observes True —
             # a deterministic wrong value for keep-going requests, caught by
             # the latch test's expected-value assertion (instead of
             # uninitialized garbage that can accidentally match).
             stop_mask_cpu.fill_(True)
-            stop_mask_cpu.copy_(stop_mask_gpu, non_blocking=True)
+            stop_mask_cpu.copy_(stop_mask_gpu, non_blocking=pinned)
             copy_done.record(self._stop_mask_stream)
 
         for i, (state, _) in enumerate(pending):
