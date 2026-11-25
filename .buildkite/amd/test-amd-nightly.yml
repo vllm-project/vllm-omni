@@ -1711,7 +1711,7 @@ steps:
         commands:
           - >-
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
-            2 14 40m rocm-tiny-diffusion-2gpu
+            2 16 40m rocm-tiny-diffusion-2gpu
             tests/model_tests/diffusion/test_common_offline.py
             -m "full_model and diffusion and rocm and MI325 and cards_2 and not nvidia_only"
 
@@ -1754,9 +1754,10 @@ steps:
         commands:
           - >-
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
-            4 2 40m rocm-tiny-diffusion-4gpu
+            4 3 40m rocm-tiny-diffusion-4gpu
             "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Flux2KleinPipeline[cfg_parallel+tensor_parallel+cpu_offload]]"
             "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LongCatImagePipeline[cfg_parallel+tensor_parallel+cpu_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LTX2Pipeline[cfg_parallel+tensor_parallel+cpu_offload]]"
             -m "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only"
 
   - group: ":full_moon: Omni-DuplexEval MI300 Nightly"
