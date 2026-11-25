@@ -669,12 +669,13 @@ logs. A successful HTTP response alone does not prove the cache was used.
 Set `VLLM_OMNI_H3_VAE_STREAM_TILE=1` to upload only each rank's spatial tiles
 for the native FP32 CNN reference-video encoder. This opt-in path preserves
 per-clip tile assignment, gather/blend order, temporal padding and one posterior
-sample. Unsupported checkpoint configurations use ordinary preparation;
-`VLLM_OMNI_VAE_ENCODE_LEGACY_PREP=1` also selects the ordinary path. The flag
-defaults to `0`, so single-card deployments keep the ordinary whole-video path
-unless explicitly enabled. On one Ascend 950PR card (256x448, 33 frames, real
-weights) the streamed path produced bit-identical encoder rows and lowered peak
-allocated device memory by about 40 MiB, with latency within 1% of the ordinary
-path. On 8 ranks (448x704, 33/65/97/129 frames) encoder rows stayed
+sample. The flag follows the legacy preparation flag syntax. It defaults to
+`0`, ignores case and surrounding whitespace, and is disabled by an empty
+value, `0`, `false`, or `off`. Other values, including `1`, `true`, and `on`,
+enable it. Unsupported checkpoint configurations use ordinary preparation.
+`VLLM_OMNI_VAE_ENCODE_LEGACY_PREP=1` takes precedence. On one Ascend 950PR
+card (256x448, 33 frames, real weights) the streamed path produced
+bit-identical encoder rows and lowered peak allocated device memory by about
+40 MiB, with latency within 1% of the ordinary path. On 8 ranks (448x704, 33/65/97/129 frames) encoder rows stayed
 bit-identical across all ranks, peak HBM dropped by 152-497 MiB as the clip
 grew, and latency was neutral to 0.8% lower.

@@ -44,6 +44,8 @@ MINIMAX_H3_AUDIO_CHANNELS = 2
 
 # Escape hatch back to the checkpoint's whole-video numpy preparation path.
 _VAE_ENCODE_LEGACY_PREP_ENV = "VLLM_OMNI_VAE_ENCODE_LEGACY_PREP"
+# Opt-in for rank-local reference-video tile uploads.
+_VAE_STREAM_TILE_ENV = "VLLM_OMNI_H3_VAE_STREAM_TILE"
 
 
 logger = init_logger(__name__)
@@ -77,8 +79,8 @@ def _minimax_h3_keyframe_encode_context(
         yield
 
 
-def _legacy_encode_prep_enabled() -> bool:
-    value = os.environ.get(_VAE_ENCODE_LEGACY_PREP_ENV, "0")
+def _env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name, "0")
     return value.strip().lower() not in ("", "0", "false", "off")
 
 
@@ -1055,7 +1057,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def predict_video_latent_shape(self, frames: np.ndarray) -> tuple[int, int, int]:
         """Predict the checkpoint latent shape for its reference-video input."""
         effective_frames = int(frames.shape[0])
-        if not _legacy_encode_prep_enabled():
+        if not _env_flag_enabled(_VAE_ENCODE_LEGACY_PREP_ENV):
             prep_metadata = self._stream_video_prep_metadata(frames)
             if prep_metadata is not None:
                 effective_frames += prep_metadata[1]
@@ -1244,8 +1246,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 latent = None
                 prepared = None
-                if isinstance(frames, np.ndarray) and not _legacy_encode_prep_enabled():
-                    if os.environ.get("VLLM_OMNI_H3_VAE_STREAM_TILE", "0") == "1":
+                if isinstance(frames, np.ndarray) and not _env_flag_enabled(_VAE_ENCODE_LEGACY_PREP_ENV):
+                    if _env_flag_enabled(_VAE_STREAM_TILE_ENV):
                         latent = self._stream_encode_video_tiles(frames, parameter.device)
                     if latent is None:
                         prepared = self._stream_prepare_video_tensor(frames, parameter.device)

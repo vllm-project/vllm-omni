@@ -225,9 +225,10 @@ def test_distinct_tile_outputs_preserve_native_weighted_blend_neighbors():
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
-def test_enabled_encode_does_not_construct_a_complete_device_video(monkeypatch):
+@pytest.mark.parametrize("flag", ["1", " True ", "on"])
+def test_enabled_encode_does_not_construct_a_complete_device_video(monkeypatch, flag):
     vae = _vae()
-    monkeypatch.setenv("VLLM_OMNI_H3_VAE_STREAM_TILE", "1")
+    monkeypatch.setenv("VLLM_OMNI_H3_VAE_STREAM_TILE", flag)
     monkeypatch.setenv("VLLM_OMNI_VAE_ENCODE_LEGACY_PREP", "0")
 
     def unexpected(*args):
