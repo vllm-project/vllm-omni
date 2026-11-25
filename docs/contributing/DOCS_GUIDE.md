@@ -116,7 +116,7 @@ You can also use Read the Docs for hosting:
 3. Read the Docs will automatically build using `.readthedocs.yml`
 4. Documentation will be available at: `https://vllm-omni.readthedocs.io/`
 
-Note that currently, PRs without the `ready` label cancel the doc builds to limit the number of builds running at a time.
+Note that currently, PRs only build the docs if they have the `ready` label in order to limit the number of builds running at a time.
 
 ## Configuration
 
