@@ -1531,7 +1531,7 @@ def test_cosyvoice_full_default_backend_suite_runs_nightly() -> None:
             "Omni Full-Model Additions · 1-GPU",
             [
                 "tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py",
-                "14",
+                "13",
                 "omni",
                 "rocm-omni-full-model-additions",
                 "tests/e2e/online_serving/test_minicpmo_4_5_expansion.py",
