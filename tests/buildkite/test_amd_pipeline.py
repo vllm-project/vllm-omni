@@ -28,7 +28,7 @@ AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
 AMD_COLLECTION_GUARD = Path(".buildkite/amd/scripts/assert-pytest-collection.sh")
-R2_01_EXPECTED_COUNT = 1456
+R2_01_EXPECTED_COUNT = 1460
 AMD_SOURCE_DEPENDENCIES = Path(".buildkite/common/ci_source_file_dependencies.yml")
 AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scripts/combine_test_suites.py"
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
@@ -916,6 +916,12 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
     ),
 )
 
+# Migrated jobs retain exactly one guard for their original collection. This
+# job also owns a separately guarded blocking parity suite.
+_ROCM_MIGRATED_AMD_GPU_EXTRA_COLLECTION_GUARDS = {
+    "Qwen3-TTS Base E2E Test": 1,
+}
+
 
 def test_ready_and_merge_pipelines_have_no_cuda_marker_selectors() -> None:
     assert _amd_marker_selector_inventory("cuda") == set()
@@ -926,7 +932,13 @@ def test_migrated_amd_gpu_jobs_select_exact_rocm_collections() -> None:
         step = _find_step(label, pipeline_path)
         assert step.get("grade") == grade
 
-        collect_commands = [command for command in step["commands"] if AMD_COLLECTION_GUARD.name in command]
+        all_collect_commands = [command for command in step["commands"] if AMD_COLLECTION_GUARD.name in command]
+        assert len(all_collect_commands) == 1 + _ROCM_MIGRATED_AMD_GPU_EXTRA_COLLECTION_GUARDS.get(label, 0)
+        collect_commands = [
+            command
+            for command in all_collect_commands
+            if marker_expression in _marker_expressions({"commands": [command]})
+        ]
         run_commands = [
             command
             for command in step["commands"]
@@ -1237,6 +1249,54 @@ def test_qwen3_tts_base_preserves_advanced_model_arguments() -> None:
     run_level_index = argv.index("--run-level")
     assert argv[marker_index + 1] == "advanced_model and rocm and MI325 and cards_1 and not nvidia_only"
     assert argv[run_level_index + 1] == "advanced_model"
+
+
+@pytest.mark.parametrize(
+    ("label", "pipeline_path", "timeout_minutes"),
+    [
+        ("Qwen3-TTS E2E Test", AMD_READY_PIPELINE, None),
+        ("Qwen3-TTS Base E2E Test", AMD_MERGE_PIPELINE, 60),
+    ],
+    ids=["ready", "merge"],
+)
+def test_qwen3_tts_eager_warmup_parity_is_blocking(
+    label: str,
+    pipeline_path: Path,
+    timeout_minutes: int | None,
+) -> None:
+    step = _find_step(label, pipeline_path)
+    commands = step["commands"]
+    path = "tests/model_executor/models/qwen3_tts/test_eager_decoder_warmup.py"
+    marker = "core_model and rocm and cards_1"
+
+    assert step["grade"] == "Blocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert "artifacts/rocm-qwen3-tts-eager-warmup/**/*" in step["artifact_paths"]
+    if timeout_minutes is not None:
+        assert step["timeout_in_minutes"] == timeout_minutes
+
+    collect_commands = [command for command in commands if AMD_COLLECTION_GUARD.name in command and path in command]
+    assert len(collect_commands) == 1
+    collect_argv = split(collect_commands[0])
+    bash_at = collect_argv.index("bash")
+    assert collect_argv[bash_at : bash_at + 3] == ["bash", str(AMD_COLLECTION_GUARD), "4"]
+    assert path in collect_argv
+    assert _marker_expressions({"commands": collect_commands}) == [marker]
+
+    run_commands = [
+        command
+        for command in commands
+        if AMD_COLLECTION_GUARD.name not in command and path in command and "pytest" in split(command)
+    ]
+    assert len(run_commands) == 1
+    run_argv = split(run_commands[0])
+    assert run_argv[:4] == ["timeout", "--signal=TERM", "--kill-after=1m", "8m"]
+    assert _marker_expressions({"commands": run_commands}) == [marker]
+    assert "--junitxml=" in run_commands[0]
+
+    joined = "\n".join(commands)
+    assert "Expected four eager decoder parity tests" in joined
+    assert "Eager decoder parity did not fully pass" in joined
 
 
 def test_qwen3_accuracy_defers_artifact_path_expansion() -> None:
@@ -6355,7 +6415,12 @@ def test_qwen3_tts_ready_pins_selected_customvoice_core_nodes() -> None:
 
     assert step["grade"] == "Blocking"
     assert "timeout 30m" in command
-    assert _marker_expressions(step) == [_QWEN3_TTS_READY_MARKER, _QWEN3_TTS_READY_MARKER]
+    assert _marker_expressions(step) == [
+        _QWEN3_TTS_READY_MARKER,
+        _QWEN3_TTS_READY_MARKER,
+        "core_model and rocm and cards_1",
+        "core_model and rocm and cards_1",
+    ]
     for node in _QWEN3_TTS_READY_NODES:
         assert command.count(node) == 1
     assert "diff -u /tmp/qwen3-tts-ready-expected.txt" in command
