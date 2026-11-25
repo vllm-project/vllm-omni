@@ -285,11 +285,11 @@ class _CEPlan:
                 self.operations[peer].append((index, offset, args))
             section += x.nbytes
 
-    def run(self, inputs):
+    def run(self, inputs, zero_copy=False):
         # An outer graph already amortizes submission costs. Avoid nested
         # capture and staging in that case; large requests use direct CE.
         if not self.use_graph or torch.cuda.is_current_stream_capturing():
-            return self._run_eager(inputs)
+            return self._run_eager(inputs, copy_out=not zero_copy)
         if self.graph is None:
             if self.coalesce_inputs:
                 batch, sequence, heads, dim = inputs[0].shape
@@ -348,10 +348,15 @@ class _CEPlan:
         # Ordinary outputs survive later exchanges and satisfy custom-op aliasing.
         if out is not None:
             out.copy_(self.shared)
-        return out
+            return out
+        # Zero-copy outputs stay valid until the next exchange, whose first
+        # barrier waits for every rank's consumers.
+        return self.shared
 
 
-def _exchange_ce(inputs, group_name: str, world_size: int, reverse: bool = False) -> torch.Tensor:
+def _exchange_ce(
+    inputs, group_name: str, world_size: int, reverse: bool = False, zero_copy: bool = False
+) -> torch.Tensor:
     # Reuse a validated plan before repeating layout and workspace bookkeeping.
     plan_key = (reverse, len(inputs))
     workspace = _SYMM_WORKSPACES.get((inputs[0].device, group_name))
@@ -362,7 +367,7 @@ def _exchange_ce(inputs, group_name: str, world_size: int, reverse: bool = False
             stream_id = torch.cuda.current_stream(inputs[0].device).cuda_stream
             if workspace.stream_id != stream_id:
                 raise RuntimeError("a2a_permute workspace must be used from a single CUDA stream")
-            return plan.run(inputs)
+            return plan.run(inputs, zero_copy)
     _ce_runtime()
     # Preserve regular row-strided QKV views; pack only unsupported layouts.
     inputs = tuple(
@@ -383,19 +388,24 @@ def _exchange_ce(inputs, group_name: str, world_size: int, reverse: bool = False
     if plan is None or plan.signature != signature:
         plan = _CEPlan(inputs, shared, workspace.handle, world_size, reverse, workspace.ce_stream)
         workspace.ce_plans[plan_key] = plan
-    return plan.run(inputs)
+    return plan.run(inputs, zero_copy)
 
 
 @torch.library.custom_op("vllm_omni_a2a::ulysses_qkv_ce", mutates_args=(), device_types="cuda")
 def ulysses_qkv_ce(
-    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, group_name: str, world_size: int
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    group_name: str,
+    world_size: int,
+    zero_copy: bool = False,
 ) -> torch.Tensor:
     """Push Q/K/V together into packed, batch-major symmetric outputs."""
-    return _exchange_ce((query, key, value), group_name, world_size)
+    return _exchange_ce((query, key, value), group_name, world_size, zero_copy=zero_copy)
 
 
 @ulysses_qkv_ce.register_fake
-def _(query, key, value, group_name, world_size):
+def _(query, key, value, group_name, world_size, zero_copy=False):
     return query.new_empty(query.numel() + key.numel() + value.numel())
 
 
@@ -406,6 +416,7 @@ def _(query, key, value, group_name, world_size):
 @torch.library.custom_op("vllm_omni_a2a::ulysses_o_rev", mutates_args=(), device_types="cuda")
 def ulysses_o_rev(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
     B, S, H, D = y.shape
+    # The output leaves the attention layer, so it is always copied out.
     return _exchange_ce((y,), group_name, world_size, reverse=True).view(B, S // world_size, H * world_size, D)
 
 
@@ -435,12 +446,24 @@ def _(x: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
     return npu_fwd(x, group_name, world_size)
 
 
+@torch.compiler.disable
+def _ulysses_qkv_ce_zero_copy(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, group_name: str, world_size: int
+) -> torch.Tensor:
+    # Zero-copy outputs are views of the persistent workspace. Inductor treats a custom op's outputs as buffers it
+    # owns and may reuse their storage for later intermediates or graph outputs, which the next exchange would then
+    # overwrite. At a compile boundary the views reach the following graph as inputs, whose storage Inductor never
+    # reuses. Eager callers pay only the decorator's call overhead.
+    return ulysses_qkv_ce(query, key, value, group_name, world_size, True)
+
+
 def ulysses_qkv_fwd_group(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     group_name: str,
     world_size: int,
+    zero_copy: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Exchange Q/K/V together using the platform transport."""
     if query.device.type == "npu":
@@ -448,7 +471,10 @@ def ulysses_qkv_fwd_group(
 
         return npu_fwd_group(query, key, value, group_name, world_size)
     inputs = (query, key, value)
-    packed = ulysses_qkv_ce(*inputs, group_name, world_size)
+    if zero_copy:
+        packed = _ulysses_qkv_ce_zero_copy(*inputs, group_name, world_size)
+    else:
+        packed = ulysses_qkv_ce(*inputs, group_name, world_size)
     if query.shape == key.shape == value.shape:
         b, s, h, d = query.shape
         query, key, value = packed.view(3, b, s * world_size, h // world_size, d).unbind(0)
