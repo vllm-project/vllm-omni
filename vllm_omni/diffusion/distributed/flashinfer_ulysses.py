@@ -36,6 +36,9 @@ def _communicator(group_name: str, nbytes: int, dtype: torch.dtype):
     if cached is not None and cached[0] >= nbytes and cached[1] == dtype:
         return cached[2]
     if cached is not None:
+        # Like a2a_permute's grow-only workspace: earlier kernels (the previous layer's attention reading Q/K/V from
+        # the registered outputs) may still be running, so finish them before the old buffers are released.
+        torch.accelerator.synchronize()
         for key in [k for k in _OUTPUTS if k[0] == group_name]:
             del _OUTPUTS[key]
         cached[2].close()
