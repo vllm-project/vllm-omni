@@ -3,7 +3,7 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import torch
 import torch.distributed as dist
@@ -12,6 +12,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 from diffusers.models.autoencoders.vae import DecoderOutput
 from diffusers.utils.accelerate_utils import apply_forward_hook
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from typing_extensions import Self
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders import wan_encode_split, wan_spatial_shard
@@ -68,7 +69,176 @@ def _requires_gfx11_math_sdpa(
     return any(head_dim > _GFX11_AOTRITON_MAX_HEAD_DIM for head_dim in _wan_attention_head_dims(model))
 
 
+def _fix_wan22_residual_vae_keys(
+    source: dict[str, torch.Tensor], converted: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """Restore Wan2.2 residual block nesting lost by Diffusers' converter."""
+    converted = {
+        key: value
+        for key, value in converted.items()
+        if not key.startswith(("encoder.down_blocks.", "decoder.up_blocks.", "decoder.upsamples."))
+    }
+    tail_replacements = {
+        "residual.0.": "norm1.",
+        "residual.2.": "conv1.",
+        "residual.3.": "norm2.",
+        "residual.6.": "conv2.",
+        "shortcut.": "conv_shortcut.",
+    }
+
+    for key, value in source.items():
+        parts = key.split(".")
+        if len(parts) < 6:
+            continue
+        if parts[:2] == ["encoder", "downsamples"] and parts[3] == "downsamples":
+            block, layer, tail = parts[2], int(parts[4]), ".".join(parts[5:])
+            component = f"resnets.{layer}" if layer < 2 else "downsampler"
+            prefix = f"encoder.down_blocks.{block}.{component}."
+        elif parts[:2] == ["decoder", "upsamples"] and parts[3] == "upsamples":
+            block, layer, tail = parts[2], int(parts[4]), ".".join(parts[5:])
+            component = f"resnets.{layer}" if layer < 3 else "upsampler"
+            prefix = f"decoder.up_blocks.{block}.{component}."
+        else:
+            continue
+        for old, new in tail_replacements.items():
+            tail = tail.replace(old, new)
+        converted[prefix + tail] = value
+
+    return converted
+
+
 class OmniAutoencoderKLWan(AutoencoderKLWan):
+    @classmethod
+    def from_wan22_state_dict(cls, state_dict: dict[str, torch.Tensor]) -> Self:
+        """Load an original Wan2.2 TI2V VAE using the shared architecture."""
+        from diffusers.loaders.single_file_utils import convert_wan_vae_to_diffusers
+
+        # Wan2.2 TI2V patchifies RGB into 12 pixel-space channels (3 * 2 * 2),
+        # while its actual latent width is z_dim=48. Do not substitute the
+        # 16-channel Wan2.1 VAE here.
+        vae_config = {
+            "_class_name": "AutoencoderKLWan",
+            "base_dim": 160,
+            "decoder_base_dim": 256,
+            "z_dim": 48,
+            "dim_mult": [1, 2, 4, 4],
+            "num_res_blocks": 2,
+            "attn_scales": [],
+            "temperal_downsample": [False, True, True],
+            "dropout": 0.0,
+            "in_channels": 12,
+            "out_channels": 12,
+            "patch_size": 2,
+            "scale_factor_temporal": 4,
+            "scale_factor_spatial": 16,
+            "is_residual": True,
+            "latents_mean": [
+                -0.2289,
+                -0.0052,
+                -0.1323,
+                -0.2339,
+                -0.2799,
+                0.0174,
+                0.1838,
+                0.1557,
+                -0.1382,
+                0.0542,
+                0.2813,
+                0.0891,
+                0.1570,
+                -0.0098,
+                0.0375,
+                -0.1825,
+                -0.2246,
+                -0.1207,
+                -0.0698,
+                0.5109,
+                0.2665,
+                -0.2108,
+                -0.2158,
+                0.2502,
+                -0.2055,
+                -0.0322,
+                0.1109,
+                0.1567,
+                -0.0729,
+                0.0899,
+                -0.2799,
+                -0.1230,
+                -0.0313,
+                -0.1649,
+                0.0117,
+                0.0723,
+                -0.2839,
+                -0.2083,
+                -0.0520,
+                0.3748,
+                0.0152,
+                0.1957,
+                0.1433,
+                -0.2944,
+                0.3573,
+                -0.0548,
+                -0.1681,
+                -0.0667,
+            ],
+            "latents_std": [
+                0.4765,
+                1.0364,
+                0.4514,
+                1.1677,
+                0.5313,
+                0.4990,
+                0.4818,
+                0.5013,
+                0.8158,
+                1.0344,
+                0.5894,
+                1.0901,
+                0.6885,
+                0.6165,
+                0.8454,
+                0.4978,
+                0.5759,
+                0.3523,
+                0.7135,
+                0.6804,
+                0.5833,
+                1.4146,
+                0.8986,
+                0.5659,
+                0.7069,
+                0.5338,
+                0.4889,
+                0.4917,
+                0.4069,
+                0.4999,
+                0.6866,
+                0.4093,
+                0.5709,
+                0.6065,
+                0.6415,
+                0.4944,
+                0.5726,
+                1.2042,
+                0.5458,
+                1.6887,
+                0.3971,
+                1.0600,
+                0.3943,
+                0.5537,
+                0.5444,
+                0.4089,
+                0.7468,
+                0.7744,
+            ],
+        }
+        converted = _fix_wan22_residual_vae_keys(state_dict, convert_wan_vae_to_diffusers(state_dict))
+        with torch.device("meta"):
+            vae = cast(Self, cls.from_config(vae_config))
+        vae.load_state_dict(converted, strict=True, assign=True)
+        return vae
+
     @contextmanager
     def _execution_context(self) -> Iterator[None]:
         try:

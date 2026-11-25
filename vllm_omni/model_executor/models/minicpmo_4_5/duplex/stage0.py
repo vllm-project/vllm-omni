@@ -31,7 +31,6 @@ logger = init_logger(__name__)
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
-_MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
 _MINICPMO45_FRAME_POOL_LOCK = Lock()
 _MINICPMO45_FRAME_POOL: ThreadPoolExecutor | None = None
 
@@ -82,6 +81,7 @@ class _MiniCPMO45Stage0SessionState:
     pending_window_unit: _MiniCPMO45WindowUnit | None = None
     pending_window_generated_tokens: list[int] = field(default_factory=list)
     current_turn_ended: bool = True
+    opened_assistant_turn_segment: tuple[str, int] | None = None
     prepared_append_identity: tuple[int | None, int] | None = None
     prepared_inputs_embeds: torch.Tensor | None = None
     prepared_input_token_ids: list[int] = field(default_factory=list)
@@ -398,9 +398,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         epoch: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
-        final: bool = False,
         stage0_window: dict[str, object] | None = None,
-        stage0_reanchor: dict[str, object] | None = None,
+        text_token_ids: list[int] | None = None,
     ) -> _PrefillSteps:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 
@@ -577,8 +576,28 @@ class MiniCPMO45Stage0DuplexRuntime:
                 state.pending_window_unit.embeds.extend(embed_parts[unit_embed_start:])
                 state.pending_window_unit.token_ids.extend(token_ids[unit_token_start:])
             chunk_size = self._streaming_chunk_size(processor)
-        # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
-        # turn is opened once at session init; re-emitting the turn-open prefix per chunk
+        if text_token_ids and units_built:
+            # Official mixed-mode prefill puts <backend> text after the media
+            # and samples from its final token, in the same resident KV.
+            import torch
+
+            ids = torch.tensor(text_token_ids, dtype=torch.long, device=self._model_device())
+            text_embeds = self._as_2d_tensor(self._token_embedder()(ids))
+            embed_parts.append(text_embeds)
+            token_ids.extend(text_token_ids)
+            if state.pending_window_unit is not None:
+                state.pending_window_unit.embeds.append(text_embeds)
+                state.pending_window_unit.token_ids.extend(text_token_ids)
+            state.pending_speech_context = True
+            state.pending_speech_append_identity = append_identity
+            # A server-owned result resumes the assistant after delegation,
+            # even if the model already ended that turn. Match a seeded
+            # response's open-turn state so silence advances the answer until
+            # its next turn_eos instead of leaving it in the listening loop.
+            state.current_turn_ended = False
+            state.pending_speech_response_open = True
+        # Match official streaming_prefill: a unit carries media and optional text.
+        # The assistant turn opens once at session init; re-emitting its prefix per chunk
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
         # model-generated and tracked via current_turn_ended (mirrors streaming_generate).
         prompt_suffix_len = 0
@@ -966,7 +985,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             # A batched-path session whose unit this path has to take: hand the
             # history over as the transformers cache the per-session path grows.
             state.audio_past_key_values = state.audio_past_key_values.to_legacy_cache()
-        self._ensure_dynamic_cache_compat()
         has_audio_cache = state is not None and hasattr(self.thinker, "audio_past_key_values")
         previous_audio_past_key_values = (
             getattr(self.thinker, "audio_past_key_values", None) if has_audio_cache else None
@@ -1110,7 +1128,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             batch_feature = process_audio([ref_audio])
             if hasattr(batch_feature, "to"):
                 batch_feature = batch_feature.to(self.device)
-            self._ensure_dynamic_cache_compat()
             for target in (self.stage_model, self.thinker):
                 get_audio_embedding = getattr(target, "get_audio_embedding", None)
                 if callable(get_audio_embedding):
@@ -1144,26 +1161,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             with suppress(Exception):
                 setattr(batch_feature, name, value)
         return self._stage_audio_embeddings(batch_feature, state=state)
-
-    @staticmethod
-    def _ensure_dynamic_cache_compat() -> None:
-        try:
-            from transformers.cache_utils import DynamicCache
-        except Exception:
-            return
-        if hasattr(DynamicCache, "get_usable_length"):
-            return
-
-        def get_usable_length(self, new_seq_length: int | None = None, layer_idx: int = 0) -> int:
-            get_seq_length = getattr(self, "get_seq_length", None)
-            if not callable(get_seq_length):
-                return 0
-            try:
-                return int(get_seq_length(layer_idx))
-            except TypeError:
-                return int(get_seq_length())
-
-        DynamicCache.get_usable_length = get_usable_length  # type: ignore[attr-defined]
 
     @staticmethod
     def _cat_nested_tensors(value: object) -> torch.Tensor | None:
@@ -1210,6 +1207,8 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "chunk_eos_token_id": self.chunk_eos_token_id,
                 "chunk_tts_eos_token_id": self.chunk_tts_eos_token_id,
                 "turn_eos_token_id": self.turn_eos_token_id,
+                "delegate_open_token_id": getattr(self, "delegate_open_token_id", -1),
+                "delegate_close_token_id": getattr(self, "delegate_close_token_id", -1),
             }.items()
             if isinstance(value, int) and value >= 0
         }
@@ -1219,27 +1218,12 @@ class MiniCPMO45Stage0DuplexRuntime:
         if not model_path:
             return None
         try:
-            from transformers import AutoImageProcessor, AutoProcessor
+            from transformers import AutoProcessor
 
-            original_register = AutoImageProcessor.register
+            from vllm_omni.model_executor.models.minicpmo_4_5.processor import legacy_image_processor_registration
 
-            def register_image_processor(config_class, *args, **kwargs):
-                # The checkpoint's auto_map already loads this class. Its
-                # legacy string registration is incompatible with some
-                # Transformers versions and is otherwise redundant.
-                if config_class == "MiniCPMVImageProcessor":
-                    return None
-                return original_register(config_class, *args, **kwargs)
-
-            with _MINICPMO45_PROCESSOR_LOAD_LOCK:
-                setattr(AutoImageProcessor, "register", staticmethod(register_image_processor))
-                try:
-                    processor = AutoProcessor.from_pretrained(
-                        model_path,
-                        trust_remote_code=True,
-                    )
-                finally:
-                    setattr(AutoImageProcessor, "register", staticmethod(original_register))
+            with legacy_image_processor_registration():
+                processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         except Exception as exc:
             raise RuntimeError(f"Failed to load MiniCPM-o duplex processor from {model_path!r}") from exc
         if getattr(processor, "tokenizer", None) is None:

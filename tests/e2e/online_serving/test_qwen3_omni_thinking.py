@@ -313,7 +313,12 @@ def test_analyse_video_with_audio_input(omni_server, openai_client):
         "modalities": ["text"],
     }
 
-    openai_client.send_omni_request(request_config)
+    # Read the raw response so reasoning also counts as generated text.
+    response = openai_client.client.chat.completions.create(**request_config)
+    message = response.choices[0].message
+    assert any(text and text.strip() for text in (message.content, getattr(message, "reasoning", None))), (
+        "No text output is generated"
+    )
 
 
 REASONING_PROMPT = "What is 17 * 23? Think it through, then reply with only the number."

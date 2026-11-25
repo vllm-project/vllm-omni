@@ -11,6 +11,9 @@ if TYPE_CHECKING:
 
     from transformers import PreTrainedTokenizerBase
 
+# Server-owned token IDs appended after the media in one native input unit.
+APPEND_TEXT_TOKEN_IDS_KEY = "duplex_append_text_token_ids"
+
 
 @dataclass(frozen=True, slots=True)
 class MiniCPMO45DuplexWindowConfig:
@@ -187,6 +190,8 @@ class MiniCPMO45DuplexPolicy:
         "turn_eos_token_id": "<|turn_eos|>",
     }
     OPTIONAL_TOKEN_FIELDS: dict[str, str] = {
+        "delegate_open_token_id": "<delegate>",
+        "delegate_close_token_id": "</delegate>",
         "audio_placeholder_token_id": "<|audio|>",
         "image_start_token_id": "<image>",
         "image_end_token_id": "</image>",

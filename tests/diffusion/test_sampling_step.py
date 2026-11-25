@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.models.interface import SupportsSamplingStep, supports_step_execution
 from vllm_omni.diffusion.worker import diffusion_model_runner as runner_module
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -33,7 +34,11 @@ def test_taomate_keeps_separate_scheduler_updates(monkeypatch):
     monkeypatch.setattr(runner_module, "set_forward_context", lambda **kw: nullcontext())
     runner = SimpleNamespace(
         pipeline=pipeline,
-        od_config=SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=False), streaming_output=False),
+        od_config=SimpleNamespace(
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+            parallel_config=SimpleNamespace(use_hsdp=False),
+            streaming_output=False,
+        ),
         vllm_config=None,
         state_cache={state.request_id: state},
         _update_states=lambda _: (states, []),
@@ -42,6 +47,10 @@ def test_taomate_keeps_separate_scheduler_updates(monkeypatch):
         _attach_stepwise_metadata=lambda *_: None,
         _maybe_send_stage_payload=lambda *_: None,
         _update_states_after=lambda *_: None,
+    )
+    # Exercise the real batch builder; the fake only stands in for I/O plumbing.
+    runner._step_execution_batch = lambda states: runner_module.DiffusionModelRunner._step_execution_batch(
+        runner, states
     )
     output = runner_module.DiffusionModelRunner._execute_stepwise_core(
         runner, SimpleNamespace(), record_output_peak_memory=False
@@ -102,7 +111,11 @@ def test_runner_dispatch_advances_once_and_decodes(monkeypatch, sampler_owned):
     monkeypatch.setattr(runner_module, "set_forward_context", lambda **kw: nullcontext())
     runner = SimpleNamespace(
         pipeline=pipeline,
-        od_config=SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=False), streaming_output=False),
+        od_config=SimpleNamespace(
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+            parallel_config=SimpleNamespace(use_hsdp=False),
+            streaming_output=False,
+        ),
         vllm_config=None,
         state_cache={s.request_id: s for s in states},
         _update_states=lambda _: (states, []),
@@ -111,6 +124,10 @@ def test_runner_dispatch_advances_once_and_decodes(monkeypatch, sampler_owned):
         _attach_stepwise_metadata=lambda *_: None,
         _maybe_send_stage_payload=lambda *_: None,
         _update_states_after=lambda *_: None,
+    )
+    # Exercise the real batch builder; the fake only stands in for I/O plumbing.
+    runner._step_execution_batch = lambda states: runner_module.DiffusionModelRunner._step_execution_batch(
+        runner, states
     )
     output = runner_module.DiffusionModelRunner._execute_stepwise_core(
         runner, SimpleNamespace(), record_output_peak_memory=False

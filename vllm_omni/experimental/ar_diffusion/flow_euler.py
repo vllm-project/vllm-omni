@@ -24,6 +24,7 @@ class FlowEuler:
         def warp(sigma: torch.Tensor) -> torch.Tensor:
             return shift * sigma / (1 + (shift - 1) * sigma)
 
+        self.shift = float(shift)
         shifted = warp(torch.linspace(1.0, float(warp(torch.tensor(1.0 / 1000))), steps, dtype=torch.float64))
         self.sigmas = [*shifted.float().tolist(), 0.0]
         self.timesteps = [1000.0 * sigma for sigma in self.sigmas[:-1]]

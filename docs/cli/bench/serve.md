@@ -97,6 +97,14 @@ Specify to save benchmark results to a json file
   clocks and timezones must agree. Older result files without `benchmark_end_time`
   cannot establish a sampling window from `date` alone.
 
+- `--omni-isolate-prefix-cache`
+  Give the measured chat/completions requests a fresh, shared `cache_salt`
+  for each benchmark invocation. Ready checks and individual warmup requests
+  use separate salts. Requests within the measured run can still reuse common
+  prefixes. This option rejects an explicit `cache_salt` and does not clear
+  multimodal processor caches or measure cold service startup. Failed warmup
+  requests abort the measurement when this option is enabled.
+
 - `--save-detailed`
 "When saving the results, whether to include per request "
         "information such as response, error, ttfs, tpots, etc."
@@ -437,10 +445,15 @@ or heard in the clip, such as the word-repetition prompts in
 `PR_post_event_reminder` and `RTD_Omni`; a clip without an audio track keeps the
 instruction alone. The standalone `generate` command accepts the same choice as `--mix`.
 The MiniCPM-o Omni-DuplexEval nightly (`tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json`)
-runs with `soundtrack`; the Qwen3-Omni `server_vad` nightly keeps `question`.
-Its DFX config uses `duplex_eval_score_floor_hardware` to enforce calibrated
-quality floors on H100, B200 and A3 while ROCm burn-in still requires complete
-generation, publication and judging but records scores without a quality floor.
+runs with `question` on the same 120 `PR_correction` IDs as Qwen3-Omni; the
+Qwen3-Omni `server_vad` nightly also uses `question`. It points `--deploy-config` at
+stock `minicpmo_4_5.yaml` and applies `duplex_session.max_sessions: 8` plus
+`duplex_session.collect_stats: true` through inline `server_params.update` on a
+temporary copy, with prefix caching left off. The job records the correction
+success rate without a numeric floor: every selected ID must complete and be
+judged, and `mean_all_success` must be finite in `[0, 1]`. The shared
+soundtrack 66-ID accuracy-config floors remain available for other callers that
+set `duplex_eval_accuracy_config`.
 
 Each session decodes its media in a
 worker thread after acquiring a concurrency slot, and releases the decoded input
@@ -501,6 +514,14 @@ requires the judge to support video inputs and access the same local video paths
 Use `--duplex-eval-judge-video-mode frame-sample` for a remote image-capable judge;
 this changes content evaluation to the existing sampled-frame variant, not full-video judging.
 
+`--duplex-eval-judge-frame-max-side` limits the longer side of RTD judge frames
+to 1920 pixels by default. Larger frames are scaled down with their aspect ratio
+preserved to reduce the judge's image token usage. The cap applies to temporal
+frames in both modes and to content frames in `frame-sample` mode or when
+`video_url` content judging falls back to sampled frames after a context limit
+error. The full video passed in `video_url` mode keeps its source resolution.
+Set the flag to `0` to keep extracted frames at source resolution.
+
 Scoring reuses the standalone evaluator and runs **after performance timing**.
 The terminal and saved benchmark result (`omni_duplex_eval.accuracy`) report scores
 and coverage: total measured sessions, evaluated sessions, skipped failed/unpublished
@@ -549,11 +570,17 @@ unpublished sessions. To automatically score the actual successfully published
 samples, including shuffled or partially successful runs, use
 `--duplex-eval-evaluate` during `bench serve`.
 
+The standalone `evaluate` command uses `--judge-frame-max-side` for the same
+setting. `summarize` reports the RTD cap and rejects scores that mix RTD caps.
+An RTD score without a recorded cap counts as source resolution. To change
+the cap, use a fresh `--score-root` or rescore all previously scored RTD samples
+in that root with `--overwrite`.
+
 The standalone `generate` command remains available. It still skips an existing
 sample unless `--overwrite` is set, and it reuses that sample only when the
 recorded mix matches (metadata without a mix counts as `question`). A different
 mix is rejected instead of returning the other artifact. This integration does
-not add nightly jobs. The MiniCPM-o job above selects `soundtrack`.
+not add nightly jobs. The MiniCPM-o job above selects `question`.
 
 For shuffled runs, use `evaluate --ids` with the successful selected sample IDs
 instead of `--limit`. Failed sessions have no judge input; do not silently drop
@@ -582,6 +609,42 @@ PCM sample when the clip ends on a model-unit boundary, so the commit always
 flushes a residual unit and that decision covers the end of the clip. A
 successful transport/session result is therefore not proof that every final
 input produced a response, nor an accuracy score.
+
+#### Per-stage metrics
+
+Add `--print-stage` to the serving command above to aggregate the final cumulative
+snapshot from each assistant response. Each response contributes once, even when
+it sends multiple metric updates; a video can therefore contribute several
+responses to each stage table. Serving tables honor `--percentile-metrics` and
+`--percentiles`.
+
+The standalone generation command also supports stage tables:
+
+```bash
+vllm bench omni-duplex-eval --omni generate \
+  --url 'ws://127.0.0.1:8000/v1/realtime?duplex=1' \
+  --model openbmb/MiniCPM-o-4_5 \
+  --ref-audio /path/to/reference.wav \
+  --dataset Hothan/Omni-DuplexEval \
+  --split PR_correction --limit 1 --concurrency 1 \
+  --response-root ./duplex-eval-responses \
+  --overwrite --print-stage
+```
+
+Standalone generation uses a fixed metric selection (`ttft`, `tpot`, `itl`,
+`audio_ttfp`, `audio_duration`) and reports mean, median and P99 where applicable.
+Only successful samples generated in the current run contribute to this table:
+`response_done` must be true and the result must have no error. Failed sessions
+are excluded from the table and counted in a message on stderr. Existing
+response files are skipped by default; their stage snapshots are not loaded for
+printing. The command reports skipped samples on stderr and suggests
+`--overwrite` to regenerate them. If successful samples return no stage snapshots,
+it reports that instead of printing an empty table.
+
+For both regular and duplex stage tables, missing or null `stage_gen_time_ms`
+and `postprocess_time_ms` values are excluded from timing distributions. Measured
+zeros remain samples. Complete snapshots retain the previous statistics; partial
+snapshots no longer lower timing means by contributing artificial zeros.
 
 ### OmniInteract Realtime Benchmark
 
@@ -758,7 +821,9 @@ scored slot plus unmatched-chunk false positives. Plain `wav_transcript.json` ti
 timing. If transcript chunks include `aligned_words`, the evaluator splits boundary-crossing chunks and derives trigger
 timing from word alignment.
 
-Per-response TTFT and TTFP start when the server begins executing the native model-turn request that owns the response. RTF
+Per-response TTFT and TTFP start at the server's latest accepted native append before the response's first output, not at
+the first append of the model turn: with 200 ms chunks every pre-response silence chunk moves the start forward, so
+user speech that overlaps the reply shortens both. RTF
 continues to use client receipt of `response.created` through the last audio packet, divided by emitted audio duration.
 When the client recorded `input_audio_buffer.append` sends, `client_ttfp_ms` / `client_rtf` start at the last such send
 before this `response.created` (after the previous `response.created` or stream start). `client_ttft_ms` still starts at
@@ -769,12 +834,22 @@ token interval is present within a continuous generation segment. Model-unit pac
 excluded from TPOT/ITL. Raw request metrics retain `response_created_to_first_text_ms` and
 `response_created_to_first_audio_ms` as client-envelope diagnostics.
 
-The checked-in local performance configuration measures four deterministic cases from `1q1a`, `1q1a_math`, and
-`1qna` (12 videos total), with no benchmark warmups and a maximum concurrency of two. Each subset also sends one readiness request before its
-measured cases. The runner starts MiniCPM-o 4.5 on the first visible GPU and a text judge
-(`Qwen/Qwen2.5-7B-Instruct`) on the second (`CUDA_VISIBLE_DEVICES=1` relative to the process). After artifacts land it
-scores All Global IA-QTF1 through that local judge. This is protocol-compatible with the paper metric, not a GPT-4o
-paper-table score. Run it from the repository root with two visible GPUs:
+The checked-in local performance configuration points `--deploy-config` at stock
+`minicpmo_4_5.yaml` and applies `duplex_session.max_sessions: 8` plus
+`duplex_session.collect_stats: true` through inline `server_params.update`, with
+prefix caching left off. It replays all 60 `1q1a_math` clips once at concurrency
+8, with no benchmark warmups. Case WAV, transcript, event, and evaluation
+artifacts are written to a temporary directory during the run and deleted
+afterwards; they are not kept under `tests/dfx/perf/results/omniinteract/`. The
+runner starts MiniCPM-o 4.5 on the first visible GPU and a text judge
+(`Qwen/Qwen2.5-7B-Instruct`) on the second (`CUDA_VISIBLE_DEVICES=1` relative to
+the process). After the subset finishes it scores All Global IA-QTF1 through that
+local judge and writes a `result_acc_*.json` next to the performance JSON
+(`ACC_BENCH_RESULT_DIR`, else `BENCHMARK_DIR`). Accuracy is published only in
+those `result_acc_*.json` files; the perf `result_test_*.json` keeps generation
+and latency metrics but no `omniinteract.accuracy` block. This is
+protocol-compatible with the paper metric, not a GPT-4o paper-table score. Run
+it from the repository root with two visible GPUs:
 
 ```bash
 export HF_HOME=/path/to/persistent/huggingface-cache
@@ -788,11 +863,11 @@ bash tools/nightly/run_nightly_jobs.sh \
 The first run downloads the pinned OmniInteract archive and the judge weights into `HF_HOME`; later runs reuse that cache.
 
 It requires every case to commit its input, complete any emitted response lifecycles, and publish the expected WAV,
-transcript, event, and result artifacts without errors. A valid LISTEN-only case may have no response audio or transcript
+transcript, event, and result artifacts without errors while the temporary output directory exists. A valid LISTEN-only case may have no response audio or transcript
 chunks. Official-manifest eligibility is reported separately because clipped or cancelled output is a benchmark-quality
-signal, not a transport failure. Accuracy must finish with `status=ok` on every subset. After all three subsets finish,
-All Global IA-QTF1 is recomputed from pooled `Global_TP` / `Global_FP` / `Global_FN` and must be at or above
-`omniinteract_aggregate_min_ia_qtf1` (checked in as `0.2`).
+signal, not a transport failure. Accuracy must finish with `status=ok`, `failed==0`, and
+`evaluated + skipped == 60`. All Global IA-QTF1 must be finite. There is no numeric
+IA-QTF1 floor; skipped sessions from the official eligibility policy do not fail the job.
 
 `test_qwen3_omni_duplex_omniinteract.json` runs Qwen3-Omni with server VAD
 using the existing `vllm_omni/deploy/qwen3_omni_duplex.yaml` via
