@@ -155,6 +155,8 @@ def test_ltx_reference_runner_unwraps_audio_only_output() -> None:
     assert sample_rate == 48_000
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_ltx_reference_runner_resolves_gemma4_rope_layer_config(monkeypatch: pytest.MonkeyPatch) -> None:
     from transformers.models.gemma4_unified.modeling_gemma4_unified import (
         Gemma4UnifiedTextRotaryEmbedding,
@@ -213,6 +215,8 @@ def test_ltx_reference_runner_resolves_gemma4_rope_layer_config(monkeypatch: pyt
     assert Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters is installed
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_ltx_reference_runner_preserves_full_attention_rope_width() -> None:
     from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
     from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedTextRotaryEmbedding
