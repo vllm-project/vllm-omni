@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Prefill and decode graphs must qualify against the reference path."""
 
+import asyncio
 from unittest.mock import Mock
 
 import numpy as np
@@ -13,15 +14,18 @@ pytest.importorskip("vllm_ascend")
 from vllm.config import CUDAGraphMode
 
 from tests.helpers.mark import hardware_marks
-from vllm_omni.platforms.npu.worker import prefill_graph, talker_batched_decode, talker_fused_decode
+from vllm_omni.platforms.npu.worker import prefill_graph, prefill_startup, talker_batched_decode, talker_fused_decode
 
 pytestmark = [pytest.mark.core_model, pytest.mark.omni, *hardware_marks(res={"npu": "A3"}, num_cards=1)]
 
 
 @pytest.mark.parametrize("mismatch", [None, "hidden", "kv"])
-def test_startup_prefill_qualifies_before_replay(tmp_path, monkeypatch, mismatch):
+@pytest.mark.parametrize("thinker", [False, True], ids=["talker", "thinker-ngram"])
+def test_startup_prefill_qualifies_before_replay(tmp_path, monkeypatch, mismatch, thinker):
     marker = tmp_path / "prefill"
-    length = prefill_graph.TALKER_STARTUP_LENGTHS.start
+    lengths = prefill_graph.THINKER_STARTUP_LENGTHS if thinker else prefill_graph.TALKER_STARTUP_LENGTHS
+    prefix = prefill_graph.THINKER_STARTUP_PREFIX if thinker else prefill_graph.TALKER_STARTUP_PREFIX
+    length = lengths.start
     output = torch.ones(length, 4, dtype=torch.bfloat16)
     cache = torch.zeros_like(output)
     metadata = Mock(
@@ -41,11 +45,19 @@ def test_startup_prefill_qualifies_before_replay(tmp_path, monkeypatch, mismatch
     model = Mock(spec=["tts_model", "_flush_deferred_cleanup"], side_effect=reference)
     model.tts_model = model
     runner = Mock(
-        spec=["model", "lora_config", "use_aux_hidden_state_outputs", "model_state", "vllm_config"],
+        spec=[
+            "model",
+            "lora_config",
+            "use_aux_hidden_state_outputs",
+            "model_state",
+            "vllm_config",
+            "_thinker_prefill_target_attention",
+        ],
         model=model,
         lora_config=None,
         use_aux_hidden_state_outputs=False,
         model_state=Mock(attn_metadata={"layer": metadata}),
+        _thinker_prefill_target_attention={"layer"},
     )
     batch = Mock(
         num_reqs=1,
@@ -53,10 +65,12 @@ def test_startup_prefill_qualifies_before_replay(tmp_path, monkeypatch, mismatch
         is_dummy=False,
         num_tokens=length,
         num_tokens_after_padding=length,
-        req_ids=[f"{prefill_graph.TALKER_STARTUP_PREFIX}0"],
+        req_ids=[f"{prefix}0"],
     )
 
     class Graph:
+        skip_compiled = False
+
         def __init__(self, *args, **kwargs):
             self.hidden = output + (1 if mismatch == "hidden" else 0)
             self.kv = [("layer", cache)]
@@ -69,17 +83,20 @@ def test_startup_prefill_qualifies_before_replay(tmp_path, monkeypatch, mismatch
             pass
 
     monkeypatch.setattr(prefill_graph, "PrefillGraph", Graph)
-    monkeypatch.setattr(prefill_graph, "get_forward_context", lambda: Mock(slot_mapping={}))
+    context = Mock(slot_mapping={}, attn_metadata={"layer": metadata}, skip_compiled=False)
+    monkeypatch.setattr(prefill_graph, "get_forward_context", lambda: context)
     monkeypatch.setattr(torch.npu, "Stream", lambda: None)
     monkeypatch.setattr(torch.npu, "mem_get_info", lambda: (8 * 1024**3, 16 * 1024**3))
     inputs = {"model_intermediate_buffer": [{}], "inputs_embeds": output, "positions": torch.arange(length)}
+    if thinker:
+        inputs["input_ids"] = torch.arange(length)
     descriptor = Mock(cg_mode=CUDAGraphMode.NONE)
-    assert prefill_graph.run_prefill(runner, inputs, batch, descriptor, startup_path=marker) is None
+    assert prefill_graph.run_prefill(runner, inputs, batch, descriptor, startup_path=marker, thinker=thinker) is None
     marker.touch()
-    first = prefill_graph.run_prefill(runner, inputs, batch, descriptor, startup_path=marker)
+    first = prefill_graph.run_prefill(runner, inputs, batch, descriptor, startup_path=marker, thinker=thinker)
     assert first is output and model.call_count == 1
     marker.unlink()
-    second = prefill_graph.run_prefill(runner, inputs, batch, descriptor, startup_path=marker)
+    second = prefill_graph.run_prefill(runner, inputs, batch, descriptor, startup_path=marker, thinker=thinker)
     if mismatch:
         assert runner._exact_prefill_disabled and second is None
         assert not runner._exact_prefill_passed
@@ -87,6 +104,28 @@ def test_startup_prefill_qualifies_before_replay(tmp_path, monkeypatch, mismatch
         assert runner._exact_prefill_passed == {length}
         assert torch.equal(second, output) and second.data_ptr() != output.data_ptr()
         assert model.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_shared_prefill_startup_runs_once_and_waits_for_completion(tmp_path, monkeypatch):
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    calls = []
+
+    async def warmup(engine):
+        calls.append(engine)
+        entered.set()
+        await finish.wait()
+
+    monkeypatch.setattr(prefill_startup, "_run_prefill_precapture", warmup)
+    first = asyncio.create_task(prefill_startup.precapture_prefill("first", shared_dir=str(tmp_path)))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    second = asyncio.create_task(prefill_startup.precapture_prefill("second", shared_dir=str(tmp_path)))
+    await asyncio.sleep(0)
+    assert not second.done()
+    finish.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
+    assert calls == ["first"]
 
 
 @pytest.mark.parametrize("matches", [False, True])

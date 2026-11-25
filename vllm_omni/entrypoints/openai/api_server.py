@@ -300,12 +300,15 @@ def _own_reuseport_socket(sock: socket.socket, client_count: int) -> socket.sock
         return sock
     if sock.family not in (socket.AF_INET, socket.AF_INET6):
         return sock
+    reuseport = getattr(socket, "SO_REUSEPORT", None)
+    if reuseport is None:
+        return sock
     try:
-        if not sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT):
+        if not sock.getsockopt(socket.SOL_SOCKET, reuseport):
             return sock
         own = socket.socket(family=sock.family, type=socket.SOCK_STREAM)
         own.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        own.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        own.setsockopt(socket.SOL_SOCKET, reuseport, 1)
         own.bind(sock.getsockname()[:2])
     except OSError as e:
         logger.warning("Per-server reuseport listener unavailable (%s); sharing the inherited socket", e)
@@ -480,9 +483,12 @@ async def omni_run_server_worker(
         await omni_init_app_state(engine_client, app.state, args)
 
         if os.getenv("MINICPMO_NPU_THINKER_PREFILL_STARTUP") or os.getenv("MINICPMO_NPU_TALKER_PREFILL_STARTUP"):
-            from vllm_omni.platforms.npu.worker.prefill_startup import precapture_prefill
+            if getattr(engine_client, "session_only", False):
+                logger.info("Skipping prefill precapture on the session-only frontend")
+            else:
+                from vllm_omni.platforms.npu.worker.prefill_startup import precapture_prefill
 
-            await precapture_prefill(engine_client)
+                await precapture_prefill(engine_client, shared_dir=getattr(args, "_omni_api_server_shared_dir", None))
 
         # Complete the configured video request before serve_http can expose
         # /health or admit user traffic. Failure unwinds the engine context.
@@ -673,7 +679,7 @@ async def build_async_omni(
 
     async with AsyncExitStack() as stack:
         deploy_config = getattr(args, "deploy_config", None)
-        if deploy_config:
+        if deploy_config and not getattr(args, "_omni_api_server_shared_dir", None):
             from vllm_omni.platforms import current_omni_platform
 
             if current_omni_platform.is_npu():

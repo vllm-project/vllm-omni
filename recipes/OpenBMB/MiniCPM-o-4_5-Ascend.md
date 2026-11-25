@@ -17,8 +17,9 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 vllm serve openbmb/MiniCPM-o-4_5 \
 ```
 
 Use a local model directory in place of the model ID for offline serving.
-Wait for `/health` before sending requests. The deployment qualifies prefill
-graphs during startup.
+Wait for `/health` before sending requests. The chat-capable frontend qualifies
+prefill graphs during startup. The session-only frontend selected by
+`--duplex-engine-backend-as-process` skips this warmup.
 
 ## Optional Thinker DSpark
 

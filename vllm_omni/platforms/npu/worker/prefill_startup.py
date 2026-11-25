@@ -8,6 +8,7 @@ from contextlib import aclosing
 from pathlib import Path
 
 import torch
+from filelock import AsyncFileLock
 from vllm import SamplingParams
 from vllm.logger import init_logger
 
@@ -22,13 +23,32 @@ from vllm_omni.platforms.npu.worker.prefill_graph import (
 logger = init_logger(__name__)
 
 
-async def precapture_prefill(engine):
+async def precapture_prefill(engine, *, shared_dir: str | None = None):
+    if shared_dir is None:
+        await _run_prefill_precapture(engine)
+        return
+
+    directory = Path(shared_dir)
+    done = directory / "minicpmo-prefill.done"
+    async with AsyncFileLock(directory / "minicpmo-prefill.lock"):
+        if not done.exists():
+            await _run_prefill_precapture(engine)
+            done.touch()
+
+
+async def _run_prefill_precapture(engine):
     if "MiniCPMO45" not in str(engine.model_config.architectures):
         raise ValueError("Prefill precapture requires MiniCPM-o 4.5")
     if marker := os.getenv("MINICPMO_NPU_THINKER_PREFILL_STARTUP"):
         await _precapture_thinker_prefill(engine, Path(marker))
     if marker := os.getenv("MINICPMO_NPU_TALKER_PREFILL_STARTUP"):
         await _precapture_talker_prefill(engine, Path(marker))
+
+
+async def _drain_prefill(stream):
+    async with aclosing(stream) as outputs:
+        async for _ in outputs:
+            pass
 
 
 async def _precapture_thinker_prefill(engine, marker):
@@ -51,10 +71,7 @@ async def _precapture_thinker_prefill(engine, marker):
                 request_id=request_id,
                 output_modalities=["text"],
             )
-            async with aclosing(stream) as outputs:
-                async with asyncio.timeout(30):
-                    async for _ in outputs:
-                        pass
+            await asyncio.wait_for(_drain_prefill(stream), timeout=30)
     finally:
         marker.unlink()
     logger.info("[thinker-prefill-startup] finished synthetic prefill requests")
@@ -97,10 +114,7 @@ async def _precapture_talker_prefill(engine, marker):
                     output_modalities=["audio"],
                     entry_stage_id=1,
                 )
-                async with aclosing(stream) as outputs:
-                    async with asyncio.timeout(30):
-                        async for _ in outputs:
-                            pass
+                await asyncio.wait_for(_drain_prefill(stream), timeout=30)
     finally:
         marker.unlink()
     logger.info("[talker-prefill-startup] finished synthetic handoffs")

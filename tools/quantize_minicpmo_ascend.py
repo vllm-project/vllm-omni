@@ -16,7 +16,7 @@ from safetensors.torch import save_file
 _INDEX = "model.safetensors.index.json"
 
 
-def quantize_shard(source: Path, destination: Path) -> tuple[int, int]:
+def quantize_shard(source: Path, destination: Path) -> tuple[int, int, list[str]]:
     tensors = {}
     linear_layers = 0
     with safe_open(str(source), framework="pt", device="cpu") as shard:
@@ -32,7 +32,7 @@ def quantize_shard(source: Path, destination: Path) -> tuple[int, int]:
                 linear_layers += 1
             tensors[name] = tensor
         save_file(tensors, destination, metadata={"format": "pt"})
-    return sum(tensor.nbytes for tensor in tensors.values()), linear_layers
+    return sum(tensor.nbytes for tensor in tensors.values()), linear_layers, list(tensors)
 
 
 def export_checkpoint(source: Path, output: Path) -> None:
@@ -42,9 +42,11 @@ def export_checkpoint(source: Path, output: Path) -> None:
 
     index = json.loads((source / _INDEX).read_text())
     shards = sorted(set(index["weight_map"].values()))
+    weight_map = {}
     total_size = linear_layers = 0
     for shard in shards:
-        size, layers = quantize_shard(source / shard, output / shard)
+        size, layers, names = quantize_shard(source / shard, output / shard)
+        weight_map.update(dict.fromkeys(names, shard))
         total_size += size
         linear_layers += layers
         print(f"{shard}: quantized {layers} Thinker projections", flush=True)
@@ -97,7 +99,7 @@ def export_checkpoint(source: Path, output: Path) -> None:
         ],
         "global_group": None,
     }
-    # vLLM discovers scale and offset tensors in the indexed weight shards.
+    index["weight_map"] = weight_map
     index["metadata"]["total_size"] = total_size
     (output / _INDEX).write_text(json.dumps(index, indent=2), encoding="utf-8")
     (output / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")

@@ -165,7 +165,7 @@ def run_prefill(runner, model_inputs, batch, desc, *, startup_path, thinker=Fals
         or batch.is_dummy
         or desc.cg_mode != CUDAGraphMode.NONE
         or runner.lora_config is not None
-        or runner.use_aux_hidden_state_outputs != thinker
+        or (not thinker and runner.use_aux_hidden_state_outputs)
         or getattr(runner, "_exact_prefill_disabled", False)
         or model_inputs.get("intermediate_tensors") is not None
     ):
