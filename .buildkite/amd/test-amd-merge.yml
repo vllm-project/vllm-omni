@@ -8,6 +8,44 @@ steps:
 
 - group: ":test_tube: ROCm advanced-entrypoints MERGE"
   steps:
+    - label: "MERGE · Qwen3-Omni Realtime WebSocket · 2-GPU"
+      agent_pool: mi300_2
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 90
+      source_file_dependencies:
+        - entrypoints_function
+        - omni_qwen3_omni_function
+        - engine_model_executor_worker_function
+        - tests/helpers/
+        - tests/conftest.py
+        - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
+        - tests/assets/livekit/
+        - tests/assets/minicpmo_4_5/
+        - vllm_omni/deploy/
+        - vllm_omni/config/
+        - vllm_omni/protocol/
+        - pyproject.toml
+        - .buildkite/amd/collections/qwen3-omni-realtime.txt
+        - .buildkite/amd/test-amd-merge.yml
+      artifact_paths:
+        - "artifacts/rocm-merge-qwen3-omni-realtime/**/*"
+      env:
+        QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-merge-qwen3-omni-realtime"
+        QWEN3_OMNI_EXPECTED_GPUS: "2"
+        QWEN3_OMNI_EXPECTED_TESTS: "8"
+        QWEN3_OMNI_EXPECTED_RESULTS: "0"
+        QWEN3_OMNI_EXPECTED_NODES: ".buildkite/amd/collections/qwen3-omni-realtime.txt"
+        QWEN3_OMNI_RUN_LEVEL: "advanced_model"
+        QWEN3_OMNI_MARK_EXPRESSION: "advanced_model and omni and rocm and MI325 and cards_2"
+        QWEN3_OMNI_TEST_TARGET: "tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py"
+        QWEN3_OMNI_TIMEOUT: "75m"
+      commands:
+        # One pytest invocation keeps the existing async-chunk server fixture shared.
+        # The CUDA-only cold-JIT case is deliberately outside this ROCm selection.
+        - bash .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
+
     - label: "MERGE · Advanced Entrypoint Sleep/Wake · 1-GPU"
       agent_pool: mi300_1
       depends_on: amd-build
