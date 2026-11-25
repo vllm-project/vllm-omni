@@ -384,10 +384,13 @@ def run_fused_step(runner, mode_path, batch_desc, model_inputs, batch, run_model
     def baseline():
         return runner._run_kstep_frames(model_inputs, batch, run_model=run_model)
 
-    try:
-        mode = Path(mode_path).read_text().strip()
-    except FileNotFoundError:
-        return baseline()
+    if mode_path is None:
+        mode = (runner.vllm_config.additional_config or {}).get("minicpmo_talker_fused_decode")
+    else:
+        try:
+            mode = Path(mode_path).read_text().strip()
+        except FileNotFoundError:
+            return baseline()
     if mode not in (
         "shadow",
         "active",
@@ -419,7 +422,7 @@ def run_fused_step(runner, mode_path, batch_desc, model_inputs, batch, run_model
     if tail:
         graph_name = "_talker_fused_tail_graph"
     model_len = runner.model_config.max_model_len
-    hybrid = hybrid_enabled(model_len)
+    hybrid = hybrid_enabled(runner)
     if model_len != CAPACITY and not hybrid:
         return baseline()
     length = None

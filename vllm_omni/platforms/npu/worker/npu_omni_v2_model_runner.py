@@ -541,7 +541,8 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
             return hidden
 
         mode_path = os.getenv("MINICPMO_NPU_TALKER_FUSED_MODE_FILE")
-        if mode_path and static_replay:
+        options = self.vllm_config.additional_config or {}
+        if static_replay and (mode_path or options.get("minicpmo_talker_fused_decode")):
             from vllm_omni.platforms.npu.worker.talker_fused_decode import run_fused_step
 
             return run_fused_step(self, mode_path, batch_desc, model_inputs, input_batch, run_model)
@@ -655,7 +656,11 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         # live on the inner talker, which the wrapper only partially forwards.
         codec_model = getattr(self.model, "talker", self.model)
         frame_forward = None
-        if using_full_graph and os.getenv("MINICPMO_NPU_TALKER_NARROW_C8_MODE_FILE") is not None:
+        options = self.vllm_config.additional_config or {}
+        if using_full_graph and (
+            options.get("minicpmo_talker_compact_decode")
+            or os.getenv("MINICPMO_NPU_TALKER_NARROW_C8_MODE_FILE") is not None
+        ):
             from vllm_omni.platforms.npu.worker.talker_batched_decode import prepare
 
             frame_forward = prepare(self, codec_model, model_inputs, input_batch, width)

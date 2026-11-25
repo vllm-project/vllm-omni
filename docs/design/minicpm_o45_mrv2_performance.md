@@ -196,7 +196,7 @@ visible NPU and one replica of Talker and Code2Wav on each NPU. It inherits
 the common stage settings from `minicpmo_4_5.yaml`. The
 [Ascend deployment recipe](gh-file:recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md)
 uses the original checkpoint and Ngram by default. It documents optional
-Thinker DSpark and INT8 W8A8.
+Thinker DSpark.
 
 ## Thinker prefix cache with drafts
 

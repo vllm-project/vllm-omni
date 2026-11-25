@@ -299,6 +299,11 @@ class StagePool:
         self._strict_watermarking = strict_watermarking
         self._watermark_lock = asyncio.Lock()
         self._next_replica_id = 0
+        options = getattr(stage_vllm_config, "additional_config", None)
+        if not isinstance(options, Mapping):
+            options = {}
+        self._c8_route_mode = options.get("minicpmo_talker_replica_route") if stage_id == 1 else None
+        self._c8_vocoder_route_mode = options.get("minicpmo_vocoder_replica_route") if stage_id == 2 else None
         mode_file = environ.get("MINICPMO_C8_TALKER_ROUTE_FILE") if stage_id == 1 else None
         self._c8_route_file = Path(mode_file) if mode_file else None
         self._c8_route_run = None
@@ -1083,14 +1088,16 @@ class StagePool:
         return len(self._session_bindings)
 
     def _c8_experimental_talker_replica(self, live: list[int]) -> int | None:
-        """Optional local experiment; choose only for previously unbound requests."""
-        if self._c8_route_file is None or self.stage_id != 1 or set(live) != {0, 1}:
+        """Apply the configured split to previously unbound Talker requests."""
+        if self.stage_id != 1 or set(live) != {0, 1}:
             return None
-        try:
-            mode, arm = self._c8_route_file.read_text().split()
-        except (OSError, ValueError):
-            return None
-        if mode not in {"primary", "quarter", "half", "secondary"}:
+        mode, arm = self._c8_route_mode, "deployment"
+        if self._c8_route_file is not None:
+            try:
+                mode, arm = self._c8_route_file.read_text().split()
+            except (OSError, ValueError):
+                return None
+        if mode not in ("primary", "quarter", "half", "secondary"):
             return None
         if (mode, arm) != self._c8_route_run:
             self._c8_route_run = (mode, arm)
@@ -1107,17 +1114,21 @@ class StagePool:
 
     def select_experimental_code2wav_replica(self, request_id: str) -> int | None:
         """Pin an HTTP turn at prewarm, before the Talker is assigned at text handoff."""
-        if self._c8_vocoder_route_file is None or set(self.available_replica_ids()) != {0, 1}:
+        if (self._c8_vocoder_route_file is None and self._c8_vocoder_route_mode is None) or set(
+            self.available_replica_ids()
+        ) != {0, 1}:
             return None
         existing = self.get_bound_replica_id(request_id)
         if existing is not None:
             return existing
         if request_id in self._requested_replica_ids:
             return None
-        try:
-            mode, arm = self._c8_vocoder_route_file.read_text().split()
-        except (OSError, ValueError):
-            return None
+        mode, arm = self._c8_vocoder_route_mode, "deployment"
+        if self._c8_vocoder_route_file is not None:
+            try:
+                mode, arm = self._c8_vocoder_route_file.read_text().split()
+            except (OSError, ValueError):
+                return None
         if mode not in ("primary", "secondary", "eighth", "quarter", "adaptive", "adaptive_secondary"):
             return None
         if (mode, arm) != self._c8_vocoder_route_run:

@@ -676,13 +676,22 @@ async def build_async_omni(
         forkserver.ensure_running()
         logger.debug("Forkserver setup complete!")
 
-    # Context manager to handle async_omni lifecycle
-    # Ensures everything is shutdown and cleaned up on error/exit
-    async with build_async_omni_from_stage_config(
-        args,
-        disable_frontend_multiprocessing=bool(disable_frontend_multiprocessing),
-        client_config=client_config,
-    ) as async_omni:
+    async with AsyncExitStack() as stack:
+        deploy_config = getattr(args, "deploy_config", None)
+        if deploy_config:
+            from vllm_omni.platforms import current_omni_platform
+
+            if current_omni_platform.is_npu():
+                from vllm_omni.model_executor.models.minicpmo_4_5.config import npu_prefill_startup_environment
+
+                stack.enter_context(npu_prefill_startup_environment(deploy_config))
+        async_omni = await stack.enter_async_context(
+            build_async_omni_from_stage_config(
+                args,
+                disable_frontend_multiprocessing=bool(disable_frontend_multiprocessing),
+                client_config=client_config,
+            )
+        )
         yield async_omni
 
 

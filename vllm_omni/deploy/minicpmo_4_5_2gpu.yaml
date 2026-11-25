@@ -40,16 +40,27 @@ platforms:
           encoder_enable_npu_graph: true
           encoder_max_npu_graphs: 4
           minicpmo_long_prefill_eager: true
+          minicpmo_prefill_precapture: true
           minicpmo_request_rope: true
           minicpmo_resampler_max_frames: 16
+        env:
+          MINICPMO_NPU_DSPARK_NATIVE_GATHER: "1"
       - stage_id: 1
         devices: "1,0"
         num_replicas: 2
         max_num_seqs: 16
         additional_config:
+          minicpmo_prefill_precapture: true
+          minicpmo_talker_compact_decode: active_fixed_padded
+          minicpmo_talker_fused_decode: tail_capacity
+          minicpmo_talker_hybrid_context: true
+          minicpmo_talker_replica_route: half
           minicpmo_talker_short_prefill_eager: true
           minicpmo_talker_refill_coalesce: true
           minicpmo_talker_wide_graph_capacity: 256
+        env:
+          MINICPMO_NPU_KSTEP_SKIP_TERMINAL_TAIL: "1"
+          MINICPMO_TALKER_STATIC_EXCLUDED_OP: ScatterPaKvCache
       - stage_id: 2
         devices: "0,1"
         num_replicas: 2
@@ -58,6 +69,7 @@ platforms:
           code2wav_enable_npu_graph: true
           cfm_graph_batch_buckets: [1, 2, 4, 8]
           code2wav_max_npu_graphs: 96
+          minicpmo_vocoder_replica_route: adaptive_secondary
         env:
           MINICPMO_C8_SECONDARY_VOCODER_HOST_CACHE: "1"
           MINICPMO_C8_SECONDARY_VOCODER_TIGHT_MEMORY: "1"

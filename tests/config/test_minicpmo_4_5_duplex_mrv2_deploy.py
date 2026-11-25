@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Resolve the MiniCPM-o default duplex deployment's CUDA and non-CUDA runners."""
 
+import os
+from pathlib import Path
+
 import pytest
 
 from tests.helpers.stage_config import get_deploy_config_path
@@ -14,6 +17,7 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
 from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
+from vllm_omni.model_executor.models.minicpmo_4_5.config import npu_prefill_startup_environment
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
 from vllm_omni.platforms import current_omni_platform
 
@@ -82,9 +86,18 @@ def test_two_card_deploy_inherits_common_npu_settings(monkeypatch) -> None:
     thinker, talker, vocoder = stages
     assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
     assert thinker.yaml_engine_args["max_model_len"] == 40960
+    assert thinker.yaml_engine_args["speculative_config"]["method"] == "ngram"
+    assert thinker.yaml_runtime["env"]["MINICPMO_NPU_DSPARK_NATIVE_GATHER"] == "1"
     assert thinker.yaml_engine_args["interleave_mm_strings"] is True
     assert thinker.yaml_engine_args["media_io_kwargs"]["video"] == {"fps": 1, "num_frames": 128}
     assert talker.yaml_runtime["num_replicas"] == 2
+    assert talker.yaml_runtime["env"]["MINICPMO_NPU_KSTEP_SKIP_TERMINAL_TAIL"] == "1"
+    options = talker.yaml_engine_args["additional_config"]
+    assert options["minicpmo_talker_fused_decode"] == "tail_capacity"
+    assert options["minicpmo_talker_compact_decode"] == "active_fixed_padded"
+    assert options["minicpmo_talker_hybrid_context"] is True
+    assert options["minicpmo_talker_replica_route"] == "half"
+    assert vocoder.yaml_engine_args["additional_config"]["minicpmo_vocoder_replica_route"] == "adaptive_secondary"
     assert (vocoder.yaml_runtime["devices"], vocoder.yaml_runtime["num_replicas"]) == ("0,1", 2)
     assert vocoder.yaml_runtime["env"] == {
         "MINICPMO_C8_SECONDARY_VOCODER_HOST_CACHE": "1",
@@ -98,6 +111,23 @@ def test_two_card_deploy_inherits_common_npu_settings(monkeypatch) -> None:
     assert extra["token2wav_setup_host_cache_size"] == 512
     assert extra["token2wav_runtime_prompt_cache_size"] == 512
     assert "code2wav_encoder_graph_singleton_history_frames" not in extra
+
+
+def test_two_card_prefill_startup_uses_private_markers(monkeypatch) -> None:
+    keys = ("MINICPMO_NPU_THINKER_PREFILL_STARTUP", "MINICPMO_NPU_TALKER_PREFILL_STARTUP")
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+    with npu_prefill_startup_environment(get_deploy_config_path(_DEPLOY)):
+        assert all(key not in os.environ for key in keys)
+
+    with npu_prefill_startup_environment(get_deploy_config_path("minicpmo_4_5_2gpu.yaml")):
+        thinker, talker = (Path(os.environ[key]) for key in keys)
+        assert thinker.parent == talker.parent and thinker != talker
+        assert not thinker.exists() and not talker.exists()
+        talker.touch()
+
+    assert all(key not in os.environ for key in keys)
+    assert not talker.parent.exists()
 
 
 @pytest.mark.parametrize(("cards", "code2wav_device"), [(2, "1"), (3, "2")])

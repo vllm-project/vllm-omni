@@ -266,12 +266,19 @@ def _compare_padded_frame(actual, reference, kv, expected_kv, slots):
 
 def prepare(runner, talker, model_inputs, input_batch, width):
     rows = input_batch.num_reqs
-    if MODE is None or width != 16 or input_batch.has_prefill or not 2 <= rows <= 16:
+    if width != 16 or input_batch.has_prefill or not 2 <= rows <= 16:
         return None
-    try:
-        mode, _, variant = Path(MODE).read_text().strip().partition("_")
-    except FileNotFoundError:
+    if MODE is None:
+        options = runner.vllm_config.additional_config or {}
+        selected_mode = options.get("minicpmo_talker_compact_decode", "")
+    else:
+        try:
+            selected_mode = Path(MODE).read_text().strip()
+        except FileNotFoundError:
+            return None
+    if not isinstance(selected_mode, str):
         return None
+    mode, _, variant = selected_mode.partition("_")
     if (
         mode not in ("shadow", "active")
         or variant not in ("", "fixed", "fixed_rope", "fixed_wide", "fixed_padded")
@@ -304,7 +311,7 @@ def prepare(runner, talker, model_inputs, input_batch, width):
 
     full_capacity = SHORT_CONTEXT
     model_len = runner.model_config.max_model_len
-    hybrid = hybrid_enabled(model_len)
+    hybrid = hybrid_enabled(runner)
     if model_len != full_capacity and not hybrid:
         return None
     length = scheduled_length(input_batch, rows, width)

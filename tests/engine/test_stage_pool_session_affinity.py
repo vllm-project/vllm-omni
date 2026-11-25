@@ -58,6 +58,29 @@ def test_code2wav_adaptive_route_uses_live_and_reserved_turns(
         assert pool.select_experimental_code2wav_replica("active-0") == 0
 
 
+def test_minicpmo_routes_use_deployment_without_mode_files(monkeypatch, mocker):
+    monkeypatch.delenv("MINICPMO_C8_TALKER_ROUTE_FILE", raising=False)
+    monkeypatch.delenv("MINICPMO_C8_VOCODER_ROUTE_FILE", raising=False)
+    talker = StagePool(
+        1,
+        [_Replica(), _Replica()],
+        stage_vllm_config=mocker.Mock(additional_config={"minicpmo_talker_replica_route": "half"}),
+    )
+    assert [talker.select_replica_id(f"talker-{i}") for i in range(4)] == [0, 1, 0, 1]
+    assert talker._c8_route_counts == [2, 2]
+
+    vocoder = StagePool(
+        2,
+        [_Replica(), _Replica()],
+        stage_vllm_config=mocker.Mock(additional_config={"minicpmo_vocoder_replica_route": "adaptive_secondary"}),
+    )
+    for i in range(22):
+        vocoder.bind_requested_replica(f"active-{i}", 0)
+    for i in range(7):
+        vocoder.reserve_requested_replica(f"reserved-{i}", 1)
+    assert vocoder.select_experimental_code2wav_replica("new") == 1
+
+
 def test_a_follow_up_lands_on_the_replica_that_holds_the_session(mocker):
     pool = _pool(mocker)
     first = pool.select_replica_id("r1", session_id="s1")
