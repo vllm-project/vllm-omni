@@ -44,7 +44,7 @@ import pytest
 from tests.e2e.accuracy import helpers as _acc_bench
 from tests.e2e.accuracy.helpers import build_acc_benchmark_cli_argv, find_vllm_cli
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServerParams
+from tests.helpers.runtime import QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S, OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.platforms import current_omni_platform
 
@@ -57,7 +57,15 @@ pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 stage_configs = [get_deploy_config_path("qwen3_omni_moe.yaml")]
 
 test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
+    # Cold NFS loading of the 65.7 GiB checkpoint can take over 500 s, before
+    # compilation and graph capture. Match the async performance startup budget.
+    OmniServerParams(
+        model=model,
+        stage_config_path=stage_config,
+        stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None),
+    )
+    for model in models
+    for stage_config in stage_configs
 ]
 
 

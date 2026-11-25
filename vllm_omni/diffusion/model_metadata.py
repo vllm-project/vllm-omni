@@ -44,6 +44,10 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos/depth`` may serve this model: it takes one video path
     # and returns a ``video_depth`` payload of per-frame depth maps.
     supports_video_depth: bool = False
+    # Frame rate at which the worker muxes a pre-encoded MP4. When set, the video
+    # API's complete-MP4 requests pre-encode on the worker unless they opt out,
+    # ask for another frame rate, or enable frame interpolation.
+    preencode_mp4_default_fps: float | None = None
 
     def default_attention_backend(self, capability_major: int | None) -> str | None:
         """This model's default attention backend on a CUDA device of ``capability_major``, if it has one."""
@@ -116,6 +120,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_latent_mask_editing=True,
         supports_timeline_guides=True,
         supports_latent_continuation=True,
+        preencode_mp4_default_fps=24.0,
         final_output_type="video",
         # H3 represents alignment padding as a second packed sequence.  The
         # packed TRTLLM backend consumes cu_seqlens and isolates that padding.
@@ -135,6 +140,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_latent_mask_editing=True,
         supports_timeline_guides=True,
         supports_latent_continuation=True,
+        preencode_mp4_default_fps=24.0,
         final_output_type="video",
         attention_mask_free=True,
         default_attention_backends=((10, "FLASHINFER_ATTN"),),

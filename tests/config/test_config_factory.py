@@ -1832,6 +1832,14 @@ stages:
         assert deploy.stages[0].compilation_config == {"pass_config": {"fuse_allreduce_rms": False}}
         assert "compilation_config" not in deploy.stages[0].engine_extras
 
+    def test_glm_tts_stage_zero_scopes_eager_quality_contract_to_rocm(self):
+        deploy_path = Path(get_deploy_config_path("glm_tts.yaml"))
+        cuda_deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        rocm_deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
+
+        assert cuda_deploy.stages[0].enforce_eager is False
+        assert rocm_deploy.stages[0].enforce_eager is True
+
     def test_load_voxcpm2_deploy_config_preserves_engine_extras(self):
         deploy_path = get_deploy_config_path("voxcpm2.yaml")
         raw_stage = get_deploy_config_stage("voxcpm2.yaml", 0)
