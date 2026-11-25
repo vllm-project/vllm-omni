@@ -68,7 +68,9 @@ def wait_for_engine_startup_with_deadline(
     timer.start()
     try:
         try:
-            wait_for_engine_startup(handshake_socket, core_engines, parallel_config, coordinated_dp, cache_config, launch)
+            wait_for_engine_startup(
+                handshake_socket, core_engines, parallel_config, coordinated_dp, cache_config, launch
+            )
         finally:
             timer.cancel()
             # A callback that passed the cancellation check can still kill
