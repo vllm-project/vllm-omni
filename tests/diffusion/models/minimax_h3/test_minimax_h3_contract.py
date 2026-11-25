@@ -4,6 +4,7 @@
 import json
 import sys
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from typing import Any, TypeVar
@@ -720,6 +721,12 @@ def test_encoder_task_validation_and_transformer_routing():
     with pytest.raises(OmniClientError, match="serves"):
         pipeline._resolve_task("ref2va", {}, turbo_spec=fl2v_spec)
     assert pipeline._resolve_task("ref2va", {"image": object()}, turbo_spec=ref2v_spec) == "ref2va"
+    # LightX2V's 8step v1.2 artifact serves ref2va only after the loader marks
+    # it as bound to the Ref2VA base; combined routes ref2va through
+    # ``transformers_ref``, which the adapter never binds to.
+    v1_2_spec = _turbo_spec("minimax_h3_fl2v_turbo_8step_v1.2_768p_bf16.safetensors")
+    with pytest.raises(OmniClientError, match="serves"):
+        pipeline._resolve_task("ref2va", {"image": object()}, turbo_spec=v1_2_spec)
     assert pipeline._resolve_task("t2va") == "t2va"
     assert pipeline._resolve_task("fl2va") == "fl2va"
     assert pipeline._resolve_task("ref2va") == "ref2va"
@@ -738,6 +745,12 @@ def test_encoder_task_validation_and_transformer_routing():
     pipeline.supported_tasks = frozenset({"ref2va"})
     assert pipeline._resolve_task("ref2va") == "ref2va"
     assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "ref2va"
+    assert (
+        pipeline._resolve_task(
+            "ref2va", {"image": object()}, turbo_spec=replace(v1_2_spec, ref2va_base=True)
+        )
+        == "ref2va"
+    )
 
     pipeline.partition = "combined"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})

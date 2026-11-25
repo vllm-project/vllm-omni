@@ -68,6 +68,13 @@ class TurboSpec:
     audio_shift: float
     rank: int
     alpha: float
+    ref2va_base: bool = False
+    """Set by the loader when this adapter binds to the Ref2VA base DiT.
+
+    LightX2V's 8step v1.2 release also supports Ref2VA generation on the
+    Ref2VA base (``transformer_ref``); there the artifact serves ref2va only.
+    Off the Ref2VA base the same artifact keeps serving t2va and fl2va.
+    """
 
     @property
     def sigma_points(self) -> int:
@@ -76,7 +83,8 @@ class TurboSpec:
 
     @property
     def supported_tasks(self) -> frozenset[str]:
-        if self.task_family == "ref2v":
+        """Tasks the artifact serves on the base it is bound to."""
+        if self.task_family == "ref2v" or self.ref2va_base:
             return frozenset({"ref2va"})
         return frozenset({"t2va", "fl2va"})
 
@@ -371,7 +379,12 @@ def load_minimax_h3_turbo_lora(
             raise ValueError(f"MiniMax-H3 Turbo alpha must be a positive number, got {raw_alpha!r}")
 
         if partition == "ref2va" and spec.task_family == "fl2v":
-            raise ValueError(f"{spec.filename} is an FL2VA/T2VA Turbo artifact; a Ref2VA-only server cannot serve it.")
+            # LightX2V's 8step v1.2 release announcement also covers Ref2VA
+            # generation on the Ref2VA base DiT; every other FL2VA/T2VA
+            # artifact stays FL2VA-partition-only.
+            if spec.filename != _TURBO_V1_2_8STEP_FILENAME:
+                raise ValueError(f"{spec.filename} is an FL2VA/T2VA Turbo artifact; a Ref2VA-only server cannot serve it.")
+            spec = replace(spec, ref2va_base=True)
         # ``combined`` serves ref2va from ``transformers_ref``, but the LoRA
         # target pattern only injects into ``transformer``: the adapter would
         # bind to the stack that never runs.
