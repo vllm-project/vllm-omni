@@ -46,7 +46,10 @@ def get_stage_connector_role(model_config: Any) -> str | None:
 
 def stage_receives_chunks(model_config: Any) -> bool:
     """Whether connector chunks, rather than the orchestrator, feed a stage."""
-    return bool(getattr(model_config, "async_chunk", True)) and get_stage_connector_role(model_config) != "sender"
+    return bool(getattr(model_config, "async_chunk", True)) and get_stage_connector_role(model_config) not in {
+        "sender",
+        "none",
+    }
 
 
 def stage_sends_async_output(model_config: Any) -> bool:

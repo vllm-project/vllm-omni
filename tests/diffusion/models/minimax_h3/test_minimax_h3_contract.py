@@ -1918,6 +1918,53 @@ def test_rainfusion_packed_padding_stays_mask_free_on_unaligned_lengths():
     assert metadata.extra["valid_kv_length"] == 5
 
 
+def test_sage_packed_padding_publishes_valid_kv_length_instead_of_a_mask():
+    """SAGE_ATTN rejects attn_mask, so an unaligned H3 request must reach it as a K/V prefix.
+
+    Drives the real backend class through the packed path: before SAGE_ATTN
+    advertised supports_prefix_kv_slicing, every request whose packed length
+    was not 64-aligned failed with "does not support attn_mask".
+    """
+    from vllm_omni.diffusion.attention.backends.sage_attn import SageAttentionBackend
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+    )
+
+    class FakeAttention(torch.nn.Module):
+        attn_backend = SageAttentionBackend
+
+        def __init__(self):
+            super().__init__()
+            self.metadata = None
+
+        def effective_attention(self):
+            return self, self.attn_backend, None
+
+        def forward(self, query, key, value, metadata):
+            self.metadata = metadata
+            return query
+
+    attention = object.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.attention = FakeAttention()
+    q = torch.randn(8, 2, 4)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        # One request: 5 valid rows padded to the 8-row alignment boundary.
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=8,
+    )
+
+    metadata = attention.attention.metadata
+    assert metadata is not None
+    assert metadata.attn_mask is None
+    assert metadata.extra["valid_kv_length"] == 5
+
+
 def _packed_backend(name: str, *, mask_free=False, prefix_kv_slicing=False, multi_doc=False):
     class FakeBackend:
         supports_prefix_kv_slicing = prefix_kv_slicing

@@ -46,7 +46,7 @@ def test_x_to_text_model_family(monkeypatch: pytest.MonkeyPatch, config: dict[st
 def test_bagel_x_to_text_prompt_builder() -> None:
     prompt, stop_token_ids = build_x_to_text_prompt("bagel", "unused", "Describe it.", has_image=True)
     assert prompt == {
-        "prompt": "<|im_start|>user\n<|image_pad|>\nDescribe it.<|im_end|>\n<|im_start|>assistant\n",
+        "prompt": "<|image_pad|><|im_start|>Describe it.<|im_end|><|im_start|>",
         "modalities": ["text"],
     }
     assert stop_token_ids is None
@@ -297,6 +297,21 @@ def test_reference_image_size_policy_threads_revision(monkeypatch: pytest.Monkey
         revision="pinned-revision",
     )
     assert captured == {"model": "org/model", "revision": "pinned-revision"}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("model_class_name", "preserves"),
+    [
+        ("Cosmos3OmniDiffusersPipeline", True),
+        ("Cosmos3OmniPipeline", True),
+        # Sim-Bimanual uses the requested output geometry as given.
+        ("Cosmos3NanoSimBimanualPipeline", False),
+    ],
+)
+def test_cosmos3_reference_image_size_policy(model_class_name: str, preserves: bool) -> None:
+    assert should_preserve_reference_image_size(model_class_name, model="nvidia/Cosmos3-Nano") is preserves
 
 
 @pytest.mark.core_model

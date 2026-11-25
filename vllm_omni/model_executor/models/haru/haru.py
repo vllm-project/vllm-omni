@@ -10,17 +10,16 @@ user's audio latent. The hidden state at frame ``t`` predicts frame ``t + 1``:
 the text token through the tied output embedding and the audio latent through
 the MeanFlow head.
 
-Per engine step the runner calls, in order: ``preprocess`` for every scheduled
-conversation (builds the input embeddings of its new positions), the backbone
-forward, ``compute_logits`` (keeps the hidden states and applies the text
-stream's logit rules), the sampler, and ``post_sample_multimodal_outputs``
-(MeanFlow head and codec decode: the audio of the frame just sampled).
+The MRv2 model state resets the batch, preprocesses each scheduled conversation,
+and applies Haru's text-stream rules to sampling logits. After text sampling,
+the sampler generates the audio for each completed frame and saves the feedback
+used in the next frame's embeddings.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -31,6 +30,11 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm_omni.model_executor.models.haru.meanflow_head import MeanFlowHead
 from vllm_omni.model_executor.models.haru.runtime import HaruRuntime
 from vllm_omni.model_executor.models.haru.vibevoice_codec import VibeVoiceCodec
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+
+    from vllm_omni.model_executor.models.haru.model_state import HaruModelState
 
 
 class AudioProjector(nn.Module):
@@ -49,7 +53,6 @@ class AudioProjector(nn.Module):
 class HaruForConditionalGeneration(Qwen3_5ForCausalLM):
     has_preprocess = True
     have_multimodal_outputs = True
-    supports_sampled_token_ids_cpu_override = True
     omni_pooler_payload_include_hidden = False
     # A conversation's prompt grows by one frame per step: keep its batch row.
     resume_streaming_rows_in_place = True
@@ -101,38 +104,18 @@ class HaruForConditionalGeneration(Qwen3_5ForCausalLM):
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         self.runtime.release(finished_req_ids)
 
-    def preprocess_batch(self, **_: Any) -> None:
-        self.runtime.begin_step()
+    def create_mrv2_model_state(
+        self, vllm_config: VllmConfig, encoder_cache: EncoderCache | None, device: torch.device
+    ) -> HaruModelState:
+        from vllm_omni.model_executor.models.haru.model_state import HaruModelState
+
+        return HaruModelState(vllm_config, self, encoder_cache, device)
 
     def preprocess(
         self, input_ids: torch.Tensor, input_embeds: torch.Tensor | None, **info: Any
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         embeds = self.runtime.add_row(input_ids, input_embeds, info)
         return input_ids, embeds, {}
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        logits = super().compute_logits(hidden_states)
-        if logits is not None and self.runtime.has_rows:
-            logits = self.runtime.adjust_logits(hidden_states, logits)
-        return logits
-
-    def consume_sampled_token_ids_cpu_override(self, sampled_token_ids: torch.Tensor) -> list[list[int]] | None:
-        if not self.runtime.has_rows:
-            return None
-        sampled = sampled_token_ids.tolist()
-        self.runtime.record_sampled(sampled)
-        return sampled
-
-    def post_sample_multimodal_outputs(
-        self,
-        *,
-        req_ids: list[str],
-        invalid_req_indices: list[int],
-        multimodal_outputs: dict[str, Any] | None,
-    ) -> dict[str, Any] | None:
-        if not self.runtime.has_rows:
-            return multimodal_outputs
-        return self.runtime.finish_step(list(req_ids), list(invalid_req_indices))
 
     # ------------------------------------------------------------ weights
 
