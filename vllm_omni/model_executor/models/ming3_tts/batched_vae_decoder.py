@@ -39,7 +39,7 @@ from .packed_qwen2 import PackedQwen2, PagedKV
 GRAPH_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64)
 GRAPH_LENGTHS = (16, 32, 64, 128)
 # Packed path: tokens of all rows per pass.
-PACKED_GRAPH_TOKENS = (16, 32, 64, 128, 256, 512, 1024, 2048)
+PACKED_GRAPH_TOKENS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 # Decoder tokens one stream may reach (four per latent).
 MAX_STREAM_POSITIONS = 16384
 
@@ -282,23 +282,40 @@ class BatchedStreamingVAEDecoder:
             self._free.append(state.slot)
 
     @torch.inference_mode()
-    def decode(self, items: list[tuple[str, torch.Tensor, bool]]) -> list[torch.Tensor]:
-        """Decode ``(request_id, latents [Patches, PatchSize, Dim], finished)``; return flat waveforms."""
+    def decode(self, items: list[tuple[str, torch.Tensor | None, bool]]) -> list[torch.Tensor]:
+        """Decode ``(request_id, latents [Patches, PatchSize, Dim] | None, finished)``; return flat waveforms."""
         decoder = self.decoder
+        empty = next(decoder.parameters()).new_zeros((0,), dtype=torch.float32)
         rows: list[tuple[int, _StreamState, torch.Tensor]] = []
-        waveforms: list[torch.Tensor | None] = [None] * len(items)
-        # One projection for every row's latents.
-        flat = [latent.reshape(-1, latent.shape[-1]) for _, latent, _ in items]
-        projected = decoder.fc1(torch.cat(flat)).split([rows.shape[0] for rows in flat])
-        for index, ((request_id, latent, finished), hidden) in enumerate(zip(items, projected, strict=True)):
+        waveforms: list[torch.Tensor] = [empty] * len(items)
+        # One projection for every non-empty row's latents.
+        non_empty = [(i, lat.reshape(-1, lat.shape[-1])) for i, (_, lat, _) in enumerate(items) if lat is not None]
+        projected = (
+            dict(
+                zip(
+                    (i for i, _ in non_empty),
+                    decoder.fc1(torch.cat([flat for _, flat in non_empty])).split([f.shape[0] for _, f in non_empty]),
+                    strict=True,
+                )
+            )
+            if non_empty
+            else {}
+        )
+        for index, (request_id, _, finished) in enumerate(items):
+            hidden_in = projected.get(index)
             state = self._streams.get(request_id)
-            if state is None:
-                state = _StreamState(slot=self._free.pop())
-                self._streams[request_id] = state
-            hidden, state.upsample = decoder.upsampling(hidden.unsqueeze(0), state=state.upsample, is_last=finished)
-            if hidden is None or hidden.shape[1] == 0:
-                waveforms[index] = latent.new_zeros((0,), dtype=torch.float32)
+            if hidden_in is None:
+                if not finished or state is None or state.upsample is None:
+                    continue
+                hidden, state.upsample = decoder.upsampling(None, state=state.upsample, is_last=True)
             else:
+                if state is None:
+                    state = _StreamState(slot=self._free.pop())
+                    self._streams[request_id] = state
+                hidden, state.upsample = decoder.upsampling(
+                    hidden_in.unsqueeze(0), state=state.upsample, is_last=finished
+                )
+            if hidden is not None and hidden.shape[1] > 0:
                 rows.append((index, state, hidden[0]))
 
         if rows:
