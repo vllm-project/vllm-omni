@@ -22,27 +22,33 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-_deferred_conditions: ContextVar[list[tuple[torch.Tensor, str]] | None] = ContextVar(
+_deferred_conditions: ContextVar[tuple[list[tuple[torch.Tensor, str]], Callable[[], int] | None] | None] = ContextVar(
     "deferred_conditions", default=None
 )
 
 
 def require_device_condition(condition: torch.Tensor, message: str) -> None:
     """Raise ValueError(message) unless the 0-d bool tensor holds; inside ``deferred_checks()``, at block exit."""
-    pending = _deferred_conditions.get()
-    if pending is None:
+    deferred = _deferred_conditions.get()
+    if deferred is None:
         if not bool(condition.item()):
             raise ValueError(message)
-    else:
-        pending.append((condition, message))
+        return
+    pending, step_index = deferred
+    pending.append((condition, message if step_index is None else f"{message} (step {step_index()})"))
 
 
 @contextmanager
-def deferred_checks():
-    """Read checks back once at block exit. A failing check no longer stops its step, so use this only where a
-    failure abandons the request."""
+def deferred_checks(step_index: Callable[[], int] | None = None):
+    """Read the checks back once at block exit, raising the first failure (tagged with ``step_index()`` at the time
+    it was queued).
+
+    Abandon-on-failure only: a failing check no longer stops its step, so later steps run and publish state before
+    the error is raised, unlike the sampler's validate-before-publish contract. Use it only where any failure
+    discards the whole request.
+    """
     pending: list[tuple[torch.Tensor, str]] = []
-    token = _deferred_conditions.set(pending)
+    token = _deferred_conditions.set((pending, step_index))
     try:
         yield
     finally:

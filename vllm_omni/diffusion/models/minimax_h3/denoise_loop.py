@@ -551,7 +551,7 @@ def minimax_h3_denoise_loop(
             return step_profiler(states[0].step_index) if step_profiler is not None else nullcontext()
 
         # A failed check abandons the request, so read the per-step checks back once at the end.
-        with torch.inference_mode(), deferred_checks():
+        with torch.inference_mode(), deferred_checks(lambda: state.step_index):
             sampler_object(sampler).sample(
                 MiniMaxH3ModelBatch({state: adapter}),
                 [state],
