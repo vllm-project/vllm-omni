@@ -46,6 +46,7 @@ implementation contract; it is not, by itself, a general support claim.
 ### Quantization
 
 - [Quantization](feature/quantization.md)
+- [MiniMax-H3 QAT and SLA Inference](feature/minimax_h3_qat_sla.md)
 
 ### Diffusion acceleration
 

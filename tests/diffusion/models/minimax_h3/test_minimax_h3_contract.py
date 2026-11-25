@@ -753,11 +753,13 @@ def test_encoder_task_validation_and_transformer_routing():
         "component_partition",
         "source_partitions",
         "expected_tasks",
+        "merged_transformer",
     ),
     [
-        (None, "combined", 2, "FL2VA", ["FL2VA", "Ref2VA"], {"t2va", "fl2va", "ref2va"}),
-        ("fl2va", "fl2va", 1, "FL2VA", ["FL2VA"], {"t2va", "fl2va"}),
-        ("ref2va", "ref2va", 1, "Ref2VA", ["Ref2VA"], {"ref2va"}),
+        (None, "combined", 2, "FL2VA", ["FL2VA", "Ref2VA"], {"t2va", "fl2va", "ref2va"}, False),
+        ("fl2va", "fl2va", 1, "FL2VA", ["FL2VA"], {"t2va", "fl2va"}, False),
+        ("ref2va", "ref2va", 1, "Ref2VA", ["Ref2VA"], {"ref2va"}, False),
+        ("fl2va", "fl2va", 1, "FL2VA", ["FL2VA"], {"t2va"}, True),
     ],
 )
 @pytest.mark.parametrize("load_text_encoder", [None, True, False])
@@ -772,6 +774,7 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     component_partition,
     source_partitions,
     expected_tasks,
+    merged_transformer,
     load_text_encoder,
     trust_remote_code,
     custom_transformer,
@@ -865,12 +868,31 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     # independently resolve the gated repository through the local HF cache.
     monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
 
+    merged_path = tmp_path / "qat" / "transformer"
+    if merged_transformer:
+        merged_path.mkdir(parents=True)
+        (merged_path / "config.json").write_text("{}")
+        (merged_path / "model.safetensors").touch()
+        (merged_path.parent / "model_index.json").write_text(
+            json.dumps(
+                {
+                    "_minimax_h3": {
+                        "partition": "fl2va",
+                        "tasks": ["t2va"],
+                        "base_schedule": [1, 0.7, 0.4, 0.15, 0],
+                        "sigma_shift_scales": {"video": 10, "audio": 2},
+                    }
+                }
+            )
+        )
+
     od_config = OmniDiffusionConfig(
         model="MiniMaxAI/MiniMax-H3",
         trust_remote_code=trust_remote_code,
         revision=None,
         task_type=task_type,
         quantization_config=None,
+        additional_config={"transformer_checkpoint": str(merged_path)} if merged_transformer else {},
         parallel_config=DiffusionParallelConfig(
             cfg_parallel_size=1,
             text_encoder_tp_size=1,
@@ -889,6 +911,9 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
         assert type(pipeline.transformers_ref) is FakeDiT
     assert pipeline.partition == expected_partition
     assert pipeline.supported_tasks == expected_tasks
+    if merged_transformer:
+        assert pipeline._base_schedule_by_partition["fl2va"].base_schedule == (1, 0.7, 0.4, 0.15, 0)
+        assert pipeline.default_video_shift == 10 and pipeline.default_audio_shift == 2
     assert len(created["dit"]) == expected_dits
     assert all(kwargs["diffusers_weights"] is False for _, kwargs in created["dit"])
     component_path = tmp_path / component_partition
@@ -934,11 +959,14 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     if expected_partition == "ref2va":
         assert pipeline._transformer_for_task("ref2va") is pipeline.transformer
     assert [source.model_or_path for source in pipeline.weights_sources] == [
-        *(str(tmp_path / partition_name) for partition_name in source_partitions),
+        *([str(merged_path)] if merged_transformer else [str(tmp_path / part) for part in source_partitions]),
         *([str(component_path)] if expect_encoder else []),
     ]
+    transformer_subfolders: list[str | None] = (
+        [None] if merged_transformer else ["transformer"] * len(source_partitions)
+    )
     assert [source.subfolder for source in pipeline.weights_sources] == [
-        *("transformer" for _ in source_partitions),
+        *transformer_subfolders,
         *(["text_encoder"] if expect_encoder else []),
     ]
     expected_prefixes = ["transformer."]

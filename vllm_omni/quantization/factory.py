@@ -157,6 +157,12 @@ def _build_mxfp4(**kw: Any) -> QuantizationConfig:
     return DiffusionMXFP4Config(**kw)
 
 
+def _build_mxfp4_fake(**kw: Any) -> QuantizationConfig:
+    from .mxfp4_fake_config import DiffusionMXFP4FakeConfig
+
+    return DiffusionMXFP4FakeConfig(**kw)
+
+
 def _build_mxfp4_dualscale(**kw: Any) -> QuantizationConfig:
     """Lazy import for MXFP4 DualScale + BF16 mixed diffusion config (NPU only).
 
@@ -223,6 +229,7 @@ _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "bitsandbytes": _build_bitsandbytes,
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,
+    "mxfp4_fake": _build_mxfp4_fake,
     "mxfp4_dualscale": _build_mxfp4_dualscale,
     "svdquant": _build_svdquant,
     "inc": _build_inc,

@@ -35,6 +35,75 @@ vLLM-Omni provides two quantization methods with different scale structures:
     `mul_scale` is available. Loading an offline checkpoint with the online
     method (or vice versa) will produce incorrect results or shape errors.
 
+## Explicit fake-quantization reference
+
+For a merged BF16 H3 transformer, `mxfp4_fake` offers explicit
+`e2m1_rne` reference and `mxfp4_c7` recipes. It does not select a recipe from
+`quant_scheme=mxfp4_c7` or `use_torch_fake_quant=true` alone.
+It uses floating storage and GEMM and does not provide FP4 acceleration.
+
+Scope it to the transformer, retaining the official text encoder and VAEs:
+
+```bash
+--diffusion-quantization-config '{"transformer":{"method":"mxfp4_fake","recipe":"e2m1_rne","ignored_layers":["token_refiner.blocks.0.attn.qkv_proj"]},"default":null}'
+```
+
+The `ignored_layers` list above is illustrative: use the delivered checkpoint's
+exact exclusion policy. These are complete runtime layer names, not subtree
+names or glob patterns. H3 rejects a differing declared checkpoint policy.
+Only vLLM quantizable linear layers are affected; SLA `proj_l` remains floating.
+SLA itself still requires the separate attention configuration.
+SLA composition additionally requires the backend from
+[PR #11089](https://github.com/vllm-project/vllm-omni/pull/11089); its implementation
+is not part of this quantization change.
+
+Merge adapters offline before enabling this mode. For the confirmed rank-64
+adapter with merge coefficient 1, the supplied merge script's
+`W'=W+(alpha/r)*B@A` formula uses `--rank 64 --alpha 64`. Merge only the QAT
+adapter when the selected base already includes the four-step adapter. Keep
+the matching four-step `model_index.json` beside the transformer directory;
+merging does not quantize weights or copy parent release metadata automatically.
+
+The reference groups 32 elements along K, including local TP shards, and uses
+power-of-two scales with exponent `clamp(floor(log2(amax))-2, -127, 127)`.
+Values round to signed E2M1 with nearest-even ties and dequantize to the input
+floating dtype. Weights are processed once after loading and activations on
+each linear call. Partial groups and serialized low-bit inputs are rejected by
+the initial H3 path. No scale/calibration files are needed.
+
+For the supplied C7 QDQ formula, explicitly select `"recipe":"mxfp4_c7"`
+in the transformer configuration above. It uses per-32 shared exponent
+`clamp(ceil(log2(clamp(amax, min=1.17e-38)/7)), -127, 127)`, private exponent
+`max(floor(log2(abs(normalized))), 0)` with the same epsilon clamp, and
+`sign(scaled) * floor(abs(scaled)+0.5)` rounding. The latter rounds ties away
+from zero, unlike the reference recipe. Elements clamp to `[-6, 6]` before
+restoring the shared scale. The implementation preserves the supplied BF16
+intermediate arithmetic; it does not promote BF16 inputs to FP32. C7 accepts
+BF16/FP32, while FP16 is rejected because it cannot represent the supplied
+epsilon. Row chunking bounds temporary storage without splitting groups.
+The producer confirmed exponent bounds -127/127, BF16 without an outer FP32
+cast, and this function for both weights and activations. The exact layer
+exclusion policy still needs to accompany the checkpoint. Selecting this recipe does not validate the delivered QAT
+checkpoint or trained SLA projection quality.
+
+Validate numerical behavior without model weights in a project test environment:
+
+```bash
+python -m pytest -q tests/diffusion/quantization/test_mxfp4_fake.py
+python -m pytest -q tests/diffusion/quantization/test_mxfp4_fake.py -m 'core_model and cpu' --run-level core_model
+```
+
+On Ascend A5 with compatible torch-npu and MindIE-SD, the H3 combination test
+also covers both explicit fake-quant recipes followed by real SLA:
+
+```bash
+python -m pytest -q tests/diffusion/models/minimax_h3/test_minimax_h3_qat_npu.py -k "fake-reference or fake-c7" -m 'core_model and npu and A5 and cards_1' --run-level core_model
+```
+
+Implementing the supplied C7 formula does not establish full training/runtime
+equivalence, attention F4, trained-weight quality or performance. The existing `mxfp4` methods below remain the native
+low-bit execution paths.
+
 ## Hardware Support
 
 The following matrix describes these vLLM-Omni implementations, rather than
@@ -87,6 +156,60 @@ UOS export or video acceptance.
     and resolves the storage format and BF16 layer policy independently.
 
 ## Configuration
+
+### MiniMax-H3 native transformer checkpoints
+
+Offline LoRA merging may produce BF16 weights. Those are not serialized FP4:
+use the existing online method only after checking that its quantization
+rules match the QAT recipe. A base that already contains the four-step adapter
+must not merge that adapter again. Training-only scheme names and fake-quant
+flags do not establish compatibility with OCP MX or UOS.
+
+To use an independently delivered merged transformer with official H3
+encoders and VAEs, select a single native partition and pass:
+
+```bash
+--additional-config '{"transformer_checkpoint":"/models/h3-qat/transformer"}'
+```
+
+The directory must include `config.json` and safetensors weights. The adjacent
+parent `model_index.json` must declare the matching `_minimax_h3` partition,
+tasks, `base_schedule` and video/audio `sigma_shift_scales`. The architecture
+must match the official model. This override rejects runtime LoRA, combined
+partitions, modular checkpoints and control adapters. Quantization metadata
+comes from the delivered transformer rather than the official transformer.
+Training-only `mxfp4_c7`/fake-quant metadata keeps a dense BF16 baseline
+unquantized; an explicit quantization request fails until a matched runtime
+contract is supplied.
+
+The initial H3 serialized integration uses the existing single-scale or
+DualScale methods with **native H3 tensor names** and grouped-by-head QKV
+checkpoint rows. Include `quantization_config` in `transformer/config.json`.
+The pipeline reconciles this storage metadata with its active transformer
+configuration, including `ignored_layers`; a mismatched method fails.
+
+Merge distilled and QAT LoRA weights before quantization export, and remove
+runtime LoRA options when serving the serialized checkpoint. A merged BF16
+transformer alone does not satisfy the offline MXFP4 storage contract. Packed
+FP4 bytes and Diffusers-named serialized QAT checkpoints require a separate
+export conversion; changing a configuration flag does not convert them.
+
+Preserve the four-step artifact's `base_schedule` and `sigma_shift_scales` in
+`model_index.json` under `_minimax_h3`. Other components can retain their
+official files. An explicit component-scoped runtime configuration keeps
+quantization overrides confined to the transformer:
+
+```json
+{"transformer": {"method": "mxfp4", "is_checkpoint_mxfp4_serialized": true}}
+```
+
+When using SLA, include every block's native `sla_module.proj_l.weight` and
+`.bias` in the checkpoint and shard index. These ordinary linear parameters
+remain floating. Only use `sla.zero_init=true` for synthetic projection tests.
+W4A4 linears do not enable attention F4. See the
+[H3 QAT/SLA design](../../design/feature/minimax_h3_qat_sla.md) for artifact
+composition, test scope and the separate F4 requirement. Real QAT export
+compatibility and generation quality still require the delivered weights.
 
 ### W4A8 fallback at selected layers and denoising steps (Ascend NPU)
 

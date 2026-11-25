@@ -800,6 +800,9 @@ class MiniMaxH3DiTModel(nn.Module):
         from .checkpoint_quantization import FastH3NVFP4Config
 
         self._serialized_weight_map = quant_config.weight_map if isinstance(quant_config, FastH3NVFP4Config) else {}
+        from .qat import is_serialized_mxfp4
+
+        self._serialized_mxfp4 = is_serialized_mxfp4(quant_config)
         self._rope_theta = float(config_mapping.get("rope_theta", 10000.0))
         arch = MiniMaxH3DiTArchConfig.from_mapping(config_mapping)
         self.arch = arch
@@ -1113,7 +1116,9 @@ class MiniMaxH3DiTModel(nn.Module):
                 # parameter, including TP slicing and online quantization.
                 weight_loader(param, loaded_weight, layout)
                 qkv_parts.setdefault(name, set()).add(layout)
-            elif name.endswith((".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale")):
+            elif name.endswith(
+                (".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale", ".attn.qkv_proj.weight_dual_scale")
+            ):
                 # The native checkpoint groups Q/K/V per head for both the
                 # weight and its scale. Transform both before entering vLLM's
                 # loader so each scale stays aligned with its weight rows.
@@ -1154,7 +1159,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     head_dim=self.arch.attention_head_dim,
                 ).T.contiguous()
                 weight_loader(param, loaded_weight)
-            elif name.endswith((".mlp.fc1.weight", ".mlp.fc1.weight_scale")):
+            elif name.endswith((".mlp.fc1.weight", ".mlp.fc1.weight_scale", ".mlp.fc1.weight_dual_scale")):
                 if name.endswith(".weight_scale") and loaded_weight.numel() == 1:
                     weight_loader(param, loaded_weight)
                 else:
@@ -1183,6 +1188,12 @@ class MiniMaxH3DiTModel(nn.Module):
             )
             default_weight_loader(params["rope.inv_freq"], rope)
             loaded.add("rope.inv_freq")
+        if getattr(self, "_serialized_mxfp4", False):
+            required_mx = {
+                name for name, param in self.named_parameters() if not getattr(param, "is_checkpoint_optional", False)
+            }
+            if missing_mx := required_mx - loaded:
+                raise ValueError(f"MiniMax-H3 MXFP4 checkpoint is missing weights: {sorted(missing_mx)}")
         return loaded
 
     @staticmethod
