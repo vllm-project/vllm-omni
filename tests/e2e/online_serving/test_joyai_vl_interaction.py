@@ -166,7 +166,7 @@ async def run_observations(url, model, output_dir, *, expect_streaming=False, in
         pass
 
 
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_server,with_asr",
     [
