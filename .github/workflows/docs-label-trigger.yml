@@ -3,10 +3,8 @@ name: Trigger docs build on add ready label
 # Ensures that we also start builds for read the docs if the ready label was just added.
 # This is useful to avoid having to push an extra commit just to trigger docs.
 on:
-  # Use pull_request_target so fork PRs can use the secret, since the read the docs check
-  # uses the github api, and therefore needs to be authenticated to avoid rate limiting.
-  # There is no additional risk here beyond the normal ready trigger check since we
-  # don't check out and execute code from the PR here and 'ready' is only added by collaborators.
+  # Use pull_request_target so fork PRs can use the secret to trigger doc builds.
+  # NOTE: this is safe because we don't check out or execute code from the PR.
   pull_request_target:
     types: [labeled]
 
