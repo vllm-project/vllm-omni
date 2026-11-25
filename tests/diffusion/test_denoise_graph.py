@@ -9,6 +9,7 @@ The capture/replay machinery itself is ``GraphedForward``'s and is covered by
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -49,6 +50,11 @@ class _CPUGraphedForward(GraphedForward):
         return SimpleNamespace(replay=lambda: copy_into(outputs, body())), outputs
 
 
+# The registry is process-global, so a runner built by one test file is visited
+# by the invalidation of another one. This is the set the fixture replaces.
+_PROCESS_GLOBAL_RUNNERS = graph_mod._RUNNERS
+
+
 @pytest.fixture
 def platform(monkeypatch) -> SimpleNamespace:
     fake = SimpleNamespace(device_type="cpu", outer_capture=False, graph_cls=_CPUGraphedForward)
@@ -57,6 +63,9 @@ def platform(monkeypatch) -> SimpleNamespace:
     monkeypatch.setattr(graph_mod, "current_omni_platform", fake)
     monkeypatch.setattr(cuda_graph_mod, "current_omni_platform", fake)
     monkeypatch.setattr(dist_utils, "get_local_device", lambda: torch.device("cpu"))
+    # Each test gets its own registry: the runners of one test must not be
+    # visited by the invalidation of another one.
+    monkeypatch.setattr(graph_mod, "_RUNNERS", weakref.WeakSet())
     return fake
 
 
@@ -141,6 +150,46 @@ def test_invalidate_denoise_graphs_drops_every_runner_and_keeps_capturing(platfo
     torch.testing.assert_close(runners[0](x=torch.ones(2)), torch.full((2,), 3.0))
     assert runners[0].stats()["captures"] == 2
     assert runners[0].enabled
+
+
+def test_the_runner_registry_is_isolated_from_the_process_global(platform):
+    # The registry is process-global; the fixture hands this test its own set,
+    # so a runner built by another test file is never visited here.
+    assert graph_mod._RUNNERS is not _PROCESS_GLOBAL_RUNNERS
+
+    build_denoise_graph_runner(_od_config(), _affine, "T")
+
+    assert len(list(graph_mod._RUNNERS)) == 1
+
+
+def test_invalidate_denoise_graphs_skips_a_member_without_the_graph_interface(platform):
+    # A graph class that does not implement the interface cannot report its
+    # graphs; the invalidation runs on the LoRA adapter paths, so it must skip
+    # such a member instead of raising on it.
+    class _NotAGraphRunner:
+        name = "not-a-graph-runner"
+
+    foreign = _NotAGraphRunner()
+    graph_mod._RUNNERS.add(foreign)
+
+    invalidate_denoise_graphs("adapter changed")
+
+
+def test_a_graph_class_that_is_not_a_graph_runner_stays_eager(platform, monkeypatch):
+    # The registry drops the graphs of every runner it holds, so a class that is
+    # not a GraphedForward cannot be registered: its graphs would survive a
+    # LoRA adapter change and replay the capture-time adapter.
+    class _DuckGraphedForward:
+        def __init__(self, module, *, name, **kwargs) -> None:
+            self.module, self.name, self.enabled = module, name, True
+
+        def __call__(self, **kwargs):
+            return self.module(**kwargs)
+
+    monkeypatch.setattr(platform, "graph_cls", _DuckGraphedForward)
+
+    assert build_denoise_graph_runner(_od_config(), _affine, "T") is None
+    assert not list(graph_mod._RUNNERS)
 
 
 @pytest.mark.parametrize("release", [True, False])

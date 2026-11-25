@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
+import weakref
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -22,6 +23,7 @@ from vllm_omni.diffusion.attention.schedule import (
     InvalidAttentionScheduleError,
 )
 from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.cuda_graph import GraphedForward
 from vllm_omni.diffusion.data import (
     AttentionConfig,
     AttentionScheduleConfig,
@@ -1302,11 +1304,13 @@ def test_startup_validation_rejects_vsa_candidate_on_self_attention_without_gate
         assert layer_mod.validate_attention_schedule_candidates(attention, config) == 1
 
 
-class _StubGraphedForward:
+class _StubGraphedForward(GraphedForward):
     """Stands in for the platform graph class: always on, records the step calls."""
 
     def __init__(self, module: nn.Module, *, name: str, **kwargs) -> None:
-        self.module, self.name, self.enabled = module, name, True
+        super().__init__(module, name=name, **kwargs)
+        # The stub captures no graph; it runs the module and records the call.
+        self.enabled = True
         self.calls: list[dict] = []
 
     def __call__(self, **kwargs) -> torch.Tensor:
@@ -1321,6 +1325,9 @@ def graph_platform(monkeypatch):
 
     monkeypatch.setattr(graph_mod.current_omni_platform, "get_graphed_forward_cls", lambda: _StubGraphedForward)
     monkeypatch.setattr(dist_utils, "get_local_device", lambda: torch.device("cpu"))
+    # Each test gets its own registry: the runner of this file must not be
+    # visited by the invalidation of another test file.
+    monkeypatch.setattr(graph_mod, "_RUNNERS", weakref.WeakSet())
 
 
 def _graph_od_config(**overrides) -> SimpleNamespace:

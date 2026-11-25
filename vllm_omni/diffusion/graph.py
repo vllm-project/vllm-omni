@@ -66,8 +66,14 @@ def invalidate_denoise_graphs(reason: str) -> None:
     For state a graph froze that lives outside the step arguments and outside
     the pipeline, such as which LoRA adapter is active: its Python branches ran
     once at capture time, so a replay keeps the capture-time adapter.
+
+    A registry member that is not a graph runner is skipped instead of raised
+    on: this runs on every LoRA adapter change, and an object that cannot report
+    its graphs must not turn an adapter change into an error.
     """
     for runner in list(_RUNNERS):
+        if not isinstance(runner, GraphedForward):
+            continue
         if runner.num_graphs:
             logger.debug("%s: dropping %d captured denoise graph(s) (%s)", runner.name, runner.num_graphs, reason)
             runner.clear()
@@ -223,6 +229,18 @@ def build_denoise_graph_runner(
             name,
             graph_cls.__name__,
             device,
+        )
+        return None
+    if not isinstance(runner, GraphedForward):
+        # The registry is walked by invalidate_denoise_graphs, which drops the
+        # graphs of every runner it holds. A runner that is not a GraphedForward
+        # cannot be dropped, so its graphs would survive a LoRA adapter change
+        # and replay the capture-time adapter; the pipeline stays eager instead.
+        logger.warning(
+            "%s: diffusion_use_graph ignored because %s is not a GraphedForward: its graphs could not be "
+            "dropped when the active LoRA adapter changes",
+            name,
+            graph_cls.__name__,
         )
         return None
     _RUNNERS.add(runner)
