@@ -260,22 +260,28 @@ def decode_taeh3_chunks(
 
     The tiny decoder runs on one device and uses no collectives, so peer ranks
     of a distributed VAE group decode nothing. They still learn whether the
-    owner's callback failed, so that every rank raises or none does.
+    owner's work failed, so that every rank raises or none does.
+
+    Decoding and publication are both inside the guard on purpose. Peer ranks
+    are already blocked in the broadcast below, so anything that escapes rank
+    zero before it leaves them waiting for the process-group timeout instead of
+    raising. ``iter_clips`` can raise before it yields -- a clip that runs out
+    of memory, for one -- so the iterator belongs under the same guard as the
+    callback rather than outside it.
     """
     owner = group is None or dist.get_rank(group) == 0
     error: BaseException | None = None
     if owner:
-        for clip in decoder.iter_clips(latent):
-            try:
+        try:
+            for clip in decoder.iter_clips(latent):
                 callback(clip.float().contiguous())
-            except BaseException as exc:  # noqa: BLE001
-                error = exc
-                break
+        except BaseException as exc:  # noqa: BLE001
+            error = exc
     if group is not None:
         failed = torch.tensor([int(error is not None)], dtype=torch.int32, device=latent.device)
         dist.broadcast(failed, src=dist.get_global_rank(group, 0), group=group)
         if int(failed.item()) and error is None:
-            raise RuntimeError("MiniMax-H3 video chunk callback failed on rank zero")
+            raise RuntimeError("MiniMax-H3 video chunk decode failed on rank zero")
     if error is not None:
         raise error
 

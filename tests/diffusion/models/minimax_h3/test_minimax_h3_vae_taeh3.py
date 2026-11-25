@@ -389,8 +389,39 @@ def test_callback_failure_stops_the_owner_and_is_reported_to_peers(monkeypatch, 
 def test_peer_ranks_raise_when_the_owner_callback_failed(monkeypatch, decoder):
     _patch_group(monkeypatch, rank=2, owner_failed=True)
 
-    with pytest.raises(RuntimeError, match="chunk callback failed on rank zero"):
+    with pytest.raises(RuntimeError, match="chunk decode failed on rank zero"):
         decode_taeh3_chunks(decoder, _latent(7), lambda _frames: None, group=object())
+
+
+@pytest.mark.parametrize("clips_before_failure", [0, 1])
+def test_iterator_failure_reaches_the_broadcast_instead_of_timing_out(monkeypatch, decoder, clips_before_failure):
+    """A decode that raises must still report to the peers.
+
+    Peer ranks are already blocked in the failure broadcast, so an exception
+    that escapes rank zero before it leaves them waiting for the process-group
+    timeout rather than raising. ``clips_before_failure=0`` is the case where
+    the iterator raises before yielding anything at all -- a first clip that
+    runs out of memory -- which no callback guard can catch.
+    """
+    published = list(decoder.iter_clips(_latent(12)))[:clips_before_failure]
+
+    def iter_clips(_latent):
+        yield from published
+        raise RuntimeError("decode clip ran out of memory")
+
+    monkeypatch.setattr(decoder, "iter_clips", iter_clips)
+
+    # Single rank: the error still surfaces to the caller.
+    seen: list[int] = []
+    with pytest.raises(RuntimeError, match="ran out of memory"):
+        decode_taeh3_chunks(decoder, _latent(12), lambda frames: seen.append(frames.shape[2]), group=None)
+    assert len(seen) == clips_before_failure
+
+    # Rank zero of a group: the same error, and the peers are told about it.
+    sent = _patch_group(monkeypatch, rank=0)
+    with pytest.raises(RuntimeError, match="ran out of memory"):
+        decode_taeh3_chunks(decoder, _latent(12), lambda _frames: None, group=object())
+    assert sent == [1]
 
 
 def test_adapter_chunk_decode_keeps_the_group_validation(monkeypatch, decoder):
