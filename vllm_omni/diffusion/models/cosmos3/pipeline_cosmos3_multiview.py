@@ -42,6 +42,7 @@ from .multiview_flex_attention import (
     DEFAULT_MAX_UND_TOKENS,
     MaskItem,
     MultiviewLayout,
+    npu_available,
     validate_multiview_backend,
 )
 from .multiview_packing import pack_state, patch_grid, unpack_state
@@ -443,8 +444,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         if od_config.enable_session_state_manager:
             raise ValueError("Cosmos3-Nano-Transfer-Auto does not support enable_session_state_manager.")
         super().__init__(od_config=od_config, prefix=prefix)
-        if self.device.type != "cuda":
-            raise ValueError("Cosmos3-Nano-Transfer-Auto requires CUDA for multiview attention.")
+        if self.device.type not in ("cuda", "npu"):
+            raise ValueError(
+                "Cosmos3-Nano-Transfer-Auto requires CUDA or an Ascend NPU for multiview attention; "
+                f"got device {self.device}."
+            )
 
         self.multiview_config = multiview_config
         self._encoder_modules = []
@@ -481,8 +485,10 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         """Pick the kernel strategy from the worker's vLLM-bundled FlashAttention.
 
         Exact maskless passes on FA4/FA3/FA2 varlen are the default, including
-        on Blackwell. Triton FlexAttention remains the fallback when no bundled
-        FlashAttention is importable. Both implement the same visibility rules.
+        on Blackwell; Ascend NPUs run the same maskless decomposition with
+        ``npu_fusion_attention``. Triton FlexAttention remains the fallback when
+        no bundled FlashAttention is importable. All implement the same
+        visibility rules.
         """
         override = os.environ.get(COSMOS3_MULTIVIEW_BACKEND_ENV)
         if override is not None:
@@ -490,6 +496,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 return validate_multiview_backend(override)
             except ValueError as exc:
                 raise ValueError(f"{exc} (from {COSMOS3_MULTIVIEW_BACKEND_ENV}={override!r})") from exc
+        if npu_available():
+            # Ascend runs the same maskless pass decomposition through
+            # ``npu_fusion_attention``; the Triton FlexAttention fallback is
+            # CUDA-only (its kernels are registered for ``torch.cuda`` only).
+            return "maskless"
         try:
             from vllm_omni.diffusion.attention.backends.utils.fa import resolve_vllm_flash_attn_version
 

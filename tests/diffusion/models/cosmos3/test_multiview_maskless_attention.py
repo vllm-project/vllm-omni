@@ -448,3 +448,54 @@ def test_cuda_maskless_matches_dense_and_sparse(fa_version: int, dtype: torch.dt
         torch.testing.assert_close(maskless.double(), dense_reference(spec, *qkv), atol=tolerance, rtol=tolerance)
         triton = padded_multiview_flex_attention(*qkv, MultiviewAttentionContext(replace(spec, backend="triton"), {}))
         torch.testing.assert_close(maskless, triton, atol=tolerance, rtol=tolerance)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("views", [1, 7, 11], ids=["1v", "7v", "11v"])
+def test_maskless_matches_dense_for_wide_rigs(views: int) -> None:
+    """Wide rigs (7v ring, 11v ring plus fisheye) keep the same maskless decomposition."""
+    spec = layout(views=views, caption_lengths=tuple(2 for _ in range(views)))
+    num_und = sum(spec.caption_lengths)
+    qkv = tensors(spec, num_und)
+    with torch.inference_mode():
+        maskless = multiview_attention(*qkv, prepared_context(spec, num_und))
+        torch.testing.assert_close(maskless.double(), dense_reference(spec, *qkv), atol=1e-6, rtol=1e-6)
+
+
+# -- Ascend NPU -----------------------------------------------------------------------
+
+
+def test_npu_pass_kernel_registered_and_resolved_on_ascend(monkeypatch) -> None:
+    """The NPU kernel is registered, and an Ascend build pins it without touching CUDA FA."""
+    assert "npu" in m.PASS_KERNELS
+    monkeypatch.setattr(m, "npu_available", lambda: True)
+    m.resolve_maskless_kernel.cache_clear()
+    try:
+        assert m.resolve_maskless_kernel() == "npu"
+    finally:
+        m.resolve_maskless_kernel.cache_clear()
+
+
+@pytest.mark.cpu
+def test_npu_kernel_absent_from_cuda_resolution(monkeypatch) -> None:
+    """CUDA keeps resolving a FlashAttention kernel instead of the Ascend one."""
+    monkeypatch.setattr(m, "npu_available", lambda: False)
+    monkeypatch.setattr("vllm_omni.diffusion.attention.backends.utils.fa.resolve_vllm_flash_attn_version", lambda: 3)
+    m.resolve_maskless_kernel.cache_clear()
+    try:
+        assert m.resolve_maskless_kernel() == "fa3"
+    finally:
+        m.resolve_maskless_kernel.cache_clear()
+
+
+@hardware_test(res={"npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_npu_maskless_matches_dense(dtype: torch.dtype) -> None:
+    """``npu_fusion_attention`` passes plus the FP32 merge reproduce the dense predicate."""
+    spec = layout(views=3)
+    num_und = sum(spec.caption_lengths)
+    qkv = tensors(spec, num_und, dtype=dtype, head_dim=128, kv_heads=2, device="npu")
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 5e-3
+    with torch.inference_mode():
+        maskless = multiview_attention(*qkv, prepared_context(spec, num_und, kernel="npu", device="npu"))
+        torch.testing.assert_close(maskless.double(), dense_reference(spec, *qkv), atol=tolerance, rtol=tolerance)
