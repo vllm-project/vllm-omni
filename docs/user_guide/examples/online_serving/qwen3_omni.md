@@ -109,6 +109,35 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 Captioner / Thinking checkpoints (`enable_audio_output=false`) still auto-select
 the same single-stage pipeline without `--deploy-config`.
 
+### Ascend TTFT profile
+
+The optional `qwen3_omni_moe_ascend_ttft.yaml` profile enables full Thinker
+decode graphs and expands the piecewise prefill capture sizes through 4608
+tokens, including 128/144/160-token buckets for short prompts. It enables
+the Thinker prefix cache and uses synchronous Thinker scheduling while
+retaining asynchronous chunk streaming and complete text/audio output.
+Talker and Code2Wav retain their existing graph settings.
+
+From a source checkout, launch the measured combined deployment with:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/qwen3_omni_moe_ascend_ttft.yaml \
+    --api-server-count 2
+```
+
+This profile inherits the default three-card Ascend placement: Thinker TP2
+on devices 0 and 1, with Talker and Code2Wav sharing device 2. It was measured
+with BF16 Instruct weights on 3× Ascend 910B1 (64 GiB), CANN 9.2.1 and
+torch_npu 2.10.0.post7, using non-duplex SeedTTS English workloads at
+concurrency 1/16/32. The two API workers share the stage engines and weights.
+The combined results include runtime cache/admission changes, graph settings
+and frontend process count; they do not isolate each optimization's gain.
+
+Capture sizes should match the deployment workload. Larger capture sets
+increase startup work and persistent graph-buffer memory. Shapes beyond
+capture coverage use the runner's normal fallback.
+
 ### Thinking checkpoint chat template
 
 Serving `Qwen/Qwen3-Omni-30B-A3B-Thinking` with function tools through
