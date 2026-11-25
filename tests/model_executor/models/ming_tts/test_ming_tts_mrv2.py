@@ -255,7 +255,7 @@ def test_batched_vae_orders_chunks_flushes_held_back_frame_and_cleans_up(patch_s
     vae = _vae_stage()
     vae.ming_config.patch_size = patch_size
     vae._batched_vae_enabled = True
-    vae._batched_decoder = batched
+    vae._batched_vae_decoder = batched
 
     chunk = {KEY_REQUEST_ID: "p", "latent": torch.ones(2, patch_size, 64), "meta": {"stream_finished": False}}
     end = {KEY_REQUEST_ID: "p", "meta": {"stream_finished": True}}

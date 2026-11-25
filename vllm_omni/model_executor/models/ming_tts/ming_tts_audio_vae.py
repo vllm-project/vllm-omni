@@ -44,7 +44,7 @@ class MingAudioVAEModel(nn.Module):
         self.ming_config.validate()
 
         self.audio = AudioVAE(self.ming_config.audio_tokenizer_config, build_encoder=False)
-        self._batched_decoder: BatchedStreamingVAEDecoder | None = None
+        self._batched_vae_decoder: BatchedStreamingVAEDecoder | None = None
         self._batched_vae_enabled = self.ming_config.model_variant == "dense" and current_omni_platform.is_cuda()
         if self._batched_vae_enabled:
             assert self.audio.decoder is not None
@@ -253,7 +253,7 @@ class MingAudioVAEModel(nn.Module):
             outputs.append(waveform_flat)
             srs.append(sr_tensor)
 
-        if pending and getattr(self, "_batched_decoder", None) is None and all(item[2] is None for item in pending):
+        if pending and getattr(self, "_batched_vae_decoder", None) is None and all(item[2] is None for item in pending):
             for _, rid, _, done in pending:
                 if done:
                     self._clear_request_state(rid)
@@ -298,7 +298,7 @@ class MingAudioVAEModel(nn.Module):
         )
 
     def _get_batched_decoder(self) -> BatchedStreamingVAEDecoder:
-        if self._batched_decoder is None:
+        if self._batched_vae_decoder is None:
             from vllm_omni.model_executor.models.ming3_tts.batched_vae_decoder import BatchedStreamingVAEDecoder
 
             assert self.audio.decoder is not None
@@ -306,12 +306,12 @@ class MingAudioVAEModel(nn.Module):
             max_seqs = int(getattr(scheduler_cfg, "max_num_seqs", 64))
             max_streams = max(64, 4 * max_seqs)
             self._max_stream_states = max_streams
-            self._batched_decoder = BatchedStreamingVAEDecoder(
+            self._batched_vae_decoder = BatchedStreamingVAEDecoder(
                 self.audio.decoder,
                 max_streams=max_streams,
                 packed_graph_tokens=DENSE_PACKED_GRAPH_TOKENS,
             )
-        return self._batched_decoder
+        return self._batched_vae_decoder
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = list(weights)
@@ -348,7 +348,7 @@ class MingAudioVAEModel(nn.Module):
             self._clear_request_state(request_id)
 
     def _clear_request_state(self, request_id: str) -> None:
-        decoder = getattr(self, "_batched_decoder", None)
+        decoder = getattr(self, "_batched_vae_decoder", None)
         if decoder is not None:
             decoder.release(request_id)
         self._past_key_values.pop(request_id, None)
