@@ -409,7 +409,7 @@ class DuplexSessionRunner:
         self.emit({"type": "session.created", "session": session.as_public_dict()})
 
     def submit(self, command: DuplexCommand) -> None:
-        if isinstance(command, AppendAudio):
+        if isinstance(command, AppendAudio | AppendText):
             self._pending_input_appends += 1
         clock = self._input_clock
         if clock is not None and command.wire_type in ACKNOWLEDGED_INPUTS:
@@ -950,7 +950,7 @@ class DuplexSessionRunner:
             except Exception as exc:
                 self._report_handler_failure(item, exc)
             finally:
-                if isinstance(item, AppendAudio):
+                if isinstance(item, AppendAudio | AppendText):
                     self._pending_input_appends -= 1
                     if self._pending_input_appends == 0 and self._deferred_silence is not None:
                         self.spawn(self._rearm_deferred_silence(), name="duplex-continue")
@@ -1049,6 +1049,8 @@ class DuplexSessionRunner:
             self.session.release_input_bytes(
                 len(command.audio) + sum(len(frame) for frame in command.video_frames), queued=True
             )
+        elif isinstance(command, AppendText):
+            self.session.release_input_bytes(len(command.text.encode("utf-8")), queued=True)
         elif isinstance(command, GetSessionStats):
             # Still answered, so the client need not time out: final turns
             # keep their numbers and the rest read as cancelled.
@@ -1176,12 +1178,24 @@ class DuplexSessionRunner:
                 reservation.callback(session.release_input_bytes, admission, queued=True)
                 await self._on_append_audio(command.payload(encode_audio=False), release_queued_input=reservation.close)
         elif isinstance(command, AppendText):
-            session.mark_user_input_activity()
-            self._emit_error(
-                "native_text_append_unsupported",
-                "The selected native duplex runtime accepts audio append only",
-                event_id=command.event_id,
-            )
+            # Keep the admitted UTF-8 bytes charged while this append waits
+            # behind earlier media; cancellation and failures release them too.
+            with ExitStack() as reservation:
+                reservation.callback(session.release_input_bytes, len(command.text.encode("utf-8")), queued=True)
+                if not self._session_auto_responds():
+                    self._emit_error("bad_event", "Text append requires auto_response=true", event_id=command.event_id)
+                    return
+                self._reset_failed_append_tail()
+                if not await self._submit_buffered_media():
+                    return
+                session.mark_user_input_activity()
+                task = await self._start_append(
+                    {"type": "text", "text": command.text, "force_listen": command.force_listen is True},
+                    final=False,
+                    precreate_response=command.force_listen is not True,
+                )
+                release = reservation.pop_all().close
+                task.add_done_callback(lambda _done: release())
         elif isinstance(command, Commit):
             session.release_pending_turn()
             resolved = resolve_commit(projector, command)
@@ -2056,23 +2070,26 @@ class DuplexSessionRunner:
             session.release_input_bytes(raw_audio_bytes)
         append_payload = pcm_reservation.payload
         await self._start_append(append_payload, final=False, pcm_reservation=pcm_reservation)
-        if self._input_clock is not None and allow_emit:
-            # Input-clocked sessions: submit every whole unit this append
-            # completed, so its acknowledgement covers all of them.
-            while (
-                self._append_chain_healthy()
-                and (
-                    backlog := model_state.audio_buffer.prepare_backlog(
-                        operation_id=uuid.uuid4().hex, chunk_period_ms=session.capabilities.chunk_period_ms or 1000
-                    )
-                )
-                is not None
-            ):
-                if backlog.payload is None:
-                    backlog.rollback()
-                    break
-                await self._start_append(backlog.payload, final=False, pcm_reservation=backlog)
+        if allow_emit:
+            # Submit every eligible whole unit on either clock. Leaving a
+            # complete unit buffered can block a text reply's continuation
+            # after the client has stopped sending input.
+            await self._submit_buffered_media()
         await self._maybe_commit_vad_turn(vad_result)
+
+    async def _submit_buffered_media(self) -> bool:
+        """Queue complete buffered units in wire order, retaining partial PCM."""
+        while self._append_chain_healthy():
+            backlog = self.model_state.audio_buffer.prepare_backlog(
+                operation_id=uuid.uuid4().hex, chunk_period_ms=self.session.capabilities.chunk_period_ms or 1000
+            )
+            if backlog is None:
+                return True
+            if backlog.payload is None:
+                backlog.rollback()
+                return True
+            await self._start_append(backlog.payload, final=False, pcm_reservation=backlog)
+        return False
 
     def _append_chain_healthy(self) -> bool:
         """Whether more of the buffered audio may be submitted: the session is open and no append in it failed."""
@@ -2135,11 +2152,15 @@ class DuplexSessionRunner:
 
     def _real_input_waiting(self) -> bool:
         self._clear_completed_pending_silence()
-        return (
-            self._pending_input_appends > 0
-            or self.model_state.audio_buffer.has_pending()
-            or self.model_state.audio_buffer.has_reserved()
-        )
+        buffer = self.model_state.audio_buffer
+        if self._pending_input_appends > 0 or buffer.has_reserved():
+            return True
+        if self.run.partial_input_continuation_turn == (self.session.epoch, self.session.active_response_turn_id):
+            # Text can release a reply without an audio commit. Keep partial PCM
+            # buffered and charged, but do not let it stall that reply forever.
+            # Complete audio/vision units still precede generated silence.
+            return buffer.has_ready_unit(chunk_period_ms=self.session.capabilities.chunk_period_ms or 1000)
+        return buffer.has_pending()
 
     async def _start_append(
         self,
@@ -2416,8 +2437,9 @@ class DuplexSessionRunner:
         deferred = self._deferred_silence
         if deferred is None or self.run.closing:
             return
-        buffer = self.model_state.audio_buffer
-        if self._pending_input_appends > 0 and not (buffer.has_pending() or buffer.has_reserved()):
+        if self._pending_input_appends > 0:
+            # The final queued append will rearm us. It may leave only partial
+            # PCM, which no longer blocks a text-opened response.
             return
         # A model-turn continuation stored no response id. A response that
         # began since then (queued stage output can begin_response before this

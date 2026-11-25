@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Pinned inputs and reviewable artifacts for the SenseNova H100 accuracy gate.
+"""Pinned inputs and reviewable artifacts for SenseNova accuracy gates.
 
 References are captured explicitly and reviewed before committing. Normal test
 runs only read the reference file; they never update it on a mismatch.
@@ -25,25 +25,43 @@ if TYPE_CHECKING:
 
 MODEL_ID = "SenseNova/SenseNova-U1-8B-MoT"
 MODEL_REVISION = "bfa9b436503cb8aed4f2bc60e3236710cc77468d"
-REFERENCE_PATH = Path(__file__).with_name("sensenova_u1_reference.json")
+H100_REFERENCE_PATH = Path(__file__).with_name("sensenova_u1_reference.json")
+MI300_REFERENCE_PATH = Path(__file__).with_name("sensenova_u1_reference_mi300.json")
+REFERENCE_PATHS = {
+    "H100": H100_REFERENCE_PATH,
+    "MI300": MI300_REFERENCE_PATH,
+}
+# Keep the original public constant for CPU contract tests and downstream tools.
+REFERENCE_PATH = H100_REFERENCE_PATH
 PIXEL_TOLERANCE = 10
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def require_h100() -> str:
-    """Check the actual GPU; hardware_test markers only route CI jobs."""
+def require_reference_hardware() -> tuple[str, str]:
+    """Return the qualified hardware family and actual device name."""
     from vllm_omni.platforms import current_omni_platform
 
-    name = current_omni_platform.get_device_name() if current_omni_platform.is_cuda() else "non-CUDA platform"
-    assert "H100" in name, f"SenseNova pixel accuracy requires an H100, got {name}"
-    return name
+    if current_omni_platform.is_cuda():
+        name = current_omni_platform.get_device_name()
+        assert "H100" in name, f"SenseNova CUDA pixel accuracy requires an H100, got {name}"
+        return "H100", name
+    if current_omni_platform.is_rocm():
+        name = current_omni_platform.get_device_name()
+        assert "MI300" in name, f"SenseNova ROCm pixel accuracy requires an MI300, got {name}"
+        return "MI300", name
+    raise AssertionError("SenseNova pixel accuracy requires an H100 or MI300 accelerator")
+
+
+def reference_path_for_current_hardware() -> Path:
+    hardware, _ = require_reference_hardware()
+    return REFERENCE_PATHS[hardware]
 
 
 def accuracy_model_path() -> str:
     """Resolve the exact weights before the pipeline can resolve a floating ID."""
     from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    require_h100()
+    require_reference_hardware()
     return hf_api().snapshot_download(
         repo_id=MODEL_ID,
         revision=MODEL_REVISION,
@@ -88,17 +106,25 @@ def _source_metadata() -> dict[str, Any]:
 def _environment_metadata() -> dict[str, Any]:
     import torch
 
+    hardware, device_name = require_reference_hardware()
+    driver_command = (
+        ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]
+        if hardware == "H100"
+        else ["rocm-smi", "--showdriverversion"]
+    )
     driver = subprocess.run(
-        ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+        driver_command,
         check=True,
         capture_output=True,
         text=True,
     )
     return {
-        "gpu": require_h100(),
-        "driver": sorted(set(driver.stdout.splitlines())),
+        "reference_hardware": hardware,
+        "gpu": device_name,
+        "driver": sorted({line.strip() for line in driver.stdout.splitlines() if line.strip()}),
         "python": platform.python_version(),
         "cuda": torch.version.cuda,
+        "rocm": torch.version.hip,
         "packages": {
             name: importlib.metadata.version(name)
             for name in ("torch", "vllm", "transformers", "diffusers", "cache-dit")
@@ -160,16 +186,29 @@ def record_accuracy(
     return record
 
 
-def assert_accuracy(record: dict[str, Any], reference_path: Path = REFERENCE_PATH) -> None:
+def assert_accuracy(record: dict[str, Any], reference_path: Path | None = None) -> None:
     """Compare like-for-like inputs and the original ten points at ±10 RGB."""
+    if reference_path is None:
+        reference_path = reference_path_for_current_hardware()
+    actual_hardware = record.get("environment", {}).get("reference_hardware")
+    if actual_hardware is None:
+        gpu_name = str(record.get("environment", {}).get("gpu", ""))
+        actual_hardware = next((name for name in REFERENCE_PATHS if name in gpu_name), "selected hardware")
     assert reference_path.is_file(), (
-        f"Missing reviewed H100 reference: {reference_path}. Capture and review the pinned H100 goldens; "
+        f"Missing reviewed {actual_hardware} reference: {reference_path}. "
+        f"Capture and review the pinned {actual_hardware} goldens; "
         "normal accuracy runs do not create or refresh references. The current PNG and metadata were saved."
     )
     reference = json.loads(reference_path.read_text())
     assert reference["schema_version"] == 1, "Unsupported SenseNova reference schema"
     golden = reference["cases"][record["case"]]
-    assert "H100" in golden["environment"]["gpu"], "SenseNova reference must be captured on an H100"
+    golden_gpu = golden["environment"]["gpu"]
+    golden_hardware = golden["environment"].get("reference_hardware")
+    if golden_hardware is None:
+        golden_hardware = next((name for name in REFERENCE_PATHS if name in golden_gpu), None)
+    assert golden_hardware == actual_hardware, (
+        f"SenseNova reference hardware mismatch: expected {actual_hardware}, got {golden_hardware} ({golden_gpu})"
+    )
     context = (
         f"Compare {reference_path} with the current PNG/JSON in "
         f"{os.environ.get('SENSENOVA_U1_ARTIFACT_DIR', 'sensenova-accuracy')}; "

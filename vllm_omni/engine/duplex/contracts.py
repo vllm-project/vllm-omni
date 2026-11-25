@@ -116,6 +116,9 @@ class DuplexOutputContext:
     # Session stats (RFC #8325): the (epoch, seq) chunks this output finishes
     # handling for. Their spans reach the ledger directly (``on_stage_work``).
     perf_chunks: frozenset[tuple[int, int]] = frozenset()
+    # Snapshot the producer's model turn before the bridge advances it. The
+    # protocol response can still belong to an earlier, draining Talker turn.
+    model_turn_id: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "segment_token_ids", tuple(self.segment_token_ids))
