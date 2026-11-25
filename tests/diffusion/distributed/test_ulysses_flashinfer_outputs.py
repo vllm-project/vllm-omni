@@ -62,9 +62,19 @@ def test_registered_outputs_stay_one_per_slot_across_shapes():
 
 
 def test_staged_outputs_are_replaced_not_accumulated():
+    # Small, then large, then small again: the larger shape replaces the staged output once, and the last
+    # small request reuses that second output as a view instead of allocating a third time.
     comm = _Communicator(max_bytes=1 << 20, registered=False)
-    for shape in _shapes():
+    small, large = (1, 16, 16, 8), (1, 64, 16, 8)
+    outs = [
         flashinfer_ulysses._output(comm, "sp", torch.empty(shape, dtype=torch.float16), "gather_heads", 0)
+        for shape in (small, large, small)
+    ]
+    assert len(comm.registrations) == 2
+    assert outs[1].data_ptr() != outs[0].data_ptr()
+    assert outs[2].data_ptr() == outs[1].data_ptr()
+    assert tuple(outs[2].shape) == flashinfer_ulysses._output_shape(torch.empty(small), "gather_heads", 2)
+    assert outs[2].is_contiguous()
     assert len(flashinfer_ulysses._OUTPUTS) == 1
 
 
