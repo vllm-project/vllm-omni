@@ -45,9 +45,10 @@ existing hidden-state payload behavior.
 Async-chunk output splits each request payload between the inter-stage and
 client channels using fixed allowlists of final-output roots in
 `vllm_omni/utils/mm_outputs.py`. A model whose client-side consumer reads other
-per-step outputs declares their roots in `omni_client_multimodal_output_keys`,
-a tuple of unique, non-empty strings. Those roots are copied to the client
-channel for every request and remain in the inter-stage payload. Nemotron
+per-step outputs declares them in `omni_client_multimodal_output_keys`, a tuple
+of unique, non-empty, complete flattened keys (`codes.audio`, not `codes`).
+Those keys are copied to the client channel for every request and remain in
+the inter-stage payload. Nemotron
 VoiceChat declares its function-call token and tool-result acknowledgement
 this way; without the declaration, the duplex data plane never sees a call.
 

@@ -50,10 +50,11 @@ def partition_flat_payload(
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Split a flattened per-request payload into inter-stage vs client mm dicts.
 
-    ``client_keys`` names model-declared roots (the model's
-    ``omni_client_multimodal_output_keys``) that the client must receive in
-    addition to the fixed allowlists. They stay in the inter-stage payload
-    too, so stage-input processors that read them are unaffected.
+    The fixed allowlists match on a key's root. ``client_keys`` (the model's
+    ``omni_client_multimodal_output_keys``) instead names complete flattened
+    keys the client must also receive; a declared ``codes.audio`` does not
+    pull in its ``codes.ref`` sibling. Declared keys stay in the inter-stage
+    payload too, so stage-input processors that read them are unaffected.
     """
     if not payload:
         return {}, {}
@@ -63,7 +64,7 @@ def partition_flat_payload(
         root = key.split(".", 1)[0]
         if root in _CLIENT_MM_ROOT_KEYS:
             client_mm[key] = value
-        elif root in client_keys:
+        elif key in client_keys:
             inter_stage[key] = value
             client_mm[key] = value
         elif root == "meta" and "." in key and key.split(".", 1)[1] in _CLIENT_MM_META_KEYS:
@@ -80,12 +81,11 @@ def partition_flat_payload(
 
 def partition_payload_list(
     payloads: Sequence[Mapping[str, object]],
-    client_keys: Collection[str] = (),
 ) -> tuple[list[dict[str, object] | None] | None, list[dict[str, object] | None] | None]:
     inter_stage_list: list[dict[str, object] | None] = []
     client_mm_list: list[dict[str, object] | None] = []
     for payload in payloads:
-        inter_stage, client_mm = partition_flat_payload(payload, client_keys)
+        inter_stage, client_mm = partition_flat_payload(payload)
         inter_stage_list.append(inter_stage or None)
         client_mm_list.append(client_mm or None)
     return (

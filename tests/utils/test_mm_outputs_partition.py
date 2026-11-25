@@ -89,9 +89,17 @@ def test_partition_model_declared_client_keys_reach_both_channels():
     inter, client = partition_flat_payload(payload, declared)
     assert inter == payload
     assert client == {key: payload[key] for key in declared}
-    inter_list, client_list = partition_payload_list([payload, {"codes.audio": torch.zeros(1, 2)}], declared)
-    assert client_list == [client, None]
-    assert inter_list[0] == payload
+
+
+def test_partition_model_declared_client_keys_match_exact_flattened_key():
+    payload = {"codes.audio": torch.zeros(2, 4), "codes.ref": torch.zeros(1, 4)}
+    baseline_inter, _ = partition_flat_payload(payload)
+
+    inter, client = partition_flat_payload(payload, ("codes.audio",))
+    assert client == {"codes.audio": payload["codes.audio"]}
+    assert inter == baseline_inter == payload  # Client opt-in leaves inter-stage routing unchanged.
+    # A declaration names a key, not a root: "codes" matches neither sibling.
+    assert partition_flat_payload(payload, ("codes",)) == (payload, {})
 
 
 def test_snapshot_mm_payload_coalesces_compatible_tensor_list(monkeypatch):

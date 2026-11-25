@@ -148,8 +148,8 @@ def _guard_graph_replay_for_pooler_copy(
         main_stream.wait_event(copy_event)
 
 
-def _client_multimodal_output_keys(model: Any) -> tuple[str, ...]:
-    """Payload roots the model requires on the client channel.
+def _client_multimodal_output_keys(model: object) -> tuple[str, ...]:
+    """Flattened payload keys the model requires on the client channel.
 
     The async-chunk split sends only fixed allowlisted roots to the client.
     A model whose client-side consumer reads other per-step outputs (for
@@ -768,8 +768,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
     ) -> tuple[list[dict[str, Any] | None] | None, list[dict[str, Any] | None] | None]:
         """Build async-chunk payloads without materializing hidden on CPU.
 
-        ``client_output_keys`` are model-declared roots copied onto the client
-        channel in addition to the fixed allowlist (see
+        ``client_output_keys`` are model-declared flattened keys copied onto
+        the client channel in addition to the fixed allowlist (see
         :func:`partition_flat_payload`).
         """
         if not mm_outputs:
