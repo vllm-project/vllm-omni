@@ -4,10 +4,9 @@
 from types import SimpleNamespace
 
 import pytest
-from vllm import SamplingParams
-from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.request import RequestStatus
 
+from tests.core.sched.conftest import make_engine_core_request
 from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
@@ -18,23 +17,9 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _make_engine_request() -> EngineCoreRequest:
-    return EngineCoreRequest(
-        request_id="req",
-        prompt_token_ids=[1],
-        mm_features=None,
-        sampling_params=SamplingParams(max_tokens=1),
-        pooling_params=None,
-        arrival_time=0.0,
-        lora_request=None,
-        cache_salt=None,
-        data_parallel_rank=None,
-    )
-
-
 def _omit_flags(*, force_kv_transfer: bool) -> tuple[bool, bool, dict]:
     tagged = apply_omni_final_stage_metadata(
-        _make_engine_request(),
+        make_engine_core_request(),
         final_stage_id=0,
         force_kv_transfer=force_kv_transfer,
     )
@@ -78,7 +63,7 @@ class _ChunkRequest(SimpleNamespace):
 
 def _make_chunk_request(final_stage_id: int, *, force_kv_transfer: bool = False):
     tagged = apply_omni_final_stage_metadata(
-        _make_engine_request(),
+        make_engine_core_request(request_id="req-shm-leak"),
         final_stage_id=final_stage_id,
         force_kv_transfer=force_kv_transfer,
     )
@@ -189,7 +174,7 @@ def test_streaming_session_update_invalidates_omits_kv_transfer_cache():
     scheduler.deferred_waiting = set()
     scheduler.kv_holding_waiting = []
     scheduler.log_stats = False
-    tagged = apply_omni_final_stage_metadata(_make_engine_request(), final_stage_id=0)
+    tagged = apply_omni_final_stage_metadata(make_engine_core_request(), final_stage_id=0)
 
     class Session(SimpleNamespace):
         __hash__ = object.__hash__  # type: ignore[assignment]
@@ -219,7 +204,7 @@ def test_streaming_session_update_invalidates_omits_kv_transfer_cache():
 def test_omits_cache_misses_when_payload_object_is_replaced():
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler._omits_kv_transfer_cache = {}
-    tagged = apply_omni_final_stage_metadata(_make_engine_request(), final_stage_id=0)
+    tagged = apply_omni_final_stage_metadata(make_engine_core_request(), final_stage_id=0)
     request = SimpleNamespace(
         request_id="req",
         additional_information=tagged.additional_information,
