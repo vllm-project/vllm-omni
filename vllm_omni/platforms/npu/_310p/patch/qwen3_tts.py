@@ -83,7 +83,11 @@ class _Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneratio
 class _Qwen3TTSPromptEmbedsBuilder310P(prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder):
     """Qwen3-TTS prompt-embeds builder specialized for the 310P NPU path."""
 
-    _mel_spectrogram_on_cpu = True
+    # 310P has no torch.stft kernels, so the mel front-end defaults to CPU.
+    # When apply_fft_patches() has installed the NPU-native FFT replacements,
+    # mel can run on the NPU next to the speaker encoder instead (no per-request
+    # CPU<->NPU round-trip).
+    _mel_spectrogram_on_cpu = not getattr(torch, "_npu_fft_310p_patched", False)
 
 
 # ===================================================================
@@ -467,6 +471,13 @@ def apply_talker_patches() -> None:
 
     if _PATCHED:
         return
+
+    # Install the NPU-native FFT/STFT replacements before the builder class
+    # reads torch state, so the mel front-end can run on-device instead of
+    # falling back to CPU.
+    from vllm_omni.platforms.npu._310p.patch import apply_fft_patches
+
+    apply_fft_patches()
 
     qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneration = _Qwen3TTSTalker310P
     qwen3_tts_talker.Qwen3TTSPromptEmbedsBuilder = _Qwen3TTSPromptEmbedsBuilder310P
