@@ -780,10 +780,10 @@ class MiniMaxH3AdalnProj(nn.Module):
         # norms, attention projections and MLP remain eligible for compilation.
         plan = self._adaln_cache.plan if self._adaln_cache is not None else None
         if plan is not None:
-            planned = plan.lookup(self)
+            planned = plan.lookup(self, t_emb)
             if planned is not None:
                 return planned
-            if plan.wants(self):
+            if plan.wants(self, t_emb):
                 # Built here, inside the block's forward, so an offloaded weight is staged or materialized.
                 return self._project_and_plan(t_emb, plan)
         return self._project(t_emb)

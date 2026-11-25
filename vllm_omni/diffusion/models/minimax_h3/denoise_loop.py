@@ -450,8 +450,9 @@ def minimax_h3_denoise_loop(
     reference_kv_state = None
     adaln_plan = None
     try:
-        if video_edit is None and audio_edit is None:
-            # Latent edits set per-row target timesteps that the plan does not model.
+        if video_edit is None and audio_edit is None and reference_isolation is None:
+            # Latent edits set per-row target timesteps, and reference isolation overrides the condition
+            # timestep; the plan models neither.
             adaln_plan = build_adaln_plan(
                 model,
                 positive,
