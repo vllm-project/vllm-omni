@@ -36,13 +36,11 @@ def _supports_mindiesd_device(device: torch.device) -> bool:
 def _supports_mindiesd_inputs(
     x: torch.Tensor, table: torch.Tensor, indices: torch.Tensor, *values: torch.Tensor
 ) -> bool:
+    """Select the SDK only when its stricter input contract is satisfied."""
     return (
-        x.ndim == 2
-        and x.numel() > 0
-        and table.ndim == 2
-        and table.shape[0] > 0
-        and table.shape[1] == x.shape[1]
-        and indices.shape == (x.shape[0],)
+        table.shape[1:] == x.shape[1:]
+        and table.numel() > 0
+        and indices.shape == x.shape[:1]
         and indices.dtype in (torch.int32, torch.int64)
         and indices.device == x.device
         and all(t.device == x.device and t.dtype == torch.bfloat16 and t.stride(-1) == 1 for t in (x, table, *values))
@@ -246,7 +244,8 @@ def indexed_gate(
     """Return ``x + gate[indices] * other`` without indexed temporaries."""
     if x.is_cpu:
         return (x + gate.index_select(0, indices) * other).to(x.dtype)
-    if x.device.type == "npu":
+    rows, hidden_size = x.shape
+    if x.device.type == "npu" and rows:
         if other.shape == x.shape and _supports_mindiesd_inputs(x, gate, indices, other):
             try:
                 from mindiesd.layers.index_modulation import indexed_gate as mindiesd_indexed_gate
@@ -257,7 +256,6 @@ def indexed_gate(
                 return mindiesd_indexed_gate(output, x, gate, other, indices)
         x, gate, other = map(_unit_inner_stride, (x, gate, other))
     output = torch.empty_like(x)
-    rows, hidden_size = x.shape
     if rows == 0:
         return output
     _launch_row_chunks(
@@ -297,13 +295,14 @@ def rms_norm_indexed_scale_shift(
         normalized = normalized * torch.rsqrt(variance + eps)
         normalized = (weight.float() * normalized).to(input_dtype)
         return (normalized * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(input_dtype)
-    if x.device.type == "npu":
+    rows, hidden_size = x.shape
+    if x.device.type == "npu" and rows:
         if (
-            _supports_mindiesd_inputs(x, shift, indices, weight, scale)
-            and x.shape[1] <= 8192
-            and weight.shape == (x.shape[1],)
+            hidden_size <= 8192
+            and weight.shape == (hidden_size,)
             and scale.shape == shift.shape
             and 0 < c_float(eps).value < math.inf
+            and _supports_mindiesd_inputs(x, shift, indices, weight, scale)
         ):
             try:
                 from mindiesd.layers.index_modulation import rms_norm_indexed_scale_shift as mindiesd_rms
@@ -313,7 +312,6 @@ def rms_norm_indexed_scale_shift(
                 return mindiesd_rms(x, weight, shift, scale, indices, eps)
         x, weight, shift, scale = map(_unit_inner_stride, (x, weight, shift, scale))
     output = torch.empty_like(x)
-    rows, hidden_size = x.shape
     if rows:
         _launch_row_chunks(
             _rms_norm_indexed_scale_shift_kernel,
