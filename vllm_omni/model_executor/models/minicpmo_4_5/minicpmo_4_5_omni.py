@@ -25,7 +25,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsEagle3, SupportsMRoPE, SupportsMultiModal, SupportsPP
@@ -1552,9 +1551,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """Each row's stage-2 token: forbidden ids masked, repetition penalty, then greedy or a candidate draw.
 
         ``rewinds`` receives, per row position, a call undoing that row's draw.
-        ``logprobs_out`` (capture only, ) receives, per row
-        position, the log-probability of the drawn/argmax token under the
-        exact post-truncation renormalized distribution.
+        ``logprobs_out`` (capture only) receives, per row position, the
+        token's log-probability under the pre-truncation stage-2 distribution:
+        the forbidden-masked logits before the repetition penalty, at the
+        row's temperature (greedy rows: 1).
         """
         device, vocab = logits.device, logits.shape[-1]
         all_greedy = bool(getattr(sampling_metadata, "all_greedy", False))
@@ -1563,6 +1563,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         forbidden_index = self._minicpmo45_duplex_forbidden_index(token_ids, vocab, device)
         if forbidden_index is not None:
             stage2_logits.index_fill_(1, forbidden_index, float("-inf"))
+        # Taken before the repetition penalty mutates ``stage2_logits``.
+        masked = stage2_logits.clone() if logprobs_out is not None else None
         history_size = MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
         penalty_rows: list[int] = []
         penalty_cols: list[int] = []
@@ -1582,22 +1584,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if greedy:
             greedy_logits = stage2_logits[index_to_device(greedy, device)]
             greedy_sample = torch.argmax(greedy_logits, dim=-1)
-            if logprobs_out is not None:
-                # Same truncation rule as sampled rows; temperature 0 is the
-                # identity, so the masked + penalized logits filter as-is.
-                greedy_filtered = greedy_logits.clone()
-                for pos, local_idx in enumerate(greedy):
-                    _temperature, top_k, top_p = row_params[rows[local_idx]]
-                    greedy_filtered[pos : pos + 1] = self._top_k_top_p_filter(
-                        greedy_filtered[pos : pos + 1], top_k=int(top_k), top_p=top_p
-                    )
-                greedy_logprobs = (
-                    torch.log_softmax(greedy_filtered.float(), dim=-1)
-                    .gather(1, greedy_sample.unsqueeze(-1))
-                    .squeeze(-1)
-                )
-                for pos, local_idx in enumerate(greedy):
-                    logprobs_out[local_idx] = greedy_logprobs[pos : pos + 1]
             for pos, local_idx in enumerate(greedy):
                 samples[local_idx] = greedy_sample[pos : pos + 1]
         drawn = [local_idx for local_idx in range(len(rows)) if samples[local_idx] is None]
@@ -1622,21 +1608,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 candidates = self._duplex_top_k_top_p_candidates(group_logits, top_k=top_k, top_p=top_p)
                 group_uniforms = torch.stack([uniforms[local_idx] for local_idx in members])
                 draws = self._duplex_draw_candidates(group_logits, candidates, group_uniforms)
-                if logprobs_out is not None:
-                    # The drawn token's renormalized mass: its regular slot, or
-                    # one tie share when it sits at the k-th value.
-                    probs, indices, kth, ties = candidates
-                    drawn_t = draws.view(-1, 1)
-                    regular = (indices == drawn_t).float() * probs
-                    per_tie = probs[..., -1:] / ties.clamp(min=1).to(probs.dtype)
-                    tied_hit = (group_logits.gather(1, drawn_t) == kth).to(probs.dtype)
-                    mass = regular.sum(dim=-1, keepdim=True) + tied_hit * per_tie
-                    group_logprobs = mass.clamp(min=torch.finfo(probs.dtype).tiny).log().squeeze(-1)
-                    for i, local_idx in enumerate(members):
-                        logprobs_out[local_idx] = group_logprobs[i : i + 1]
                 for i, local_idx in enumerate(members):
                     samples[local_idx] = draws[i : i + 1]
-        return torch.cat(samples)  # type: ignore[arg-type]
+        tokens = torch.cat(samples)  # type: ignore[arg-type]
+        if logprobs_out is not None and masked is not None:
+            sampled_rows = set(drawn)
+            row_temperatures = [
+                float(row_params[rows[local_idx]][0]) if local_idx in sampled_rows else 1.0
+                for local_idx in range(len(rows))
+            ]
+            temperatures = to_device_nonblocking(torch.tensor(row_temperatures, dtype=torch.float32), device).view(
+                -1, 1
+            )
+            logprobs = (
+                torch.log_softmax(masked.float() / temperatures, dim=-1).gather(1, tokens.view(-1, 1)).squeeze(-1)
+            )
+            for local_idx in range(len(rows)):
+                logprobs_out[local_idx] = logprobs[local_idx : local_idx + 1]
+        return tokens
 
     def _sample_minicpmo45_native_duplex_rows(
         self,
@@ -1739,7 +1728,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 reason_codes=["terminator_reemit"],
                 stream_names=["boundary"],
                 terminators=[{"token_id": int(token), "kind": self._minicpmo45_terminator_kind(token, token_ids)}],
-                model={"minicpmo_duplex": {"repetition_penalty": 1.05}},
             ),
         )
 
@@ -1824,9 +1812,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         stage2_logprob: float | None,
         raw_sampled: int | None = None,
     ) -> dict[str, Any] | None:
-        """Assemble one row's unit payload. The universal ``logprob`` is the joint
-        (``log P(chunk_eos)`` for a boundary hit, else ``log(1-P) + stage-2``) —
-        per-stage quantities ride the ``model`` extension; forced rows record no draw."""
+        """Assemble one row's unit payload. The universal ``logprob`` is the two-stage joint
+        (``log P(chunk_eos)`` for a boundary hit, else ``log(1-P)`` + the stage-2 pre-truncation
+        logprob); forced rows record no draw."""
         from vllm_omni.protocol.duplex.action_records import ACTION_FORCED, ACTION_SAMPLED, build_unit_payload
 
         session_id, epoch, seq = identity
@@ -1840,13 +1828,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         action_reason: str | None = None
         logprob: float | None = None
         stream = "content"
-        model_extension: dict[str, Any] = {
-            "repetition_penalty": 1.05,
-            "repetition_history_tokens": MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE,
-            "forbidden_tokens": "tts_pad+bad_token_ids+chunk_eos",
-        }
-        if boundary_prob is not None:
-            model_extension["stage0_prob_chunk_eos"] = float(boundary_prob)
+        model_extension: dict[str, Any] = {}
         if reason is not None:
             # Cap-resolved before any draw: no RNG consumed.
             kind = ACTION_FORCED
@@ -1857,7 +1839,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             stream = "boundary"
         elif stage2_logprob is not None:
             logprob = _capture_log1m(boundary_prob) + stage2_logprob if boundary_prob is not None else stage2_logprob
-            model_extension["stage2_logprob"] = float(stage2_logprob)
         if raw_sampled is not None and raw_sampled != token:
             # The engine rewrote the sampled token (mid-turn listen -> tts_bos):
             # still the policy's draw, but a forced emission.
@@ -2277,27 +2258,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return default
 
     @staticmethod
-    def _top_k_top_p_filter(logits: torch.Tensor, *, top_k: int, top_p: float) -> torch.Tensor:
-        if top_k > 0 and top_k < logits.shape[-1]:
-            kth = torch.topk(logits, top_k, dim=-1).values[..., -1, None]
-            logits = logits.masked_fill(logits < kth, float("-inf"))
-        if 0.0 < top_p < 1.0:
-            # Stable: tied logits enter the nucleus lowest index first.
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1, stable=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_remove = cumulative_probs > top_p
-            sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
-            sorted_remove[..., 0] = False
-            remove = torch.zeros_like(logits, dtype=torch.bool)
-            remove.scatter_(dim=-1, index=sorted_indices, src=sorted_remove)
-            logits = logits.masked_fill(remove, float("-inf"))
-        return logits
-
-    @staticmethod
     def _duplex_top_k_top_p_candidates(
         logits: torch.Tensor, *, top_k: int, top_p: float
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``softmax(_top_k_top_p_filter(logits))`` on its support as ``(probs, indices, kth, ties)``, no host read.
+        """The top-k/top-p truncated softmax on its support as ``(probs, indices, kth, ties)``, no host read.
 
         Nucleus order (value descending, index ascending), O(V + k log k). All logits tied at the k-th value
         stay; their count is data-dependent, so they share the last slot (index -1): the ``ties`` lowest-index

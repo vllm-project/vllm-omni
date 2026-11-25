@@ -3,10 +3,11 @@
 # FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Action capture from the MiniCPM-o 4.5 duplex stage-0 sampler.
 
-The parity test recomputes every recorded log-probability independently from
-the recorded distribution inputs (raw-softmax Bernoulli, forbidden mask,
-repetition penalty, top-k/top-p renormalized stage 2) and must match within
-tolerance on all sampled tokens. Taxonomy, seeded replay, cap-without-draw,
+The parity test recomputes every recorded log-probability independently in
+float32 (raw-softmax Bernoulli for stage 1, forbidden-masked logits at the
+row's temperature for stage 2) and must match within tolerance on all sampled
+tokens; a second test pins that truncation and the repetition penalty steer
+the draw but not the record. Taxonomy, seeded replay, cap-without-draw,
 force-listen-without-draw, same-step publication, the generator device and
 the per-unit capture seq are pinned beside it.
 """
@@ -29,7 +30,6 @@ from tests.model_executor.models.minicpmo_4_5.test_native_duplex_sampling import
 )
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.protocol.duplex.action_records import decode_unit_payload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -85,36 +85,19 @@ def _published(model) -> dict[str, Any]:
     return dict(stash)
 
 
-def _stage2_reference_logprob(
-    logits_row: torch.Tensor,
-    recent: list[int],
-    generated: list[int],
-    temperature: float,
-    top_k: int,
-    top_p: float,
-    token: int,
-) -> float:
-    """Independent recompute: masked, penalized, truncated, renormalized logprob of ``token``."""
-    row_logits = logits_row.clone()
-    row_logits[TTS_PAD] = float("-inf")
-    row_logits[CHUNK_EOS] = float("-inf")
-    history = list(dict.fromkeys((generated or recent)[-MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE :]))
-    for token_id in history:
-        row_logits[token_id] /= 1.05
-    scaled = row_logits if temperature <= 0 else row_logits / temperature
-    dense = torch.softmax(Model._top_k_top_p_filter(scaled.view(1, -1), top_k=top_k, top_p=top_p), dim=-1)[0]
-    return float(torch.log(dense[token].clamp_min(torch.finfo(torch.float32).tiny)))
+def _stage2_reference_logprob(logits_row: torch.Tensor, temperature: float, token: int) -> float:
+    """Independent recompute in float32: ``log_softmax(forbidden-masked logits / T)[token]``."""
+    masked = logits_row.clone()
+    masked[TTS_PAD] = float("-inf")
+    masked[CHUNK_EOS] = float("-inf")
+    return float(torch.log_softmax(masked.float() / temperature, dim=-1)[token])
 
 
 @pytest.mark.parametrize("seed", range(3))
 def test_capture_logprobs_match_independent_recomputation(seed: int) -> None:
     model, states, md, steps = _setup(seed)
     _enable_capture(model)
-    # The parity reference must see the pre-commit repetition history.
-    pre_recent = {row: list(md.output_token_ids[row]) for row in range(6)}
-    pre_generated = {row: list(states[row].generated_tokens) for row in range(6)}
-    logits = steps[0].clone()
-    out = model._sample_minicpmo45_native_duplex_stage0(logits.clone(), md, duplex_rows=list(range(6)))
+    out = model._sample_minicpmo45_native_duplex_stage0(steps[0].clone(), md, duplex_rows=list(range(6)))
     tokens = out.sampled_token_ids.squeeze(-1).tolist()
     entries = _published(model)
 
@@ -136,7 +119,7 @@ def test_capture_logprobs_match_independent_recomputation(seed: int) -> None:
         kind, reason = payload["action_kinds"][0], payload["reason_codes"][0] or None
         logprob = payload["logprobs"][0]
         extension = payload["model"]["minicpmo_duplex"]
-        temperature, top_k, top_p = row_params[row]
+        temperature = float(row_params[row][0])
         p0 = float(torch.softmax(steps[0][row], dim=-1)[CHUNK_EOS])
         if reason in ("chunk_token_cap", "chunk_char_cap", "request_token_cap"):
             # A budget cap resolved before any draw: forced, no logprob.
@@ -144,7 +127,7 @@ def test_capture_logprobs_match_independent_recomputation(seed: int) -> None:
             continue
         if row == 1:
             # Sampled listen rewritten to tts_bos mid-turn: forced emission of
-            # the policy's own draw.
+            # the policy's own draw, recorded as that draw.
             assert kind == "forced" and reason == "mid_turn_listen_rewrite"
             assert extension["sampled_token"] == LISTEN
             token = LISTEN
@@ -153,23 +136,49 @@ def test_capture_logprobs_match_independent_recomputation(seed: int) -> None:
         if token == CHUNK_EOS:
             # Boundary hit: the exact Bernoulli parameter on the raw softmax.
             assert math.isclose(logprob, math.log(p0), rel_tol=1e-4, abs_tol=1e-5)
-            assert math.isclose(extension["stage0_prob_chunk_eos"], p0, rel_tol=1e-4)
             continue
-        recent = pre_recent[row]
-        generated = pre_generated[row]
-        reference = _stage2_reference_logprob(
-            steps[0][row], recent, generated, float(temperature), int(top_k), float(top_p), token
+        # Stage 2: the pre-truncation measure; a greedy row's argmax takes temperature 1.
+        stage_temperature = 1.0 if temperature <= 0 else temperature
+        joint = math.log(max(1.0 - p0, torch.finfo(torch.float32).tiny)) + _stage2_reference_logprob(
+            steps[0][row], stage_temperature, token
         )
-        joint = math.log(max(1.0 - p0, torch.finfo(torch.float32).tiny)) + reference
         assert math.isclose(logprob, joint, rel_tol=1e-3, abs_tol=1e-4), (row, logprob, joint)
-        assert math.isclose(extension["stage2_logprob"], reference, rel_tol=1e-3, abs_tol=1e-4)
-        # Every non-SamplingParams distribution input rides the extension.
-        assert extension["repetition_penalty"] == 1.05
-        assert extension["repetition_history_tokens"] == 512
-        assert extension["forbidden_tokens"]
 
 
-def test_capture_records_the_non_sampling_params_distribution_inputs() -> None:
+def test_capture_logprobs_ignore_truncation_and_repetition_penalty() -> None:
+    """Top-k/top-p and the repetition history steer the draw, not the recorded measure."""
+    runs = []
+    for top_k, top_p, history in (
+        (None, None, {}),
+        (3, 0.5, {}),
+        (0, 1.0, {}),
+        # The drawn tokens themselves in the penalty window.
+        (None, None, {0: [23, 22, 21], 4: [22, 21, 20]}),
+    ):
+        model, states, md, steps = _setup(0)
+        _enable_capture(model)
+        if top_k is not None:
+            md.top_k, md.top_p = torch.full((6,), top_k), torch.full((6,), top_p)
+        for row, tokens in history.items():
+            states[row].generated_tokens = list(tokens)
+        out = model._sample_minicpmo45_native_duplex_stage0(steps[0].clone(), md, duplex_rows=list(range(6)))
+        runs.append(
+            (
+                out.sampled_token_ids.squeeze(-1).tolist(),
+                {k: decode_unit_payload(v) for k, v in _published(model).items()},
+            )
+        )
+    tokens, baseline = runs[0]
+    drawn = [row for row in range(6) if baseline[f"req-{row}"]["logprobs"][0] is not None]
+    assert drawn, "no row recorded a draw"
+    for varied_tokens, entries in runs[1:]:
+        assert varied_tokens == tokens, "a varied input changed the draw; the record comparison needs the same token"
+        for row in drawn:
+            record, reference = entries[f"req-{row}"]["logprobs"][0], baseline[f"req-{row}"]["logprobs"][0]
+            assert math.isclose(record, reference, abs_tol=1e-6), (row, record, reference)
+
+
+def test_capture_records_the_effective_sampling_params() -> None:
     model, states, md, steps = _setup(0)
     _enable_capture(model)
     model._sample_minicpmo45_native_duplex_stage0(steps[0].clone(), md, duplex_rows=list(range(6)))
@@ -381,10 +390,7 @@ def test_capture_records_force_listen_as_forced_without_logprob(source: str) -> 
         assert record["action_kinds"] == ["forced"]
         assert record["reason_codes"] == ["force_listen"]
         assert record["logprobs"] == [None]
-        extension = record["model"]["minicpmo_duplex"]
-        assert "stage0_prob_chunk_eos" not in extension
-        assert "stage2_logprob" not in extension
-        assert "sampled_token" not in extension
+        assert "sampled_token" not in record["model"]["minicpmo_duplex"]
         assert record["terminators"] == [{"token_id": LISTEN, "kind": "listen"}]
     for row in set(range(6)) - forced:
         assert tokens[row] == baseline_tokens[row]

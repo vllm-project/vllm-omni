@@ -20,6 +20,25 @@ _NAMES = ("unit", "chunk_eos", "listen", "tts_bos", "turn_eos", "chunk_tts_eos",
 TOKEN_IDS = {f"{name}_token_id": token for name, token in zip(_NAMES, (1, CHUNK_EOS, LISTEN, 7, 8, 9, TTS_PAD))}
 
 
+def top_k_top_p_filter_reference(logits: torch.Tensor, *, top_k: int, top_p: float) -> torch.Tensor:
+    """Dense top-k/top-p truncation: the oracle for the candidate-distribution fast path."""
+    logits = logits.clone()
+    if top_k > 0 and top_k < logits.shape[-1]:
+        kth = torch.topk(logits, top_k, dim=-1).values[..., -1, None]
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    if 0.0 < top_p < 1.0:
+        # Stable: tied logits enter the nucleus lowest index first.
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1, stable=True)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_remove = cumulative_probs > top_p
+        sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+        sorted_remove[..., 0] = False
+        remove = torch.zeros_like(logits, dtype=torch.bool)
+        remove.scatter_(dim=-1, index=sorted_indices, src=sorted_remove)
+        logits = logits.masked_fill(remove, float("-inf"))
+    return logits
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_chunk_boundary_probability_preserves_softmax_shift_invariance(dtype):
     # A shared logit offset must not change the decision to stop a speech chunk.
@@ -88,7 +107,7 @@ def _reference(logits, md, states, row_params) -> list[int]:
         scaled = row_logits / temperature
         candidates = Model._duplex_top_k_top_p_candidates(scaled, top_k=top_k, top_p=top_p)
         # The candidate-space distribution is the dense top-k / top-p filter's.
-        dense = torch.softmax(Model._top_k_top_p_filter(scaled, top_k=int(top_k), top_p=top_p), -1)
+        dense = torch.softmax(top_k_top_p_filter_reference(scaled, top_k=int(top_k), top_p=top_p), -1)
         torch.testing.assert_close(_expand(scaled, candidates), dense)
         uniform = torch.rand((), generator=generator)
         out.append(int(Model._duplex_draw_candidates(scaled, candidates, uniform.view(1))))
@@ -156,7 +175,7 @@ def test_candidate_draws_follow_the_dense_distribution(top_k, top_p):
     # A midpoint grid of uniforms integrates the inverse CDF exactly: each token
     # is drawn in proportion to its dense probability, ties included.
     logits, n = _tied_logits("cpu"), 4096
-    expected = torch.softmax(Model._top_k_top_p_filter(logits, top_k=top_k, top_p=top_p), dim=-1)
+    expected = torch.softmax(top_k_top_p_filter_reference(logits, top_k=top_k, top_p=top_p), dim=-1)
     rows = logits.repeat(n, 1)
     grid = ((torch.arange(n, dtype=torch.float32) + 0.5) / n).repeat_interleave(logits.shape[0])
     draws = Model._duplex_draw_candidates(
@@ -177,7 +196,7 @@ def test_tied_nucleus_boundaries_match_the_dense_filter(n, top_p, dtype):
     logits[0, :n], logits[1, 3 : 3 + n], logits[2, :2], logits[2, 4 : 4 + n] = 20.0, 0.5, 2.0, 1.0
     logits = logits.to(dtype)
     # The candidates compute in float32; bf16 widens exactly, so ties survive.
-    expected = torch.softmax(Model._top_k_top_p_filter(logits.float(), top_k=3, top_p=top_p), dim=-1)
+    expected = torch.softmax(top_k_top_p_filter_reference(logits.float(), top_k=3, top_p=top_p), dim=-1)
     actual = _expand(logits, Model._duplex_top_k_top_p_candidates(logits, top_k=3, top_p=top_p))
     assert torch.equal(actual > 0, expected > 0)
     torch.testing.assert_close(actual, expected)

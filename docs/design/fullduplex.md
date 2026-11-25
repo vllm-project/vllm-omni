@@ -1634,15 +1634,21 @@ what forcing* — the two surfaces this contract adds.
   assembles units into sealed, columnar `DuplexActionRecordSet`s — one per
   response, or per listening period (model-native sessions sample the units
   where they keep listening too; those actions are as much policy as the
-  spoken ones). Records carry the exact-distribution joint log-probability of
-  each emitted action (`log P(chunk_eos)` for a boundary hit; `log(1-P) +
-  stage-2 logprob` for content), per-stage quantities and every
-  non-`SamplingParams` distribution input (repetition penalty and window,
-  forbidden-set identity) in the namespaced `model` extension, the forcing
-  taxonomy (`sampled` / `forced` with reason / `reemit`), input origins
-  (`client` / engine-injected silence), effective sampling parameters, and
-  the derived seed `f(session_seed, epoch, response_index)`. Validation
-  failure is session-fatal (`action_capture_invalid`). The ledger retains
+  spoken ones). Each record carries the two-stage policy's joint
+  log-probability of the emitted action under its pre-truncation distribution:
+  stage 1 is the raw `log P(chunk_eos)`; a content token records
+  `log(1 - P(chunk_eos)) + log_softmax(masked logits / T)[token]`, where the
+  mask is the forbidden set (`tts_pad`, `bad_token_ids`, `chunk_eos`) and
+  `T` the row's temperature (greedy rows: `T = 1`, the argmax token).
+  Cap-resolved, force-listen and re-emitted rows record no draw; the
+  mid-turn listen rewrite is a forced emission of the policy's own raw
+  draw, whose joint log-probability is its `logprob` and whose token id
+  rides `sampled_token` in the namespaced `model` extension.
+  Records also carry the forcing taxonomy (`sampled` / `forced` with reason /
+  `reemit`), input origins (`client` / engine-injected silence), effective
+  sampling parameters, and the derived seed
+  `f(session_seed, epoch, response_index)`. Validation failure is
+  session-fatal (`action_capture_invalid`). The ledger retains
   one open plus one sealed scope; before every non-forced seal the session
   spills sealed sets past that window into the manager's terminal cache, so
   a live multi-turn episode never overflows and every sealed set is drained
@@ -1664,7 +1670,7 @@ MiniCPM-o 4.5 is the first implementation: the stage-0 policy functions are
 shared by the duplex deployments and sampled through the worker_v2 duplex
 sampler (ModelRunner V1 is removed upstream and gets no implementation);
 capture rows force the synchronous sampling path so each record publishes on
-its own unit's delivery, and per-stage log-probabilities are proven against
+its own unit's delivery, and the joint log-probability is proven against
 an independent recomputation at CPU scale
 (`tests/model_executor/models/minicpmo_4_5/test_duplex_action_capture.py`).
 Other duplex models adopt through per-model follow-ups without engine changes.
