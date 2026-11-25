@@ -248,8 +248,10 @@ def test_flashinfer_backend_routes_qkv_and_reverse(monkeypatch, with_gate):
         return exchange
 
     def reverse(name):
-        def exchange(tensor, group_name, world_size):
+        def exchange(tensor, group_name, world_size, copy_out=True):
             assert (group_name, world_size) == ("ulysses", 2)
+            # The output goes back to model code, so the FlashInfer gather copies it out by default.
+            assert copy_out
             calls.append(name)
             return tensor[:, :3].repeat(1, 1, 2, 1)
 

@@ -126,8 +126,18 @@ def _nvlink_all_pairs(uuids: list[str]) -> bool:
     stays valid whatever devices each process sees)."""
     from vllm.utils.import_utils import import_pynvml
 
-    nvml = import_pynvml()
-    nvml.nvmlInit()
+    # Containers can expose CUDA compute without NVML; report no NVLink so every rank still reaches the agreement
+    # all-reduce and falls back together. Shut NVML down only after a successful init.
+    try:
+        nvml = import_pynvml()
+    except (ImportError, OSError) as error:
+        logger.debug("pynvml unavailable, treating NVLink as absent: %s", error)
+        return False
+    try:
+        nvml.nvmlInit()
+    except nvml.NVMLError as error:
+        logger.debug("NVML init failed, treating NVLink as absent: %s", error)
+        return False
     try:
         handles = [nvml.nvmlDeviceGetHandleByUUID(gpu) for gpu in uuids]
         for i, a in enumerate(handles):

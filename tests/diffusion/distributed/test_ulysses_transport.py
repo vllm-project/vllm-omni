@@ -191,6 +191,64 @@ def test_probe_is_cached_per_group(monkeypatch):
     assert ulysses_transport.probe_ulysses_topology(SimpleNamespace(group_name="ulysses"), 2) is first
 
 
+class _FakeNVML:
+    class NVMLError(Exception):
+        pass
+
+    NVML_P2P_CAPS_INDEX_NVLINK = 0
+    NVML_P2P_STATUS_OK = 0
+
+    def __init__(self, init_fails=False, status=0):
+        self.init_fails = init_fails
+        self.status = status
+        self.shutdowns = 0
+
+    def nvmlInit(self):
+        if self.init_fails:
+            raise self.NVMLError("NVML not available in this container")
+
+    def nvmlShutdown(self):
+        self.shutdowns += 1
+
+    def nvmlDeviceGetHandleByUUID(self, gpu):
+        return gpu
+
+    def nvmlDeviceGetP2PStatus(self, a, b, index):
+        return self.status
+
+
+def _patch_nvml(monkeypatch, nvml):
+    import vllm.utils.import_utils as import_utils
+
+    def load():
+        if isinstance(nvml, BaseException):
+            raise nvml
+        return nvml
+
+    monkeypatch.setattr(import_utils, "import_pynvml", load)
+
+
+@pytest.mark.parametrize("status, expected", [(0, True), (1, False)])
+def test_nvlink_probe_checks_pairs_and_shuts_nvml_down(monkeypatch, status, expected):
+    nvml = _FakeNVML(status=status)
+    _patch_nvml(monkeypatch, nvml)
+    assert ulysses_transport._nvlink_all_pairs(["GPU-a", "GPU-b", "GPU-c"]) is expected
+    assert nvml.shutdowns == 1
+
+
+def test_nvlink_probe_treats_failed_nvml_init_as_no_nvlink(monkeypatch):
+    nvml = _FakeNVML(init_fails=True)
+    _patch_nvml(monkeypatch, nvml)
+    assert ulysses_transport._nvlink_all_pairs(["GPU-a", "GPU-b"]) is False
+    assert nvml.shutdowns == 0
+
+
+@pytest.mark.parametrize("error", [ImportError("no pynvml"), OSError("libnvidia-ml.so.1 not found")])
+def test_nvlink_probe_treats_missing_pynvml_as_no_nvlink(monkeypatch, error):
+    _patch_nvml(monkeypatch, error)
+    assert ulysses_transport._nvlink_all_pairs(["GPU-a", "GPU-b"]) is False
+
+
 def _resolve(requested, monkeypatch, topology, backend="FLASHINFER_ATTN", impl="cute-dsl"):
     messages = []
     monkeypatch.setattr(ulysses_transport, "_LOGGED", set())
