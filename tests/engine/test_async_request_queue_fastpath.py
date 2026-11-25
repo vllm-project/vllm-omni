@@ -88,7 +88,8 @@ def test_fast_put_notifies_owner_async_consumer(cross_loop_engine):
     waiting = threading.Event()
 
     async def consume():
-        waiting.set()
+        # Signal only after get() has suspended on the empty queue.
+        asyncio.get_running_loop().call_soon(waiting.set)
         return await engine.request_queue.async_q.get()
 
     received = asyncio.run_coroutine_threadsafe(consume(), engine.orchestrator_loop)
