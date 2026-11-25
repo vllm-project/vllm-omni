@@ -306,14 +306,32 @@ def main() -> None:
     from importlib import import_module
     from pathlib import Path
 
-    from vllm_omni.clients.duplex import DuplexClient, SessionConfig
+    from vllm_omni.clients.duplex import (
+        DuplexClient,
+        EventCollector,
+        SessionConfig,
+        acknowledge_collected_playback,
+        read_pcm16_wav,
+        write_pcm16_wav,
+    )
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--tools-json", required=True, help="JSON file containing a list of tool declarations")
     parser.add_argument("--handler", action="append", required=True, help="NAME=MODULE:ASYNC_FUNCTION; repeat per tool")
-    parser.add_argument("--prompt", required=True)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--prompt", help="Text turn for models that support conversation.item.create")
+    inputs.add_argument("--input-wav", help="Stream mono PCM16 at 16 kHz to a native-duplex model")
+    inputs.add_argument("--initial-user-text", help="Seed a native-duplex session, then stream silence")
+    parser.add_argument("--instructions", help="Session instructions")
+    parser.add_argument("--temperature", type=float, help="Sampling temperature; omit to use the server default")
+    parser.add_argument("--output-wav", help="Save generated PCM audio as a WAV file")
+    parser.add_argument(
+        "--ack-collected-audio",
+        action="store_true",
+        help="Simulate immediate playback of received audio for an offline probe; does not play sound",
+    )
     parser.add_argument("--timeout", type=float, default=60, help="Seconds to consume events before closing")
     args = parser.parse_args()
     if args.timeout <= 0:
@@ -328,38 +346,77 @@ def main() -> None:
         handlers[name] = getattr(import_module(module), function)
 
     async def serve() -> None:
-        config = SessionConfig(modalities=("text",), auto_response=False, extra_body=function_call_session_defaults())
+        native = args.input_wav is not None or args.initial_user_text is not None
+        extra_body = {**function_call_session_defaults(), "realtime_tools": tools}
+        if args.initial_user_text is not None:
+            extra_body["duplex_initial_user_text"] = args.initial_user_text
+        config = SessionConfig(
+            modalities=("text", "audio") if native or args.output_wav else ("text",),
+            auto_response=native,
+            instructions=args.instructions,
+            temperature=args.temperature,
+            overlap_policy="listen_only" if native else None,
+            extra_body=extra_body,
+        )
         async with DuplexClient(args.url, model=args.model, config=config) as client:
             runner = DuplexToolRunner(client, handlers)
+            collector = EventCollector() if args.output_wav or args.ack_collected_audio else None
 
             async def print_events() -> None:
                 async for event in client.events():
+                    if collector is not None:
+                        collector.add(event.raw)
                     print(json.dumps(event.raw), flush=True)
+                    if args.ack_collected_audio and event.type in (
+                        "response.output_audio.delta",
+                        "response.audio.delta",
+                    ):
+                        assert collector is not None
+                        await acknowledge_collected_playback(client, collector)
 
             printer = asyncio.create_task(print_events())
             running = asyncio.create_task(runner.run())
+
+            async def provide_input() -> None:
+                if native:
+                    if args.input_wav is not None:
+                        pcm = await asyncio.to_thread(read_pcm16_wav, Path(args.input_wav))
+                        await client.stream_pcm(pcm)
+                    # Native models need input units to decide when to speak,
+                    # including while the application awaits a tool's result.
+                    while True:
+                        await client.stream_pcm(bytes(32000), is_speech=False)
+                else:
+                    await client.send(
+                        {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": args.prompt}],
+                            },
+                        }
+                    )
+                    await client.send({"type": "response.create"})
+
+            feeding = asyncio.create_task(provide_input())
             try:
-                await asyncio.sleep(0)
-                await client.send({"type": "session.update", "session": {"tools": tools}})
-                await client.send(
-                    {
-                        "type": "conversation.item.create",
-                        "item": {
-                            "type": "message",
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": args.prompt}],
-                        },
-                    }
-                )
-                await client.send({"type": "response.create"})
                 try:
-                    await asyncio.wait_for(running, args.timeout)
+                    await asyncio.wait_for(asyncio.gather(running, feeding), args.timeout)
                 except TimeoutError:
                     pass
             finally:
                 running.cancel()
                 printer.cancel()
-                await asyncio.gather(running, printer, return_exceptions=True)
+                feeding.cancel()
+                await asyncio.gather(running, printer, feeding, return_exceptions=True)
+                if args.output_wav and collector is not None:
+                    await asyncio.to_thread(
+                        write_pcm16_wav,
+                        Path(args.output_wav),
+                        collector.audio_bytes(),
+                        sample_rate_hz=collector.output_sample_rate_hz,
+                    )
 
     asyncio.run(serve())
 

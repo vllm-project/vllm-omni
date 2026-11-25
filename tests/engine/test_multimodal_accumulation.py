@@ -101,7 +101,17 @@ def test_replace_nemotron_snapshot_keys_detects_nested_meta_marker():
     assert "codes.audio" not in accumulated
 
 
-@pytest.mark.parametrize("key", ["finished", "duplex_audio_cache_epoch", "duplex_audio_chunk_seq"])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "finished",
+        "duplex_audio_cache_epoch",
+        "duplex_audio_chunk_seq",
+        "speech_flush",
+        "text_without_audio",
+        "streaming_condition_seq",
+    ],
+)
 def test_chunk_metadata_is_replaced_per_chunk_not_appended(key):
     """Per-step flags and chunk identities are snapshots, like segment_end.
 

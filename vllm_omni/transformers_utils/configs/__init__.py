@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 
 _CLASS_TO_MODULE: dict[str, str] = {
+    "RealtimeVenusOmniConfig": "vllm_omni.transformers_utils.configs.realtime_venus",
     "Audio8TTSConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "Audio8TTSSlowARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "Audio8TTSFastARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
@@ -116,6 +117,7 @@ from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_
 from vllm_omni.transformers_utils.configs import minimax_music3 as _minimax_music3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import phonon as _phonon  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import realtime_venus as _realtime_venus  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import sensenova_u1 as _sensenova_u1  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import vibevoice as _vibevoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
