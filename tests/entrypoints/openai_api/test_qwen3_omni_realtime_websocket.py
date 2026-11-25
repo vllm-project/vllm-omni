@@ -459,7 +459,7 @@ class TestQwen3OmniRealtimeWebSocket:
 
     @pytest.mark.advanced_model
     @pytest.mark.omni
-    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @hardware_test(res={"cuda": "H100"}, num_cards=2)
     @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
     def test_livekit_client_vad_replay_without_runtime_jit(self, omni_server) -> None:
         """The shared server's first session answers all three replay turns without compiling kernels mid-request.
