@@ -1,0 +1,14 @@
+{
+  "status": "unselected",
+  "calibration_notes": "No accuracy floors have been selected. Calibrate each device profile before enabling H3_IMAGE_CALIBRATE=0. Editing currently has a substantial native-versus-Diffusers discrepancy.",
+  "t2i": {
+    "default": {"ssim": null, "psnr": null},
+    "H100": {"ssim": null, "psnr": null},
+    "A3": {"ssim": null, "psnr": null}
+  },
+  "edit": {
+    "default": {"ssim": null, "psnr": null},
+    "H100": {"ssim": null, "psnr": null},
+    "A3": {"ssim": null, "psnr": null}
+  }
+}

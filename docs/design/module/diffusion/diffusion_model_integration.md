@@ -70,6 +70,11 @@ generation configuration, tokenizer, and weight loading, including preprocessing
 The shared-weight runtime pins remote loads to the commit resolved by AR;
 local checkpoint directories must remain immutable throughout the session.
 
+MiniMax-H3-Image resolves all requested release assets from the Hub, including
+the PDD configuration and fused heads, tokenizer, processor, and VAE. Finding
+`model_index.json` in a cold or partially populated cache does not establish
+that these other required assets are available.
+
 ## HunyuanImage3 AR KV token identity
 
 The HunyuanImage3 AR-to-DiT bridge carries the original prompt and generated
