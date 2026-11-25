@@ -1082,7 +1082,8 @@ retain the native `17n+5` video-frame grid, `5n+2` video-latent grid, and 40 Hz
 audio latents. A request for 75 seconds becomes 1,807 frames (75.292 seconds at
 24 FPS). In full mode, attention cost and activation memory grow with the full
 sequence length. Reference-video and reference-audio limits remain unchanged.
-Other task types retain full-mode behavior. Requests are limited to 30 seconds
+T2VA and FL2VA keep full mode unless the request sets
+`long_video_mode=continuation`. Requests are limited to 30 seconds
 in full mode and 300 seconds in continuation mode; without `long_video=true`,
 the limit remains 15 seconds. The limits cover duration aliases and explicit
 `num_frames`, and externally encoded requests are checked again before diffusion.
@@ -1136,9 +1137,9 @@ To continue a finished job in a separate request, see
 [MiniMax H3 Continuation Across Requests](../../docs/serving/videos_api.md#minimax-h3-continuation-across-requests).
 
 `long_video=true` selects this mode by default for Ref2VA. It can also be selected
-explicitly with `long_video_mode=continuation`. This experimental mode supports
-Ref2VA request execution with uncached denoising (`quality=lossless`); step
-execution is rejected. Use `long_video_mode=full` explicitly for whole-target
+explicitly with `long_video_mode=continuation`, which is how T2VA and FL2VA
+requests opt in. This experimental mode supports request execution with
+uncached denoising (`quality=lossless`); step execution is rejected. Use `long_video_mode=full` explicitly for whole-target
 sampling, including requests up to 30 seconds that require step execution.
 Continuation currently rejects latent-mask editing (`video_noise_mask` or
 `audio_noise_mask` with retained source regions). Full mode supports editing;
@@ -1185,9 +1186,42 @@ strings for the default 75-second request). These prompts are independently
 encoded with the same reference assets and selected in window order. Shot times
 inside each prompt describe that local window, including its hidden overlap.
 This option requires a local text encoder; external-encoder stage execution is
-not supported. Media positions use one shared origin after the longest encoded
-text prefix, so different prompt lengths do not shift the global AV clock.
-Without this list, the request's single prompt is reused as before.
+not supported. Ref2VA media positions use one shared origin after the longest
+encoded text prefix, so different prompt lengths do not shift the global AV clock;
+T2VA and FL2VA windows each follow their own prompt, as separate `continue_from`
+requests do. Without this list, the request's single prompt is reused as before.
+
+T2VA and FL2VA windows carry the preceding AV latent tail as a frame-0 timeline
+guide, the layout [`continue_from`](../../docs/serving/videos_api.md#minimax-h3-continuation-across-requests)
+uses across requests, instead of a Ref2VA `latent_guide` reference. Each window
+gets the sampler inputs the matching request of a `continue_from` chain would.
+An FL2VA first frame conditions the first window only: later windows drop the
+keyframe and take the prompt encoded without the image, as a `continue_from`
+request without an image does, which requires a local text encoder. Any other
+keyframe is rejected; use `long_video_mode=full` for those. Nothing re-anchors
+the subject after the first window. When a reference has to hold for the whole
+clip, use Ref2VA, which keeps its references in every window.
+
+FL2VA windows default to 141 frames instead of 277. Later windows no longer
+carry the first frame, and in Ascend runs at 1344x768 with the Turbo 4-step
+adapter its look held across joins for 141- and 209-frame windows and was lost at
+the first join of a 277-frame window, in a `continue_from` chain as well. Base
+weights with the full schedule also held at 277; set `continuation_window_frames`
+to use longer windows there.
+
+How well a join holds also depends on the prompt. A prompt that describes a
+continuing scene joined cleanly throughout; one that describes a one-off action
+can restart it in a later window, for T2VA and FL2VA alike. Describe a scene that
+can continue, or give each window its own prompt.
+
+```bash
+curl --fail-with-body -sS -X POST "${API_URL}" \
+  --form-string 'prompt=A red fox walks slowly through a snowy pine forest at dawn, sniffing the ground, with soft pawsteps, steady winter wind and distant birds.' \
+  -F 'width=1344' -F 'height=768' -F 'fps=24' \
+  -F 'num_inference_steps=50' -F 'flow_shift=12' -F 'seed=1101' \
+  -F 'extra_params={"task":"t2va","duration":30,"long_video":true,"long_video_mode":"continuation","audio_flow_shift":3}' \
+  -o long-t2va.mp4
+```
 
 The cumulative latent is decoded once after all windows. Denoising memory is
 bounded by the window, while cumulative latent storage still grows with duration.

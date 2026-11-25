@@ -103,7 +103,10 @@ from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
     encode_media,
     prepare_encoder_inputs,
 )
-from vllm_omni.model_executor.models.minimax_h3.long_video import validate_encoded_frame_limit
+from vllm_omni.model_executor.models.minimax_h3.long_video import (
+    check_continuation_conditions,
+    validate_encoded_frame_limit,
+)
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     build_minimax_h3_presentation,
     load_minimax_h3_images,
@@ -134,7 +137,9 @@ from .continuation import (
     ContinuationWindow,
     LatentPrefix,
     _audio_t,
+    continuation_uses_timeline_guides,
     diffuse_continuation,
+    later_windows_drop_text_images,
     plan_continuation_windows,
     resolve_continuation,
     window_args,
@@ -3239,6 +3244,8 @@ class MiniMaxH3Pipeline(
         initial_noise_params = None
         visual_noise_params = None
         base_encode_needed = False
+        text_only_windows = 0
+        later_prepared = None
         error = None
         if rank == 0:
             try:
@@ -3287,7 +3294,8 @@ class MiniMaxH3Pipeline(
                 # continuation resolves before the normalize call so the
                 # helper can reject the combination with zero encoder passes.
                 continuation = None
-                if prompts is not None or (request_context is not None and task == "ref2va"):
+                if prompts is not None or request_context is not None:
+                    # Before any encoder collective, for every task that can window.
                     continuation = resolve_continuation(
                         sampling.extra_args or {},
                         task=task,
@@ -3328,6 +3336,16 @@ class MiniMaxH3Pipeline(
                     prepared = replace(prepared, prompt=prompts[0])
                     # External text belongs to the main prompt, not the first window.
                     text_conditioning = None
+                later_prepared = prepared
+                if continuation is not None and later_windows_drop_text_images(task):
+                    # Later windows drop the request's keyframes, so their text is the
+                    # text-only presentation, without the images.
+                    later_prepared = replace(
+                        prepared, images=[], condition_labels=[], media=replace(prepared.media, task="t2va")
+                    )
+                    later_windows = len(plan_continuation_windows(prepared.media.num_frames, *continuation)) - 1
+                    if prompts is None and later_windows and self.load_text_encoder:
+                        text_only_windows = later_windows
                 if (
                     request_context is not None
                     and task == "ref2va"
@@ -3358,10 +3376,18 @@ class MiniMaxH3Pipeline(
             except Exception as exc:
                 error = exc
         _broadcast_rank0_exception(error)
-        header = [(text_conditioning is not None, initial_noise_params, visual_noise_params, base_encode_needed)]
+        header = [
+            (
+                text_conditioning is not None,
+                initial_noise_params,
+                visual_noise_params,
+                base_encode_needed,
+                text_only_windows,
+            )
+        ]
         if world_size > 1:
             dist.broadcast_object_list(header, src=0, group=group)
-        reuse_text, initial_noise_params, visual_noise_params, base_encode_needed = header[0]
+        reuse_text, initial_noise_params, visual_noise_params, base_encode_needed, text_only_windows = header[0]
         executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="minimax_h3_initial_noise")
             if initial_noise_params is not None
@@ -3379,6 +3405,11 @@ class MiniMaxH3Pipeline(
                 if visual_noise_params is not None
                 else None
             )
+            later_text = None
+            if text_only_windows:
+                # Ahead of the request's own encode: its image pass then separates the two text passes.
+                logger.info("MiniMax H3 encoding the text-only prompt of %d later windows", text_only_windows)
+                later_text = self.encode_prompt(later_prepared)
             if reuse_text:
                 hidden = _broadcast_tensor(
                     text_conditioning.hidden_states if rank == 0 else None,
@@ -3409,7 +3440,11 @@ class MiniMaxH3Pipeline(
                 window_text = [(hidden, tags)]
                 for index, prompt in enumerate(prompts[1:], start=2):
                     logger.info("MiniMax H3 encoding continuation prompt %d/%d", index, len(prompts))
-                    window_text.append(self.encode_prompt(replace(prepared, prompt=prompt) if rank == 0 else None))
+                    window_text.append(
+                        self.encode_prompt(replace(later_prepared, prompt=prompt) if rank == 0 else None)
+                    )
+            elif later_text is not None:
+                window_text = [(hidden, tags), *([later_text] * text_only_windows)]
             media = self._encode_local_media(prepared.media if prepared is not None else None)
             if initial_noise is not None:
                 assert request_context is not None
@@ -3469,6 +3504,13 @@ class MiniMaxH3Pipeline(
                 raise OmniClientError("MiniMax H3 latent_refine requires the original FL2VA keyframe images")
         if window_text is not None:
             context["continuation_text_conditioning"] = window_text
+        elif context.get("continuation") is not None and later_windows_drop_text_images(context["task"]):
+            window, overlap = context["continuation"]
+            if len(plan_continuation_windows(context["num_frames"], window, overlap)) > 1:
+                raise OmniClientError(
+                    "MiniMax H3 FL2VA continuation encodes the prompt again without the first frame for later "
+                    "windows, which requires a local text encoder; use long_video_mode=full"
+                )
         return context
 
     @staticmethod
@@ -3510,6 +3552,8 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(
                 "MiniMax H3 continuation does not support latent-mask editing; use long_video_mode=full"
             )
+        if continuation is not None:
+            check_continuation_conditions(conditioning.task, conditioning.keyframe_frame_indices)
         if extra.get("audio_mode") == "lock_source" and conditioning.audio_edit_clean_rows is not None:
             raise OmniClientError("MiniMax H3 audio_mode=lock_source cannot be combined with audio latent-mask editing")
         requested_task = extra.get("task")
@@ -4326,6 +4370,8 @@ class MiniMaxH3Pipeline(
                     overlap_frames=overlap_frames,
                     text_conditioning=context.get("continuation_text_conditioning"),
                     prefix=prefix,
+                    # Ref2VA appends each tail as a latent_guide reference.
+                    timeline_guides=continuation_uses_timeline_guides(context["task"]),
                 )
             check_request_cancellation()
             # Continuations stay on the base canvas, so an upscaled clip is cached
