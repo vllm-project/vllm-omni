@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import copy
+import queue
 import shutil
 import threading
 import time
@@ -26,6 +27,7 @@ from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import (
     apply_omni_final_stage_metadata,
     inject_global_id,
+    is_janus_sync_queue_shutdown,
     scope_stage_replica_mm_uuids,
     upgrade_to_omni_request,
 )
@@ -729,6 +731,24 @@ class AsyncOmniEngine(OmniEngineBase):
         if owner_loop is None or owner_loop is asyncio.get_running_loop():
             await self._owned_enqueue_group(msg, companions, outcome)
             return
+        if not companions:
+            # Janus's sync facade can notify its owning async consumer from
+            # another thread. Avoid a coroutine/future round trip when no
+            # capacity wait or companion-group unwind is needed.
+            try:
+                self.request_queue.sync_q.put_nowait(msg)
+            except BaseException as error:
+                if not isinstance(error, queue.Full) and not (
+                    isinstance(error, Exception) and is_janus_sync_queue_shutdown(error)
+                ):
+                    for artifact_dir in msg.request_artifact_dirs or ():
+                        shutil.rmtree(artifact_dir, ignore_errors=True)
+                    raise
+                # Saturation retains cancellable backpressure; shutdown uses
+                # the owning async path's exception and artifact cleanup.
+            else:
+                outcome["parent_enqueued"] = True
+                return
         await self._bridge_owned_put(lambda: self._owned_enqueue_group(msg, companions, outcome), outcome)
 
     async def _bridge_owned_put(

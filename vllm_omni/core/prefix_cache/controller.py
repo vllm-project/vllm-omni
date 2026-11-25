@@ -17,7 +17,7 @@ the committer:
                      tensors, then writes the pool.
 
 Async: high-priority then low-priority queues, then pool write.
-Eager: StepWriteContext.start_writes() waits and writes inline (CPU tests / no CUDA).
+Eager: StepWriteContext.start_writes() waits and writes inline (CPU tests / unavailable device).
 """
 
 from __future__ import annotations
@@ -647,10 +647,19 @@ class OmniPrefixCacheController:
     rows (JOIN_ON_FINISH), then writes into the CPU pool.
     """
 
-    def __init__(self, pool: PrefixBlockPool, config: PrefixCacheConfig, eager: bool | None = None):
+    def __init__(
+        self,
+        pool: PrefixBlockPool,
+        config: PrefixCacheConfig,
+        eager: bool | None = None,
+        *,
+        device_type: str = "cuda",
+    ):
         self._pool = pool
         self._config = config
-        self._eager = (not torch.cuda.is_available()) if eager is None else eager
+        self._device_type = device_type
+        self._device_module = torch.get_device_module(device_type)
+        self._eager = (device_type == "cpu" or not self._device_module.is_available()) if eager is None else eager
         self._tasks: dict[Tid, WriteTask] = {}
         self._completed: deque[Tid] = deque()  # pool write done, awaiting manager drain
         self._failed: deque[Tid] = deque()  # write failed; manager raises from every later entry (sticky)
@@ -666,10 +675,18 @@ class OmniPrefixCacheController:
         self._worker: threading.Thread | None = None
         self._staging_pool = StagingBufferPool(config.staging_depth, config.staging_capacity_tokens)
         if not self._eager:
-            self._copy_stream = torch.cuda.Stream()
-            self._read_stream = torch.cuda.Stream()
+            self._copy_stream = self._device_module.Stream()
+            self._read_stream = self._device_module.Stream()
             self._worker = threading.Thread(target=self._worker_loop, name="omni-prefix-cache-committer", daemon=True)
             self._worker.start()
+
+    def record_freeze_event(self, tensors: list[torch.Tensor]) -> torch.cuda.Event | None:
+        """Fence this device's producer stream before the copy stream reads it."""
+        if self._eager or not any(t.device.type == self._device_type for t in tensors):
+            return None
+        event = self._device_module.Event()
+        event.record()
+        return event
 
     # --------------------------------------------------------- step device→host staging
 
@@ -718,11 +735,11 @@ class OmniPrefixCacheController:
         copy: Callable[[], None],
     ) -> torch.cuda.Event:
         """Issue device→host on `stream` after freeze; return the done event."""
-        with torch.cuda.stream(stream):
+        with self._device_module.stream(stream):
             if freeze_event is not None:
                 stream.wait_event(freeze_event)
             copy()
-            ev = torch.cuda.Event()
+            ev = self._device_module.Event()
             ev.record()
         return ev
 
@@ -764,6 +781,8 @@ class OmniPrefixCacheController:
                     for key, src in tensors.items():
                         v = self._staging_pool.views(slot, key, n, int(src.shape[-1]), src.dtype, pin)
                         v.copy_(src, non_blocking=True)
+                        if src.device.type == self._device_type:
+                            src.record_stream(self._copy_stream)
                         views[key] = v
 
                 event = self._d2h_on_stream(self._copy_stream, freeze_event, _copy_to_staging)
@@ -1099,8 +1118,8 @@ class OmniPrefixCacheController:
                 by_key.setdefault(k, []).append(chunk)
         pending: list[tuple[str, list[_WriteChunk], list[torch.Tensor]]] = []
         if self._copy_stream is None:
-            raise OmniPrefixCacheUnmatchError("deferred prefix cache copy requires a CUDA copy stream")
-        with torch.cuda.stream(self._copy_stream):
+            raise OmniPrefixCacheUnmatchError("deferred prefix cache copy requires a device copy stream")
+        with self._device_module.stream(self._copy_stream):
             if task.freeze_event is not None:
                 self._copy_stream.wait_event(task.freeze_event)
             for k, chunks in by_key.items():
@@ -1111,7 +1130,7 @@ class OmniPrefixCacheController:
                 step = max(1, rows if rows * row_bytes <= chunk_bytes else chunk_bytes // row_bytes)
                 parts = [src[s : s + step].to("cpu", non_blocking=True) for s in range(0, max(rows, 1), step)]
                 pending.append((k, chunks, parts))
-            ev = torch.cuda.Event()
+            ev = self._device_module.Event()
             ev.record()
         ev.synchronize()
         rows_out: list[tuple[_WriteChunk, str, torch.Tensor]] = []
