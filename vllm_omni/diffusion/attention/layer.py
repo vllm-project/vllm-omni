@@ -1264,8 +1264,8 @@ class Attention(nn.Module):
             lambda q, k, v: self._run_local_attention(q, k, v, attn_metadata),
             chunks=chunks,
         )
-        # The runner reuses its output buffer on the next call; model code gets its own copy unless opted in.
-        return output if strategy.output_views else output.clone()
+        # The runner reuses its output buffer on the next call, so model code gets its own copy.
+        return output.clone()
 
     def _forward_impl(
         self,

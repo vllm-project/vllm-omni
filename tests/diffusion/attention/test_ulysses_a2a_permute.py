@@ -13,17 +13,8 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel import factory, ulysses
 from vllm_omni.diffusion.distributed import a2a_permute, flashinfer_ulysses
 from vllm_omni.diffusion.forward_context import set_forward_context
-from vllm_omni.platforms.interface import UnspecifiedOmniPlatform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-class _NoSyncPlatform(UnspecifiedOmniPlatform):
-    """Not an NPU; ``synchronize`` is a no-op."""
-
-    @classmethod
-    def synchronize(cls) -> None:
-        pass
 
 
 @pytest.mark.parametrize("npu", [False, True])
@@ -52,10 +43,10 @@ def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_syn
     value = torch.randn_like(key)
     gate = torch.randn_like(query)
 
-    def qkv(q, k, v, group_name, world_size, in_place):
+    def qkv(q, k, v, group_name, world_size, zero_copy=False):
         assert q is query and k is key and v is value
-        # Attention is the only reader of the exchanged Q/K/V, so they stay in the workspace.
-        assert (group_name, world_size, in_place) == ("ulysses", 2, True)
+        # Q/K/V stay inside the attention layer, so they are exchanged in place.
+        assert (group_name, world_size, zero_copy) == ("ulysses", 2, True)
         calls.append("qkv")
         return tuple(t[:, :, : t.shape[2] // 2].repeat(1, 2, 1, 1) for t in (q, k, v))
 
@@ -121,7 +112,7 @@ def test_qkv_views_survive_gate_exchange_and_output_is_copied_out(monkeypatch):
         return 0
 
     runtime = SimpleNamespace(lib=SimpleNamespace(cudaMemcpy2DAsync=copy2d), CUDART_CHECK=lambda result: None)
-    platform = _NoSyncPlatform()
+    platform = SimpleNamespace(is_npu=lambda: False, synchronize=lambda: None)
     monkeypatch.setattr(ulysses, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: None)
@@ -221,7 +212,7 @@ def test_qkv_views_survive_gate_exchange_and_output_is_copied_out(monkeypatch):
 def test_flashinfer_backend_routes_qkv_and_reverse(monkeypatch, with_gate):
     """FlashInfer carries Q/K/V and the output; gate_compress keeps Q/K/V on the copy engines."""
     calls = []
-    platform = _NoSyncPlatform()
+    platform = SimpleNamespace(is_npu=lambda: False, synchronize=lambda: None)
     monkeypatch.setattr(ulysses, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: calls.append("ce_init"))
@@ -240,7 +231,7 @@ def test_flashinfer_backend_routes_qkv_and_reverse(monkeypatch, with_gate):
     query, key, value, gate = (torch.randn(1, 3, 4, 16) for _ in range(4))
 
     def qkv(name):
-        def exchange(q, k, v, group_name, world_size, *in_place):
+        def exchange(q, k, v, group_name, world_size, zero_copy=False):
             assert (group_name, world_size) == ("ulysses", 2)
             calls.append(name)
             return tuple(t[:, :, :2].repeat(1, 2, 1, 1) for t in (q, k, v))
@@ -248,10 +239,8 @@ def test_flashinfer_backend_routes_qkv_and_reverse(monkeypatch, with_gate):
         return exchange
 
     def reverse(name):
-        def exchange(tensor, group_name, world_size, copy_out=True):
+        def exchange(tensor, group_name, world_size):
             assert (group_name, world_size) == ("ulysses", 2)
-            # The output goes back to model code, so the FlashInfer gather copies it out by default.
-            assert copy_out
             calls.append(name)
             return tensor[:, :3].repeat(1, 1, 2, 1)
 
@@ -373,37 +362,6 @@ def test_disabled_optimization_does_not_load_backend(monkeypatch):
     group = SimpleNamespace(ulysses_group=object(), ulysses_world_size=2, ring_world_size=1)
     strategy = ulysses.UlyssesParallelAttention(group, 2, 1, False)
     assert strategy.name == "ulysses"
-
-
-def test_kv_consumer_hooks_keep_qkv_out_of_the_workspace(monkeypatch):
-    """Hooks that keep or reread K/V after the exchange get copied-out Q/K/V (and skip FlashInfer)."""
-    platform = _NoSyncPlatform()
-    monkeypatch.setattr(ulysses, "current_omni_platform", platform)
-    monkeypatch.setattr(a2a_permute, "current_omni_platform", platform)
-    monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: None)
-    monkeypatch.setattr(flashinfer_ulysses, "ensure_flashinfer_ulysses_available", lambda: None)
-    monkeypatch.setattr(ulysses.dist, "get_world_size", lambda pg: 2)
-    monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "strict")
-    group = SimpleNamespace(
-        ulysses_group=SimpleNamespace(group_name="ulysses"),
-        ulysses_world_size=2,
-        ulysses_rank=0,
-        ring_world_size=1,
-        allgather_world_size=1,
-    )
-    strategy = ulysses.UlyssesParallelAttention(group, 2, 1, False, ulysses_a2a_backend="flashinfer")
-    seen = []
-
-    def qkv(q, k, v, group_name, world_size, in_place):
-        seen.append(in_place)
-        return tuple(t[:, :, :2].repeat(1, 2, 1, 1) for t in (q, k, v))
-
-    monkeypatch.setattr(a2a_permute, "ulysses_qkv_fwd_group", qkv)
-    monkeypatch.setattr(flashinfer_ulysses, "ulysses_fi_qkv", lambda *a: pytest.fail("FlashInfer views escape"))
-    query = torch.randn(1, 3, 4, 16)
-    for hook in ulysses._KV_CONSUMER_HOOKS:
-        strategy.pre_attention(query, query, query, AttentionMetadata(extra={hook: object()}))
-    assert seen == [False] * len(ulysses._KV_CONSUMER_HOOKS)
 
 
 @pytest.mark.parametrize(

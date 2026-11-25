@@ -5,9 +5,6 @@
 Keyed by compute capability (``"major.minor"``) and Ulysses world size, like vLLM's ``CUSTOM_ALL_REDUCE_MAX_SIZES``.
 Entries exist only where they were measured; a missing capability or world size makes that transport ineligible, and
 dispatch falls through to the next one (FlashInfer -> copy-engine overlap -> copy engine -> NCCL).
-
-Regenerate with ``benchmarks/diffusion/benchmark_ulysses_transports.py``, which sweeps the transports over message
-sizes at each world size and prints these entries.
 """
 
 MiB = 1024 * 1024

@@ -31,7 +31,6 @@ from vllm_omni.diffusion.forward_context import (
     get_ulysses_mode,
     is_forward_context_available,
 )
-from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -82,15 +81,6 @@ def _maybe_warn_uaa_pad_ratio(
         ulysses_world_size,
         padded_query_head_cnt,
     )
-
-
-# Attention metadata hooks that read or keep the exchanged K/V besides the attention call itself.
-_KV_CONSUMER_HOOKS = ("minimax_h3_reference_kv_post_parallel", REFERENCE_ISOLATION)
-
-
-def _qkv_read_only_by_attention(attn_metadata: AttentionMetadata | None) -> bool:
-    """Whether the exchanged Q/K/V may stay views of the transport buffer (the attention call is their only reader)."""
-    return attn_metadata is None or not any(hook in attn_metadata.extra for hook in _KV_CONSUMER_HOOKS)
 
 
 def _a2a_permute_enabled(enabled: bool, scatter_idx: int, gather_idx: int, world_size: int) -> bool:
@@ -291,8 +281,6 @@ class UlyssesParallelAttention:
         # existing exchange, and explicit symmetric memory takes precedence.
         self._packed_qkv = not ulysses_a2a_permute and envs.VLLM_OMNI_PACKED_QKV
         self._flashinfer_a2a = transports.flashinfer_min_bytes is not None
-        # The output goes back to model code, so it is copied out of transport buffers unless opted in.
-        self._output_views = envs.VLLM_OMNI_ULYSSES_OUTPUT_VIEWS
         if ulysses_a2a_permute:
             from vllm_omni.diffusion.distributed.a2a_permute import (
                 ensure_a2a_permute_available,
@@ -312,11 +300,6 @@ class UlyssesParallelAttention:
                     from vllm_omni.diffusion.distributed.flashinfer_ulysses import ensure_flashinfer_ulysses_available
 
                     ensure_flashinfer_ulysses_available()
-
-    @property
-    def output_views(self) -> bool:
-        """Whether attention outputs may stay views of reused transport buffers (``VLLM_OMNI_ULYSSES_OUTPUT_VIEWS``)."""
-        return self._output_views
 
     @property
     def enabled(self) -> bool:
@@ -596,9 +579,6 @@ class UlyssesParallelAttention:
                     )
 
             # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
-            # Q/K/V stay in the transport's buffers (no copy-out) when attention is their only reader;
-            # those buffers are reused by the next exchange on the group.
-            in_place = _qkv_read_only_by_attention(attn_metadata)
             if _a2a_permute_enabled(
                 self._ulysses_a2a_permute,
                 self._scatter_idx,
@@ -606,7 +586,7 @@ class UlyssesParallelAttention:
                 ulysses_world_size,
             ):
                 a2a_transport = self._transports.exchange(
-                    query.numel() * query.element_size(), flashinfer_ok=gate_compress is None and in_place
+                    query.numel() * query.element_size(), flashinfer_ok=gate_compress is None
                 )
             if a2a_transport != NCCL:
                 # Keep optional transports lazy so default Ulysses does not
@@ -614,19 +594,18 @@ class UlyssesParallelAttention:
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd, ulysses_qkv_fwd_group
 
                 group_name = self._ulysses_pg.group_name
-                use_flashinfer = a2a_transport == FLASHINFER
-                # Exchange the gate first: it is copied out of the shared
-                # workspace, while in-place Q/K/V stay views of it that any
-                # later exchange would overwrite before attention reads them.
-                if gate_compress is not None:
-                    gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
-                if use_flashinfer:
+                if a2a_transport == FLASHINFER:
                     from vllm_omni.diffusion.distributed.flashinfer_ulysses import ulysses_fi_qkv
 
                     query, key, value = ulysses_fi_qkv(query, key, value, group_name, ulysses_world_size)
                 else:
+                    # Q/K/V come back as views of the shared workspace; attention
+                    # consumes them before the output exchange reuses it. Exchange
+                    # the gate first, since it is copied out and stored in metadata.
+                    if gate_compress is not None:
+                        gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
                     query, key, value = ulysses_qkv_fwd_group(
-                        query, key, value, group_name, ulysses_world_size, in_place
+                        query, key, value, group_name, ulysses_world_size, zero_copy=True
                     )
                 if self._use_sync:
                     current_omni_platform.synchronize()
@@ -815,22 +794,15 @@ class UlyssesParallelAttention:
             return packed_output_all_to_all(ctx.ulysses_pg, attn_output, ctx.use_sync)
         if ctx.a2a_transport != NCCL:
             if ctx.a2a_transport == FLASHINFER:
-                from vllm_omni.diffusion.distributed.flashinfer_ulysses import ulysses_fi_o
-
-                output = ulysses_fi_o(
-                    attn_output,
-                    ctx.ulysses_pg.group_name,
-                    dist.get_world_size(ctx.ulysses_pg),
-                    not self._output_views,
-                )
+                from vllm_omni.diffusion.distributed.flashinfer_ulysses import ulysses_fi_o as ulysses_o_rev
             else:
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
 
-                output = ulysses_o_rev(
-                    attn_output,
-                    ctx.ulysses_pg.group_name,
-                    dist.get_world_size(ctx.ulysses_pg),
-                )
+            output = ulysses_o_rev(
+                attn_output,
+                ctx.ulysses_pg.group_name,
+                dist.get_world_size(ctx.ulysses_pg),
+            )
             if ctx.use_sync:
                 current_omni_platform.synchronize()
             return output

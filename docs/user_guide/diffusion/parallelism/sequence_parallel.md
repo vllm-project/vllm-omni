@@ -242,28 +242,16 @@ In `DiffusionParallelConfig`:
 - Degrees must evenly divide the sequence length for optimal performance (or use `ulysses_mode="advanced_uaa"` for Ulysses-SP)
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
 
-With the default `ulysses_a2a_backend="auto"`, each strict Ulysses group is probed once at startup
-(single node, NVLink between every GPU pair, compute capability, symmetric memory, FlashInfer) and
-the transport is chosen per attention layer; the choice is logged as
-`Ulysses a2a transport: ...`. The thresholds were measured with MiniMax-H3 on 8x B200:
-
-| Ulysses group | Transport |
-| --- | --- |
-| 2-4 GPUs, NVLink, SM10x, per-head-invariant attention (FlashInfer cute-dsl) | `copy_engine_overlap`, two heads per chunk |
-| 8 GPUs, NVLink, SM10x, FlashInfer `UlyssesCommunicator` available | `flashinfer` |
-| other single-node NVLink SM10x groups | `copy_engine` |
-| anything else (PCIe, multi-node, other GPUs, NPU, ring/AllGather hybrids) | `nccl` |
-
-`auto` only selects head-chunked overlap for attention kernels whose per-head output does not depend on the
-number of heads per call, so its outputs match `nccl`. Set `--ulysses-a2a-backend` to override, for example:
+With the default `ulysses_a2a_backend="auto"`, each strict Ulysses group is probed once at startup and every
+exchange uses the fastest transport measured for that GPU and group size (MiniMax-H3 on B200), falling back to
+`nccl` elsewhere; the selection is logged once per group. Set `--ulysses-a2a-backend` to override:
 
 ```bash
 vllm serve Qwen/Qwen-Image --omni --ulysses-degree 2 --ulysses-a2a-backend copy_engine
 ```
 
 The copy-engine transports need `ulysses_mode="strict"`, `ulysses_degree > 1`, and peer-accessible
-GPUs on one NVLink-connected node; `copy_engine_overlap` also needs strict pure Ulysses
-(`ring_degree=1`, `allgather_degree=1`).
+GPUs on one NVLink-connected node.
 
 On NPU, the flag retains the existing
 [NPU symmetric-memory requirements](../../../design/feature/sequence_parallel.md#npu-symmetric-memory-ulysses).

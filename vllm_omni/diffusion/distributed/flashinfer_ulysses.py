@@ -101,17 +101,15 @@ def _(query, key, value, group_name, world_size):
 
 
 @torch.library.custom_op("vllm_omni_a2a::ulysses_fi_o", mutates_args=(), device_types="cuda")
-def ulysses_fi_o(y: torch.Tensor, group_name: str, world_size: int, copy_out: bool = True) -> torch.Tensor:
+def ulysses_fi_o(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
     """(B, S, H/P, D) -> (B, S/P, H, D)."""
     y = y.contiguous()
     comm = _communicator(group_name, y.numel() * y.element_size(), y.dtype)
-    out = comm.gather_heads(y, out=_output(comm, group_name, y, "gather_heads", 0))
-    # The output goes back to model code, so by default it gets its own storage instead of the reused
-    # communicator buffer.
-    return out.clone() if copy_out else out
+    # The output goes back to model code, so it gets its own storage instead of the reused communicator buffer.
+    return comm.gather_heads(y, out=_output(comm, group_name, y, "gather_heads", 0)).clone()
 
 
 @ulysses_fi_o.register_fake
-def _(y, group_name, world_size, copy_out=True):
+def _(y, group_name, world_size):
     b, s, h, d = y.shape
     return y.new_empty(b, s // world_size, h * world_size, d)
