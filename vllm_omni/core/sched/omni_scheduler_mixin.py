@@ -46,6 +46,7 @@ from vllm_omni.core.sched.output import (
     OmniRequestPrewarm,
     OmniSchedulerOutput,
 )
+from vllm_omni.core.sched.utils import parked_running_requests as _parked_running_rows
 from vllm_omni.data_entry_keys import (
     ASYNC_CHUNK_PREWARM_NS,
     JOYAI_FINISH_ON_NEXT_STOP_KEY,
@@ -537,17 +538,15 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         live_requests = self.requests
         reserved_ids: set[str] = set()
         if adapter is not None:
-            parked = getattr(adapter, "waiting_for_chunk_running_requests", ())
-            held = getattr(adapter, "_held_non_active", ())
+            parked = _parked_running_rows(
+                adapter,
+                "waiting_for_chunk_running_requests",
+                "_held_non_active",
+            )
         else:
             coordinator = getattr(self, "input_coordinator", None)
-            parked = getattr(coordinator, "_waiting_for_chunk_running", ())
-            held = ()
+            parked = _parked_running_rows(coordinator, "_waiting_for_chunk_running")
         for request in parked:
-            req_id = getattr(request, "request_id", None)
-            if req_id is not None and req_id in live_requests:
-                reserved_ids.add(req_id)
-        for request in held:
             req_id = getattr(request, "request_id", None)
             if req_id is not None and req_id in live_requests:
                 reserved_ids.add(req_id)

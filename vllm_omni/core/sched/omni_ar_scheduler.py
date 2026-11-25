@@ -36,6 +36,9 @@ from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
 from vllm_omni.core.sched.utils import (
+    parked_running_requests as _parked_running_rows,
+)
+from vllm_omni.core.sched.utils import (
     streaming_update_replaces_prompt as _streaming_update_replaces_prompt,
 )
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
@@ -893,14 +896,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         parked: tuple[Any, ...] = ()
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
-            parked += (
-                *getattr(adapter, "waiting_for_chunk_running_requests", ()),
-                *getattr(adapter, "_held_non_active", ()),
+            parked += _parked_running_rows(
+                adapter,
+                "waiting_for_chunk_running_requests",
+                "_held_non_active",
             )
         coordinator = getattr(self, "input_coordinator", None)
         if coordinator is not None:
             # Native-coordinator path: same park/restore contract as the adapter.
-            parked += tuple(getattr(coordinator, "_waiting_for_chunk_running", ()))
+            parked += _parked_running_rows(coordinator, "_waiting_for_chunk_running")
         return parked
 
     def _seeded_isolation_plan(self) -> tuple[bool, bool]:

@@ -139,6 +139,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     work and return immediately.
     """
 
+    def parked_running_requests(self) -> tuple[Any, ...]:
+        """Running requests parked in the chunk layer for the current step.
+
+        They will be restored to the running queue when the step ends, so the
+        scheduler counts them as occupied capacity. The private deques stay
+        implementation details of this adapter.
+        """
+        return (*self.waiting_for_chunk_running_requests, *self._held_non_active)
+
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
         spec_config = getattr(vllm_config, "speculative_config", None)

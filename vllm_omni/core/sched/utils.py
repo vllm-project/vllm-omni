@@ -46,3 +46,19 @@ def free_kv_blocks_in_physical_order(manager: KVCacheManager, request: Request) 
         return
     blocks = manager.pop_blocks_for_free(request)
     manager.block_pool.free_blocks(sorted(blocks, key=lambda block: block.block_id))
+
+
+def parked_running_requests(owner: object, *legacy_attrs: str) -> tuple[object, ...]:
+    """Rows a chunk adapter or coordinator has parked for the current step.
+
+    Both owners expose ``parked_running_requests()``; the private deque names
+    are kept as a fallback for test doubles and older adapters so the contract
+    can be adopted without breaking their fakes.
+    """
+    getter = getattr(owner, "parked_running_requests", None)
+    if callable(getter):
+        return tuple(getter())
+    parked: tuple[object, ...] = ()
+    for attr in legacy_attrs:
+        parked += tuple(getattr(owner, attr, ()))
+    return parked
