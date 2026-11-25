@@ -36,6 +36,7 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.hiuni import HIUNI_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.hunyuan_image3 import (
     HUNYUAN_IMAGE3_EXTRA_BODY_PARAMS,
     HUNYUAN_IMAGE3_EXTRA_OUTPUT_PARAMS,
@@ -241,6 +242,9 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "init_extra_args_for_non_diffusion_stages": BAGEL_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
         "text_to_image_prompt_builder": build_bagel_text_to_image_prompt,
         "image_to_image_prompt_builder": build_bagel_image_to_image_prompt,
+    },
+    "HiUniPipeline": {
+        "extra_body_params": HIUNI_EXTRA_BODY_PARAMS,
     },
     "SenseNovaU1Pipeline": {
         "extra_body_params": SENSENOVA_U1_EXTRA_BODY_PARAMS,

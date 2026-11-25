@@ -246,6 +246,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
     ),
+    # HiUni: text-to-image, single-reference editing and image understanding.
+    "HiUniPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+    ),
 }
 
 _DIFFUSION_MODEL_METADATA_ALIASES = {
