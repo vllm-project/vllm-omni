@@ -503,24 +503,25 @@ class InputClock:
                 return
 
     def placeholder_turns(self) -> list[str | None]:
-        """Turns of the reserved slots (deferred committed turns not yet submitted), oldest first."""
-        return [unit.turn for unit in self._units if unit.placeholder]
+        """Turns of deferred committed turns not yet submitted (reserved or timed out), oldest first."""
+        return [*self._settled_turns, *(unit.turn for unit in self._units if unit.placeholder)]
 
     def release_placeholder(self, turn: str | None, reason: str) -> None:
         """The deferred turn was not submitted: its audio was dropped, or the response it waited for was cancelled.
 
-        Its commit is acknowledged as ``cancelled``, so the end of a response
-        must not submit the turn after all (``turn_submittable``): the client
-        was told the turn is gone and drives the kept audio with its next
-        commit or ``response.create``. Only a slot settled by a timeout keeps
-        a late submission its own.
+        Its commit is acknowledged as ``cancelled`` (unless a timeout already
+        settled its slot), so the end of a response must not submit the turn
+        after all (``turn_submittable``): the client was told the turn is gone
+        and drives the kept audio with its next commit or ``response.create``.
+        Only an unreleased slot settled by a timeout keeps a late submission
+        its own.
         """
         for unit in list(self._units):
             if unit.placeholder and unit.turn == turn:
                 self.settle_unit(unit, DECISION_CANCELLED, reason=reason)
-                if turn is not None:
-                    self._settled_turns.pop(turn, None)
                 return
+        if turn is not None:
+            self._settled_turns.pop(turn, None)
 
     def turn_submittable(self, turn: str | None) -> bool:
         """Whether the end of a response may still submit the deferred turn ``turn``.
@@ -576,13 +577,14 @@ class InputClock:
     def _settle(self, unit: InputClockUnit, decision: str, reason: str | None) -> None:
         """Complete ``unit`` without output, with the given decision; idempotent.
 
-        A reserved slot settled before its turn was submitted is remembered in
-        ``_settled_turns``: the submission of that turn at the end of the
-        response takes the settled unit instead of creating a new one.
+        A reserved slot settled by a timeout before its turn was submitted is
+        remembered in ``_settled_turns``: the submission of that turn at the
+        end of the response takes the settled unit instead of creating a new
+        one.
         """
         if unit.complete:
             return
-        if unit.placeholder and unit.turn is not None and not self._closed:
+        if unit.placeholder and unit.turn is not None and decision == DECISION_TIMED_OUT and not self._closed:
             # Its turn may still be submitted when the response ends: that submission stays this unit's.
             self._settled_turns[unit.turn] = unit
         unit.placeholder = False

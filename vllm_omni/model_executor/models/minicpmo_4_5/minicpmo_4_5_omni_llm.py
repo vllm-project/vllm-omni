@@ -2560,19 +2560,22 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         return self.ctx.get_hf_config()
 
     def get_hf_processor(self, **kwargs: object):
-        # When skip_tokenizer_init=True (e.g. in worker), ctx.tokenizer is None.
-        # HF MiniCPM processor requires a tokenizer; use get_tokenizer() which loads lazily.
-        if self.ctx.tokenizer is None:
-            from vllm.transformers_utils.processor import cached_processor_from_config
+        from vllm_omni.model_executor.models.minicpmo_4_5.processor import legacy_image_processor_registration
 
-            tokenizer = self.get_tokenizer()
-            hf_processor = cached_processor_from_config(
-                self.ctx.model_config,
-                tokenizer=tokenizer,
-                **kwargs,
-            )
-        else:
-            hf_processor = self.ctx.get_hf_processor(**kwargs)
+        with legacy_image_processor_registration():
+            # When skip_tokenizer_init=True (e.g. in worker), ctx.tokenizer is None.
+            # HF MiniCPM processor requires a tokenizer; use get_tokenizer() which loads lazily.
+            if self.ctx.tokenizer is None:
+                from vllm.transformers_utils.processor import cached_processor_from_config
+
+                tokenizer = self.get_tokenizer()
+                hf_processor = cached_processor_from_config(
+                    self.ctx.model_config,
+                    tokenizer=tokenizer,
+                    **kwargs,
+                )
+            else:
+                hf_processor = self.ctx.get_hf_processor(**kwargs)
 
         # NumPy arrays are considered as Iterable but not Sequence in
         # https://github.com/huggingface/transformers/blob/main/src/transformers/image_transforms.py#L428

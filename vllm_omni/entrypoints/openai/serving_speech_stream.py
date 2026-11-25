@@ -25,6 +25,7 @@ splitter or the commitment policy.
 Protocol:
     Client -> Server:
         {"type": "session.config", ...}   # Session config (first message; repeatable)
+        {"type": "session.ping"}          # Send optional keep alive ping message
         {"type": "input.text", "text": "..."} # Text chunks
         {"type": "input.done"}            # End of utterance, flush and keep connection open
         {"type": "session.close"}         # End of connection
@@ -41,6 +42,7 @@ Protocol:
         ...
         {"type": "audio.done", "utterance_index": 0, "sentence_index": 0}
         {"type": "session.done", "utterance_index": 0, "total_sentences": N}
+        {"type": "session.pong"} # Response to ping message
         {"type": "error", "message": "..."}
         # session.done ends the flushed utterance, not the connection.
         # utterance_index counts input.done flushes. sentence_index counts
@@ -254,6 +256,9 @@ class OmniStreamingSpeechHandler:
                         continue  # Keep serving with the previous config
                     config = new_config
                     splitter = SpeechTextSplitter(config.split_granularity)
+
+                elif msg_type == "session.ping":
+                    await websocket.send_json({"type": "session.pong"})
 
                 elif config is None:
                     await self._send_error(
@@ -797,35 +802,11 @@ class OmniStreamingSpeechHandler:
 
     @staticmethod
     def _speech_request(config: StreamingSpeechSessionConfig, text: str) -> OpenAICreateSpeechRequest:
-        """Build the /v1/audio/speech request that synthesizes ``text`` with this session's options."""
+        """Forward session options through the REST request's validation and merge rules."""
         return OpenAICreateSpeechRequest(
             input=text,
-            model=config.model,
-            voice=config.voice,
-            task_type=config.task_type,
-            language=config.language,
-            instructions=config.instructions,
-            response_format=config.response_format or "wav",
-            sample_rate=config.sample_rate,
-            speed=config.speed,
-            max_new_tokens=config.max_new_tokens,
-            initial_codec_chunk_frames=config.initial_codec_chunk_frames,
-            non_streaming_mode=config.non_streaming_mode,
-            ref_audio=config.ref_audio,
-            ref_text=config.ref_text,
-            ref_audio_2=config.ref_audio_2,
-            ref_audio_codes=config.ref_audio_codes,
-            ambient_sound=config.ambient_sound,
-            duration_seconds=config.duration_seconds,
-            token_count=config.token_count,
-            x_vector_only_mode=config.x_vector_only_mode,
-            speaker_embedding=config.speaker_embedding,
-            cache_salt=config.cache_salt,
-            extra_params=config.extra_params,
             stream=config.stream_audio,
-            word_timestamps=config.word_timestamps,
-            seed=config.seed,
-            watermarking=config.watermarking,
+            **config.model_dump(exclude={"text_input_mode", "split_granularity", "stream_audio"}),
         )
 
     def _generation_precondition_error(self, config: StreamingSpeechSessionConfig) -> str | None:

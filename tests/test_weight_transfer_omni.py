@@ -414,6 +414,59 @@ def test_orchestrator_rejects_when_no_stage_configured():
     omni.collective_rpc.assert_not_awaited()
 
 
+def test_orchestrator_start_weight_update_with_id_routes_to_tagged_rpc():
+    """AsyncOmni routes untagged starts to start_weight_update and tagged starts to start_weight_update_with_id."""
+    import asyncio
+
+    enabled = SimpleNamespace(weight_transfer_config={"backend": "omni_lora_ipc"})
+    omni = _omni_with_stages([enabled])
+    omni.collective_rpc = AsyncMock(return_value=[True])
+
+    asyncio.run(omni.start_weight_update())
+    omni.collective_rpc.assert_awaited_once_with(
+        method="start_weight_update",
+        args=(),
+        stage_ids=[0],
+    )
+
+    omni.collective_rpc.reset_mock()
+    asyncio.run(omni.start_weight_update(update_id="tok-123"))
+    omni.collective_rpc.assert_awaited_once_with(
+        method="start_weight_update_with_id",
+        args=("tok-123",),
+        stage_ids=[0],
+    )
+
+
+def test_weight_transfer_api_start_weight_update_optional_update_id():
+    """Omni's /start_weight_update route accepts both empty bodies and {"update_id": ...}."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from vllm_omni.entrypoints.serve.weight_transfer_api import router
+
+    app = FastAPI()
+    app.include_router(router)
+    engine = SimpleNamespace(start_weight_update=AsyncMock())
+    app.state.engine_client = engine
+
+    client = TestClient(app)
+
+    resp_empty = client.post("/start_weight_update")
+    assert resp_empty.status_code == 200
+    engine.start_weight_update.assert_awaited_once_with()
+
+    engine.start_weight_update.reset_mock()
+    resp_tagged = client.post("/start_weight_update", json={"update_id": "tok-abc"})
+    assert resp_tagged.status_code == 200
+    engine.start_weight_update.assert_awaited_once_with(update_id="tok-abc")
+
+    engine.start_weight_update.reset_mock()
+    resp_bad = client.post("/start_weight_update", json={"update_id": "   "})
+    assert resp_bad.status_code == 400
+    engine.start_weight_update.assert_not_awaited()
+
+
 def _reload_config(**overrides):
     return SimpleNamespace(
         **{

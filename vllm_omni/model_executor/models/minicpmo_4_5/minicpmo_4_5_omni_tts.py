@@ -46,7 +46,11 @@ from vllm_omni.model_executor.models.minicpmo_4_5.config import (
     parse_bool_flag as _bool_flag,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.config import stage_connector_extra
-from vllm_omni.model_executor.models.minicpmo_4_5.handoff import unpack_handoff_tensor
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import (
+    SPEECH_FLUSH_KEY,
+    TEXT_WITHOUT_AUDIO_KEY,
+    unpack_handoff_tensor,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     HISTORY_WINDOW,
     TalkerCodecDeviceState,
@@ -143,6 +147,10 @@ def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, in
     """Return ``(max_tokens, min_tokens)`` for one native-duplex Talker request."""
     turn_start = isinstance(meta, Mapping) and bool(meta.get("turn_start"))
     turn_end = isinstance(meta, Mapping) and bool(meta.get("turn_end"))
+    if isinstance(meta, Mapping) and meta.get(SPEECH_FLUSH_KEY):
+        # A delegated unit flushes one last Venus codec chunk, without the
+        # extended MiniCPM sentence-end drain or a new text condition.
+        return _DUPLEX_CODEC_TOKENS_PER_CHUNK, 0
     if turn_end:
         # The turn-end chunk drains the text the Talker still owes: no floor
         # and a multi-unit ceiling; ``_turn_end_drain_kind`` decides when the
@@ -226,7 +234,7 @@ _CODEC_CLASS_QUIET = 2
 
 def _turn_end_drain_kind(native_duplex: bool, meta: Mapping[str, Any] | None) -> int:
     """How the condition described by ``meta`` may stop (see ``_DRAIN_*``)."""
-    if not native_duplex or not isinstance(meta, Mapping) or not meta.get("turn_end"):
+    if not native_duplex or not isinstance(meta, Mapping) or not meta.get("turn_end") or meta.get(SPEECH_FLUSH_KEY):
         return _DRAIN_NONE
     return _DRAIN_UNTIL_SILENT if meta.get("turn_text_ends_sentence") else _DRAIN_BOUNDARY_MASK
 
@@ -289,6 +297,10 @@ def _native_duplex_row_meta(info_dict: Mapping[str, Any]) -> tuple[bool, int, in
         ends_turn = isinstance(turn_eos_id, int) and bool(tts_ids) and tts_ids[-1] == turn_eos_id
     else:
         ends_turn = False
+    # The speech filter may remove a delegated EOS row. Dialogue termination
+    # belongs to the original Thinker unit, not the filtered Talker condition.
+    if isinstance(meta_info.get("turn_end"), bool):
+        ends_turn = meta_info["turn_end"]
     return (
         native_duplex,
         epoch if isinstance(epoch, int) else -1,
@@ -1685,21 +1697,25 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # An empty condition means the thinker chose not to speak: finish the
             # request up front so it emits zero audio codes instead of killing
             # the stage engine.
-            empty_condition = token_ids.numel() == 0 or hidden_states.numel() == 0
+            native_duplex = bool(info_dict.get("native_duplex", False))
+            meta = info_dict.get("meta")
+            speech_flush = native_duplex and isinstance(meta, Mapping) and bool(meta.get(SPEECH_FLUSH_KEY))
+            empty_condition = (token_ids.numel() == 0 or hidden_states.numel() == 0) and not speech_flush
             if empty_condition:
                 logger.warning_once(
                     "MiniCPM-o Talker received an empty condition (request %s); this request produces no audio.",
                     info_dict.get("request_id"),
                 )
-            native_duplex = bool(info_dict.get("native_duplex", False))
-            meta = info_dict.get("meta")
             drain_kind = _turn_end_drain_kind(native_duplex, meta if isinstance(meta, Mapping) else None)
-            full_embeds = self._build_condition_embeddings(
-                token_ids,
-                hidden_states,
-                native_duplex=native_duplex,
-                close_text=drain_kind == _DRAIN_UNTIL_SILENT,
-            )
+            if speech_flush:
+                full_embeds = self.emb_text(index_to_device([self._tts_bos_id], self.emb_text.weight.device))
+            else:
+                full_embeds = self._build_condition_embeddings(
+                    token_ids,
+                    hidden_states,
+                    native_duplex=native_duplex,
+                    close_text=drain_kind == _DRAIN_UNTIL_SILENT,
+                )
             if native_duplex:
                 full_embeds = self._build_streaming_recompute_embeddings(
                     full_embeds,
@@ -2142,6 +2158,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             condition_seqs: list[torch.Tensor] = []
             segment_texts_utf8: list[torch.Tensor] = []
             turn_end_flags: list[torch.Tensor] = []
+            speech_flush_flags: list[torch.Tensor] = []
+            text_without_audio_flags: list[torch.Tensor] = []
             for info in model_intermediate_buffer:
                 info_dict = info if isinstance(info, dict) else {}
                 native_duplex, epoch, turn_id, segment_text, turn_end = _native_duplex_row_meta(info_dict)
@@ -2155,6 +2173,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 duplex_turn_ids.append(torch.tensor(turn_id, dtype=torch.long))
                 segment_texts_utf8.append(torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8))
                 turn_end_flags.append(torch.tensor(turn_end, dtype=torch.bool))
+                speech_flush_flags.append(torch.tensor(bool(meta_info.get(SPEECH_FLUSH_KEY)), dtype=torch.bool))
+                text_without_audio_flags.append(
+                    torch.tensor(bool(meta_info.get(TEXT_WITHOUT_AUDIO_KEY)), dtype=torch.bool)
+                )
             meta_outputs["native_duplex"] = native_duplex_flags
             meta_outputs["duplex_epoch"] = duplex_epochs
             meta_outputs["duplex_turn_id"] = duplex_turn_ids
@@ -2163,6 +2185,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             meta_outputs["llm_output_text_utf8"] = segment_texts_utf8
             meta_outputs["native_duplex_segment_text"] = segment_texts_utf8
             meta_outputs["turn_end"] = turn_end_flags
+            meta_outputs[SPEECH_FLUSH_KEY] = speech_flush_flags
+            meta_outputs[TEXT_WITHOUT_AUDIO_KEY] = text_without_audio_flags
 
         return OmniOutput(
             text_hidden_states=hidden,
@@ -2831,6 +2855,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         condition_seqs: list[torch.Tensor] = []
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
+        speech_flush_flags: list[torch.Tensor] = []
+        text_without_audio_flags: list[torch.Tensor] = []
         row_continue, row_stop, flag_false, flag_true, empty_delta = self._step_constants(hidden)
         # Keep one batched projection, but omit rows that exit without sampling.
         projection_rows: list[int] = []
@@ -2884,6 +2910,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 )
                 segment_texts_utf8.append(torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8))
                 turn_end_flags.append(torch.tensor(turn_end, dtype=torch.bool))
+                speech_flush_flags.append(torch.tensor(bool(meta_info.get(SPEECH_FLUSH_KEY)), dtype=torch.bool))
+                text_without_audio_flags.append(
+                    torch.tensor(bool(meta_info.get(TEXT_WITHOUT_AUDIO_KEY)), dtype=torch.bool)
+                )
 
             if not isinstance(info, dict):
                 stop_rows.append(row_continue)
@@ -3134,6 +3164,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     "streaming_condition_seq": condition_seqs,
                     "llm_output_text_utf8": segment_texts_utf8,
                     "turn_end": turn_end_flags,
+                    SPEECH_FLUSH_KEY: speech_flush_flags,
+                    TEXT_WITHOUT_AUDIO_KEY: text_without_audio_flags,
                 }
             )
         multimodal_outputs: dict[str, Any] = {
