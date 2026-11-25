@@ -28,7 +28,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, cast
 
 from vllm_omni.protocol.duplex import RealtimeProtocolError
 from vllm_omni.protocol.duplex import commands as _duplex_wire
@@ -93,7 +93,7 @@ class UpdateSession(DuplexCommand, _duplex_wire.UpdateSession):
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
         data["event"] = "session.update"
-        data["payload"] = dict(data.pop("patch", {}) or {})
+        data["payload"] = dict(cast("dict[str, object]", data.pop("patch", {}) or {}))
         return data
 
 
@@ -171,7 +171,7 @@ class CreateItem(DuplexCommand, _duplex_wire.CreateItem):
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
         data["event"] = "conversation.item.create"
-        payload: dict[str, object] = {"item": dict(data.pop("item"))}
+        payload: dict[str, object] = {"item": dict(cast("dict[str, object]", data.pop("item")))}
         previous = data.pop("previous_item_id", None)
         if previous is not None:
             payload["previous_item_id"] = previous
@@ -256,11 +256,6 @@ class GetSessionStats(DuplexCommand, _duplex_wire.GetSessionStats):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class GetSessionActionRecords(DuplexCommand, _duplex_wire.GetSessionActionRecords):
-    type: ClassVar[str] = "session.action_records.get"
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
 class CloseSession(DuplexCommand, _duplex_wire.CloseSession):
     type: ClassVar[str] = "session.close"
 
@@ -280,7 +275,6 @@ REALTIME_COMMAND_TYPES: frozenset[str] = frozenset(
         "playback.ack",
         "session.heartbeat",
         "session.stats.get",
-        "session.action_records.get",
         "session.close",
         "turn.signal",
         "input.text.append",
@@ -327,7 +321,6 @@ __all__ = [
     "DeleteItem",
     "DuplexCommand",
     "DuplexCommandError",
-    "GetSessionActionRecords",
     "GetSessionStats",
     "Heartbeat",
     "REALTIME_COMMAND_TYPES",

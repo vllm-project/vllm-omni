@@ -106,6 +106,15 @@ async def open_capture_harness(**kwargs: Any) -> Harness:
     return harness
 
 
+async def drain_after_close(h: Harness) -> list[DuplexActionRecordSet]:
+    """The post-close drain is the suite's only observation window."""
+    await h.manager.shutdown()
+    drained: list[DuplexActionRecordSet] = []
+    while (set_ := h.manager.take_terminal_action_records(SESSION_ID)) is not None:
+        drained.append(set_)
+    return drained
+
+
 async def open_response_scope_with_units(h: Harness) -> str:
     """Arrange one listening unit pre-bind plus a bound response scope with one unit."""
     await h.run(append_audio())
@@ -134,7 +143,7 @@ async def open_response_scope_with_units(h: Harness) -> str:
 
 
 @pytest.mark.asyncio
-async def test_capture_off_appends_no_envelope_and_refuses_collection() -> None:
+async def test_capture_off_appends_no_envelope_and_drains_nothing_post_close() -> None:
     h = await open_harness()
     try:
         assert h.session.actions is None
@@ -143,10 +152,8 @@ async def test_capture_off_appends_no_envelope_and_refuses_collection() -> None:
             duplex = submission.prompt["model_intermediate_buffer"].get("duplex", {})
             assert "action_capture" not in duplex
 
-        events = await h.run(commands.GetSessionActionRecords(event_id="evt_records"))
-        assert types(events) == ["error"]
-        assert events[0].code == "action_capture_unsupported"
-        assert events[0].related_event_id == "evt_records"
+        await h.manager.shutdown()
+        assert h.manager.take_terminal_action_records(SESSION_ID) is None
     finally:
         await close_harness(h)
 
@@ -191,11 +198,10 @@ async def test_records_reach_retrieval_with_forced_kinds_and_origin() -> None:
                 reasons=(None, "silent_unit_turn_ended"),
             ),
         )
-        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_collect"))
-        assert types(reply_events) == ["session.action.records"]
-        reply = reply_events[0]
-        assert reply.request_event_id == "evt_collect"
-        record_set = DuplexActionRecordSet.from_wire(reply.records)
+        sets = await drain_after_close(h)
+        assert len(sets) == 1
+        record_set = sets[0]
+        assert record_set.status == "truncated_close"
         assert record_set.epoch == 0
         assert record_set.token_ids == (11, LISTEN_TOKEN_ID)
         assert record_set.action_kinds == ("sampled", "forced")
@@ -205,11 +211,8 @@ async def test_records_reach_retrieval_with_forced_kinds_and_origin() -> None:
         records = list(record_set.records())
         assert len(records) == 1
         assert records[0].actions[-1].action_kind == "forced"
-
-        # Collection cleared the retained set.
-        events = await h.run(commands.GetSessionActionRecords(event_id="evt_again"))
-        assert types(events) == ["error"]
-        assert events[0].code == "action_capture_not_retained"
+        # The drain emptied the terminal cache.
+        assert h.manager.take_terminal_action_records(SESSION_ID) is None
     finally:
         await close_harness(h)
 
@@ -238,9 +241,9 @@ async def test_decisionless_unit_delivery_reaches_the_ledger_and_still_forwards(
         assert forwards is False
         events = await h.settle()
         assert "error" not in types(events)
-        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_collect"))
-        assert types(reply_events) == ["session.action.records"], types(reply_events)
-        record_set = DuplexActionRecordSet.from_wire(reply_events[0].records)
+        sets = await drain_after_close(h)
+        assert len(sets) == 1
+        record_set = sets[0]
         assert (record_set.token_ids, record_set.num_units()) == ((11, 12), 1)
     finally:
         await close_harness(h)
@@ -267,9 +270,8 @@ async def test_terminal_delivery_still_ingests_its_capture_payload() -> None:
         )
         assert "error" not in types(events)
         h.session.end_response(commit_text=False)
-        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_collect", response_id=response_id))
-        assert types(reply_events) == ["session.action.records"], types(reply_events)
-        record_set = DuplexActionRecordSet.from_wire(reply_events[0].records)
+        sets = await drain_after_close(h)
+        record_set = next(s for s in sets if s.response_id == response_id)
         assert (record_set.status, record_set.token_ids) == ("completed", (11, LISTEN_TOKEN_ID))
     finally:
         await close_harness(h)
@@ -351,9 +353,9 @@ async def test_closure_without_payload_is_skipped_and_the_response_seals_complet
         assert "error" not in types(events)
         assert h.session.state.name == "OPEN"
         assert find(events, "response.done").status == "completed"
-        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_collect", response_id=response_id))
-        assert types(reply_events) == ["session.action.records"], types(reply_events)
-        assert DuplexActionRecordSet.from_wire(reply_events[0].records).status == "completed"
+        sets = await drain_after_close(h)
+        record_set = next(s for s in sets if s.response_id == response_id)
+        assert record_set.status == "completed"
     finally:
         await close_harness(h)
 
@@ -438,9 +440,9 @@ async def test_barge_in_seals_interruption_and_cancel_seals_truncated_cancel() -
                 capture_payload=_unit_payload(seq=1),
             )
             h.session.begin_response(turn_id=h.session.turn_id)
-            # Drain the just-sealed listening scope so the interruption seal
+            # Spill the just-sealed listening scope so the interruption seal
             # below fits the one-set retention window.
-            assert h.session.actions.collect() is not None
+            assert h.session.actions.pop_oldest_sealed() is not None
             assert h.session.actions is not None
             h.session.actions.ingest(
                 _unit_payload(seq=2, token_ids=(12,)),
@@ -452,10 +454,10 @@ async def test_barge_in_seals_interruption_and_cancel_seals_truncated_cancel() -
             )
             # barge_in is the epoch-advance funnel every cancel path rides; the
             # delivery path is covered by the retrieval tests above.
+            response_id = h.session.active_response_id
             seal(h.session)
-            reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_collect"))
-            assert types(reply_events) == ["session.action.records"], types(reply_events)
-            record_set = DuplexActionRecordSet.from_wire(reply_events[0].records)
+            sets = await drain_after_close(h)
+            record_set = next(s for s in sets if s.response_id == response_id)
             assert record_set.status == expected
             assert record_set.num_units() == 1
         finally:
@@ -515,36 +517,6 @@ async def test_multi_turn_scopes_spill_into_the_terminal_cache_and_close_drains_
 
 
 @pytest.mark.asyncio
-async def test_in_flight_get_never_removes_spilled_sets_from_the_post_close_drain() -> None:
-    """The in-flight ledger collect only drains the ledger's retained window;
-
-    sets spilled mid-session stay in the manager's terminal cache for the
-    post-close drain.
-    """
-    h = await open_capture_harness()
-    try:
-        await open_response_scope_with_units(h)
-        response_id = h.session.active_response_id
-        # Ending the response spills the pre-bind listening scope and seals
-        # the response scope as the one retained set.
-        h.session.end_response(commit_text=False)
-        # The in-flight get drains the retained response set only.
-        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_collect"))
-        assert types(reply_events) == ["session.action.records"], types(reply_events)
-        collected = DuplexActionRecordSet.from_wire(reply_events[0].records)
-        assert collected.status == "completed"
-        assert collected.response_id == response_id
-        assert collected.num_units() == 1
-        # The mid-session spill is untouched in the terminal cache.
-        spilled = h.manager.take_terminal_action_records(SESSION_ID)
-        assert spilled is not None
-        assert spilled.response_id is None
-        assert spilled.num_units() == 1
-    finally:
-        await close_harness(h)
-
-
-@pytest.mark.asyncio
 async def test_barge_in_through_the_cancel_funnel_seals_truncated_interruption() -> None:
     """The runner's cancel funnel — not ``barge_in`` directly — terminates the
 
@@ -553,12 +525,11 @@ async def test_barge_in_through_the_cancel_funnel_seals_truncated_interruption()
     """
     h = await open_capture_harness()
     try:
-        await open_response_scope_with_units(h)
+        response_id = await open_response_scope_with_units(h)
         events = await h.run(commands.BargeIn())
         assert "error" not in types(events)
-        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_read"))
-        assert types(reply_events) == ["session.action.records"], types(reply_events)
-        record_set = DuplexActionRecordSet.from_wire(reply_events[0].records)
+        sets = await drain_after_close(h)
+        record_set = next(s for s in sets if s.response_id == response_id)
         assert record_set.status == "truncated_interruption"
         assert record_set.num_units() == 1
     finally:
@@ -569,12 +540,11 @@ async def test_barge_in_through_the_cancel_funnel_seals_truncated_interruption()
 async def test_response_cancel_through_the_cancel_funnel_seals_truncated_cancel() -> None:
     h = await open_capture_harness()
     try:
-        await open_response_scope_with_units(h)
+        response_id = await open_response_scope_with_units(h)
         events = await h.run(commands.CancelResponse(event_id="evt_cancel"))
         assert "error" not in types(events)
-        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_read"))
-        assert types(reply_events) == ["session.action.records"], types(reply_events)
-        record_set = DuplexActionRecordSet.from_wire(reply_events[0].records)
+        sets = await drain_after_close(h)
+        record_set = next(s for s in sets if s.response_id == response_id)
         assert record_set.status == "truncated_cancel"
         assert record_set.num_units() == 1
     finally:
@@ -590,12 +560,11 @@ async def test_rejected_cancel_leaves_no_cause_for_the_next_interruption() -> No
         events = await h.run(commands.CancelResponse(event_id="evt_stray"))
         assert types(events) == ["error"]
         assert events[0].code == "response_not_active"
-        await open_response_scope_with_units(h)
+        response_id = await open_response_scope_with_units(h)
         events = await h.run(commands.BargeIn())
         assert "error" not in types(events)
-        reply_events = await h.run(commands.GetSessionActionRecords(event_id="evt_read"))
-        assert types(reply_events) == ["session.action.records"], types(reply_events)
-        record_set = DuplexActionRecordSet.from_wire(reply_events[0].records)
+        sets = await drain_after_close(h)
+        record_set = next(s for s in sets if s.response_id == response_id)
         assert record_set.status == "truncated_interruption"
         assert record_set.num_units() == 1
     finally:
@@ -698,15 +667,39 @@ async def test_sessions_with_appended_data_gate_the_weight_sync_fence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_turning_capture_on_mid_session_creates_the_ledger_lazily() -> None:
+async def test_session_update_cannot_change_action_capture_or_seed_after_open() -> None:
+    h = await open_capture_harness()
+    try:
+        events = await h.run(commands.UpdateSession(patch={"action_capture": False}, event_id="evt-capture"))
+        assert types(events) == ["error"]
+        assert events[0].code == "action_capture_update_unsupported"
+        assert events[0].related_event_id == "evt-capture"
+        assert h.session.config.action_capture is True
+        assert h.session.actions is not None
+        events = await h.run(commands.UpdateSession(patch={"seed": 8}, event_id="evt-seed"))
+        assert types(events) == ["error"]
+        assert events[0].code == "action_capture_update_unsupported"
+        assert events[0].related_event_id == "evt-seed"
+        assert h.session.config.seed == 7
+        events = await h.run(commands.UpdateSession(patch={"seed": "8"}, event_id="evt-seed-type"))
+        assert types(events) == ["error"]
+        assert events[0].code == "invalid_seed"
+        assert h.session.config.seed == 7
+        # Realtime clients resend the whole session object, so the current
+        # values must not read as a change.
+        events = await h.run(commands.UpdateSession(patch={"action_capture": True, "seed": 7}, event_id="evt-echo"))
+        assert types(events) == ["session.updated"]
+        assert h.session.config.action_capture is True
+        assert h.session.config.seed == 7
+    finally:
+        await close_harness(h)
+    # The other polarity: a capture-off session cannot turn capture on either.
     h = await open_harness()
     try:
+        events = await h.run(commands.UpdateSession(patch={"action_capture": True}, event_id="evt-on"))
+        assert types(events) == ["error"]
+        assert events[0].code == "action_capture_update_unsupported"
+        assert h.session.config.action_capture is False
         assert h.session.actions is None
-        events = await h.run(commands.UpdateSession(patch={"action_capture": True}))
-        assert "error" not in types(events)
-        assert h.session.config.action_capture is True
-        # The control path created the ledger; its first scope opens at the
-        # first captured delivery.
-        assert h.session.actions is not None
     finally:
         await close_harness(h)

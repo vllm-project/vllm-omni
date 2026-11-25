@@ -78,8 +78,7 @@ class TouchDuplexSessionMessage(EngineQueueMessage, kw_only=True):
 
 
 class CollectActionRecordsMessage(EngineQueueMessage, kw_only=True):
-    """Post-close retrieval via the manager's terminal cache (open sessions use
-    the ``session.action_records.get`` command instead)."""
+    """Post-close retrieval via the manager's terminal cache."""
 
     type: Literal["collect_action_records"] = "collect_action_records"
     control_id: str

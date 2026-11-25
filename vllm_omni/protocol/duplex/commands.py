@@ -3,14 +3,15 @@
 
 """The client-event vocabulary a full-duplex session accepts.
 
-Eight of the eighteen are events OpenAI's Realtime API has no equivalent for,
+Nine of the nineteen are events OpenAI's Realtime API has no equivalent for,
 because they only make sense when the model and the user can talk at the same
 time: the user cuts in (``barge_in``), the client reports how much audio it
 played (``playback.ack``), a turn transition is signalled locally
 (``turn.signal``), input is abandoned without committing (``input.cancel``),
-text is pushed into a live turn (``input.text.append``), the session is
-kept alive or closed explicitly (``session.heartbeat`` / ``session.close``), and
-the server's per-turn stage work is read back (``session.stats.get``).
+text is pushed into a live turn (``input.text.append``), a function call is
+cancelled (``cancel_function_call``), the session is kept alive or closed
+explicitly (``session.heartbeat`` / ``session.close``), and the server's
+per-turn stage work is read back (``session.stats.get``).
 Two more are OpenAI commands carrying duplex-only fields (Tier 2).
 
 The remaining eight are OpenAI's, unchanged, and re-exported from
@@ -22,7 +23,7 @@ handed events its clients never send.
 
 None of these carries the engine's mailbox rendering: ``payload()`` and its
 channel live in ``vllm_omni.engine.duplex.commands``, because for four of the
-eighteen the runner's channel is not the client event type at all.
+nineteen the runner's channel is not the client event type at all.
 """
 
 from __future__ import annotations
@@ -148,20 +149,6 @@ class GetSessionStats(RealtimeCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class GetSessionActionRecords(RealtimeCommand):
-    """Collect the session's captured action records.
-
-    Answered by ``session.action_records``. ``response_id`` selects one
-    response's retained set; omitting it collects the most recent (complete,
-    in progress, or sealed-truncated) and clears it, per the draining
-    retention rules of
-    """
-
-    wire_type: ClassVar[str] = "session.action_records.get"
-    response_id: str | None = None
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
 class CloseSession(RealtimeCommand):
     """Graceful close requested through the command stream (``session.close``)."""
 
@@ -195,7 +182,6 @@ __all__ = [
     "CancelInput",
     "CancelFunctionCall",
     "CloseSession",
-    "GetSessionActionRecords",
     "GetSessionStats",
     "Heartbeat",
     "SignalTurn",

@@ -49,7 +49,6 @@ from vllm_omni.engine.duplex.commands import (
     CreateResponse,
     DeleteItem,
     DuplexCommand,
-    GetSessionActionRecords,
     GetSessionStats,
     Heartbeat,
     SignalTurn,
@@ -77,7 +76,6 @@ from vllm_omni.engine.duplex.events import (
     InputCleared,
     PlaybackAcknowledged,
     ResponseDone,
-    SessionActionRecords,
     SessionExpired,
     SessionHeartbeatAck,
     SessionStats,
@@ -103,7 +101,6 @@ from vllm_omni.engine.duplex.realtime_events import (
     retrieve_item_events,
 )
 from vllm_omni.engine.duplex.session import helpers, overlap_policy, playback_ledger
-from vllm_omni.engine.duplex.session.action_ledger import ActionLedgerError
 from vllm_omni.engine.duplex.session.append_task import AppendAttempt
 from vllm_omni.engine.duplex.session.commit_policy import CommitAction, CommitSnapshot, decide_commit_action
 from vllm_omni.engine.duplex.session.context import (
@@ -686,8 +683,6 @@ class DuplexSessionRunner:
                 # Still answered, so the client need not time out: final turns
                 # keep their numbers and the rest read as cancelled.
                 self._on_get_session_stats(item)
-            elif isinstance(item, GetSessionActionRecords):
-                self._on_get_session_action_records(item)
             return
         await self._on_command(item)
 
@@ -878,8 +873,6 @@ class DuplexSessionRunner:
             self._on_heartbeat(command)
         elif isinstance(command, GetSessionStats):
             self._on_get_session_stats(command)
-        elif isinstance(command, GetSessionActionRecords):
-            self._on_get_session_action_records(command)
         elif isinstance(command, CreateItem):
             previous_user_items = session.unanswered_user_items()
             control = resolve_create_item(projector, command)
@@ -949,32 +942,6 @@ class DuplexSessionRunner:
             )
             return
         self._emit_events([SessionStats(request_event_id=command.event_id, stats=perf.snapshot())])
-
-    def _on_get_session_action_records(self, command: GetSessionActionRecords) -> None:
-        """Answer ``session.action_records.get``; collection is draining."""
-        actions = self.session.actions
-        if actions is None or not self.session.config.action_capture:
-            self._emit_error(
-                "action_capture_unsupported",
-                "This session does not capture action records (session action_capture)",
-                event_id=command.event_id,
-            )
-            return
-        try:
-            record_set = actions.collect(command.response_id)
-        except ActionLedgerError as exc:
-            # Not-retained and retention overflow are both loud, typed answers.
-            self._emit_error(exc.code, str(exc), event_id=command.event_id)
-            return
-        self._emit_events(
-            [
-                SessionActionRecords(
-                    request_event_id=command.event_id,
-                    response_id=record_set.response_id,
-                    records=record_set.to_wire(),
-                )
-            ]
-        )
 
     def _on_heartbeat(self, command: Heartbeat) -> None:
         try:

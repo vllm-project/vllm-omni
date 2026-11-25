@@ -1618,8 +1618,8 @@ what forcing* — the two surfaces this contract adds.
   plugin-declared (MiniCPM-o 4.5 sets it; models whose sampler has not gained
   emission do not), AND-ed with the deployment gate
   `duplex_session.allow_action_capture` (default true — the per-session
-  `action_capture` knob is the real opt-in, patchable via `session.update`
-  alongside `seed`). A capture request against a non-capable effective
+  `action_capture` knob is the real opt-in, set when the session opens and
+  immutable afterwards, like `seed`). A capture request against a non-capable effective
   capability is rejected at admission (`action_capture_unsupported`).
 - **Transport.** With capture on, the duplex sampler attaches one
   self-describing, versioned payload per sampled unit on the dedicated
@@ -1643,25 +1643,18 @@ what forcing* — the two surfaces this contract adds.
   (`client` / engine-injected silence), effective sampling parameters, and
   the derived seed `f(session_seed, epoch, response_index)`. Validation
   failure is session-fatal (`action_capture_invalid`). The ledger retains
-  one open plus one sealed scope and collection is draining; before every
-  non-forced seal the session spills sealed sets past that window into the
-  manager's terminal cache, so a live multi-turn episode never overflows and
-  consumers need no in-flight collects — TTL eviction stays the cache's only
-  bound, and a ledger without a spill sink still fails loudly
-  (`action_capture_retention_overflow`). The funnel that terminates a scope
+  one open plus one sealed scope; before every non-forced seal the session
+  spills sealed sets past that window into the manager's terminal cache, so
+  a live multi-turn episode never overflows and every sealed set is drained
+  after close — TTL eviction stays the cache's only bound, and a ledger
+  without a spill sink still fails loudly (`action_capture_retention_overflow`). The funnel that terminates a scope
   owns its sealed status: natural end `completed`, client cancel
   `truncated_cancel`, interruption `truncated_interruption`, close
   `truncated_close`. Post-close the terminal cache merges mid-session spills
   with the final stash, so a drain returns every sealed set, most recent
   first.
-- **Retrieval.** In-process: `DuplexSessionHandle.collect_action_records()`
-  (request/reply on the session's outbox, so a concurrent `events()` consumer
-  is unaffected) and `DuplexOmni.collect_action_records(session_id)` after
-  close. Wire: `session.action_records.get` → `session.action.records`
-  (Tier 3; see the [serving guide](../serving/realtime_duplex_api.md)). The
-  wire reaches the ledger's one-set retention window only: a scope the
-  session already spilled is retrievable post-close through
-  `DuplexOmni.collect_action_records`, not through the socket.
+- **Retrieval.** In-process, post-close: `DuplexOmni.collect_action_records(session_id)`
+  drains the manager's terminal cache.
 - **Weight-sync fence.** A session that appended data depends on the weights
   it sampled under: `DuplexOmni.start_weight_update` / `add_lora` reject with
   `weight_sync_sessions_open` while any such session is open (session open
@@ -1673,12 +1666,5 @@ sampler (ModelRunner V1 is removed upstream and gets no implementation);
 capture rows force the synchronous sampling path so each record publishes on
 its own unit's delivery, and per-stage log-probabilities are proven against
 an independent recomputation at CPU scale
-(`tests/model_executor/models/minicpmo_4_5/test_duplex_action_capture.py`) and
-at engine scale on GPU CI
-(`tests/e2e/online_serving/test_minicpmo_4_5_duplex_action_capture.py`).
-The e2e server subprocess runs with the repository root as its working
-directory (`tests/helpers/runtime.py`), so the checkout's `vllm_omni`
-package shadows any installed one: an engine change under test must be in
-the checkout, and a mirrored edit under `site-packages` is not what the
-test runs.
+(`tests/model_executor/models/minicpmo_4_5/test_duplex_action_capture.py`).
 Other duplex models adopt through per-model follow-ups without engine changes.

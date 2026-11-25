@@ -35,7 +35,6 @@ from vllm.logger import init_logger
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands as duplex_commands
-from vllm_omni.engine.duplex import events as duplex_events
 from vllm_omni.engine.duplex.commands import DuplexCommand
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig, ResponseCreateOptions
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
@@ -48,7 +47,6 @@ from vllm_omni.engine.duplex.messages import (
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.protocol.duplex.action_records import DuplexActionRecordSet
-from vllm_omni.protocol.duplex.events import ErrorEvent, new_event_id
 
 logger = init_logger(__name__)
 
@@ -184,60 +182,6 @@ class DuplexSessionHandle:
 
     async def update(self, session_patch: Mapping[str, object]) -> None:
         await self.submit(duplex_commands.UpdateSession(patch=dict(session_patch)))
-
-    async def collect_action_records(
-        self,
-        response_id: str | None = None,
-        *,
-        timeout: float = _DEFAULT_CONTROL_TIMEOUT_S,
-    ) -> DuplexActionRecordSet:
-        """Collect and clear this session's retained action records.
-
-        Args:
-            response_id: Select one response's retained set; ``None`` selects the
-                most recent (complete, in progress, or sealed-truncated).
-            timeout: Seconds to wait for the engine's reply.
-
-        Returns:
-            The drained ``DuplexActionRecordSet``.
-
-        Raises:
-            DuplexSessionError: ``action_capture_not_retained`` when the id is
-                outside the retention window; ``session_closed`` after close.
-        """
-        if self._closed:
-            raise DuplexSessionError(
-                f"duplex session {self.session_id} is closed", code="session_closed", session_id=self.session_id
-            )
-        event_id = new_event_id()
-        self._outbox.arm_capture_retention(event_id)
-        try:
-            await self.submit(duplex_commands.GetSessionActionRecords(event_id=event_id, response_id=response_id))
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + timeout
-            while not self._outbox.capture_reply_arrived():
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    raise TimeoutError(f"session.action_records.get {event_id} timed out after {timeout}s")
-                seen = self._outbox.observation_seq()
-                if not await self._outbox.wait_for_observation(seen):
-                    raise DuplexSessionError(
-                        f"duplex session {self.session_id} closed before action records arrived",
-                        code="session_closed",
-                        session_id=self.session_id,
-                    )
-            reply = self._outbox.disarm_capture_retention()
-        finally:
-            self._outbox.disarm_capture_retention()
-        if isinstance(reply, ErrorEvent):
-            raise DuplexSessionError(reply.message or reply.code, code=reply.code, session_id=self.session_id)
-        if not isinstance(reply, duplex_events.SessionActionRecords):
-            raise DuplexSessionError(
-                f"unexpected reply to session.action_records.get: {type(reply).__name__}",
-                code="internal_error",
-                session_id=self.session_id,
-            )
-        return DuplexActionRecordSet.from_wire(reply.records)
 
     async def ack_playback(
         self,
@@ -435,8 +379,7 @@ class DuplexOmni(AsyncOmni):
         *,
         timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
     ) -> DuplexActionRecordSet:
-        """Post-close retrieval from the manager's terminal cache; open sessions
-        use the handle's ``collect_action_records`` instead."""
+        """Post-close retrieval from the manager's terminal cache."""
         return self.engine.collect_terminal_action_records(session_id, response_id, timeout=timeout)
 
     # ---- session lifecycle ----

@@ -116,7 +116,7 @@ def test_ingest_orders_units_and_derives_records() -> None:
     # A new response beginning seals the listening period as completed.
     ledger.bind_response("r1", epoch=0, turn_id=2)
 
-    set_ = ledger.collect()
+    [set_] = ledger.take_terminal_sets()
     assert set_.status == "completed"
     assert set_.num_units() == 2
     assert set_.input_origins == ("client", "engine")
@@ -157,9 +157,11 @@ def test_response_binding_promotes_listening_scope() -> None:
     ledger.ingest(_payload(seq=2), epoch=0, turn_id=1, response_id="r1", stage_id=0, input_modality="")
     ledger.bind_response("r1", epoch=0, turn_id=1)
 
-    spoken = ledger.collect()
+    # Promoted in place: the scope keeps its units and now answers to r1.
+    assert ledger.open_scope_response_id == "r1"
+    ledger.seal_active_response("r1")
+    [spoken] = ledger.take_terminal_sets()
     assert spoken.response_id == "r1"
-    assert spoken.status == "in_progress"
     assert spoken.num_units() == 2
 
 
@@ -170,7 +172,7 @@ def test_bind_response_seals_a_pure_listening_scope() -> None:
     # No promotion ever happened (the response's first payload has not
     # arrived); the engine opening the response seals the listening period.
     ledger.bind_response("r1", epoch=0, turn_id=2)
-    listening = ledger.collect()
+    [listening] = ledger.take_terminal_sets()
     assert listening.response_id is None
     assert listening.status == "completed"
     assert listening.num_units() == 1
@@ -184,27 +186,12 @@ def test_retention_window_is_bounded_and_overflow_is_loud() -> None:
     ledger.seal_active_response("r1")  # sealed slot now holds r1
     ledger.bind_response("r2", epoch=0, turn_id=2)
     ledger.ingest(_payload(seq=2), epoch=0, turn_id=2, response_id="r2", stage_id=0, input_modality="")
-    with pytest.raises(ActionLedgerError, match="not collected") as exc_info:
+    with pytest.raises(ActionLedgerError, match="not spilled") as exc_info:
         ledger.seal_active_response("r2")  # overflow: r1 uncollected
     assert exc_info.value.code == "action_capture_retention_overflow"
-    # Collecting clears the window; the next seal succeeds.
-    ledger.collect()
+    # Spilling the oldest sealed set clears the window; the next seal succeeds.
+    assert ledger.pop_oldest_sealed() is not None
     ledger.seal_active_response("r2")
-
-
-def test_draining_in_progress_scope_resets_columns() -> None:
-    ledger = SessionActionLedger(session_id="s1")
-    ledger.bind_response("r1", epoch=0, turn_id=1)
-    ledger.ingest(_payload(seq=1), epoch=0, turn_id=1, response_id="r1", stage_id=0, input_modality="")
-    drained = ledger.collect("r1")
-    assert drained.status == "in_progress"
-    assert drained.num_units() == 1
-
-    ledger.ingest(_payload(seq=2), epoch=0, turn_id=1, response_id="r1", stage_id=0, input_modality="")
-    ledger.seal_active_response("r1")
-    sealed = ledger.collect("r1")
-    assert sealed.status == "completed"
-    assert sealed.num_units() == 1  # only the post-drain unit
 
 
 def test_seal_statuses_for_close_interruption_and_cancel() -> None:
@@ -217,19 +204,9 @@ def test_seal_statuses_for_close_interruption_and_cancel() -> None:
         ledger.bind_response("r1", epoch=0, turn_id=1)
         ledger.ingest(_payload(seq=1), epoch=0, turn_id=1, response_id="r1", stage_id=0, input_modality="")
         seal(ledger)
-        set_ = ledger.collect()
+        set_ = ledger.take_terminal_sets()[0]
         assert set_.status == expected
         assert set_.num_units() == 1  # partial set kept, never dropped
-
-
-def test_collect_outside_retention_window_errors() -> None:
-    ledger = SessionActionLedger(session_id="s1")
-    with pytest.raises(ActionLedgerError, match="no action records") as exc_info:
-        ledger.collect()
-    assert exc_info.value.code == "action_capture_not_retained"
-    with pytest.raises(ActionLedgerError) as exc_info:
-        ledger.collect("r-nope")
-    assert exc_info.value.code == "action_capture_not_retained"
 
 
 def test_seed_contradiction_within_scope_is_invalid() -> None:
@@ -259,7 +236,7 @@ def test_record_set_wire_roundtrip() -> None:
         input_modality="",
     )
     ledger.seal_active_response("r1")
-    set_ = ledger.collect()
+    set_ = ledger.take_terminal_sets()[0]
     wire = set_.to_wire()
     restored = DuplexActionRecordSet.from_wire(wire)
     assert restored.token_ids == set_.token_ids

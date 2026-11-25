@@ -266,7 +266,7 @@ class DuplexEngineSession:
     #: Server-side stage work and audio by turn and chunk (RFC #8325); None when
     #: the deployment does not collect session stats.
     perf: SessionPerfLedger | None = field(default=None, repr=False)
-    # Per-session capture ledger; a mid-session turn-on creates it lazily.
+    # Per-session capture ledger; present when the session opened with capture on.
     actions: SessionActionLedger | None = field(default=None, repr=False)
     # Manager-installed spill target for sealed sets the retention window must
     # drop before the next seal; None keeps the ledger's loud overflow.
@@ -2182,8 +2182,7 @@ class DuplexEngineSession:
             cause = self.capture_epoch_cause
             self.capture_epoch_cause = None
             try:
-                # A seal only happens when a scope is open; the just-sealed set
-                # must stay retained for the in-flight collect otherwise.
+                # A seal only happens when a scope is open; make retention room first.
                 if self.actions.has_open_scope:
                     self.ensure_capture_retention_room()
                 if cause is not None:

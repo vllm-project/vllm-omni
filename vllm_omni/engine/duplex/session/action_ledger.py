@@ -4,7 +4,8 @@
 """Per-session capture ledger: assembles validated unit payloads into sealed
 ``DuplexActionRecordSet`` s, one per scope (response or listening period).
 
-Validation failure is session-fatal; retention is draining; close/interrupt/
+Validation failure is session-fatal; sealed sets spill into the manager's terminal
+cache; close/interrupt/
 cancel seal partial sets. Mutated only on the orchestrator loop — no locking.
 """
 
@@ -21,7 +22,6 @@ from vllm_omni.protocol.duplex.action_records import (
     ACTION_SAMPLED,
     INPUT_ORIGINS,
     STATUS_COMPLETED,
-    STATUS_IN_PROGRESS,
     STATUS_TRUNCATED_CANCEL,
     STATUS_TRUNCATED_CLOSE,
     STATUS_TRUNCATED_INTERRUPTION,
@@ -260,7 +260,7 @@ class SessionActionLedger:
         if not force and len(self._sealed) >= RETAINED_SEALED_SETS:
             held = next(iter(self._sealed))
             raise ActionLedgerError(
-                f"action records for {held} were not collected before the next scope completed",
+                f"action records for {held} were not spilled before the next scope completed",
                 code=CODE_RETENTION_OVERFLOW,
             )
         self._sealed[key] = self._freeze(scope, status)
@@ -293,43 +293,6 @@ class SessionActionLedger:
         )
 
     # ---- retention / retrieval ----
-
-    def collect(self, response_id: str | None = None) -> DuplexActionRecordSet:
-        """Return and clear a retained set; ``None`` selects the most recent
-        (sealed, or the open scope drained as an ``in_progress`` snapshot)."""
-        if response_id is None:
-            if self._sealed:
-                key = next(reversed(self._sealed))
-                return self._sealed.pop(key)
-            if self._open is not None and (self._open.units or self._open.token_ids):
-                return self._drain_open()
-            raise ActionLedgerError("no action records retained", code=CODE_NOT_RETAINED)
-        if response_id in self._sealed:
-            return self._sealed.pop(response_id)
-        if (
-            self._open is not None
-            and self._open.response_id == response_id
-            and (self._open.units or self._open.token_ids)
-        ):
-            return self._drain_open()
-        raise ActionLedgerError(
-            f"action records for {response_id} are outside the retention window",
-            code=CODE_NOT_RETAINED,
-        )
-
-    def _drain_open(self) -> DuplexActionRecordSet:
-        scope = self._open
-        assert scope is not None
-        snapshot = self._freeze(scope, STATUS_IN_PROGRESS)
-        # Drained units leave the scope; its sealed successor carries only
-        # post-drain units (the trainer concatenates drained + sealed).
-        scope.token_ids = []
-        scope.logprobs = []
-        scope.action_kinds = []
-        scope.reason_codes = []
-        scope.stream_names = []
-        scope.units = []
-        return snapshot
 
     def pop_oldest_sealed(self) -> DuplexActionRecordSet | None:
         """Spill support: pop the oldest sealed set once the window is full.

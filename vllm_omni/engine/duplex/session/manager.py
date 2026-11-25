@@ -675,8 +675,7 @@ class DuplexSessionManager:
                 log_stats=self.log_stats,
                 perf=self._session_perf_ledger() if collect_stats else None,
                 actions=SessionActionLedger(session_id=session_id) if config.action_capture else None,
-                # Spill target for the retention window; a mid-session ledger
-                # (session.update turn-on) reuses the same sink.
+                # Spill target for the retention window.
                 capture_retention_sink=self._capture_retention_sink(session_id),
             )
             # Validates the plugin's sampling policy for this runtime config before admission.
@@ -926,7 +925,7 @@ class DuplexSessionManager:
 
         The ledger retains one sealed set; before the next seal the session
         spills older ones here, so a multi-turn episode never overflows and
-        consumers need no in-flight collects. TTL eviction stays the only bound.
+        every sealed set is drained after close. TTL eviction stays the only bound.
         """
 
         def spill(set_: DuplexActionRecordSet) -> None:

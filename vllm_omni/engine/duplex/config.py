@@ -424,7 +424,7 @@ class DuplexSessionConfig:
     temperature: float | None = None
     max_tokens: int | None = None
     #: Record per-unit policy actions with exact-distribution logprobs;
-    #: patchable via ``session.update`` like ``temperature``.
+    #: set when the session opens and immutable afterwards.
     action_capture: bool = False
     #: Seeds the per-request generators; the derived effective seed rides each record.
     seed: int | None = None
@@ -677,7 +677,7 @@ class DuplexSessionConfig:
 
         Raises :class:`DuplexConfigError` (``code`` in ``model_update_unsupported``,
         ``voice_update_after_audio_unsupported``, ``ref_audio_update_unsupported``,
-        ``watermarking_update_unsupported``)
+        ``watermarking_update_unsupported``, ``action_capture_update_unsupported``)
         when the patch changes something a live session cannot change.
         ``audio_started`` is ``playback.generated_ms > 0 or playback.sent_ms > 0``.
         """
@@ -763,16 +763,23 @@ class DuplexSessionConfig:
             self.response_format = duplex_response_format(response_format)
         if isinstance(payload.get("temperature"), int | float):
             self.temperature = float(payload["temperature"])
-        # Turning capture off mid-response seals the in-flight set.
-        if isinstance(payload.get("action_capture"), bool):
-            self.action_capture = bool(payload["action_capture"])
-        seed_patch = payload.get("seed")
-        if isinstance(seed_patch, bool) or (
-            "seed" in payload and seed_patch is not None and not isinstance(seed_patch, int)
-        ):
-            raise DuplexConfigError("session.update seed must be an integer or null", code="invalid_seed", param="seed")
+        action_capture_patch = payload.get("action_capture")
+        if isinstance(action_capture_patch, bool) and action_capture_patch != self.action_capture:
+            raise DuplexConfigError(
+                "session.update cannot change action_capture after the session is open",
+                code="action_capture_update_unsupported",
+                param="action_capture",
+            )
         if "seed" in payload:
-            self.seed = seed_patch
+            seed_patch = payload["seed"]
+            if isinstance(seed_patch, bool) or (seed_patch is not None and not isinstance(seed_patch, int)):
+                raise DuplexConfigError("session seed must be an integer or null", code="invalid_seed", param="seed")
+            if seed_patch != self.seed:
+                raise DuplexConfigError(
+                    "session.update cannot change seed after the session is open",
+                    code="action_capture_update_unsupported",
+                    param="seed",
+                )
         speed = payload.get("speed")
         if not isinstance(speed, int | float) and isinstance(audio_output, dict):
             speed = audio_output.get("speed")

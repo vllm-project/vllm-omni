@@ -49,7 +49,7 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "action_capture_invalid": "server_error",
     "action_capture_retention_overflow": "rate_limit_error",
     "action_capture_not_retained": "invalid_request_error",
-    "action_capture_update_conflict": "invalid_request_error",
+    "action_capture_update_unsupported": "invalid_request_error",
     "invalid_seed": "invalid_request_error",
     "engine_error": "server_error",
     "input_backpressure": "rate_limit_error",
