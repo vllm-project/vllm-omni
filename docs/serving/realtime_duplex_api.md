@@ -9,8 +9,9 @@ This page covers how to run a duplex deployment, how to drive it from Python
 with `vllm_omni.clients.duplex.DuplexClient`, and the complete wire contract.
 
 The endpoint requires a duplex plugin and a deployment with `session_mode: duplex`.
-See [supported models and deployments](full_duplex_api.md#enable-full-duplex)
-and the [runtime architecture](../design/fullduplex.md).
+See [supported models and deployments](full_duplex_api.md#enable-full-duplex),
+the [runtime architecture](../design/fullduplex.md), and the
+[Duplex-MPE multi-party selective participation benchmark](../../benchmarks/duplex_mpe/README.md).
 
 ## Qwen3-Omni conversation history
 
