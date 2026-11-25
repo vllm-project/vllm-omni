@@ -218,6 +218,23 @@ def _unlink_shm_handles(handles: list[dict[str, Any]]) -> None:
             pass
 
 
+def _allocate_d2h_buffer(tensor: torch.Tensor) -> torch.Tensor:
+    try:
+        return torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=PIN_MEMORY)
+    except RuntimeError as exc:
+        # Ascend can run out of free pages for pinned host allocations.
+        # A pageable buffer can still carry the same data.
+        message = str(exc)
+        if "MallocHost" not in message and "out of memory" not in message.lower():
+            raise
+        logger.warning_once(
+            "Pinned host buffer unavailable for shape=%s dtype=%s; copying through pageable memory.",
+            tuple(tensor.shape),
+            tensor.dtype,
+        )
+        return torch.empty(tensor.shape, dtype=tensor.dtype)
+
+
 def _tensor_to_shm(
     tensor: torch.Tensor,
     d2h_stream: torch.Stream | None = None,
@@ -248,31 +265,10 @@ def _tensor_to_shm(
             created.append(handle)
         return handle
     if d2h_stream is not None and tensor.device.type != "cpu":
-        # Non-blocking D2H: copy on side stream into host memory pinned per
-        # the platform flag (PIN_MEMORY). Host tensors skip this staging
-        # copy; they are copied into SHM directly.
-        old_stream = torch.accelerator.current_stream()
-        torch.accelerator.set_stream(d2h_stream)
-        try:
-            t = tensor.detach()
-            try:
-                cpu = torch.empty(t.shape, dtype=t.dtype, pin_memory=PIN_MEMORY)
-            except RuntimeError as exc:
-                # Some Ascend hosts cannot grant pinned host pages when free
-                # (non-reclaimable) memory runs low. The copy is still correct
-                # through pageable memory; only the transfer may be slower.
-                message = str(exc)
-                if "MallocHost" not in message and "out of memory" not in message.lower():
-                    raise
-                logger.warning_once(
-                    "Pinned host buffer unavailable for shape=%s dtype=%s; copying through pageable memory.",
-                    tuple(t.shape),
-                    t.dtype,
-                )
-                cpu = torch.empty(t.shape, dtype=t.dtype)
-            cpu.copy_(t, non_blocking=True)
-        finally:
-            torch.accelerator.set_stream(old_stream)
+        with d2h_stream:
+            source = tensor.detach()
+            cpu = _allocate_d2h_buffer(source)
+            cpu.copy_(source, non_blocking=True)
         d2h_stream.synchronize()
         tensor = cpu
     else:

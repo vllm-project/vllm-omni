@@ -38,6 +38,57 @@ the model plugins.
 The optional process runtime isolates the orchestrator from the frontend GIL
 and serves sessions only. See [process runtime usage, ownership, and limits](../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
 
+## Incremental text input
+
+`AppendText` is admitted only when the model advertises `text` as an input
+modality. MiniCPM-o consumes each fragment as a native TEXT unit in automatic
+response mode. The manager rejects text that cannot be encoded as UTF-8 with a
+request-scoped `bad_event`, then charges UTF-8 bytes before mailbox admission; the
+runner keeps that charge until its ordered append task completes or is
+cancelled. Text shares the audio/video append tail and epoch fencing, without
+flushing partial PCM or advancing the first audio-encoder window. Before queuing
+text, the runner submits any complete buffered media units through that same
+append tail, preserving their input flags and leaving incomplete PCM buffered.
+Eligible audio appends also submit every complete buffered unit on either
+clock, including appends arriving after text has opened the response. An
+overlap policy that defers an append still keeps its media buffered.
+
+The MiniCPM plugin tokenizes off the owner loop and reserves exactly the
+context/previous-unit closure, `<unit>`, and text tokens. Stage 0 embeds these
+tokens using the native `streaming_prefill(text_list=...)` layout and retains
+them in sliding-window units. Repeated prefill of the same append identity
+reuses its embeddings. `force_listen` permits intermediate fragments to enter
+the KV cache without generating a reply; an unforced text unit opens the
+assistant turn once during prefill, since text has no microphone silence
+marking the end of input. When no response is active, the runner creates one before submission;
+an empty `<|chunk_eos|>` unit returns directly to the session to advance the
+normal continuation clock instead of waiting for nonexistent Talker output.
+This shortcut applies only to model-confirmed unforced text input. Empty audio
+units retain their Talker handoff and segment boundary, including when the
+chunk terminator is their only token, so input-clock acknowledgements keep
+their unit ownership.
+For a response released by unforced text, incomplete buffered PCM does not
+block that clock. The PCM remains charged and unconsumed; queued appends,
+reserved input, and complete audio or vision units retain priority over
+generated silence. Stage 0 confirms this exception for the epoch and model turn
+that consumed the text, using the bridge's turn snapshot before handoff. The
+active response at text admission may still belong to the previous Talker turn;
+it must not receive the new turn's continuation permission. An empty first unit
+waits for the previous response's final audio and `response.done` before opening
+the new response and continuing. Cancellation discards this deferred unit. The exception does not
+carry over to a later audio-only response or a new epoch. Disabling silence continuation or
+using the input clock still prevents synthetic units.
+An empty Talker segment, such as a unit containing only `<|speak|>` and a
+chunk terminator, uses the same deferred response transition when Stage 0 has
+confirmed its text turn. It retains its normal handoff and segment boundary;
+the session binds continuation to that text turn even if the previous response
+has ended before the empty segment arrives.
+For units returned directly to the session, the Talker handoff skips their
+completed control tokens in cumulative output before aligning the next speech
+unit's text and hidden states.
+Replayed prefill cannot reopen an ended reply. This does not change the separate
+conversation-item text-turn capability or replace assistant playback controls.
+
 ## Playback completion ownership
 
 Cancellation of a retained model stream identifies the response owning its
@@ -1642,11 +1693,38 @@ comes from the first tokenizer-owning stage, matching frontend comprehension
 ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
 enters ASR and carries the original observation context through the handoff.
 
-JoyAI keeps an empty assistant message for a retained visual observation's
-response when cancellation leaves no committed speech. This preserves the turn
-boundary in both direct and ASR-handoff prompts without restoring unheard text
-or treating cancellation as a model silence decision. The boundary follows the
-existing recent-history budget and disappears when its history item is deleted.
+JoyAI renders a retained visual observation's unheard response as an assistant
+message containing only `</response>`. The Session history item remains empty;
+the model prompt keeps JoyAI's action marker to close the previous observation.
+This preserves the turn boundary in both direct and ASR-handoff prompts without
+restoring unheard text or treating cancellation as a model silence decision.
+The boundary follows the existing recent-history budget and disappears when
+its history item is deleted.
+
+Both text and speech queries precede their observation's frames inside the same
+user message, matching the visual reference frontend. The ASR handoff and
+reconstructed history preserve this query-before-frame format.
+Spoken observations retain the public Session item ID and its non-reusable
+source ID. JoyAI resolves the current text only while both identities match.
+Deleting and recreating a public item ID must not attach the new item's text to
+old frames, even when the text is identical. Observation ordering anchors also
+retain user source IDs so recreated items cannot inherit old positions.
+The retained transcript precedes the original frames in the same user message,
+matching the ASR handoff. A later
+camera observation must not move the transcript into a separate user turn.
+Deleted transcripts stay absent; cancelled output does not discard an accepted
+user transcript.
+
+The default JoyAI silence persona keeps ongoing user instructions active across
+replies: a completed answer does not finish an instruction about future
+observations. Each new observation must be evaluated against applicable ongoing
+instructions before choosing silence. This does not force a spoken response for
+every camera commit; silence remains valid when no instruction or scene change
+calls for speech. The absence of a new query is not by itself a reason to stay
+silent: an ongoing instruction may require a reply to the newest observation.
+Answered one-time questions and unmet conditions in ongoing instructions do not
+require another reply. An explicit `joyai_system_prompt` still replaces the persona.
+
 The ASR handoff retains frame timestamps and observation-to-history references,
 so an old frame precedes its reply boundary and the new transcript accompanies
 only the current observation. Both paths apply the image limit before selecting

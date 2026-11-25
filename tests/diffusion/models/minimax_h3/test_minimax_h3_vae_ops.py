@@ -381,10 +381,10 @@ def test_h3_vae_dispatch_selects_supported_cuda_capabilities(monkeypatch):
     monkeypatch.setattr(dispatch, "HAS_TRITON", True)
     monkeypatch.setattr(dispatch, "current_omni_platform", platform)
 
-    for capability in (89, 90, 100, 103):
+    for capability in (89, 90, 100, 103, 120):
         platform.get_device_capability.return_value.to_int.return_value = capability
         assert dispatch.resolve_h3_vae_operators(torch.device("cuda:0")) is not None
 
-    for capability in (80, 101, 110):
+    for capability in (80, 101, 110, 121):
         platform.get_device_capability.return_value.to_int.return_value = capability
         assert dispatch.resolve_h3_vae_operators(torch.device("cuda:0")) is None
