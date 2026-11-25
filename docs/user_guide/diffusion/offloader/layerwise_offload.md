@@ -127,12 +127,13 @@ Local spawned workers inherit locality before Torch imports; the launching
 thread restores its affinity after startup, including failed starts. Worker
 initialization and loading bind existing thread pools within their individual
 CPU limits. IRQ affinity and process-wide page migration are unchanged.
-When omitted, the automatic policy applies only if an optional AdaLN cache is
-enabled for MindIE-SD CP2×U8 on 16 devices; failure then preserves affinity.
-A5 uses explicit binding with LO and AdaLN residency disabled.
+Omit `enable_cpu_binding` to preserve the default placement. Consider enabling
+it when host work and NPU transfers are running on different NUMA nodes. At
+startup with `VLLM_LOGGING_LEVEL=DEBUG`, check the worker affinity messages for
+the physical device, NUMA node, and the actual allowed CPUs. A5 uses explicit
+binding with layerwise offload and AdaLN residency disabled.
 
-Set `VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE=2` (AICPU) or `3` (AIV) before
-startup to choose the engine for both Ulysses and AllGather-KV groups.
-Omitting it preserves the HCCL default. Check participating group logs to
-confirm the selected engine. CPU binding support does not establish a latency
-gain; qualify each model/topology with frozen-source hot samples.
+`additional_config.hccl_expansion_mode` optionally selects the engine for
+Ulysses and AllGather-KV groups: `2` for AICPU or `3` for AIV. Omit it to keep
+the runtime's HCCL default. Use the same configuration on all ranks and check
+the group creation debug logs for the effective override.

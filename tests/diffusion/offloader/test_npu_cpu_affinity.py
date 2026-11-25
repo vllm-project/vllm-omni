@@ -12,20 +12,7 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 
 
 def config(**options):
-    return SimpleNamespace(
-        enable_layerwise_offload=True,
-        cache_adaln=True,
-        additional_config=options,
-        parallel_config=SimpleNamespace(
-            ulysses_degree=8, allgather_degree=2, ring_degree=1, tensor_parallel_size=1, world_size=16
-        ),
-        diffusion_attention_config=SimpleNamespace(
-            default=SimpleNamespace(
-                backend="RAINFUSION_ATTN", block_sparse=SimpleNamespace(parallel=SimpleNamespace())
-            ),
-            per_role={},
-        ),
-    )
+    return SimpleNamespace(default_npu_cpu_binding=True, additional_config=options)
 
 
 @pytest.fixture
@@ -38,7 +25,7 @@ def runtime(monkeypatch):
     return current
 
 
-def test_auto_binding_intersects_incoming_cpu_limits(runtime):
+def test_default_binding_intersects_incoming_cpu_limits(runtime):
     assert affinity.maybe_bind_npu_offload_cpu(config(), SimpleNamespace(type="npu", index=0))
     assert runtime["cpus"] == {2, 3}
 

@@ -627,6 +627,7 @@ class DiffusionWorker:
                 ulysses_degree=parallel_config.ulysses_degree,
                 ring_degree=parallel_config.ring_degree,
                 allgather_degree=parallel_config.allgather_degree,
+                hccl_expansion_mode=(self.od_config.additional_config or {}).get("hccl_expansion_mode"),
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
                 fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,

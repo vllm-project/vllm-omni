@@ -77,16 +77,23 @@ def test_only_explicit_frontend_hashes_are_forwarded(hashes):
         assert result.received["block_hashes"] is hashes
 
 
-def test_connector_only_output_constructs_on_legacy_runtime():
+def test_connector_only_output_constructs():
     token = object()
     output = OmniModelRunnerOutput.with_kv_conn_output_only(token)
     assert output.req_ids == [] and output.kv_connector_output is token
-    assert output.req_id_to_index == {}
 
 
-def test_legacy_index_tracks_output_order():
-    output = OmniModelRunnerOutput._from_components(req_ids=["second", "first"], sampled_token_ids=[[], []])
-    assert output.req_id_to_index == {"second": 0, "first": 1}
+def test_legacy_index_tracks_output_order(monkeypatch):
+    monkeypatch.setattr(
+        ModelRunnerOutput, "__dataclass_fields__", {**ModelRunnerOutput.__dataclass_fields__, "req_id_to_index": None}
+    )
+
+    class LegacyOutput(OmniModelRunnerOutput):
+        def __init__(self, *, req_id_to_index, **kwargs):
+            self.received_index = req_id_to_index
+
+    output = LegacyOutput._from_components(req_ids=["second", "first"], sampled_token_ids=[[], []])
+    assert output.received_index == {"second": 0, "first": 1}
 
 
 def test_new_output_layout_does_not_receive_legacy_field(monkeypatch):

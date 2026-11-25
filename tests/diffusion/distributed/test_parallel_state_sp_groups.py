@@ -73,7 +73,6 @@ def _fake_new_group_factory(created_groups: list[SimpleNamespace]):
 
 @pytest.fixture
 def hccl_mode(request, monkeypatch):
-    monkeypatch.setattr(omni_parallel_state.envs, "VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE", request.param)
     monkeypatch.setattr(omni_parallel_state.current_omni_platform, "is_npu", lambda: True)
     options = SimpleNamespace(Options=lambda: SimpleNamespace(hccl_config={}))
     extension = SimpleNamespace(_C=SimpleNamespace(_distributed_c10d=SimpleNamespace(ProcessGroupHCCL=options)))
@@ -126,6 +125,7 @@ def test_set_seq_parallel_pg_builds_independent_allgather_group(rank, monkeypatc
         rank=rank,
         world_size=4,
         sp_group_ranks=sp_group_ranks,
+        hccl_expansion_mode=hccl_mode,
     )
 
     assert ulysses_pg.ranks == [rank]
@@ -166,6 +166,7 @@ def test_set_seq_parallel_pg_builds_orthogonal_ulysses_allgather_groups(
         rank=rank,
         world_size=4,
         sp_group_ranks=[[0, 1, 2, 3]],
+        hccl_expansion_mode=hccl_mode,
     )
 
     assert ulysses_pg.ranks == expected_ulysses
@@ -184,10 +185,9 @@ def test_set_seq_parallel_pg_builds_orthogonal_ulysses_allgather_groups(
 def test_invalid_hccl_mode_rejects_before_creating_groups(monkeypatch, mode, npu):
     created: list[SimpleNamespace] = []
     monkeypatch.setattr(torch.distributed, "new_group", _fake_new_group_factory(created))
-    monkeypatch.setattr(omni_parallel_state.envs, "VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE", mode)
     monkeypatch.setattr(omni_parallel_state.current_omni_platform, "is_npu", lambda: npu)
     with pytest.raises(ValueError, match="requires NPU"):
-        set_seq_parallel_pg(8, 1, 0, 16, sp_allgather_degree=2)
+        set_seq_parallel_pg(8, 1, 0, 16, sp_allgather_degree=2, hccl_expansion_mode=mode)
     assert not created
 
 

@@ -111,33 +111,6 @@ def _npu_affinity(index: int) -> tuple[int, int, set[int]]:
     return physical, node, _cpu_list((pci / "local_cpulist").read_text())
 
 
-def _sd16_cache_path(od_config: OmniDiffusionConfig) -> bool:
-    """Recognize configured MindIE-SD U8 x CP2, keeping native and SD8 defaults."""
-    if not (getattr(od_config, "enable_layerwise_offload", False) and getattr(od_config, "cache_adaln", False)):
-        return False
-    parallel = getattr(od_config, "parallel_config", None)
-    if (
-        parallel is None
-        or parallel.ulysses_degree != 8
-        or parallel.allgather_degree != 2
-        or parallel.ring_degree != 1
-        or parallel.tensor_parallel_size != 1
-        or parallel.world_size != 16
-    ):
-        return False
-    attention = getattr(od_config, "diffusion_attention_config", None)
-    if attention is None:
-        return False
-    specs = [attention.default, *attention.per_role.values()]
-    return any(
-        spec is not None
-        and spec.backend.upper() == "RAINFUSION_ATTN"
-        and spec.block_sparse is not None
-        and spec.block_sparse.parallel is not None
-        for spec in specs
-    )
-
-
 def _worker_threads() -> list[int]:
     """Enumerate only threads belonging to the current worker process."""
     return [int(path.name) for path in Path("/proc/self/task").iterdir() if path.name.isdigit()]
@@ -161,7 +134,7 @@ def npu_worker_start_affinity(od_config: OmniDiffusionConfig, device_index: int,
         yield
         return
     requested = _binding_request(od_config)
-    if requested is False or (requested is None and not _sd16_cache_path(od_config)):
+    if requested is False or (requested is None and not getattr(od_config, "default_npu_cpu_binding", False)):
         yield
         return
     before: set[int] | None = None
@@ -209,7 +182,7 @@ def maybe_bind_npu_offload_cpu(od_config: OmniDiffusionConfig, device: torch.dev
     if device is None or getattr(device, "type", None) != "npu":
         return False
     requested = _binding_request(od_config)
-    if requested is False or (requested is None and not _sd16_cache_path(od_config)):
+    if requested is False or (requested is None and not getattr(od_config, "default_npu_cpu_binding", False)):
         return False
     changed: dict[int, set[int]] = {}
     try:
