@@ -187,6 +187,12 @@ def talker2code2wav_async_chunk(
     audio = _codes_from(getattr(request, "additional_information", None))
     if audio is None:
         audio = _codes_from(multimodal_output)
+    # MRv2 supplies token-major placeholders before post-sample fills live rows.
+    # Inspect their validity only here, after the runner's async host copy.
+    meta = multimodal_output.get("meta", {}) if isinstance(multimodal_output, dict) else {}
+    valid = meta.get("codec_frame_valid") if isinstance(meta, dict) else None
+    if isinstance(valid, torch.Tensor) and (valid.numel() == 0 or not bool(valid.reshape(-1)[-1])):
+        audio = None
     if isinstance(audio, torch.Tensor) and audio.numel() > 0:
         a = audio if audio.ndim == 2 else audio.reshape(1, -1)
         frames.append(a[-1].to(torch.long).cpu())  # latest frame's codes

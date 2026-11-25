@@ -148,7 +148,7 @@ def dit_fp8_deploy_config(tmp_path_factory: pytest.TempPathFactory) -> str:
 @pytest.mark.full_model
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_mammoth_moda2_dit_online_fp8_quality_and_memory(dit_fp8_deploy_config: str):
     baseline, bf16_device_mem, bf16_latency_s = _generate(DEPLOY_CONFIG)
     quantized, fp8_device_mem, fp8_latency_s = _generate(dit_fp8_deploy_config)

@@ -17,6 +17,7 @@ list of supported architectures across all modalities, see
 | AuK | `tencent/AuK`, `tencent/AuK-Flash` (assembled with `tools/prepare_auk_checkpoint.py`) | 2 (thinker encoder + DiT) | ✓ | — | instruction-driven editing, enhancement, separation; no example script (use `vllm_omni.model_extras.auk`) | 24 kHz |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | dual-AR | ✓ | ✓ | 11 languages | 44.1 kHz |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | 2 (talker + codec) | ✓ | ✓ (async chunk) | voice design / voice direction (`--instruction`) | 24 kHz |
+| Chatterbox Turbo / Original | `ResembleAI/chatterbox-turbo`, `ResembleAI/chatterbox` | 2 (AR + S3Gen/HiFT) | ✓ (no transcript) | ✓ (async chunk) | English; Original CFG / exaggeration | 24 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Audio Drama 3 | `fishaudio/drama-3` | 2 (AR + DAC codec) | ✓ | ✓ (online) | speaker and event tags; no example script | 44.1 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
@@ -32,6 +33,23 @@ list of supported architectures across all modalities, see
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
+
+## Chatterbox Turbo and Original
+
+Two-stage English speech synthesis at 24 kHz, with a built-in voice or a single
+reference recording. No reference transcript is needed. Install the conditioning
+extra with `uv pip install -e '.[chatterbox]'`.
+
+Use the production `load_text_tokenizer`, `tokenize_text`, `build_prompt`, and
+`VoiceConditioning` helpers with `Omni.generate`; Original's `build_prompt` takes
+`exaggeration` and `cfg_weight` (upstream's defaults are 0.5 each). The [offline command in the
+H100 recipe](../../../recipes/ResembleAI/Chatterbox-H100.md#command)
+saves a complete mono 24 kHz WAV and uses the same preparation as serving.
+
+See the [H100 recipe](../../../recipes/ResembleAI/Chatterbox-H100.md) for
+profiles, qualification scope and concurrency limitations.
+
+---
 
 ## Common Quick Start
 

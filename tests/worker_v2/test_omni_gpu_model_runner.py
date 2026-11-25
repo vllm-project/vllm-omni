@@ -736,6 +736,72 @@ def test_hybrid_state_constructs_and_reuses_request_slots(remove_by_id):
     assert state.intermediate_buffer.req_id_to_index == {"replacement": 0, "peer": 1}
 
 
+def test_encoder_only_omni_stage_keeps_encoder_state_and_omni_lifecycle(monkeypatch):
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backend import AttentionType
+    from vllm.v1.worker.gpu.model_states.encoder_only import EncoderOnlyModelState
+
+    from vllm_omni.worker_v2.model_states.omni_encoder_only import OmniEncoderOnlyModelState
+
+    enc_layer = object.__new__(Attention)
+    enc_layer.attn_type = AttentionType.ENCODER_ONLY
+
+    class EncoderOnlyConfig(OmniModelConfig):
+        is_hybrid = False
+        enable_prompt_embeds = False
+
+    model_config = object.__new__(EncoderOnlyConfig)
+    vllm_config = SimpleNamespace(
+        model_config=model_config,
+        compilation_config=SimpleNamespace(static_forward_context={"encoder.attn": enc_layer}),
+    )
+    upstream = MagicMock(side_effect=AssertionError("encoder-only Omni stage used the upstream state"))
+    monkeypatch.setattr("vllm_omni.worker_v2.model_states._upstream_init_model_state", upstream)
+    monkeypatch.setattr(OmniEncoderOnlyModelState, "__init__", lambda *_args: None)
+    model = SimpleNamespace()
+    state = init_omni_model_state(vllm_config, model, None, torch.device("cpu"))
+    assert isinstance(state, OmniModelState) and isinstance(state, EncoderOnlyModelState)
+    mro = type(state).__mro__
+    assert mro.index(OmniModelState) < mro.index(EncoderOnlyModelState) < mro.index(DefaultModelState)
+    assert callable(state.run_preprocess) and callable(state.run_postprocess)
+    assert callable(state.get_additional_cg_support)
+    assert state.supports_prompt_embeds is False
+
+
+@pytest.mark.parametrize("remove_by_id", [False, True])
+def test_encoder_only_state_constructs_and_cleans_request_state(remove_by_id):
+    from vllm_omni.worker_v2.model_states.omni_encoder_only import OmniEncoderOnlyModelState
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_inputs_embeds_size=lambda: 8,
+            dtype=torch.float32,
+            max_model_len=32,
+            enable_prompt_embeds=False,
+            uses_mrope=False,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=16),
+        cache_config=SimpleNamespace(cache_dtype="auto", block_size=16),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    state = OmniEncoderOnlyModelState(config, torch.nn.Linear(8, 8), None, torch.device("cpu"))
+    for index, req_id in enumerate(("finished", "peer")):
+        state.add_request(
+            index,
+            SimpleNamespace(
+                req_id=req_id,
+                mm_features=[],
+                prompt_token_ids=[1, 2, 3, 4],
+                pooling_params=SimpleNamespace(extra_kwargs={"compressed_token_type_ids": (1, 3)}),
+            ),
+        )
+    assert set(state.token_type_ids) == {"finished", "peer"}
+    state.remove_request("finished" if remove_by_id else 0)
+    assert state.intermediate_buffer.buffers[0] == {}
+    assert state.intermediate_buffer.req_id_to_index == {"peer": 1}
+    assert set(state.token_type_ids) == {"peer"}
+
+
 def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch):
     runner = _make_runner()
     calls = []
@@ -776,10 +842,10 @@ def test_capture_contract_uses_model_declaration(stage, declared):
 
 
 @pytest.mark.parametrize(
-    ("stage", "use_mrv2", "returns_aux", "exclude_full"),
-    [("llm", True, False, False), ("tts", True, False, False), ("llm", True, True, False), ("llm", False, False, True)],
+    ("stage", "returns_aux"),
+    [("llm", False), ("tts", False), ("llm", True)],
 )
-def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
+def test_minicpmo_capture_contract(stage, returns_aux):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
@@ -787,18 +853,17 @@ def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     torch.nn.Module.__init__(model)
     model.model_stage = stage
-    model._use_v2_model_runner = use_mrv2
     model._returns_aux_hidden_states = returns_aux
     model.have_multimodal_outputs = True
-    assert model.mrv2_forward_returns_tensor is (use_mrv2 and (stage == "tts" or not returns_aux))
-    assert model.mrv2_forward_returns_native_aux is (use_mrv2 and stage == "llm" and returns_aux)
+    assert model.mrv2_forward_returns_tensor is (stage == "tts" or not returns_aux)
+    assert model.mrv2_forward_returns_native_aux is (stage == "llm" and returns_aux)
 
     runner = _make_runner()
     runner.model = model
     runner._configure_cudagraph_output_contract()
 
-    assert runner._model_has_structured_output is exclude_full
-    assert runner._exclude_full_graph is exclude_full
+    assert runner._model_has_structured_output is False
+    assert runner._exclude_full_graph is False
 
 
 def _make_graph_contract_model(architecture, stage):

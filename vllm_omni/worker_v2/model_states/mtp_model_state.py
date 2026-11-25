@@ -128,6 +128,7 @@ class MTPState:
         self._mtp_offsets: torch.Tensor | None = None
         self._stage_offsets = DeviceStager()  # per-step MTP row offsets, read in place by the GPU
         self._mtp_sample_uniforms: torch.Tensor | None = None
+        self._mtp_sample_uniforms_step: torch.Tensor | None = None
         self._mtp_runner: Any | None = None
         # Captured whole-MTP graph entry per batch size, once a replay through
         # the wrapper has resolved it: (padded rows, entry).
@@ -152,6 +153,15 @@ class MTPState:
                     dtype=torch.float32,
                     device=device,
                 )
+                if bool(getattr(model, "mtp_sample_uniforms_preserve_eager_stream", False)):
+                    # ``buffer[:, step, :]`` is not contiguous. Reuse one
+                    # contiguous step buffer to match eager unseeded draws of
+                    # shape [batch, vocab] before copying into graph storage.
+                    self._mtp_sample_uniforms_step = torch.empty(
+                        (max_bs, sample_vocab_size),
+                        dtype=torch.float32,
+                        device=device,
+                    )
             self._mtp_runner = self._init_mtp_runner(model)
             if getattr(model, "has_talker_mtp", False):
                 self.embeds = torch.zeros((max_bs, self.owner._embed_dim), dtype=self.owner.dtype, device=device)
@@ -910,6 +920,23 @@ class MTPState:
         seeded = self._mtp_seeded
         all_buffers = self.owner.intermediate_buffer.buffers
         device = batch_ids.device
+        buffers = None
+        resolve_sampling = getattr(self.owner.model, "get_mtp_sampling_overrides", None)
+        if callable(resolve_sampling):
+            buffers = [all_buffers[req_idx] for req_idx in req_indices]
+            overrides = [resolve_sampling(buffer.get("sampling_params")) for buffer in buffers]
+            if any(bool(override) for override in overrides):
+                # The cached graph fixes Python sampling branches. Resolve
+                # request policy before either replay shortcut can run.
+                return self._mtp_forward_with_sampling_overrides(
+                    batch_ids,
+                    batch_emb,
+                    batch_hidden,
+                    batch_step,
+                    buffers=buffers,
+                    req_ids=req_ids,
+                    overrides=overrides,
+                )
         replay = self._mtp_replays.get(bsz) if mtp_batch_descriptor_dispatcher is not None else None
         if replay is not None and req_ids is not None:
             for req_id, req_idx in zip(req_ids, req_indices):
@@ -921,11 +948,12 @@ class MTPState:
                 # what the wrapper path below does, minus its per-call Python.
                 num_tokens, entry = replay
                 assert self._mtp_sample_uniforms is not None
-                self._mtp_sample_uniforms[:num_tokens].uniform_(1e-20, 1.0 - 1e-20)
+                self._prepare_mtp_sample_uniforms([None] * bsz, num_tokens)
                 get_offloader().sync_prev_onload()
                 entry.cudagraph.replay()
                 return entry.output
-        buffers = [all_buffers[req_idx] for req_idx in req_indices]
+        if buffers is None:
+            buffers = [all_buffers[req_idx] for req_idx in req_indices]
         if req_ids is None:
             req_ids = [str(buffer.get("req_id")) for buffer in buffers]
         if cache.keys() >= set(req_ids) and seeded.isdisjoint(req_ids):
@@ -984,6 +1012,73 @@ class MTPState:
         if batch_descriptor is not None and cudagraph_mode == CUDAGraphMode.FULL and sample_uniforms is not None:
             self._remember_mtp_replay(bsz, num_tokens, batch_descriptor, has_explicit_generator)
         return new_emb, codes
+
+    def _mtp_forward_with_sampling_overrides(
+        self,
+        batch_ids: torch.Tensor,
+        batch_emb: torch.Tensor,
+        batch_hidden: torch.Tensor,
+        batch_step: torch.Tensor,
+        *,
+        buffers: list[dict[str, Any]],
+        req_ids: list[str] | None,
+        overrides: list[dict[str, Any] | None],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Keep dynamic scalar policies outside the default whole-MTP graphs.
+
+        Homogeneous policies stay batched. Mixed policies pay for raw row calls
+        and owned output snapshots; the default path never pays these copies.
+        Predictor-owned transformer graphs remain usable inside the raw hook.
+        """
+        from vllm.forward_context import set_forward_context
+
+        if req_ids is None:
+            req_ids = [str(buffer.get("req_id")) for buffer in buffers]
+        generators = [
+            self._get_mtp_generator(req_id, buffer.get("sampling_params"), batch_ids.device)
+            for req_id, buffer in zip(req_ids, buffers, strict=True)
+        ]
+        base = self._get_mtp_base_sampling_kwargs()
+        policies = [{**base, **(override or {})} for override in overrides]
+        mtp = self._raw_mtp or self.owner.model.mtp
+
+        def run_rows(start: int, end: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+            row_buffers, row_ids = buffers[start:end], req_ids[start:end]
+            row_generators = generators[start:end]
+            kwargs = self._get_mtp_sampling_kwargs(row_buffers, row_ids, row_generators)
+            kwargs.update(policies[start])
+            # Keep MRv2's request-local full-span uniform draws for sampled
+            # rows. Greedy rows neither prepare noise nor advance their RNG.
+            sampling = kwargs.get("do_sample") is not False and kwargs.get("temperature") != 0
+            if sampling and self._mtp_sample_uniforms is not None:
+                kwargs["sample_uniforms"] = self._prepare_mtp_sample_uniforms(row_generators, end - start)
+                kwargs.pop("generator", None)
+                kwargs.pop("generators", None)
+            with set_forward_context(
+                None,
+                self.owner.vllm_config,
+                num_tokens=end - start,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            ):
+                return mtp(
+                    batch_ids[start:end],
+                    batch_emb[start:end],
+                    batch_hidden[start:end],
+                    batch_step[start:end],
+                    **kwargs,
+                )
+
+        if all(policy == policies[0] for policy in policies[1:]):
+            return run_rows(0, len(buffers))
+        emb_chunks, code_chunks = [], []
+        for row in range(len(buffers)):
+            row_emb, row_codes = run_rows(row, row + 1)
+            # Another row may reuse graph/static storage, including the input
+            # uniform buffer. Own each result before invoking the next row.
+            emb_chunks.append(row_emb.clone())
+            if row_codes is not None:
+                code_chunks.append(row_codes.clone())
+        return torch.cat(emb_chunks), torch.cat(code_chunks) if code_chunks else None
 
     def _remember_mtp_replay(self, bsz: int, num_tokens: int, batch_descriptor: Any, seeded: bool) -> None:
         """Record the captured graph entry the wrapper replayed for ``bsz`` unseeded rows."""
@@ -1068,6 +1163,45 @@ class MTPState:
             )
 
         active = sample_uniforms[:bsz]
+        if bool(getattr(self.owner.model, "mtp_sample_uniforms_preserve_eager_stream", False)):
+            # Qwen3-Omni's eager predictor draws once per residual step. With
+            # per-row generators it then draws each row separately; without
+            # them it draws one contiguous [batch, vocab] tensor. Keep those
+            # exact call shapes and ordering so graph input preparation leaves
+            # both generated values and generator states unchanged.
+            if num_tokens > bsz:
+                sample_uniforms[bsz:num_tokens].fill_(0.5)
+            if any(generator is not None for generator in generators):
+                for step in range(active.shape[1]):
+                    for row, generator in enumerate(generators):
+                        active[row : row + 1, step, :].uniform_(
+                            1e-20,
+                            1.0 - 1e-20,
+                            generator=generator,
+                        )
+            else:
+                step_uniforms = self._mtp_sample_uniforms_step
+                if (
+                    step_uniforms is None
+                    or step_uniforms.shape[0] < sample_uniforms.shape[0]
+                    or step_uniforms.shape[1] != sample_uniforms.shape[2]
+                    or step_uniforms.device != sample_uniforms.device
+                    or step_uniforms.dtype != sample_uniforms.dtype
+                ):
+                    # Real model construction preallocates this buffer. Keep a
+                    # lazy fallback for lightweight model-state tests.
+                    step_uniforms = torch.empty(
+                        (sample_uniforms.shape[0], sample_uniforms.shape[2]),
+                        dtype=sample_uniforms.dtype,
+                        device=sample_uniforms.device,
+                    )
+                    self._mtp_sample_uniforms_step = step_uniforms
+                for step in range(active.shape[1]):
+                    step_active = step_uniforms[:bsz]
+                    step_active.uniform_(1e-20, 1.0 - 1e-20)
+                    active[:, step, :].copy_(step_active)
+            return sample_uniforms[:num_tokens]
+
         if any(generator is not None for generator in generators):
             # Consume one request-local stream for the whole residual span so the
             # outer MTP graph can treat sampling noise as a stable tensor input.

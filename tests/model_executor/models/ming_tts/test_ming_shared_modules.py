@@ -19,7 +19,7 @@ from vllm_omni.model_executor.models.common.ming.cfm_head import FlowLoss
 from vllm_omni.model_executor.models.common.ming.cfm_solver import Solver, get_epss_timesteps
 from vllm_omni.model_executor.models.common.ming.speaker_extractor import SpeakerEmbeddingExtractor
 from vllm_omni.model_executor.models.common.ming.spk_embedding import SpkembExtractor
-from vllm_omni.model_executor.models.ming_tts.config_ming_tts import KEY_LATENT_HISTORY, KEY_REQUEST_ID
+from vllm_omni.model_executor.models.ming_tts.config_ming_tts import KEY_LATENT_HISTORY, KEY_REQUEST_ID, MingTTSConfig
 from vllm_omni.model_executor.models.ming_tts.constants import (
     AGGREGATOR_HIDDEN_SIZE,
     HISTORY_PATCH_SIZE,
@@ -35,7 +35,9 @@ from vllm_omni.model_executor.models.ming_tts.constants import (
     SPEAKER_EMBEDDING_DIM,
     VAE_PATCH_SIZE,
 )
+from vllm_omni.model_executor.models.ming_tts.ming_tts import MingTTSForConditionalGeneration
 from vllm_omni.model_executor.models.ming_tts.ming_tts_llm import MingLLMModel
+from vllm_omni.model_executor.models.ming_tts.prompt_assembly import build_ming_dense_prompt
 from vllm_omni.model_executor.models.ming_tts.speaker_extractor import _resolve_speaker_embeddings
 from vllm_omni.model_executor.models.ming_tts.validation import validate_ming_tts_config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -238,6 +240,99 @@ def test_ming_tts_flowloss_preserves_checkpoint_prefix():
     flowloss = FlowLoss(z_channels=4, llm_cond_dim=8, hidden_size=16, depth=1, num_heads=2)
 
     assert any(name.startswith("cfm.model.") for name in flowloss.state_dict())
+
+
+@pytest.mark.parametrize(("patch", "history"), [(1, 1), (4, 32)])
+def test_dense_flow_and_vae_patch_geometry(patch, history):
+    cfg = MingTTSConfig(
+        patch_size=patch,
+        history_patch_size=history,
+        audio_tokenizer_config=AudioVAEConfig(patch_size=4, sample_rate=SAMPLE_RATE),
+    )
+    validate_ming_tts_config(cfg)
+    cfg.history_patch_size = history + 1
+    with pytest.raises(ValueError, match="history_patch_size"):
+        validate_ming_tts_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("patch_size", "instruction_end", "reference_patches"),
+    [(1, "<|im_end|>", 4), (4, "<|endoftext|>", 1)],
+)
+def test_dense_reference_prompt_matches_checkpoint(patch_size, instruction_end, reference_patches, mocker):
+    tokenizer = mocker.Mock(unk_token_id=None)
+    tokenizer.convert_tokens_to_ids.return_value = 100
+    tokenizer.encode.side_effect = lambda text: [2] if text == instruction_end else [1]
+    prompt = build_ming_dense_prompt(
+        tokenizer,
+        model_variant="dense",
+        prompt="Read aloud.",
+        text="Hello.",
+        instruction="Speak calmly.",
+        prompt_waveform=torch.zeros(4 * 3528),
+        prompt_text="Good morning.",
+        patch_size=patch_size,
+    )
+    assert prompt["prompt_token_ids"][-(3 + reference_patches) :] == [1, 2, 1] + [100] * reference_patches
+
+
+@pytest.mark.parametrize(("single_frame", "expected"), [(False, 0.0), (True, 0.5)])
+def test_dense_flow_final_noise(single_frame, expected):
+    class ZeroVelocity(torch.nn.Module):
+        def forward_with_cfg(self, *, x, **kwargs):
+            return torch.zeros_like(x).repeat(2, 1, 1)
+
+    state = torch.zeros(1, 1, 1, dtype=torch.bfloat16)
+    sampler = CFMSampler(ZeroVelocity(), steps=1, include_final_noise=single_frame)
+    result = sampler(state, state, state, torch.tensor([0.0, 1.0]), (2.0, 0.5, 1.0), torch.ones_like(state)[None])
+    torch.testing.assert_close(result, torch.full_like(state, expected))
+
+
+def test_dense_single_frame_uncond_eager_and_generator_cleanup():
+    seen_c: list[torch.Tensor] = []
+
+    class RecordingDiT(torch.nn.Module):
+        def forward(self, *, x, t, c, latent_history):
+            del t, latent_history
+            seen_c.append(c.clone())
+            return torch.zeros_like(x)
+
+        def forward_with_cfg(self, **kwargs):
+            raise AssertionError(f"cfg < 1e-5 must not call forward_with_cfg: {kwargs}")
+
+    model = object.__new__(MingLLMModel)
+    torch.nn.Module.__init__(model)
+    model.ming_config = MingTTSConfig(patch_size=1, history_patch_size=1, llm_hidden_size=4, latent_dim=2)
+    model.fm_dtype = torch.bfloat16
+    model._dense_single_frame = True
+    model._cfm_graph_enabled = False
+    model._request_generators = {}
+    model._pending_postprocess_updates = {}
+    flowloss = object.__new__(FlowLoss)
+    torch.nn.Module.__init__(flowloss)
+    flowloss.z_channels = 2
+    flowloss._timesteps_cache = {}
+    flowloss.cfm = torch.nn.Module()
+    flowloss.cfm.model = RecordingDiT()
+    model.flowloss = flowloss
+    model.linear_proj_audio = lambda x: torch.zeros((x.shape[0], 1, 4), dtype=x.dtype)
+    model.stop_head = torch.nn.Linear(4, 2, dtype=torch.bfloat16)
+
+    req_info = {KEY_REQUEST_ID: "payload-id", "req_id": "runner-id", "tts_local_seed": 7}
+    gen = model._get_request_generator(req_info, torch.device("cpu"))
+    assert gen is not None
+    assert "runner-id" in model._request_generators
+    model.on_requests_finished({"runner-id"})
+    assert not model._request_generators
+
+    model._decode_one_step(
+        hidden_states=torch.ones((1, 4), dtype=torch.bfloat16),
+        latent_history=torch.zeros((1, 1, 2), dtype=torch.bfloat16),
+        cfg_scale=0.0,
+        sigma=0.25,
+        temperature=0.0,
+    )
+    assert seen_c and all(c.abs().max().item() == 0.0 for c in seen_c)
 
 
 def test_ming_dense_validation_rejects_semantic_audio_vae_config():
@@ -626,3 +721,41 @@ def test_cfm_solver_accepts_precomputed_per_step_noise():
     ).integrate(timesteps)
 
     assert torch.allclose(solution[-1], torch.full_like(y0, 2.0 * (0.5**0.5)))
+
+
+@torch.inference_mode()
+def test_seeded_voice_clone_prefill_uses_request_generator():
+    cfg = MingTTSConfig(patch_size=1, history_patch_size=4, latent_dim=2, llm_hidden_size=2, sample_rate=SAMPLE_RATE)
+    vae = SimpleNamespace(config=SimpleNamespace(enc_kwargs={"input_dim": 882}, patch_size=-1), encoder=True)
+    vae.encode_latent = lambda *args, **kwargs: AudioVAE.encode_latent(vae, *args, **kwargs)
+    llm = SimpleNamespace(
+        ming_config=cfg,
+        fm_dtype=torch.float32,
+        _dense_single_frame=True,
+        _request_generators={},
+        _generator_key=MingLLMModel._generator_key,
+        linear_proj_audio=lambda patches: patches,
+    )
+    llm._get_request_generator = lambda info, dev: MingLLMModel._get_request_generator(llm, info, dev)
+    wrapper = SimpleNamespace(
+        ming_config=cfg,
+        model=llm,
+        _speaker_cache=None,
+        _prompt_encoder=vae,
+        _prompt_encoder_forward=lambda _enc, wav: torch.zeros((1, wav.shape[-1] // 882, 4)),
+    )
+    ids = torch.tensor([1, cfg.audio_start_token_id] + [cfg.audio_dummy_token_id] * 4)
+
+    def _clone(req_id: str, seed: int, global_seed: int):
+        torch.manual_seed(global_seed)
+        info = {"req_id": req_id, "prompt_waveform": torch.zeros((1, 3528)), "tts_local_seed": seed}
+        _, embeds, update = MingTTSForConditionalGeneration._prefill_preprocess(
+            wrapper, ids, torch.zeros((6, 2)), **info
+        )
+        return embeds, update[KEY_LATENT_HISTORY]
+
+    embeds_1, history_1 = _clone("clone-1", seed=42, global_seed=1)
+    embeds_2, history_2 = _clone("clone-2", seed=42, global_seed=9999)
+    _, history_other = _clone("clone-3", seed=43, global_seed=1)
+    assert torch.equal(embeds_1, embeds_2) and torch.equal(history_1, history_2)
+    assert not torch.equal(history_1, history_other)
