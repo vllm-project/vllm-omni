@@ -582,6 +582,49 @@ class TestStreamingVideoOutputWebSocket:
             assert len(audio_paths) == 1
             assert not audio_paths[0].exists()
 
+    def test_live_audio_delivers_video_before_audio_done(self, mocker: MockerFixture):
+        async def no_full_request(**_kwargs):
+            pytest.fail("Live audio should use finite Worker calls.")
+            yield
+
+        app, _handler, engine = _build_test_app(
+            mocker=mocker, streaming_chunks=[(b"live-fragment", True)], mock_generate=no_full_request
+        )
+        calls = []
+
+        async def rpc(method, *, stage_ids, args, timeout):
+            assert method == "video_live_audio" and stage_ids == [0]
+            operation, request_id, *parameters = args
+            calls.append((operation, request_id, parameters))
+            if operation == "push":
+                audio, final = parameters
+                assert audio == (b"" if final else b"\0\0")
+                chunks = [] if final else [{"video": _fake_video_frames(2)}]
+                return [[{"chunks": chunks}]]
+            return [[None]]
+
+        engine._engine_core_rpc = rpc
+        image = generate_synthetic_image(4, 4)
+        with TestClient(app) as client, client.websocket_connect("/v1/realtime/video") as ws:
+            ws.send_json(
+                {
+                    "type": "session.start",
+                    "prompt": "Speak.",
+                    "fps": 16,
+                    "image_reference": {"image_url": f"data:image/jpeg;base64,{image['base64']}"},
+                    "extra_params": {"live_audio": True},
+                }
+            )
+            started = ws.receive_json()
+            assert started["type"] == "video.start"
+            ws.send_json({"type": "input_audio_buffer.append", "audio": "AAA="})
+            assert _receive_video_chunk(ws)[1] == b"live-fragment"
+            ws.send_json({"type": "input_audio_buffer.done"})
+            assert ws.receive_json()["type"] == "session.done"
+
+        assert [call[0] for call in calls] == ["start", "push", "push", "close"]
+        assert {call[1] for call in calls} == {started["request_id"]}
+
     def test_streaming_session_rejects_unknown_format(self, mocker: MockerFixture):
         async def mock_generate(*_args, **_kwargs):
             if False:

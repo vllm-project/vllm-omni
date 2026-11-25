@@ -43,6 +43,7 @@ from typing import Any, cast
 
 import anyio
 import numpy as np
+import pybase64
 import torch
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 from PIL import Image
@@ -181,6 +182,7 @@ class OmniStreamingVideoOutputHandler:
         response_task: asyncio.Task[None] | None = None
         response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_MAX_CONTROL_RESPONSE_QUEUE_SIZE)
         interaction_queue: asyncio.Queue[OmniInteractionPrompt] = asyncio.Queue(maxsize=_MAX_INTERACTION_QUEUE_SIZE)
+        live_audio_queue: asyncio.Queue[bytes | None] | None = None
         stopped = False
         chunks_sent = 0
         generation_done = False
@@ -195,6 +197,10 @@ class OmniStreamingVideoOutputHandler:
             if start is None:
                 return
             request, output_format = start
+            if (request.extra_params or {}).get("live_audio") is True:
+                if request.audio_reference is not None or request.image_reference is None:
+                    raise ValueError("Live audio requires a reference image and no audio_reference.")
+                live_audio_queue = asyncio.Queue(maxsize=8)
             pacing = request.streaming_pacing
             # Unpaced sessions keep the pre-backpressure unbounded sends.
             idle_timeout = pacing.idle_timeout_s if pacing is not None and pacing.enabled else None
@@ -252,10 +258,11 @@ class OmniStreamingVideoOutputHandler:
                     request.streaming_buffer_seconds is not None,
                     stop_received_at=stop_received_at,
                     response_queue=response_queue,
+                    live_audio_queue=live_audio_queue,
                 )
             )
             async for chunk, metadata in self._stream_video_bytes(
-                request, request_id, output_format, progress, resources
+                request, request_id, output_format, progress, resources, live_audio_queue, stop_event
             ):
                 if stop_event.is_set():
                     stopped = True
@@ -359,6 +366,11 @@ class OmniStreamingVideoOutputHandler:
                     await asyncio.gather(response_task, return_exceptions=True)
                 if request_id is not None and not generation_done:
                     await self._abort_request(request_id)
+                if live_audio_queue is not None and request_id is not None:
+                    try:
+                        await self._live_audio_rpc("close", request_id)
+                    except Exception:
+                        logger.exception("Failed to release live video session %s", request_id)
                 resources.cleanup()
 
     async def _receive_start(self, websocket: WebSocket) -> tuple[VideoGenerationRequest, StreamingVideoFormat] | None:
@@ -471,7 +483,9 @@ class OmniStreamingVideoOutputHandler:
         *,
         stop_received_at: list[float],
         response_queue: asyncio.Queue[dict[str, Any]],
+        live_audio_queue: asyncio.Queue[bytes | None] | None = None,
     ) -> None:
+        audio_finished = False
         try:
             while not stop_event.is_set():
                 if progress.stalled_for(self._stall_timeout):
@@ -522,6 +536,28 @@ class OmniStreamingVideoOutputHandler:
                     continue
 
                 msg_type = msg.get("type")
+                if live_audio_queue is not None and msg_type in (
+                    "input_audio_buffer.append",
+                    "input_audio_buffer.done",
+                ):
+                    try:
+                        if audio_finished:
+                            raise ValueError(f"Cannot accept {msg_type} after input_audio_buffer.done.")
+                        if msg_type == "input_audio_buffer.done":
+                            live_audio_queue.put_nowait(None)
+                            audio_finished = True
+                        else:
+                            audio = msg.get("audio")
+                            if not isinstance(audio, str):
+                                raise ValueError("audio must be base64 PCM16.")
+                            pcm = pybase64.b64decode(audio, validate=True)
+                            if not pcm or len(pcm) % 2 or len(pcm) > 48000:
+                                raise ValueError("Send between one sample and one second of 24 kHz mono PCM16.")
+                            live_audio_queue.put_nowait(pcm)
+                        progress.touch()
+                    except ValueError as exc:
+                        await self._send_error(websocket, str(exc), send_lock=send_lock, response_queue=response_queue)
+                    continue
                 if msg_type == "session.stop":
                     if not stop_received_at:
                         stop_received_at.append(time.monotonic())
@@ -914,6 +950,8 @@ class OmniStreamingVideoOutputHandler:
         output_format: StreamingVideoFormat,
         progress: _SessionProgress,
         resources: VideoRequestResources,
+        live_audio_queue: asyncio.Queue[bytes | None] | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> AsyncGenerator[tuple[bytes, dict[str, Any]], None]:
         """Yield encoded video bytes from diffusion streaming outputs."""
         prompt, gen_params, vp = await self._build_prompt_and_sampling_params(request, resources)
@@ -945,7 +983,14 @@ class OmniStreamingVideoOutputHandler:
                 raise
 
         try:
-            async for result in self._iter_generation_outputs(prompt, gen_params, request_id, progress):
+            if live_audio_queue is None:
+                results = self._iter_generation_outputs(prompt, gen_params, request_id, progress)
+            else:
+                assert stop_event is not None
+                results = self._iter_live_audio_outputs(
+                    prompt, request_id, request.seed, live_audio_queue, stop_event, progress
+                )
+            async for result in results:
                 if result.error:
                     raise RuntimeError(str(result.error))
                 # Request-mode emitters send a media-free terminal result
@@ -1129,6 +1174,44 @@ class OmniStreamingVideoOutputHandler:
 
         gen_params.lora_request = lora_requests
         gen_params.lora_scale = lora_scales
+
+    async def _live_audio_rpc(self, operation: str, request_id: str, *args: Any) -> Any:
+        results = await self._engine_client._engine_core_rpc(
+            "video_live_audio", stage_ids=[0], args=(operation, request_id, *args), timeout=120.0
+        )
+        result: Any = results
+        while isinstance(result, list) and len(result) == 1:
+            result = result[0]
+        return result
+
+    async def _iter_live_audio_outputs(
+        self,
+        prompt: OmniTextPrompt,
+        request_id: str,
+        seed: int | None,
+        queue: asyncio.Queue[bytes | None],
+        stop: asyncio.Event,
+        progress: _SessionProgress,
+    ) -> AsyncGenerator[OmniRequestOutput, None]:
+        await self._live_audio_rpc(
+            "start", request_id, prompt["multi_modal_data"]["image"], prompt["prompt"], 42 if seed is None else seed
+        )
+        progress.touch()
+        while not stop.is_set():
+            try:
+                pcm = await asyncio.wait_for(queue.get(), timeout=0.2)
+            except asyncio.TimeoutError:
+                continue
+            result = await self._live_audio_rpc("push", request_id, pcm or b"", pcm is None)
+            if not isinstance(result, dict) or "chunks" not in result:
+                raise RuntimeError("Invalid response from the live audio worker.")
+            progress.touch()
+            for chunk in result["chunks"]:
+                yield OmniRequestOutput.from_diffusion(
+                    request_id=request_id, images=[], multimodal_output=chunk, final_output_type="video", finished=False
+                )
+            if pcm is None:
+                return
 
     async def _iter_generation_outputs(
         self,

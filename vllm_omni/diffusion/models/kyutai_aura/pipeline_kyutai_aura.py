@@ -47,6 +47,7 @@ from vllm_omni.diffusion.models.kyutai_aura.config import (
     unsupported_kyutai_aura,
 )
 from vllm_omni.diffusion.models.kyutai_aura.kv_cache import RollingChunkKVCache
+from vllm_omni.diffusion.models.kyutai_aura.live_audio import AuraLiveAudio
 from vllm_omni.diffusion.models.kyutai_aura.sampling import StudentSigmas, crop_chunks, decode_spans
 from vllm_omni.diffusion.models.kyutai_aura.transformer import KyutaiAuraTransformer
 from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
@@ -115,6 +116,7 @@ class KyutaiAuraPipeline(nn.Module, SupportImageInput, SupportAudioInput, Suppor
         self.cfg = cfg
         self.device = get_local_device()
         self._text_encoder_stager: PinnedModuleStager | None = None
+        self._live_audio_sessions: dict[str, AuraLiveAudio] = {}
         extra: dict[str, Any] = getattr(od_config, "model_config", None) or {}
 
         aura_dir = _local_dir(od_config.model, [cfg.checkpoint])
@@ -318,6 +320,27 @@ class KyutaiAuraPipeline(nn.Module, SupportImageInput, SupportAudioInput, Suppor
                 yield chunk, total, self.decode_chunk(x0, vae_cache, first=chunk == 0)
 
     # ---------------------------------------------------------------------------------- serving
+    def run_live_audio(self, operation: str, request_id: str, *args: Any) -> dict[str, Any] | None:
+        sessions = self._live_audio_sessions
+        if operation == "close":
+            sessions.pop(request_id, None)
+            return None
+        if operation == "start":
+            if sessions:
+                raise RuntimeError("A live AURA session is already active.")
+            sessions[request_id] = AuraLiveAudio(self, *args)
+            return None
+        if operation != "push":
+            raise ValueError("Unknown AURA live audio operation.")
+        pcm, final = args
+        postprocess = get_kyutai_aura_post_process_func(self.od_config)
+        chunks = []
+        for output in sessions[request_id].push(pcm, final=final):
+            chunk = postprocess(output)
+            chunk["metadata"] = {"audio": {"sample_rate": chunk["audio_sample_rate"]}}
+            chunks.append(chunk)
+        return {"chunks": chunks}
+
     def _request_inputs(self, req: DiffusionRequestBatch) -> tuple[str, Any, Any, int, int | None]:
         """Read and check one request before any chunk is generated; bad inputs are client errors."""
         prompt_entry = req.prompts[0] if req.prompts else {"prompt": ""}

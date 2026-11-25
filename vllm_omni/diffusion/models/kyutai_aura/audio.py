@@ -9,12 +9,17 @@ AURA-1.3B uses the dequantized first (semantic) codebook of Kyutai's Mimi codec:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import soundfile
 import soxr
 import torch
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from transformers.cache_utils import Cache
+    from transformers.models.mimi.modeling_mimi import MimiConv1dPaddingCache
 
 FEATURE_RATE = 25  # Hz, the rate of the features before they are sampled at the video frame rate
 MIMI_REPO = "kyutai/mimi"
@@ -58,6 +63,65 @@ class MimiSemanticFeatures:
         latent = self.model.quantizer.decode(codes)  # [1, 512, T]
         n = int(latent.shape[-1] / self.frame_rate * FEATURE_RATE)
         latent = F.interpolate(latent, size=n, mode="linear", align_corners=True)
+        return latent.transpose(1, 2).float()
+
+    def start_stream(self) -> MimiSemanticStream:
+        """Create independent incremental state for mono PCM at the Mimi sample rate."""
+        return MimiSemanticStream(self)
+
+
+class MimiSemanticStream:
+    """Emit native-rate semantic features from normalized mono PCM.
+
+    Incomplete codec frames are buffered until the next push. Finishing
+    zero-pads a partial frame at the PCM boundary.
+    """
+
+    def __init__(self, features: MimiSemanticFeatures) -> None:
+        self._features = features
+        self._frame_size = int(features.model.config.frame_size)
+        self._pending = np.empty(0, dtype=np.float32)
+        self._kv_cache: Cache | None = None
+        self._padding_cache: MimiConv1dPaddingCache | None = None
+        self._finished = False
+
+    @torch.no_grad()
+    def push(self, pcm: np.ndarray, *, final: bool = False) -> torch.Tensor | None:
+        """Emit [1, frames, 512] float32 features, or None if no frame is ready."""
+        if self._finished:
+            raise RuntimeError("This Mimi stream has already finished.")
+        samples = np.asarray(pcm, dtype=np.float32)
+        if samples.ndim != 1:
+            raise ValueError("Mimi streaming expects one-dimensional mono PCM.")
+        samples = np.concatenate((self._pending, samples))
+        remainder = samples.size % self._frame_size
+        if final and remainder:
+            samples = np.pad(samples, (0, self._frame_size - remainder))
+            remainder = 0
+        end = samples.size - remainder
+        if end == 0:
+            self._pending = samples
+            if final:
+                self._kv_cache = None
+                self._padding_cache = None
+                self._finished = True
+            return None
+
+        features = self._features
+        wav = torch.from_numpy(samples[:end]).to(features.device)[None, None]
+        result = features.model.encode(
+            wav,
+            num_quantizers=1,
+            use_streaming=True,
+            encoder_past_key_values=self._kv_cache,
+            padding_cache=self._padding_cache,
+            return_dict=True,
+        )
+        latent = features.model.quantizer.decode(result.audio_codes)
+        self._pending = samples[end:].copy()
+        self._kv_cache = result.encoder_past_key_values if not final else None
+        self._padding_cache = result.padding_cache if not final else None
+        self._finished = final
         return latent.transpose(1, 2).float()
 
 

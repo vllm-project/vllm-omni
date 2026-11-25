@@ -239,6 +239,7 @@ def build_browser_stream_config(
     reference_image: Image.Image | None = None,
     reference_audio: tuple[int, np.ndarray] | None = None,
     enable_prompt_updates: bool = True,
+    use_microphone: bool = False,
 ) -> tuple[str, Any]:
     """Build the browser-side WebSocket request config for the HTML/MSE player."""
     if not model.strip():
@@ -266,12 +267,20 @@ def build_browser_stream_config(
         image_buffer = io.BytesIO()
         reference_image.save(image_buffer, format="PNG")
         payload["image_reference"] = {"image_url": _media_data_url(image_buffer.getvalue(), "image/png")}
-    if reference_audio is not None:
+    if use_microphone:
+        if reference_image is None:
+            raise gr.Error("A reference image is required for microphone input.")
+        if fps != 16:
+            raise gr.Error("Microphone input requires 16 fps.")
+        payload["extra_params"] = {"live_audio": True}
+    elif reference_audio is not None:
         sample_rate, samples = reference_audio
         audio_buffer = io.BytesIO()
         soundfile.write(audio_buffer, samples, sample_rate, format="WAV")
         payload["audio_reference"] = {"audio_url": _media_data_url(audio_buffer.getvalue(), "audio/wav")}
-    prompt_updates = _parse_prompt_updates_dataframe(prompt_updates_df) if enable_prompt_updates else []
+    prompt_updates = (
+        _parse_prompt_updates_dataframe(prompt_updates_df) if enable_prompt_updates and not use_microphone else []
+    )
     config = {
         "url": f"ws://{host}:{int(port)}/v1/realtime/video",
         "payload": payload,
@@ -301,6 +310,7 @@ def create_demo() -> gr.Blocks:
                 reference_image = gr.Image(
                     label="Reference image (optional)", sources=["upload"], type="pil", image_mode="RGB"
                 )
+                use_microphone = gr.Checkbox(label="Use microphone (AURA)", value=False)
                 reference_audio = gr.Audio(label="Reference audio (optional)", sources=["upload"], type="numpy")
 
                 with gr.Row():
@@ -410,6 +420,7 @@ def create_demo() -> gr.Blocks:
             reference_image,
             reference_audio,
             enable_prompt_updates,
+            use_microphone,
         ]
         for toggle, field in [
             (include_negative_prompt, negative_prompt),
@@ -425,6 +436,9 @@ def create_demo() -> gr.Blocks:
                 inputs=toggle,
                 outputs=field,
             )
+        use_microphone.change(
+            fn=lambda enabled: gr.update(visible=not enabled), inputs=use_microphone, outputs=reference_audio
+        )
         start_button.click(
             fn=build_browser_stream_config,
             inputs=inputs,
