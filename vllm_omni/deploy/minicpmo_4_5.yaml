@@ -369,10 +369,5 @@ platforms:
           token2wav_runtime_prompt_cache_size: 64
           token2wav_setup_cache_size: 64
           code2wav_encoder_tail_precapture: true
-          cfm_graph_capture_frames:
-          - 16
-          - 32
-          - 48
-          - 64
-          - 80
+          cfm_graph_capture_frames: [16, 32, 48, 64, 80]
           token2wav_ref_prefetch_setup: true

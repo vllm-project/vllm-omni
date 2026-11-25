@@ -173,7 +173,7 @@ MRv2 but do not inherit this CUDA drafter configuration; XPU and MUSA retain
 the deferred V1 default and cannot run it with vLLM 0.34.
 Greedy text can differ from decoding without drafts at near-tied tokens.
 
-The default single-card and two-card Ascend profiles use synchronous MRv2
+The default single-card and two-card Ascend YAMLs use synchronous MRv2
 with seven Ngram draft tokens for greedy Thinker requests. The scheduler
 drafts from committed token history and the NPU verifies the drafts. When
 a Thinker decode batch includes non-greedy sampling, MRv2 scheduler Ngram
@@ -191,9 +191,11 @@ To disable Thinker Ngram, set `speculative_config: null` for stage 0 under
 `platforms.npu.stages` in a deploy overlay. Use `async_scheduling: true` there
 to restore asynchronous scheduling for ordinary decoding.
 
-The Ascend `minicpmo_4_5_npu_2card.yaml` profile colocates Thinker and
-Talker and gives Code2Wav its own NPU. The `minicpmo_4_5_2gpu.yaml`
-profile gives Thinker its own device and colocates Talker and Code2Wav.
+The Ascend `minicpmo_4_5_npu_2card.yaml` profile puts Thinker on the second
+visible NPU and one replica of Talker and Code2Wav on each NPU. It inherits
+the common stage settings from `minicpmo_4_5.yaml`. The
+[Ascend launcher](gh-file:recipes/OpenBMB/serve_minicpmo_ascend.sh) selects
+the prepared W8A8 Thinker and DSpark draft when those checkpoints are available.
 
 ## Thinker prefix cache with drafts
 

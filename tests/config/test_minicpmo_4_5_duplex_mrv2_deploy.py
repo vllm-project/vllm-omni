@@ -77,24 +77,15 @@ def test_duplex_mrv2_profile_npu_full_mrv2(monkeypatch) -> None:
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
 
 
-@pytest.mark.parametrize(
-    ("deploy_name", "devices", "replicas"),
-    [
-        ("minicpmo_4_5_2gpu.yaml", "0,1", 2),
-        ("minicpmo_4_5_2gpu_throughput.yaml", "0", 1),
-    ],
-)
-def test_two_card_vocoder_profiles_preserve_shared_tuning(monkeypatch, deploy_name, devices, replicas) -> None:
-    config, stages = _resolve_stages(monkeypatch, "npu", deploy_name)
+def test_two_card_deploy_inherits_common_npu_settings(monkeypatch) -> None:
+    config, stages = _resolve_stages(monkeypatch, "npu", "minicpmo_4_5_npu_2card.yaml")
     thinker, talker, vocoder = stages
     assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
     assert thinker.yaml_engine_args["max_model_len"] == 40960
     assert thinker.yaml_engine_args["interleave_mm_strings"] is True
     assert thinker.yaml_engine_args["media_io_kwargs"]["video"] == {"fps": 1, "num_frames": 128}
-    spec = thinker.yaml_engine_args["speculative_config"]
-    assert (spec["method"], spec["num_speculative_tokens"]) == ("dspark", 7)
     assert talker.yaml_runtime["num_replicas"] == 2
-    assert (vocoder.yaml_runtime["devices"], vocoder.yaml_runtime["num_replicas"]) == (devices, replicas)
+    assert (vocoder.yaml_runtime["devices"], vocoder.yaml_runtime["num_replicas"]) == ("0,1", 2)
     assert vocoder.yaml_runtime["env"] == {
         "MINICPMO_C8_SECONDARY_VOCODER_HOST_CACHE": "1",
         "MINICPMO_C8_SECONDARY_VOCODER_TIGHT_MEMORY": "1",
@@ -107,6 +98,20 @@ def test_two_card_vocoder_profiles_preserve_shared_tuning(monkeypatch, deploy_na
     assert extra["token2wav_setup_host_cache_size"] == 512
     assert extra["token2wav_runtime_prompt_cache_size"] == 512
     assert "code2wav_encoder_graph_singleton_history_frames" not in extra
+
+
+def test_two_card_deploy_accepts_single_vocoder_stage_override(monkeypatch) -> None:
+    monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+    config = VllmOmniConfig.from_pipeline_config(
+        MINICPMO_4_5_PIPELINE,
+        user_deploy_config=load_deploy_config(get_deploy_config_path("minicpmo_4_5_npu_2card.yaml")),
+        cli_overrides={"stage_2_devices": "0", "stage_2_num_replicas": 1},
+    )
+    assert [(s.runtime_config.devices, s.runtime_config.num_replicas) for s in config.stage_configs] == [
+        ("1", 1),
+        ("1,0", 2),
+        ("0", 1),
+    ]
 
 
 @pytest.mark.parametrize("deploy_name", [_DEPLOY, "minicpmo_4_5_turn.yaml"])

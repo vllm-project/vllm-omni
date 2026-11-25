@@ -1,8 +1,0 @@
-base_config: minicpmo_4_5_2gpu.yaml
-
-platforms:
-  npu:
-    stages:
-    - stage_id: 2
-      devices: '0'
-      num_replicas: 1

@@ -65,6 +65,7 @@ def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
     # Row-local snapshots replace the previous append's value, including when
     # audio follows text on the same resumable scheduler request.
     outputs["duplex_text_input"] = [info.get("text_input") is True for info in duplex_rows]
+    outputs["duplex_explicit_reply"] = [info.get("duplex_explicit_reply") is True for info in duplex_rows]
     prompt_rows = []
     for duplex_info in duplex_rows:
         prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
@@ -75,9 +76,6 @@ def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
         prompt_rows.append(list(prompt_token_ids) if isinstance(prompt_token_ids, list) else None)
     if any(row is not None for row in prompt_rows):
         outputs["duplex_prompt_token_ids"] = prompt_rows
-        outputs["duplex_explicit_reply"] = [
-            torch.tensor([int(info.get("duplex_explicit_reply") is True)], dtype=torch.long) for info in duplex_rows
-        ]
 
     special_rows = [
         info if isinstance(info := duplex_info.get("special_token_ids"), dict) else {} for duplex_info in duplex_rows

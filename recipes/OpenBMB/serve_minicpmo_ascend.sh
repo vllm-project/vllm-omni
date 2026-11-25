@@ -12,7 +12,7 @@ mkdir -p "$runtime_dir"
 runtime_dir="$(cd "$runtime_dir" && pwd)"
 export PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}"
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1}"
-export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export MINICPMO_TALKER_STATIC_EXCLUDED_OP=ScatterPaKvCache
 export MINICPMO_NPU_DSPARK_NATIVE_GATHER=1 MINICPMO_NPU_KSTEP_SKIP_TERMINAL_TAIL=1
 export MINICPMO_NPU_THINKER_PREFILL_STARTUP="$runtime_dir/thinker-prefill-startup"
@@ -38,7 +38,8 @@ from vllm_omni.config.stage_config import resolve_deploy_yaml
 
 repo, runtime, model, draft = (Path(p).resolve() for p in sys.argv[1:5])
 deployment, seqs_arg = sys.argv[5:7]
-deploy_path = Path(deployment).resolve() if deployment else repo / "vllm_omni/deploy/minicpmo_4_5_2gpu.yaml"
+default_deploy = repo / "vllm_omni/deploy/minicpmo_4_5_npu_2card.yaml"
+deploy_path = Path(deployment).resolve() if deployment else default_deploy
 seqs = int(seqs_arg) if seqs_arg else None
 if seqs is not None and seqs <= 0:
     raise ValueError("MAX_NUM_SEQS must be positive")
@@ -55,8 +56,18 @@ if seqs is not None:
 for stage in config["platforms"]["npu"]["stages"]:
     if seqs is not None:
         stage["max_num_seqs"] = seqs
-    spec = stage.get("speculative_config")
-    if stage["stage_id"] == 0 and spec and spec["method"] == "dspark":
+    thinker = stage["stage_id"] == 0
+    if deploy_path == default_deploy:
+        stage["model_subdir"] = "thinker-w8a8" if thinker else "original"
+    if thinker and deploy_path == default_deploy:
+        stage.setdefault("additional_config", {})["minicpmo_visual_a16_prefill"] = True
+        stage["speculative_config"] = {
+            "method": "dspark",
+            "model": str(draft),
+            "num_speculative_tokens": 7,
+            "draft_tensor_parallel_size": 1,
+        }
+    elif thinker and (spec := stage.get("speculative_config")) and spec["method"] == "dspark":
         spec["model"] = str(draft)
 (runtime / "deploy.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
 print(f"Rendered deployment: {runtime / 'deploy.yaml'}", flush=True)

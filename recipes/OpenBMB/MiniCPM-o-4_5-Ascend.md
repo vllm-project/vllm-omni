@@ -5,7 +5,7 @@ Talker replicas with K16, and two Code2Wav replicas with five-step FP32 CFM.
 All stages use MRv2. The shared KV layout is scoped to MiniCPM-o on Ascend and
 uses the stock vLLM-Ascend allocator.
 
-- [Two-card deployment template](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml)
+- [Two-card deployment template](../../vllm_omni/deploy/minicpmo_4_5_npu_2card.yaml)
 - [Launcher](serve_minicpmo_ascend.sh)
 - [Checkpoint manifest](minicpmo_ascend_checkpoint_manifest.json)
 
@@ -99,15 +99,22 @@ export PROFILING_MODE=dynamic TASK_QUEUE_ENABLE=1
 bash recipes/OpenBMB/serve_minicpmo_ascend.sh
 ```
 
-The launcher renders `minicpmo_4_5_2gpu.yaml` with the local draft checkpoint.
+The launcher renders `minicpmo_4_5_npu_2card.yaml` with the prepared W8A8
+Thinker and local DSpark checkpoint. Using the YAML directly with the original
+checkpoint selects the shared Ngram settings.
 It creates mode files in a per-service temporary directory. Set `RUNTIME_DIR`
 to a unique path to keep the rendered deployment and mode files.
 
 Thinker and Talker allow 16 sequences per worker, and Code2Wav allows 32. The
 Talker splits new requests evenly. Code2Wav routes by weighted active and
 reserved work, with CFM micro-batches of eight and four. Each request keeps
-its replica for subsequent chunks. To run a single Code2Wav replica, set
-`DEPLOY_CONFIG` to `vllm_omni/deploy/minicpmo_4_5_2gpu_throughput.yaml`.
+its replica for subsequent chunks. To keep a single Code2Wav replica on the
+first visible card, override that stage's placement at launch.
+
+```bash
+bash recipes/OpenBMB/serve_minicpmo_ascend.sh \
+  --stage-overrides '{"2":{"devices":"0","num_replicas":1}}'
+```
 
 Startup graph capture can take several minutes. Wait for `/health` before
 sending requests. The launcher qualifies common short prefill shapes ahead

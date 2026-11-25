@@ -1,18 +1,62 @@
-# Thinker and Talker share the first NPU. Code2Wav uses the second.
+# One Thinker and two replicas each for Talker and Code2Wav.
 base_config: minicpmo_4_5.yaml
-pipeline: minicpmo_4_5
 
-stages:
-  - stage_id: 0
-    devices: "0"
-  - stage_id: 1
-    devices: "0"
-  - stage_id: 2
-    devices: "1"
-
-connectors:
-  connector_of_shared_memory:
-    extra:
-      # The fused top-k/top-p codec sampling tail measured slower than the
-      # eager pair on 910B; keep the eager chain.
-      talker_codec_fused_tail: false
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        devices: "1"
+        max_num_seqs: 16
+        max_model_len: 40960
+        kv_cache_memory_bytes: 17179869184  # 16 GiB
+        hf_overrides:
+          rope_parameters:
+            rope_type: yarn
+            rope_theta: 1000000.0
+            factor: 4.0
+            original_max_position_embeddings: 10240
+        # additional_config replaces the inherited map.
+        additional_config:
+          encoder_enable_npu_graph: true
+          encoder_max_npu_graphs: 4
+          minicpmo_long_prefill_eager: true
+          minicpmo_request_rope: true
+          minicpmo_resampler_max_frames: 16
+      - stage_id: 1
+        devices: "1,0"
+        num_replicas: 2
+        max_num_seqs: 16
+        additional_config:
+          minicpmo_talker_short_prefill_eager: true
+          minicpmo_talker_refill_coalesce: true
+          minicpmo_talker_wide_graph_capacity: 256
+      - stage_id: 2
+        devices: "0,1"
+        num_replicas: 2
+        max_num_seqs: 32
+        additional_config:
+          code2wav_enable_npu_graph: true
+          cfm_graph_batch_buckets: [1, 2, 4, 8]
+          code2wav_max_npu_graphs: 96
+        env:
+          MINICPMO_C8_SECONDARY_VOCODER_HOST_CACHE: "1"
+          MINICPMO_C8_SECONDARY_VOCODER_TIGHT_MEMORY: "1"
+    connectors:
+      connector_of_shared_memory:
+        extra:
+          cfm_max_graphs: 96
+          micro_batch_size: 8
+          secondary_vocoder_micro_batch_size: 4
+          whole_euler_pad_max_rows: 2
+          token2wav_runtime_prompt_cache_size: 512
+          token2wav_setup_host_cache_size: 512
+          token2wav_ref_cpu_prefetch_workers: 4
+          generation_max_regular_batch: 16
+          generation_min_batch_size: 4
+          generation_max_wait_ms: 25
+          cfm_drop_upstream_att_buffer: true
+          code2wav_encoder_padded_flow_history: 416
+          code2wav_encoder_padded_flow_continuations: true
+          minicpmo_code2wav_sync_primary: true
+          generation_first_chunk_express: true
+          generation_first_chunk_express_min_slack_s: 0.30
