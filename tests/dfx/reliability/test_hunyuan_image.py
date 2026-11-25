@@ -194,7 +194,6 @@ def test_process_tree_crash_at_launch(launch_params) -> None:
 @launch_scenario_params(
     MODEL,
     ServeRootCrashAtLaunch,
-    skip_reason="Worker survives root crash during startup: https://github.com/vllm-project/vllm-omni/issues/10398",
 )
 def test_serve_root_crash_at_launch(launch_params) -> None:
     """SIGKILL only root before readiness, after a diffusion worker appears.

@@ -62,6 +62,12 @@ from vllm_omni.clients.utils import (
     summarize_stage_metrics,
 )
 
+#: Errors about one tool call. The session carries on, so a consumer waiting on
+#: the response path must not fail; they stay visible through ``events()``.
+_TOOL_CALL_ERROR_CODES = frozenset(
+    {"tool_result_timeout", "invalid_function_call_output", "invalid_function_call_cancel"}
+)
+
 __all__ = [
     "DUPLEX_FIRST_UNIT_MS",
     "DUPLEX_UNIT_MS",
@@ -773,6 +779,16 @@ class DuplexClientBase(ABC):
 
     # -- input ----------------------------------------------------------------
 
+    async def append_text(self, text: str, *, force_listen: bool = False) -> None:
+        """Prefill a text fragment; force listening while more input is arriving.
+
+        Requires ``text`` in the session's input modalities. Like audio units,
+        fragments may elicit a model-native response before the next append.
+        """
+        if not text:
+            raise ValueError("append_text requires non-empty text")
+        await self.send({"type": "input.text.append", "text": text, "force_listen": force_listen})
+
     async def append_audio(
         self,
         pcm: bytes,
@@ -903,6 +919,21 @@ class DuplexClientBase(ABC):
 
     async def clear_input(self) -> None:
         await self.send({"type": "input_audio_buffer.clear"})
+
+    # -- tool calls -------------------------------------------------------------
+
+    async def send_function_call_output(self, call_id: str, output: str) -> None:
+        """Return one function call's result to the model."""
+        await self.send(
+            {
+                "type": "conversation.item.create",
+                "item": {"type": "function_call_output", "call_id": call_id, "output": output},
+            }
+        )
+
+    async def cancel_function_call(self, call_id: str, reason: str = "cancelled") -> None:
+        """End one pending function call; ``reason="failed"`` reports a failed tool."""
+        await self.send({"type": "function_call.cancel", "call_id": call_id, "reason": reason})
 
     # -- playback contract ------------------------------------------------------
 
@@ -1084,7 +1115,7 @@ class DuplexClientBase(ABC):
             item = await asyncio.wait_for(queue.get(), remaining)
             if isinstance(item, _ClosedMarker):
                 raise DuplexSessionClosedError(item.reason)
-            if isinstance(item, ErrorEvent) and item.type not in types:
+            if isinstance(item, ErrorEvent) and item.type not in types and item.code not in _TOOL_CALL_ERROR_CODES:
                 raise item.to_exception()
             if item.type in types:
                 return item
@@ -1163,7 +1194,8 @@ class DuplexClientBase(ABC):
             # A rejected request produces no response; surface the rejection
             # on the response path too so a consumer waiting in responses()
             # is not left waiting forever (see the responses() docstring).
-            _put_drop_oldest(self._response_queue, _ErrorMarker(event))
+            if event.code not in _TOOL_CALL_ERROR_CODES:
+                _put_drop_oldest(self._response_queue, _ErrorMarker(event))
             # Keep the text for the close that usually follows: a client that
             # is streaming input is inside send(), not draining responses(),
             # and would otherwise only ever see "closed".
@@ -1771,7 +1803,7 @@ class EventCollector:
             if isinstance(stage_metrics, dict):
                 for stage_id, stage_snapshot in stage_metrics.items():
                     if isinstance(stage_snapshot, dict):
-                        observed_stage_metrics[str(stage_id)] = stage_snapshot
+                        observed_stage_metrics[str(stage_id)] = dict(stage_snapshot)
 
             event_request_metrics = _event_response_request_metrics(event)
             if event_request_metrics is not None:
@@ -1791,6 +1823,8 @@ class EventCollector:
         result: dict[str, object] = {}
         stage0_metrics = observed_stage_metrics.get("0")
         if observed_stage_metrics:
+            # Preserve raw cumulative snapshots for the shared benchmark aggregator.
+            result["stage_metrics"] = observed_stage_metrics
             stages = {
                 stage_id: _stage_engine_metrics_block(stage_snapshot)
                 for stage_id, stage_snapshot in sorted(

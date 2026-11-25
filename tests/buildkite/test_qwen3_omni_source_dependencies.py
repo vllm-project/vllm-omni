@@ -49,7 +49,7 @@ def nightly(request):
                 families[family].add(step["label"])
     assert families["accuracy"]
     assert families["perf"]
-    assert bool(families["duplex_perf"]) == (platform == "cuda")
+    assert bool(families["duplex_perf"]) == (platform in {"cuda", "npu"})
     return platform, path, doc, families
 
 
@@ -70,8 +70,6 @@ def _selected(nightly, changed_files):
         "vllm_omni/engine/stage_engine_core_proc.py",
         "vllm_omni/distributed/omni_connectors/connectors/shm_connector.py",
         "vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py",
-        # NPU inherits this runner despite its GPU name.
-        "vllm_omni/worker/gpu_model_runner.py",
         "vllm_omni/worker/sampling_utils.py",
         "vllm_omni/worker/runner_assisted_metadata.py",
         "vllm_omni/engine/serialization.py",
@@ -109,17 +107,24 @@ def test_shared_changes_keep_accuracy_and_perf(nightly, changed_file):
 
 
 @pytest.mark.parametrize(
+    "changed_file",
+    ["vllm_omni/worker_v2/omni_model_runner.py", "vllm_omni/core/prefix_cache/manager.py"],
+)
+def test_v2_runtime_selects_relevant_jobs(nightly, changed_file):
+    platform, _, _, families = nightly
+    qwen_labels = set().union(*families.values())
+    expected = {"cuda": qwen_labels, "npu": families["duplex_perf"], "rocm": set()}
+    assert _selected(nightly, [changed_file, MINICPM]) & qwen_labels == expected[platform]
+
+
+@pytest.mark.parametrize(
     "changed_file,platforms",
     [
-        ("vllm_omni/worker/gpu_ar_model_runner.py", {"cuda", "rocm"}),
-        ("vllm_omni/worker_v2/omni_model_runner.py", {"cuda"}),
-        ("vllm_omni/core/prefix_cache/manager.py", {"cuda"}),
         ("vllm_omni/platforms/cuda/platform.py", {"cuda"}),
         ("docker/Dockerfile.ci", {"cuda"}),
         ("requirements/cuda.txt", {"cuda"}),
         (".buildkite/cuda/scripts/build-ci-image.sh", {"cuda"}),
         (".buildkite/cuda/test-nightly.yml", {"cuda"}),
-        ("vllm_omni/platforms/npu/worker/npu_ar_model_runner.py", {"npu"}),
         ("vllm_omni/platforms/npu/attention/static_shape_decode.py", {"npu"}),
         ("vllm_omni/platforms/npu/platform.py", {"npu"}),
         ("docker/Dockerfile.npu.ci", {"npu"}),

@@ -17,6 +17,7 @@ from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
 
 import vllm_omni.diffusion.offloader.distributed_layerwise_backend as dist_backend_module
+import vllm_omni.diffusion.offloader.tensor_utils as tensor_utils_module
 from tests.diffusion.offloader.helpers import (
     DummyStream,
     _PlainEncoder,
@@ -33,6 +34,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 )
 from vllm_omni.diffusion.offloader import plan_resolver
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+from vllm_omni.diffusion.offloader.chunked_transport import build_part_manifest, pack_local_shard
 from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
     DistributedLayerwiseOffloadHook,
@@ -71,6 +73,128 @@ class TinyBlock(nn.Module):
 
 def _make_values(start: float) -> torch.Tensor:
     return torch.arange(start, start + 4, dtype=torch.float32)
+
+
+def _install_flat_shards(hook: DistributedLayerwiseOffloadHook, source_block: nn.Module) -> None:
+    """Replace chunk-packed shards with the legacy flat-shard layout."""
+    params = dict(source_block.named_parameters())
+    bufs = dict(source_block.named_buffers())
+    hook.cpu_shards, hook.metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
+        params,
+        bufs,
+        hook.dp_size,
+        hook.rank,
+        hook.pin_memory,
+        hook.tensor_transforms,
+    )
+    hook.manifest = None
+    hook._ag_output_sizes = {dtype: sum(meta["numel"] for meta in metas) for dtype, metas in hook.metadata.items()}
+    hook._cached_repoint = tuple(
+        (
+            hook.next_block_parameters[m["name"]]
+            if m["name"] in hook.next_block_parameters
+            else hook.next_block_buffers[m["name"]],
+            dtype,
+            m["offset"],
+            m["numel"],
+            m["shape"],
+            m["stride"],
+        )
+        for dtype, metas in hook.metadata.items()
+        for m in metas
+    )
+
+
+@pytest.fixture
+def fail_packed_fp4_zeros(monkeypatch):
+    real_zeros = torch.zeros
+
+    def guarded_zeros(*args, **kwargs):
+        if kwargs.get("dtype") == torch.float4_e2m1fn_x2:
+            raise NotImplementedError('"fill_cpu" not implemented for Float4_e2m1fn_x2')
+        return real_zeros(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", guarded_zeros)
+
+
+@pytest.fixture
+def fail_packed_fp4_zero_(monkeypatch):
+    real_zero_ = torch.Tensor.zero_
+
+    def guarded_zero_(self, *args, **kwargs):
+        if self.dtype == torch.float4_e2m1fn_x2:
+            raise NotImplementedError('"fill_cpu" not implemented for Float4_e2m1fn_x2')
+        return real_zero_(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "zero_", guarded_zero_)
+
+
+class TestPackedMxfp4Storage:
+    def test_zeros_for_storage_uses_byte_backing_for_packed_fp4(self, fail_packed_fp4_zeros):
+        tensor = tensor_utils_module.zeros_for_storage(8, torch.float4_e2m1fn_x2)
+        assert tensor.dtype == torch.float4_e2m1fn_x2
+        assert tensor.view(torch.uint8).tolist() == [0] * 8
+
+    def test_zero_tensor_storage_uses_byte_view_for_packed_fp4(self, fail_packed_fp4_zero_):
+        tensor = torch.arange(8, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        tensor_utils_module.zero_tensor_storage(tensor)
+        assert tensor.view(torch.uint8).tolist() == [0] * 8
+
+    def test_flatten_physical_storage_uses_byte_backing_for_packed_fp4(self, fail_packed_fp4_zeros):
+        backing = torch.arange(12, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        tensor = backing.view(3, 4).t()
+        flattened = tensor_utils_module.flatten_physical_storage(tensor)
+        assert flattened.view(torch.uint8).tolist() == list(range(12))
+
+    def test_shard_and_pin_allocates_packed_fp4_without_fill(self, fail_packed_fp4_zeros):
+        block = nn.Module()
+        block.weight = nn.Parameter(
+            torch.arange(12, dtype=torch.uint8).view(torch.float4_e2m1fn_x2),
+            requires_grad=False,
+        )
+        shards, _ = DistributedLayerwiseOffloadHook._shard_and_pin(
+            dict(block.named_parameters()),
+            {},
+            dp_size=2,
+            rank=0,
+            pin_memory=False,
+        )
+        assert shards[torch.float4_e2m1fn_x2].view(torch.uint8).tolist() == list(range(6))
+
+    def test_pack_local_shard_zeroes_packed_fp4_without_fill(self, fail_packed_fp4_zero_):
+        tensor = torch.arange(7, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        specs = [("weight", tensor, False)]
+        manifest = build_part_manifest(
+            specs,
+            block_id=0,
+            part_id="block",
+            weight_shard_size=2,
+            weight_shard_rank=1,
+            chunk_size_bytes=8,
+            alignment_bytes=1,
+        )
+        shards = pack_local_shard(
+            specs,
+            manifest,
+            allocator=lambda numel, dtype: torch.empty(numel, dtype=torch.uint8).fill_(0xFF).view(dtype),
+        )
+        assert shards[torch.float4_e2m1fn_x2].view(torch.uint8).tolist() == [4, 5, 6, 0]
+
+    def test_all_gather_shard_byte_views_packed_fp4(self, monkeypatch):
+        local = torch.arange(4, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        output = torch.empty(8, dtype=torch.float4_e2m1fn_x2)
+        calls = []
+
+        def fake_allgather(output, input_tensor, *, group):
+            del group
+            calls.append((output.dtype, input_tensor.dtype))
+            output.view(torch.uint8)[:4].copy_(input_tensor.view(torch.uint8))
+            output.view(torch.uint8)[4:].copy_(torch.arange(4, 8, dtype=torch.uint8))
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
+        dist_backend_module._all_gather_shard(output, local, None)
+        assert calls == [(torch.uint8, torch.uint8)]
+        assert output.view(torch.uint8).tolist() == list(range(8))
 
 
 class TestDistributedLayerwiseOffloadHook:
@@ -430,10 +554,12 @@ class TestDistributedLayerwiseOffloadHook:
                 atol=0,
             )
 
+    @pytest.mark.parametrize("chunked", [True, False], ids=["manifest", "flat"])
     def test_allgather_reconstructs_online_mxfp8_weight_and_scale(
         self,
         patched_offload_runtime,
         monkeypatch,
+        chunked,
     ):
         """DLO must reconstruct finalized online-MXFP8 tensors byte-for-byte.
 
@@ -484,21 +610,49 @@ class TestDistributedLayerwiseOffloadHook:
 
         rank0_hook = make_hook(rank0_block, 0)
         rank1_hook = make_hook(rank1_block, 1)
+        rank0_flat_source = OnlineMxfp8Block()
+        rank1_flat_source = OnlineMxfp8Block()
         rank0_hook.initialize_hook(current_block)
         rank1_hook.initialize_hook(OnlineMxfp8Block())
+        if chunked:
+            # dp_size > 1 normally takes the chunk-manifest path.
+            assert rank0_hook.manifest is not None
+        else:
+            _install_flat_shards(rank0_hook, rank0_flat_source)
+            _install_flat_shards(rank1_hook, rank1_flat_source)
+            assert rank0_hook.manifest is None
         rank0_hook.gpu_shard_buffers = [
             {dtype: torch.empty_like(shard) for dtype, shard in rank0_hook.cpu_shards.items()} for _ in range(2)
         ]
 
+        source_dtypes = []
+        original_all_gather = dist_backend_module._all_gather_shard
+
+        def recording_all_gather(output, input_tensor, group):
+            # Record the dtype before the helper applies its uint8 byte view,
+            # so the fake can route to the correct rank-1 shard even when a
+            # block later carries a real uint8 dtype group.
+            source_dtypes.append(input_tensor.dtype)
+            original_all_gather(output, input_tensor, group)
+
+        monkeypatch.setattr(dist_backend_module, "_all_gather_shard", recording_all_gather)
+        collective_dtypes = []
+
         def fake_allgather(output, local_shard, *, group):
             del group
-            remote_shard = rank1_hook.cpu_shards[local_shard.dtype]
-            shard_size = local_shard.numel()
-            output[:shard_size].copy_(local_shard)
-            output[shard_size : 2 * shard_size].copy_(remote_shard)
+            collective_dtypes.append(local_shard.dtype)
+            local_bytes = local_shard.view(torch.uint8)
+            remote_bytes = rank1_hook.cpu_shards[source_dtypes.pop(0)].view(torch.uint8)
+            shard_size = local_bytes.numel()
+            output_bytes = output.view(torch.uint8)
+            output_bytes[:shard_size].copy_(local_bytes)
+            output_bytes[shard_size : 2 * shard_size].copy_(remote_bytes)
 
         monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
         rank0_hook.prefetch_layer(slot=0, non_blocking=False)
+
+        assert torch.uint8 in collective_dtypes
+        assert torch.float8_e8m0fnu not in collective_dtypes
 
         for name, tensor in rank0_block.named_parameters():
             assert tensor.stride() == expected_strides[name]

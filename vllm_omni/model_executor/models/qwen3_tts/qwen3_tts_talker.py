@@ -44,6 +44,7 @@ from .prompt_embeds_builder import (
     resolve_x_vector_only,
 )
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
+from .sampling_policy import get_mtp_sampling_overrides as resolve_mtp_sampling_overrides
 from .stream_decode import stream_ref_context_frames, talker_stream_decode_enabled
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Encoder
@@ -189,6 +190,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         from vllm_omni.platforms import current_omni_platform
+
+        # The NPU platform must finish initialization before patching the Talker.
+        if current_omni_platform.is_npu():
+            from vllm_omni.platforms.npu.models.qwen3_tts import apply_qwen3_tts_patches
+
+            apply_qwen3_tts_patches()
 
         if (
             current_omni_platform.is_npu()
@@ -400,7 +407,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             torch.zeros(1, int(self.talker_config.hidden_size), dtype=model_dtype),
             persistent=False,
         )
-        self._embedding_dtype = torch.bfloat16
+        self._embedding_dtype = model_dtype
 
         tokenizer_config = Qwen3TTSTokenizerV2Config.from_pretrained(
             self.model_path,
@@ -449,6 +456,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             speaker_cache=self._speaker_cache,
             ref_audio_artifact_cache_max_entries=_ref_audio_artifact_cache_capacity(vllm_config),
         )
+        self._prompt_builder._embedding_dtype = model_dtype
         self._load_custom_voice_profiles()
 
     # -------------------- custom voice profiles --------------------
@@ -1738,6 +1746,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     # such as the NPU 310P graph-safety override apply to both runners.
     mtp = talker_mtp
     get_mtp_seed = staticmethod(get_tts_local_seed)
+
+    def get_mtp_sampling_overrides(self, sampling_params: object) -> dict[str, bool | float | int] | None:
+        overrides = resolve_mtp_sampling_overrides(sampling_params)
+        if overrides is not None and "top_k" in overrides:
+            # Request top-k may exceed a checkpoint's residual vocabulary.
+            # Keeping all entries is equivalent to disabling that cutoff.
+            overrides["top_k"] = min(int(overrides["top_k"]), int(self.code_predictor.config.vocab_size))
+        return overrides
 
     # Postprocess only stores the last hidden for the deferred decode MTP.
     eager_frames_need_postprocess = False

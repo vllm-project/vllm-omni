@@ -204,6 +204,28 @@ class DiffusionKVRequest:
         self.skip_reading_prefix_cache = not hashes
 
     @property
+    def prefix_cache_hit_limit(self) -> int | None:
+        """Native v0.34 Request surface consumed by ``KVCacheManager``.
+
+        ``prefix_cache_lookup_enabled`` reads this on every cache-enabled
+        lookup. ``0`` keeps a request without cache identity out of the
+        lookup (the pre-0.34 ``skip_reading_prefix_cache`` gate); ``None``
+        mirrors upstream's unbounded default.
+        """
+
+        return 0 if self.skip_reading_prefix_cache else None
+
+    def get_max_cache_hit_length(self, bound: int | None = None) -> int:
+        """Longest prefix cache hit allowed, optionally tightened by bound.
+
+        Vendored from the pin's ``vllm/v1/request.py`` (``get_computed_blocks``
+        derives its default hit bound through this method).
+        """
+
+        limits = (self.num_tokens - 1, self.prefix_cache_hit_limit, bound)
+        return min(limit for limit in limits if limit is not None)
+
+    @property
     def seq_len(self) -> int:
         """Complete first-step sequence length and allocation boundary."""
 

@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.dit_fused import (
     blocks_forward_chunk_fused,
     supports_fused_body,
 )
@@ -15,6 +15,7 @@ from vllm_omni.platforms.npu.models.minicpmo_fused import (
     _causal_conv,
     blocks_forward_chunk_fused_npu,
     packed_conv_columns,
+    prepare_estimator,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -73,6 +74,8 @@ class _Estimator(nn.Module):
 
 
 def _run(body, estimator: nn.Module) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if body is blocks_forward_chunk_fused_npu:
+        prepare_estimator(estimator)
     torch.manual_seed(1)
     rows, frames, cached = 4, 6, 5
     attn = estimator.blocks[0].attn

@@ -20,7 +20,7 @@ import zmq
 from vllm.v1.engine.exceptions import EngineDeadError
 
 import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE
@@ -91,7 +91,7 @@ def _make_engine(num_gpus: int = 1):
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine.od_config = SimpleNamespace(streaming_output=False)
     sched = RequestScheduler()
-    sched.initialize(SimpleNamespace())
+    sched.initialize(OmniDiffusionConfig(diffusion_attention_schedule=None))
     engine.scheduler = sched
     engine.executor = executor
     engine._rpc_lock = threading.RLock()
@@ -320,6 +320,25 @@ class TestRequestModeDispatch:
         result = executor.execute_batch(scheduler_output)
 
         assert result == "dlo-dp"
+        executor.execute_request.assert_called_once_with(scheduler_output)
+        executor.collective_rpc.assert_not_called()
+
+    def test_hsdp_dp_routes_multiple_requests_without_pipeline_batching(self):
+        executor, _, _ = _make_executor(num_gpus=8)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=8,
+                hsdp_data_parallel=True,
+            ),
+        )
+        executor.execute_request = Mock(return_value="hsdp-dp")
+        executor.collective_rpc = Mock()
+        scheduler_output = _make_sched_output("A", "B")
+
+        result = executor.execute_batch(scheduler_output)
+
+        assert result == "hsdp-dp"
         executor.execute_request.assert_called_once_with(scheduler_output)
         executor.collective_rpc.assert_not_called()
 
@@ -1514,10 +1533,14 @@ class TestStageDiffusionClientErrorPropagation:
 
 
 class TestExecutorShutdownCleaner:
-    def test_worker_uses_hard_parent_death_signal(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("platform_name", "parent_pid", "current_parent_pid"),
+        [("linux", 321, 321), ("linux", 1, 1), ("linux", 321, 1), ("linux", 321, 123), ("darwin", 321, 1)],
+    )
+    def test_worker_uses_hard_parent_death_signal(self, monkeypatch, platform_name, parent_pid, current_parent_pid):
         import vllm_omni.plugins as omni_plugins
 
-        events = []
+        events: list[tuple[str, object]] = []
         worker_main = WorkerProc.worker_main
 
         class StopWorkerError(Exception):
@@ -1528,6 +1551,14 @@ class TestExecutorShutdownCleaner:
                 events.append(("worker", None))
                 raise StopWorkerError
 
+        def self_kill(pid, sig):
+            events.append(("self_kill", (pid, sig)))
+            raise SystemExit
+
+        monkeypatch.setattr(diffusion_worker_module.sys, "platform", platform_name)
+        monkeypatch.setattr(diffusion_worker_module.os, "getppid", lambda: current_parent_pid)
+        monkeypatch.setattr(diffusion_worker_module.os, "getpid", lambda: 654)
+        monkeypatch.setattr(diffusion_worker_module.os, "kill", self_kill)
         monkeypatch.setattr(diffusion_worker_module, "configure_logging", lambda _: events.append(("logging", None)))
         monkeypatch.setattr(
             diffusion_worker_module.signal,
@@ -1552,7 +1583,8 @@ class TestExecutorShutdownCleaner:
         monkeypatch.setattr(omni_plugins, "load_omni_general_plugins", lambda: events.append(("plugins", None)))
         monkeypatch.setattr(diffusion_worker_module, "WorkerProc", FakeWorkerProc)
 
-        with pytest.raises(StopWorkerError):
+        parent_lost = platform_name == "linux" and parent_pid != current_parent_pid
+        with pytest.raises(SystemExit if parent_lost else StopWorkerError):
             worker_main(
                 rank=0,
                 od_config=SimpleNamespace(
@@ -1566,13 +1598,18 @@ class TestExecutorShutdownCleaner:
                 pipe_writer=Mock(),
                 broadcast_handle=None,
                 wake_event=Mock(),
+                parent_pid=parent_pid,
             )
 
+        if parent_lost:
+            assert events == [("death_signal", signal.SIGKILL), ("self_kill", (654, signal.SIGKILL))]
+            return
+
         assert events == [
+            ("death_signal", signal.SIGKILL),
             ("logging", None),
             ("handler", signal.SIGTERM),
             ("handler", signal.SIGINT),
-            ("death_signal", signal.SIGKILL),
             ("plugins", None),
             ("worker", None),
             ("destroy", None),

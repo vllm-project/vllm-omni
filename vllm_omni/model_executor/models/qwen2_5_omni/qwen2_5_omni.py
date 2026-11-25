@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from __future__ import annotations
+
 import glob
 import os
 from collections.abc import Iterable
 from functools import cached_property
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -28,8 +31,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
@@ -45,6 +46,9 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 # `get_llm_pos_ids_for_vision` was removed from upstream vLLM (commit
 # 0cf49a5d15); vllm-omni keeps an identical copy as a static method on
@@ -111,6 +115,8 @@ class Qwen2_5OmniForConditionalGeneration(
         # else-branch below, so an unset stage would otherwise build no submodule
         # at all and fail later at self.thinker.
         self.model_stage = getattr(vllm_config.model_config, "model_stage", None) or "thinker"
+        # AR forwards return tensors; only Code2Wav returns OmniOutput.
+        self.mrv2_forward_returns_tensor = self.model_stage in ("thinker", "talker")
         if self.model_stage == "thinker":
             # Initialize thinker model (multimodal processing)
             self.thinker = init_vllm_registered_model(
@@ -232,6 +238,8 @@ class Qwen2_5OmniForConditionalGeneration(
 
     @cached_property
     def sampler(self):
+        from vllm.v1.sample.sampler import Sampler
+
         if hasattr(self.model, "sampler"):
             return self.model.sampler
         return Sampler()
@@ -348,11 +356,8 @@ class Qwen2_5OmniForConditionalGeneration(
             else:
                 text_hidden_states = thinker_output
 
-            # Text-only path
-            return OmniOutput(
-                text_hidden_states=(text_hidden_states.reshape(-1, text_hidden_states.shape[-1])),
-                multimodal_outputs=None,
-            )
+            # AR stages expose tensors to native CUDA graph capture/replay.
+            return text_hidden_states.reshape(-1, text_hidden_states.shape[-1])
 
         # 2) Talker (if codec not provided)
         if self.model_stage == "talker":
@@ -378,12 +383,14 @@ class Qwen2_5OmniForConditionalGeneration(
                 # which do not match with the talker model's word embedding size
                 sampling_metadata.prompt_token_ids[sampling_metadata.prompt_token_ids == 152064] = 8448
 
-            return OmniOutput(
-                text_hidden_states=talker_hidden,
-                multimodal_outputs=None,
-            )
+            return talker_hidden
 
         if self.model_stage == "code2wav":
+            # Non-async stage prompts contain only scheduling slots. The
+            # worker connector owns the actual codec ids and requested voice.
+            buffers = kwargs.get("model_intermediate_buffer") or ()
+            info = buffers[0] if buffers else None
+            codec_ids = info.get("codes", {}).get("audio") if isinstance(info, dict) else None
             code = (
                 input_ids
                 if input_ids is not None
@@ -393,6 +400,8 @@ class Qwen2_5OmniForConditionalGeneration(
                     device=inputs_embeds.device,
                 )
             )
+            if codec_ids is not None:
+                code = torch.as_tensor(codec_ids, dtype=torch.long, device=code.device).reshape(-1)
 
             if code.numel() and code[-1] == TALKER_CODEC_EOS_TOKEN_ID:
                 code = code[:-1]
@@ -400,8 +409,6 @@ class Qwen2_5OmniForConditionalGeneration(
                 code = code[1:]
 
             # Code2Wav decodes one request per forward (its deploy uses max_num_seqs=1).
-            buffers = kwargs.get("model_intermediate_buffer") or ()
-            info = buffers[0] if buffers else None
             speaker = resolve_speaker(info.get("speaker") if isinstance(info, dict) else None)
             audio_tensor = self.generate_audio(code, speaker) if code.numel() else torch.zeros(0, device=code.device)
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})
@@ -431,9 +438,9 @@ class Qwen2_5OmniForConditionalGeneration(
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec] | None = None,
         *,
-        hf_config: PretrainedConfig,
-        image_grid_thw: list[list[int]] | torch.Tensor,
-        video_grid_thw: list[list[int]] | torch.Tensor,
+        hf_config: PretrainedConfig | None = None,
+        image_grid_thw: list[list[int]] | torch.Tensor | None = None,
+        video_grid_thw: list[list[int]] | torch.Tensor | None = None,
         second_per_grid_ts: list[float] | None = None,
         context_len: int = 0,
         seq_len: int | None = None,
@@ -456,6 +463,15 @@ class Qwen2_5OmniForConditionalGeneration(
             |vision chunk 1|audio chunk 1|vision chunk 2|audio chunk 2 |...
         """
 
+        # Native MRoPE callers pass features directly. Keep the extended
+        # config/grid form below for the existing AuK position caller.
+        if hf_config is None:
+            if self.thinker is not None:
+                return self.thinker.get_mrope_input_positions(input_tokens, mm_features or [])
+            length = len(input_tokens)
+            return torch.arange(length, dtype=torch.long).expand(3, -1), 0
+
+        assert image_grid_thw is not None and video_grid_thw is not None
         # TODO(fyabc): refactor and share more code with
         #  _vl_get_input_positions_tensor.
 

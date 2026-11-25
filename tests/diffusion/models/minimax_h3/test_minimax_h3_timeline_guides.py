@@ -189,7 +189,13 @@ def _guide_pipeline():
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace()
+    pipeline.od_config = SimpleNamespace(
+        cache_backend="none",
+        additional_config={},
+        step_execution=False,
+        controlnet_model_path=None,
+        diffusion_attention_schedule=None,
+    )
     pipeline._base_schedule_by_partition = {"t2va": None, "fl2va": None, "ref2va": None}
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
@@ -197,8 +203,7 @@ def _guide_pipeline():
     pipeline._quality_policy.resolve.return_value = SimpleNamespace(cache_dit=None)
     pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda spec: None)
     pipeline._turbo_lora_specs = {}
-    pipeline._native_distilled_lora_adapter_ids = set()
-    pipeline._lora_sigma_schedules = {}
+    pipeline._native_lora_specs = {}
     return pipeline
 
 
@@ -275,27 +280,38 @@ def test_unguided_context_is_unchanged():
     assert context["visual_condition_shapes"] == [(1, 4, 2)]
 
 
-def test_fast_omni_rejects_timeline_guides():
-    from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import FastH3OmniCheckpointSpec
+def _fast_guided_request(spec):
     from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 
     pipeline = _guide_pipeline()
-    pipeline._fasth3_checkpoint = FastH3OmniCheckpointSpec()
-    pipeline._base_schedule_by_partition["ref2va"] = DMD2SigmaSchedule.from_metadata(
-        pipeline._fasth3_checkpoint.release_metadata()
-    )
+    pipeline._fasth3_checkpoint = spec
+    pipeline._base_schedule_by_partition["ref2va"] = DMD2SigmaSchedule.from_metadata(spec.release_metadata())
     media = _media(
         task="ref2va",
         timeline_guides=_prepare(
             [{"frame_index": 7, "image": _two_tone(96, 64)}, {"frame_index": -1, "image": _two_tone(96, 64)}]
         ),
     )
-    conditioning = _conditioning(media)
     sampling = _sampling()
     sampling.num_inference_steps = 8
     sampling.guidance_scale = 1.0
     sampling.guidance_scale_2 = 1.0
-    with pytest.raises(OmniClientError, match="timeline guides require base H3 weights, not FastH3"):
+    return pipeline, _conditioning(media), sampling
+
+
+def test_fast_omni_accepts_timeline_guides_on_its_pinned_schedule():
+    from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import FastH3OmniCheckpointSpec
+
+    pipeline, conditioning, sampling = _fast_guided_request(FastH3OmniCheckpointSpec())
+    context = pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
+    assert [block["kind"] for block in context["guide_blocks"]] == ["image", "image"]
+
+
+def test_fast_v2_still_rejects_timeline_guides():
+    from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import FastH3CheckpointSpec
+
+    pipeline, conditioning, sampling = _fast_guided_request(FastH3CheckpointSpec())
+    with pytest.raises(OmniClientError, match="timeline guides require base H3 weights or FastH3 Omni"):
         pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
 
 
