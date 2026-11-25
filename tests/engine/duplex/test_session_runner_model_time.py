@@ -97,7 +97,7 @@ INPUT_CLOCK = {"clock": "input"}
 
 @pytest.fixture
 def input_clock_model(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No model opts into the input clock in this change: let the harness model stand in for one that has."""
+    """The harness model (MiniCPM-o 4.5) opts in; kept explicit so these tests do not depend on it."""
     monkeypatch.setattr(MiniCPMO45DuplexPlugin, "supports_input_clock", True)
 
 
@@ -1484,8 +1484,9 @@ async def test_without_the_clock_nothing_changes(monkeypatch: pytest.MonkeyPatch
 # ---- capability, mode lock and idle window -----------------------------------
 
 
-async def test_a_model_that_has_not_opted_in_refuses_an_input_clocked_session() -> None:
-    assert MiniCPMO45DuplexPlugin.supports_input_clock is False
+async def test_a_model_that_has_not_opted_in_refuses_an_input_clocked_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The harness model opts in; stand it in for one that has not.
+    monkeypatch.setattr(MiniCPMO45DuplexPlugin, "supports_input_clock", False)
     limits = DuplexSessionRuntimeConfig()
     results: asyncio.Queue[object] = asyncio.Queue()
     manager = DuplexSessionManager(
@@ -1817,6 +1818,39 @@ async def test_a_cancel_between_the_responses_end_and_the_deferred_turns_promoti
         assert [a.input_index for a in acks] == [2, 3, 4]
         assert _units(acks[2]) == [("cancelled", "output_audio_buffer_clear")]
         assert len(h.port.submissions) == 1, "the released turn is not submitted behind its cancelled acknowledgement"
+        assert h.runner.model_state.committed_audio_payload is not None, "its audio is kept for the next input"
+
+        events = await h.run(commands.CreateResponse())
+        assert len(h.port.submissions) == 2 and _acks(events) == []
+        (ack,) = _acks(await _deliver_listen(h, h.port.submissions[-1].context.request_id))
+        assert (ack.input_index, ack.trigger, _units(ack)) == (5, "response.create", [("listen", None)])
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_cancel_after_a_deferred_turn_timed_out_does_not_submit_it() -> None:
+    """A deferred turn whose slot already timed out must still be blocked from promotion after a cancel."""
+    h, now = await _open_with_fake_time(auto_response=False, extra_body=INPUT_CLOCK)
+    h.session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
+    try:
+        request_id = await _defer_a_commit_behind_the_active_response(h)
+        now[0] += DEFAULT_UNIT_TIMEOUT_S
+        assert [a.input_index for a in _acks(await _check_timeouts(h))] == [2, 3]
+        now[0] += DEFAULT_UNIT_TIMEOUT_S
+        (ack,) = _acks(await _check_timeouts(h))
+        assert ack.input_index == 4 and _units(ack) == [("timed_out", "no_progress")]
+
+        h.deliver(
+            tts_output(request_id, samples=24000, text="hello", tts_is_last_chunk=True, finished=True),
+            segment_finished=True,
+        )
+        h.submit(commands.ClearOutputAudio())
+        events = await h.settle()
+
+        assert "response.done" in types(events)
+        assert _acks(events) == [], "already acknowledged on timeout: cancel emits no duplicate acknowledgement"
+        assert len(h.port.submissions) == 1, "the cancelled deferred turn is not promoted after timeout"
         assert h.runner.model_state.committed_audio_payload is not None, "its audio is kept for the next input"
 
         events = await h.run(commands.CreateResponse())

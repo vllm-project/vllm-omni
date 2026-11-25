@@ -85,7 +85,12 @@ class Cosmos3MultiviewGenDecoderLayer(Cosmos3GenDecoderLayer):
         # buffers, preserving the caller's input and the normal autograd path.
         if not torch.is_grad_enabled() and output.dtype == residual.dtype:
             return output.add_(residual)
-        return super()._add_residual(output, residual)
+        return residual + output
+
+    def _forward_post_attention(self, attn_out: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        # Keep normalization chunked with the MLP and retain its TP reduction.
+        hidden_states = self._add_residual(attn_out, residual)
+        return self._add_residual(self._forward_mlp(hidden_states), hidden_states)
 
     @torch.compiler.disable(recursive=False)
     def _forward_mlp_chunked(self, hidden_states: torch.Tensor, chunk_size: int) -> torch.Tensor:

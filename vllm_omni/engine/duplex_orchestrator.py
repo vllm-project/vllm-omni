@@ -294,6 +294,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         prompt = getattr(req_state, "prompt", None)
         info = prompt.get("additional_information") if isinstance(prompt, dict) else None
         item_id = info.get("realtime_item_id") if isinstance(info, dict) else None
+        duplex_bridge = req_state.streaming.bridge_states.get("duplex", {})
+        model_turn_id = duplex_bridge.get("model_turn_id") if isinstance(duplex_bridge, dict) else None
         context = DuplexOutputContext(
             identity=DuplexRequestIdentity(
                 session_id=req_state.session_id,
@@ -304,6 +306,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             segment_token_ids=tuple(segment.token_ids),
             segment_output_metadata=segment.output_metadata,
             perf_chunks=self._take_perf_chunks(req_state, stage_id),
+            model_turn_id=model_turn_id if stage_id == 0 and isinstance(model_turn_id, int) else None,
         )
         return runner.on_stage_output(
             stage_id,
@@ -311,6 +314,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             stage_metrics,
             request_id=request_id,
             context=context,
+            streaming_context=req_state.streaming,
             input_transcript=transcript,
             input_item_id=item_id if isinstance(item_id, str) else None,
         )
@@ -860,7 +864,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if (
             not submission.already_submitted
             and self.async_chunk
-            and context.stage_id == 0
+            and context.stage_id == request_state.entry_stage_id
+            and request_state.final_stage_id > context.stage_id
             and self.plugin.prewarms_downstream_stages(context.request_id)
         ):
             prewarmed = await self._prewarm_async_chunk_stages(context.request_id, request, request_state)

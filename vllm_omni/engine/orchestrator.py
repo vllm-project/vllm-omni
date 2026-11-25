@@ -43,7 +43,10 @@ from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
-from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
+from vllm_omni.core.sched.omni_scheduling_coordinator import (
+    uses_native_mrv2_data_plane,
+    uses_native_qwen3_omni_resumable,
+)
 from vllm_omni.data_entry_keys import (
     ASYNC_CHUNK_PREWARM_NS,
     FIRST_AUDIO_KEY,
@@ -231,6 +234,9 @@ def build_engine_core_request_from_tokens(
     wire_payload: dict[str, Any] | None = None
     if isinstance(raw_additional_information, dict):
         wire_payload = dict(raw_additional_information)
+        # Deferred image/video stays on the original prompt for the orchestrator;
+        # keep it off the wire, where PIL images and video arrays cannot be serialized.
+        wire_payload.pop("deferred_multi_modal_data", None)
     additional_info_payload = serialize_additional_information(
         wire_payload,
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
@@ -3462,6 +3468,9 @@ class OrchestratorBase:
                 return
 
             final_stage_id = req_state.final_stage_id
+            # async-chunk may have prewarmed stages past this one; they will
+            # never receive input, so abort them instead of waiting for timeout.
+            prewarmed_downstream = any(stage > src_stage_id for stage in req_state.stage_submit_ts)
             final_pool = self.stage_pools[final_stage_id]
             final_output_type = getattr(final_pool.stage_client, "final_output_type", None)
             terminal_output = _build_terminal_empty_output(
@@ -3490,7 +3499,9 @@ class OrchestratorBase:
                     stage_submit_ts=submit_ts,
                 )
             )
-            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+            await self._cleanup_request_ids(
+                [req_id, *self._cfg_tracker.cleanup_parent(req_id)], abort=prewarmed_downstream
+            )
             return
 
         self._annotate_next_stage_inputs(src_stage_id, req_state, next_inputs)
@@ -3844,8 +3855,15 @@ class OrchestratorBase:
                         memo,
                     )
                     if "additional_information" in original_prompt:
+                        raw_additional_info = original_prompt["additional_information"]
+                        if isinstance(raw_additional_info, dict) and "deferred_multi_modal_data" in raw_additional_info:
+                            # Deferred visuals belong to the raw prompt for stage handoff,
+                            # not to prewarmed downstream wire placeholders.
+                            raw_additional_info = {
+                                k: v for k, v in raw_additional_info.items() if k != "deferred_multi_modal_data"
+                            }
                         base_input["additional_information"] = copy_request_snapshot(
-                            original_prompt["additional_information"],
+                            raw_additional_info,
                             memo,
                             shared_types=(torch.Tensor,),
                         )
@@ -4263,28 +4281,57 @@ class Orchestrator(OrchestratorBase):
             return
 
         if getattr(prompt, "resumable", False):
-            for active_stage_id in range(stage_id, min(final_stage_id, len(self.stage_pools) - 1) + 1):
-                vllm_config = getattr(self.stage_pools[active_stage_id], "stage_vllm_config", None)
-                model_config = getattr(vllm_config, "model_config", None)
-                hf_config = getattr(model_config, "hf_config", None)
-                spec_config = getattr(vllm_config, "speculative_config", None)
-                if (
-                    getattr(hf_config, "model_type", None) == "qwen3_omni_moe"
-                    and spec_config is not None
-                    and spec_config.use_dflash()
-                ):
+            active_configs = [
+                getattr(self.stage_pools[index], "stage_vllm_config", None)
+                for index in range(stage_id, min(final_stage_id + 1, len(self.stage_pools)))
+            ]
+            entry_spec_config = getattr(active_configs[0], "speculative_config", None)
+            native_resume = (
+                entry_spec_config is not None
+                and entry_spec_config.use_dflash()
+                and all(
+                    uses_native_qwen3_omni_resumable(getattr(config, "model_config", None))
+                    and not getattr(getattr(config, "scheduler_config", None), "async_scheduling", False)
+                    for config in active_configs
+                )
+            )
+            # Thinker-only requests have no cross-stage speech spans.
+            if final_stage_id > stage_id:
+                for active_stage_id in range(stage_id, min(final_stage_id, len(self.stage_pools) - 1) + 1):
+                    vllm_config = getattr(self.stage_pools[active_stage_id], "stage_vllm_config", None)
+                    model_config = getattr(vllm_config, "model_config", None)
+                    hf_config = getattr(model_config, "hf_config", None)
+                    spec_config = getattr(vllm_config, "speculative_config", None)
+                    if getattr(hf_config, "model_type", None) != "qwen3_omni_moe":
+                        continue
+                    if spec_config is None or not spec_config.use_dflash():
+                        continue
+                    if (
+                        self.async_chunk
+                        and active_stage_id == stage_id
+                        and (
+                            native_resume
+                            or not uses_native_mrv2_data_plane(
+                                model_config,
+                                use_v2_model_runner=bool(getattr(model_config, "use_v2_model_runner", False)),
+                            )
+                        )
+                        and not getattr(getattr(vllm_config, "scheduler_config", None), "async_scheduling", False)
+                        and not getattr(getattr(vllm_config, "cache_config", None), "enable_prefix_caching", False)
+                        and self._stage_receives_async_chunks(stage_id + 1)
+                    ):
+                        continue
                     cleanup_request_artifact_dirs(artifact_dirs)
                     await self._fail_request_client_error(
                         request_id,
                         stage_id,
                         f"streaming (resumable) input is not supported with Qwen3-Omni DFlash on stage "
-                        f"{active_stage_id}; disable DFlash for streaming input or use a non-resumable request",
+                        f"{active_stage_id} in this configuration; speech requires async_chunk, "
+                        "synchronous Thinker scheduling and disabled Thinker prefix caching",
                     )
                     return
             mrv2_stage_id = self._native_mrv2_receiver_stage(final_stage_id)
-            if mrv2_stage_id is not None:
-                # Streaming-input sessions replace downstream prompts through
-                # the V1 chunk adapter, which MRv2's native data plane lacks.
+            if mrv2_stage_id is not None and not native_resume:
                 cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(
                     request_id,

@@ -62,6 +62,7 @@ from vllm_omni.diffusion.forward_context import (
     get_ulysses_mode,
     is_forward_context_available,
 )
+from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION
 from vllm_omni.diffusion.mixfusion.packed_attention import (
     MIXFUSION_PLAN_KEY,
     run_mixfusion_packed_attention,
@@ -429,6 +430,11 @@ class ScheduleCandidate:
     spec: "AttentionSpec | None"
     impl: AttentionImpl
     backend_explicit: bool
+
+
+def _is_nvidia_cuda() -> bool:
+    """The copy-engine overlap drives the NVIDIA driver; ROCm tensors also report ``is_cuda``."""
+    return current_omni_platform.is_cuda() and torch.version.hip is None
 
 
 class Attention(nn.Module):
@@ -1222,6 +1228,54 @@ class Attention(nn.Module):
         # parallel strategy of this layer. Projections, norms and RoPE outside it stay compiled.
         return self._forward_impl(query, key, value, attn_metadata)
 
+    def _ulysses_ce_overlap_chunks(self, strategy, query, key, value, attn_metadata, use_paged_attention) -> int:
+        """Chunk count for the copy-engine overlapped strict-Ulysses path, or 0 when it does not apply."""
+        chunks = int(getattr(strategy, "ce_overlap_chunks", 0))
+        if chunks <= 0 or strategy.name != "ulysses" or use_paged_attention or self.use_ring:
+            return 0
+        if getattr(self, "_explicit_cross_contract", False) or not getattr(strategy, "_ulysses_a2a_permute", False):
+            return 0
+        if getattr(strategy, "_scatter_idx", None) != 2 or getattr(strategy, "_gather_idx", None) != 1:
+            return 0
+        sp_group = getattr(strategy, "_sp_group", None)
+        if sp_group is None or sp_group.ring_world_size != 1 or sp_group.ulysses_world_size <= 1:
+            return 0
+        if get_ulysses_mode(default="strict") != "strict" or not query.is_cuda or not _is_nvidia_cuda():
+            return 0
+        if query.dim() != 4 or query.shape[0] != 1 or key.shape != query.shape or value.shape != query.shape:
+            return 0
+        if any(x.dtype != query.dtype or x.stride(-1) != 1 or x.stride(-2) != x.shape[-1] for x in (query, key, value)):
+            return 0
+        if query.shape[2] % (sp_group.ulysses_world_size * chunks):
+            return 0
+        if attn_metadata is not None and (
+            attn_metadata.attn_mask is not None
+            or attn_metadata.joint_query is not None
+            or attn_metadata.joint_key is not None
+            or attn_metadata.joint_attn_mask is not None
+            or attn_metadata.cross_query_mask is not None
+            or attn_metadata.full_attn_spans is not None
+            or "gate_compress" in attn_metadata.extra
+            or "minimax_h3_reference_kv_post_parallel" in attn_metadata.extra
+            or REFERENCE_ISOLATION in attn_metadata.extra
+        ):
+            return 0
+        return chunks
+
+    @torch.compiler.disable
+    def _forward_ulysses_ce_overlap(self, strategy, query, key, value, attn_metadata, chunks: int) -> torch.Tensor:
+        from vllm_omni.diffusion.attention.parallel.ulysses_ce_overlap import run_ulysses_ce_overlap
+
+        attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+        return run_ulysses_ce_overlap(
+            strategy._ulysses_pg,
+            query,
+            key,
+            value,
+            lambda q, k, v: self._run_local_attention(q, k, v, attn_metadata),
+            chunks=chunks,
+        )
+
     def _forward_impl(
         self,
         query: torch.Tensor,
@@ -1270,6 +1324,20 @@ class Attention(nn.Module):
                 )
             if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
+
+        isolation = attn_metadata.extra.get(REFERENCE_ISOLATION) if attn_metadata is not None else None
+        isolated_dense = None
+        if isolation is not None:
+            # Check before collectives or cache capture; switching semantics
+            # midway through a request would invalidate the reference cache.
+            if use_paged_attention or self.use_ring or self.causal or strategy.name not in {"none", "ulysses"}:
+                raise ValueError("H3 reference isolation requires noncausal local/pure-Ulysses attention")
+            if not isinstance(isolation, tuple) or len(isolation) != 2:
+                raise TypeError("reference isolation metadata must be a (state, compact) tuple")
+            isolated_dense = self._reference_isolation_dense_impl()
+        chunks = self._ulysses_ce_overlap_chunks(strategy, query, key, value, attn_metadata, use_paged_attention)
+        if chunks:
+            return self._forward_ulysses_ce_overlap(strategy, query, key, value, attn_metadata, chunks)
 
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
@@ -1348,7 +1416,26 @@ class Attention(nn.Module):
             if self.use_ring and strategy is not self._no_parallel_strategy:
                 out = self._run_ring_attention(query, key, value, attn_metadata)
             else:
-                out = self._run_local_attention(query, key, value, attn_metadata)
+                if isolation is None:
+                    out = self._run_local_attention(query, key, value, attn_metadata)
+                else:
+                    state, compact = isolation
+                    assert isolated_dense is not None
+                    logger.info_once(
+                        "MiniMax-H3 isolation attention active: reference=dense_rr, dynamic=%s",
+                        self.attn_backend.get_name(),
+                    )
+                    out = state.attend(
+                        query,
+                        key,
+                        value,
+                        attn_metadata,
+                        compact=compact,
+                        dense_forward=isolated_dense.forward,
+                        dynamic_forward=(
+                            self.attention.forward if self.attn_backend.get_name() == "RAINFUSION_ATTN" else None
+                        ),
+                    )
 
         if paged_sp_padding:
             padding_start = paged_sp_padding_offset - paged_sp_padding
@@ -1496,6 +1583,16 @@ class Attention(nn.Module):
         """Return whether this layer will use Scheduler-managed paged KV."""
 
         return self.paged_kv_cache_role is not None and self._active_paged_kv_adapter() is not None
+
+    def _reference_isolation_dense_impl(self) -> AttentionImpl:
+        if self.qkv_layout != "BSND":
+            raise ValueError("H3 reference isolation requires BSND Q/K/V")
+        backend = self.attn_backend.get_name()
+        if backend in {"FLASH_ATTN", "SDPA"}:
+            return self.attention
+        if backend == "RAINFUSION_ATTN":
+            return self.attention.dense_fallback
+        raise ValueError(f"H3 reference isolation does not support backend {backend!r}")
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         if self._has_custom_attention:
