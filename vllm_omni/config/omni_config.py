@@ -1067,7 +1067,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     lora_path: str | list[str] | None = None
     lora_scale: float = 1.0
     lora_backend: str = "peft"
-    lora_application: Literal["runtime", "merged"] = "runtime"
+    lora_application: Literal["runtime", "merged", "startup-merge"] = "runtime"
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     diffusion_offload_config: dict[str, Any] | None = None
@@ -2250,15 +2250,24 @@ def _build_diffusion_stage_config(
         OmniStageDiffusionParallelConfig,
         model=model,
     )
-    common_kwargs["diffusion_config"] = _build_diffusion_config_projection(
+    model_config = common_kwargs["model_config"]
+    diffusion_config = _build_diffusion_config_projection(
         pipeline,
         deploy,
         topology,
         engine.diffusion,
-        model=common_kwargs["model_config"].model,
+        model=model_config.model,
         quantization_config=common_kwargs["quantization_config"],
         enable_prefix_caching=bool(common_kwargs["cache_config"].enable_prefix_caching),
     )
+    if topology.step_execution_default_steps is not None and (
+        diffusion_config.step_execution or diffusion_config.streaming_output
+    ):
+        model_config.default_sampling_params = {
+            "num_inference_steps": topology.step_execution_default_steps,
+            **(model_config.default_sampling_params or {}),
+        }
+    common_kwargs["diffusion_config"] = diffusion_config
     return cast(
         VllmOmniDiffusionStageConfig,
         _with_resolved_processors(

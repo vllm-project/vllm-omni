@@ -315,6 +315,18 @@ def test_fast_v2_still_rejects_timeline_guides():
         pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
 
 
+def test_timeline_guides_reject_active_startup_lora():
+    from vllm_omni.lora.request import LoRARequest
+
+    pipeline = _guide_pipeline()
+    pipeline.partition = "fl2va"
+    pipeline._fixed_startup_lora = (LoRARequest("startup", 1, "unused"), 1.0)
+    conditioning = _conditioning(_guide_media())
+
+    with pytest.raises(OmniClientError, match="timeline guides do not support active LoRA"):
+        pipeline._prepare_encoder_conditioning_inputs(conditioning, _sampling())
+
+
 def test_guides_are_rejected_across_a_separate_encoder_stage():
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
     from vllm_omni.model_executor.stage_input_processors.minimax_h3 import prepare_encoder_prompt

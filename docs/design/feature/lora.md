@@ -92,14 +92,55 @@ the [Diffusion LoRA guide](../../user_guide/diffusion/lora.md) for formats,
 supported pipelines and checkpoint name mapping
 ([#8001](https://github.com/vllm-project/vllm-omni/issues/8001)).
 
+### Fixed startup fusion
+
+`startup-merge` is a separate, opt-in MiniMax-H3 loading path. It resolves one
+PEFT/Turbo/FlashGen adapter, normalizes each original floating checkpoint
+matrix, accumulates its delta in FP32, and passes the result in the target parameter
+dtype (retaining FP32 target precision) to the
+existing TP/online-quantization loader. No quantized base is reconstructed.
+The NPU loader selects the layer's pending load device even while its weight
+is on meta. Adapted matrices and FP32 factors transfer to that device once;
+4096-row FP32 updates stay on the device for the original loader and quantizer.
+A combined finite check synchronizes only a scalar. Fusion temporarily disables
+HF32 and suspends any explicit reduced-precision cube policy, restoring the
+original precision settings before the loader processes the fused tensor.
+Unadapted slices of packed projections are copied to the same device before
+concatenation. CPU and other accelerator backends retain CPU fusion.
+All adapter targets must be consumed. Unsupported PEFT transformations, invalid
+shapes, non-finite values and serialized quantization tensors fail startup.
+Split H3 topologies route global startup options to the DiT stage. Request
+selection is fixed and the pipeline retains the adapter's task and sampler
+metadata.
+After the worker finishes loading, quantization, device placement and kernel
+selection, the pipeline alternates supported conditioning modes and precomputes
+whole timestep plans within the exact projection cache budget. The plan budget
+uses gathered output sizes, so tensor-parallel ranks take the same collectives. The initial fixed-adapter
+identity is recorded so request admission does not evict the startup results.
+Weight versions, exact embeddings and numerical settings retain the runtime
+cache's invalidation rules; disabling that cache also disables this warmup.
+
+The mode leaves the live module tree unwrapped and releases factors after the
+transformer loads. Request-mode DLO materializes the fused policy through the
+ordinary loader before constructing offload storage. Direct checkpoint mmap
+would read the unfused policy and is bypassed. The exact AdaLN cache populates
+during requests when weight offload, including independent AdaLN offload, is enabled.
+Model-level and standard layerwise offload may select the text encoder alone.
+The mode requires a single H3 checkpoint partition and excludes sleep, HSDP,
+weight transfer, and reusable host artifacts. Additional request adapters are
+rejected. The
+`runtime` default keeps its existing adapter-selection semantics.
+
+### Runtime adapter composition
+
 Runtime PEFT adapters may be composed into one rank-sum adapter. Before
 composition, the manager calls an optional pipeline
 `_validate_diffusion_lora_composition(lora_model=...)` hook for each source,
 immediately after loading or cache lookup. A pipeline may reject a source
 before another transient load prunes its metadata or any weights are composed.
 MiniMax-H3 uses this hook to reject FlashGen native stacks; those adapters also
-reject merged application during metadata loading because their sampling
-contract depends on runtime activation. See
+reject `merged` application during metadata loading because it cannot enforce
+their sampling contract. See
 [adapter-declared schedules](../../user_guide/diffusion/lora.md#minimax-h3-adapter-declared-schedules).
 
 ## Merged LoRA mode

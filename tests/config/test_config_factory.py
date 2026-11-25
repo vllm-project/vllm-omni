@@ -23,6 +23,7 @@ from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
+    SERVE_CLI_SCOPE_KEY,
     DeployConfig,
     PipelineConfig,
     StageConfig,
@@ -40,7 +41,7 @@ from vllm_omni.config.stage_config import (
     pipeline_cfg_resolver,
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.engine.arg_utils import SHARED_FIELDS, OmniEngineArgs, internal_blacklist_keys
+from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER, SHARED_FIELDS, OmniEngineArgs, internal_blacklist_keys
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -2003,7 +2004,7 @@ stages:
             assert sampling["num_inference_steps"] == 5
             assert sampling["extra_args"] == {"flow_shift": 6.0, "audio_flow_shift": 3.0}
         else:
-            assert sampling["num_inference_steps"] == 50
+            assert "num_inference_steps" not in sampling
 
         turbo = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated_turbo.yaml")))
         turbo_stages = merge_pipeline_deploy(pipeline, turbo)
@@ -2109,6 +2110,110 @@ stages:
         assert diffusion_args.parallel_config.ulysses_degree == 1
         assert diffusion_args.parallel_config.vae_patch_parallel_size == 4
         assert tuple(diffusion_args.stage_input_payload_keys) == ("encoder_output",)
+
+    @pytest.mark.parametrize("structured", [False, True])
+    @pytest.mark.parametrize("application", ["startup-merge", "runtime", "merged"])
+    def test_minimax_h3_decode_routes_only_fixed_startup_lora_to_dit(self, structured, application):
+        pipeline = OMNI_PIPELINES["minimax_h3_disaggregated_decode"]
+        flags = {
+            "lora_application": application,
+            "lora_backend": "peft",
+            "lora_path": "/global/adapter",
+            "lora_scale": 0.75,
+            "stage_1_lora_path": "/stage-1/adapter",
+            "stage_1_enable_distributed_layerwise_offload": False,
+        }
+        if structured:
+            config = VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides=flags)
+            dit = config.stage_by_id(1).diffusion_config
+            decoder = config.stage_by_id(2).diffusion_config
+        else:
+            stages, _ = StageConfigFactory._create_legacy_from_registry(pipeline, flags)
+            dit = stages[1].to_omegaconf().engine_args
+            decoder = stages[2].to_omegaconf().engine_args
+
+        assert dit.lora_application == application
+        assert dit.lora_backend == "peft"
+        assert dit.lora_path == "/stage-1/adapter"
+        assert dit.lora_scale == 0.75
+        if application == "startup-merge":
+            assert getattr(decoder, "lora_application", "runtime") == "runtime"
+            assert getattr(decoder, "lora_path", None) is None
+            assert getattr(decoder, "lora_scale", 1.0) == 1.0
+        else:
+            assert decoder.lora_application == application
+            assert decoder.lora_path == "/global/adapter"
+            assert decoder.lora_scale == 0.75
+
+    @pytest.mark.parametrize(
+        "deploy_name",
+        [
+            "minimax_h3_disaggregated.yaml",
+            "minimax_h3_disaggregated_decode.yaml",
+            "minimax_h3_disaggregated_16card_agkv2.yaml",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("step_execution", "streaming_output", "configured_steps", "expected_steps"),
+        [
+            (None, False, None, None),
+            (False, False, 4, 4),
+            (True, False, None, 50),
+            (True, False, 4, 4),
+            (None, True, None, 50),
+            (False, True, None, 50),
+            (None, True, 4, 4),
+        ],
+    )
+    def test_minimax_h3_split_dit_sampling_defaults(
+        self, deploy_name, step_execution, streaming_output, configured_steps, expected_steps
+    ):
+        deploy = load_deploy_config(get_deploy_config_path(deploy_name))
+        pipeline = OMNI_PIPELINES[deploy.pipeline]
+        dit = next(stage for stage in deploy.stages if stage.stage_id == 1)
+        if streaming_output:
+            dit.engine_extras["streaming_output"] = True
+        if configured_steps is not None:
+            dit.default_sampling_params = {"seed": 42, "num_inference_steps": configured_steps}
+        flags = {} if step_execution is None else {"stage_1_step_execution": step_execution}
+
+        legacy, _ = StageConfigFactory._create_legacy_from_registry(pipeline, flags, user_deploy_config=deploy)
+        legacy_dit = legacy[1].to_omegaconf()
+        structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy, cli_overrides=flags)
+        structured_dit = structured.stage_by_id(1)
+        legacy_defaults = legacy_dit.default_sampling_params
+        structured_defaults = structured_dit.model_config.default_sampling_params
+
+        assert legacy_dit.engine_args.get("streaming_output", False) is streaming_output
+        assert structured_dit.diffusion_config.streaming_output is streaming_output
+        assert legacy_defaults.get("num_inference_steps") == expected_steps
+        assert structured_defaults.get("num_inference_steps") == expected_steps
+        assert legacy_defaults["seed"] == structured_defaults["seed"] == 42
+
+    @pytest.mark.parametrize("stage_id", [0, 1, 2, pytest.param(FRONTEND_ONLY_ID_FILTER, id="none")])
+    def test_minimax_h3_startup_lora_requires_dit_stage_for_single_stage_serve(self, stage_id):
+        pipeline = OMNI_PIPELINES["minimax_h3_disaggregated_decode"]
+        flags = {
+            SERVE_CLI_SCOPE_KEY: True,
+            "stage_id": stage_id,
+            "lora_application": "startup-merge",
+            "lora_backend": "peft",
+            "lora_path": "/adapter",
+            "lora_scale": 0.75,
+        }
+        if stage_id != 1:
+            match = "--stage-id none" if stage_id == FRONTEND_ONLY_ID_FILTER else f"is not used by stage {stage_id}"
+            with pytest.raises(ValueError, match=match):
+                VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides=flags)
+            return
+        config = VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides=flags)
+        dit = config.stage_by_id(1).diffusion_config
+        assert (dit.lora_application, dit.lora_backend, dit.lora_path, dit.lora_scale) == (
+            "startup-merge",
+            "peft",
+            "/adapter",
+            0.75,
+        )
 
     def test_minimax_h3_text_encoder_tp_alias_targets_stage_zero(self):
         pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]

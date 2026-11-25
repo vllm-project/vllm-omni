@@ -18,6 +18,7 @@ _DECODER_PIPELINE = "vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_d
 MINIMAX_H3_PIPELINE = PipelineConfig(
     model_type="minimax_h3_disaggregated",
     default_deploy_config_name="minimax_h3_disaggregated.yaml",
+    startup_lora_stage_id=1,
     stage_cli_aliases={"text_encoder_tp_size": (0, "tensor_parallel_size")},
     model_arch="MiniMaxH3Encoder",
     stages=(
@@ -49,6 +50,7 @@ MINIMAX_H3_PIPELINE = PipelineConfig(
             final_output_type="video",
             requires_multimodal_data=False,
             model_arch="MiniMaxH3Pipeline",
+            step_execution_default_steps=50,
             custom_process_input_func=f"{_PROCESSOR}.encoder2diffusion",
             stage_input_payload_keys=("encoder_output",),
             omni_kv_config={"need_recv_cache": False},
@@ -59,11 +61,10 @@ MINIMAX_H3_PIPELINE = PipelineConfig(
 )
 
 
-MINIMAX_H3_DECODE_PIPELINE = PipelineConfig(
+MINIMAX_H3_DECODE_PIPELINE = replace(
+    MINIMAX_H3_PIPELINE,
     model_type="minimax_h3_disaggregated_decode",
     default_deploy_config_name="minimax_h3_disaggregated_decode.yaml",
-    stage_cli_aliases={"text_encoder_tp_size": (0, "tensor_parallel_size")},
-    model_arch="MiniMaxH3Encoder",
     stages=(
         replace(
             MINIMAX_H3_PIPELINE.stages[0],
