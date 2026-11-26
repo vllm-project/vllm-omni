@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """CPU parity tests for Lance's tensor-built 3-D mRoPE positions.
 
@@ -123,3 +123,22 @@ def test_prepare_video_latent_cfg_without_requests_is_empty():
     assert cfg["cfg_packed_position_ids"].shape == (3, 0)
     assert cfg["cfg_packed_position_ids"].dtype == torch.long
     assert cfg["cfg_packed_query_indexes"].numel() == 0
+
+
+@pytest.mark.parametrize("is_video", [False, True], ids=["image", "video"])
+def test_native_vae_prefill_matches_python_positions(is_video):
+    frames = 9 if is_video else 1
+    shape = (frames, 32, 48)
+    pixels = torch.zeros((3, *shape) if is_video else (3, *shape[1:]))
+    t_scale = lance_transformer.LANCE_TOKENS_PER_SECOND * lance_transformer.LANCE_SECONDS_PER_GRID if is_video else 1
+    expected = _reference_positions([shape], [111], t_scale)
+
+    out, new_kvlens, new_rope = LanceBagel._lance_native_prepare_vae_images(
+        _bagel_stub(), [5], [111], [pixels], lambda image: image, _NEW_TOKEN_IDS, is_video=is_video
+    )
+
+    latent_grid = _latent_grid(shape)
+    assert out["patchified_vae_latent_shapes"] == [latent_grid if is_video else latent_grid[1:]]
+    torch.testing.assert_close(out["packed_position_ids"], expected, rtol=0, atol=0)
+    assert new_kvlens == [5 + expected.shape[1]]
+    assert new_rope == [expected[0, -1].item() + 1]

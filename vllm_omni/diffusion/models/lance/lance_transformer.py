@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Lance transformer pieces.
 
 The Lance LLM is BAGEL's Qwen2-MoT transformer verbatim — the released
@@ -1326,9 +1326,8 @@ class LanceBagel(Bagel):
             # Upstream Lance places VAE-ref body at ``(P+1+t*t_scale, P+1+h, P+1+w)``
             # with the start marker at ``(P, P, P)`` and the end marker at
             # ``(P+max+1, ...)``; gen-latent tokens (noise) share the SAME
-            # rope range via the modality_map==1/2 trick, so this is the
-            # convention used by :meth:`_per_token_mrope_for_vae_latent` (2D)
-            # and :meth:`_per_token_mrope_for_video_latent` (3D) below.
+            # rope range via the modality_map==1/2 trick, matching the
+            # position layout of prepare_vae_latent and prepare_video_latent.
             # For video, ``t_scale = LANCE_TOKENS_PER_SECOND * LANCE_SECONDS_PER_GRID``
             # matches upstream Qwen2.5-VL's temporal-axis scaling; for still
             # images we leave the t-channel scalar (T=1 → ``ti=0`` anyway).
