@@ -577,6 +577,8 @@ AR_MERGED_LORA_REGISTRY: dict[str, MergedLoRARegistryEntry] = {
     "BreezeCode2Wav": _not_capable(_NON_LLM_STAGE),
     "BreezeForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "ChatterboxForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
+    "Confucius4TTSS2ADecoder": _not_capable(_NON_LLM_STAGE),
+    "Confucius4TTSTalkerForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "CosyVoice3Model": _not_capable(_PENDING_AR_MAPPING),
     "CovoAudioCode2WavModel": _not_capable(_NON_LLM_STAGE),
     "CovoAudioForCausalLM": _not_capable(_PENDING_AR_MAPPING),

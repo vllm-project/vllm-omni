@@ -108,6 +108,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     auk,
     breeze_tts_2,
     chatterbox,
+    confucius4_tts,
     cosyvoice3,
     covo_audio,
     fish_omni,
