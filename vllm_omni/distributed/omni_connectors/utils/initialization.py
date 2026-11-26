@@ -269,6 +269,7 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
 def load_omni_transfer_config(
     config_path: str | Path | None = None,
     config_dict: dict[str, Any] | None = None,
+    deployment_scope: str | None = None,
 ) -> OmniTransferConfig | None:
     """Load OmniTransferConfig from file or dict."""
     if config_path is None and config_dict is None:
@@ -441,9 +442,11 @@ def load_omni_transfer_config(
             f"{missing_str}. Define connectors or allow auto SHM creation for these edges."
         )
 
-    # Resolve once in the launcher; serialized connector extras carry the same
-    # namespace through EngineCore and multiprocess/TP workers.
-    wakeup_scope = uuid.uuid4().hex
+    # One scope per deployment. Head generates it and registration hands the
+    # same value to --headless; hashing each side's master address would
+    # split 127.0.0.1 from a hostname for the same endpoint. An explicit
+    # extra still wins. A caller with no scope keeps one UUID for this load.
+    wakeup_scope = deployment_scope or uuid.uuid4().hex
     for spec in connectors.values():
         if spec.name == "SharedMemoryConnector":
             spec.extra.setdefault("wakeup_scope", wakeup_scope)

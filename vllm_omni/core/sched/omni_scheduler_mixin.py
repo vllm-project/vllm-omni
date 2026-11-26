@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import os
 import queue
+import threading
 import time
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import replace
@@ -213,10 +214,14 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
 
     def _init_omni_connector_output_inbox(self) -> None:
         self._omni_connector_output_inbox: queue.SimpleQueue[OmniConnectorOutput] = queue.SimpleQueue()
+        self._omni_connector_inbox_lock = threading.Lock()
+        self._omni_connector_inbox_count = 0
 
     def enqueue_omni_connector_output(self, output: OmniConnectorOutput) -> None:
         """Accept a lightweight readiness event from the local runner thread."""
-        self._omni_connector_output_inbox.put(output)
+        with self._omni_connector_inbox_lock:
+            self._omni_connector_output_inbox.put(output)
+            self._omni_connector_inbox_count += 1
 
     # ------------------------------------------------------------------ #
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
@@ -288,6 +293,21 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         if not num_scheduled_tokens:
+            return
+        requests = getattr(self, "requests", {})
+        if any(
+            (request := requests.get(rid)) is not None
+            and request.num_computed_tokens < len(getattr(request, "prompt_token_ids", ()) or ())
+            for rid in spec_tokens
+        ):
+            # Upstream pads a resumed one-token prompt as if it were decode.
+            # Venus's speech flush appends only <audio_bos>; those extra draft
+            # rows have no condition embeddings. Drop drafts before booking
+            # the step, keeping all real prefill rows and single-frame peers.
+            for rid, drafts in spec_tokens.items():
+                num_scheduled_tokens[rid] -= len(drafts)
+            spec_tokens.clear()
+            scheduler_output.total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
             return
         dynamic_lookup = getattr(self, "dynamic_sd_lookup", None)
         vllm_config = getattr(self, "vllm_config", None)
@@ -584,7 +604,16 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         """Collect control messages in order, without changing request state."""
         connector_outputs: list[OmniConnectorOutput] = []
         inbox = getattr(self, "_omni_connector_output_inbox", None)
-        if inbox is not None:
+        lock = getattr(self, "_omni_connector_inbox_lock", None)
+        if inbox is not None and lock is not None:
+            with lock:
+                while True:
+                    try:
+                        connector_outputs.append(inbox.get_nowait())
+                    except queue.Empty:
+                        break
+                self._omni_connector_inbox_count = 0
+        elif inbox is not None:
             while True:
                 try:
                     connector_outputs.append(inbox.get_nowait())
@@ -599,6 +628,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
     def _consume_pending_connector_output(self, model_mode: str) -> None:
         """Drain input notifications into the coordinator on the scheduler thread."""
         connector_outputs = self._drain_omni_connector_outputs()
+        self._queue_permanent_send_failures(connector_outputs)
 
         # Attach returned payloads to held run outputs.
         awaiting = self._outputs_awaiting_stage_payload
@@ -709,6 +739,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
     def _process_pending_omni_inputs(self, model_mode: str) -> None:
         """Apply pending connector inputs, timeouts, and async chunks."""
         self._consume_pending_connector_output(model_mode)
+        self._process_permanent_send_failures()
         self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(
@@ -750,6 +781,59 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             )
         if self.input_coordinator:
             self.input_coordinator.restore_queues(_OmniWaitingQueue(self), self.running)
+
+    def _queue_permanent_send_failures(self, connector_outputs: list[OmniConnectorOutput]) -> None:
+        """Hold producer send give-ups until this scheduler step can emit them."""
+        if not connector_outputs:
+            return
+        queued = getattr(self, "_queued_permanent_send_failures", None)
+        if queued is None:
+            queued = {}
+            self._queued_permanent_send_failures = queued
+        for output in connector_outputs:
+            for req_id, failure in getattr(output, "permanent_send_failures", {}).items():
+                queued.setdefault(req_id, failure)
+            for req_id, failure in getattr(output, "permanent_recv_failures", {}).items():
+                queued.setdefault(req_id, failure)
+
+    def _process_permanent_send_failures(self) -> None:
+        """Turn an exhausted connector send into a client-visible ERROR.
+
+        Full-payload flush happens after the producer request has already
+        left this scheduler, so ``finish_requests`` alone cannot reach the
+        client. The ERROR output is attached later by
+        ``_attach_finished_request_sets`` and the orchestrator fails the
+        request from any stage. A request still scheduled here is finished
+        as well, so its slot is released.
+        """
+        queued = getattr(self, "_queued_permanent_send_failures", None)
+        if not queued:
+            return
+        failures, self._queued_permanent_send_failures = queued, {}
+        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        if pending is None:
+            pending = self._pending_input_timeout_outputs = {}
+        still_local: list[str] = []
+        for req_id, (client_index, reason) in failures.items():
+            request = self.requests.get(req_id)
+            if request is not None:
+                client_index = request.client_index
+                request.stop_reason = reason
+                still_local.append(req_id)
+            if req_id in pending:
+                continue
+            logger.error("Failing request %s after connector send gave up: %s", req_id, reason)
+            pending[req_id] = (
+                client_index,
+                OmniEngineCoreOutput(
+                    request_id=req_id,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.ERROR,
+                    stop_reason=reason,
+                ),
+            )
+        if still_local:
+            self.finish_requests(still_local, RequestStatus.FINISHED_ERROR)
 
     def _process_pending_input_timeouts(self) -> None:
         """Force-fail requests waiting on the full-payload coordinator too long.
@@ -1194,15 +1278,38 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             return
         outputs[request.client_index].append(output)
 
+    def _has_connector_transfer_work(self) -> bool:
+        """True when a send is still running or its failure has not been emitted.
+
+        The producer request has usually left the scheduler before the
+        background put finishes. Without this, the engine goes idle and the
+        give-up stays stashed until some later request wakes it.
+        """
+        latest = getattr(self, "_latest_omni_connector_output", None)
+        if latest is not None and (
+            getattr(latest, "permanent_send_failures", None) or getattr(latest, "permanent_recv_failures", None)
+        ):
+            return True
+        if getattr(self, "_queued_permanent_send_failures", None):
+            return True
+        # A give-up on the runner thread is queued here. Counting under the
+        # same lock as the enqueue keeps the engine runnable until the next
+        # schedule drains it. This is not "a send is still in flight": that
+        # would make every successful background put keep execute_model spinning.
+        return bool(getattr(self, "_omni_connector_inbox_count", 0))
+
     def has_requests(self) -> bool:
         """Keep stepping while a finished run request's output waits for its stage payload."""
-        return (
+        if (
             bool(self._outputs_awaiting_stage_payload)
             or bool(getattr(self, "_pending_chunk_commits", ()))
             or bool(getattr(self, "_pending_input_timeout_outputs", ()))
             or bool(getattr(self, "_resume_chunk_receivers", ()))
-            or super().has_requests()
-        )
+            or self._has_connector_transfer_work()
+        ):
+            return True
+        parent = getattr(super(), "has_requests", None)
+        return bool(parent()) if callable(parent) else False
 
     def _handle_failed_kv_load_outputs(
         self,

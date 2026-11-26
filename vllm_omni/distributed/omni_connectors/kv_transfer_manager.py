@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified OmniConnector and KV cache transfer management."""
 
 import enum
@@ -419,12 +419,18 @@ class OmniKVTransferManager:
 
         self._topo_config: _TransferTopoConfig | None = None
 
-        if config.need_send_cache and config.connector_config:
+        connector_config = config.connector_config or {}
+        shared_receiver = (
+            config.stage_id is not None
+            and connector_config.get("type") == "SharedMemoryConnector"
+            and (config.need_recv_cache or connector_config.get("role") == "receiver")
+        )
+        if (config.need_send_cache or shared_receiver) and config.connector_config:
             try:
+                logger.debug("Initializing stage connector at startup", extra={"stage_id": config.stage_id})
                 _ = self.connector
-                logger.info("Sender connector eagerly initialized")
             except Exception as e:
-                logger.warning("Failed to eagerly initialize sender connector: %s", e)
+                logger.warning("Failed to initialize stage connector at startup: %s", e)
 
     @property
     def tp_topology(self) -> KVTPTopology:
@@ -536,6 +542,8 @@ class OmniKVTransferManager:
             if cfg and (c_type := cfg.get("type")):
                 try:
                     c_extra = {k: v for k, v in cfg.items() if k != "type"}
+                    if c_type == "SharedMemoryConnector" and self.config.stage_id is not None:
+                        c_extra["stage_id"] = self.config.stage_id
                     if c_type in TRANSFER_ENGINE_CONNECTOR_NAMES:
                         base_port = expand_env_int(c_extra.get("zmq_port", 50051), "zmq_port")
                         c_extra["from_stage"] = (

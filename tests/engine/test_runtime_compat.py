@@ -30,7 +30,11 @@ def test_cache_api_delegates_without_mutating_connector_configuration(monkeypatc
 
     def base(normalized):
         seen.append(normalized)
-        return "cache-key" if method == "compute_hash" else {"cache": "factor"}
+        return (
+            "cache-key"
+            if method == "compute_hash"
+            else {"cache": "factor", "scheduler_window_policy": "runtime.policy"}
+        )
 
     monkeypatch.setattr(ModelConfig, method, base, raising=False)
     result = getattr(config, method)()
@@ -162,3 +166,27 @@ def test_nonmember_encoder_rank_joins_creation_without_coordinator(monkeypatch):
     group = pipeline._build_text_encoder_group(8)
     assert calls == [(list(range(8)), pipeline_module.current_omni_platform.dist_backend), (list(range(8)), "gloo")]
     assert group.world_size == 1
+
+
+@pytest.mark.parametrize("need_recv,role", [(False, "receiver"), (True, None)])
+def test_shared_memory_receiver_is_visible_before_first_payload(monkeypatch, tmp_path, need_recv, role):
+    from vllm_omni.distributed.omni_connectors import kv_transfer_manager as transfer
+    from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
+
+    monkeypatch.setattr(SharedMemoryConnector, "shm_directory", str(tmp_path))
+    monkeypatch.setattr(transfer, "get_local_tp_rank", lambda: 0)
+    monkeypatch.setattr(transfer, "get_tp_world_size", lambda: 1)
+    sender = SharedMemoryConnector({"stage_id": 0, "wakeup_scope": "runtime-test"})
+    manager = transfer.OmniKVTransferManager(
+        transfer.OmniKVCacheConfig(
+            stage_id=1,
+            need_recv_cache=need_recv,
+            connector_config={"type": "SharedMemoryConnector", "role": role, "wakeup_scope": "runtime-test"},
+        )
+    )
+    try:
+        assert sender._peer_visible("1")
+        assert manager.connector.stage_id == 1
+    finally:
+        manager.close()
+        sender.close()

@@ -22,6 +22,10 @@ connectors:
 
 - Auto-mode uses SharedMemoryConnector if no connector is declared for an edge.
 
+Staged receivers owned by `OmniKVTransferManager` initialize before the first producer send.
+The connector receives its stage ID and deployment scope so peers can verify IPC visibility.
+The manager retains shutdown ownership; initialization does not bypass the visibility check.
+
 ---
 
 ## Design
