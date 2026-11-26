@@ -189,3 +189,190 @@ def test_prepare_failure_aborts_both_ranks_without_changing_policy():
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     torch.multiprocessing.spawn(_failed_prepare_rank, args=(port,), nprocs=2)
+
+
+def test_pristine_bank_is_host_resident_and_built_once():
+    layer = _layer(torch.bfloat16)
+    bank = MergedLinearWeights()
+    prepared1 = bank.prepare({"proj": layer})
+    assert bank._base["proj"].device.type == "cpu"
+    base_ptr = bank._base["proj"].data_ptr()
+    bank.apply(prepared1)
+
+    layer.lora_b_stacked[0].mul_(2.0)
+    prepared2 = bank.prepare({"proj": layer})
+    assert bank._base["proj"].device.type == "cpu"
+    assert bank._base["proj"].data_ptr() == base_ptr
+    bank.apply(prepared2)
+
+    bank.close()
+    assert not bank._base
+    assert not bank._fp32_scratch
+    assert not bank._cast_scratch
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_parking_branches_select_device_or_host_from_free_hbm(dtype):
+    first, second = _layer(dtype), _layer(dtype)
+    modules = {"first": first, "second": second}
+    active_bytes = first.base_layer.weight.nbytes + second.base_layer.weight.nbytes
+    margin = 1024
+    threshold = 2 * active_bytes + margin
+
+    # Exact threshold -> device parking (and float32 prepared must not alias scratch).
+    dev_bank = MergedLinearWeights(
+        parking_hbm_margin_bytes=margin,
+        free_device_memory_fn=lambda _dev: threshold,
+    )
+    dev_prepared = dev_bank.prepare(modules)
+    assert dev_bank.last_parking_modes[torch.device("cpu")] == "device"
+    assert dev_prepared["first"].data_ptr() != dev_prepared["second"].data_ptr()
+    assert dev_prepared["first"].data_ptr() != dev_bank._fp32_scratch[torch.device("cpu")].data_ptr()
+
+    # One byte below threshold -> host parking with cast scratch.
+    host_bank = MergedLinearWeights(
+        parking_hbm_margin_bytes=margin,
+        free_device_memory_fn=lambda _dev: threshold - 1,
+    )
+    host_prepared = host_bank.prepare(modules)
+    assert host_bank.last_parking_modes[torch.device("cpu")] == "host"
+    assert host_prepared["first"].device.type == "cpu"
+    assert (torch.device("cpu"), dtype) in host_bank._cast_scratch
+
+    # Both parking branches produce bitwise-identical results.
+    for name in modules:
+        torch.testing.assert_close(dev_prepared[name], host_prepared[name], rtol=0, atol=0)
+
+    host_bank.apply(host_prepared)
+    for name, layer in modules.items():
+        torch.testing.assert_close(layer.base_layer.weight, dev_prepared[name], rtol=0, atol=0)
+
+
+def test_device_scratch_is_reused_across_syncs():
+    layer = _layer(torch.bfloat16)
+    bank = MergedLinearWeights(
+        parking_hbm_margin_bytes=1024,
+        free_device_memory_fn=lambda _dev: 0,
+    )
+    bank.apply(bank.prepare({"proj": layer}))
+    fp32_ptr = bank._fp32_scratch[torch.device("cpu")].data_ptr()
+    cast_ptr = bank._cast_scratch[(torch.device("cpu"), torch.bfloat16)].data_ptr()
+
+    for step in range(3):
+        layer.lora_b_stacked[0].fill_(float(step + 1))
+        bank.apply(bank.prepare({"proj": layer}))
+        assert bank._fp32_scratch[torch.device("cpu")].data_ptr() == fp32_ptr
+        assert bank._cast_scratch[(torch.device("cpu"), torch.bfloat16)].data_ptr() == cast_ptr
+
+
+def test_host_parked_copy_failure_rolls_back_all_weights(monkeypatch):
+    modules = {"first": _layer(torch.bfloat16), "second": _layer(torch.bfloat16)}
+    bank = MergedLinearWeights(
+        parking_hbm_margin_bytes=1024,
+        free_device_memory_fn=lambda _dev: 0,
+    )
+    bank.apply(bank.prepare(modules))
+    previous = {name: layer.base_layer.weight.detach().clone() for name, layer in modules.items()}
+
+    for layer in modules.values():
+        layer.lora_a_stacked[0].mul_(3.0)
+    prepared = bank.prepare(modules)
+    assert bank.last_parking_modes[torch.device("cpu")] == "host"
+
+    orig_copy = torch.Tensor.copy_
+    failed = False
+
+    def fail_second(tensor, value, *args, **kwargs):
+        nonlocal failed
+        if tensor is modules["second"].base_layer.weight and not failed:
+            failed = True
+            raise RuntimeError("injected host-parked copy failure")
+        return orig_copy(tensor, value, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", fail_second)
+    with pytest.raises(RuntimeError, match="injected host-parked copy failure"):
+        bank.apply(prepared)
+
+    for name, layer in modules.items():
+        torch.testing.assert_close(layer.base_layer.weight, previous[name], rtol=0, atol=0)
+
+
+def test_pinned_arena_falls_back_to_chunked_pinned_and_pageable(caplog):
+    modules = {"first": _layer(torch.float32), "second": _layer(torch.float32), "third": _layer(torch.float32)}
+    expected_bank = MergedLinearWeights()
+    expected = expected_bank.prepare(modules)
+
+    # Tier 1 -> Tier 2: fail single arena (> 512 bytes), succeed per-chunk pinned (<= 512 bytes).
+    chunk_calls: list[int] = []
+
+    def small_arena_alloc(nbytes: int) -> torch.Tensor:
+        chunk_calls.append(nbytes)
+        if nbytes > 512:
+            raise RuntimeError("forced arena OOM")
+        return torch.empty(nbytes, dtype=torch.uint8, device="cpu")
+
+    with caplog.at_level("WARNING"):
+        chunked_bank = MergedLinearWeights(
+            pinned_chunk_max_bytes=256,
+            free_device_memory_fn=lambda _dev: 0,
+            use_pinned_host_fn=lambda _dev: True,
+            alloc_pinned_bytes_fn=small_arena_alloc,
+        )
+        chunked_prepared = chunked_bank.prepare(modules)
+    assert chunked_bank.last_host_alloc_mode == "chunked_pinned"
+    assert any(size > 512 for size in chunk_calls)
+    assert any(size <= 512 for size in chunk_calls)
+    assert "falling back to chunked pinned" in caplog.text
+    for name in modules:
+        torch.testing.assert_close(chunked_prepared[name], expected[name], rtol=0, atol=0)
+
+    # Tier 2 -> Tier 3: fail all pinned allocations, complete on pageable memory with warning.
+    caplog.clear()
+
+    def always_fail_pinned(nbytes: int) -> torch.Tensor:
+        raise RuntimeError(f"pinned alloc disabled ({nbytes})")
+
+    with caplog.at_level("WARNING"):
+        pageable_bank = MergedLinearWeights(
+            pinned_chunk_max_bytes=256,
+            free_device_memory_fn=lambda _dev: 0,
+            use_pinned_host_fn=lambda _dev: True,
+            alloc_pinned_bytes_fn=always_fail_pinned,
+        )
+        pageable_prepared = pageable_bank.prepare(modules)
+    assert pageable_bank.last_host_alloc_mode == "pageable"
+    assert "falling back to pageable host memory" in caplog.text
+    for name in modules:
+        torch.testing.assert_close(pageable_prepared[name], expected[name], rtol=0, atol=0)
+
+
+def test_failed_first_prepare_cleans_up_newly_captured_base():
+    first, second = _layer(), _layer()
+    second.lora_a_stacked[0].fill_(float("nan"))
+    bank = MergedLinearWeights()
+    with pytest.raises(ValueError, match="non-finite"):
+        bank.prepare({"first": first, "second": second})
+    assert not bank._base
+    assert not bank._weights
+
+
+def test_non_blocking_used_for_pinned_copies(monkeypatch):
+    layer = _layer(torch.bfloat16)
+    bank = MergedLinearWeights(
+        free_device_memory_fn=lambda _dev: 0,
+        use_pinned_host_fn=lambda _dev: True,
+        alloc_pinned_bytes_fn=lambda nbytes: torch.empty(nbytes, dtype=torch.uint8, device="cpu"),
+    )
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
+
+    orig_copy = torch.Tensor.copy_
+    non_blocking_flags: list[bool] = []
+
+    def record_copy(self, src, non_blocking=False):
+        non_blocking_flags.append(bool(non_blocking))
+        return orig_copy(self, src, non_blocking=False)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", record_copy)
+    prepared = bank.prepare({"proj": layer})
+    bank.apply(prepared)
+    assert any(non_blocking_flags), "expected non_blocking=True copies for pinned host buffers"

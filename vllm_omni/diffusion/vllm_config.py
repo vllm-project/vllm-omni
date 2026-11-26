@@ -218,22 +218,6 @@ def resolve_diffusion_moe_lora_token_capacity(
     return capacity
 
 
-def _supports_native_online_mxfp4_moe() -> bool:
-    """Return whether this device has a native online-MXFP4 MoE backend."""
-    if current_omni_platform.is_xpu():
-        return True
-    if not current_omni_platform.is_cuda():
-        return False
-
-    capability = current_omni_platform.get_device_capability()
-    if capability is None:
-        return False
-
-    from vllm import _custom_ops as ops
-
-    return ops.mxfp4_experts_quant_supported(capability.to_int())
-
-
 def create_base_diffusion_vllm_config(
     device: torch.device,
     od_config: OmniDiffusionConfig,

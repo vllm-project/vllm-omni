@@ -9,6 +9,7 @@ This script tests two main scenarios:
 2. Case 2: Comparing FlashAttention and SDPA backends for batch_size=2 with padding
 """
 
+import os
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -61,6 +62,46 @@ def test_fa4_dense_fake_preserves_value_head_dimension():
         key = torch.empty(1, 7, 2, 16)
         value = torch.empty(1, 7, 2, 32)
         output = torch.ops.vllm_omni.fa4_dense_attention(query, key, value, 0.25, False, False)
+        assert output.shape == (1, 5, 4, 32)
+        assert output.dtype == query.dtype and output.device == query.device
+
+
+@pytest.mark.cpu
+def test_aiter_dense_dispatch_is_opaque_to_compile(monkeypatch):
+    calls = []
+
+    def kernel(query, key, value, **kwargs):
+        # AITER dispatch stats files (a Dynamo graph break) and returns a
+        # padded-head slice.
+        os.stat(__file__)
+        calls.append(kwargs)
+        padded = torch.cat([query + value.mean(), query.new_zeros((*query.shape[:-1], 8))], dim=-1)
+        return padded[..., : value.shape[-1]]
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "IS_AITER", True)
+    monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
+    monkeypatch.setattr(fa, "flash_attn_func", kernel)
+    impl = FlashAttentionImpl(2, 16, softmax_scale=0.25, causal=False)
+    query = torch.randn(1, 5, 2, 16)
+    key, value = torch.randn(1, 7, 2, 16), torch.randn(1, 7, 2, 16)
+    expected = impl.forward_cuda(query, key, value)
+    assert expected.is_contiguous()
+    compiled = torch.compile(impl.forward_cuda, backend="eager", fullgraph=True, dynamic=True)
+    torch.testing.assert_close(compiled(query, key, value), expected, rtol=0, atol=0)
+    assert calls == [dict(softmax_scale=0.25, causal=False)] * 2
+
+
+@pytest.mark.cpu
+def test_aiter_dense_fake_preserves_value_head_dimension():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        query = torch.empty(1, 5, 4, 16)
+        key = torch.empty(1, 7, 2, 16)
+        value = torch.empty(1, 7, 2, 32)
+        output = torch.ops.vllm_omni.aiter_dense_attention(query, key, value, 0.25, False, False)
         assert output.shape == (1, 5, 4, 32)
         assert output.dtype == query.dtype and output.device == query.device
 
@@ -771,6 +812,7 @@ def test_published_noop_mask_uses_dense_path(monkeypatch):
         raise AssertionError("published no-op mask must not use varlen attention")
 
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "IS_AITER", False)
     monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
     monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
     monkeypatch.setattr(fa, "flash_attn_func", fake_dense_func)

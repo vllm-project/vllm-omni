@@ -88,6 +88,28 @@ async def test_realtime_client_configure_omits_ref_audio_by_default():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("supports_playback_ack", [True, False])
+async def test_realtime_client_acks_only_when_the_deployment_accepts_acks(supports_playback_ack):
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+
+    client = Client()
+    client.events.add(
+        {"type": "session.created", "session": {"capabilities": {"supports_playback_ack": supports_playback_ack}}}
+    )
+    client.events.add({"type": "response.created", "response_id": "resp_1"})
+
+    await client.acknowledge_playback()
+
+    assert [event["type"] for event in client.sent] == (["playback.ack"] if supports_playback_ack else [])
+
+
+@pytest.mark.asyncio
 async def test_realtime_client_configure_sends_explicit_ref_audio():
     class Client(RealtimeDuplexClient):
         def __init__(self):

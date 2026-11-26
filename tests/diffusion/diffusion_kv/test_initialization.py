@@ -6,7 +6,6 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from vllm.platforms.interface import DeviceCapability
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 import vllm_omni.diffusion.diffusion_kv.initialization as initialization
@@ -325,49 +324,6 @@ def test_base_moe_without_opt_in_leaves_lora_config_unset() -> None:
     assert config.lora_config is None
 
 
-@pytest.mark.parametrize(
-    ("is_cuda", "is_xpu", "capability", "quant_supported", "expected"),
-    [
-        (True, False, DeviceCapability(10, 0), True, True),
-        (True, False, DeviceCapability(12, 0), False, False),
-        (True, False, DeviceCapability(9, 0), False, False),
-        (True, False, None, False, False),
-        (False, True, None, False, True),
-        (False, False, None, False, False),
-    ],
-)
-def test_online_mxfp4_native_backend_device_gate(
-    is_cuda,
-    is_xpu,
-    capability,
-    quant_supported,
-    expected,
-    monkeypatch,
-) -> None:
-    import vllm._custom_ops as vllm_ops
-
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_cuda", lambda: is_cuda)
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: is_xpu)
-    monkeypatch.setattr(
-        diffusion_vllm_config.current_omni_platform,
-        "get_device_capability",
-        lambda: capability,
-    )
-    queried_capabilities: list[int] = []
-
-    def _quant_supported(device_capability: int) -> bool:
-        queried_capabilities.append(device_capability)
-        return quant_supported
-
-    monkeypatch.setattr(vllm_ops, "mxfp4_experts_quant_supported", _quant_supported)
-
-    assert diffusion_vllm_config._supports_native_online_mxfp4_moe() is expected
-    if is_cuda and capability is not None:
-        assert queried_capabilities == [capability.to_int()]
-    else:
-        assert queried_capabilities == []
-
-
 def test_enable_moe_lora_opts_in_for_non_mxfp4_online_moe() -> None:
     config = diffusion_vllm_config.create_diffusion_vllm_config(
         torch.device("cpu"),
@@ -382,6 +338,71 @@ def test_enable_moe_lora_opts_in_for_non_mxfp4_online_moe() -> None:
     )
 
     assert config.lora_config is not None
+
+
+def _modelopt_mixed_config(dense, experts):
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig
+
+    layers = {"model.layers.0.self_attn.qkv_proj": dense, "model.layers.0.mlp.experts.0.down_proj": experts}
+    return ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "group_size": 16,
+            "exclude_modules": [],
+            "quantized_layers": {name: {"quant_algo": algo} for name, algo in layers.items() if algo},
+        }
+    )
+
+
+def _modelopt_nvfp4_config(quant_method="NVFP4"):
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+
+    return ModelOptNvFp4Config(quant_method=quant_method, is_checkpoint_nvfp4_serialized=True)
+
+
+@pytest.mark.parametrize(
+    ("quant_config", "lora_path", "enable_moe_lora", "moe_backend", "expects_lora"),
+    [
+        (lambda: _modelopt_nvfp4_config(), None, False, "auto", False),
+        (lambda: _modelopt_nvfp4_config(), None, False, "cutlass", False),
+        (lambda: _modelopt_mixed_config("FP8", "NVFP4"), None, False, "auto", False),
+        (lambda: _modelopt_mixed_config("NVFP4", "FP8"), None, False, "auto", False),
+        (lambda: _modelopt_mixed_config("NVFP4", None), None, False, "auto", False),
+        (lambda: _modelopt_nvfp4_config(), "/adapter", False, "auto", True),
+        (lambda: _modelopt_nvfp4_config(), None, False, "marlin", False),
+        (lambda: _modelopt_nvfp4_config("W4A16_NVFP4"), None, False, "auto", False),
+        (lambda: _modelopt_mixed_config("FP8", "FP8"), None, False, "auto", False),
+        (lambda: None, None, False, "auto", False),
+        (lambda: _modelopt_nvfp4_config(), None, True, "auto", True),
+        (lambda: _modelopt_nvfp4_config(), None, True, "marlin", True),
+        (lambda: _modelopt_mixed_config("FP8", "NVFP4"), None, True, "auto", True),
+        (lambda: _modelopt_mixed_config("NVFP4", "FP8"), None, True, "auto", True),
+        (lambda: _modelopt_mixed_config("FP8", "FP8"), None, True, "auto", True),
+    ],
+)
+def test_modelopt_moe_lora_requires_explicit_opt_in(
+    quant_config,
+    lora_path,
+    enable_moe_lora,
+    moe_backend,
+    expects_lora,
+) -> None:
+    # This checks the pre-load gate, not hardware/backend support for expert LoRA.
+    config = diffusion_vllm_config.create_diffusion_vllm_config(
+        torch.device("cpu"),
+        _od_config(
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+            is_moe=True,
+            lora_backend="peft",
+            lora_path=lora_path,
+            enable_moe_lora=enable_moe_lora,
+            moe_backend=moe_backend,
+            quantization_config=quant_config(),
+        ),
+    )
+
+    assert (config.lora_config is not None) is expects_lora
 
 
 def test_enable_moe_lora_is_scoped_to_moe() -> None:
