@@ -114,7 +114,7 @@ def run_tool_round_trip(monkeypatch):
         monkeypatch.setattr(
             playback, "_run_tool_session", lambda server, config, body: asyncio.run(in_session(config, body))
         )
-        test = playback.TestQwen3OmniDuplexPlayback().test_live_tool_runner_completes_a_tool_round_trip
+        test = playback.TestQwen3OmniDuplexTools().test_live_tool_runner_completes_a_tool_round_trip
         test(Mock(spec=playback._DuplexTestRuntime, server=object()))
 
     return run

@@ -67,7 +67,7 @@ from .mixed_precision import (
     Cosmos3MixedPrecisionRuntime,
     resolve_mixed_precision_config,
 )
-from .norm import RMSNorm
+from .norm import QKRMSNorm, RMSNorm
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
@@ -680,8 +680,8 @@ class Cosmos3CausalAttention(nn.Module):
             prefix=f"{prefix}.to_out",
         )
 
-        self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.norm_q = QKRMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.norm_k = QKRMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm_und_for_gen = RMSNorm(self.head_dim, eps=rms_norm_eps) if use_und_k_norm_for_gen else None
 
         # skip_sequence_parallel=True because the UND pathway is
@@ -709,8 +709,8 @@ class Cosmos3CausalAttention(nn.Module):
         v = self.to_v(hidden_states).view(B, S, self.num_kv_heads_local, self.head_dim)
 
         # Per-head QK norm
-        q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, eps=self.norm_q.variance_epsilon)
-        k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
+        q = self.norm_q(q)
+        k = self.norm_k(k)
 
         # Qwen3-style RoPE
         q, k = self.rotary_embedding(q, k, freqs_cos, freqs_sin)
@@ -800,8 +800,8 @@ class Cosmos3CrossAttention(nn.Module):
 
         self.qk_norm = qk_norm
         if self.qk_norm:
-            self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.norm_q = QKRMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.norm_k = QKRMSNorm(self.head_dim, eps=rms_norm_eps)
 
         self.attn = FrameworkAttention(
             num_heads=self.num_heads,
@@ -984,8 +984,8 @@ class Cosmos3CrossAttention(nn.Module):
 
         # Per-head QK norm
         if self.qk_norm:
-            q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, eps=self.norm_q.variance_epsilon)
-            k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
+            q = self.norm_q(q)
+            k = self.norm_k(k)
 
         # Qwen3-style RoPE
         q, k = self.rotary_embedding(q, k, freqs_cos, freqs_sin)
@@ -1064,10 +1064,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
 
         cos, sin = freqs
         attn_out, k, v = self.self_attn(hidden_states, cos, sin)
-        hidden_states = residual + attn_out
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
         hidden_states = residual + self.mlp(hidden_states)
 
         return hidden_states, k, v
@@ -1113,12 +1110,6 @@ class Cosmos3GenDecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
         )
 
-    def _forward_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.mlp(self.post_attention_layernorm(hidden_states))
-
-    def _add_residual(self, output: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        return residual + output
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1155,10 +1146,11 @@ class Cosmos3GenDecoderLayer(nn.Module):
             control_weights=control_weights,
             multiview_layout=multiview_layout,
         )
-        hidden_states = self._add_residual(hidden_states, residual)
+        return self._forward_post_attention(hidden_states, residual)
 
-        residual = hidden_states
-        hidden_states = self._add_residual(self._forward_mlp(hidden_states), residual)
+    def _forward_post_attention(self, attn_out: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+        hidden_states = residual + self.mlp(hidden_states)
 
         return hidden_states
 

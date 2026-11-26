@@ -55,7 +55,7 @@ class _DuplexTestRuntime(NamedTuple):
     artifacts: Path
 
 
-@pytest.fixture(scope="class")
+@pytest.fixture(scope="module")
 def qwen_duplex_server(
     request: pytest.FixtureRequest,
     tmp_path_factory,
@@ -659,6 +659,50 @@ def _run_tool_session(omni_server, config: SessionConfig, body) -> None:
 
 @pytest.mark.omni
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
+class TestQwen3OmniDuplexTools:
+    @pytest.mark.advanced_model
+    def test_live_tool_runner_completes_a_tool_round_trip(self, qwen_duplex_server):
+        """Smoke-test real model/tool integration without prescribing the answer."""
+
+        async def body(session: _ToolSession) -> None:
+            handled = []
+
+            async def get_weather(arguments):
+                handled.append(arguments)
+                return WEATHER_RESULT
+
+            runner = DuplexToolRunner(session.client, {"get_weather": get_weather})
+            start = len(session.collector.events)
+            task = asyncio.create_task(runner.run())
+            try:
+                await asyncio.sleep(0)
+                call_id = await session.ask_for_weather()
+                await session.finish_response(start, after_tool_result=call_id)
+                if task.done():
+                    await task
+                call = next(call for call in session.calls() if call["call_id"] == call_id)
+                arguments = call["arguments"]
+                assert isinstance(arguments, str)
+                assert json.loads(arguments) in handled
+                assert any(
+                    event.get("type") == "conversation.item.created"
+                    and isinstance(item := event.get("item"), dict)
+                    and item.get("type") == "function_call_output"
+                    and item.get("call_id") == call_id
+                    and item.get("output") == WEATHER_RESULT
+                    for event in session.events_since(start)
+                )
+                assert session.error_codes() == []
+                assert runner.undelivered_results == {}
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        _run_tool_session(qwen_duplex_server.server, _tool_session_config(), body)
+
+
+@pytest.mark.omni
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 class TestQwen3OmniDuplexPlayback:
     @pytest.mark.advanced_model
     @pytest.mark.parametrize(
@@ -731,7 +775,6 @@ class TestQwen3OmniDuplexPlayback:
         )
 
     @pytest.mark.full_model
-    @hardware_test(res={"rocm": "MI325"}, num_cards=2)
     @pytest.mark.parametrize("generation_finished", [False, True], ids=["generating", "queued-playback"])
     @pytest.mark.parametrize("repetition", range(_DUPLEX_REPEATS_FULL))
     def test_speech_interrupts_playback_full(
@@ -777,47 +820,6 @@ class TestQwen3OmniDuplexPlayback:
     def test_full_history_rejects_audio_overflow(self, qwen_duplex_server, tmp_path: Path):
         """The unconfigured default preserves sources and rejects a fifth audio input."""
         asyncio.run(_run_duplex_history(qwen_duplex_server, tmp_path / "events.json", reject_overflow=True))
-
-    @pytest.mark.advanced_model
-    @pytest.mark.nvidia_only
-    def test_live_tool_runner_completes_a_tool_round_trip(self, qwen_duplex_server):
-        """Smoke-test real model/tool integration without prescribing the answer."""
-
-        async def body(session: _ToolSession) -> None:
-            handled = []
-
-            async def get_weather(arguments):
-                handled.append(arguments)
-                return WEATHER_RESULT
-
-            runner = DuplexToolRunner(session.client, {"get_weather": get_weather})
-            start = len(session.collector.events)
-            task = asyncio.create_task(runner.run())
-            try:
-                await asyncio.sleep(0)
-                call_id = await session.ask_for_weather()
-                await session.finish_response(start, after_tool_result=call_id)
-                if task.done():
-                    await task
-                call = next(call for call in session.calls() if call["call_id"] == call_id)
-                arguments = call["arguments"]
-                assert isinstance(arguments, str)
-                assert json.loads(arguments) in handled
-                assert any(
-                    event.get("type") == "conversation.item.created"
-                    and isinstance(item := event.get("item"), dict)
-                    and item.get("type") == "function_call_output"
-                    and item.get("call_id") == call_id
-                    and item.get("output") == WEATHER_RESULT
-                    for event in session.events_since(start)
-                )
-                assert session.error_codes() == []
-                assert runner.undelivered_results == {}
-            finally:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-
-        _run_tool_session(qwen_duplex_server.server, _tool_session_config(), body)
 
     # Keep this fixture parameter last to group the default-policy cases on one server.
     @pytest.mark.advanced_model

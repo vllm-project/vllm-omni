@@ -44,7 +44,7 @@ from torch.nn.modules.utils import _pair
 from typing_extensions import Self
 
 from vllm_omni.diffusion.layers.rope import apply_rotary_emb_torch
-from vllm_omni.diffusion.models.cosmos3.norm import RMSNorm
+from vllm_omni.diffusion.models.cosmos3.norm import VAERMSNorm
 
 if TYPE_CHECKING:
     from vllm.config.load import LoadConfig
@@ -430,7 +430,7 @@ class GlobalSelfAttentionBlock(nn.Module):
         self.head_dim = dim // self.num_heads
         self.eps = eps
 
-        self.norm = RMSNorm(dim)
+        self.norm = VAERMSNorm(dim)
         self.scale = nn.Parameter(torch.full([self.num_heads, 1], math.log(10.0)))
         self.qkv_proj = nn.Linear(dim, dim * 3, bias=bias)
         self.rope = AxialRoPE(self.head_dim, num_heads, rope_max_harmonics)
@@ -561,7 +561,7 @@ class CausalTemporalAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
 
-        self.norm = RMSNorm(dim)
+        self.norm = VAERMSNorm(dim)
         self.qkv_proj = nn.Linear(dim, dim * 3, bias=bias)
         self.out_proj = nn.Linear(dim, dim, bias=bias).apply(_zero_out)
         self._SDPA_MAX_BATCH = 65535
@@ -667,7 +667,7 @@ class GEGLU(nn.Linear):
 class FeedForwardNetwork(nn.Module):
     def __init__(self, dim, mid_dim):
         super().__init__()
-        self.norm = RMSNorm(dim)
+        self.norm = VAERMSNorm(dim)
         self.gegelu = GEGLU(dim, mid_dim, bias=False)
         self.linear = nn.Linear(mid_dim, dim, bias=False).apply(_zero_out)
 
@@ -780,7 +780,7 @@ class Joint3DSelfAttention(nn.Module):
         self.max_h = len_h
         self.max_w = len_w
 
-        self.norm = RMSNorm(dim)
+        self.norm = VAERMSNorm(dim)
         self.scale = nn.Parameter(torch.full([num_heads, 1], math.log(10.0)))
         self.qkv_proj = nn.Linear(dim, dim * 3, bias=bias)
         self.rope3d = VideoRopePosition3DEmb(
@@ -1014,7 +1014,7 @@ class Detokenizer(nn.Sequential):
     ):
         patch_size = _pair(patch_size)
         super().__init__(
-            RMSNorm(in_channels),
+            VAERMSNorm(in_channels),
             nn.Linear(
                 in_channels,
                 out_channels * patch_size[0] * patch_size[1],
@@ -1181,7 +1181,7 @@ class Encoder(nn.Module):
 
         # Project to z_dim * 2 (mean + logvar)
         self.head = nn.Sequential(
-            RMSNorm(bottleneck_dim),
+            VAERMSNorm(bottleneck_dim),
             nn.Linear(bottleneck_dim, z_dim * 2, bias=False),
             Rearrange("B H W C -> B C H W"),
         )
@@ -1693,7 +1693,7 @@ class _LidarComponent(nn.Module):
         # mapping from modules so attention temperature scales stay untouched,
         # including norms in Sequential containers (head/detokenizer).
         norm_keys = {
-            f"{name}.scale": f"{name}.weight" for name, module in self.named_modules() if isinstance(module, RMSNorm)
+            f"{name}.scale": f"{name}.weight" for name, module in self.named_modules() if isinstance(module, VAERMSNorm)
         }
         seen: set[str] = set()
 

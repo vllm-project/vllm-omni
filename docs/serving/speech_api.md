@@ -173,6 +173,42 @@ configured budgets. This is a token limit, not an audio-duration limit.
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
 
+### Sampling overrides
+
+Speech requests can override the first AR stage's temperature and repetition
+penalty at the top level or through `extra_params`. Explicit top-level values
+take precedence over nested values, then the stage's `default_sampling_params`;
+omitted or `null` values do not override them. Overrides are merged before
+validation, so shadowed nested values are ignored. The first-stage `temperature`
+follows vLLM `SamplingParams` validation and normalization (currently a finite
+value in `[0, 2]`, with small positive values raised to `0.01`).
+Normalization happens before adapter prompt construction, so model metadata
+and stage sampling use the same effective temperature.
+`repetition_penalty` must be finite and positive, with `1.0` disabling repetition
+scaling for the first AR stage.
+
+For Qwen3-TTS, request `temperature` also controls the residual Subtalker's
+temperature and sampling switch, using the normalized first-stage value.
+Without a request override, an effective first-stage temperature of zero also
+makes the Subtalker greedy; other values keep its deployment defaults.
+Explicit `extra_params.subtalker_sampling_params`
+fields override residual defaults and take precedence over temperature
+inheritance; `{}` keeps residual defaults without inheriting temperature.
+Accepted fields are `do_sample` (boolean), `temperature` (finite, nonnegative),
+`top_k` (-1 or a nonnegative integer, capped at the residual vocabulary size),
+and `top_p` (only `1.0` is supported).
+
+This request makes both Qwen3-TTS predictors greedy and disables the first
+stage's repetition penalty:
+
+```json
+{
+  "input": "Hello, how are you?",
+  "temperature": 0.0,
+  "repetition_penalty": 1.0
+}
+```
+
 ### Response Format
 
 The response shape depends on the streaming parameters:
@@ -390,7 +426,8 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 ## Streaming Text Input (WebSocket)
 
 The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally.
-Choose the input policy according to when synthesis should start:
+With `model_input_mode="complete"` (default), choose the input policy according
+to when synthesis should start:
 
 | `text_input_mode` | `split_granularity` | When a TTS request starts | Handling more text during synthesis |
 | --- | --- | --- | --- |
@@ -403,13 +440,34 @@ text to the prompt of a model request that is already generating, or preserves
 acoustic/model state between segments. Reusing the WebSocket connection after
 `session.done` also does not imply reuse of a model generation session.
 
+With `model_input_mode="incremental"`, the commitment frontend feeds one model
+request for the entire utterance. The adapter buffers any tokenizer-unstable
+suffix after frontend commitment. It submits the initial engine request only
+when stable text tokens are available, or flushes the remaining text at
+`input.done`. Subsequent
+releases may also be buffered without sending an engine update. The delivered
+token IDs match encoding the complete model text, regardless of text packet
+boundaries or delivery batching. Empty or whitespace-only utterances do not
+submit an engine request.
+
+The incremental-input scheduler enforces a fixed 10-second conditioning-starvation
+timeout that request payloads cannot override. It starts when the model cannot
+execute its next step because the required text conditioning is unavailable,
+not at every WebSocket message gap. The commitment frontend may still be
+withholding text during this wait. Normal model drain after text EOF is not
+subject to this timeout.
+
+Before the initial request is ready, the normal session idle timeout applies.
+The total generation deadline starts after initial input construction succeeds,
+including the time spent waiting for engine admission.
+
 !!! important
     Commitment mode is not a general sentence detector. Its strong-terminator
     boundaries say only that the configured finite policy no longer needs to
     withhold a recognized lexical or special-text suffix. A released segment
-    may be shorter or longer than a linguistic sentence. Every segment is
-    synthesized as a new one-shot request; model and acoustic state are not
-    continued from the preceding segment.
+    may be shorter or longer than a linguistic sentence. In `complete` model
+    input mode, every segment is synthesized as a new one-shot request; model
+    and acoustic state are not continued from the preceding segment.
 
 Text transport and audio transport are separate choices. `input.text` always
 arrives incrementally. `stream_audio=false` sends one binary audio frame per
@@ -447,6 +505,7 @@ Client -> Server:
 | `{"type": "input.text", "text": "..."}` | Text chunk. It is accumulated in `buffered` mode or fed to the readiness policy in `commitment` mode. |
 | `{"type": "input.done"}` | End-of-input for the current utterance. It flushes buffered text or closes and flushes the commitment policy, waits for submitted work, and keeps the connection open. |
 | `{"type": "session.close"}` | Close the connection. In `commitment` mode it cancels active and queued synthesis. In `buffered` mode it discards text not yet submitted, but a close frame cannot be handled while a request is generating, including requests from the linguistic splitter. There is no separate `input.cancel` message. |
+| `{"type": "session.ping"}`| Deliver an optional keep alive message to the server |
 
 Server -> Client:
 
@@ -456,6 +515,7 @@ Server -> Client:
 | Binary frame | A chunk of the current request's continuous byte stream; feed frames to that request's parser (`audio.start` … `audio.done`). With `stream_audio=true`, the stream contains PCM samples; for `wav`, each request starts with its own 44-byte placeholder WAV header. |
 | `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | The corresponding request is complete. `total_bytes` counts all binary bytes sent for that request, including the WAV header when applicable. `error=true` means it failed. |
 | `{"type": "session.done", "utterance_index": 0, "total_sentences": N}` | Terminal marker after `input.done`/EOF and all started requests have settled. It is not a success indicator. `total_sentences` is the number of requests that emitted `audio.start`, despite the compatibility name. |
+| `{"type": "session.pong"}` | Response to `session.ping` message |
 | `{"type": "error", "message": "..."}` | A protocol, limit, validation, or generation error. Some protocol errors are recoverable; a segment failure terminates the current utterance. |
 
 No additional acknowledgment, boundary, or cancellation event is introduced
@@ -560,6 +620,12 @@ connection can return to idle. That event is only an utterance boundary; use
 disconnect and `session.close` abort active generation, discard unsubmitted or
 queued work, and do not emit `session.done`.
 
+In incremental mode, generation ending before text EOF is submitted is also
+reported as a failure. The error message includes the model's finish reason
+when available; `audio.done.error=true` and the same EOF/reuse rules apply.
+After text EOF is submitted, reaching a Qwen3-TTS length limit returns the
+generated audio normally, as in complete mode.
+
 ### Flushing vs. Closing
 
 `input.done` is a flush, not a disconnect. The server synthesizes the buffered
@@ -596,10 +662,14 @@ when the first text arrives. `ref_audio` takes a single string and
 length of a whole request, so they require `split_granularity="none"` and
 `text_input_mode="buffered"`. Session parameters:
 
+`temperature`, `repetition_penalty`, and `extra_params` are forwarded through
+the same sampling override validation, precedence, and normalization as REST.
+
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
 | `stream_audio` | bool | false | Stream one or more audio chunks for each synthesis request over WebSocket. Requires `response_format="pcm"` or `"wav"`. |
 | `text_input_mode` | `"buffered"` or `"commitment"` | `"buffered"` | Select whole-utterance buffering or M1 semantic-readiness commitment. Commitment requires Qwen3-TTS and explicit `language="Chinese"` or `"English"`. |
+| `model_input_mode` | `"complete"` or `"incremental"` | `"complete"` | Select one complete request per text segment or one incrementally fed request per utterance. Incremental input requires commitment, PCM streaming, and an opted-in model adapter (currently Qwen3-TTS CustomVoice with MRv2). |
 | `split_granularity` | string | `"none"` | `"none"`: one request per `input.done`. `"sentence"`: split on `.!?` plus CJK `。！？…`, Indic danda `।॥`, and Arabic `؟`. `"clause"`: also split on `,;，；،؛`. |
 | `seed` | integer | null | Forwarded to the speech engine for this session |
 

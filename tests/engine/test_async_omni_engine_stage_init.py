@@ -57,6 +57,7 @@ class _FakeVllmConfig:
 @dataclass
 class _FakeRuntimeConfig:
     devices: str
+    num_replicas: int = 1
 
 
 @dataclass
@@ -65,6 +66,18 @@ class _FakeStageConfig:
     stage_type: str
     engine_args: dict[str, object]
     runtime: _FakeRuntimeConfig
+    final_output_type: str | None = None
+
+
+@dataclass
+class _FakeModelConfig:
+    hf_config: object = field(default_factory=object)
+
+
+@dataclass
+class _FakeEngineConfig:
+    quant_config: object
+    model_config: _FakeModelConfig = field(default_factory=_FakeModelConfig)
 
 
 def test_stage_runtime_env_accepts_typed_runtime_config(monkeypatch):
@@ -227,6 +240,41 @@ def test_build_vllm_config_forwards_text_watermark_config(
         )
 
     assert forwarded == ([expected] if use_v2_model_runner else [])
+
+
+def test_build_vllm_config_upgrades_inc_quant_config_in_place(monkeypatch):
+    original_quant_config = object()
+    upgraded_quant_config = object()
+    fake_config = _FakeEngineConfig(quant_config=original_quant_config)
+    sentinel_executor = object()
+
+    monkeypatch.setattr(
+        stage_init_utils.OmniEngineArgs,
+        "create_engine_config",
+        lambda _self, **_kwargs: fake_config,
+    )
+    monkeypatch.setattr(stage_init_utils.Executor, "get_class", lambda _config: sentinel_executor)
+    monkeypatch.setattr(
+        stage_init_utils.OmniINCConfig,
+        "maybe_upgrade",
+        lambda quant_config: upgraded_quant_config if quant_config is original_quant_config else quant_config,
+    )
+    stage = _FakeStageConfig(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={},
+        runtime=_FakeRuntimeConfig(devices="0"),
+    )
+
+    vllm_config, executor_class = build_vllm_config(
+        stage,
+        "dummy-model",
+        engine_args_dict={"tensor_parallel_size": 1, "use_v2_model_runner": True},
+    )
+
+    assert vllm_config is fake_config
+    assert vllm_config.quant_config is upgraded_quant_config
+    assert executor_class is sentinel_executor
 
 
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):

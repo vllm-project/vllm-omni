@@ -89,6 +89,12 @@ class Alpamayo2SuperPolicyForConditionalGeneration(Qwen3VLForConditionalGenerati
         self._recent_steps: dict[str, deque[tuple[int, torch.Tensor, torch.Tensor, int, int]]] = {}
         self._step = 0
 
+    def create_omni_model_state(self, vllm_config: VllmConfig, encoder_cache: Any, device: torch.device) -> Any:
+        # Calls prepare_runner_inputs before every forward.
+        from .model_state import Alpamayo2SuperModelState
+
+        return Alpamayo2SuperModelState(vllm_config, self, encoder_cache, device)
+
     def prepare_runner_inputs(
         self,
         input_ids: torch.Tensor | None,
