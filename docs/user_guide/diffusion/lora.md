@@ -15,7 +15,8 @@ MoE diffusion stages keep expert LoRA **off by default** so vLLM can select nati
 MoE kernels for base-model serving. Expert LoRA is enabled when either:
 
 - a startup `--lora-path` / `lora_path` is set, or
-- `--enable-moe-lora` / `enable_moe_lora: true` is set before model load.
+- `--enable-moe-lora` is set before model load, or `enable_moe_lora: true` is
+  set under the diffusion stage in the deploy YAML's `stages` list.
 
 Use the flag when the server starts without an adapter but must accept
 request-time expert `LoRARequest`s later. Dense-only adapters do not need it.

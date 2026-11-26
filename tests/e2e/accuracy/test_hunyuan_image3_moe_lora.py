@@ -87,12 +87,12 @@ def test_hunyuan_image3_dit_moe_lora_generation(tmp_path: Path):
                 "pipeline": "hunyuan_image3_dit",
                 "async_chunk": False,
                 "trust_remote_code": True,
-                # Request-time expert adapters need MoE LoRA opted in at startup
-                # when no --lora-path is set (#10798).
-                "enable_moe_lora": True,
                 "stages": [
                     {
                         "stage_id": 0,
+                        # Request-time expert adapters need stage-scoped opt-in
+                        # when no startup lora_path is set (#10798).
+                        "enable_moe_lora": True,
                         "devices": ",".join(map(str, range(tp))),
                         "max_num_seqs": 1,
                         "enforce_eager": True,

@@ -922,6 +922,41 @@ stages:
         assert config.stage_by_id(1).diffusion_config.max_cpu_loras == 1
 
 
+@pytest.mark.parametrize(
+    "stage_value,cli_value,expected",
+    [
+        (None, None, False),
+        (False, None, False),
+        (True, None, True),
+        (None, True, True),
+        (True, False, False),
+        (False, True, True),
+    ],
+)
+def test_diffusion_moe_lora_opt_in_precedence_and_transport(tmp_path, stage_value, cli_value, expected):
+    import yaml
+
+    from vllm_omni.engine.stage_init_utils import _project_omni_stage_engine_args
+
+    stage_deploy = {"stage_id": 0}
+    if stage_value is not None:
+        stage_deploy["enable_moe_lora"] = stage_value
+    deploy_path = tmp_path / "moe_lora.yaml"
+    deploy_path.write_text(yaml.safe_dump({"pipeline": "hunyuan_image3_dit", "stages": [stage_deploy]}))
+    cli = {} if cli_value is None else {"enable_moe_lora": cli_value}
+    stage = _from_pipeline_key(
+        "hunyuan_image3_dit",
+        deploy_config_path=str(deploy_path),
+        cli_overrides=cli,
+    ).stage_by_id(0)
+
+    assert stage.diffusion_config.enable_moe_lora is expected
+    assert _project_omni_stage_engine_args(stage)["enable_moe_lora"] is expected
+    serialized = _serialize_stage_config(stage)
+    restored = omni_config_module._DiffusionConfigProjection.from_kwargs(**serialized["diffusion_config"])
+    assert restored.enable_moe_lora is expected
+
+
 def test_global_llm_lora_fields_apply_to_single_stage_pipeline():
     pipeline = PipelineConfig(
         model_type="single_stage",
