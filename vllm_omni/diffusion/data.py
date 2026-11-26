@@ -55,6 +55,8 @@ from vllm_omni.quantization import build_quant_config
 if TYPE_CHECKING:
     from vllm.config import KVTransferConfig, ProfilerConfig
 
+    from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
+
 # Import after TYPE_CHECKING to avoid circular imports at runtime
 # The actual import is deferred to __post_init__ to avoid import order issues
 
@@ -2107,6 +2109,33 @@ def is_diffusion_request_started_output(output: Any) -> bool:
         isinstance(custom_output, dict)
         and custom_output.get(DIFFUSION_REQUEST_LIFECYCLE_KEY) == DIFFUSION_REQUEST_STARTED
     )
+
+
+@dataclass(frozen=True)
+class ARDiffusionChunkMetadata:
+    """Identity metadata returned with one generated AR block."""
+
+    session_id: str
+    request_id: str
+    chunk_index: int
+    applied_event_ids: tuple[int, ...] = ()
+
+    @classmethod
+    def from_tick(cls, tick: "ARDiffusionTickRequest") -> "ARDiffusionChunkMetadata":
+        return cls(
+            session_id=tick.session_id,
+            request_id=tick.request_id,
+            chunk_index=tick.chunk_index,
+            applied_event_ids=tick.applied_event_ids,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "request_id": self.request_id,
+            "chunk_index": self.chunk_index,
+            "applied_event_ids": list(self.applied_event_ids),
+        }
 
 
 @dataclass

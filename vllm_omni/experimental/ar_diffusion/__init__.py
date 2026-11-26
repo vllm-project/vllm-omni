@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """AR-Diffusion Engine (AR-Diffusion).
 
 The AR-Diffusion engine: a ``DiffusionEngine`` subclass that adds engine-level KV
@@ -6,6 +7,7 @@ cache management for autoregressive / chunked diffusion models. Selected via
 ``OmniDiffusionConfig.engine_backend = "ar_diffusion"``.
 """
 
+from vllm_omni.diffusion.data import ARDiffusionChunkMetadata
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
@@ -22,7 +24,6 @@ from vllm_omni.experimental.ar_diffusion.session import (
 )
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     AR_DIFFUSION_TICK_KEY,
-    ARDiffusionChunkMetadata,
     ARDiffusionControlInput,
     ARDiffusionTickRequest,
 )

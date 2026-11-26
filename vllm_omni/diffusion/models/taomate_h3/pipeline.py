@@ -39,7 +39,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.cuda_graph import GraphedForward
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import ARDiffusionChunkMetadata, DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.taomate_h3_prompt import sync_prompt_length
 from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
@@ -63,7 +63,6 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import ARDiffusionSegmentedKVState
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
-from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionChunkMetadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderMediaInput

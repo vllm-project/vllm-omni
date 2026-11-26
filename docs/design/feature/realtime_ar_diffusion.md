@@ -58,7 +58,8 @@ therefore does not require a private entrypoint override.
    `LingBotWorldCausalDMDPipeline.forward()`; the generic runtime does not parse
    camera or action schemas.
 7. The pipeline returns one `DiffusionOutput` with the generated payload and an
-   `ARDiffusionChunkMetadata` mapping under `metadata["ar_diffusion"]`.
+   mapping under `metadata["ar_diffusion"]`, serialized from
+   `vllm_omni.diffusion.data.ARDiffusionChunkMetadata`.
    `AsyncOmni` exposes it as
    `OmniRequestOutput.multimodal_output["metadata"]["ar_diffusion"]`.
 8. The consumer parses the standard envelope. The session commits its reducer

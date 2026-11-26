@@ -21,7 +21,7 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.compile import regionally_compile
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import ARDiffusionChunkMetadata, DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
@@ -79,7 +79,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionSegmentedKVSpec,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
-from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionChunkMetadata, ARDiffusionTickRequest
+from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = init_logger(__name__)
