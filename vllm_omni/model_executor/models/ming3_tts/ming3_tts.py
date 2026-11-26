@@ -177,6 +177,10 @@ class Ming3TTSForConditionalGeneration(
     def embed_input_ids(self, input_ids: torch.Tensor, **kwargs: Any):
         return self.model.embed_input_ids(input_ids=input_ids, **kwargs)
 
+    @property
+    def mrv2_forward_returns_tensor(self) -> bool:
+        return self.model_stage == "llm"
+
     def forward(self, *args: Any, **kwargs: Any):
         return self.model(*args, **kwargs)
 

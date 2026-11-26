@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from vllm_omni.config.endpoint_policy import speech_only_endpoint_restrictions
 from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, StagePipelineConfig
 
 BREEZE_TTS_2_PIPELINE = PipelineConfig(
     model_type="breeze",
+    endpoint_restrictions=speech_only_endpoint_restrictions("Breeze-TTS-2"),
     model_arch="BreezeForConditionalGeneration",
     default_deploy_config_name="breeze_tts_2.yaml",
     stages=(
@@ -12,6 +14,7 @@ BREEZE_TTS_2_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="breeze_tts_2",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
@@ -27,6 +30,7 @@ BREEZE_TTS_2_PIPELINE = PipelineConfig(
             model_stage="breeze_tts_2_codec",
             model_arch="BreezeCode2Wav",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",

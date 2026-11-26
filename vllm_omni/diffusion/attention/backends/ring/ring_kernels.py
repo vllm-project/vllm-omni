@@ -16,6 +16,7 @@ from .ring_globals import (
     HAS_FA4,
     HAS_FLASH_ATTN,
     HAS_FLASHINFER,
+    bundled_flash_attn_version,
     fa3_fwd_func,
     fa4_attn_func,
 )
@@ -265,6 +266,21 @@ def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap,
     return out, softmax_lse
 
 
+@torch.library.custom_op("vllm_omni::bundled_fa4_ring_attention", mutates_args=())
+def _bundled_fa4_ring_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float | None, causal: bool, softcap: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return vllm_flash_attn_dense_with_lse(q, k, v, softmax_scale=scale, causal=causal, softcap=softcap, fa_version=4)
+
+
+@_bundled_fa4_ring_attention.register_fake
+def _bundled_fa4_ring_attention_fake(q, k, v, scale, causal, softcap):
+    batch, seq, heads, _ = q.shape
+    out = q.new_empty((batch, seq, heads, v.shape[-1]))
+    lse = q.new_empty((heads, batch, seq), dtype=torch.float32).transpose(0, 1)
+    return out, lse
+
+
 def vllm_flash_attn_forward(
     q,
     k,
@@ -279,6 +295,8 @@ def vllm_flash_attn_forward(
 ):
     """vLLM-bundled FlashAttention forward pass with ring-compatible LSE."""
     del dropout_p, window_size, alibi_slopes, return_softmax
+    if torch.compiler.is_compiling() and not torch.is_grad_enabled() and bundled_flash_attn_version(q.device) == 4:
+        return _bundled_fa4_ring_attention(q, k, v, softmax_scale, causal, softcap or 0.0)
     return vllm_flash_attn_dense_with_lse(
         q,
         k,
@@ -291,6 +309,46 @@ def vllm_flash_attn_forward(
 
 # Legacy alias for backward compatibility
 flash_attn3_func_forward = fa3_forward
+
+
+if not hasattr(torch.ops.vllm_omni, "fa4_ring_attention"):
+
+    @torch.library.custom_op("vllm_omni::fa4_ring_attention", mutates_args=())
+    def _fa4_ring_attention_op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        softmax_scale: float | None,
+        causal: bool,
+        window_left: int,
+        window_right: int,
+        softcap: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The CuTe Python launcher is opaque; its attention arithmetic is unchanged.
+        if fa4_attn_func is None:
+            raise RuntimeError("CuTe FlashAttention-4 is unavailable")
+        out, lse = fa4_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=(None if window_left == -1 else window_left, None if window_right == -1 else window_right),
+            softcap=softcap,
+            return_lse=True,
+        )
+        return out, lse
+
+    @_fa4_ring_attention_op.register_fake
+    def _fa4_ring_attention_op_fake(q, k, v, softmax_scale, causal, window_left, window_right, softcap):
+        # Match FA4's contiguous BSHD output and contiguous FP32 BHS LSE.
+        return (
+            torch.empty((q.shape[0], q.shape[1], q.shape[2], v.shape[-1]), dtype=q.dtype, device=q.device),
+            torch.empty((q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32, device=q.device),
+        )
+
+
+_fa4_ring_attention_op = torch.ops.vllm_omni.fa4_ring_attention
 
 
 def flash_attn4_func_forward(
@@ -311,6 +369,8 @@ def flash_attn4_func_forward(
     assert fa4_attn_func is not None, "FA4 high-level API is not available"
 
     left, right = window_size if window_size else (-1, -1)
+    if torch.compiler.is_compiling() and not torch.is_grad_enabled():
+        return _fa4_ring_attention_op(q, k, v, softmax_scale, causal, left, right, softcap or 0.0)
     out, softmax_lse = fa4_attn_func(
         q,
         k,
