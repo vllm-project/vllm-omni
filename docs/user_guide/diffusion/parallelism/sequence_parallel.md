@@ -241,8 +241,10 @@ In `DiffusionParallelConfig`:
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
 
 On CUDA, set `ulysses_a2a_permute=True` (CLI: `--ulysses-a2a-permute`) to use CE.
-This requires `ulysses_mode="strict"`, `ulysses_degree > 1`, and peer-accessible
-GPUs on one NVLink-connected node.
+This requires `ulysses_mode="strict"`, `ulysses_degree > 1`, and GPUs on one node
+with CUDA peer access between every pair: NVLink, or PCIe with P2P enabled
+(check with `nvidia-smi topo -p2p r`). The link type changes performance, not
+correctness.
 
 ```bash
 vllm serve Qwen/Qwen-Image --omni --ulysses-degree 2 --ulysses-a2a-permute

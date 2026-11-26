@@ -14,6 +14,7 @@ import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingType
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
@@ -38,8 +39,9 @@ from vllm_omni.core.sched.utils import (
 from vllm_omni.core.sched.utils import (
     streaming_update_replaces_prompt as _streaming_update_replaces_prompt,
 )
+from vllm_omni.core.sched.window_policy import SchedulerWindowPolicy
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
+from vllm_omni.engine import CONTEXT_LENGTH_EXCEEDED, AdditionalInformationPayload, OmniEngineCoreOutput
 from vllm_omni.engine.messages import TextInputUpdate
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import CONTINUE_TOKEN_ID
@@ -241,8 +243,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return False
         return super().reset_prefix_cache(reset_running_requests, reset_connector)
 
+    _window_policy: SchedulerWindowPolicy | None = None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        policy_path = getattr(self.vllm_config.model_config, "scheduler_window_policy", None)
+        if isinstance(policy_path, str) and policy_path:
+            self._window_policy = resolve_obj_by_qualname(policy_path)()
         self._thinker_ngram = is_thinker_ngram(self.vllm_config)
         self._scheduler_ngram: Callable[..., np.ndarray] | None = None
         if use_scheduler_ngram(self.vllm_config):
@@ -312,6 +319,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
             logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
             return
+        if self._window_policy is not None and request.request_id not in self.requests:
+            if retired := self._window_policy.superseded_by(request, self.requests):
+                self.finish_requests(retired, RequestStatus.FINISHED_ABORTED)
+            max_prompt_len = self.max_model_len - self._streaming_sample_room()
+            required = self._window_policy.prepare_admission(request, max_prompt_len)
+            if required is not None:
+                self._record_context_overflow(request, required, self.max_model_len)
+                return
         super().add_request(request)
 
     def register_input_stream(self, request_id: str, stream: object) -> None:
@@ -435,6 +450,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_request_ids = ids
             cleanup_ids = tuple(ids)
 
+        if self._window_policy is not None:
+            self._window_policy.before_finish(
+                self.requests, cleanup_ids, aborted=finished_status == RequestStatus.FINISHED_ABORTED
+            )
         finished = super().finish_requests(finish_request_ids, finished_status)
         self._clear_kv_wait_starts(cleanup_ids)
         return finished
@@ -887,6 +906,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if getattr(self, "_thinker_ngram", False):
             self._limit_thinker_drafts(scheduler_output)
         self._enforce_kstep_span_uniformity(scheduler_output)
+        if self._window_policy is not None:
+            self._window_policy.before_book(self.requests, scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
     def _find_text_input_waits(self) -> set[str]:
@@ -1314,6 +1335,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.max_num_active_reqs = original_max_num_active_reqs
             self._finish_seeded_isolation(step, scheduled_any=scheduled_any)
 
+        window_ops = (
+            self._window_policy.on_schedule(self.requests, scheduler_output) if self._window_policy is not None else []
+        )
+
         # Backstop: a step built without ``_update_after_schedule`` (nothing
         # booked, so nothing to reconcile) still leaves here uniform. On the
         # booking paths the rewrite already ran ahead of the booking and this
@@ -1327,10 +1352,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finished_reqs = self.get_finished_requests_needing_kv_transfer()
 
         # Wrap in omni scheduler output to carry transfer metadata.
-        return self._wrap_omni_scheduler_output(
+        omni_output = self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+        if window_ops:
+            omni_output.duplex_carry_ops = window_ops
+        return omni_output
 
     def update_from_output(
         self,
@@ -1465,6 +1493,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # ModelRunnerOutput.req_id_to_index was dropped upstream; derive the
         # row index from req_ids like the pin's scheduler does.
         req_indices = {req_id: i for i, req_id in enumerate(model_runner_output.req_ids)}
+        window_policy = getattr(self, "_window_policy", None)
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             if num_tokens_scheduled <= 0:
                 # A zero-token schedule entry used to die on the bare assert
@@ -1564,6 +1593,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             ):
                 new_token_ids, stopped = self._update_request_with_output(request, generated_token_ids)
                 if not stopped:
+                    if window_policy is not None:
+                        window_policy.observe_progress(request)
                     prefill_stats = request.take_prefill_stats()
                     if prefill_stats is not None:
                         prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
@@ -1748,6 +1779,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             ):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+
+            if window_policy is not None and not output_is_stale and not sampling_validation_failed:
+                window_policy.observe_progress(request)
 
             # If criteria returns True, it means we must STOP the request.
             # If criteria returns False, it might have triggered a background
@@ -2174,33 +2208,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self.log_stats:
                     session.record_event(EngineCoreEventType.QUEUED)
                 return
-        if stage_id == 0:
-            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
-                MiniCPMO45DuplexSchedulerHelper,
-            )
-
-            reanchored = False
-            if MiniCPMO45DuplexSchedulerHelper.find_duplex_window_manager(self) is not None:
-                plan = self._maybe_reanchor_streaming_window(
-                    session,
-                    update,
-                    segment_output_ids=segment_output_ids,
-                    completed_terminator=completed_terminator,
-                )
-                reanchored = plan is not None
-            if not reanchored and self._prepare_minicpmo45_stage0_window(
+        if self._window_policy is not None:
+            replacement_len = self._window_policy.prepare_append(
+                self,
                 session,
                 update,
                 segment_output_ids=segment_output_ids,
                 completed_terminator=completed_terminator,
-            ):
-                # The rebuilt prompt is bounded by the client's window settings,
-                # not by the model (a camera unit is hundreds of tokens), so it
-                # needs the same max_model_len check as a plain extension. The
-                # plan replaces the whole prompt, so the replacement length is the
-                # projection, not the session's current prompt plus an extension.
-                plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
-                if self._streaming_update_overflows(session, update, projected_len=plan["replacement_prompt_len"]):
+            )
+            if replacement_len is not None:
+                if self._streaming_update_overflows(session, update, projected_len=replacement_len):
                     return
                 self._release_replaced_streaming_prompt_cache(session)
                 self._replace_streaming_session(session, update)
@@ -2287,8 +2304,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _update_native_streaming_prompt(self, session: Request, payload: dict[str, Any]) -> bool | None:
         """Delegate streaming prompt policy to the stage's payload processor."""
-        from vllm.utils.import_utils import resolve_obj_by_qualname
-
         if not hasattr(self, "_native_prompt_hook"):
             path = getattr(self.vllm_config.model_config, "custom_process_next_stage_input_func", None)
             processor = resolve_obj_by_qualname(path) if path else None
@@ -2297,206 +2312,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return None
         return self._native_prompt_hook(self.vllm_config.model_config, session, payload)
 
-    def _maybe_reanchor_streaming_window(
-        self,
-        session: Request,
-        update: StreamingUpdate,
-        *,
-        segment_output_ids: list[int] | None = None,
-        completed_terminator: int | None = None,
-    ) -> Any:
-        """Lifecycle hook to evaluate and apply duplex streaming window compaction."""
-        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
-            MiniCPMO45DuplexSchedulerHelper,
-        )
-
-        return MiniCPMO45DuplexSchedulerHelper.apply_session_window(
-            self,
-            session,
-            update,
-            segment_output_ids=segment_output_ids,
-            completed_terminator=completed_terminator,
-        )
-
-    def _maybe_reanchor_minicpmo45_stage0_window(
-        self,
-        session: Request,
-        update: StreamingUpdate,
-        *,
-        segment_output_ids: list[int] | None = None,
-        completed_terminator: int | None = None,
-    ) -> Any:
-        """Backward-compatible alias for _maybe_reanchor_streaming_window."""
-        return self._maybe_reanchor_streaming_window(
-            session,
-            update,
-            segment_output_ids=segment_output_ids,
-            completed_terminator=completed_terminator,
-        )
-
-    @staticmethod
-    def _prepare_minicpmo45_stage0_window(
-        session: Request,
-        update: StreamingUpdate,
-        *,
-        segment_output_ids: list[int],
-        completed_terminator: int | None = None,
-    ) -> bool:
-        """Plan an official-style MiniCPM Stage-0 window at unit boundaries.
-
-        vLLM owns a paged KV cache, so deleting a middle span and rotating the
-        retained K tensors in place is not a safe model hook.  Instead, record
-        completed unit lengths in the scheduler and request a full prompt
-        replacement when a watermark fires.  The worker rebuilds matching
-        embeddings from its unit history, which recomputes RoPE at the new
-        contiguous positions.
-        """
-        info = getattr(update, "model_intermediate_buffer", None)
-        if not isinstance(info, dict):
-            return False
-        duplex = info.get("duplex")
-        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
-            return False
-        runtime_config = duplex.get("runtime_config")
-        runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
-        window = runtime_config.get("duplex_window_config")
-        mode = window.get("sliding_window_mode", "off") if isinstance(window, dict) else "off"
-
-        try:
-            seq = int(duplex.get("seq", 0) or 0)
-            preserve_len = int(runtime_config.get("duplex_first_append_context_tokens", 0) or 0)
-        except (TypeError, ValueError):
-            return False
-        if seq <= 1:
-            return False
-
-        # The sampled terminator is discarded by the normal session update and
-        # re-injected at the head of this append, followed by </unit>.
-        # generated_ids contains only the confirmed output span retained by
-        # the streaming update, excluding its final uncomputed sample.
-        generated_ids = segment_output_ids
-        # Sampler-side history can contain speculative or stale async output.
-        # The worker must rebuild from the same accepted ids used for lengths.
-        duplex["stage0_window"] = {"completed_token_ids": list(generated_ids)}
-        if completed_terminator is not None:
-            duplex["stage0_window"]["completed_terminator_token_id"] = int(completed_terminator)
-        # Boundary reconciliation is required even with an unbounded context:
-        # async lookahead can overwrite the worker's pending terminator after
-        # the scheduler accepted the segment stop. Window retention is optional.
-        if not isinstance(window, dict) or mode not in {"basic", "context"}:
-            return False
-        base_len = int(getattr(session, "num_prompt_tokens", 0) or 0) + len(generated_ids)
-        boundary = base_len + 2
-        # A legitimate open_start of 0 (an empty context prefix) must not fall
-        # back to preserve_len, which would double-count the suffix below.
-        recorded_open_start = getattr(session, "_minicpmo45_window_open_start", None)
-        open_start = preserve_len if recorded_open_start is None else int(recorded_open_start)
-        unit_len = boundary - open_start
-        if unit_len <= 0:
-            return False
-
-        special_ids = {
-            int(token_id)
-            for token_id in runtime_config.get("duplex_window_special_token_ids", ())
-            if isinstance(token_id, int)
-        }
-        units = list(getattr(session, "_minicpmo45_window_units", ()))
-        units.append(
-            {
-                "length": unit_len,
-                "generated_token_ids": [int(token_id) for token_id in generated_ids if token_id not in special_ids],
-            }
-        )
-        projected_len = base_len + len(update.prompt_token_ids)
-        drop_count = 0
-        dropped_len = 0
-
-        if mode == "basic":
-            try:
-                high = int(window.get("basic_window_high_tokens", 8000))
-                low = int(window.get("basic_window_low_tokens", 6000))
-            except (TypeError, ValueError):
-                return False
-            if projected_len > high:
-                while units and projected_len - dropped_len > low:
-                    dropped_len += int(units[drop_count]["length"])
-                    drop_count += 1
-                    if drop_count >= len(units):
-                        break
-        else:
-            try:
-                max_units = int(window.get("context_max_units", 24))
-                previous_max = int(window.get("context_previous_max_tokens", 500))
-            except (TypeError, ValueError):
-                return False
-            drop_count = max(0, len(units) - max_units)
-            dropped_len = sum(int(unit["length"]) for unit in units[:drop_count])
-            previous = list(getattr(session, "_minicpmo45_window_previous_token_ids", ()))
-            for unit in units[:drop_count]:
-                previous.extend(unit["generated_token_ids"])
-            if len(previous) > previous_max:
-                previous = previous[-previous_max:]
-            marker = [
-                int(token_id)
-                for token_id in runtime_config.get("duplex_window_previous_marker_token_ids", ())
-                if isinstance(token_id, int)
-            ]
-            previous_with_marker = marker + previous if previous else []
-            old_previous_len = int(getattr(session, "_minicpmo45_window_previous_len", 0) or 0)
-            session._minicpmo45_window_previous_token_ids = previous
-            session._minicpmo45_window_previous_len = len(previous_with_marker)
-            projected_len += len(previous_with_marker) - old_previous_len
-
-        retained_units = units[drop_count:]
-        session._minicpmo45_window_units = retained_units
-        if drop_count == 0:
-            session._minicpmo45_window_open_start = boundary
-            return False
-
-        replacement_len = projected_len - dropped_len
-        if replacement_len <= 0:
-            return False
-        scheduler_token_id = runtime_config.get("duplex_scheduler_token_id", 0)
-        try:
-            scheduler_token_id = max(0, int(scheduler_token_id))
-        except (TypeError, ValueError):
-            scheduler_token_id = 0
-        update.prompt_token_ids = [scheduler_token_id] * replacement_len
-        meta = info.setdefault("meta", {})
-        if isinstance(meta, dict):
-            meta["replace_streaming_prompt"] = True
-        previous_ids = list(getattr(session, "_minicpmo45_window_previous_token_ids", ()))
-        # The worker embeds the marker ids the window plan carries: it must not
-        # re-tokenize the marker with its own tokenizer, which could differ
-        # from the ids this length is computed from.
-        marker_ids = [
-            int(token_id)
-            for token_id in runtime_config.get("duplex_window_previous_marker_token_ids", ())
-            if isinstance(token_id, int)
-        ]
-        duplex["stage0_window"] = {
-            "completed_token_ids": list(generated_ids),
-            "replace": True,
-            "mode": mode,
-            "drop_units": drop_count,
-            "dropped_tokens": dropped_len,
-            "previous_token_ids": previous_ids,
-            "previous_marker_token_ids": marker_ids,
-            "replacement_prompt_len": replacement_len,
-        }
-        if completed_terminator is not None:
-            duplex["stage0_window"]["completed_terminator_token_id"] = int(completed_terminator)
-        recorded_prefix_len = runtime_config.get("duplex_window_prefix_tokens")
-        prefix_len = preserve_len if recorded_prefix_len is None else int(recorded_prefix_len)
-        suffix_len = len(runtime_config.get("duplex_window_suffix_token_ids", ()) or ())
-        previous_len = int(getattr(session, "_minicpmo45_window_previous_len", 0) or 0)
-        new_preserve_len = prefix_len + previous_len + suffix_len if mode == "context" else preserve_len
-        session._minicpmo45_window_open_start = new_preserve_len + sum(int(unit["length"]) for unit in retained_units)
-        return True
-
     # Prefix of the stop_reason carried by the FinishReason.ERROR output, so the
     # serving side can map it to a stable error code.
-    STREAMING_CONTEXT_OVERFLOW_STOP_REASON = "context_length_exceeded"
+    STREAMING_CONTEXT_OVERFLOW_STOP_REASON = CONTEXT_LENGTH_EXCEEDED
 
     def _streaming_update_overflows(
         self,
@@ -2529,15 +2347,29 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Room for the tokens one step samples on top of the prompt (1 without
         # speculative decoding). __new__-built test schedulers carry no
         # num_sampled_tokens_per_step.
-        sample_room = max(1, int(getattr(self, "num_sampled_tokens_per_step", 1) or 1))
-        if projected + sample_room <= int(max_model_len):
+        if projected + self._streaming_sample_room() <= int(max_model_len):
             return False
+        self._record_context_overflow(session, projected, int(max_model_len))
+        if session.is_finished():
+            # Reached from ``_handle_stopped_request`` with a queued update.
+            # ``update_from_output`` frees every request that call reports as
+            # finished, so finishing the session here too would free it twice.
+            # ``_handle_stopped_request`` below takes it out of admission and
+            # leaves the single free to the caller.
+            return True
+        self.finish_requests((session.request_id,), RequestStatus.FINISHED_ERROR)
+        return True
+
+    def _streaming_sample_room(self) -> int:
+        return max(1, int(getattr(self, "num_sampled_tokens_per_step", 1) or 1))
+
+    def _record_context_overflow(self, session: Request, projected: int, max_model_len: int) -> None:
         reason = (
             f"{self.STREAMING_CONTEXT_OVERFLOW_STOP_REASON}: streaming session prompt would grow to "
             f"{projected} tokens, leaving no room to sample within max_model_len {int(max_model_len)}"
         )
         logger.error(
-            "[Omni] %s: %s; finishing the request instead of extending it",
+            "[Omni] %s: %s; rejecting the streaming prompt",
             session.request_id,
             reason,
         )
@@ -2549,15 +2381,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if overflowed is None:
             overflowed = self._overflowed_streaming_requests = set()
         overflowed.add(session.request_id)
-        if session.is_finished():
-            # Reached from ``_handle_stopped_request`` with a queued update.
-            # ``update_from_output`` frees every request that call reports as
-            # finished, so finishing the session here too would free it twice.
-            # ``_handle_stopped_request`` below takes it out of admission and
-            # leaves the single free to the caller.
-            return True
-        self.finish_requests((session.request_id,), RequestStatus.FINISHED_ERROR)
-        return True
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Keep terminal sessions out of the admission queue after overflow.
@@ -2843,7 +2666,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def has_finished_requests(self) -> bool:
         """Check if there are any finished requests (including those needing KV transfer)."""
-        return self._has_pending_kv_work() or super().has_finished_requests()
+        return (
+            bool(getattr(self, "_streaming_context_overflow", None))
+            or self._has_pending_kv_work()
+            or super().has_finished_requests()
+        )
 
     def has_unfinished_requests(self) -> bool:
         """Check if there are any unfinished requests (including those needing KV transfer)."""
