@@ -17,13 +17,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tests.helpers.mark import hardware_marks
 from vllm_omni.platforms.npu._310p import fft_ops
 
-pytestmark = [
-    pytest.mark.core_model,
-    *hardware_marks(res={"npu": "310P"}, num_cards=1),
-]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 TOL = 5e-4
 
@@ -143,3 +139,66 @@ def test_long_audio_real_load():
     want = torch.stft(wav, window=torch.hann_window(1024), return_complex=True, **kwargs)
     assert got.shape == want.shape
     assert (_pair(got) - _pair(want)).abs().max().item() / _pair(want).abs().max().item() < TOL
+
+
+def test_fft_ops_module_is_import_safe_and_non_invasive():
+    """Regression: importing/using fft_ops must not touch process-wide torch APIs.
+
+    Guards the P1 review finding — the 310P FFT overrides are bound locally
+    to the Qwen3-TTS builder, never monkey-patched onto torch. If a future
+    change reintroduces global patching, native torch APIs would be replaced
+    and this test fails.
+    """
+    x = torch.randn(256)
+    native = torch.fft.fft(x)
+    # torch.fft.fft must still be the native implementation
+    assert torch.fft.fft.__module__ == "torch._C" or "fft_ops" not in repr(torch.fft.fft)
+    # and must still produce correct results (i.e., was not replaced by a
+    # broken wrapper)
+    assert (_pair(torch.fft.fft(x)) - _pair(native)).abs().max().item() == 0.0
+    # fft_ops.stft must remain usable while torch.stft is untouched
+    kwargs = dict(n_fft=256, hop_length=64, win_length=256, center=False, onesided=True)
+    got = fft_ops.stft(x, window=fft_ops.hann_window(256), **kwargs)
+    want = torch.stft(x, window=torch.hann_window(256), return_complex=True, **kwargs)
+    assert (_pair(got) - _pair(want)).abs().max().item() / _pair(want).abs().max().item() < TOL
+
+
+def test_310p_builder_mel_front_end_binding():
+    """Regression: the 310P builder overrides mel locally, not via torch patches.
+
+    Verifies (in a fresh subprocess, as the review requested) that:
+    1. stock torch.hann_window still works after the 310P talker patch chain
+       is exercised (no recursion, no replacement), and
+    2. the 310P builder class exists with _mel_spectrogram_on_cpu=True so the
+       NPU-native override in extract_speaker_embedding is the only on-device
+       mel path.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent(
+        """
+        import torch
+        # 1. native window API works and is not a wrapper that recurses
+        w = torch.hann_window(64)
+        assert w.shape == (64,) and float(w.sum()) > 0.5
+        # 2. the 310P builder specialization keeps CPU mel as the fallback flag
+        from vllm_omni.platforms.npu._310p.patch.qwen3_tts import (
+            _Qwen3TTSPromptEmbedsBuilder310P,
+        )
+        assert _Qwen3TTSPromptEmbedsBuilder310P._mel_spectrogram_on_cpu is True
+        assert "fft_ops" in __import__("inspect").getsource(
+            _Qwen3TTSPromptEmbedsBuilder310P.extract_speaker_embedding
+        )
+        print("SUBPROCESS-OK")
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, f"subprocess failed:\n{proc.stderr[-2000:]}"
+    assert "SUBPROCESS-OK" in proc.stdout

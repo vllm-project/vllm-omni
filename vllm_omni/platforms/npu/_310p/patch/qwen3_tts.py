@@ -84,10 +84,61 @@ class _Qwen3TTSPromptEmbedsBuilder310P(prompt_embeds_builder.Qwen3TTSPromptEmbed
     """Qwen3-TTS prompt-embeds builder specialized for the 310P NPU path."""
 
     # 310P has no torch.stft kernels, so the mel front-end defaults to CPU.
-    # When apply_fft_patches() has installed the NPU-native FFT replacements,
-    # mel can run on the NPU next to the speaker encoder instead (no per-request
-    # CPU<->NPU round-trip).
-    _mel_spectrogram_on_cpu = not getattr(torch, "_npu_fft_310p_patched", False)
+    # The FFT overrides below are bound locally to this builder (not patched
+    # process-wide onto torch), so stock torch window/FFT APIs keep their
+    # native behavior everywhere else.
+    _mel_spectrogram_on_cpu = True
+
+    def extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
+        """NPU-native variant of the speaker-embedding front-end.
+
+        Identical to the base implementation except that the mel spectrogram
+        is computed with the 310P FFT/STFT re-implementation directly on the
+        model device — no per-request CPU<->NPU round-trip, and no global
+        torch API replacement. Falls back to the base (CPU mel) path if the
+        fft_ops module is unavailable.
+        """
+        try:
+            from vllm_omni.platforms.npu._310p import fft_ops
+        except ImportError:
+            return super().extract_speaker_embedding(wav, sr)
+
+        dev = self._device()
+        dtype = self._embedding_dtype
+        try:
+            spk_param = next(self._speaker_encoder.parameters())
+            if spk_param.device != dev or spk_param.dtype != dtype:
+                self._speaker_encoder.to(device=dev, dtype=dtype)
+        except StopIteration:
+            pass
+        # Resample to 24kHz for speaker encoder.
+        target_sr = int(getattr(self._config.speaker_encoder_config, "sample_rate", 24000))
+        if sr != target_sr:
+            resampler = self._get_resampler(int(sr), target_sr)
+            wav = resampler.resample(wav.astype(np.float32), orig_sr=int(sr))
+            sr = target_sr
+
+        wav_tensor = torch.from_numpy(wav).to(device=dev, dtype=torch.float32).unsqueeze(0)
+        mel_basis = prompt_embeds_builder._cached_mel_filter_bank(24000, 1024, 128, 0, 12000).to(dev)
+        window = fft_ops.hann_window(1024, device=dev)
+        padding = (1024 - 256) // 2
+        y = torch.nn.functional.pad(wav_tensor.unsqueeze(1), (padding, padding), mode="reflect").squeeze(1)
+        spec = fft_ops.stft(
+            y,
+            n_fft=1024,
+            hop_length=256,
+            win_length=1024,
+            window=window,
+            center=False,
+            pad_mode="reflect",
+            normalized=False,
+            onesided=True,
+        )
+        spec = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1) + 1e-9)
+        mel_spec = prompt_embeds_builder._dynamic_range_compression(torch.matmul(mel_basis, spec))
+        mels = mel_spec.transpose(1, 2)
+        spk = self._speaker_encoder(mels.to(device=dev, dtype=dtype))[0]
+        return spk.to(dtype=dtype)
 
 
 # ===================================================================
@@ -471,13 +522,6 @@ def apply_talker_patches() -> None:
 
     if _PATCHED:
         return
-
-    # Install the NPU-native FFT/STFT replacements before the builder class
-    # reads torch state, so the mel front-end can run on-device instead of
-    # falling back to CPU.
-    from vllm_omni.platforms.npu._310p.patch import apply_fft_patches
-
-    apply_fft_patches()
 
     qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneration = _Qwen3TTSTalker310P
     qwen3_tts_talker.Qwen3TTSPromptEmbedsBuilder = _Qwen3TTSPromptEmbedsBuilder310P
