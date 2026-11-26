@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.reduction import ForkingPickler
+from pathlib import Path
 from queue import Queue
 from threading import Event
 from types import SimpleNamespace
@@ -54,9 +55,13 @@ from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2co
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import MiniCPMO45SchedulerWindowPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import prepare_stage0_window
+
 from tests.helpers.duplex_scheduler import (
     DUPLEX_MAX_MODEL_LEN,
     append_duplex_frame,
+    duplex_append,
     join_duplex_sessions,
     make_engine_duplex_scheduler,
 )
@@ -891,8 +896,17 @@ def test_stage0_streaming_update_keeps_full_hash_block() -> None:
     assert session.num_computed_tokens >= 16
 
 
+def test_stage_without_window_policy_leaves_duplex_append_to_upstream() -> None:
+    sched = _make_scheduler(stage_id=0)
+    session = _make_request()
+    update = _make_minicpm_window_update(seq=2, mode="basic")
+    sched._update_request_as_session(session, update)
+    assert "stage0_window" not in update.model_intermediate_buffer["duplex"]
+
+
 def test_stage0_basic_window_rebuilds_below_low_watermark() -> None:
     sched = _make_scheduler(stage_id=0)
+    sched._window_policy = MiniCPMO45SchedulerWindowPolicy()
     session = _make_request()
     session.prompt_token_ids = [0] * 9
     del session._all_token_ids[:]
@@ -924,6 +938,7 @@ def test_stage0_basic_window_rebuilds_below_low_watermark() -> None:
 
 def test_stage0_context_window_compacts_dropped_speech() -> None:
     sched = _make_scheduler(stage_id=0)
+    sched._window_policy = MiniCPMO45SchedulerWindowPolicy()
     session = _make_request()
     session.prompt_token_ids = [0] * 9
     del session._all_token_ids[:]
@@ -961,6 +976,7 @@ def test_stage0_context_window_compacts_dropped_speech() -> None:
 @pytest.mark.parametrize("in_flight", [0, 1])
 def test_stage0_window_uses_confirmed_span_and_terminator(cleared_outputs, in_flight, mode) -> None:
     sched = _make_scheduler(stage_id=0)
+    sched._window_policy = MiniCPMO45SchedulerWindowPolicy()
     session = _make_request()
     session.prompt_token_ids = [0] * 9
     del session._all_token_ids[:]
@@ -996,6 +1012,7 @@ def test_stage0_window_rebuild_that_overflows_max_model_len_finishes_the_session
     ``max_model_len - sample_room`` and finish the session with
     ``context_length_exceeded``, exactly like a plain extension."""
     sched = _make_live_session_scheduler(max_model_len=21)
+    sched._window_policy = MiniCPMO45SchedulerWindowPolicy()
     session = _make_request()
     session.prompt_token_ids = [0] * 9
     del session._all_token_ids[:]
@@ -1046,6 +1063,7 @@ def test_stage0_window_rebuild_that_leaves_room_to_sample_replaces_the_prompt() 
     """One slot above the plan fits: the replacement applies through the normal
     replacement path."""
     sched = _make_scheduler(stage_id=0)
+    sched._window_policy = MiniCPMO45SchedulerWindowPolicy()
     sched.max_model_len = 25
     sched.num_sampled_tokens_per_step = 1
     session = _make_request()
@@ -1087,9 +1105,7 @@ def test_stage0_window_open_start_zero_is_not_replaced_by_the_context_reserve() 
     update = _make_minicpm_window_update(seq=2, mode="basic")
     update.prompt_token_ids = [0] * 21
 
-    assert OmniARScheduler._prepare_minicpmo45_stage0_window(
-        session, update, segment_output_ids=[40], completed_terminator=3
-    )
+    assert prepare_stage0_window(session, update, segment_output_ids=[40], completed_terminator=3)
 
     # open_start stays 0, so the reported unit spans the whole 12-token
     # boundary instead of the 9 the context reserve would fold in.
@@ -1108,9 +1124,7 @@ def test_stage0_window_open_start_falls_back_to_the_context_reserve_when_unset()
     update = _make_minicpm_window_update(seq=2, mode="basic")
     update.prompt_token_ids = [0] * 21
 
-    assert OmniARScheduler._prepare_minicpmo45_stage0_window(
-        session, update, segment_output_ids=[40], completed_terminator=3
-    )
+    assert prepare_stage0_window(session, update, segment_output_ids=[40], completed_terminator=3)
 
     # fallback open_start is preserve_len 3 from duplex_first_append_context_tokens,
     # so the unit is three tokens shorter.
@@ -2001,6 +2015,46 @@ def test_queued_streaming_update_that_overflows_does_not_return_to_admission() -
     # update_from_output frees every request reported as finished; freeing here
     # as well deleted it from self.requests twice (KeyError in _free_blocks).
     sched._free_request.assert_not_called()
+
+
+def test_queued_overflow_releases_carry_snapshot(tmp_path: Path) -> None:
+    sched = make_engine_duplex_scheduler(tmp_path, max_model_len=64, sliding_window=64)
+    policy = MiniCPMO45SchedulerWindowPolicy()
+    sched._window_policy = policy
+    request_id = "duplex-s.cw.e.1.r.stage0"
+
+    sched.add_request(duplex_append(request_id, 40))
+    running_step = sched.schedule()
+    assert running_step.num_scheduled_tokens == {request_id: 40}
+    request = sched.requests[request_id]
+
+    # A later append arrives while the first step is in flight. The stop path
+    # applies this append, snapshots the window, and rejects the 80-token prompt.
+    sched.add_request(duplex_append(request_id, 40))
+    assert len(request.streaming_queue) == 1
+    outputs = sched.update_from_output(
+        running_step,
+        ModelRunnerOutput(
+            req_ids=[request_id],
+            sampled_token_ids=[[3]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert request_id not in sched.requests
+    [terminal] = [
+        out
+        for batch in outputs.values()
+        for out in batch.outputs
+        if out.request_id == request_id and out.finish_reason == FinishReason.ERROR
+    ]
+    assert str(terminal.stop_reason).startswith("context_length_exceeded:")
+
+    cleanup_step = sched.schedule()
+
+    assert cleanup_step.finished_req_ids == {request_id}
+    assert policy.carry is not None and not policy.carry.snapshot_ids
 
 
 def test_queued_streaming_update_that_fits_still_resumes_the_session() -> None:

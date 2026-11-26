@@ -1154,6 +1154,14 @@ def test_flux2_klein_tiny_diffusion_has_cold_start_headroom() -> None:
     assert 'model_kwargs["init_timeout"] = settings.offline_init_timeout_s' in offline_source
 
 
+def test_longcat_image_edit_tiny_diffusion_has_cold_start_headroom() -> None:
+    """The LongCat Image Edit cold start must not retain the 600s default."""
+    settings_source = Path("tests/model_tests/diffusion/model_settings.py").read_text(encoding="utf-8")
+    longcat_edit_settings = settings_source.split('"LongCatImageEditPipeline":', 1)[1].split('"FluxPipeline":', 1)[0]
+
+    assert "offline_init_timeout_s=900" in longcat_edit_settings
+
+
 def test_flux2_klein_weekly_pixel_contract_uses_native_image_diff() -> None:
     source = Path("tests/e2e/offline_inference/test_flux2_klein.py").read_text(encoding="utf-8")
 
@@ -1570,6 +1578,87 @@ def test_tts_additions_restore_aiter_mha_and_cap_cpu_threads() -> None:
     assert len(step["commands"]) == 2
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         assert step["env"][var] == "4"
+
+
+_QUANTIZATION_MARKER = "-m 'full_model and diffusion and rocm and MI325 and cards_1 and not nvidia_only'"
+_QUANTIZATION_LTX2_NODES = (
+    "tests/diffusion/quantization/test_quantization_fp8.py::test_single_stage_ltx2_fp8_uses_less_memory",
+    '"tests/diffusion/quantization/test_quantization_quality.py::test_quantization_quality[fp8_ltx2]"',
+)
+
+
+@pytest.mark.parametrize(
+    ("label", "expected", "gguf"),
+    [
+        ("Diffusion · Quantization · 1-GPU", "1 17 165m rocm-diffusion-quantization", False),
+        ("Diffusion · Quantization · GGUF · 1-GPU", "1 2 75m rocm-diffusion-quantization-gguf", True),
+        ("Diffusion · Quantization · LTX-2 FP8 · 1-GPU", "1 2 105m rocm-diffusion-quantization-ltx2", False),
+    ],
+)
+def test_diffusion_quantization_nightly_jobs_mirror_cuda_scopes(label: str, expected: str, gguf: bool) -> None:
+    step = _find_step(label, AMD_NIGHTLY_PIPELINE)
+    commands = step["commands"]
+    command = "\n".join(commands)
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["grade"] == "NonBlocking"
+    assert step["source_file_dependencies"] == ["diffusion_quantization", "rocm_diffusion_nightly_runner"]
+    assert f"run-rocm-diffusion-nightly.sh {expected}" in " ".join(command.split())
+    assert command.count(_QUANTIZATION_MARKER) == 1
+    # The GGUF plugin replaces DiffusersPipelineLoader.load_weights; keep it
+    # away from the online-quant CPU-offload cases.
+    assert ('pip install "vllm-gguf-plugin==0.0.4"' in commands) is gguf
+    _assert_build_scoped_aiter_mha_cache(step, "run-rocm-diffusion-nightly.sh", publishes=False)
+    if label == "Diffusion · Quantization · 1-GPU":
+        assert "--ignore=tests/diffusion/quantization/test_gguf_diffusion.py" in command
+        assert all(f"--deselect {node}" in command for node in _QUANTIZATION_LTX2_NODES)
+        # BAGEL's masked AITER module is built after the cache sets AITER_JIT_DIR.
+        warm_at = next(index for index, item in enumerate(commands) if "flash_attn_func(q, q, q, causal=True)" in item)
+        assert commands.index(AITER_MHA_CACHE_PREPARE) < warm_at < len(commands) - 1
+    elif label.endswith("LTX-2 FP8 · 1-GPU"):
+        assert all(node in command for node in _QUANTIZATION_LTX2_NODES)
+
+
+@pytest.mark.parametrize(
+    ("label", "pool", "expected", "marker"),
+    [
+        (
+            "ROCm · Distributed Test · 1-GPU",
+            "mi300_1",
+            "1 27 20m rocm-distributed-1gpu",
+            "-m 'core_model and rocm and MI325 and not cards_2'",
+        ),
+        (
+            "ROCm · Distributed Test · 2-GPU",
+            "mi300_2",
+            "2 8 20m rocm-distributed-2gpu",
+            "-m 'core_model and rocm and MI325 and cards_2'",
+        ),
+    ],
+)
+def test_distributed_ready_jobs_mirror_cuda_scopes(label: str, pool: str, expected: str, marker: str) -> None:
+    step = _find_step(label, AMD_READY_PIPELINE)
+    command = " ".join("\n".join(step["commands"]).split())
+
+    assert step["agent_pool"] == pool
+    assert step["grade"] == "NonBlocking"
+    assert step["env"]["ROCM_DIFFUSION_RUN_LEVEL"] == "core_model"
+    assert f"run-rocm-diffusion-nightly.sh {expected} tests/distributed/omni_connectors/ {marker}" in command
+    # Only the single-process Mooncake connector tests need the TCP path.
+    assert ("MC_DISABLE_HIP" in step["env"]) is (pool == "mi300_1")
+
+
+def test_wan22_autoround_nightly_job_mirrors_cuda_function_test() -> None:
+    step = _find_step("Diffusion X2V · Wan2.2 AutoRound · 1-GPU", AMD_NIGHTLY_PIPELINE)
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["grade"] == "NonBlocking"
+    assert step["env"]["VLLM_ROCM_USE_AITER"] == "0"
+    assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    assert (
+        "run-rocm-full-model-nightly.sh tests/e2e/offline_inference/test_wan22_autoround_w4a16_expansion.py 8 "
+        "diffusion rocm-wan22-autoround"
+    ) in " ".join("\n".join(step["commands"]).split())
 
 
 def test_qwen3_omni_realtime_merge_job_mirrors_cuda_h100_entrypoints() -> None:
