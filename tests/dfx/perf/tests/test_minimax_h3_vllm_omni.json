@@ -484,6 +484,13 @@
           "seed": 42,
           "flow_shift": 12.0,
           "extra_params": "{\"task\":\"t2va\",\"duration\":8.7,\"aspect_ratio\":\"16:9\",\"audio_flow_shift\":3.0}"
+        },
+        "baseline": {
+          "MI300": {
+            "request_throughput": 0.0227,
+            "mean_e2el_ms": 44094.2425,
+            "mean_peak_memory_mb": 93300.0
+          }
         }
       }
     ]
@@ -551,6 +558,13 @@
           "seed": 42,
           "flow_shift": 12.0,
           "extra_params": "{\"task\":\"fl2va\",\"duration\":8.7,\"audio_flow_shift\":3.0}"
+        },
+        "baseline": {
+          "MI300": {
+            "request_throughput": 0.0208,
+            "mean_e2el_ms": 48130.3647,
+            "mean_peak_memory_mb": 93528.0
+          }
         }
       }
     ]
@@ -618,6 +632,13 @@
           "seed": 42,
           "flow_shift": 12.0,
           "extra_params": "{\"task\":\"ref2va\",\"duration\":8.7,\"aspect_ratio\":\"16:9\",\"audio_flow_shift\":3.0}"
+        },
+        "baseline": {
+          "MI300": {
+            "request_throughput": 0.0118,
+            "mean_e2el_ms": 84351.3154,
+            "mean_peak_memory_mb": 95176.0
+          }
         }
       }
     ]

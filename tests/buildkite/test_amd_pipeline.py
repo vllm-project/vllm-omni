@@ -1648,6 +1648,80 @@ def test_distributed_ready_jobs_mirror_cuda_scopes(label: str, pool: str, expect
     assert ("MC_DISABLE_HIP" in step["env"]) is (pool == "mi300_1")
 
 
+@pytest.mark.parametrize(
+    ("label", "pool", "expected", "config", "cards"),
+    [
+        (
+            "Diffusion X2I · Perf · Qwen-Image-2.1 · 1-GPU",
+            "mi300_1",
+            "1 5 165m rocm-perf-qwen-image-21-1gpu",
+            "test_qwen_image_21_vllm_omni",
+            1,
+        ),
+        (
+            "Diffusion X2V · Perf · Wan2.2 I2V · 1-GPU",
+            "mi300_1",
+            "1 1 165m rocm-perf-wan22-i2v-1gpu",
+            "test_wan22_i2v_vllm_omni",
+            1,
+        ),
+        (
+            "Diffusion X2V · Perf · Wan2.2 I2V · 2-GPU",
+            "mi300_2",
+            "2 2 165m rocm-perf-wan22-i2v-2gpu",
+            "test_wan22_i2v_vllm_omni",
+            2,
+        ),
+        (
+            "Diffusion X2V · Perf · MiniMax-H3 · 4-GPU",
+            "mi300_4",
+            "4 4 165m rocm-perf-minimax-h3-4gpu",
+            "test_minimax_h3_vllm_omni",
+            4,
+        ),
+    ],
+)
+def test_diffusion_perf_nightly_jobs_mirror_cuda_perf(
+    label: str, pool: str, expected: str, config: str, cards: int
+) -> None:
+    step = _find_step(label, AMD_NIGHTLY_PIPELINE)
+    command = " ".join("\n".join(step["commands"]).split())
+    artifact = expected.split()[-1]
+
+    assert step["agent_pool"] == pool
+    assert step["grade"] == "NonBlocking"
+    assert step["artifact_paths"] == [f"artifacts/{artifact}/**/*"]
+    _assert_build_scoped_aiter_mha_cache(step, "run-rocm-diffusion-nightly.sh", publishes=False)
+    # Results land in the uploaded artifact directory.
+    assert (
+        f'export BENCHMARK_DIR="$${{BUILDKITE_BUILD_CHECKOUT_PATH:?}}/artifacts/{artifact}/benchmark-results"'
+        in command
+    )
+    assert (
+        f"run-rocm-diffusion-nightly.sh {expected} tests/dfx/perf/scripts/run_benchmark.py "
+        f"--test-config-file tests/dfx/perf/tests/{config}.json --assert-baseline "
+        f"-m 'full_model and diffusion and rocm and MI325 and cards_{cards}'"
+    ) in command
+
+
+def test_chatterbox_perf_nightly_job_collects_until_mi300_baselines() -> None:
+    step = _find_step("Chatterbox TTS Perf", AMD_NIGHTLY_PIPELINE)
+    command = " ".join("\n".join(step["commands"]).split())
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["grade"] == "NonBlocking"
+    assert "--baseline collect" in command
+    # One result per concurrency point: 1 + 3 + 1 (stress) + 1 + 3 for the graph variants.
+    for model, count in (
+        ("test_chatterbox_turbo_graph", 9),
+        ("test_chatterbox_turbo_eager", 1),
+        ("test_chatterbox_original_graph", 9),
+        ("test_chatterbox_original_eager", 1),
+    ):
+        assert f"--expect-results {model} {count}" in command
+    assert command.count("test_chatterbox_") - command.count("--expect-results test_chatterbox_") == 12
+
+
 def test_wan22_autoround_nightly_job_mirrors_cuda_function_test() -> None:
     step = _find_step("Diffusion X2V · Wan2.2 AutoRound · 1-GPU", AMD_NIGHTLY_PIPELINE)
 
