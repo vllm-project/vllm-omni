@@ -86,6 +86,18 @@ def test_serve_parser_accepts_nested_watermark_config() -> None:
     assert args.get_explicit_kwargs_dict()["watermark_config"] == args.watermark_config
 
 
+def test_serve_parser_ulysses_a2a_backend_choices_match_config() -> None:
+    """The CLI keeps its own copy of the backend names so the docs build need not import vllm."""
+    from vllm_omni.diffusion.data import ULYSSES_A2A_BACKENDS
+
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    serve_parser = OmniServeCommand().subparser_init(subparsers)
+    action = next(a for a in serve_parser._actions if "--ulysses-a2a-backend" in a.option_strings)
+
+    assert tuple(action.choices) == ULYSSES_A2A_BACKENDS
+
+
 def test_watermark_config_collision_uses_omni_validation(capsys: pytest.CaptureFixture[str]) -> None:
     """Ensure an upstream watermark argument is extended without a duplicate flag."""
     parser = TrackingArgumentParser()
@@ -776,15 +788,14 @@ def test_serve_parser_rejects_negative_robot_openpi_idle_timeout() -> None:
         parser.parse_args(["serve", "fake-model", "--omni", "--robot-openpi-idle-timeout", "-1"])
 
 
-def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
+@pytest.mark.parametrize("flag", ["--ulysses-a2a-permute", "--no-ulysses-a2a-permute"])
+def test_serve_parser_rejects_removed_ulysses_a2a_permute(flag: str) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
 
-    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-a2a-permute"])
-
-    assert args.ulysses_a2a_permute is True
-    assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", flag])
 
 
 def test_serve_parser_accepts_ulysses_overlap_chunks() -> None:
@@ -793,7 +804,7 @@ def test_serve_parser_accepts_ulysses_overlap_chunks() -> None:
     OmniServeCommand().subparser_init(subparsers)
 
     args = parser.parse_args(
-        ["serve", "fake-model", "--omni", "--ulysses-a2a-permute", "--ulysses-overlap-chunks", "4"]
+        ["serve", "fake-model", "--omni", "--ulysses-a2a-backend", "copy_engine", "--ulysses-overlap-chunks", "4"]
     )
 
     assert args.ulysses_overlap_chunks == 4

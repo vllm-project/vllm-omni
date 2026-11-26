@@ -819,15 +819,18 @@ class OmniServeCommand(CLISubcommand):
             "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
         )
         omni_config_group.add_argument(
-            "--ulysses-a2a-permute",
-            action=argparse.BooleanOptionalAction,
+            "--ulysses-a2a-backend",
+            type=str,
             default=None,
+            # Kept in sync with vllm_omni.diffusion.data.ULYSSES_A2A_BACKENDS (asserted in tests); importing it here
+            # would pull in vllm when the docs build renders the parser.
+            choices=["auto", "nccl", "copy_engine"],
             help=(
-                "Enable Ulysses all-to-all over platform symmetric memory "
-                "(CUDA copy engines on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
-                "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
-                "TorchNPU NPUSHMEM and Triton-Ascend, "
-                "with libshmem.so on LD_LIBRARY_PATH. Defaults to disabled."
+                "Transport for the strict Ulysses all-to-all. 'auto' (default) uses the copy engine when the "
+                "Ulysses group is on one node with CUDA peer access between all GPUs, otherwise 'nccl'. "
+                "'copy_engine' uses CUDA copy engines on CUDA and TorchNPU on NPU. Only strict Ulysses layouts are "
+                "eligible. NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
+                "TorchNPU NPUSHMEM and Triton-Ascend, with libshmem.so on LD_LIBRARY_PATH."
             ),
         )
         omni_config_group.add_argument(
@@ -835,9 +838,9 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=None,
             help=(
-                "With --ulysses-a2a-permute on CUDA, split each rank's attention heads into this many chunks and "
-                "move them on copy engines while earlier chunks compute (must divide num_heads / ulysses_degree; "
-                "0 disables). Requires strict pure Ulysses. Defaults to disabled."
+                "On the copy-engine transport, split each rank's attention heads into this many chunks and move them "
+                "on copy engines while earlier chunks compute (must divide num_heads / ulysses_degree; 0 disables; "
+                "ignored when auto resolves to nccl). Requires strict pure Ulysses. Defaults to disabled."
             ),
         )
         omni_config_group.add_argument(
