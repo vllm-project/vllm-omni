@@ -480,14 +480,13 @@ class MOSSImageTransformer(nn.Module):
         self.final_out = MOSSImageFinalOut(self.final_norm_video, self.final_linear_video)
 
     def _time_modulation(self, timestep, batch: int, device: torch.device):
-        times = torch.as_tensor(timestep, device=device, dtype=torch.float32).reshape(-1)
-        times = times.expand(batch)
         # Training computes the sinusoid in float64 and feeds float32 into its MLP.
         # Compute it on the CPU for MPS, which does not support float64.
-        if device.type == "mps":
-            times = times.cpu()
+        compute_device = torch.device("cpu") if device.type == "mps" else device
+        times = torch.as_tensor(timestep, device=compute_device, dtype=torch.float32).reshape(-1)
+        times = times.expand(batch)
         half = self.freq_dim // 2
-        freq = 10000 ** (-torch.arange(half, device=times.device, dtype=torch.float64) / half)
+        freq = 10000 ** (-torch.arange(half, device=compute_device, dtype=torch.float64) / half)
         phase = times.double()[:, None] * freq
         embedding = torch.cat((phase.cos(), phase.sin()), -1).float().to(device)
         time = self.time_embedding(embedding.to(self.time_embedding[0].weight.dtype)).float()
