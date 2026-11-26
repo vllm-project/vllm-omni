@@ -142,6 +142,103 @@ steps:
             tests/e2e/online_serving/test_minicpmo_4_5_expansion.py
             tests/e2e/online_serving/test_joyai_vl_interaction.py
 
+  # MI300 owners for CUDA NIGHTLY "Diffusion · Quantization Test with H100 ·
+  # Single-GPU" and "with L4" (same selectors minus the NVIDIA-only FlashInfer /
+  # CuTe DSL backends; GGUF and LTX-2 run separately), and for "Diffusion X2V · Wan2.2
+  # Autoround Function Test". Non-blocking until burn-in.
+  - group: ":full_moon: Diffusion Quantization MI300 Nightly"
+    steps:
+      - label: "Diffusion · Quantization · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: [diffusion_quantization, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-diffusion-quantization/**/*
+        commands:
+          # Z-Image cold-built the unmasked BF16 AITER MHA module for 1581 s in
+          # AMD build 17607; restore the provenance-checked copy instead.
+          - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
+          # BAGEL's causal attention needs the dense masked AITER MHA module,
+          # which the cache does not hold. Built inside stage init it exceeds
+          # the 300 s timeout; build it into the job-local AITER_JIT_DIR first.
+          - >-
+            python -c 'import torch; from aiter import flash_attn_func;
+            q = torch.randn(1, 32, 8, 128, device="cuda", dtype=torch.bfloat16);
+            flash_attn_func(q, q, q, causal=True)'
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 17 165m rocm-diffusion-quantization
+            tests/diffusion/quantization
+            --ignore=tests/diffusion/quantization/test_gguf_diffusion.py
+            --deselect tests/diffusion/quantization/test_quantization_fp8.py::test_single_stage_ltx2_fp8_uses_less_memory
+            --deselect "tests/diffusion/quantization/test_quantization_quality.py::test_quantization_quality[fp8_ltx2]"
+            -m 'full_model and diffusion and rocm and MI325 and cards_1 and not nvidia_only'
+
+      # vllm-gguf-plugin replaces DiffusersPipelineLoader.load_weights with a
+      # narrower signature, breaking online-quant CPU streaming; CUDA likewise
+      # installs it only in its L4 job.
+      - label: "Diffusion · Quantization · GGUF · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        source_file_dependencies: [diffusion_quantization, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-diffusion-quantization-gguf/**/*
+        commands:
+          - pip install "vllm-gguf-plugin==0.0.4"
+          # Same cold unmasked AITER MHA build (1570 s in AMD build 17607).
+          - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 2 75m rocm-diffusion-quantization-gguf
+            tests/diffusion/quantization/test_gguf_diffusion.py
+            -m 'full_model and diffusion and rocm and MI325 and cards_1 and not nvidia_only'
+
+      # LTX-2 (19B) loads BF16 and FP8 copies; keep it in a fresh process so a
+      # host-memory failure cannot hide the other quantization results.
+      - label: "Diffusion · Quantization · LTX-2 FP8 · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        source_file_dependencies: [diffusion_quantization, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-diffusion-quantization-ltx2/**/*
+        commands:
+          # Same cold unmasked AITER MHA build (1574 s in AMD build 17607).
+          - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 2 105m rocm-diffusion-quantization-ltx2
+            tests/diffusion/quantization/test_quantization_fp8.py::test_single_stage_ltx2_fp8_uses_less_memory
+            "tests/diffusion/quantization/test_quantization_quality.py::test_quantization_quality[fp8_ltx2]"
+            -m 'full_model and diffusion and rocm and MI325 and cards_1 and not nvidia_only'
+
+      # GPTQ-packed W4A16 weights, as in the weekly Qwen-Image AutoRound job.
+      - label: "Diffusion X2V · Wan2.2 AutoRound · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        source_file_dependencies: diffusion_wan22_function
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+          ROCM_E2E_TIMEOUT_MINUTES: "105"
+        artifact_paths:
+          - artifacts/rocm-wan22-autoround/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_wan22_autoround_w4a16_expansion.py 8 diffusion rocm-wan22-autoround
+
   # MI325 is the repository's legacy ROCm pytest marker. The AMD template maps
   # agent_pool to the current MI300 Buildkite queues independently of that mark.
   - group: ":full_moon: Qwen3-Omni MI300 Nightly"
