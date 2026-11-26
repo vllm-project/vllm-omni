@@ -264,6 +264,7 @@ class OmniDiffusionSamplingParams:
     # Latent tensors
     latents: torch.Tensor | None = None
     audio_latents: torch.Tensor | None = None
+    action_latents: torch.Tensor | None = None
     raw_latent_shape: torch.Tensor | None = None
     noise_pred: torch.Tensor | None = None
     image_latent: torch.Tensor | None = None
