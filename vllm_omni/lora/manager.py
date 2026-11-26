@@ -18,11 +18,7 @@ from vllm.lora.lora_model import LoRAModel
 from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
-from vllm.lora.utils import (
-    get_adapter_absolute_path,
-    get_supported_lora_modules,
-    replace_submodule,
-)
+from vllm.lora.utils import get_supported_lora_modules, replace_submodule
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 
 from vllm_omni.lora.binding import (
@@ -35,6 +31,7 @@ from vllm_omni.lora.binding import (
     normalize_target_modules,
 )
 from vllm_omni.lora.capability import MergedLoRASpec, resolve_merged_lora_spec
+from vllm_omni.lora.loader import FilesystemLoRALoader, LoRALoader
 from vllm_omni.lora.merged_weights import MergedLinearWeights
 from vllm_omni.lora.request import TensorLoRARequest
 from vllm_omni.lora.utils import round_lora_scale, stable_lora_int_id
@@ -144,6 +141,7 @@ class LoRAManager:
         lora_scale: float = 1.0,
         max_num_batched_tokens: int | None = None,
         lora_application: str = "runtime",
+        lora_loader: LoRALoader | None = None,
     ):
         """
         Initialize the LoRAManager.
@@ -155,6 +153,10 @@ class LoRAManager:
             max_num_batched_tokens: Preallocated token-mapping capacity for MoE
                 LoRA forwards.
             lora_application: Runtime adapters or one globally merged policy.
+            lora_loader: Optional instance-scoped adapter loader. A pipeline may
+                alternatively expose ``diffusion_lora_loader`` during worker
+                initialization. The default preserves filesystem loading and
+                pipeline-owned loader hooks.
         """
         self.pipeline = pipeline
         self.device = device
@@ -190,6 +192,18 @@ class LoRAManager:
         )
         # Include indexed expert suffixes before replacing MoE runners.
         self._expected_lora_modules = self._expand_expected_modules_for_moe(self._expected_lora_modules)
+        # A custom pipeline can supply its loader during worker initialization;
+        # direct manager users can override it explicitly at construction time.
+        pipeline_loader = getattr(pipeline, "diffusion_lora_loader", None)
+        self._lora_loader = (
+            lora_loader
+            or pipeline_loader
+            or FilesystemLoRALoader(
+                pipeline=self.pipeline,
+                expected_lora_modules=list(self._expected_lora_modules),
+                dtype=self.dtype,
+            )
+        )
 
         # LRU-style cache management
         self.max_cached_adapters = max_cached_adapters  # max_cpu_loras
@@ -867,36 +881,7 @@ class LoRAManager:
                     raise ValueError(f"LoRA factor rank does not match PEFT config: {weights.module_name}")
             return lora_model, peft_helper
 
-        lora_path = get_adapter_absolute_path(lora_request.lora_path)
-        logger.debug("Resolved LoRA path: %s", lora_path)
-
-        model_loader = getattr(self.pipeline, "_load_diffusion_lora_adapter", None)
-        loaded = None
-        if callable(model_loader):
-            loaded = model_loader(
-                lora_request=lora_request,
-                lora_path=lora_path,
-                dtype=self.dtype,
-            )
-
-        if loaded is None:
-            peft_helper = PEFTHelper.from_local_dir(
-                lora_path,
-                max_position_embeddings=None,  # no need in diffusion
-            )
-
-            lora_model = LoRAModel.from_local_checkpoint(
-                lora_path,
-                expected_lora_modules=self._expected_lora_modules,
-                peft_helper=peft_helper,
-                lora_model_id=lora_request.lora_int_id,
-                device="cpu",  # consistent w/ vllm's behavior
-                dtype=self.dtype,
-                model_vocab_size=None,
-                weights_mapper=None,
-            )
-        else:
-            lora_model, peft_helper = loaded
+        lora_model, peft_helper = self._lora_loader.load(lora_request)
 
         logger.info(
             "Loaded PEFT config: r=%d, lora_alpha=%d, target_modules=%s",
