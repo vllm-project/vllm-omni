@@ -131,6 +131,32 @@ def test_native_batch_waiting_still_rejects_unsupported_state_or_topology(constr
         construct_scheduler(config)
 
 
+@pytest.mark.parametrize("policy", ["fixed", "idle_wait"])
+def test_personaplex_native_decoder_enables_batch_waiting(construct_scheduler, monkeypatch, policy):
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+    pipeline = resolve_pipeline_config("personaplex")
+    deploy = load_deploy_config(get_deploy_config_path("personaplex_duplex_mrv2.yaml"))
+    codec = merge_pipeline_deploy(pipeline, deploy)[1]
+    config = _config(
+        native=codec.yaml_engine_args["use_v2_model_runner"],
+        stateful=codec.yaml_engine_args["retains_state_across_chunks"],
+        capacity=codec.yaml_engine_args["max_num_seqs"],
+    )
+    config.additional_config = {
+        "generation_min_batch_size": 4,
+        "generation_max_wait_ms": 10,
+        "generation_coalescing_policy": policy,
+    }
+
+    scheduler = construct_scheduler(config)
+
+    assert scheduler._native_data_plane
+    assert scheduler._retains_state_across_chunks
+    assert scheduler._generation_min_batch_size == 4
+    assert scheduler._generation_max_wait_s == 0.01
+    assert scheduler._generation_coalescing_policy == policy
+
+
 @pytest.mark.parametrize(
     "extras,message",
     [
