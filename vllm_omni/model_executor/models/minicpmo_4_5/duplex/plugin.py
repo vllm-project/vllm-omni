@@ -20,8 +20,9 @@ from base64 import b64decode
 from binascii import Error as BinasciiError
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
+from hashlib import sha256
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -65,6 +66,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import MiniCPMO45PcmAppendBuffer
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     APPEND_TEXT_TOKEN_IDS_KEY,
+    CHECKPOINT_KEY,
     REPLAY_CONTEXT_KEY,
     MiniCPMO45DuplexPolicy,
     MiniCPMO45DuplexWindowConfig,
@@ -88,6 +90,7 @@ _REPLAY_MAX_TOKENS = 2048
 @dataclass(frozen=True, slots=True)
 class _ReplayInput:
     turn_id: int
+    input_commit_seq: int
     payload: dict[str, object]
     num_bytes: int
     token_budget: int
@@ -96,11 +99,18 @@ class _ReplayInput:
 
 
 @dataclass(frozen=True, slots=True)
+class _ReplaySource:
+    item_id: str
+    source_id: int
+
+
+@dataclass(frozen=True, slots=True)
 class _ReplayTurn:
     item_id: str | None
     inputs: list[_ReplayInput]
     epoch: int
-    user_item_id: str | None
+    source: _ReplaySource | None
+    completed_text: str = ""
 
 
 @dataclass(slots=True)
@@ -114,8 +124,9 @@ class MiniCPMO45ServingSessionState(DefaultDuplexModelSessionState):
     replay_epoch: int = -1
     replay_pending: list[_ReplayInput] = field(default_factory=list)
     replay_overflow_turn: int | None = None
-    replay_commits: dict[int, str] = field(default_factory=dict)
+    replay_commits: dict[int, _ReplaySource] = field(default_factory=dict)
     replay_completed: list[_ReplayTurn] = field(default_factory=list)
+    replay_history_eligible: bool = True
 
 
 _DUPLEX_CHUNK_SAMPLES = 16000
@@ -162,6 +173,7 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "duplex_window_previous_marker_token_ids",
         "duplex_window_special_token_ids",
         REPLAY_CONTEXT_KEY,
+        CHECKPOINT_KEY,
     }
 )
 
@@ -389,9 +401,14 @@ def build_duplex_data_plane_prompt(
     append_text_ids = runtime_config.get(APPEND_TEXT_TOKEN_IDS_KEY)
     if isinstance(append_text_ids, list):
         token_budget += len(append_text_ids)
-    session_config = {key: value for key, value in session_config.items() if key != REPLAY_CONTEXT_KEY}
+    checkpoint = session_config.get(CHECKPOINT_KEY)
+    session_config = {
+        key: value for key, value in session_config.items() if key not in (REPLAY_CONTEXT_KEY, CHECKPOINT_KEY)
+    }
     live_token_budget = token_budget
     model_fields: dict[str, object] = {}
+    if isinstance(checkpoint, dict):
+        model_fields[CHECKPOINT_KEY] = checkpoint
     if seq == 1 and fence.epoch > 0 and isinstance(replay, list):
         replay_budget = sum(turn["token_budget"] for turn in replay)
         token_budget += replay_budget
@@ -826,7 +843,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         return tuple(configured)
 
     def observe_submitted_append(
-        self, *, state: DuplexModelSessionState, fence: DuplexFence, prompt: Mapping[str, object]
+        self, *, state: DuplexModelSessionState, fence: DuplexFence, prompt: Mapping[str, object], input_commit_seq: int
     ) -> None:
         # The native media/text replay does not cover delegated tool results.
         if self.plugin_id != MiniCPMO45DuplexPlugin.plugin_id:
@@ -838,6 +855,10 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             return
         payload = duplex["payload"]
         self._open_replay_epoch(state, fence.epoch)
+        if fence.epoch > 0 and duplex["seq"] == 1:
+            restored = duplex.get(REPLAY_CONTEXT_KEY, ())
+            if len(restored) != len(state.replay_completed):
+                state.replay_history_eligible = False
         if not isinstance(payload, dict):
             return
         fields = ("audio", "data", "format", "sample_rate_hz", "video_frames", "text_token_ids")
@@ -858,10 +879,12 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         ):
             state.replay_pending.clear()
             state.replay_overflow_turn = fence.turn_id
+            state.replay_history_eligible = False
         if state.replay_overflow_turn is None or fence.turn_id > state.replay_overflow_turn:
             state.replay_pending.append(
                 _ReplayInput(
                     fence.turn_id,
+                    input_commit_seq,
                     media,
                     num_bytes,
                     budget,
@@ -878,14 +901,38 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             state.replay_commits.clear()
             state.replay_overflow_turn = None
 
-    def observe_committed_input(self, *, state: DuplexModelSessionState, fence: DuplexFence, item_id: str) -> None:
+    def observe_committed_input(
+        self, *, state: DuplexModelSessionState, fence: DuplexFence, item_id: str, source_id: int, input_commit_seq: int
+    ) -> None:
         if self.plugin_id == MiniCPMO45DuplexPlugin.plugin_id:
             assert isinstance(state, MiniCPMO45ServingSessionState)
             self._open_replay_epoch(state, fence.epoch)
-            state.replay_commits[fence.turn_id] = item_id
+            pending_seqs = {unit.input_commit_seq for unit in state.replay_pending}
+            state.replay_commits = {seq: source for seq, source in state.replay_commits.items() if seq in pending_seqs}
+            source = _ReplaySource(item_id, source_id)
+            state.replay_commits[input_commit_seq] = source
+            for index, turn in enumerate(state.replay_completed):
+                if (
+                    turn.epoch == fence.epoch
+                    and turn.source is None
+                    and self._input_commit_seq(turn.inputs) == input_commit_seq
+                ):
+                    state.replay_completed[index] = replace(turn, source=source)
+
+    @staticmethod
+    def _input_commit_seq(inputs: list[_ReplayInput]) -> int | None:
+        # Synthetic silence advancing a reply owns no conversation item.
+        seqs = {unit.input_commit_seq for unit in inputs if unit.user_media}
+        return seqs.pop() if len(seqs) == 1 else None
 
     def observe_response_end(
-        self, *, state: DuplexModelSessionState, fence: DuplexFence, response_id: str, completed: bool
+        self,
+        *,
+        state: DuplexModelSessionState,
+        fence: DuplexFence,
+        response_id: str,
+        completed: bool,
+        assistant_text: str = "",
     ) -> None:
         assert isinstance(state, MiniCPMO45ServingSessionState)
         if state.replay_epoch != fence.epoch:
@@ -893,32 +940,70 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         item_id = f"item_{response_id}"
         inputs = [unit for unit in state.replay_pending if unit.turn_id <= fence.turn_id]
         state.replay_pending = [unit for unit in state.replay_pending if unit.turn_id > fence.turn_id]
-        user_item_id = state.replay_commits.get(fence.turn_id)
-        state.replay_commits = {turn: item for turn, item in state.replay_commits.items() if turn > fence.turn_id}
+        commit_seq = self._input_commit_seq(inputs)
+        source = state.replay_commits.get(commit_seq) if commit_seq is not None else None
         if not completed:
             # A generated reply can still be cancelled while the client plays it.
             for index, turn in enumerate(state.replay_completed):
                 if turn.item_id == item_id:
                     del state.replay_completed[index]
-                    inputs, user_item_id = turn.inputs, turn.user_item_id
+                    inputs, source = turn.inputs, turn.source
                     break
             inputs = [unit for unit in inputs if unit.user_media]
-            if user_item_id and inputs:
-                state.replay_completed.append(_ReplayTurn(None, inputs, fence.epoch, user_item_id))
+            if source is not None and inputs:
+                state.replay_completed.append(_ReplayTurn(None, inputs, fence.epoch, source))
         elif inputs and (state.replay_overflow_turn is None or fence.turn_id > state.replay_overflow_turn):
-            state.replay_completed.append(_ReplayTurn(item_id, inputs, fence.epoch, user_item_id))
+            state.replay_completed.append(_ReplayTurn(item_id, inputs, fence.epoch, source, assistant_text.strip()))
         while sum(unit.num_bytes for turn in state.replay_completed for unit in turn.inputs) > _REPLAY_MAX_BYTES:
             state.replay_completed.pop(0)
+            state.replay_history_eligible = False
         while sum(unit.token_budget for turn in state.replay_completed for unit in turn.inputs) > _REPLAY_MAX_TOKENS:
             state.replay_completed.pop(0)
+            state.replay_history_eligible = False
 
     def prepare_prompt_config(
         self, config: dict[str, object], *, state: DuplexModelSessionState, payload: dict[str, object]
     ) -> dict[str, object]:
         assert isinstance(state, MiniCPMO45ServingSessionState)
         if state.replay_completed:
-            return {**config, REPLAY_CONTEXT_KEY: state.replay_completed.copy()}
+            return {
+                **config,
+                REPLAY_CONTEXT_KEY: state.replay_completed.copy(),
+                CHECKPOINT_KEY: state.replay_history_eligible,
+            }
         return config
+
+    @staticmethod
+    def _source_is_current(turn: _ReplayTurn, messages: dict, sources: Mapping) -> bool:
+        return (
+            turn.source is not None
+            and sources.get(turn.source.item_id) == turn.source.source_id
+            and messages.get(turn.source.item_id, {}).get("role") == "user"
+        )
+
+    @staticmethod
+    def _checkpoint_history(turns: list[_ReplayTurn], session_config: dict[str, object]) -> str | None:
+        messages = dict(zip(session_config.get("conversation_item_ids", ()), session_config.get("conversation", ())))
+        sources = session_config.get("conversation_user_source_ids", {})
+        history = []
+        for turn in turns:
+            if not MiniCPMO45DuplexPlugin._source_is_current(turn, messages, sources):
+                return None
+            assert turn.source is not None
+            if turn.item_id is None:
+                history.append((turn.source.source_id, None, None))
+                continue
+            assistant = messages.get(turn.item_id, {})
+            text = assistant.get("content")
+            if (
+                assistant.get("role") != "assistant"
+                or not isinstance(text, str)
+                or not turn.completed_text
+                or text.strip() != turn.completed_text
+            ):
+                return None
+            history.append((turn.source.source_id, turn.item_id, text))
+        return sha256(json.dumps(history, sort_keys=True).encode()).hexdigest() if history else None
 
     def _prepare_replay(self, session_config: dict[str, object], runtime_config: dict[str, object]) -> None:
         turns = session_config.get(REPLAY_CONTEXT_KEY)
@@ -930,13 +1015,15 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             session_config.pop(REPLAY_CONTEXT_KEY)
             return
         messages = dict(zip(session_config.get("conversation_item_ids", ()), session_config.get("conversation", ())))
+        sources = session_config.get("conversation_user_source_ids", {})
         selected = []
+        selected_turns = []
         remaining = _REPLAY_MAX_TOKENS
         for turn in reversed(turns):
+            if not self._source_is_current(turn, messages, sources):
+                continue
             user_only = turn.item_id is None
             if user_only:
-                if messages.get(turn.user_item_id, {}).get("role") != "user":
-                    continue
                 token_ids: list[int] = []
                 # Start a fresh audio encoder after the completed history and close
                 # the last listening unit before the live append.
@@ -961,8 +1048,21 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
                     "token_budget": budget,
                 }
             )
+            selected_turns.append(turn)
             remaining -= budget
         session_config[REPLAY_CONTEXT_KEY] = list(reversed(selected))
+        if (
+            session_config.get(CHECKPOINT_KEY) is True
+            and selected_turns
+            and selected_turns[0].item_id is None
+            and len(selected_turns) == len(turns)
+        ):
+            if signature := self._checkpoint_history(turns[:-1], session_config):
+                session_config[CHECKPOINT_KEY] = {
+                    "history": signature,
+                    "interrupted_turn": turns[-1].inputs[-1].turn_id,
+                    "reuse_turns": len(turns) - 1,
+                }
 
     async def prepare_append_plan(
         self,
@@ -992,7 +1092,13 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             if seq == 1 and fence.epoch > 0:
                 self._prepare_replay(session_config, runtime_config)
             else:
-                session_config.pop(REPLAY_CONTEXT_KEY)
+                turns = session_config.pop(REPLAY_CONTEXT_KEY)
+                if session_config.get(CHECKPOINT_KEY) is True and turn_seq == 1 and isinstance(turns, list) and turns:
+                    if signature := self._checkpoint_history(turns, session_config):
+                        session_config[CHECKPOINT_KEY] = {
+                            "history": signature,
+                            "completed_turn": turns[-1].inputs[-1].turn_id,
+                        }
         return self.plan_append(
             request_id=request_id,
             fence=fence,

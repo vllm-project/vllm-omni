@@ -285,7 +285,8 @@ def test_final_exact_chunk_append_reserves_one_unit_not_two(seq):
 
 
 @pytest.mark.asyncio
-async def test_cancel_restore_keeps_committed_user_media_and_excludes_cancelled_answer(monkeypatch):
+@pytest.mark.parametrize("late_commit", [False, True], ids=["commit-before-done", "commit-after-done"])
+async def test_cancel_restore_keeps_committed_user_media_and_excludes_cancelled_answer(monkeypatch, late_commit):
     _stub_tokenizer(monkeypatch)
     plugin = _plugin()
     state = plugin.create_session_state()
@@ -318,23 +319,37 @@ async def test_cancel_restore_keeps_committed_user_media_and_excludes_cancelled_
     new = {"type": "audio", "video_frames": ["new-frame"]}
 
     first_plan = await plan(blue, 1, first)
-    plugin.observe_submitted_append(state=state, fence=blue, prompt=first_plan.prompt)
-    plugin.observe_response_end(state=state, fence=blue, response_id="blue", completed=True)
+    plugin.observe_submitted_append(state=state, fence=blue, prompt=first_plan.prompt, input_commit_seq=1)
+    plugin.observe_committed_input(state=state, fence=blue, item_id="user_blue", source_id=1, input_commit_seq=1)
+    plugin.observe_response_end(state=state, fence=blue, response_id="blue", completed=True, assistant_text="Blue.")
     old_plan = await plan(cancelled, 2, old)
-    plugin.observe_submitted_append(state=state, fence=cancelled, prompt=old_plan.prompt)
-    plugin.observe_committed_input(state=state, fence=cancelled, item_id="user_old")
+    plugin.observe_submitted_append(state=state, fence=cancelled, prompt=old_plan.prompt, input_commit_seq=2)
+    if not late_commit:
+        plugin.observe_committed_input(
+            state=state, fence=cancelled, item_id="user_old", source_id=2, input_commit_seq=2
+        )
     # Even if a generated reply was archived before playback, cancel excludes
     # it. An already-visible prefix can still be present in conversation.
     plugin.observe_response_end(state=state, fence=cancelled, response_id="old", completed=True)
+    if late_commit:
+        plugin.observe_committed_input(
+            state=state,
+            fence=DuplexFence("session", epoch=0, turn_id=3),
+            item_id="user_old",
+            source_id=2,
+            input_commit_seq=2,
+        )
     plugin.observe_response_end(state=state, fence=cancelled, response_id="old", completed=False)
     config = plugin.prepare_prompt_config(
         {
             "conversation": [
+                {"role": "user", "content": "What color is this?"},
                 {"role": "assistant", "content": "Blue."},
                 {"role": "user", "content": "Please count."},
                 {"role": "assistant", "content": "One"},
             ],
-            "conversation_item_ids": ("item_blue", "user_old", "item_old"),
+            "conversation_item_ids": ("user_blue", "item_blue", "user_old", "item_old"),
+            "conversation_user_source_ids": {"user_blue": 1, "user_old": 2},
         },
         state=state,
         payload=new,
@@ -352,9 +367,20 @@ async def test_cancel_restore_keeps_committed_user_media_and_excludes_cancelled_
     assert len(recovered.prompt["prompt_token_ids"]) == (
         len(baseline.prompt["prompt_token_ids"]) + turn["token_budget"] + interrupted["token_budget"]
     )
-    deleted_user = {**config, "conversation": [config["conversation"][0]], "conversation_item_ids": ("item_blue",)}
-    without_deleted = await plan(recovery, 1, new, deleted_user)
-    assert without_deleted.prompt["model_intermediate_buffer"]["duplex"][module.REPLAY_CONTEXT_KEY] == [turn]
+    assert envelope[module.CHECKPOINT_KEY]["reuse_turns"] == 1
+
+    deleted_user = {
+        **config,
+        "conversation": config["conversation"][1:],
+        "conversation_item_ids": config["conversation_item_ids"][1:],
+        "conversation_user_source_ids": {"user_old": 2},
+    }
+    reused_public_id = {**config, "conversation_user_source_ids": {"user_blue": 1, "user_old": 9}}
+    for edited, expected in ((deleted_user, [interrupted]), (reused_public_id, [turn])):
+        result = await plan(recovery, 1, new, edited)
+        duplex = result.prompt["model_intermediate_buffer"]["duplex"]
+        assert duplex[module.REPLAY_CONTEXT_KEY] == expected
+        assert module.CHECKPOINT_KEY not in duplex
     for fence, seq in ((blue, 1), (recovery, 2)):
         continued = await plan(fence, seq, new, config)
         assert module.REPLAY_CONTEXT_KEY not in continued.prompt["model_intermediate_buffer"]["duplex"]

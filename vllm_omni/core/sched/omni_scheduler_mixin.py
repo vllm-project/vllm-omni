@@ -854,7 +854,13 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         one terminal error instead, so the caller learns the output is
         truncated rather than receiving audio that silently restarts.
         """
-        if not getattr(self, "recompute_preemption_fails", False) or getattr(self, "_resetting_prefix_cache", False):
+        # A donated native duplex prefix exists only in KV. Generic recompute
+        # would replay its placeholder IDs and silently lose the media context.
+        has_native_checkpoint = getattr(request, "_omni_has_native_checkpoint", False)
+        fail_by_policy = getattr(self, "recompute_preemption_fails", False) and not getattr(
+            self, "_resetting_prefix_cache", False
+        )
+        if not has_native_checkpoint and not fail_by_policy:
             return super()._preempt_request(request, timestamp, drop_stale_output=drop_stale_output)
         if request.is_finished():
             return

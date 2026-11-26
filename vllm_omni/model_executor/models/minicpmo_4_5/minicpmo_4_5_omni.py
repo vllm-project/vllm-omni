@@ -40,6 +40,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     APPEND_TEXT_TOKEN_IDS_KEY,
+    CHECKPOINT_KEY,
     REPLAY_CONTEXT_KEY,
     MiniCPMO45DuplexPolicy,
 )
@@ -600,6 +601,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             prompt_len = int(prompt_len) if prompt_len is not None else int(full_req_embeds.shape[0])
         except (TypeError, ValueError):
             prompt_len = int(full_req_embeds.shape[0])
+        reused_prefix = duplex.get(CHECKPOINT_KEY, {}).get("reused_tokens", 0)
+        prompt_len -= reused_prefix
         pad_token_id = helper.stage_padding_token_id()
         if prompt_len > int(full_req_embeds.shape[0]):
             pad_len = prompt_len - int(full_req_embeds.shape[0])
@@ -637,6 +640,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             token_offset = max(0, int(token_offset))
         except (TypeError, ValueError):
             token_offset = 0
+        token_offset = max(0, token_offset - reused_prefix)
         req_embeds = full_req_embeds[token_offset : token_offset + span_len]
         if req_embeds.shape[0] < span_len:
             pad_ids = torch.full(
@@ -758,10 +762,26 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if hasattr(helper.thinker, "audio_past_key_values"):
                 helper.thinker.audio_past_key_values = None
             helper._configure_streaming_processor(state)
-            helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
+            checkpoint = duplex.get(CHECKPOINT_KEY, {})
+            if reused_tokens := checkpoint.get("reused_tokens"):
+                state.reused_context_tokens = reused_tokens
+                helper._prepare_session_context(
+                    state, session_config, runtime_config=runtime_config, reuse_context=True
+                )
+                helper.register_reused_window_prefix(state, reused_tokens, runtime_config)
+            else:
+                helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
             replay = duplex.get(REPLAY_CONTEXT_KEY)
             if replay:
-                helper.restore_completed_turns(state, replay, duplex["duplex_replay_token_budget"])
+                if reused_tokens:
+                    helper.restore_completed_turns(
+                        state,
+                        replay,
+                        duplex["duplex_replay_token_budget"],
+                        preceding_terminator=checkpoint["terminator"],
+                    )
+                else:
+                    helper.restore_completed_turns(state, replay, duplex["duplex_replay_token_budget"])
         elif runtime_config and hasattr(helper, "_sync_session_runtime_config"):
             helper._sync_session_runtime_config(state, runtime_config)
         return state

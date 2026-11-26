@@ -306,12 +306,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._model_input_streams = {}
         # External finishes release Request before their terminal output is assembled.
         self._held_token_ids: dict[str, list[int]] = {}
+        self._duplex_checkpoints = None
         self._init_prefill_admission_policy()
 
     def add_request(self, request: Request) -> None:
         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
             logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
             return
+        checkpoints = getattr(self, "_duplex_checkpoints", None)
+        if checkpoints is not None and request.request_id not in self.requests:
+            checkpoints.restore(request)
         super().add_request(request)
 
     def register_input_stream(self, request_id: str, stream: object) -> None:
@@ -435,6 +439,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_request_ids = ids
             cleanup_ids = tuple(ids)
 
+        checkpoints = getattr(self, "_duplex_checkpoints", None)
+        if checkpoints is not None and finished_status == RequestStatus.FINISHED_ABORTED:
+            for request_id in cleanup_ids:
+                request = self.requests.get(request_id)
+                if request is not None and not request.is_finished():
+                    checkpoints.retain_before_abort(request)
         finished = super().finish_requests(finish_request_ids, finished_status)
         self._clear_kv_wait_starts(cleanup_ids)
         return finished
@@ -1274,6 +1284,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._isolation_drain_stalled = False
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        checkpoints = getattr(self, "_duplex_checkpoints", None)
+        if checkpoints is not None:
+            checkpoints.sweep()
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
@@ -2179,6 +2192,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 MiniCPMO45DuplexSchedulerHelper,
             )
 
+            self._record_duplex_checkpoint_boundary(session, update, confirmed_end)
             reanchored = False
             if MiniCPMO45DuplexSchedulerHelper.find_duplex_window_manager(self) is not None:
                 plan = self._maybe_reanchor_streaming_window(
@@ -2188,12 +2202,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     completed_terminator=completed_terminator,
                 )
                 reanchored = plan is not None
+                if reanchored:
+                    session._minicpmo_checkpoint_boundary = None
+                    session._minicpmo_checkpoint_rebased = True
             if not reanchored and self._prepare_minicpmo45_stage0_window(
                 session,
                 update,
                 segment_output_ids=segment_output_ids,
                 completed_terminator=completed_terminator,
             ):
+                session._minicpmo_checkpoint_boundary = None
+                session._minicpmo_checkpoint_rebased = True
                 # The rebuilt prompt is bounded by the client's window settings,
                 # not by the model (a camera unit is hundreds of tokens), so it
                 # needs the same max_model_len check as a plain extension. The
@@ -2284,6 +2303,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
+
+    def _record_duplex_checkpoint_boundary(self, session: Request, update: StreamingUpdate, confirmed_end: int) -> None:
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import CHECKPOINT_KEY
+
+        info = getattr(update, "model_intermediate_buffer", None)
+        duplex = info.get("duplex") if isinstance(info, dict) else None
+        if not isinstance(duplex, dict) or CHECKPOINT_KEY not in duplex:
+            return
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.checkpoint import MiniCPMO45DuplexCheckpoints
+
+        checkpoints = getattr(self, "_duplex_checkpoints", None)
+        if checkpoints is None:
+            checkpoints = MiniCPMO45DuplexCheckpoints(self)
+            self._duplex_checkpoints = checkpoints
+        checkpoints.record_boundary(session, update, confirmed_end)
 
     def _update_native_streaming_prompt(self, session: Request, payload: dict[str, Any]) -> bool | None:
         """Delegate streaming prompt policy to the stage's payload processor."""

@@ -764,15 +764,23 @@ class DuplexModelPlugin(ABC):
         """Commit model-owned context after the stage accepts a fenced append."""
 
     def observe_submitted_append(
-        self, *, state: DuplexModelSessionState, fence: DuplexFence, prompt: Mapping[str, object]
+        self, *, state: DuplexModelSessionState, fence: DuplexFence, prompt: Mapping[str, object], input_commit_seq: int
     ) -> None:
         """Observe an accepted model input on the session owner."""
 
-    def observe_committed_input(self, *, state: DuplexModelSessionState, fence: DuplexFence, item_id: str) -> None:
+    def observe_committed_input(
+        self, *, state: DuplexModelSessionState, fence: DuplexFence, item_id: str, source_id: int, input_commit_seq: int
+    ) -> None:
         """Bind model-owned history material to a committed user input."""
 
     def observe_response_end(
-        self, *, state: DuplexModelSessionState, fence: DuplexFence, response_id: str, completed: bool
+        self,
+        *,
+        state: DuplexModelSessionState,
+        fence: DuplexFence,
+        response_id: str,
+        completed: bool,
+        assistant_text: str = "",
     ) -> None:
         """Observe cancellation or a normal response end eligible for history."""
 

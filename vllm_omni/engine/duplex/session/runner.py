@@ -1383,11 +1383,15 @@ class DuplexSessionRunner:
             item_id = payload.get("realtime_item_id")
             turn_id = payload.get("turn_id")
             if isinstance(item_id, str) and isinstance(turn_id, int) and payload.get("epoch") == self.session.epoch:
-                self.plugin.observe_committed_input(
-                    state=self.ctx.model_state,
-                    fence=DuplexFence(self.session.session_id, self.session.epoch, turn_id),
-                    item_id=item_id,
-                )
+                sources = self.session.user_source_ids_for_items((item_id,))
+                if sources and not payload.get("empty"):
+                    self.plugin.observe_committed_input(
+                        state=self.ctx.model_state,
+                        fence=DuplexFence(self.session.session_id, self.session.epoch, turn_id),
+                        item_id=item_id,
+                        source_id=sources[0],
+                        input_commit_seq=self.session.input_commit_seq,
+                    )
         self.out.emit(payload)
 
     def _emit_events(self, events: list[DuplexEvent]) -> None:

@@ -80,6 +80,7 @@ class _MiniCPMO45Stage0SessionState:
     window_enabled: bool = False
     pending_window_unit: _MiniCPMO45WindowUnit | None = None
     restored_context: _MiniCPMO45WindowUnit | None = None
+    reused_context_tokens: int = 0
     pending_window_generated_tokens: list[int] = field(default_factory=list)
     current_turn_ended: bool = True
     opened_assistant_turn_segment: tuple[str, int] | None = None
@@ -296,6 +297,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         session_config: dict[str, object],
         *,
         runtime_config: dict[str, object] | None = None,
+        reuse_context: bool = False,
     ) -> None:
         window_config = (runtime_config or {}).get("duplex_window_config")
         state.window_enabled = isinstance(window_config, dict) and window_config.get("sliding_window_mode", "off") in {
@@ -306,7 +308,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         state.wrap_unit_audio_markers = bool(rt.get("duplex_wrap_unit_audio_markers", False))
         state.allow_speech_interruption = bool(rt.get("duplex_allow_speech_interruption", False))
         self._sync_session_runtime_config(state, rt)
-        if not self._stage_runtime_ready():
+        if (reuse_context and not state.window_enabled) or not self._stage_runtime_ready():
             return
         self._require_special_token_ids()
         ref_audio = self._decode_ref_audio_from_session_config(runtime_config or {})
@@ -356,8 +358,22 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.current_turn_ended = False
             state.pending_speech_response_open = True
 
+    def register_reused_window_prefix(
+        self, state: _MiniCPMO45Stage0SessionState, token_count: int, runtime_config: dict[str, object]
+    ) -> None:
+        if state.window_enabled:
+            # A full basic-window rebuild drops this unit first. In-place
+            # reanchor only needs its length to trim matching worker history.
+            length = token_count - int(runtime_config["duplex_first_append_context_tokens"])
+            state.window_units.append(_MiniCPMO45WindowUnit(token_ids=[self.stage_padding_token_id()] * length))
+
     def restore_completed_turns(
-        self, state: _MiniCPMO45Stage0SessionState, turns: list[dict[str, Any]], token_budget: int
+        self,
+        state: _MiniCPMO45Stage0SessionState,
+        turns: list[dict[str, Any]],
+        token_budget: int,
+        *,
+        preceding_terminator: int | None = None,
     ) -> None:
         """Build a silent prefill prefix using normalized media and settled assistant text."""
         restored = _MiniCPMO45WindowUnit()
@@ -399,7 +415,8 @@ class MiniCPMO45Stage0DuplexRuntime:
             # this historical epoch uses the same encoder, but opens a new unit.
             replay.audio_chunk_idx = 0
             replay.pending_terminator_token = None
-        padding = token_budget - len(restored.token_ids)
+        closure = [preceding_terminator, self.unit_end_token_id] if preceding_terminator is not None else []
+        padding = token_budget - len(restored.token_ids) - len(closure)
         if padding < 0:
             raise ValueError(
                 f"MiniCPM-o completed context requires {len(restored.token_ids)} tokens, reserved {token_budget}"
@@ -409,6 +426,9 @@ class MiniCPMO45Stage0DuplexRuntime:
             pad = self._embed_token(pad_id)
             restored.embeds[:0] = [pad] * padding
             restored.token_ids[:0] = [pad_id] * padding
+        if closure:
+            restored.embeds[:0] = [self._embed_token(token_id) for token_id in closure]
+            restored.token_ids[:0] = closure
         state.restored_context = restored
         if replay is not None and turns[-1].get("resumes_audio_window") is True:
             # The user's accepted input is already on this encoder's time line.
@@ -587,7 +607,7 @@ class MiniCPMO45Stage0DuplexRuntime:
 
         embed_parts: list[torch.Tensor] = []
         token_ids: list[int] = []
-        if state.audio_chunk_idx == 0 and state.context_embeds:
+        if state.audio_chunk_idx == 0 and state.context_embeds and not state.reused_context_tokens:
             embed_parts.extend(state.context_embeds)
             token_ids.extend(state.context_token_ids)
 

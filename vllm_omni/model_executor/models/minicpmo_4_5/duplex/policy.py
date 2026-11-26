@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 # Server-owned token IDs appended after the media in one native input unit.
 APPEND_TEXT_TOKEN_IDS_KEY = "duplex_append_text_token_ids"
 REPLAY_CONTEXT_KEY = "duplex_replay_completed_turns"
+CHECKPOINT_KEY = "duplex_stage0_checkpoint"
 
 
 @dataclass(frozen=True, slots=True)

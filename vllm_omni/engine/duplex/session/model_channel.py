@@ -343,6 +343,9 @@ class ModelChannel:
         session = self._ctx.session
         # Session stats: the chunk's in-engine interval starts when its append is taken up.
         accepted_ns = session.perf.now_ns() if session.perf is not None else 0
+        # A model reply can end while live units are still awaiting the next
+        # input commit. Its final residual belongs to the already committed item.
+        input_commit_seq = session.input_commit_seq + (0 if final else 1)
         if self._ctx.stage_port.stage_count == 0:
             raise RuntimeError("duplex_data_plane_has_no_stage")
         fence = helpers.append_fence(session, payload)
@@ -548,7 +551,9 @@ class ModelChannel:
                 update = session.commit_append(reservation)
                 session.bind_stage_request(stage_id, request_id, fence=fence)
                 self._ctx.plugin.commit_append_plan(request_id)
-                self._ctx.plugin.observe_submitted_append(state=self._ctx.model_state, fence=fence, prompt=prompt)
+                self._ctx.plugin.observe_submitted_append(
+                    state=self._ctx.model_state, fence=fence, prompt=prompt, input_commit_seq=input_commit_seq
+                )
             except BaseException:
                 if perf is not None and perf_chunk is not None:
                     perf.drop_chunk(perf_chunk)
@@ -1805,7 +1810,11 @@ class ModelChannel:
             turn_id = session.active_response_turn_id
             fence = DuplexFence(session.session_id, session.epoch, session.turn_id if turn_id is None else turn_id)
             self._ctx.plugin.observe_response_end(
-                state=self._ctx.model_state, fence=fence, response_id=response_id, completed=True
+                state=self._ctx.model_state,
+                fence=fence,
+                response_id=response_id,
+                completed=True,
+                assistant_text="".join(session.assistant_text_buffer),
             )
         return session.end_response(commit_text=should_commit, preserve_request=preserve_request)
 

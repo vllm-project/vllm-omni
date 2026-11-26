@@ -38,7 +38,10 @@ _SERVER = OmniServerParams(
     use_stage_cli=False,
     server_args=["--trust-remote-code"],
 )
-_THINKER_ONLY = _SERVER._replace(stage_config_path=get_deploy_config_path("minicpmo_4_5_duplex_thinker_only.yaml"))
+_BARGE_IN_SERVER = _SERVER._replace(env_dict={"VLLM_LOGGING_STREAM": "ext://sys.stderr"})
+_THINKER_ONLY = _BARGE_IN_SERVER._replace(
+    stage_config_path=get_deploy_config_path("minicpmo_4_5_duplex_thinker_only.yaml")
+)
 
 
 def _color_frame(color: str, turn: int, unit: int) -> str:
@@ -54,12 +57,14 @@ def _color_frame(color: str, turn: int, unit: int) -> str:
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("resume_with_kv", [False, True], ids=["replay", "checkpoint"])
 @pytest.mark.parametrize(
     ("omni_server", "expect_audio"),
-    [pytest.param(_SERVER, True, id="three-stage"), pytest.param(_THINKER_ONLY, False, id="thinker-only")],
+    [pytest.param(_BARGE_IN_SERVER, True, id="three-stage"), pytest.param(_THINKER_ONLY, False, id="thinker-only")],
     indirect=["omni_server"],
+    scope="module",
 )
-def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool):
+def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool, resume_with_kv: bool):
     """A server-VAD barge-in preserves the first color and accepts a fresh camera frame."""
     audio_delta = "response.output_audio.delta"
     text_deltas = {"response.output_text.delta", "response.output_audio_transcript.delta"}
@@ -79,7 +84,11 @@ def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool)
         idle_timeout_s=115,
         overlap_policy="barge_in_on_speech",
         instructions="Listen to the user and answer in English. Use only the requested words.",
-        extra_body={"auto_response": True, "silence_continuation": True},
+        extra_body={
+            "auto_response": True,
+            "silence_continuation": True,
+            "sliding_window_mode": "basic" if resume_with_kv else "context",
+        },
     )
 
     async def run():
@@ -214,7 +223,12 @@ def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool)
                 with suppress(asyncio.CancelledError):
                     await reader
 
-    asyncio.run(run())
+    checkpoint_marker = "MiniCPM-o duplex re-used "
+    replay_marker = "MiniCPM-o restored "
+    with omni_server.capture_stderr_evidence([checkpoint_marker, replay_marker]) as evidence:
+        asyncio.run(run())
+        expected_restore = checkpoint_marker if resume_with_kv else replay_marker
+        assert expected_restore in evidence.wait()
 
 
 # ``minicpmo_4_5.yaml`` resolves all three stages to MRv2 on CUDA and ROCm.
