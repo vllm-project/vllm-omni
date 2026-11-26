@@ -198,7 +198,8 @@ masked for the preset's first 200 steps, so a 200-frame budget always
 truncates; a longer budget lets the song end on its own end token, and
 `truncated` in the report line says which happened. Serving follows the
 same rule: omit `max_new_tokens` (or set it above 200) for a natural
-ending.
+ending. The speech endpoint rejects `token_count`; it does not control
+YuE2's duration.
 
 ## Notes
 

@@ -36,6 +36,7 @@ from vllm_omni.engine.messages import (
     InteractionMessage,
     NextStageInputMessage,
     StageSubmissionMessage,
+    TextInputUpdate,
 )
 from vllm_omni.engine.omni_engine_base import OmniEngineBase, StageRuntimeInfo
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorBase
@@ -661,7 +662,13 @@ class AsyncOmniEngine(OmniEngineBase):
             # because a model whose guidance is mandatory cannot decode a request
             # whose companion never arrived.
             companions: list[AddCompanionRequestMessage] = []
-            if self.prompt_expand_func is not None and final_stage_id > 0:
+            # A prompt that declares a cfg_group is paired by the atomic CFG
+            # scheduler, which admits it only with its companion, whatever stage
+            # the request ends at; without one it would wait forever.
+            declares_cfg_group = isinstance(prompt, dict) and "cfg_group" in (
+                prompt.get("additional_information") or {}
+            )
+            if self.prompt_expand_func is not None and (final_stage_id > 0 or declares_cfg_group):
                 effective_spl = msg.sampling_params_list
                 stage0_params = effective_spl[0] if effective_spl else None
                 if stage0_params is not None:
@@ -1013,6 +1020,14 @@ class AsyncOmniEngine(OmniEngineBase):
             message_type="streaming_update",
         )
         await self._put_request_queue(msg)
+
+    async def append_text_async(self, request_id: str, token_ids: list[int], *, final: bool = False) -> None:
+        """Enqueue committed body tokens in submission order.
+
+        Returning means queued, not acknowledged by the scheduler. Each call
+        appends new text; callers must not retry a submitted chunk.
+        """
+        await self._put_request_queue(TextInputUpdate(request_id=request_id, token_ids=list(token_ids), final=final))
 
     def submit_interaction(
         self,

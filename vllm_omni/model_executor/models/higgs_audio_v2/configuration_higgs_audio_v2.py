@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Configuration class for higgs-audio v2 in vllm-omni.
 
 Mirrors `bosonai/higgs-audio-v2-generation-3B-base/config.json` and exposes the
@@ -98,6 +98,13 @@ class HiggsAudioV2Config(PretrainedConfig):
         use_cache: bool = True,
         **kwargs: Any,
     ) -> None:
+        for name, token_id in (
+            ("audio_stream_bos_id", audio_stream_bos_id),
+            ("audio_stream_eos_id", audio_stream_eos_id),
+        ):
+            if not 0 <= token_id < codebook_size:
+                raise ValueError(f"{name} must be in [0, codebook_size={codebook_size}), got {token_id}")
+
         if rope_parameters is None:
             rope_parameters = {
                 "factor": 32.0,

@@ -251,8 +251,10 @@ class UlyssesParallelAttention:
         gather_idx: int,
         use_sync: bool,
         ulysses_a2a_permute: bool = False,
+        ce_overlap_chunks: int = 0,
     ) -> None:
         self._sp_group = sp_group
+        self.ce_overlap_chunks = int(ce_overlap_chunks)
         self._ulysses_pg = sp_group.ulysses_group
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx
@@ -565,9 +567,14 @@ class UlyssesParallelAttention:
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd, ulysses_qkv_fwd_group
 
                 group_name = self._ulysses_pg.group_name
-                query, key, value = ulysses_qkv_fwd_group(query, key, value, group_name, ulysses_world_size)
+                # Q/K/V come back as views of the shared workspace; attention
+                # consumes them before the output exchange reuses it. Exchange
+                # the gate first, since it is copied out and stored in metadata.
                 if gate_compress is not None:
                     gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
+                query, key, value = ulysses_qkv_fwd_group(
+                    query, key, value, group_name, ulysses_world_size, zero_copy=True
+                )
                 if self._use_sync:
                     current_omni_platform.synchronize()
             elif (

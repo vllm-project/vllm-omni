@@ -130,11 +130,14 @@ different scales) are scheduled into separate batches.
 
 Constraints:
 
-- The summed rank of the stacked adapters must not exceed **512** per layer.
-  Two or three typical LoRAs (rank 4-64) fit comfortably.
+- The rank of one adapter, and the summed rank of stacked adapters, must not
+  exceed **1024** per layer. Two or three typical LoRAs (rank 4-64) fit
+  comfortably. Per-layer LoRA buffers are allocated at the largest rank seen so
+  far, rounded up to 1, 8, 16, 32, 64, 128, 256, 320, 512, 768 or 1024, so one
+  high-rank adapter raises the memory every wrapped layer reserves.
 - Adapters with a scale of approximately 0 are skipped.
 - Packed-projection stacking requires a compatible loader and packed-module mapping; MiniMax-H3 supports its fused QKV and MLP projections.
-- MiniMax-H3 accepts ordinary adapter stacks and at most one compatible Turbo adapter. Native distilled adapters such as FlashGen cannot be composed with other adapters.
+- MiniMax-H3 accepts ordinary adapter stacks and at most one compatible Turbo adapter. Native distilled adapters such as FlashGen and PDD acceleration adapters cannot be composed with other adapters.
 - FastH3 Omni accepts ordinary adapters with independent scales, including under distributed layerwise offload; Turbo and native distilled adapters remain unsupported with this checkpoint.
 
 Offline: pass a list of `LoRARequest` objects together with a matching list of
