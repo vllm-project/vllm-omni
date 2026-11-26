@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration, Qwen
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.cache.cachedit import set_separate_cfg
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -605,6 +606,8 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
 
         # custom partial function with cfg_renorm_min
         self.cfg_normalize_function = partial(self.cfg_normalize_function, cfg_renorm_min=cfg_renorm_min)
+
+        set_separate_cfg(self.transformer, self.do_classifier_free_guidance)
 
         # 6. Denoising loop
         for i, t in enumerate(timesteps):
