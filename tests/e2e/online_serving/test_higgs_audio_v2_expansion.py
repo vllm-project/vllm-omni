@@ -123,12 +123,13 @@ class TestHiggsAudioV2OnlineHappyPath:
 
     @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_long_input_text(self, omni_server, online_client) -> None:
-        """A long prompt near the stage-0 context budget must synthesize fully.
+        """A long input must complete with sustained audio.
 
         Stage 0 caps generation at 1024 audio frames (~41 s at 25 fps) under
-        a 4096-token context; the two-sentence pair repeated 40 times lands
-        the prompt near that budget while the synthesized speech stays under
-        the frame cap.
+        a 4096-token context, and 40 repeats of the pair take several minutes
+        of speech, so the input cannot be synthesized in full. The transcript
+        check is therefore off for this request; only the audio length is
+        asserted.
         """
         long_input = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. " * 40
         online_client.send_audio_speech_request(
@@ -138,10 +139,11 @@ class TestHiggsAudioV2OnlineHappyPath:
                 "stream": False,
                 "response_format": "wav",
                 "timeout": 300.0,
-                # The byte floor stays generous-under-dummy weights:
-                # audio-eos timing is weight-dependent, so only require
-                # ~20 s of synthesized audio to prove the long input
-                # completes rather than truncating.
+                # Pin the generation cap below Stage-0's max_tokens (1024).
+                # Audio-eos timing is weight-dependent, so the byte floor only
+                # requires ~20 s, half of what the cap allows.
+                "max_new_tokens": 1000,
+                "transcript_expected_text": None,
                 "min_audio_bytes": 1_000_000,
             }
         )
