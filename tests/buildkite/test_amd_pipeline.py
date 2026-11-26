@@ -1154,6 +1154,14 @@ def test_flux2_klein_tiny_diffusion_has_cold_start_headroom() -> None:
     assert 'model_kwargs["init_timeout"] = settings.offline_init_timeout_s' in offline_source
 
 
+def test_longcat_image_edit_tiny_diffusion_has_cold_start_headroom() -> None:
+    """The LongCat Image Edit cold start must not retain the 600s default."""
+    settings_source = Path("tests/model_tests/diffusion/model_settings.py").read_text(encoding="utf-8")
+    longcat_edit_settings = settings_source.split('"LongCatImageEditPipeline":', 1)[1].split('"FluxPipeline":', 1)[0]
+
+    assert "offline_init_timeout_s=900" in longcat_edit_settings
+
+
 def test_flux2_klein_weekly_pixel_contract_uses_native_image_diff() -> None:
     source = Path("tests/e2e/offline_inference/test_flux2_klein.py").read_text(encoding="utf-8")
 
