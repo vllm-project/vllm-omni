@@ -8,7 +8,7 @@ CausVidWan supports clean-history and Same-Step policies with their declared top
 
 * Codec base: Diffusers ``Wan-AI/Wan2.1-T2V-1.3B-Diffusers``
 * Student DiT: ``tianweiy/CausVid`` → ``autoregressive_checkpoint/model.pt``
-* Shared infra: ``experimental.ar_diffusion`` (schedule / executor / KV / FlowEuler)
+* Shared infra: ``experimental.ar_diffusion`` (schedule / executor / KV)
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ from vllm_omni.diffusion.media import (
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.causvid_wan.async_chunk_decode import start_async_chunk_decode
+from vllm_omni.diffusion.models.causvid_wan.flow_euler import FlowEuler
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.models.causvid_wan.weights import (
@@ -59,7 +60,6 @@ from vllm_omni.diffusion.models.causvid_wan.weights import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.request_streaming import get_emit_chunk
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
     NoisyKVState,

@@ -15,8 +15,8 @@ from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.batch import (
     MemberRef,
     organize_batches,
 )
+from vllm_omni.diffusion.models.causvid_wan.flow_euler import FlowEuler
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
-from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 
 
 def _make_member(
@@ -192,6 +192,12 @@ def _one(
         kv_views=(kv,),
     )
     return member.forward(batch, [member], member_inputs=[member_input])
+
+
+def test_flow_euler_legacy_import_is_the_causvid_sampler():
+    from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler as LegacyFlowEuler
+
+    assert LegacyFlowEuler is FlowEuler
 
 
 @pytest.mark.parametrize(
