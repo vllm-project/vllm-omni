@@ -113,14 +113,12 @@ class LingBotVideoRotaryEmbedding(nn.Module):
         elif self.freqs_cis[0].device != device:
             self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
 
-        # NPU aclnnIndex (advanced indexing) rejects complex64 self tensors,
-        # so index the float32 real view and convert back to complex64.
-        parts = []
-        for i in range(len(self.axes_dims)):
-            fc_real = torch.view_as_real(self.freqs_cis[i])  # (N, D/2, 2) float32
-            sel = fc_real.index_select(0, position_ids[:, i])
-            parts.append(torch.view_as_complex(sel.contiguous()))
-        return torch.cat(parts, dim=-1)
+        # NPU aclnnIndex (advanced indexing) rejects complex64 self tensors;
+        # use index_select, as the other RoPE implementations do.
+        return torch.cat(
+            [self.freqs_cis[i].index_select(0, position_ids[:, i]) for i in range(len(self.axes_dims))],
+            dim=-1,
+        )
 
 
 def make_joint_position_ids(text_len: int, grid_t: int, grid_h: int, grid_w: int, device: torch.device) -> torch.Tensor:
