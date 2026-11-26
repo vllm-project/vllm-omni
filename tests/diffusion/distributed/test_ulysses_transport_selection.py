@@ -129,21 +129,24 @@ def test_probe_is_cached_per_group_and_members(monkeypatch):
     "values, backend",
     [
         ({}, "auto"),
-        ({"ulysses_a2a_permute": True}, "copy_engine"),
-        ({"ulysses_a2a_permute": False}, "nccl"),
-        ({"ulysses_a2a_permute": True, "ulysses_a2a_backend": "nccl"}, "nccl"),
+        ({"ulysses_a2a_backend": "nccl"}, "nccl"),
         ({"ulysses_overlap_chunks": 7}, "auto"),
         ({"ulysses_overlap_chunks": 7, "ulysses_a2a_backend": "copy_engine"}, "copy_engine"),
         ({"ulysses_overlap_chunks": 7, "ulysses_a2a_backend": "nccl"}, ValueError),
         ({"ulysses_a2a_backend": "copy_engine_overlap"}, ValueError),
     ],
 )
-def test_config_and_deprecated_flags(values, backend):
+def test_config(values, backend):
     if backend is ValueError:
         with pytest.raises(ValueError):
             DiffusionParallelConfig(ulysses_degree=2, **values)
     else:
         assert DiffusionParallelConfig(ulysses_degree=2, **values).ulysses_a2a_backend == backend
+
+
+def test_removed_permute_field_is_rejected():
+    with pytest.raises(TypeError):
+        DiffusionParallelConfig(ulysses_degree=2, ulysses_a2a_permute=True)
 
 
 @pytest.mark.parametrize("backend, pinned", [("auto", "nccl"), ("nccl", "nccl"), ("copy_engine", ValueError)])

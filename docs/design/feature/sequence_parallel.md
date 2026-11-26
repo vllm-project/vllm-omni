@@ -48,7 +48,7 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 
 ### NPU symmetric-memory Ulysses
 
-On NPU, `--ulysses-a2a-permute` uses Python and Triton-Ascend to read peer
+On NPU, `--ulysses-a2a-backend copy_engine` uses Python and Triton-Ascend to read peer
 symmetric memory directly into the final attention layout. It requires
 TorchNPU's NPUSHMEM allocator and the native SHMEM runtime. The backend
 loads the runtime from the installed `cann-shmem` wheel, or from the loader
@@ -101,7 +101,7 @@ persistent workspace.
 
 Advanced UAA, unequal Q/K/V shapes (including GQA), gradients, and compressed
 gates retain their existing exchanges. An explicitly selected
-`--ulysses-a2a-permute` backend keeps precedence.
+`--ulysses-a2a-backend` keeps precedence.
 
 Benchmark with the flag off and on using the same model, precision, topology,
 sequence shape, concurrency, and warmup. Larger messages and staging copies can

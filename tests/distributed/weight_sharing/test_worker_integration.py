@@ -87,7 +87,6 @@ def memory_worker(weight_sharing, monkeypatch, mocker):
         allgather_degree=1,
         ulysses_mode="strict",
         ulysses_a2a_backend="auto",
-        ulysses_a2a_permute=False,
         cfg_parallel_size=1,
         vae_patch_parallel_size=1,
         text_encoder_tp_size=1,

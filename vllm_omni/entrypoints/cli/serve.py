@@ -819,20 +819,6 @@ class OmniServeCommand(CLISubcommand):
             "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
         )
         omni_config_group.add_argument(
-            "--ulysses-a2a-permute",
-            action=argparse.BooleanOptionalAction,
-            default=None,
-            help=(
-                "Deprecated: with --ulysses-a2a-backend auto, --ulysses-a2a-permute selects copy_engine "
-                "and --no-ulysses-a2a-permute selects nccl; "
-                "an explicit --ulysses-a2a-backend takes precedence. "
-                "CUDA copy engines on CUDA, TorchNPU on NPU. Only strict Ulysses layouts are eligible. "
-                "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
-                "TorchNPU NPUSHMEM and Triton-Ascend, "
-                "with libshmem.so on LD_LIBRARY_PATH."
-            ),
-        )
-        omni_config_group.add_argument(
             "--ulysses-a2a-backend",
             type=str,
             default=None,
@@ -841,7 +827,10 @@ class OmniServeCommand(CLISubcommand):
             choices=["auto", "nccl", "copy_engine"],
             help=(
                 "Transport for the strict Ulysses all-to-all. 'auto' (default) uses the copy engine when the "
-                "Ulysses group is on one node with CUDA peer access between all GPUs, otherwise 'nccl'."
+                "Ulysses group is on one node with CUDA peer access between all GPUs, otherwise 'nccl'. "
+                "'copy_engine' uses CUDA copy engines on CUDA and TorchNPU on NPU. Only strict Ulysses layouts are "
+                "eligible. NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
+                "TorchNPU NPUSHMEM and Triton-Ascend, with libshmem.so on LD_LIBRARY_PATH."
             ),
         )
         omni_config_group.add_argument(

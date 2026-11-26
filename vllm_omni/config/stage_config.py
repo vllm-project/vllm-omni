@@ -656,7 +656,6 @@ class StageDeployConfig:
     # Diffusion parallel_config deploy/runtime override fields.
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
-    ulysses_a2a_permute: bool | None = None
     ulysses_overlap_chunks: int | None = None
     ulysses_a2a_backend: str | None = None
     ring_degree: int | None = None

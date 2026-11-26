@@ -38,7 +38,7 @@ def test_default_does_not_build_optional_extension(monkeypatch, parallel_context
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("allgather", [1, 2])
 def test_explicit_exchange_setting_is_forwarded(monkeypatch, parallel_context, enabled, allgather):
-    parallel_context.ulysses_a2a_permute = enabled
+    parallel_context.ulysses_a2a_backend = "copy_engine" if enabled else "nccl"
     parallel_context.allgather_degree = allgather
     strategy = Mock()
     name = "UlyssesAllGatherKVParallelAttention" if allgather > 1 else "UlyssesParallelAttention"

@@ -322,18 +322,12 @@ class DiffusionParallelConfig:
       sequence shapes across the ring group.
     """
 
-    ulysses_a2a_permute: bool | None = None
-    """Deprecated: ``True`` maps to ``ulysses_a2a_backend="copy_engine"`` and ``False`` to ``"nccl"`` when the backend
-    is left at ``"auto"``; an explicit ``ulysses_a2a_backend`` takes precedence.
-
-    On CUDA, enables CE (copy engines) on a single node whose GPUs have CUDA
-    peer access (NVLink or PCIe P2P). NPU retains its eager, pure Ulysses
-    implementation over WORLD in one HCCS domain, using TorchNPU's NPUSHMEM
-    allocator, Triton-Ascend and a symmetric-memory runtime.
-    """
-
     ulysses_a2a_backend: str = "auto"
     """Transport for the strict Ulysses all-to-all: ``"auto"``, ``"nccl"`` or ``"copy_engine"``.
+
+    On CUDA, ``"copy_engine"`` uses CE (copy engines) on a single node whose GPUs have CUDA peer access (NVLink or PCIe
+    P2P). On NPU it selects the eager, pure Ulysses implementation over WORLD in one HCCS domain, using TorchNPU's
+    NPUSHMEM allocator, Triton-Ascend and a symmetric-memory runtime; ``"auto"`` keeps NPU on its default exchange.
 
     ``"auto"`` uses the copy engine when the Ulysses group is on one node with CUDA peer access between every pair of
     ranks and torch symmetric memory, and NCCL otherwise (and always with CUDA-graphed denoising).
@@ -429,9 +423,6 @@ class DiffusionParallelConfig:
             raise ValueError(
                 f"ulysses_a2a_backend must be one of {ULYSSES_A2A_BACKENDS}, but got {self.ulysses_a2a_backend!r}."
             )
-        if self.ulysses_a2a_permute is not None and self.ulysses_a2a_backend == "auto":
-            logger.warning_once("ulysses_a2a_permute is deprecated; use ulysses_a2a_backend instead.")
-            self.ulysses_a2a_backend = "copy_engine" if self.ulysses_a2a_permute else "nccl"
         assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
             "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."

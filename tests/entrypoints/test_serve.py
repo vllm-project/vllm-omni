@@ -788,15 +788,14 @@ def test_serve_parser_rejects_negative_robot_openpi_idle_timeout() -> None:
         parser.parse_args(["serve", "fake-model", "--omni", "--robot-openpi-idle-timeout", "-1"])
 
 
-def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
+@pytest.mark.parametrize("flag", ["--ulysses-a2a-permute", "--no-ulysses-a2a-permute"])
+def test_serve_parser_rejects_removed_ulysses_a2a_permute(flag: str) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
 
-    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-a2a-permute"])
-
-    assert args.ulysses_a2a_permute is True
-    assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", flag])
 
 
 def test_serve_parser_accepts_ulysses_overlap_chunks() -> None:
@@ -805,7 +804,7 @@ def test_serve_parser_accepts_ulysses_overlap_chunks() -> None:
     OmniServeCommand().subparser_init(subparsers)
 
     args = parser.parse_args(
-        ["serve", "fake-model", "--omni", "--ulysses-a2a-permute", "--ulysses-overlap-chunks", "4"]
+        ["serve", "fake-model", "--omni", "--ulysses-a2a-backend", "copy_engine", "--ulysses-overlap-chunks", "4"]
     )
 
     assert args.ulysses_overlap_chunks == 4

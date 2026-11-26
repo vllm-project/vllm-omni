@@ -655,7 +655,7 @@ def test_module_offload_rejects_unsupported_components(components, mocker):
         ({"parallel_config": DiffusionParallelConfig(allgather_degree=2)}, "only supports Ulysses"),
         ({"parallel_config": DiffusionParallelConfig(ulysses_degree=3)}, "16 attention heads"),
         ({"parallel_config": DiffusionParallelConfig(ulysses_mode="advanced_uaa")}, "strict Ulysses"),
-        ({"parallel_config": DiffusionParallelConfig(ulysses_a2a_permute=True)}, "ulysses_a2a_backend='nccl'"),
+        ({"parallel_config": DiffusionParallelConfig(ulysses_a2a_backend="copy_engine")}, "ulysses_a2a_backend='nccl'"),
         ({"parallel_config": DiffusionParallelConfig(vae_patch_parallel_size=2)}, "VAE"),
         ({"dtype": torch.float32}, "bfloat16"),
         ({"cache_backend": "cache_dit"}, "cache backend"),

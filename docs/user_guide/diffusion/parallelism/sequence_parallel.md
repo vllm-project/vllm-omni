@@ -231,9 +231,8 @@ In `DiffusionParallelConfig`:
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
 | `allgather_degree` | int | 1 | Number of GPUs for AllGather-KV sequence parallelism. Gathers K/V in an orthogonal group so every rank runs local-Q/global-KV attention. May be combined with `ulysses_degree`, but not with `ring_degree > 1`. |
 | `ulysses_mode` | str | `"strict"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
-| `ulysses_a2a_backend` | str | `"auto"` | Strict Ulysses all-to-all transport: `auto`, `nccl` or `copy_engine` (see below). |
+| `ulysses_a2a_backend` | str | `"auto"` | Strict Ulysses all-to-all transport: `auto`, `nccl` or `copy_engine` (see below). On NPU, `copy_engine` selects platform SHMEM. |
 | `ulysses_overlap_chunks` | int | `0` | Overlap the copy-engine exchange with attention in this many head chunks; `0` disables. |
-| `ulysses_a2a_permute` | bool | `False` | Deprecated alias for `ulysses_a2a_backend="copy_engine"`. On NPU, selects platform SHMEM. |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**

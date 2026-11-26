@@ -92,7 +92,7 @@ class TestParallelConfigPropagation:
         assert od.parallel_config.ulysses_a2a_backend == "copy_engine"
 
     def test_ulysses_ce_overlap_roundtrip(self):
-        pc = DiffusionParallelConfig(ulysses_degree=2, ulysses_a2a_permute=True, ulysses_overlap_chunks=4)
+        pc = DiffusionParallelConfig(ulysses_degree=2, ulysses_a2a_backend="copy_engine", ulysses_overlap_chunks=4)
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.parallel_config.ulysses_overlap_chunks == 4
         assert od.parallel_config.ulysses_a2a_backend == "copy_engine"
@@ -103,28 +103,14 @@ class TestParallelConfigPropagation:
             {"ulysses_overlap_chunks": -1},
             {"ulysses_mode": "advanced_uaa"},
             {"ring_degree": 2},
-            {"ulysses_a2a_permute": False},
+            {"ulysses_a2a_backend": "nccl"},
         ],
     )
     def test_ulysses_ce_overlap_rejects_invalid_config(self, overrides):
-        values = dict(ulysses_degree=2, ulysses_a2a_permute=True, ulysses_overlap_chunks=2)
+        values = dict(ulysses_degree=2, ulysses_a2a_backend="copy_engine", ulysses_overlap_chunks=2)
         values.update(overrides)
         with pytest.raises(ValueError, match="ulysses_overlap_chunks"):
             DiffusionParallelConfig(**values)
-
-    @pytest.mark.parametrize(
-        "permute, backend, expected",
-        [
-            (None, "auto", "auto"),
-            (False, "auto", "nccl"),
-            (True, "auto", "copy_engine"),
-            (True, "nccl", "nccl"),
-            (False, "copy_engine", "copy_engine"),
-        ],
-    )
-    def test_deprecated_permute_maps_only_onto_auto(self, permute, backend, expected):
-        pc = DiffusionParallelConfig(ulysses_degree=2, ulysses_a2a_permute=permute, ulysses_a2a_backend=backend)
-        assert pc.ulysses_a2a_backend == expected
 
     def test_unknown_a2a_backend_raises_value_error(self):
         with pytest.raises(ValueError, match="ulysses_a2a_backend must be one of"):

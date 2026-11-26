@@ -1864,7 +1864,6 @@ def test_sub_config_fields_match_structured_scopes():
         "ring_degree",
         "allgather_degree",
         "ulysses_mode",
-        "ulysses_a2a_permute",
         "ulysses_overlap_chunks",
         "ulysses_a2a_backend",
         "cfg_parallel_size",
@@ -2131,14 +2130,13 @@ def test_from_pipeline_config_derives_sequence_parallel_size_from_allgather_degr
     assert stage.parallel_config.world_size == 2
 
 
-def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
+def test_from_pipeline_config_preserves_deployed_ulysses_a2a_backend() -> None:
     pipeline = _resolve_pipeline_or_skip("dreamzero")
     deploy = DeployConfig(
         stages=[
             StageDeployConfig(
                 stage_id=0,
                 ulysses_degree=2,
-                ulysses_a2a_permute=True,
                 ulysses_a2a_backend="copy_engine",
             )
         ]
@@ -2147,7 +2145,6 @@ def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
     stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
-    assert stage.parallel_config.ulysses_a2a_permute is True
     assert stage.parallel_config.ulysses_a2a_backend == "copy_engine"
 
 

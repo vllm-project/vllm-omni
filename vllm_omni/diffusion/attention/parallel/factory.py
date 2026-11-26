@@ -23,7 +23,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-from vllm_omni.diffusion.distributed.ulysses_transport import AUTO, COPY_ENGINE, NCCL, select_transport
+from vllm_omni.diffusion.distributed.ulysses_transport import AUTO, COPY_ENGINE, select_transport
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
 logger = init_logger(__name__)
@@ -58,8 +58,6 @@ def build_parallel_attention_strategy(
     allgather_degree = getattr(p, "allgather_degree", 1)
     ulysses_overlap_chunks = int(getattr(p, "ulysses_overlap_chunks", 0) or 0)
     ulysses_a2a_backend = getattr(p, "ulysses_a2a_backend", AUTO)
-    if getattr(p, "ulysses_a2a_permute", None) is not None and ulysses_a2a_backend == AUTO:  # deprecated alias
-        ulysses_a2a_backend = COPY_ENGINE if p.ulysses_a2a_permute else NCCL
     ulysses_a2a_permute = ulysses_a2a_backend == COPY_ENGINE
     if ulysses_a2a_permute:
         from vllm_omni.diffusion.distributed.a2a_permute import validate_a2a_permute_config
