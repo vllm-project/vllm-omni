@@ -40,8 +40,15 @@ _RESTORE_SOC_PREFIXES = ("ascend910_93", "ascend910c")
 _KSTEP_SOC_PREFIXES = ("ascend910b",)
 
 
-def _target_soc(vllm_config: Any = None) -> bool:
-    name = _probe_soc_name().strip().lower()
+def _target_soc(soc_name: str, vllm_config: Any = None) -> bool:
+    """Whether this part needs the torch-native sampler.
+
+    ``soc_name`` is passed in so that one probe decides both this check and
+    the latch in ``restore_native_rejection_sampler``: two probes can disagree
+    (the device name is not readable yet on the first call), and a disagreement
+    skips the restore on the parts that need it.
+    """
+    name = soc_name.strip().lower()
     if any(name.startswith(prefix) for prefix in _RESTORE_SOC_PREFIXES):
         return True
     return any(name.startswith(prefix) for prefix in _KSTEP_SOC_PREFIXES) and _kstep_armed(vllm_config)
@@ -57,14 +64,17 @@ def restore_native_rejection_sampler(vllm_config: Any = None) -> None:
     global _RESTORED
     if _RESTORED:
         return
-    if not _target_soc(vllm_config):
+    soc_name = _probe_soc_name()
+    if not _target_soc(soc_name, vllm_config):
         # Latch only on a confirmed non-target SoC: "probe once" describes a
         # real part. An empty probe result is "unknown", not "non-target" --
         # leaving _RESTORED False here lets the next call retry instead of
         # skipping the restore for the whole process lifetime. The probe is
         # an env/name lookup and this function runs once per worker init, so
-        # the retry costs nothing.
-        if _probe_soc_name().strip():
+        # the retry costs nothing. The same probe decides the target check
+        # above: a second probe could report a part that the first one could
+        # not read, and that disagreement would latch the skip.
+        if soc_name.strip():
             _RESTORED = True
         return
     _RESTORED = True
