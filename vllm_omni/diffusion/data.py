@@ -326,7 +326,8 @@ class DiffusionParallelConfig:
     """Deprecated: ``True`` maps to ``ulysses_a2a_backend="copy_engine"`` and ``False`` to ``"nccl"`` when the backend
     is left at ``"auto"``; an explicit ``ulysses_a2a_backend`` takes precedence.
 
-    On CUDA, enables CE (copy engines) on a single node. NPU retains its eager, pure Ulysses
+    On CUDA, enables CE (copy engines) on a single node whose GPUs have CUDA
+    peer access (NVLink or PCIe P2P). NPU retains its eager, pure Ulysses
     implementation over WORLD in one HCCS domain, using TorchNPU's NPUSHMEM
     allocator, Triton-Ascend and a symmetric-memory runtime.
     """
@@ -342,9 +343,10 @@ class DiffusionParallelConfig:
     """Overlap the copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
 
     Applies when the transport is the copy engine (ignored when ``"auto"`` resolves to NCCL) and requires strict pure
-    Ulysses. Each chunk's Q/K/V move to their head owners while
-    earlier chunks compute, and outputs return as each chunk finishes. Results match the unchunked path exactly when
-    the attention backend's per-head output does not depend on the number of heads per call.
+    Ulysses. Each chunk's Q/K/V move to their head owners while earlier chunks compute, and outputs return as each
+    chunk finishes. The first call for each attention kernel and shape runs the overlap and the standard path on
+    every rank and keeps the overlap only if all ranks are bit-identical, so results match the unchunked path
+    exactly; other kernels and shapes keep the standard exchange.
     """
 
     cfg_parallel_size: int = 1

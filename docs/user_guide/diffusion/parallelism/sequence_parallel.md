@@ -244,7 +244,7 @@ In `DiffusionParallelConfig`:
 
 The copy engine is faster than NCCL, so the default `ulysses_a2a_backend="auto"` uses it wherever it is supported and
 NCCL otherwise. It follows vLLM's custom all-reduce rules: NVIDIA CUDA, the whole Ulysses group on one node, full
-NVLink connectivity for more than two GPUs (two GPUs may use PCIe P2P), GPU P2P access and torch symmetric memory, plus
+NVLink connectivity for more than two GPUs (two GPUs may use PCIe P2P; check with `nvidia-smi topo -p2p r`), GPU P2P access and torch symmetric memory, plus
 strict pure Ulysses without CUDA graphs. The choice and any reason for NCCL are logged once per group. Set `--ulysses-a2a-backend` to override (an unsupported explicit
 `copy_engine` raises):
 
