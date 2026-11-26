@@ -233,6 +233,8 @@ match `--text-encoder-tp-size`; for TP4, set the vision SP degree to `4`.
 Python and deployment YAML use
 `text_encoder_vision_sp_size` in the diffusion `parallel_config`.
 The default `1` leaves vision computation replicated.
+SP2 is supported, but showed no net speedup in the tested standalone shape;
+it is not a performance recommendation.
 
 #### Cache-DiT
 
