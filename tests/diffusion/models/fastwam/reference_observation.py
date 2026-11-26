@@ -28,7 +28,7 @@ REFERENCE_CHUNK_ROWS = np.array([
 ], dtype=np.float32)
 # fmt: on
 # MI355X (2026-10-29): the reference implementation itself lands up to 1.2e-2
-# (eager) / 1.7e-2 (GEAK kernels) from these CPU rows, the port up to 1.2e-2
+# (eager) / 1.7e-2 (AMD kernel package) from these CPU rows, the port up to 1.2e-2
 # (eager) / 1.6e-2 (regional compile), so 2e-2 covers bfloat16 GPU rounding.
 GPU_ATOL = 2e-2
 
