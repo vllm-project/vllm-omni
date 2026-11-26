@@ -130,29 +130,49 @@ scales. BF16 exclusions, rig embeddings, RGB/LiDAR projections and both VAEs
 retain their checkpoint precision. The policy quantizes linear layers; it does
 not quantize attention scores or a KV cache.
 
-The same physical FP8 checkpoint supports these runtime overrides. Here `N`
-is the request's number of denoising steps, for example 35:
+MAPS (mixed activation precision steps) is the default for the FP8 checkpoint.
+The checkpoint stores the policy in `transformer/config.json` under
+`quantization_config.runtime.diffusion_step_policy`. vLLM-Omni reads this
+policy at load time. No extra server argument is necessary:
 
-| Execution | `first_steps` | `last_steps` | `reasoner` |
-| --- | ---: | ---: | --- |
-| W8A16 | N | 0 | `a16` |
-| W8A8 | 0 | 0 | `native` |
-| MAPS | 3 | 3 | `a16` |
+```json
+"diffusion_step_policy": {
+  "schema_version": 1,
+  "type": "first_last_n",
+  "index_space": "denoising_loop_iteration",
+  "scope": ["transformer"],
+  "default_mode": "native",
+  "first_steps": {"count": 3, "mode": "a16"},
+  "last_steps": {"count": 3, "mode": "a16"},
+  "overlap": "a16",
+  "reasoner": "a16"
+}
+```
 
-W8A16 reconstructs live local weights for BF16 linear execution. MAPS uses that
-path for GEN's first and last three steps and UND throughout; middle GEN steps
-use native W8A8. These policies change execution, not stored weights. A runtime
-override takes precedence over a checkpoint precision schedule. For 35-step
-MAPS with eager execution:
+With this policy, GEN runs its first three and last three denoising steps with
+BF16 activations (A16) and the other steps with native FP8 activations (A8).
+UND runs with BF16 activations in all steps. The weights stay FP8 in all steps.
+A16 reconstructs the live local weights and runs a BF16 linear.
 
 ```bash
 VLLM_OMNI_USE_QUACK_FP8=0 vllm serve /path/to/transfer-auto-modelopt-fp8 \
   --omni \
   --model-class-name Cosmos3MultiviewPipeline \
-  --enforce-eager \
-  --additional-config \
-  '{"cosmos3_mixed_precision":{"first_steps":3,"last_steps":3,"reasoner":"a16"}}'
+  --enforce-eager
 ```
+
+The server log shows the active policy and its source, for example
+`Cosmos3 mixed precision active (source=checkpoint): first_steps=3 last_steps=3 reasoner=a16`.
+
+For experiments, `--additional-config` can override the checkpoint policy. Here
+`N` is the request's number of denoising steps:
+
+| Execution | `cosmos3_mixed_precision` override |
+| --- | --- |
+| W8A16 | `{"first_steps": N, "last_steps": 0, "reasoner": "a16"}` |
+| W8A8 | `{"first_steps": 0, "last_steps": 0, "reasoner": "native"}` |
+
+An override changes execution only. It does not change the stored weights.
 
 Long multiview renders can exceed the executor's 600-second request timeout.
 Set `VLLM_OMNI_DLO_DP_WAVE_TIMEOUT` to a suitable whole-request budget in seconds
@@ -161,9 +181,9 @@ before starting the server or importing `Omni`. For example,
 not change denoising steps or numerical behavior. Async output users can also
 set `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT` to the same budget.
 
-Use the same `additional_config` dictionary with the public `Omni` Python API.
-W8A16's `first_steps` must cover the actual request length; a longer request
-without updating it would enable native W8A8 in the remaining steps.
+The public `Omni` Python API reads the same checkpoint policy. It accepts the
+same `additional_config` override. A W8A16 override must set `first_steps` to
+the request length or more. Otherwise the remaining steps run native W8A8.
 Block-scaled formats, dynamic per-token/per-channel activations and SmoothQuant
 pre-scales are not interchangeable with this checkpoint contract.
 
@@ -505,4 +525,4 @@ count, parallel topology, steps, cold/warm latency and peak memory.
 | Regional compilation | ✅ static GEN layers; `--enforce-eager` disables it | [Regional compilation](../../docs/user_guide/diffusion/regional_compilation.md) |
 | Cache-DiT / TeaCache | ❌ disabled at startup with a warning | [Cache-DiT](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md) |
 | Session state | ❌ rejected at load time | — |
-| LiDAR decoder parallelism | ❌ the decoder runs eager FP32 on the output owner | — |
+| LiDAR decoder parallelism | ❌ — currently the decoder runs eager FP32 on the output owner rank only | — |
