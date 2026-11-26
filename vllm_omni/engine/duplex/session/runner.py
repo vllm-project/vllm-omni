@@ -339,7 +339,7 @@ class DuplexSessionRunner:
         )
         self.out = SessionEmitter(self.ctx, promote_deferred_overlap=self._promote_deferred_overlap_later)
         self.memory = SessionMemoryRuntime(self.ctx, post=self._post_memory_event, wake=self._wake_memory)
-        calibration = plugin.history_calibrator(manager.runtime_config)
+        calibration = plugin.history_calibrator(manager.runtime_config) if session.capabilities.emits_audio else None
         if calibration is not None:
             self.ctx.history_calibration = HistoryCalibration(
                 session,
@@ -409,7 +409,7 @@ class DuplexSessionRunner:
         self.emit({"type": "session.created", "session": session.as_public_dict()})
 
     def submit(self, command: DuplexCommand) -> None:
-        if isinstance(command, AppendAudio):
+        if isinstance(command, AppendAudio | AppendText):
             self._pending_input_appends += 1
         clock = self._input_clock
         if clock is not None and command.wire_type in ACKNOWLEDGED_INPUTS:
@@ -450,6 +450,7 @@ class DuplexSessionRunner:
         *,
         request_id: str,
         context: DuplexOutputContext,
+        streaming_context: object | None = None,
         input_transcript: str | None = None,
         input_item_id: str | None = None,
     ) -> bool:
@@ -478,12 +479,12 @@ class DuplexSessionRunner:
         decision: DuplexOutputDecision | None = None
         project = False
         if stage_id < context.final_stage_id:
-            decision = self.model.decide_output(stage_id, output, context)
+            decision = self.model.decide_output(stage_id, output, context, streaming_context=streaming_context)
             # Optional mid-pipeline projection: client sees this stage; TTS still runs.
             if decision is None:
                 project = self.model.project_intermediate_output(stage_id, output, context)
         if self.session.capabilities.supports_concurrent_turn_requests and self.model.release_concurrent_turn_requests(
-            stage_id, output, context
+            stage_id, output, context, streaming_context=streaming_context
         ):
             # Never true in an input-clocked session: ``apply_input_clock_capabilities``
             # clears the capability at creation, so a commit during a response waits
@@ -811,6 +812,7 @@ class DuplexSessionRunner:
                 session.request_resources.pop((stage_id, request_id), None)
         elif response_id == session.active_response_id:
             session.end_response(commit_text=False)
+            session.release_zero_audio_response(response_id)
             settle_response_runtime(self.plugin, session, committed=False, response_id=response_id, release_owner=True)
         self.emit(
             {
@@ -949,7 +951,7 @@ class DuplexSessionRunner:
             except Exception as exc:
                 self._report_handler_failure(item, exc)
             finally:
-                if isinstance(item, AppendAudio):
+                if isinstance(item, AppendAudio | AppendText):
                     self._pending_input_appends -= 1
                     if self._pending_input_appends == 0 and self._deferred_silence is not None:
                         self.spawn(self._rearm_deferred_silence(), name="duplex-continue")
@@ -1048,6 +1050,8 @@ class DuplexSessionRunner:
             self.session.release_input_bytes(
                 len(command.audio) + sum(len(frame) for frame in command.video_frames), queued=True
             )
+        elif isinstance(command, AppendText):
+            self.session.release_input_bytes(len(command.text.encode("utf-8")), queued=True)
         elif isinstance(command, GetSessionStats):
             # Still answered, so the client need not time out: final turns
             # keep their numbers and the rest read as cancelled.
@@ -1175,12 +1179,24 @@ class DuplexSessionRunner:
                 reservation.callback(session.release_input_bytes, admission, queued=True)
                 await self._on_append_audio(command.payload(encode_audio=False), release_queued_input=reservation.close)
         elif isinstance(command, AppendText):
-            session.mark_user_input_activity()
-            self._emit_error(
-                "native_text_append_unsupported",
-                "The selected native duplex runtime accepts audio append only",
-                event_id=command.event_id,
-            )
+            # Keep the admitted UTF-8 bytes charged while this append waits
+            # behind earlier media; cancellation and failures release them too.
+            with ExitStack() as reservation:
+                reservation.callback(session.release_input_bytes, len(command.text.encode("utf-8")), queued=True)
+                if not self._session_auto_responds():
+                    self._emit_error("bad_event", "Text append requires auto_response=true", event_id=command.event_id)
+                    return
+                self._reset_failed_append_tail()
+                if not await self._submit_buffered_media():
+                    return
+                session.mark_user_input_activity()
+                task = await self._start_append(
+                    {"type": "text", "text": command.text, "force_listen": command.force_listen is True},
+                    final=False,
+                    precreate_response=command.force_listen is not True,
+                )
+                release = reservation.pop_all().close
+                task.add_done_callback(lambda _done: release())
         elif isinstance(command, Commit):
             session.release_pending_turn()
             resolved = resolve_commit(projector, command)
@@ -1278,6 +1294,8 @@ class DuplexSessionRunner:
                         self.plugin.on_history_item_deleted(state=self.model_state, item_id=command.item_id)
                     )
         elif isinstance(command, TruncateItem):
+            if not self.control.check_audio_truncate_support(event_id=command.event_id):
+                return
             control = resolve_truncate_item(
                 projector, command, has_audio=self.session.history_item_has_audio(command.item_id)
             )
@@ -2055,23 +2073,26 @@ class DuplexSessionRunner:
             session.release_input_bytes(raw_audio_bytes)
         append_payload = pcm_reservation.payload
         await self._start_append(append_payload, final=False, pcm_reservation=pcm_reservation)
-        if self._input_clock is not None and allow_emit:
-            # Input-clocked sessions: submit every whole unit this append
-            # completed, so its acknowledgement covers all of them.
-            while (
-                self._append_chain_healthy()
-                and (
-                    backlog := model_state.audio_buffer.prepare_backlog(
-                        operation_id=uuid.uuid4().hex, chunk_period_ms=session.capabilities.chunk_period_ms or 1000
-                    )
-                )
-                is not None
-            ):
-                if backlog.payload is None:
-                    backlog.rollback()
-                    break
-                await self._start_append(backlog.payload, final=False, pcm_reservation=backlog)
+        if allow_emit:
+            # Submit every eligible whole unit on either clock. Leaving a
+            # complete unit buffered can block a text reply's continuation
+            # after the client has stopped sending input.
+            await self._submit_buffered_media()
         await self._maybe_commit_vad_turn(vad_result)
+
+    async def _submit_buffered_media(self) -> bool:
+        """Queue complete buffered units in wire order, retaining partial PCM."""
+        while self._append_chain_healthy():
+            backlog = self.model_state.audio_buffer.prepare_backlog(
+                operation_id=uuid.uuid4().hex, chunk_period_ms=self.session.capabilities.chunk_period_ms or 1000
+            )
+            if backlog is None:
+                return True
+            if backlog.payload is None:
+                backlog.rollback()
+                return True
+            await self._start_append(backlog.payload, final=False, pcm_reservation=backlog)
+        return False
 
     def _append_chain_healthy(self) -> bool:
         """Whether more of the buffered audio may be submitted: the session is open and no append in it failed."""
@@ -2134,11 +2155,15 @@ class DuplexSessionRunner:
 
     def _real_input_waiting(self) -> bool:
         self._clear_completed_pending_silence()
-        return (
-            self._pending_input_appends > 0
-            or self.model_state.audio_buffer.has_pending()
-            or self.model_state.audio_buffer.has_reserved()
-        )
+        buffer = self.model_state.audio_buffer
+        if self._pending_input_appends > 0 or buffer.has_reserved():
+            return True
+        if self.run.partial_input_continuation_turn == (self.session.epoch, self.session.active_response_turn_id):
+            # Text can release a reply without an audio commit. Keep partial PCM
+            # buffered and charged, but do not let it stall that reply forever.
+            # Complete audio/vision units still precede generated silence.
+            return buffer.has_ready_unit(chunk_period_ms=self.session.capabilities.chunk_period_ms or 1000)
+        return buffer.has_pending()
 
     async def _start_append(
         self,
@@ -2415,8 +2440,9 @@ class DuplexSessionRunner:
         deferred = self._deferred_silence
         if deferred is None or self.run.closing:
             return
-        buffer = self.model_state.audio_buffer
-        if self._pending_input_appends > 0 and not (buffer.has_pending() or buffer.has_reserved()):
+        if self._pending_input_appends > 0:
+            # The final queued append will rearm us. It may leave only partial
+            # PCM, which no longer blocks a text-opened response.
             return
         # A model-turn continuation stored no response id. A response that
         # began since then (queued stage output can begin_response before this
@@ -2861,6 +2887,7 @@ class DuplexSessionRunner:
                     )
                     or committed
                 )
+        session.release_zero_audio_response(old_response_id)
         # Settle once, after every history write. A new user input may prevent
         # end_response from committing while the reserved older item still can.
         # Cancelling before audio starts releases the tool pair for a retry.
@@ -2977,19 +3004,22 @@ class DuplexSessionRunner:
     # Commit / response.create                                           #
     # ------------------------------------------------------------------ #
 
-    def _apply_response_create_options(self, response_payload: dict[str, object]) -> str | None:
+    def _apply_response_create_options(self, response_payload: dict[str, object]) -> DuplexConfigError | None:
         session = self.session
         try:
             options = ResponseCreateOptions.from_realtime(
                 response_payload,
                 private_runtime_config_keys=self.plugin.private_runtime_config_keys,
+                capabilities=session.capabilities,
             )
         except DuplexConfigError as exc:
-            return exc.code
+            return exc
         try:
             session.reserve_response_options(options)
-        except Exception:
-            return "response_already_active"
+        except DuplexConfigError as exc:
+            return exc
+        except RuntimeError as exc:
+            return DuplexConfigError(str(exc), code="response_already_active")
         return None
 
     def _reserve_commit_prefixes(self) -> list[PcmAppendReservation]:
@@ -3557,14 +3587,11 @@ class DuplexSessionRunner:
             if isinstance(response_payload, dict):
                 response_options_error = self._apply_response_create_options(response_payload)
                 if response_options_error is not None:
-                    error_message = (
-                        "The selected native duplex runtime does not support generation "
-                        "overrides for instructions, voice, temperature, max tokens, tools, or "
-                        "tool_choice."
-                        if response_options_error == "unsupported_native_response_options"
-                        else "response.create cannot reserve options while another response is active."
+                    self._emit_error(
+                        response_options_error.code,
+                        str(response_options_error),
+                        event_id=event.get("realtime_event_id"),
                     )
-                    self._emit_error(response_options_error, error_message, event_id=event.get("realtime_event_id"))
                     return
         if event_type == "input_audio_buffer.commit":
             has_pending_audio = (

@@ -15,6 +15,7 @@ import pybase64 as base64
 from vllm.multimodal.image import open_image
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.config.stage_config import PipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
@@ -23,6 +24,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputDecision,
 )
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError, EncodeAudio
+from vllm_omni.engine.duplex.response_judge import judge_rejects
 from vllm_omni.model_executor.models.aura_omni.control_tokens import (
     AURA_V1,
     AURA_V2,
@@ -35,6 +37,10 @@ from vllm_omni.model_executor.models.aura_omni.duplex.data_plane import (
     AuraDataPlaneSession,
 )
 from vllm_omni.model_executor.models.aura_omni.duplex.session import AuraServingSessionState
+from vllm_omni.model_executor.models.aura_omni.duplex.stages import (
+    AURA_STAGE_LAYOUT,
+    AuraStageLayout,
+)
 from vllm_omni.model_executor.models.aura_omni.duplex.tools_utils import chat_template_tools
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     DEFAULT_AURA_SYSTEM_PROMPT,
@@ -162,16 +168,25 @@ class AuraDuplexPlugin(DuplexModelPlugin):
 
     plugin_id = "aura"
     private_runtime_config_keys = _PRIVATE_KEYS
+    stages: AuraStageLayout = AURA_STAGE_LAYOUT
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
-        self.data_plane = AuraDataPlaneSession(encode_audio)
+        self.data_plane = AuraDataPlaneSession(encode_audio, stages=self.stages)
         # Empty sampling defaults stay on v1. A stage that already lists the
         # v2 silent or im_end id switches this before the first request.
         self._profile = AURA_V1
         # Tool-result history writes planned by ``plan_append`` and applied by
         # ``commit_append_plan``: request_id -> (session_id, outputs, nudge).
         self._staged_tool_history: dict[str, tuple[str, tuple[str, ...], bool]] = {}
+
+    def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        stages = AuraStageLayout.from_pipeline(pipeline_config)
+        self.data_plane.configure_stages(stages)
+        self.stages = stages
+
+    def input_stage_id(self, payload: object) -> int:
+        return self.stages.asr
 
     def startup_warmup_turn(self) -> dict[str, object] | None:
         # A missing clip (e.g. a build without package data) keeps the shared tone.
@@ -200,8 +215,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
     ) -> tuple[object, ...]:
         del runtime_config
         configured = list(defaults)
-        if len(configured) > 1 and isinstance(configured[1], SamplingParams):
-            stage1 = configured[1].clone()
+        aura, talker = self.stages.aura, self.stages.talker
+        if len(configured) > aura and isinstance(configured[aura], SamplingParams):
+            stage1 = configured[aura].clone()
             self._profile = profile_for_stop_ids(stage1.stop_token_ids)
             stage1.stop_token_ids = stop_ids_for_profile(stage1.stop_token_ids, self._profile)
             # Silent / im_end are stop ids: keep them in the completion so
@@ -219,25 +235,25 @@ class AuraDuplexPlugin(DuplexModelPlugin):
                 extra = dict(stage1.extra_args or {})
                 extra["aura_mode"] = "streaming"
                 stage1.extra_args = extra
-            configured[1] = stage1
+            configured[aura] = stage1
         # Codec EOS (2150) and the 1024-token cap are defaults for an unset
         # Talker config. A value already set by yaml or the caller is kept,
         # even when max_tokens is longer than 1024.
-        if len(configured) > 2 and isinstance(configured[2], SamplingParams):
-            stage2 = configured[2].clone()
+        if len(configured) > talker and isinstance(configured[talker], SamplingParams):
+            stage2 = configured[talker].clone()
             if not stage2.stop_token_ids:
                 stage2.stop_token_ids = [2150]
             if stage2.max_tokens is None:
                 stage2.max_tokens = 1024
-            configured[2] = stage2
+            configured[talker] = stage2
         return tuple(configured)
 
     def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
-        # Talker is stage 2; Code2Wav is the last stage. Stage 0/1 are the
+        # Talker through Code2Wav drain. The stages before Talker are the
         # input gate and are idle once a turn is released.
-        if stage_count <= 2:
+        if stage_count <= self.stages.talker:
             return frozenset()
-        return frozenset(range(2, stage_count))
+        return frozenset(range(self.stages.talker, stage_count))
 
     def plan_append(
         self,
@@ -442,9 +458,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         output: object,
         context: object,
     ) -> bool:
-        """Project Stage1 thinker text to the client without short-circuiting TTS."""
+        """Project AURA thinker text to the client without short-circuiting TTS."""
         del output, context
-        return stage_id == 1
+        return stage_id == self.stages.aura
 
     def user_transcript(
         self,
@@ -459,7 +475,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         Vision-follow sets ``is_speech`` false; that audio is a silent pad and
         must not open a user bubble. The pipeline still forwards Stage0.
         """
-        if stage_id != 0 or not finished:
+        if stage_id != self.stages.asr or not finished:
             return None
         info = prompt.get("additional_information") if isinstance(prompt, dict) else None
         if isinstance(info, dict) and info.get("is_speech") is False:
@@ -487,7 +503,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             plan_partial_stage_output,
         )
 
-        return plan_partial_stage_output(orchestrator, stage_id, replica_id, output, req_state)
+        return plan_partial_stage_output(
+            orchestrator, stage_id, replica_id, output, req_state, aura_stage_id=self.stages.aura
+        )
 
     def partial_stage_followup(self, plan: Any, req_state: Any) -> Any:
         """Close the Talker stream after a resumable final sentence.
@@ -527,10 +545,13 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         segment_finished: bool,
         output: object,
         context: object,
+        streaming_context: object | None = None,
     ) -> bool:
-        """After Stage1 text/silent final, next commit may start while TTS drains."""
+        """After AURA text/silent final, next commit may start while TTS drains."""
         del context
-        if stage_id != 1:
+        if stage_id == self.stages.judge:
+            return segment_finished and judge_rejects(output, streaming_context)
+        if stage_id != self.stages.aura:
             return False
         if segment_finished:
             return True
@@ -545,10 +566,22 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
         del final_stage_id, segment_output_metadata
-        # Stage1 silent → short-circuit TTS/Code2Wav.
-        if stage_id != 1 or not segment_finished:
+        if stage_id == self.stages.judge:
+            if not segment_finished or not judge_rejects(output, streaming_context):
+                return None
+            return DuplexOutputDecision(
+                action=DuplexOutputAction.DIRECT_RESPONSE,
+                metadata={
+                    "duplex_direct_response": True,
+                    "model_listen": True,
+                    "listen_source": "response_judge",
+                },
+            )
+        # AURA silent → short-circuit TTS/Code2Wav.
+        if stage_id != self.stages.aura or not segment_finished:
             return None
         completion = _first_completion(output)
         token_ids = _completion_token_ids(completion) or list(segment_token_ids)

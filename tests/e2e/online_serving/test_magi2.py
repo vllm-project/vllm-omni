@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Released-checkpoint MAGI-2 Preview serving smoke on four CUDA GPUs or Ascend NPUs.
+"""Released-checkpoint MAGI-2 Preview serving smoke on four GPUs or Ascend NPUs.
 
 This is a one-step 272p load/dispatch test, not a quality or performance test.
 It exercises the recommended resident SP4 topology through ``/v1/videos``.
@@ -24,7 +24,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 MODEL = "sand-ai/MAGI-2-preview"
 PROMPT = "A red fox walks through fresh snow while wind moves the pine branches."
 
-FOUR_CARD_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=4)
+FOUR_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI300"}, num_cards=4)
 NPU_FOUR_CARD_MARKS = hardware_marks(res={"npu": "A5"}, num_cards=4)
 
 

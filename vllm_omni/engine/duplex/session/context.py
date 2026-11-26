@@ -60,6 +60,8 @@ class DuplexRunState:
     runtime_closed: bool = False
     #: Request id of the resumable data-plane stream currently bound to the session.
     stream_request_id: str | None = None
+    #: Model-confirmed (epoch, turn) allowed to continue past incomplete PCM.
+    partial_input_continuation_turn: tuple[int, int] | None = None
     #: Plugin signaled that the next user commit may start while the current
     #: assistant audio is still draining. Cleared on barge-in/cancel, or when
     #: the next ephemeral turn begins. Orthogonal to barge-in (which aborts).

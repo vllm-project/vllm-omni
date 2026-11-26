@@ -88,6 +88,12 @@ _OMNI_MODELS = {
         "step_audio2_token2wav",
         "StepAudio2Token2WavForConditionalGeneration",
     ),
+    ## chatterbox
+    "ChatterboxForConditionalGeneration": (
+        "chatterbox",
+        "chatterbox",
+        "ChatterboxForConditionalGeneration",
+    ),
     "CosyVoice3Model": (
         "cosyvoice3",
         "cosyvoice3",
@@ -372,6 +378,7 @@ _OMNI_MODELS = {
         "vibevoice",
         "VibeVoiceForConditionalGeneration",
     ),
+    "PhononTalkerForConditionalGeneration": ("phonon", "phonon_talker", "PhononTalkerForConditionalGeneration"),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
         "voxcpm2",
@@ -526,6 +533,17 @@ _OMNI_MODELS = {
         "aura_omni",
         "qwen3_5",
         "AuraQwen3_5ForConditionalGeneration",
+    ),
+    ## Response-judge stage models
+    "ResponseJudgeQwen3ForCausalLM": (
+        "response_judge",
+        "qwen3",
+        "ResponseJudgeQwen3ForCausalLM",
+    ),
+    "LayaDecisionModel": (
+        "response_judge",
+        "laya",
+        "LayaDecisionModel",
     ),
     "MiniMaxH3Encoder": (
         "minimax_h3",

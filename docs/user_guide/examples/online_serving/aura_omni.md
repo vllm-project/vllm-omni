@@ -55,6 +55,13 @@ model speaks the result. Hardware, numbers and limits are in
 `recipes/AURA/AURA_v2-H200.md`; the design is in
 [Full-Duplex Runtime (AURA_v2)](../../../design/aura_v2_duplex.md).
 
+## Optional response judge
+
+`vllm_omni/deploy/aura_omni_judged.yaml` adds a
+[response judge stage](../../../features/response_judge.md) between ASR and
+AURA, so a backchannel, cough or noise ends the turn before AURA and TTS run.
+`aura_omni.yaml` is unchanged and loads no judge model.
+
 ## GPU Utilization Recommendation
 
 `gpu_memory_utilization` in `vllm_omni/deploy/aura_omni.yaml` controls how much

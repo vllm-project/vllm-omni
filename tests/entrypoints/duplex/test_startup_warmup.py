@@ -11,12 +11,14 @@ from vllm_omni.entrypoints.duplex.warmup import (
     _WARMUP_FRAME_WIDTH,
     _WARMUP_INSTRUCTIONS,
     _WARMUP_SAMPLE_RATE_HZ,
+    WARMUP_OUTCOME_AUDIO,
+    WARMUP_OUTCOME_LISTEN,
     _ProcessWarmupProfile,
     _short_pcm_f32le_b64,
     _warmup_jpeg_b64,
+    classify_warmup_outcome,
     startup_warmup_kind,
     video_warmup_turn,
-    warmup_output_kind,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -97,9 +99,15 @@ def test_incomplete_plugin_warmup_turn_keeps_the_shared_tone() -> None:
 
 
 def test_warmup_stops_on_audio_or_listen() -> None:
-    assert warmup_output_kind({"type": "response.output_audio.delta"}) == "audio"
-    assert warmup_output_kind({"type": "response.listen"}) == "listen"
-    assert warmup_output_kind({"type": "response.created"}) is None
+    assert classify_warmup_outcome("response.output_audio.delta", kind="silent_frames") == WARMUP_OUTCOME_AUDIO
+    assert classify_warmup_outcome("response.listen", kind="silent_frames") == WARMUP_OUTCOME_LISTEN
+    assert classify_warmup_outcome("response.created", kind="silent_frames") is None
+
+
+def test_video_probe_listen_does_not_end_the_warmup() -> None:
+    # The video probe needs speech to warm Talker/Code2Wav, so a listen is not success.
+    assert classify_warmup_outcome("response.listen", kind="video_turn") is None
+    assert classify_warmup_outcome("response.output_audio.delta", kind="video_turn") == WARMUP_OUTCOME_AUDIO
 
 
 def test_startup_turn_frame_is_a_camera_sized_jpeg() -> None:

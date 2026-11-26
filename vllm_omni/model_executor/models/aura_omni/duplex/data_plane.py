@@ -16,6 +16,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_turn_id_from_request_id,
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, EncodeAudio
+from vllm_omni.model_executor.models.aura_omni.duplex.stages import AURA_STAGE_LAYOUT, AuraStageLayout
 from vllm_omni.model_executor.models.aura_omni.duplex.tools_utils import (
     extract_finished_tool_calls,
     safe_streaming_prefix,
@@ -196,12 +197,18 @@ def _requested_audio_format(context: object | None) -> tuple[str, float | None]:
 
 
 class AuraDataPlaneSession(DuplexDataPlane):
-    """Map Stage1 text + Stage3 audio (or silent) onto duplex events."""
+    """Map AURA text + Code2Wav audio (or silent) onto duplex events."""
 
-    def __init__(self, encode_audio: EncodeAudio) -> None:
+    def __init__(self, encode_audio: EncodeAudio, *, stages: AuraStageLayout = AURA_STAGE_LAYOUT) -> None:
         self._encode_audio = encode_audio
+        self._stages = stages
         self._requests: dict[str, _RequestState] = {}
         self._closed: set[str] = set()
+
+    def configure_stages(self, stages: AuraStageLayout) -> None:
+        if self._requests or self._closed:
+            raise RuntimeError("AURA stage layout must be configured before serving requests")
+        self._stages = stages
 
     def begin_request(self, request_id: str) -> None:
         self._closed.discard(request_id)
@@ -336,7 +343,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
         finished = bool(outer_finished or getattr(output, "finished", False))
         if (
             finished
-            and stage_id == 1
+            and stage_id == self._stages.aura
             and not state.silent
             and not state.context_committed
             and state.text_sent
@@ -391,7 +398,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
                     abort_data_plane_request=True,
                 )
                 return
-        is_final_audio_stage = stage_id is None or stage_id >= 3
+        is_final_audio_stage = stage_id is None or stage_id >= self._stages.code2wav
         mm = _multimodal(output, completion)
         audio = _audio_value(mm)
         if audio is not None and not state.silent:
