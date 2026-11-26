@@ -2210,7 +2210,7 @@ class Cosmos3VFMTransformer(nn.Module):
             raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
         # A local view: the stored cache (CFG branches, session state, PP
         # transport) stays batch 1.
-        und_kv = _broadcast_und_kv(self.cached_kv, hidden_gen.shape[0])
+        und_kv = _broadcast_und_kv(cached_kv, hidden_gen.shape[0])
         if freqs_gen is None:
             hidden_gen, freqs_gen = self._shard_gen_inputs(hidden_gen)
         freqs_cos, freqs_sin = freqs_gen
@@ -2228,10 +2228,10 @@ class Cosmos3VFMTransformer(nn.Module):
             # e.g. by tests or cache wrappers).
             if not self.attention_execution.strategy_enabled and _pp_parallel_active():
                 own_layers = self.gen_layers[self.start_layer : self.end_layer]
-                own_kv = cached_kv[self.start_layer : self.end_layer]
+                own_kv = und_kv[self.start_layer : self.end_layer]
             else:
                 own_layers = self.gen_layers
-                own_kv = cached_kv
+                own_kv = und_kv
             for layer, (k_und, v_und) in zip(own_layers, own_kv, strict=True):
                 hidden_gen = layer(
                     hidden_gen,
@@ -2250,13 +2250,13 @@ class Cosmos3VFMTransformer(nn.Module):
             if (
                 not self.attention_execution.strategy_enabled
                 and _pp_parallel_active()
-                and (self.start_layer, self.end_layer) != (0, len(self.cached_kv))
+                and (self.start_layer, self.end_layer) != (0, len(und_kv))
             ):
                 raise NotImplementedError(
                     "Cosmos3 Cache-Dit is not supported together with pipeline parallelism; disable one of them."
                 )
             for layer in self.gen_layers:
-                hidden_gen = layer(hidden_gen, cached_kv=cached_kv, freqs_gen=(freqs_cos, freqs_sin), **layer_kwargs)
+                hidden_gen = layer(hidden_gen, cached_kv=und_kv, freqs_gen=(freqs_cos, freqs_sin), **layer_kwargs)
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
         return self.gen_sp_gather(hidden_gen) if gather_output else hidden_gen

@@ -502,7 +502,7 @@ class Attention(nn.Module):
         computation: AttentionComputation | str | None = None,
         cross_parallel_layout: CrossAttentionParallelLayout | str | None = None,
         cross_mask_kind: str | None = None,
-        _attention_spec: AttentionSpec | BlockSparseAttentionSpec | None = None,
+        _attention_spec: "AttentionSpec | BlockSparseAttentionSpec | None" = None,
     ):
         super().__init__()
 
