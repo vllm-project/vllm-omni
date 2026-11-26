@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from torch import nn
+from vllm.utils.mem_utils import GiB_bytes, MiB_bytes
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 
 import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
@@ -180,23 +181,29 @@ def test_worker_honors_explicit_kv_memory_budget(monkeypatch) -> None:
     worker.model_runner.profile_run.assert_not_called()
 
 
-def test_worker_treats_zero_kv_memory_budget_as_profiled_auto_sizing(monkeypatch) -> None:
-    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=Mock()))
+@pytest.mark.parametrize(
+    ("non_kv_cache_memory", "expected_kv_memory"),
+    [(2 * GiB_bytes, 512 * MiB_bytes), (3 * GiB_bytes - 512 * MiB_bytes - 1, 1)],
+)
+def test_worker_treats_zero_kv_memory_budget_as_profiled_auto_sizing(
+    monkeypatch, mocker, non_kv_cache_memory: int, expected_kv_memory: int
+) -> None:
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=mocker.Mock()))
     worker = object.__new__(DiffusionWorker)
     worker.rank = 0
-    worker.init_snapshot = SimpleNamespace(free_memory=900)
-    worker.requested_memory = 750
+    worker.init_snapshot = SimpleNamespace(free_memory=4 * GiB_bytes)
+    worker.requested_memory = 3 * GiB_bytes
     worker.vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(
             kv_cache_memory_bytes=0,
             gpu_memory_utilization=0.75,
         )
     )
-    worker.model_runner = SimpleNamespace(profile_run=Mock(), model_memory_usage=100)
+    worker.model_runner = SimpleNamespace(profile_run=mocker.Mock(), model_memory_usage=GiB_bytes)
     monkeypatch.setattr(diffusion_worker_module, "_all_gather_rank_values", lambda value: [value])
     profile_result = SimpleNamespace(
-        non_kv_cache_memory=400,
-        after_profile=SimpleNamespace(free_memory=500),
+        non_kv_cache_memory=non_kv_cache_memory,
+        after_profile=SimpleNamespace(free_memory=2 * GiB_bytes),
     )
     monkeypatch.setattr(
         diffusion_worker_module,
@@ -205,28 +212,31 @@ def test_worker_treats_zero_kv_memory_budget_as_profiled_auto_sizing(monkeypatch
     )
     profile_request = object()
 
-    assert worker.determine_available_kv_memory(profile_request) == [350]
+    assert worker.determine_available_kv_memory(profile_request) == [expected_kv_memory]
+    assert profile_result.non_kv_cache_memory == non_kv_cache_memory
     worker.model_runner.profile_run.assert_called_once_with(profile_request)
 
 
-@pytest.mark.parametrize("non_kv_cache_memory", [750, 800])
-def test_worker_rejects_non_positive_profiled_kv_memory(monkeypatch, non_kv_cache_memory: int) -> None:
-    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=Mock()))
+@pytest.mark.parametrize(
+    "non_kv_cache_memory", [238 * MiB_bytes, 238 * MiB_bytes + 1, 750 * MiB_bytes, 800 * MiB_bytes]
+)
+def test_worker_rejects_non_positive_profiled_kv_memory(monkeypatch, mocker, non_kv_cache_memory: int) -> None:
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=mocker.Mock()))
     worker = object.__new__(DiffusionWorker)
     worker.rank = 0
-    worker.init_snapshot = SimpleNamespace(free_memory=900)
-    worker.requested_memory = 750
+    worker.init_snapshot = SimpleNamespace(free_memory=900 * MiB_bytes)
+    worker.requested_memory = 750 * MiB_bytes
     worker.vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(
             kv_cache_memory_bytes=None,
             gpu_memory_utilization=0.75,
         )
     )
-    worker.model_runner = SimpleNamespace(profile_run=Mock(), model_memory_usage=100)
+    worker.model_runner = SimpleNamespace(profile_run=mocker.Mock(), model_memory_usage=100 * MiB_bytes)
     monkeypatch.setattr(diffusion_worker_module, "_all_gather_rank_values", lambda value: [value])
     profile_result = SimpleNamespace(
         non_kv_cache_memory=non_kv_cache_memory,
-        after_profile=SimpleNamespace(free_memory=100),
+        after_profile=SimpleNamespace(free_memory=100 * MiB_bytes),
     )
     monkeypatch.setattr(
         diffusion_worker_module,
@@ -239,7 +249,7 @@ def test_worker_rejects_non_positive_profiled_kv_memory(monkeypatch, non_kv_cach
         RuntimeError,
         match=(
             "rank 0: RuntimeError: No memory remains for Diffusion KV cache after profiling: "
-            f"requested_memory=750 bytes, non_kv_cache_memory={non_kv_cache_memory} bytes"
+            f"requested_memory={750 * MiB_bytes} bytes, non_kv_cache_memory={non_kv_cache_memory} bytes"
         ),
     ):
         worker.determine_available_kv_memory(profile_request)
@@ -247,23 +257,23 @@ def test_worker_rejects_non_positive_profiled_kv_memory(monkeypatch, non_kv_cach
     worker.model_runner.profile_run.assert_called_once_with(profile_request)
 
 
-def test_worker_profiles_activation_headroom_instead_of_current_residency(monkeypatch) -> None:
-    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=Mock()))
+def test_worker_profiles_activation_headroom_instead_of_current_residency(monkeypatch, mocker) -> None:
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=mocker.Mock()))
     worker = object.__new__(DiffusionWorker)
     worker.rank = 0
-    worker.init_snapshot = SimpleNamespace(free_memory=1200)
-    worker.requested_memory = 1000
+    worker.init_snapshot = SimpleNamespace(free_memory=5 * GiB_bytes)
+    worker.requested_memory = 4 * GiB_bytes
     worker.vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(
             kv_cache_memory_bytes=None,
             gpu_memory_utilization=0.8,
         )
     )
-    worker.model_runner = SimpleNamespace(profile_run=Mock(), model_memory_usage=250)
+    worker.model_runner = SimpleNamespace(profile_run=mocker.Mock(), model_memory_usage=GiB_bytes)
     monkeypatch.setattr(diffusion_worker_module, "_all_gather_rank_values", lambda value: [value])
     profile_result = SimpleNamespace(
-        non_kv_cache_memory=650,
-        after_profile=SimpleNamespace(free_memory=550),
+        non_kv_cache_memory=3 * GiB_bytes,
+        after_profile=SimpleNamespace(free_memory=3 * GiB_bytes),
     )
     profiling_calls = []
 
@@ -278,8 +288,8 @@ def test_worker_profiles_activation_headroom_instead_of_current_residency(monkey
     )
     profile_request = object()
 
-    assert worker.determine_available_kv_memory(profile_request) == [350]
-    assert profiling_calls == [(worker.init_snapshot, 250)]
+    assert worker.determine_available_kv_memory(profile_request) == [512 * MiB_bytes]
+    assert profiling_calls == [(worker.init_snapshot, GiB_bytes)]
     worker.model_runner.profile_run.assert_called_once_with(profile_request)
 
 
