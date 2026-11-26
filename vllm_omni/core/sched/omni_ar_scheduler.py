@@ -551,31 +551,25 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _get_ar_coalescing_ready_request_ids(self) -> set[str]:
         """Count candidates, leaving allocation and execution limits upstream."""
-        eligible = {
-            request.request_id for queue in (self.running, self.waiting, self.kv_holding_waiting) for request in queue
-        }
-        ready = self._get_coalescing_ready_request_ids()
-        if ready is None:
+        input_ready = self._get_coalescing_ready_request_ids()
+        if input_ready is None:
             return set()
-        ready.update(
-            request.request_id
-            for request in self.running
-            if request.status == RequestStatus.RUNNING
-            and request.num_tokens_with_spec + request.num_output_placeholders > request.num_computed_tokens
-        )
-        for queue in (self.waiting, self.kv_holding_waiting):
-            ready.update(
-                request.request_id
-                for request in queue
-                if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
-            )
-        return {
-            req_id
-            for req_id in ready
-            if req_id in eligible
-            and (request := self.requests.get(req_id)) is not None
-            and request.status in (RequestStatus.RUNNING, RequestStatus.WAITING, RequestStatus.PREEMPTED)
-        }
+        ready: set[str] = set()
+        for queue in (self.running, self.waiting, self.kv_holding_waiting):
+            for request in queue:
+                if request.request_id not in self.requests:
+                    continue
+                if request.status == RequestStatus.RUNNING:
+                    has_token_work = queue is self.running and (
+                        request.num_tokens_with_spec + request.num_output_placeholders > request.num_computed_tokens
+                    )
+                elif request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+                    has_token_work = queue is not self.running
+                else:
+                    continue
+                if request.request_id in input_ready or has_token_work:
+                    ready.add(request.request_id)
+        return ready
 
     def _should_defer_ar_generation(self, ready_ids: set[str]) -> bool:
         """Bound batch waiting without restarting the deadline as inputs arrive."""
