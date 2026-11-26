@@ -1572,6 +1572,68 @@ def test_tts_additions_restore_aiter_mha_and_cap_cpu_threads() -> None:
         assert step["env"][var] == "4"
 
 
+_QUANTIZATION_MARKER = "-m 'full_model and diffusion and rocm and MI325 and cards_1 and not nvidia_only'"
+_QUANTIZATION_LTX2_NODES = (
+    "tests/diffusion/quantization/test_quantization_fp8.py::test_single_stage_ltx2_fp8_uses_less_memory",
+    '"tests/diffusion/quantization/test_quantization_quality.py::test_quantization_quality[fp8_ltx2]"',
+)
+_QUANTIZATION_FLUX2_TE_NODE = (
+    '"tests/diffusion/quantization/test_quantization_quality.py::test_quantization_quality[fp8_flux2_dev_text_encoder]"'
+)
+
+
+@pytest.mark.parametrize(
+    ("label", "expected", "gguf"),
+    [
+        ("Diffusion · Quantization · 1-GPU", "1 17 165m rocm-diffusion-quantization", False),
+        (
+            "Diffusion · Quantization · FLUX.2 FP8 Text Encoder · 1-GPU",
+            "1 1 75m rocm-diffusion-quantization-flux2-te",
+            False,
+        ),
+        ("Diffusion · Quantization · GGUF · 1-GPU", "1 2 75m rocm-diffusion-quantization-gguf", True),
+        ("Diffusion · Quantization · LTX-2 FP8 · 1-GPU", "1 2 105m rocm-diffusion-quantization-ltx2", False),
+    ],
+)
+def test_diffusion_quantization_nightly_jobs_mirror_cuda_scopes(label: str, expected: str, gguf: bool) -> None:
+    step = _find_step(label, AMD_NIGHTLY_PIPELINE)
+    commands = step["commands"]
+    command = "\n".join(commands)
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["grade"] == "NonBlocking"
+    assert step["source_file_dependencies"] == ["diffusion_quantization", "rocm_diffusion_nightly_runner"]
+    assert f"run-rocm-diffusion-nightly.sh {expected}" in " ".join(command.split())
+    assert command.count(_QUANTIZATION_MARKER) == 1
+    # The GGUF plugin replaces DiffusersPipelineLoader.load_weights; keep it
+    # away from the online-quant CPU-offload cases.
+    assert ('pip install "vllm-gguf-plugin==0.0.4"' in commands) is gguf
+    _assert_build_scoped_aiter_mha_cache(step, "run-rocm-diffusion-nightly.sh", publishes=False)
+    if label == "Diffusion · Quantization · 1-GPU":
+        assert "--ignore=tests/diffusion/quantization/test_gguf_diffusion.py" in command
+        assert all(f"--deselect {node}" in command for node in (*_QUANTIZATION_LTX2_NODES, _QUANTIZATION_FLUX2_TE_NODE))
+        # BAGEL's masked AITER module is built after the cache sets AITER_JIT_DIR.
+        warm_at = next(index for index, item in enumerate(commands) if "flash_attn_func(q, q, q, causal=True)" in item)
+        assert commands.index(AITER_MHA_CACHE_PREPARE) < warm_at < len(commands) - 1
+    elif label.endswith("FLUX.2 FP8 Text Encoder · 1-GPU"):
+        assert _QUANTIZATION_FLUX2_TE_NODE in command
+    elif label.endswith("LTX-2 FP8 · 1-GPU"):
+        assert all(node in command for node in _QUANTIZATION_LTX2_NODES)
+
+
+def test_wan22_autoround_nightly_job_mirrors_cuda_function_test() -> None:
+    step = _find_step("Diffusion X2V · Wan2.2 AutoRound · 1-GPU", AMD_NIGHTLY_PIPELINE)
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["grade"] == "NonBlocking"
+    assert step["env"]["VLLM_ROCM_USE_AITER"] == "0"
+    assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    assert (
+        "run-rocm-full-model-nightly.sh tests/e2e/offline_inference/test_wan22_autoround_w4a16_expansion.py 8 "
+        "diffusion rocm-wan22-autoround"
+    ) in " ".join("\n".join(step["commands"]).split())
+
+
 def test_qwen3_omni_realtime_merge_job_mirrors_cuda_h100_entrypoints() -> None:
     step = _find_step("MERGE · Qwen3-Omni Realtime and Duplex Entrypoints · 2-GPU", AMD_MERGE_PIPELINE)
     commands = "\n".join(step["commands"])
