@@ -36,7 +36,8 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.data_entry_keys import OmniPayload
-from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
+from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .configuration_indextts2 import (
@@ -157,9 +158,10 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         # outputs from the live batch after CUDA graph replay (#10435).
         self.mrv2_forward_returns_tensor = True
         self.has_preprocess = True
-        self.has_postprocess = True
+        self.has_postprocess = self.use_gpt_latent
         self.requires_raw_input_tokens = True
         self.enable_update_additional_information = True
+        self._zero_tensor_cache: dict[tuple[Any, ...], torch.Tensor] = {}
         # S2Mel never reads the generic pooler ``hidden`` key: latent mode
         # ships the aligned GPT latent as ``hidden_states.latent`` from
         # make_omni_output, and no-latent mode needs no hidden state at all.
@@ -395,8 +397,26 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
 
         device = hidden.device
         latent_dim = hidden.shape[-1]
-        _zero_codes = torch.zeros(0, 1, dtype=torch.long, device=device) if self.use_gpt_latent else None
-        _zero_latent = torch.zeros(0, latent_dim, dtype=hidden.dtype, device=device) if self.use_gpt_latent else None
+        zero_cache = getattr(self, "_zero_tensor_cache", None)
+        if zero_cache is None:
+            zero_cache = {}
+            self._zero_tensor_cache = zero_cache
+
+        def _get_zero_codes() -> torch.Tensor:
+            key = ("codes", device)
+            t = zero_cache.get(key)
+            if t is None:
+                t = torch.zeros(0, 1, dtype=torch.long, device=device)
+                zero_cache[key] = t
+            return t
+
+        def _get_zero_latent() -> torch.Tensor:
+            key = ("latent", device, hidden.dtype, latent_dim)
+            t = zero_cache.get(key)
+            if t is None:
+                t = torch.zeros(0, latent_dim, dtype=hidden.dtype, device=device)
+                zero_cache[key] = t
+            return t
 
         # Per-request lists: to_payload_element dispatches lists via
         # element[idx], giving correct per-request mapping even during
@@ -414,10 +434,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         for info in info_dicts:
             if not isinstance(info, dict):
                 if self.use_gpt_latent:
-                    assert _zero_codes is not None
-                    mel_codes_list.append(_zero_codes)
-                    assert _zero_latent is not None
-                    latent_list.append(_zero_latent)
+                    mel_codes_list.append(_get_zero_codes())
+                    latent_list.append(_get_zero_latent())
                 meta_list.append({})
                 continue
             info_meta = info.get("meta", {})
@@ -432,8 +450,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                     code_seq = mc.reshape(-1)
                     mel_codes_list.append(code_seq[-1:].reshape(1, 1).contiguous())
                 else:
-                    assert _zero_codes is not None
-                    mel_codes_list.append(_zero_codes)
+                    mel_codes_list.append(_get_zero_codes())
 
                 lat_acc = info_meta.get("step_latent")
                 if not isinstance(lat_acc, torch.Tensor) or lat_acc.numel() == 0:
@@ -449,8 +466,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                         lat_seq = lat.reshape(-1, lat.shape[-1]) if lat.ndim != 2 else lat
                         latent_list.append(lat_seq[-1:].contiguous())
                     else:
-                        assert _zero_latent is not None
-                        latent_list.append(_zero_latent)
+                        latent_list.append(_get_zero_latent())
 
             # Scalar metadata is kept with REPLACE semantics by the generic
             # full-payload accumulator. Emit the policy on every step so the
@@ -551,6 +567,56 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             },
         )
 
+    def preprocess_decode_batch_mrv2(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        """Vectorized MRv2 decode preprocess across all active decode rows."""
+        del input_embeds
+        ids_flat = input_ids.reshape(-1)
+        batch_size = len(req_infos)
+        if int(ids_flat.numel()) != batch_size:
+            raise ValueError(
+                f"IndexTTS decode batch mismatch: expected {batch_size} input ids, got {int(ids_flat.numel())}"
+            )
+        if batch_size == 0:
+            return input_ids, self.mel_embedding.weight.new_empty((0, self.model_dim)), []
+
+        decode_steps: list[int] = []
+        updates_by_req: list[dict[str, Any]] = []
+        new_codes = ids_flat.detach()
+
+        for row, info in enumerate(req_infos):
+            meta = info.get("meta")
+            if not isinstance(meta, dict) or meta.get("mel_start_offset") is None:
+                raise RuntimeError("IndexTTS MRv2 batched decode requires completed prefill state")
+            prev_count = meta.get("mel_code_count", 0)
+            if not isinstance(prev_count, int):
+                prev_count = int(prev_count)
+            decode_step = prev_count + 1
+            decode_steps.append(decode_step)
+
+            meta_update: dict[str, Any] = {"mel_code_count": decode_step}
+            if self.use_gpt_latent:
+                prev_latent = meta.get("latent_acc")
+                if isinstance(prev_latent, torch.Tensor):
+                    meta_update["step_latent"] = prev_latent
+                updates_by_req.append(
+                    {
+                        "codes": {"mel": new_codes[row : row + 1]},
+                        "meta": meta_update,
+                    }
+                )
+            else:
+                updates_by_req.append({"meta": meta_update})
+
+        step_tensor = index_to_device(decode_steps, ids_flat.device)
+        embeds = self.mel_embedding(ids_flat) + self.mel_pos_embedding.emb(step_tensor)
+        return input_ids, embeds, updates_by_req
+
     def _preprocess_prefill(
         self,
         input_ids: torch.Tensor,
@@ -597,14 +663,24 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         text_preprocessed = bool(_first(INDEXTTS25_TEXT_PREPROCESSED_KEY, False))
         _raw_emo_voice = _first("emo_voice_name")
         emo_voice_name = str(_raw_emo_voice).strip().lower() if _raw_emo_voice else None
+        _ref_audio_cache_key = _first("ref_audio_cache_key")
+        _emo_audio_cache_key = _first("emo_audio_cache_key")
 
         # --- Speaker cache lookup ---
         _voice_name = _first("voice_name")
         _voice_created_at = int(_first("voice_created_at", 0))
+        _cache_model_tag = "indextts2_5" if self.conditioning_policy.uses_campplus_projection else "indextts2"
         _speaker_cache_key = None
         _cached = None
         if _voice_name:
-            _speaker_cache_key = self._speaker_cache.make_cache_key(_voice_name, "indextts2", _voice_created_at)
+            _speaker_cache_key = self._speaker_cache.make_cache_key(_voice_name, _cache_model_tag, _voice_created_at)
+            _cached = self._speaker_cache.get(_speaker_cache_key)
+        elif isinstance(_ref_audio_cache_key, str) and _ref_audio_cache_key:
+            _speaker_cache_key = self._speaker_cache.make_cache_key(
+                f"ref:{_ref_audio_cache_key}",
+                _cache_model_tag,
+                0,
+            )
             _cached = self._speaker_cache.get(_speaker_cache_key)
 
         # --- Load audio and extract features ---
@@ -680,6 +756,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             speaker_audio_path=voice_path,
             emo_audio_path=emo_audio_path,
             emo_voice_name=emo_voice_name,
+            emo_audio_cache_key=_emo_audio_cache_key if isinstance(_emo_audio_cache_key, str) else None,
             main_text=text,
             use_emo_text=use_emo_text,
             emo_text=emo_text,
@@ -798,6 +875,18 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
 
         return {"meta": {"latent_acc": hidden_states.detach()}}
 
+    def postprocess_batch_mrv2(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        last_token_indices: torch.Tensor,
+    ) -> tuple[tuple[str, str], OwnedBatchTensor]:
+        """Gather each request's tail hidden state in one GPU operation."""
+        return (
+            ("meta", "latent_acc"),
+            OwnedBatchTensor(hidden_states.detach().index_select(0, last_token_indices).unsqueeze(1)),
+        )
+
     def _compute_mel_22k(self, wav_22k: torch.Tensor, device: torch.device) -> torch.Tensor:
         """Compute 80-band mel spectrogram at 22.05kHz for Stage 1."""
         s2mel_cfg = self.config.s2mel.get("preprocess_params", {})
@@ -841,6 +930,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         w2v_model: Any,
         w2v_proc: Any,
         device: torch.device,
+        emo_audio_cache_key: str | None = None,
     ) -> torch.Tensor:
         """Full emotion control logic aligned with official infer_v2.py. Returns [1, D]."""
         # --- Mutual exclusion: text/vector guidance clears emotion reference audio ---
@@ -901,11 +991,14 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             emo_cond_emb = spk_cond_emb
         else:
             effective_alpha = emo_alpha
-            # emotion audio cache (enabled when emo_voice_name is provided)
+            # emotion audio cache (uploaded emo_voice_name or content-hashed emo_audio_cache_key)
             _emo_cache_key = None
             _emo_cached = None
             if emo_voice_name:
                 _emo_cache_key = self._speaker_cache.make_cache_key(emo_voice_name, "indextts2_emo", 0)
+                _emo_cached = self._speaker_cache.get(_emo_cache_key)
+            elif emo_audio_cache_key:
+                _emo_cache_key = self._speaker_cache.make_cache_key(f"ref:{emo_audio_cache_key}", "indextts2_emo", 0)
                 _emo_cached = self._speaker_cache.get(_emo_cache_key)
 
             if _emo_cached is not None:

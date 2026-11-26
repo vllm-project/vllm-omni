@@ -756,3 +756,341 @@ def test_s2mel_forward_handles_mrv2_dummy_placeholders_and_rejects_partial_missi
     valid_payload = _stage1_payload(4, seed=9)
     with pytest.raises(ValueError, match="input 1 is missing use_gpt_latent"):
         decoder.forward(torch.tensor([0, 0]), model_intermediate_buffer=[valid_payload, {}])
+
+
+def test_ref_audio_and_emo_audio_cache_keys_reuse_speaker_cache_and_isolate_versions():
+    """Inline ref_audio/emo_audio requests pass cache keys from the serving adapter.
+
+    Verify Stage 0 reuses SpeakerEmbeddingCache on ref_audio_cache_key and
+    emo_audio_cache_key without colliding between IndexTTS-2 and IndexTTS-2.5.
+    """
+    from vllm_omni.model_executor.models.indextts2.indextts2_talker import (
+        resolve_indextts_conditioning_policy,
+    )
+    from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
+
+    shared_cache = SpeakerEmbeddingCache(max_bytes=64 * 1024 * 1024)
+
+    def _build_minimal_talker(model_type: str) -> IndexTTS2TalkerForConditionalGeneration:
+        talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
+        nn.Module.__init__(talker)
+        talker.model_path = "dummy-model"
+        talker.config = SimpleNamespace(
+            model_type=model_type,
+            semantic_codec={"codebook_size": 8192},
+        )
+        talker.conditioning_policy = resolve_indextts_conditioning_policy(model_type)
+        talker.use_gpt_latent = model_type == "indextts2"
+        talker.model_dim = HIDDEN
+        talker.start_mel_token = 8192
+        talker._speaker_cache = shared_cache
+        talker._w2v_stat = None
+        talker.text_embedding = nn.Embedding(32, HIDDEN)
+        talker.mel_embedding = nn.Embedding(8194, HIDDEN)
+        talker.text_pos_embedding = lambda ids: torch.zeros(ids.shape[0], ids.shape[1], HIDDEN)
+        talker.mel_pos_embedding = SimpleNamespace(
+            get_fixed_embedding=lambda _pos, device: torch.zeros(1, 1, HIDDEN, device=device)
+        )
+        talker.emo_layer = nn.Linear(HIDDEN, HIDDEN)
+        talker.emovec_layer = nn.Linear(1024, HIDDEN)
+        if talker.conditioning_policy.uses_campplus_projection:
+            talker.spk_emb_proj = nn.Linear(192, HIDDEN)
+            talker.lang_embedding = nn.Embedding(8, HIDDEN)
+        else:
+
+            class _DummyCondEncoder(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.weight = nn.Parameter(torch.zeros(1))
+
+                def forward(self, emb, _lens):
+                    return (
+                        torch.zeros(1, 4, HIDDEN, dtype=emb.dtype, device=emb.device),
+                        torch.ones(1, 1, 4, device=emb.device),
+                    )
+
+            talker.conditioning_encoder = _DummyCondEncoder()
+            talker.cond_mask_pad = lambda mask: mask
+            talker.perceiver_encoder = lambda cond, _mask: torch.zeros(1, 32, HIDDEN, dtype=cond.dtype)
+            talker.speed_emb = nn.Embedding(2, HIDDEN)
+
+        talker._ensure_w2v_stat_loaded = lambda _dev: None
+        talker._compute_mel_22k = lambda _wav, dev: torch.ones(1, 80, 12, device=dev)
+        talker._tokenize_text = lambda text, dev, **kw: (
+            torch.tensor([[1, 2, 3]], dtype=torch.long, device=dev),
+            torch.tensor([0], dtype=torch.long, device=dev)
+            if talker.conditioning_policy.uses_language_embedding
+            else None,
+        )
+        talker._merge_emovec = lambda spk, emo, _alpha: torch.zeros(1, HIDDEN, dtype=spk.dtype, device=spk.device)
+        return talker
+
+    load_calls: list[str] = []
+    w2v_calls: list[str] = []
+    quant_calls: list[str] = []
+
+    def _fake_load_ref(_path, device, mode="speaker"):
+        load_calls.append(mode)
+        return torch.zeros(1600, device=device), torch.zeros(2205, device=device)
+
+    def _fake_w2v(_wav, _model, _proc, device, _stat):
+        w2v_calls.append("w2v")
+        return torch.full((1, 5, 1024), 2.5, device=device)
+
+    class _FakeCodec:
+        def quantize(self, emb):
+            quant_calls.append("quant")
+            return None, torch.full((1, 5, 1024), 1.25, device=emb.device)
+
+    with (
+        patch("vllm_omni.model_executor.models.indextts2.indextts2_talker.load_reference_audio", _fake_load_ref),
+        patch(
+            "vllm_omni.model_executor.models.indextts2.indextts2_talker.load_wav2vec2",
+            lambda _p, _d: (object(), object()),
+        ),
+        patch("vllm_omni.model_executor.models.indextts2.indextts2_talker.wav2vec_extract", _fake_w2v),
+        patch(
+            "vllm_omni.model_executor.models.indextts2.indextts2_talker.load_semantic_codec",
+            lambda _p, _c, _d: _FakeCodec(),
+        ),
+        patch(
+            "vllm_omni.model_executor.models.indextts2.indextts2_talker.load_campplus",
+            lambda _p, _d: (lambda _fb: torch.ones(1, 192)),
+        ),
+        patch(
+            "vllm_omni.model_executor.models.indextts2.indextts2_talker.compute_fbank",
+            lambda _wav, dev: torch.ones(1, 10, 80, device=dev),
+        ),
+    ):
+        t2 = _build_minimal_talker("indextts2")
+        info_v2 = {
+            "text": ["hello"],
+            "voice": [["dummy.wav"]],
+            "ref_audio_cache_key": ["sha256-same-ref"],
+        }
+        # IndexTTS-2: 34 prefix + 3 text + 1 start_mel = 38 tokens
+        ids_v2 = torch.ones(38, dtype=torch.long)
+        _, _, upd1 = t2._preprocess_prefill(ids_v2, None, info_v2, 38)
+        _, _, upd2 = t2._preprocess_prefill(ids_v2, None, info_v2, 38)
+        assert len(load_calls) == 1
+        assert len(w2v_calls) == 1
+        assert len(quant_calls) == 1
+        torch.testing.assert_close(upd1["meta"]["S_ref"], upd2["meta"]["S_ref"])
+        assert float(upd2["meta"]["S_ref"][0, 0, 0]) == pytest.approx(1.25)
+
+        # IndexTTS-2.5 with the exact same ref_audio_cache_key must NOT hit 2.0's quantized S_ref
+        t25 = _build_minimal_talker("indextts2_5")
+        info_v25 = {
+            "text": ["hello"],
+            "voice": [["dummy.wav"]],
+            "ref_audio_cache_key": ["sha256-same-ref"],
+            "emo_audio": ["emo.wav"],
+            "emo_audio_cache_key": ["sha256-same-emo"],
+        }
+        # IndexTTS-2.5: 3 prefix + 3 text + 1 start_mel = 7 tokens
+        ids_v25 = torch.ones(7, dtype=torch.long)
+        _, _, upd25_1 = t25._preprocess_prefill(ids_v25, None, info_v25, 7)
+        _, _, upd25_2 = t25._preprocess_prefill(ids_v25, None, info_v25, 7)
+        # 1 speaker load + 1 emo load on 1st call; 0 new loads on 2nd call
+        assert load_calls == ["speaker", "speaker", "emotion"]
+        assert len(w2v_calls) == 3
+        assert float(upd25_1["meta"]["S_ref"][0, 0, 0]) == pytest.approx(2.5)
+        torch.testing.assert_close(upd25_1["meta"]["S_ref"], upd25_2["meta"]["S_ref"])
+
+
+@pytest.mark.parametrize("use_gpt_latent", [True, False])
+def test_mrv2_batched_decode_preprocess_and_postprocess_match_serial(use_gpt_latent: bool):
+    """Batched MRv2 decode preprocess and postprocess match serial hooks bit-for-bit."""
+    import numpy as np
+
+    from vllm_omni.model_executor.models.output_templates import OwnedBatchTensor
+    from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+    torch.manual_seed(17)
+    talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
+    nn.Module.__init__(talker)
+    talker.use_gpt_latent = use_gpt_latent
+    talker.has_preprocess = True
+    talker.has_postprocess = use_gpt_latent
+    talker.model_dim = HIDDEN
+    talker.mel_embedding = nn.Embedding(64, HIDDEN)
+    talker.mel_pos_embedding = SimpleNamespace(emb=nn.Embedding(64, HIDDEN))
+    talker.gpu_resident_buffer_keys = {
+        ("codes", "mel"),
+        ("meta", "mel_start_offset"),
+        ("meta", "mel_code_count"),
+        ("hidden_states", "latent"),
+        ("meta", "latent_acc"),
+        ("meta", "step_latent"),
+    }
+
+    batch_size = 3
+    input_ids = torch.tensor([7, 19, 41], dtype=torch.long)
+    prev_latents = [torch.randn(1, HIDDEN) for _ in range(batch_size)]
+    req_infos = [
+        {
+            "req_id": f"req-{i}",
+            "meta": {
+                "mel_start_offset": 10 + i,
+                "mel_code_count": i + 2,
+                **({"latent_acc": prev_latents[i]} if use_gpt_latent else {}),
+            },
+        }
+        for i in range(batch_size)
+    ]
+
+    # Compare batched MRv2 decode hook against serial _preprocess_decode
+    serial_embeds = []
+    serial_updates = []
+    for i in range(batch_size):
+        _, emb_i, upd_i = talker.preprocess(input_ids[i : i + 1], None, **req_infos[i])
+        serial_embeds.append(emb_i)
+        serial_updates.append(upd_i)
+
+    batch_ids, batch_embeds, batch_updates = talker.preprocess_decode_batch_mrv2(
+        input_ids=input_ids,
+        input_embeds=torch.zeros(batch_size, HIDDEN),
+        req_infos=req_infos,
+    )
+    assert batch_ids is input_ids
+    torch.testing.assert_close(batch_embeds, torch.cat(serial_embeds, dim=0), atol=0.0, rtol=0.0)
+    for i in range(batch_size):
+        assert batch_updates[i]["meta"]["mel_code_count"] == serial_updates[i]["meta"]["mel_code_count"]
+        if use_gpt_latent:
+            torch.testing.assert_close(batch_updates[i]["codes"]["mel"], serial_updates[i]["codes"]["mel"])
+            torch.testing.assert_close(
+                batch_updates[i]["meta"]["step_latent"], serial_updates[i]["meta"]["step_latent"]
+            )
+        else:
+            assert "codes" not in batch_updates[i]
+
+    # Verify postprocess_batch_mrv2 matches serial postprocess
+    hidden = torch.randn(7, HIDDEN)
+    last_indices = torch.tensor([2, 4, 6], dtype=torch.long)
+    if use_gpt_latent:
+        key, owned = talker.postprocess_batch_mrv2(hidden_states=hidden, last_token_indices=last_indices)
+        assert key == ("meta", "latent_acc")
+        assert isinstance(owned, OwnedBatchTensor)
+        assert owned.tensor.shape == (3, 1, HIDDEN)
+        torch.testing.assert_close(owned.tensor[:, 0, :], hidden[last_indices], atol=0.0, rtol=0.0)
+
+    # Verify OmniModelState.run_preprocess prefers num_computed_tokens_np over non-indexable StagedWriteTensor
+    class _UnindexableStaged:
+        pass
+
+    state = object.__new__(OmniModelState)
+    state.model = talker
+    state.has_preprocess = True
+    state.has_postprocess = use_gpt_latent
+    state.preprocess_keeps_mm_inputs = False
+    state._static_inputs_embeds = None
+    state._has_mtp = False
+    state._decode_preprocess_is_identity = False
+    state.intermediate_buffer = OmniIntermediateBuffer(max_num_reqs=4)
+    for i in range(batch_size):
+        state.intermediate_buffer.buffers[i] = {
+            "req_id": f"req-{i}",
+            "meta": dict(req_infos[i]["meta"]),
+        }
+
+    input_batch = SimpleNamespace(
+        num_reqs=batch_size,
+        num_tokens=batch_size,
+        input_ids=input_ids,
+        idx_mapping_np=np.arange(batch_size, dtype=np.int32),
+        query_start_loc_np=np.arange(batch_size + 1, dtype=np.int32),
+        num_scheduled_tokens=np.ones(batch_size, dtype=np.int32),
+    )
+    req_states = SimpleNamespace(
+        prompt_len=SimpleNamespace(np=np.array([10, 11, 12, 0], dtype=np.int32)),
+        num_computed_tokens=_UnindexableStaged(),
+        num_computed_tokens_np=np.array([12, 14, 16, 0], dtype=np.int32),
+    )
+    model_inputs: dict[str, Any] = {"input_ids": input_ids}
+    state.run_preprocess(input_batch, model_inputs, req_states=req_states)
+    torch.testing.assert_close(model_inputs["inputs_embeds"], batch_embeds, atol=0.0, rtol=0.0)
+    for i in range(batch_size):
+        assert state.intermediate_buffer.buffers[i]["meta"]["mel_code_count"] == i + 3
+
+    # Also verify OmniModelState.run_postprocess end-to-end (updates meta.latent_acc when use_gpt_latent=True,
+    # skips completely when use_gpt_latent=False).
+    decode_hidden = torch.randn(batch_size, HIDDEN)
+    state.run_postprocess(decode_hidden, input_batch)
+    for i in range(batch_size):
+        if use_gpt_latent:
+            stored = state.intermediate_buffer.buffers[i]["meta"]["latent_acc"]
+            assert stored.shape == (1, HIDDEN)
+            torch.testing.assert_close(stored, decode_hidden[i : i + 1], atol=0.0, rtol=0.0)
+        else:
+            assert "latent_acc" not in state.intermediate_buffer.buffers[i]["meta"]
+
+
+def test_cfm_solve_euler_hoists_cond_projection_once_with_identical_output():
+    """CFM.solve_euler projects static cond once before the Euler loop with bit-identical output."""
+    from vllm_omni.model_executor.models.indextts2.s2mel.modules.flow_matching import BASECFM
+
+    class _CountingLinear(nn.Module):
+        def __init__(self, in_features: int, out_features: int):
+            super().__init__()
+            self.linear = nn.Linear(in_features, out_features)
+            self.calls = 0
+
+        def forward(self, inp: torch.Tensor) -> torch.Tensor:
+            self.calls += 1
+            return self.linear(inp)
+
+    class _TinyDiT(nn.Module):
+        _supports_precomputed_cond = True
+        style_as_token = False
+        time_as_token = False
+        is_causal = False
+
+        def __init__(self):
+            super().__init__()
+            self.cond_projection = _CountingLinear(16, 16)
+            self.merge = nn.Linear(8 + 8 + 16, 8)
+
+        def forward(self, x, prompt_x, x_lens, t, style, cond, pre_mask=None, unpad_data=None, precomputed_cond=None):
+            del x_lens, style, pre_mask, unpad_data
+            c = self.cond_projection(cond) if precomputed_cond is None else precomputed_cond
+            cat = torch.cat([x.transpose(1, 2), prompt_x.transpose(1, 2), c], dim=-1)
+            return (self.merge(cat) + t[:, None, None]).transpose(1, 2)
+
+    class _TinyCFM(BASECFM):
+        def __init__(self, est):
+            super().__init__(SimpleNamespace(DiT=SimpleNamespace(in_channels=8)))
+            self.estimator = est
+            object.__setattr__(self, "_eager_estimator", est)
+
+    torch.manual_seed(0)
+    est = _TinyDiT().eval()
+    cfm = _TinyCFM(est)
+
+    mu = torch.randn(2, 10, 16)
+    x_lens = torch.tensor([10, 10], dtype=torch.long)
+    prompt = torch.randn(2, 8, 4)
+    style = torch.randn(2, 12)
+    noise = torch.randn(2, 8, 10)
+
+    out_hoisted = cfm.inference(
+        mu, x_lens, prompt, style, None, n_timesteps=6, inference_cfg_rate=0.7, initial_noise=noise.clone()
+    )
+    assert est.cond_projection.calls == 1
+
+    est.cond_projection.calls = 0
+    est._supports_precomputed_cond = False
+    out_baseline = cfm.inference(
+        mu, x_lens, prompt, style, None, n_timesteps=6, inference_cfg_rate=0.7, initial_noise=noise.clone()
+    )
+    assert est.cond_projection.calls == 6
+    torch.testing.assert_close(out_hoisted, out_baseline, atol=0.0, rtol=0.0)
+
+
+def test_indextts2_deploy_config_includes_640_vocoder_graph_bucket():
+    deploy_path = Path(__file__).parents[4] / "vllm_omni" / "deploy" / "indextts2.yaml"
+    cfg = yaml.safe_load(deploy_path.read_text(encoding="utf-8"))
+    stage1 = next(stage for stage in cfg["stages"] if stage["stage_id"] == 1)
+    overrides = stage1["hf_overrides"]
+    assert 640 in overrides["s2mel_vocoder_capture_sizes"]
+    assert overrides["s2mel_vocoder_compile_shapes"] == [256, 384, 512]

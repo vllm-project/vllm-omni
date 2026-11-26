@@ -52,7 +52,7 @@ stages:
       s2mel_dit_cuda_graph_max_graphs: 8
       # Opt-in scoped TF32 for S2Mel/CFM matmul; kept false by default to preserve baseline numerics.
       s2mel_allow_tf32: false
-      s2mel_vocoder_capture_sizes: [128, 256, 384, 512]
+      s2mel_vocoder_capture_sizes: [128, 256, 384, 512, 640]
       s2mel_vocoder_compile_shapes: [256, 384, 512]
     default_sampling_params:
       temperature: 0.0
