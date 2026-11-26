@@ -180,6 +180,9 @@ values in `{-1.0, 1.0}`.
 | Peak device memory (allocated, one policy incl. umT5) | 20.4 GiB |
 | Re-check on `vllm/vllm-openai-rocm:v0.34.0` after the rebase: parity (deterministic, MIOpen convolution variables unset on both sides) | Bitwise equal (32/32 chunks) |
 | Same image: LIBERO success rate, 400 episodes per setting (4 suites x 10 tasks x 10 trials, init states 0-9, seed 42) | Eager 10 steps 97.75 % (391/400), eager 4 steps 97.00 % (388/400), regional `torch.compile` 10 steps 96.50 % (386/400); each within one standard error (about 0.85 pp) of the 2000-episode result above |
+| Optional Kernel Hub backend (`VLLM_OMNI_FASTWAM_KERNELS=hub`, `amd/cae-fastwam-kernels` version 1) on MI355X, `vllm/vllm-openai-rocm:v0.34.0`: action parity vs the stock eager path (4 suites x 4 observations x {10, 4} steps, seed 42) | Not bitwise (0/32, fused kernels); max difference 0.042 env units (dims 0-5), gripper equal on 1023/1024 rows. For scale: the stock path against itself in a second process 0.023, stock eager vs regional `torch.compile` 0.036. Golden rows vs the CPU reference 0.0101 (test tolerance 2e-2), gripper equal |
+| Same image: served latency through `vllm serve` + OpenPI (B=1, warm-up excluded, 6 interleaved rounds, fresh server per round; pipeline forward inside the server) | Eager 241.8 / 124.4 ms (10 / 4 steps); regional `torch.compile` 137.4 / 76.7 ms; Kernel Hub backend 40.3 / 35.5 ms. OpenPI round trip on localhost, 10 steps: 245.2 / 140.7 / 43.7 ms |
+| Same image: LIBERO success, stock eager vs the Kernel Hub backend, 10 steps, served, paired by episode (4 suites x 10 tasks x 10 initial states, seed 42) | Stock 96.25 % (385/400), Kernel Hub 97.00 % (388/400); difference +0.75 pp (95 % CI -1.15 to +2.65 pp) |
 
 ## Notes
 
