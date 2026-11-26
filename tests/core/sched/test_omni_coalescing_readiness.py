@@ -76,11 +76,13 @@ def test_native_readiness_includes_unapplied_terminal_notifications(scheduler):
     coordinator.requests_with_ready_chunks.add("ready")
     coordinator.finished_requests.add("finished")
     coordinator.input_terminal_req_ids.add("terminal")
+    coordinator.segment_finished_req_ids.add("segment")
     output = OmniConnectorOutput(
         chunk_ready_req_ids={"new", "ready"},
         chunk_finished_req_ids={"new_finished"},
         request_metadata={
             "new_terminal": SchedulingMetadataUpdate(input_terminal=True),
+            "new_segment": SchedulingMetadataUpdate(segment_finished=True),
             "other": SchedulingMetadataUpdate(input_terminal=False),
         },
     )
@@ -91,10 +93,13 @@ def test_native_readiness_includes_unapplied_terminal_notifications(scheduler):
         "new",
         "new_finished",
         "new_terminal",
+        "segment",
+        "new_segment",
     }
     assert coordinator.requests_with_ready_chunks == {"ready"}
     assert coordinator.finished_requests == {"finished"}
     assert coordinator.input_terminal_req_ids == {"terminal"}
+    assert coordinator.segment_finished_req_ids == {"segment"}
     assert output.chunk_ready_req_ids == {"new", "ready"}
     assert output.chunk_finished_req_ids == {"new_finished"}
 

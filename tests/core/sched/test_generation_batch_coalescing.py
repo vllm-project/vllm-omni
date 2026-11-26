@@ -49,6 +49,25 @@ def test_idle_wait_preserves_completion_and_control_progress(monkeypatch, pendin
     assert not s._omni_connector_output_inbox.waits
 
 
+@pytest.mark.parametrize(
+    "pending",
+    [
+        "finished_req_ids",
+        "_pending_chunk_commits",
+        "_resume_chunk_receivers",
+        "_pending_request_prewarms",
+        "_pending_input_timeout_outputs",
+    ],
+)
+def test_idle_wait_does_not_delay_pending_v2_control_work(monkeypatch, pending):
+    s, clock = scheduler(monkeypatch)
+    s._generation_coalescing_policy = "idle_wait"
+    setattr(s, pending, {"0"})
+    assert s._drain_omni_connector_outputs() == []
+    assert clock[0] == 10
+    assert not s._omni_connector_output_inbox.waits
+
+
 def test_idle_wait_without_arrivals_is_bounded(monkeypatch):
     s, clock = scheduler(monkeypatch)
     s._generation_coalescing_policy = "idle_wait"

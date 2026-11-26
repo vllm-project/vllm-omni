@@ -211,6 +211,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     kv_holding_waiting: RequestQueue
     max_num_active_reqs: int
     max_num_running_reqs: int
+    max_num_scheduled_tokens: int
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
@@ -532,15 +533,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """Initialize AR execution batching after admission policy setup."""
         super()._init_generation_coalescing(extra)
         if self._generation_min_batch_size > 1 and self._generation_max_wait_s:
-            if any(
-                extra.get(key)
-                for key in (
-                    "ar_prefill_admission_min_batch",
-                    "ar_prefill_admission_max_wait_ms",
-                    "ar_prefill_admission_min_running",
-                )
-            ):
+            if self._prefill_admission_min_batch > 1:
                 raise ValueError("generation coalescing and ar_prefill_admission_* cannot be enabled together")
+            if self._talker_refill_coalesce:
+                raise ValueError(
+                    "generation coalescing and minicpmo_talker_refill_coalesce cannot be enabled together; "
+                    "disable one of these policies"
+                )
             parallel = self.vllm_config.parallel_config
             if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
                 raise ValueError("AR generation batch waiting requires TP1/PP1")
@@ -552,6 +551,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _get_ar_coalescing_ready_request_ids(self) -> set[str]:
         """Count candidates, leaving allocation and execution limits upstream."""
+        eligible = {
+            request.request_id for queue in (self.running, self.waiting, self.kv_holding_waiting) for request in queue
+        }
         ready = self._get_coalescing_ready_request_ids()
         if ready is None:
             return set()
@@ -570,7 +572,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return {
             req_id
             for req_id in ready
-            if (request := self.requests.get(req_id)) is not None
+            if req_id in eligible
+            and (request := self.requests.get(req_id)) is not None
             and request.status in (RequestStatus.RUNNING, RequestStatus.WAITING, RequestStatus.PREEMPTED)
         }
 
@@ -1357,6 +1360,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
         blocked_text_requests = self._find_text_input_waits()
+        coalescing_enabled = bool(getattr(self, "_generation_max_wait_s", 0.0) and self._generation_min_batch_size > 1)
         # Talker K-frame guard: a step whose decode spans would be uneven
         # (mixed prefill+decode rows, or a first-step decode joining a
         # steady-state K-step request) must not carry the K-step drafts --
@@ -1366,7 +1370,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if coalesce_talker_refill:
             logger.info_once("MiniCPM-o Talker coalesced a refill for one K-step")
         self._last_talker_refill_deferred = coalesce_talker_refill
-        if not coalesce_talker_refill:
+        if not coalesce_talker_refill and not coalescing_enabled:
             self._drop_talker_drafts_if_prefill_pending()
 
         step = self._begin_seeded_isolation(coalesce_talker_refill=coalesce_talker_refill)
@@ -1374,9 +1378,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.max_num_active_reqs = step.limit
         text_input_waits = None
         scheduled_any = False
+        original_token_budget = self.max_num_scheduled_tokens if coalescing_enabled else None
         try:
             text_input_waits = self._prepare_text_input_waits(blocked_text_requests)
-            if coalesce_talker_refill:
+            defer_generation = False
+            if coalescing_enabled:
+                # Isolation owns solo and drain steps. Count only the queues
+                # left eligible by isolation and the streaming-input gate.
+                if step.solo or step.drain or step.deferred:
+                    self._generation_batch_deadline = None
+                else:
+                    defer_generation = self._should_defer_ar_generation(self._get_ar_coalescing_ready_request_ids())
+                if defer_generation:
+                    self.max_num_scheduled_tokens = 0
+            if coalesce_talker_refill or (coalescing_enabled and not defer_generation):
                 self._drop_talker_drafts_if_prefill_pending()
             scheduler_output = super().schedule(throttle_prefills)
             scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", None)
@@ -1384,6 +1399,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 scheduled_tokens = scheduler_output.get("num_scheduled_tokens")
             scheduled_any = bool(scheduled_tokens)
         finally:
+            if original_token_budget is not None:
+                self.max_num_scheduled_tokens = original_token_budget
             self._restore_text_input_waits(text_input_waits)
             self.max_num_active_reqs = original_max_num_active_reqs
             self._finish_seeded_isolation(step, scheduled_any=scheduled_any)

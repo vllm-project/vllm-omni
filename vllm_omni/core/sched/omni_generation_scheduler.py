@@ -77,11 +77,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             raise ValueError("generation_coalescing_policy must be fixed or idle_wait")
         if self._generation_max_wait_s and self._generation_min_batch_size > 1:
             parallel = self.vllm_config.parallel_config
-            v1_ready_inputs = not self.use_v2_model_runner and self._get_coalescing_ready_request_ids() is not None
-            if not self._native_data_plane and not v1_ready_inputs:
+            legacy_ready_inputs = not self._native_data_plane and self._get_coalescing_ready_request_ids() is not None
+            if not self._native_data_plane and not legacy_ready_inputs:
                 logger.warning(
                     "Generation batch waiting and regular-batch limit ignored: "
-                    "requires a native MRV2 stage or V1 input readiness support."
+                    "requires a native MRV2 stage or input readiness support."
                 )
                 self._generation_min_batch_size = 1
                 self._generation_max_wait_s = 0.0
@@ -90,8 +90,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 raise ValueError("Generation batch waiting requires TP1/PP1")
             elif self._native_data_plane and not self._retains_state_across_chunks:
                 raise ValueError("Native MRV2 generation batch waiting requires a stateful stage")
-            elif v1_ready_inputs and self._generation_coalescing_policy != "fixed":
-                raise ValueError("V1 generation batch waiting supports only the fixed coalescing policy")
+            elif legacy_ready_inputs and self._generation_coalescing_policy != "fixed":
+                raise ValueError("Legacy-transport generation batch waiting supports only the fixed coalescing policy")
             else:
                 logger.info(
                     "Generation input coalescing: target batch=%d, max wait=%.3f ms",
@@ -195,15 +195,15 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         }
 
     def _process_pending_omni_inputs(self, model_mode: str) -> None:
-        """Process inputs for either runner, then apply V1-only batch waiting."""
+        """Process inputs, then apply tick-based waiting outside the native plane."""
         super()._process_pending_omni_inputs(model_mode)
-        if not self.use_v2_model_runner:
-            self._process_v1_pending_omni_inputs()
+        if not self._native_data_plane:
+            self._process_legacy_pending_omni_inputs()
 
-    def _process_v1_pending_omni_inputs(self) -> None:
-        """Coalesce received V1 inputs without blocking completion processing.
+    def _process_legacy_pending_omni_inputs(self) -> None:
+        """Coalesce legacy-transport inputs without blocking completion processing.
 
-        V1 readiness comes from the mixin hook after input processing.
+        Readiness comes from the mixin hook after input processing.
         Revisit its batch deadline on scheduler ticks; native V2 waiting is
         handled separately by _drain_omni_connector_outputs().
         """
@@ -282,6 +282,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     and not getattr(coordinator, "pending_chunk_registrations", ())
                     and not getattr(coordinator, "pending_input_registrations", ())
                     and not getattr(self, "_pending_data_plane_terminal_req_ids", ())
+                    and not any(
+                        getattr(self, name, ())
+                        for name in (
+                            "finished_req_ids",
+                            "_pending_chunk_commits",
+                            "_resume_chunk_receivers",
+                            "_pending_request_prewarms",
+                            "_pending_input_timeout_outputs",
+                        )
+                    )
                     and all(request.status == RequestStatus.WAITING_FOR_CHUNK for request in self.requests.values())
                 )
                 if not can_wait_idle:

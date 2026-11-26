@@ -32,8 +32,8 @@ def construct_scheduler(monkeypatch, mocker):
 def _config(*, native=True, stateful=True, tp=1, pp=1, extras=None, capacity=128):
     return SimpleNamespace(
         model_config=SimpleNamespace(
-            use_v2_model_runner=native,
-            supports_native_mrv2_data_plane=True,
+            use_v2_model_runner=True,
+            supports_native_mrv2_data_plane=native,
             retains_state_across_chunks=stateful,
             async_chunk=True,
             stage_id=1,
@@ -41,10 +41,11 @@ def _config(*, native=True, stateful=True, tp=1, pp=1, extras=None, capacity=128
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=tp, pipeline_parallel_size=pp),
         scheduler_config=SimpleNamespace(max_num_seqs=capacity),
+        speculative_config=None,
     )
 
 
-def test_v1_custom_readiness_enables_batch_waiting(construct_scheduler):
+def test_legacy_custom_readiness_enables_batch_waiting(construct_scheduler):
     class OrchestratorScheduler(OmniGenerationScheduler):
         def _get_coalescing_ready_request_ids(self, connector_outputs=()):
             return set()
@@ -76,7 +77,7 @@ def test_stage_additional_config_enables_generation_coalescing(construct_schedul
 
 
 @pytest.mark.parametrize("async_chunk", [False, True])
-def test_v1_stage_zero_enables_batch_waiting_without_override(construct_scheduler, mocker, async_chunk):
+def test_legacy_stage_zero_enables_batch_waiting_without_override(construct_scheduler, mocker, async_chunk):
     adapter = mocker.patch("vllm_omni.core.sched.omni_scheduler_mixin.OmniChunkTransferAdapter")
     adapter.return_value.receives_chunks = False
     config = _config(native=False, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 12})
@@ -147,7 +148,7 @@ def test_non_native_fallback_still_rejects_invalid_values(construct_scheduler, e
 
 
 @pytest.mark.parametrize("stateful", [False, True])
-def test_v1_chunk_receiver_enables_batch_waiting(construct_scheduler, stateful):
+def test_legacy_chunk_receiver_enables_batch_waiting(construct_scheduler, stateful):
     config = _config(
         native=False, stateful=stateful, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 10}
     )
@@ -156,7 +157,7 @@ def test_v1_chunk_receiver_enables_batch_waiting(construct_scheduler, stateful):
     assert scheduler._generation_max_wait_s == 0.01
 
 
-def test_v1_rejects_idle_inbox_waiting(construct_scheduler):
+def test_legacy_rejects_idle_inbox_waiting(construct_scheduler):
     config = _config(
         native=False,
         extras={
@@ -179,7 +180,7 @@ def test_sender_only_adapter_keeps_batch_waiting_disabled(construct_scheduler, m
 
 
 @pytest.mark.parametrize("tp,pp", [(2, 1), (1, 2)])
-def test_v1_batch_waiting_rejects_parallel_topologies(construct_scheduler, tp, pp):
+def test_legacy_batch_waiting_rejects_parallel_topologies(construct_scheduler, tp, pp):
     config = _config(native=False, tp=tp, pp=pp, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 10})
     with pytest.raises(ValueError, match="TP1/PP1"):
         construct_scheduler(config)

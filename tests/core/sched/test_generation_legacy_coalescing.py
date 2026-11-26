@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""V1 coalescing preserves scheduler state until a batch can execute."""
+"""Legacy-transport coalescing preserves scheduler state until a batch can execute."""
 
 from types import SimpleNamespace
 
@@ -25,6 +25,7 @@ def scheduler(monkeypatch, queue_name="waiting"):
     clock = [10.0]
     monkeypatch.setattr("vllm_omni.core.sched.omni_generation_scheduler.time.monotonic", lambda: clock[0])
     s = _make_scheduler(budget=32)
+    s.use_v2_model_runner = True
     s._generation_min_batch_size = 4
     s._generation_max_wait_s = 0.012
     s._generation_pending_inputs = set()
@@ -36,7 +37,7 @@ def scheduler(monkeypatch, queue_name="waiting"):
 
 
 @pytest.mark.parametrize("queue_name", ["running", "waiting", "kv_holding_waiting"])
-def test_v1_wait_does_not_allocate_or_consume_input(monkeypatch, mocker, queue_name):
+def test_legacy_wait_does_not_allocate_or_consume_input(monkeypatch, mocker, queue_name):
     s, clock = scheduler(monkeypatch, queue_name)
     if queue_name == "kv_holding_waiting":
         s.waiting.remove_requests([s.requests["0"]])
@@ -61,7 +62,7 @@ def test_v1_wait_does_not_allocate_or_consume_input(monkeypatch, mocker, queue_n
     assert s._generation_batch_deadline is None
 
 
-def test_v1_releases_when_more_chunks_arrive(monkeypatch):
+def test_legacy_releases_when_more_chunks_arrive(monkeypatch):
     s, clock = scheduler(monkeypatch)
     assert not s.schedule().num_scheduled_tokens
     clock[0] += 0.003
@@ -71,17 +72,17 @@ def test_v1_releases_when_more_chunks_arrive(monkeypatch):
     assert s._generation_batch_deadline is None
 
 
-def test_v1_wait_uses_overridden_readiness_without_receiver(monkeypatch):
+def test_legacy_wait_uses_overridden_readiness_without_receiver(monkeypatch):
     s, clock = scheduler(monkeypatch)
     s.chunk_transfer_adapter.receives_chunks = False
     ready = {"0"}
     monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: ready)
-    s._process_v1_pending_omni_inputs()
+    s._process_legacy_pending_omni_inputs()
     assert s._generation_defer_batch
     assert s._generation_batch_deadline == pytest.approx(10.012)
     clock[0] += 0.003
     ready.update({"1", "2", "3"})
-    s._process_v1_pending_omni_inputs()
+    s._process_legacy_pending_omni_inputs()
     assert not s._generation_defer_batch
     assert s._generation_batch_deadline is None
 
@@ -152,7 +153,7 @@ def test_custom_readiness_fallback_restores_budget_and_queues_on_failure(monkeyp
     assert list(s.waiting) == [s.requests["0"]]
 
 
-def test_v1_cancelled_request_is_not_restored(monkeypatch):
+def test_legacy_cancelled_request_is_not_restored(monkeypatch):
     s, clock = scheduler(monkeypatch)
     assert not s.schedule().num_scheduled_tokens
     s.finish_requests({"0"}, RequestStatus.FINISHED_ABORTED)
@@ -164,7 +165,7 @@ def test_v1_cancelled_request_is_not_restored(monkeypatch):
 
 
 @pytest.mark.parametrize("reason", ["disabled", "low_concurrency", "pending", "terminal"])
-def test_v1_immediate_progress(monkeypatch, reason):
+def test_legacy_immediate_progress(monkeypatch, reason):
     s, _ = scheduler(monkeypatch)
     if reason == "disabled":
         s._generation_max_wait_s = 0
@@ -180,7 +181,7 @@ def test_v1_immediate_progress(monkeypatch, reason):
     assert s.schedule().num_scheduled_tokens == {"0": 8}
 
 
-def test_v1_retains_in_flight_readiness_until_output_retires(monkeypatch):
+def test_legacy_retains_in_flight_readiness_until_output_retires(monkeypatch):
     s, clock = scheduler(monkeypatch)
     s._supports_pending_generation = True
     s.requests["0"].num_in_flight_tokens = 8
@@ -192,7 +193,7 @@ def test_v1_retains_in_flight_readiness_until_output_retires(monkeypatch):
     assert s.schedule().num_scheduled_tokens == {"0": 8}
 
 
-def test_v1_pause_does_not_keep_a_stale_deadline(monkeypatch):
+def test_legacy_pause_does_not_keep_a_stale_deadline(monkeypatch):
     s, clock = scheduler(monkeypatch)
     assert not s.schedule().num_scheduled_tokens
     s._pause_state = PauseState.PAUSED_ALL
@@ -213,7 +214,7 @@ def test_free_request_clears_pending_input_ownership(monkeypatch):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_v1_reduced_target_waits_only_when_enabled(monkeypatch, enabled):
+def test_legacy_reduced_target_waits_only_when_enabled(monkeypatch, enabled):
     s, clock = scheduler(monkeypatch)
     s.requests.pop("3")
     s._generation_always_wait_target_batch = enabled
@@ -224,7 +225,7 @@ def test_v1_reduced_target_waits_only_when_enabled(monkeypatch, enabled):
         assert s.schedule().num_scheduled_tokens == {"0": 8}
 
 
-def test_v1_reduced_target_releases_when_all_registered_streams_arrive(monkeypatch):
+def test_legacy_reduced_target_releases_when_all_registered_streams_arrive(monkeypatch):
     s, clock = scheduler(monkeypatch)
     s.requests.pop("3")
     s._generation_always_wait_target_batch = True
@@ -235,7 +236,7 @@ def test_v1_reduced_target_releases_when_all_registered_streams_arrive(monkeypat
     assert s.schedule().num_scheduled_tokens == {str(i): 8 for i in range(3)}
 
 
-def test_v1_shrinking_registered_population_releases_lone_stream(monkeypatch):
+def test_legacy_shrinking_registered_population_releases_lone_stream(monkeypatch):
     s, _ = scheduler(monkeypatch)
     s._generation_always_wait_target_batch = True
     assert not s.schedule().num_scheduled_tokens
@@ -243,7 +244,7 @@ def test_v1_shrinking_registered_population_releases_lone_stream(monkeypatch):
     assert s.schedule().num_scheduled_tokens == {"0": 8}
 
 
-def test_v1_inactive_registered_streams_keep_target_until_deadline(monkeypatch):
+def test_legacy_inactive_registered_streams_keep_target_until_deadline(monkeypatch):
     s, clock = scheduler(monkeypatch)
     s._generation_always_wait_target_batch = True
     s.chunk_transfer_adapter._active_window = 1

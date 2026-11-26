@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """AR execution coalescing uses a bounded gate, separate from admission."""
 
+from types import SimpleNamespace
+
 import pytest
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
@@ -14,6 +16,8 @@ from tests.core.sched.test_generation_scheduler_atomic_chunk import FakeAdapter,
 from tests.core.sched.test_generation_scheduler_init import _config
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler, VLLMScheduler
 from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
+from vllm_omni.core.sched.output import OmniChunkCommit
+from vllm_omni.core.sched.window_policy import WindowOperation
 from vllm_omni.outputs import OmniConnectorOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -40,7 +44,11 @@ def scheduler(*, native=False, extras=None, population=4, async_scheduling=False
     s.waiting = create_request_queue(s.policy)
     s.kv_holding_waiting = create_request_queue(s.policy)
     s.deferred_waiting = set()
-    s.use_v2_model_runner = native
+    s.use_v2_model_runner = True
+    s._window_policy = None
+    s._model_input_streams = {}
+    s.max_model_len = 256
+    s.connector = None
     s.max_num_active_reqs = 128
     s.max_num_scheduled_tokens = 128
     _init_policies(s)
@@ -76,7 +84,7 @@ def test_constructor_initializes_both_policies(monkeypatch, mocker, native, poli
 
 
 @pytest.mark.parametrize("native", [False, True])
-def test_configuration_supports_both_runners_and_additional_config(native):
+def test_configuration_supports_both_transports_and_additional_config(native):
     s = scheduler(native=native)
     s.vllm_config.additional_config = knobs()
     _init_policies(s)
@@ -115,13 +123,33 @@ def test_batch_size_upper_bound_applies_even_when_waiting_is_disabled(max_wait_m
     "old_knobs",
     [
         {"ar_prefill_admission_min_batch": 4, "ar_prefill_admission_max_wait_ms": 12},
-        {"ar_prefill_admission_max_wait_ms": 12},
-        {"ar_prefill_admission_min_running": 2},
+        {"minicpmo_talker_refill_coalesce": True},
     ],
 )
 def test_rejects_combining_admission_and_execution_coalescing(old_knobs):
     with pytest.raises(ValueError, match="cannot be enabled together"):
         scheduler(extras=knobs(**old_knobs))
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_inactive_admission_knobs_do_not_conflict(native):
+    s = scheduler(
+        native=native,
+        extras=knobs(ar_prefill_admission_max_wait_ms=12, ar_prefill_admission_min_running=2),
+    )
+    assert s._generation_max_wait_s == 0.012
+
+
+@pytest.mark.parametrize("target,wait_ms", [(1, 12), (4, 0)])
+def test_talker_refill_is_allowed_when_execution_coalescing_is_disabled(target, wait_ms):
+    s = scheduler(
+        extras=knobs(
+            generation_min_batch_size=target,
+            generation_max_wait_ms=wait_ms,
+            minicpmo_talker_refill_coalesce=True,
+        )
+    )
+    assert s._talker_refill_coalesce
 
 
 def test_deadline_does_not_restart_on_partial_arrivals(monkeypatch):
@@ -206,6 +234,58 @@ def prepare_schedule_boundary(monkeypatch, s, *, fail=False):
 
 
 @pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("client_seed", [False, True])
+def test_only_client_seeded_isolation_bypasses_execution_wait(monkeypatch, native, client_seed):
+    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: 10.0)
+    s = scheduler(native=native, extras=knobs())
+    request = s.requests["0"]
+    request.sampling_params.seed = 42
+    request.sampling_params.extra_args = {"omni_user_seed": True} if client_seed else {}
+    s.waiting.add_request(request)
+    s._generation_batch_deadline = 10.01
+    budgets = prepare_schedule_boundary(monkeypatch, s)
+    s.schedule()
+    assert budgets == [128 if client_seed else 0]
+    assert s._generation_batch_deadline == (None if client_seed else 10.01)
+    assert list(s.waiting) == [request]
+    assert s.max_num_active_reqs == 128
+
+
+def test_seeded_admission_drain_keeps_running_work_moving(monkeypatch):
+    s = scheduler(extras=knobs())
+    running = s.requests["0"]
+    running.status = RequestStatus.RUNNING
+    s.running.append(running)
+    seeded = s.requests["1"]
+    seeded.sampling_params.seed = 42
+    seeded.sampling_params.extra_args = {"omni_user_seed": True}
+    s.waiting.add_request(seeded)
+    s._generation_batch_deadline = 123.0
+    budgets = prepare_schedule_boundary(monkeypatch, s)
+    s.schedule()
+    assert budgets == [128]
+    assert s._generation_batch_deadline is None
+    assert list(s.waiting) == [seeded]
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_text_starved_request_does_not_fill_batch_and_is_restored(monkeypatch, native):
+    s = scheduler(native=native, extras=knobs(generation_min_batch_size=2))
+    s.waiting.add_request(s.requests["0"])
+    blocked = s.requests["1"]
+    blocked.status = RequestStatus.RUNNING
+    s.running.append(blocked)
+    receiver = s.input_coordinator if native else s.chunk_transfer_adapter
+    receiver.requests_with_ready_chunks.add("1")
+    s._model_input_streams["1"] = SimpleNamespace(is_ready=lambda request: False, wait_started_at=None)
+    budgets = prepare_schedule_boundary(monkeypatch, s)
+    s.schedule()
+    assert budgets == [0]
+    assert s.running == [blocked]
+    assert s.max_num_running_reqs == s.max_num_active_reqs == 128
+
+
+@pytest.mark.parametrize("native", [False, True])
 def test_schedule_defers_before_allocation_and_preserves_control_output(monkeypatch, native):
     clock = [10.0]
     monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
@@ -229,6 +309,33 @@ def test_schedule_restores_budget_on_upstream_exception(monkeypatch):
     with pytest.raises(RuntimeError, match="allocation failed"):
         s.schedule()
     assert s.max_num_scheduled_tokens == 128
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_deferred_step_wraps_commits_cleanup_and_window_operations(monkeypatch, native):
+    s = scheduler(native=native, extras=knobs())
+    s.waiting.add_request(s.requests["0"])
+    wrap_output = s._wrap_omni_scheduler_output
+    budgets = prepare_schedule_boundary(monkeypatch, s)
+    monkeypatch.setattr(s, "_wrap_omni_scheduler_output", wrap_output)
+    commit = OmniChunkCommit(request_id="finished", token_ids=[1], request_finished=True)
+    s._pending_chunk_commits = [commit]
+    s._resume_chunk_receivers = {"0"}
+    s._discarded_req_ids = {"finished"}
+    operation = WindowOperation(kind="drop", session_id="session")
+    s._window_policy = SimpleNamespace(on_schedule=lambda requests, output: [operation])
+
+    output = s.schedule()
+
+    assert budgets == [0]
+    assert output.num_scheduled_tokens == {}
+    assert output.finished_req_ids == output.discarded_req_ids == {"finished"}
+    assert output.chunk_commits == [commit]
+    assert output.resume_chunk_receivers == {"0"}
+    assert output.duplex_carry_ops == [operation]
+    assert s._pending_chunk_commits == []
+    assert s._resume_chunk_receivers == set()
+    assert s._discarded_req_ids == set()
 
 
 @pytest.mark.parametrize("tp,pp", [(2, 1), (1, 2)])
@@ -379,15 +486,22 @@ def test_real_upstream_empty_step_preserves_tokens_and_emits_finished_ids(
     s.scheduler_config = s.vllm_config.scheduler_config
     s.scheduler_config.max_num_batched_tokens = 128
     s.scheduler_config.long_prefill_token_threshold = 0
+    s.scheduler_config.enable_chunked_prefill = True
     s.adaptive_long_prefill_threshold = False
+    s.cache_aware_window = 0
     s.prefill_capacity_bound = False
     s.max_num_encoder_input_tokens = 0
     s.num_waiting_for_streaming_input = 0
     s.lora_config = None
-    s.prev_step_scheduled_req_ids = set()
+    s.async_kv_waiting = {}
     s.finished_req_ids = {"finished"}
     s.reset_preempted_req_ids = set()
     s.num_spec_tokens = 0
+    s.can_skip_drafts = False
+    s.local_prefill_interval = 1
+    s.num_executed_steps = 0
+    s.model_uses_mrope = False
+    s._pending_encoder_input_ids = {}
     s.dynamic_sd_lookup = None
     s.log_stats = False
     s.defer_block_free = False
@@ -400,7 +514,6 @@ def test_real_upstream_empty_step_preserves_tokens_and_emits_finished_ids(
     s.kv_cache_manager = cache
     encoder = mocker.Mock(spec=EncoderCacheManager)
     encoder.get_freed_mm_hashes.return_value = []
-    encoder.get_manager_metadata.return_value = None
     s.encoder_cache_manager = encoder
     output = s.schedule()
     assert output.num_scheduled_tokens == {}

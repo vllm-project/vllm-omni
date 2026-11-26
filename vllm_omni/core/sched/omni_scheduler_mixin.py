@@ -583,14 +583,14 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         participate in coalescing. Callers retain responsibility for filtering
         stale, finished or in-flight requests and deciding execution eligibility.
         """
-        # V1: readiness is tracked by the legacy chunk-transfer adapter.
+        # Legacy transport tracks readiness in the chunk-transfer adapter.
         adapter = self.chunk_transfer_adapter
         if adapter is not None and adapter.receives_chunks:
             return set(adapter.requests_with_ready_chunks)
         # Check for native connector input before using the shared fallback.
         coordinator = self.input_coordinator
         if not self._native_data_plane or coordinator is None or not coordinator.receives_chunks:
-            # V1 and V2: Stage zero receives prompts/appends from the orchestrator.
+            # Stage zero receives prompts/appends from the orchestrator.
             # Parked streams stay excluded until an append resumes admission.
             model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
             if getattr(model_config, "stage_id", None) == 0:
@@ -605,10 +605,15 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         ready = set(coordinator.requests_with_ready_chunks)
         ready.update(coordinator.finished_requests)
         ready.update(coordinator.input_terminal_req_ids)
+        ready.update(coordinator.segment_finished_req_ids)
         for output in connector_outputs:
             ready.update(output.chunk_ready_req_ids)
             ready.update(output.chunk_finished_req_ids)
-            ready.update(req_id for req_id, update in output.request_metadata.items() if update.input_terminal)
+            ready.update(
+                req_id
+                for req_id, update in output.request_metadata.items()
+                if update.input_terminal or update.segment_finished
+            )
         return ready
 
     def _async_chunk_transport_enabled(self) -> bool:
