@@ -359,6 +359,7 @@ def _move_module_to_packed_pinned_cpu(
         return False
 
     accelerator_targets = 0
+    pageable_targets = 0
     device_indices: set[int | None] = set()
     for target in targets:
         if (
@@ -371,14 +372,19 @@ def _move_module_to_packed_pinned_cpu(
         ):
             return None
         if target.device.type == "cpu":
+            pageable_targets += not target.is_pinned()
             continue
         if target.device.type != "cuda":
             return None
         accelerator_targets += 1
         device_indices.add(target.device.index)
     if accelerator_targets == 0:
-        return False
-    if accelerator_targets != len(targets) or len(device_indices) != 1:
+        # A module built on host is packed once on its first offload; pinned ones need no move.
+        if pageable_targets == 0:
+            return False
+        if pageable_targets != len(targets):
+            return None
+    elif accelerator_targets != len(targets) or len(device_indices) != 1:
         return None
 
     source_groups = _collect_source_groups((module,))

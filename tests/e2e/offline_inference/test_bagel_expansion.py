@@ -37,8 +37,15 @@ MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
 BAGEL_STAGE_CONFIG = get_deploy_config_path("ci/bagel.yaml")
 DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
 
-# (model, deploy_config_path) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
-_OMNI_RUNNER_PARAM = (MODEL, BAGEL_STAGE_CONFIG)
+# (model, deploy_config_path, extra_omni_kwargs) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
+# Cold ROCm AITER MHA builds have taken nearly 1,690 seconds under CI load.
+# Keep the offline weekly owner bounded while leaving headroom for import and
+# the stage-ready handshake after compilation completes.
+_OMNI_RUNNER_PARAM = (
+    MODEL,
+    BAGEL_STAGE_CONFIG,
+    {"stage_init_timeout": 2400, "init_timeout": 2700},
+)
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +141,7 @@ def _make_file_lora_request(adapter_dir: Path) -> LoRARequest:
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_bagel_lora_scale_and_deactivation(omni_runner: OmniRunner, tmp_path) -> None:
     """Validate LoRA effect, bounded perturbation, and clean deactivation."""
     omni = omni_runner.omni

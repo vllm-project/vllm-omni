@@ -10,6 +10,9 @@ from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 
 MAX_CODE2WAV_GRAPHS = 32
+# Long non-streaming windows share the device with the Talker's KV cache.
+# Bound both startup capture and live decoding, including eager fallbacks.
+MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE = 8
 
 
 def prepare_code2wav_graph_runtime() -> None:

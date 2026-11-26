@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 from pytest_mock import MockerFixture
@@ -93,6 +93,18 @@ def test_noncontiguous_tensor_serialization():
 
     serialized = OmniSerializer.serialize({"codes": tensor})
     deserialized = OmniSerializer.deserialize(serialized)
+
+    assert torch.equal(tensor, deserialized["codes"])
+
+
+def test_contiguous_tensor_with_unit_dim_stride_serialization():
+    """A single-frame [codebooks, frames] transpose is contiguous yet has a non-unit last stride."""
+    import torch
+
+    tensor = torch.arange(12, dtype=torch.long).reshape(1, 12).transpose(0, 1).contiguous()
+    assert tensor.is_contiguous() and tensor.stride(-1) != 1
+
+    deserialized = OmniSerializer.deserialize(OmniSerializer.serialize({"codes": tensor}))
 
     assert torch.equal(tensor, deserialized["codes"])
 

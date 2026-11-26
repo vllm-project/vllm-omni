@@ -104,7 +104,19 @@ def test_production_tile_offsets_above_int32(npu_world, seq, reverse, interleave
 
 
 @pytest.mark.skipif("LOCAL_RANK" not in os.environ, reason="Requires a scheduled multi-NPU torchrun job")
-def test_production_symmetric_memory_matches_hccl(npu_world):
+def test_production_symmetric_memory_initializes_with_memfabric(npu_world):
+    # MemFabric loads HYBM helpers globally. SHMEM must initialize its own
+    # device state even when those identically named helpers are loaded first.
+    pytest.importorskip("memfabric_hybrid")
+    from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import NPUUlyssesSymmetricMemory
+
+    workspace = NPUUlyssesSymmetricMemory(4096)
+    workspace.close()
+
+
+@pytest.mark.skipif("LOCAL_RANK" not in os.environ, reason="Requires a scheduled multi-NPU torchrun job")
+@pytest.mark.parametrize("layout", ["contiguous", "packed"])
+def test_production_symmetric_memory_matches_hccl(npu_world, layout):
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
     from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
     from vllm_omni.diffusion.distributed.a2a_permute import (
@@ -141,8 +153,8 @@ def test_production_symmetric_memory_matches_hccl(npu_world):
 
     try:
         with torch.inference_mode():
-            # Packed strided views, GQA, workspace growth to the actual model
-            # shape, then a smaller request reusing that larger allocation.
+            # Separate contiguous tensors and packed strided views, GQA,
+            # workspace growth, then a smaller request reusing that allocation.
             for batch, seq, heads, kv_heads, dim in [
                 (1, 0, divisible_heads(32), divisible_heads(8), 128),  # Hunyuan CFG prefill: joint text only.
                 (2, 17, divisible_heads(8), divisible_heads(8), 32),
@@ -157,6 +169,8 @@ def test_production_symmetric_memory_matches_hccl(npu_world):
                     packed = torch.randn(batch, seq, 3, heads, dim, device=device, dtype=torch.bfloat16)
                     query, key, value = packed.unbind(2)
                     key, value = key[:, :, :kv_heads], value[:, :, :kv_heads]
+                    if layout == "contiguous":
+                        query, key, value = (tensor.contiguous() for tensor in (query, key, value))
                     metadata = AttentionMetadata(extra={"gate_compress": query})
                     q, k, v, metadata, context = strategy.pre_attention(query, key, value, metadata)
                     for actual, source in zip((q, k, v), (query, key, value)):
@@ -174,6 +188,8 @@ def test_production_symmetric_memory_matches_hccl(npu_world):
                 packed = torch.randn(1, 17, 3, heads, 32, device=device, dtype=dtype)
                 query, key, value = packed.unbind(2)
                 key, value = key[:, :, :kv_heads], value[:, :, :kv_heads]
+                if layout == "contiguous":
+                    query, key, value = (tensor.contiguous() for tensor in (query, key, value))
                 expected_qkv = tuple(
                     SeqAllToAll4D.apply(dist.group.WORLD, tensor, 2, 1, False) for tensor in (query, key, value)
                 )

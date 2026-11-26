@@ -10,10 +10,12 @@ expected_tests=${2:?expected test count required}
 run_timeout=${3:?pytest timeout required}
 artifact_name=${4:?artifact directory name required}
 shift 4
+run_level=${ROCM_DIFFUSION_RUN_LEVEL:-full_model}
 [[ "$expected_gpus" =~ ^[1-9][0-9]*$ ]]
 [[ "$expected_tests" =~ ^[1-9][0-9]*$ ]]
 [[ "$run_timeout" =~ ^[1-9][0-9]*m$ ]]
 [[ "$artifact_name" =~ ^[a-z0-9-]+$ ]]
+[[ "$run_level" == core_model || "$run_level" == full_model ]]
 (( $# > 0 ))
 artifact_dir="${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/${artifact_name}"
 mkdir -p "$artifact_dir"
@@ -61,7 +63,7 @@ trap check_cleanup EXIT
         printf 'checkout_head=%s\n' "$(git rev-parse HEAD)"
     fi
     printf 'pytest_arg=%s\n' "$@"
-    echo "expected_tests=$expected_tests run_level=full_model timeout=$run_timeout"
+    echo "expected_tests=$expected_tests run_level=$run_level timeout=$run_timeout"
     rocminfo
     python3 - "$expected_gpus" <<'PY'
 import sys
@@ -85,7 +87,7 @@ baseline_ready=1
 
 pytest_args=(
     "$@"
-    --run-level full_model --shard-id 0 --num-shards 1
+    --run-level "$run_level" --shard-id 0 --num-shards 1
 )
 timeout --signal=TERM --kill-after=1m 10m \
     bash .buildkite/amd/scripts/assert-pytest-collection.sh "$expected_tests" "${pytest_args[@]}" \
@@ -112,10 +114,20 @@ import sys
 import xml.etree.ElementTree as ET
 
 root = ET.parse(sys.argv[1]).getroot()
+if root.tag not in {"testsuite", "testsuites"}:
+    raise SystemExit(5)
 suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
 counts = {key: sum(int(s.attrib.get(key, 0)) for s in suites) for key in ("tests", "failures", "errors", "skipped")}
-print(counts)
-if counts["tests"] != int(sys.argv[2]) or any(counts[key] for key in ("failures", "errors", "skipped")):
+# pytest 9 includes subtests in the suite total. Collection counts top-level
+# cases, so compare testcase elements while retaining every failure/skip gate.
+cases = [case for suite in suites for case in suite.findall("testcase")]
+print({**counts, "testcases": len(cases)})
+if (
+    len(cases) != int(sys.argv[2])
+    or counts["tests"] < len(cases)
+    or any(counts[key] for key in ("failures", "errors", "skipped"))
+    or any(element.tag in {"failure", "error", "skipped"} for case in cases for element in case.iter())
+):
     raise SystemExit(5)
 PY
 junit_status=$?

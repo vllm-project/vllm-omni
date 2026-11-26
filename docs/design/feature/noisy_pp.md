@@ -24,6 +24,7 @@
 - [Configuration](#configuration)
 - [Compatibility](#compatibility)
 - [Testing](#testing)
+- [Streaming](#streaming)
 - [Open issues](#open-issues)
 - [Related](#related)
 
@@ -190,10 +191,36 @@ delegate to Pipeline `forward`, which admits via `admit_cell_request`, runs
 schedule two requests on the same session id (batch-wide reset would otherwise
 run before per-request execution). Admit / drop / fail-closed cleanup prevent
 mid-request leaks of `VersionPool` slots.
-`extra_args.stream_decode` remains available on this path; abort/fail-closed
-calls `AsyncStreamDecodeJob.cancel()` when a side job is present.
+`streaming_output=True` enables `async_chunk_decode`; non-streaming requests
+can opt into decode overlap with `extra_args.async_chunk_decode=True`.
+Decode requires a vertical topology or `S=1, G=1`, with a non-tiled,
+single-owner VAE. Abort cancels any active `AsyncStreamDecodeJob`.
 
 ## NoisyKV
+
+### KV lifecycle boundary
+
+The [AR-Diffusion backend contract](ar_diffusion_kv_backends.md) describes the
+shared preparation/publication, request/history lifetime, and compute-member
+boundaries used by the legacy and Noisy paths. Storage remains backend-specific.
+
+`KVCacheLifecycle[OwnerT]` separates `finish_request(owner)` from
+`release_history(owner)`. Owners are backend-local: a legacy session/branch
+adapter or a Noisy version namespace. The protocol does not require shared
+token, layer or Cell coordinates.
+
+Legacy window/segment commits and Noisy retention select history independently.
+Finishing a request keeps that history and retires temporary execution state;
+releasing history returns pool pages/slots, not their backing tensors. Model
+computation must stop before either operation; storage communication must
+complete before a page or slot is recycled.
+
+Noisy `protect` can declare future products to retain, while `retain_history`
+validates already-resident products. `finish_request` preserves those versions;
+`release_history` rejects active owners and releases finished history. A later
+request may bind the retained namespace using the existing continuation plan
+and absolute chunk positions. `end_request(req, retain=...)` remains the
+compatibility boundary; `retain=()` clears history explicitly.
 
 Implemented in `vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py`
 (`NoisyKVCache` / `NoisyKVState`). Stays experimental; not graduated with
@@ -212,13 +239,15 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 
 ### Same-Step with a first-chunk clean sink
 
-`Ordering.SAME_STEP` uses a first-chunk clean sink when a request has multiple chunks.
+`Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests and
+persistent single-chunk bootstrap requests.
 The topology stays `S=D`. Chunk 0 runs one extra clean forward on the last
 replica, then its clean KV is distributed once to the readers before later
 chunks start. When the clean successor is on the same rank, the executor carries
 the final latent directly into that pass, without adapter-local latent storage.
-Subsequent chunks use the normal Same-Step schedule. A single-chunk
-request skips the unused clean forward and sink distribution.
+Subsequent chunks use the normal Same-Step schedule. An ephemeral single-chunk
+request skips the unused clean forward and sink distribution; a persistent
+single-chunk request produces and retains it for continuation.
 
 Each chunk reads the fixed clean sink plus its most recent `H` Same-Step
 history chunks, deduplicating chunk 0 while it is in the window. `H=0` keeps
@@ -233,14 +262,14 @@ requires separate validation.
 | `ar_diffusion_stage_config` | `step_replicas` | `S` |
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
-| Request `extra_args` | `cell_schedule` | CausVidWan: `self_forcing` \| `latest_kv`; Same-Step is schedule-level only |
+| Request `extra_args` | `cell_schedule` | CausVidWan (this stack layer): `self_forcing` \| `latest_kv`. Same-Step is shared plan/executor support only — the CausVidWan parser rejects it until the exposing stack layer lands. |
 | | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (clean scheduling follows the ordering and CellPlan shape) |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.
 Last-noisy finish rank: `S=1` → `G-1`; vertical `S ∈ {D, D+1}` → `D·G-1`
-(used for `chunk_timeline_file`). Remote `stream_decode` `source_rank` is
+(used for `chunk_timeline_file`). Remote `async_chunk_decode` `source_rank` is
 that finish rank only when `S > 1`. `S=1` decodes locally: `G=1` (single
-rank, which owns the VAE) keeps local `stream_decode`; `G>1` rejects it
+rank, which owns the VAE) keeps local `async_chunk_decode`; `G>1` rejects it
 (fail fast — the finish rank `G-1` has no VAE).
 
 ## Compatibility
@@ -251,7 +280,7 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 | Combination | Status |
 | --- | --- |
 | No session + Self-Forcing / Latest-KV | Supported (opt-in; CausVid) |
-| No session + Same-Step | Generic schedule primitive with a clean sink; not exposed by CausVidWan |
+| No session + Same-Step | Supported schedule path with a clean sink; checkpoint quality requires validation |
 | Session + legacy loop | Supported (unchanged) |
 | Session + Cell path | Supported (single active session; see [#9758](https://github.com/vllm-project/vllm-omni/pull/9758)) |
 
@@ -281,14 +310,77 @@ plus CausVid / Physis model resolve tests.
 GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 (`benchmarks/` / recipe smoke).
 
+## Streaming
+
+With `streaming_output=True`, Request-mode CausVid sends ordered `CHUNK_READY`
+video chunks to Engine during one forward, without enabling `step_execution`.
+Engine owns client output; chunks do not advance the request scheduler, and
+successful completion does not resend the clip. Gaps or out-of-order chunks
+are errors; partial output does not suppress a later failure.
+
+CausVid enables `supports_request_cancellation`; cell ticks call
+`check_request_cancellation()` at PP-safe boundaries. Chunks route by active
+`request_id`; `rpc_id` only correlates RPCs. Before returning or raising,
+Worker closes emit callbacks and drains submitted chunks before the execution
+reply can retire request state. A drain timeout stops the Worker.
+
 ## Open issues
 
+- Streaming: multi-GPU end-to-end coverage and chunk reorder/buffering remain open.
 - Paged session vs NoisyKV still separate prealloc; no TP × Noisy PP yet.
 - Multi-session NoisyKV pool admission / bounded eviction (single-session is the
   current contract).
-- Micro-batch packing (`R`): varlen vs pad.
+- Micro-batch packing (`R`): attention still loops per-member paged-KV views;
+  DiT FFN/embed/unembed pack via executor-organized ``ComputeBatch`` +
+  ``CellAdapter.forward`` when ``max_batch_size>1``. Varlen / pad merge
+  and Legacy step Batch remain open.
 - Plan with `K>1` multiplies ticks; activation inbox is keyed by
   `(chunk, step)` (R=1 friendly).
+
+## Cell Batch (Noisy KV)
+
+Batch is a Noisy PP execution contract, not a model feature. Same boundary as
+Stepwise: the generic runtime organizes compute; the model consumes a batch.
+Pipeline admits requests and passes a ``kv_id → CellAdapter`` map; it does not
+own batch policy.
+
+Per slot, ``run_cell_pipeline`` collects ready tasks, groups them with
+``organize_batches`` (``compatibility_key`` + ``max_batch_size`` split, no
+deferral to a later plan slot), maps each member's activation by request
+identity for the consumer ``(chunk, step)``, then calls ``CellAdapter.forward``.
+
+``ComputeBatch`` requires a shared DiT ``block`` only; each member keeps its
+own ``(chunk, step, block)``, KV view, and output row. CausVid's ``WanCell``
+keys on ``(block, latent_shape, dtype)``; chunk / step / timestep are member
+inputs. ``forward`` packs per-member noise levels and chunk RoPE (e.g.
+``timesteps=[800, 500]``, ``chunks=[0, 3]``) into embed / block / unembed.
+
+Each member contributes exactly one tensor row and one KV view. Activation
+payloads and model outputs validate that row count rather than broadcasting a
+mismatched tensor. Local activation retention and PP boundary sends are decided
+per member, independently of other requests in the slot. Local handoffs record
+the expected consumer Cell and reject a different consumer. A missing send payload
+is an execution error.
+
+CausVid reuses conditioning and RoPE across blocks while the ordered prompt
+tensors stay unchanged. Changing the member composition invalidates the caches;
+noise levels remain part of the embedding key. Only the current noise-level embedding is cached; CPU noise levels form the
+key before any device transfer, so cache hits need no GPU readback. RoPE
+retention is bounded by the current pack size and refreshed on access.
+Prompt tensors must remain immutable during execution. Physis continues to run
+one member at a time through the same explicit member-map runtime entry.
+
+Async VAE decode retains a separate temporal state per member. Each request in
+an execution wave receives a deterministic Gloo tag from its input position;
+sender and VAE owner use the same tag, so interleaved member chunks cannot match
+another request's receives. Single-request execution uses tag 0. The Pipeline
+joins all decode jobs before returning and cancels them on admission, compute,
+or output failure. Cancellation drains posted latent transfers before the next
+wave reuses tags; a failed drain stops the Worker rather than reusing an unsafe
+communication group. Cancellation skips pending decode work and waits for the
+active decoder before releasing VAE state. A sender, decoder, or transfer
+cancellation timeout terminates the Worker; Ray kills the actor so the failure
+monitor tears down peers. This does not change Engine dispatch or Request completion.
 
 ## Related
 
@@ -296,5 +388,5 @@ GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 - [AR-Diffusion pipeline capability](../ar_diffusion_pipeline_capability.md)
 - [Pipeline Parallel](pipeline_parallel.md)
 - Recipe: [`recipes/Physis-AI/CausVid-Wan.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Physis-AI/CausVid-Wan.md)
-- Code: `vllm_omni/diffusion/distributed/noisy_pipeline_parallel/{noisy_pp_plan,noisy_pp_executor}.py`;
+- Code: `vllm_omni/diffusion/distributed/noisy_pipeline_parallel/{batch,noisy_pp_plan,noisy_pp_executor}.py`;
   NoisyKV: `vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py`

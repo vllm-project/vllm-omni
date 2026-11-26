@@ -278,11 +278,15 @@ def collect_duplex_session_metrics(
         raw_metric = timing.get("request_metrics")
         stages = timing.get("stages")
         stage0 = timing.get("stage0_tokens")
+        stage_metrics = timing.get("stage_metrics")
         metric: dict[str, object] = {
             "session_id": session_id,
             "request_index": request_index,
             "response_id": response_id,
         }
+        if timing.get("output_modality") == "text":
+            # Classify the turn even when it ended before any text arrived.
+            metric["output_modality"] = "text"
         if isinstance(raw_metric, dict):
             metric.update(raw_metric)
             metric["rtf"] = audio_rtf_from_raw_metric(raw_metric)
@@ -310,7 +314,13 @@ def collect_duplex_session_metrics(
         if isinstance(stage0, dict):
             metric["stage0_tokens"] = dict(stage0)
             output_tokens += int(stage0.get("output_token_count") or 0)
-        if isinstance(raw_metric, dict) or copied_stages or isinstance(stage0, dict):
+        if isinstance(stage_metrics, dict):
+            metric["stage_metrics"] = {
+                str(stage_id): dict(snapshot)
+                for stage_id, snapshot in stage_metrics.items()
+                if isinstance(snapshot, dict)
+            }
+        if isinstance(raw_metric, dict) or copied_stages or isinstance(stage0, dict) or isinstance(stage_metrics, dict):
             request_metrics.append(metric)
     apply_session_stats_to_request_metrics(request_metrics, session_stats)
     session_metrics = summarize_session_request_metrics(

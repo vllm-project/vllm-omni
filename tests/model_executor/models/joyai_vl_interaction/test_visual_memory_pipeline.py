@@ -27,12 +27,14 @@ from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError, duplex_text_history
 from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
+from vllm_omni.engine.duplex.visual_memory import (
+    VisualSummary,
+)
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import USER_QUERY_HEADER
 from vllm_omni.experimental.fullduplex.joyvl.memory.memory import MidTermSummary, WorkingChunk
 from vllm_omni.experimental.fullduplex.joyvl.serving.config import InteractionConfig
 from vllm_omni.experimental.fullduplex.joyvl.serving.session import InteractionSession
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import WorkingObservation
-from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import VisualSummary
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -963,7 +965,6 @@ async def test_boundary_matches_experimental_archived_qa_and_standing_query(mock
     mocker.patch(
         "vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin.monotonic", side_effect=lambda: clock[0]
     )
-    template = mocker.spy(plugin.processor, "apply_chat_template")
     query = "Tell me whenever the card color changes."
     summary = "A red card changed to blue."
     try:
@@ -975,9 +976,10 @@ async def test_boundary_matches_experimental_archived_qa_and_standing_query(mock
             await reference.step(
                 ["data:image/png;base64," + frame(color)], query=query if index == 0 else None, t=float(index)
             )
-            await command(h, AppendAudio(video_frames=(frame(color),)))
-            await command(h, Commit(final=True, create_response=True))
-            request_id = submissions(h, auxiliary=False)[-1].context.request_id
+            observation = await observe(
+                h, AppendAudio(video_frames=(frame(color),)), Commit(final=True, create_response=True)
+            )
+            request_id = observation.context.request_id
             await h.deliver_and_settle(
                 tts_output(request_id, text=f"</response> {color.title()}.", finished=True),
                 stage_id=0,
@@ -1007,15 +1009,26 @@ async def test_boundary_matches_experimental_archived_qa_and_standing_query(mock
             await command(h, user_item("q2", [{"type": "input_text", "text": next_query}]))
         clock[0] = 2.0
         await reference.step(["data:image/png;base64," + frame("green")], query=next_query, t=2.0)
-        await command(h, AppendAudio(video_frames=(frame("green"),)))
-        await command(h, Commit(final=True, create_response=True))
+        observation = await observe(
+            h, AppendAudio(video_frames=(frame("green"),)), Commit(final=True, create_response=True)
+        )
+        # Background visual preparation can render after foreground submission.
+        if not summary_ready:
+            assert (
+                await plugin.prepare_auxiliary_request(
+                    history=duplex_text_history(h.session.history), runtime_config=h.session.runtime_config, state=state
+                )
+                is not None
+            )
         expected = backend.generate.call_args.args[0]
         for message in expected:
             if isinstance(message["content"], list):
                 message["content"] = [
                     {"type": "image"} if part["type"] == "image_url" else part for part in message["content"]
                 ]
-        assert template.call_args.args[0] == expected
+        assert observation.prompt["prompt"] == Processor().apply_chat_template(
+            expected, tokenize=False, add_generation_prompt=True
+        )
         assert "[Q&A History]" in str(expected)
         assert "[Response@0.0 seconds] Red." in str(expected)
         assert "[Response@1.0 seconds] Blue." in str(expected)

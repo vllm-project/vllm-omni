@@ -34,6 +34,8 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from functools import lru_cache
 
+from vllm_omni.diffusion.distributed.member_batch import planned_task
+
 # (chunk, step, block) — schedule task and KV version.
 Cell = tuple[int, int, int]
 
@@ -87,6 +89,15 @@ class CellSchedule:
     blocks_per_rank: int | None = None
     #: Absolute chunk index of the first scheduled chunk (session continuation).
     chunk_base: int = 0
+    #: Whether a one-chunk Same-Step request must publish chunk 0's clean sink for a persistent session.
+    same_step_session: bool = False
+
+    @property
+    def same_step_has_sink(self) -> bool:
+        """Whether this plan reads or produces the Same-Step clean sink."""
+        return self.ordering is Ordering.SAME_STEP and (
+            self.chunk_base > 0 or self.chunks > 1 or self.same_step_session
+        )
 
     def __post_init__(self) -> None:
         if self.chunks < 1:
@@ -161,7 +172,7 @@ class CellSchedule:
     @property
     def num_schedule_steps(self) -> int:
         """Step-ID bound; with a Same-Step sink, only chunk 0 uses step ``D``."""
-        return self.num_denoise_steps + int(self.ordering is not Ordering.SAME_STEP or self.chunks > 1)
+        return self.num_denoise_steps + int(self.ordering is not Ordering.SAME_STEP or self.same_step_has_sink)
 
 
 @dataclass(frozen=True)
@@ -378,7 +389,12 @@ def _completions(slots: tuple[tuple[Cell | None, ...], ...]) -> dict[Cell, int]:
 
 
 def expected_prior_cells(schedule: CellSchedule) -> frozenset[Cell]:
-    """Logical prior clean cells implied by ``chunk_base`` / ``H`` / ordering.
+    """Logical prior cells implied by ``chunk_base`` / ``H`` / ordering.
+
+    Must agree with what :func:`clean_history_cells` kept for the request that
+    produced chunk ``chunk_base - 1``: the plan reads these versions and the
+    caller checks residency against them, so declaring a cell the previous
+    request never produced (or never kept) fails the continuation closed.
 
     This is independent of which ranks currently hold the versions. Callers that
     need residency checks must verify owners separately and schedule handoffs.
@@ -389,11 +405,24 @@ def expected_prior_cells(schedule: CellSchedule) -> frozenset[Cell]:
     t_clean = schedule.num_denoise_steps
     cells: set[Cell] = set()
     h = schedule.kv_history_chunks
-    if h >= 1:
-        start = max(0, schedule.chunk_base - h)
-        cells |= {(chunk, t_clean, block) for chunk in range(start, schedule.chunk_base) for block in range(num_blocks)}
+    start = max(0, schedule.chunk_base - h)
     if schedule.ordering is Ordering.SAME_STEP:
-        cells |= {(0, t_clean, block) for block in range(num_blocks)}
+        # A Same-Step consumer reads the version matching its own denoise step, so
+        # the window is per-step. Only chunk 0 runs the extra clean forward (the
+        # session sink); a non-zero chunk never produces its clean step, so
+        # demanding it here would fail every continuation closed.
+        if h >= 1:
+            cells |= {
+                (chunk, step, block)
+                for chunk in range(start, schedule.chunk_base)
+                for step in range(schedule.num_denoise_steps)
+                for block in range(num_blocks)
+            }
+        if schedule.same_step_has_sink:
+            cells |= {(0, t_clean, block) for block in range(num_blocks)}
+        return frozenset(cells)
+    if h >= 1:
+        cells |= {(chunk, t_clean, block) for chunk in range(start, schedule.chunk_base) for block in range(num_blocks)}
     return frozenset(cells)
 
 
@@ -592,7 +621,7 @@ def _cell_slots(schedule: CellSchedule) -> tuple[tuple[Cell | None, ...], ...]:
             # Continuation: only noisy steps; clean sink lives in prior history at chunk 0.
             return _offset_chunk_ids(_base_cell_slots(schedule), schedule.chunk_base)
         head = _base_cell_slots(replace(schedule, chunks=1))
-        if schedule.chunks == 1:
+        if schedule.chunks == 1 and not schedule.same_step_session:
             return head
         # One clean pass, on the final noisy replica; never allocate a clean
         # replica or run clean forwards for subsequent chunks.
@@ -601,6 +630,8 @@ def _cell_slots(schedule: CellSchedule) -> tuple[tuple[Cell | None, ...], ...]:
             row: list[Cell | None] = [None] * (schedule.step_replicas * schedule.layer_groups)
             row[rank_of_block(schedule.num_denoise_steps, block, schedule)] = (0, schedule.num_denoise_steps, block)
             clean.append(tuple(row))
+        if schedule.chunks == 1:
+            return (*head, *clean)
         tail = _base_cell_slots(replace(schedule, chunks=schedule.chunks - 1))
         shifted = tuple(
             tuple(None if cell is None else (cell[0] + 1, cell[1], cell[2]) for cell in row) for row in tail
@@ -661,7 +692,7 @@ def rank_work(inflight: tuple[Inflight, ...], slot: int, rank: int) -> tuple[tup
     out: list[tuple[str, Cell]] = []
     for item in inflight:
         local = slot - item.t0
-        task = item.plan.task(local, rank)
+        task = planned_task(item.plan, local, rank)
         if task is not None:
             out.append((item.req, task))
     return tuple(out)

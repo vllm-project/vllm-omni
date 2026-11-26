@@ -42,7 +42,6 @@ higher-priority strategy is selected.
 | --- | --- | --- | :---: | :---: | :---: | --- |
 | Flux2Pipeline | `black-forest-labs/FLUX.2-dev` | `Flux2Transformer2DModel` | yes | yes | — | `transformer_blocks`, `single_transformer_blocks` |
 | LongCatImagePipeline | `meituan-longcat/LongCat-Image` | `LongCatImageTransformer2DModel` | — | yes | — | `transformer_blocks`, `single_transformer_blocks` |
-| JoyImageEditPipeline | `jdopensource/JoyAI-Image-Edit-Diffusers` | `JoyImageEditTransformer3DModel` | yes | yes | — | `double_blocks` |
 | NextStep11Pipeline | `stepfun-ai/NextStep-1.1` | `NextStepModel` | — | yes | — | `layers` |
 | OvisImagePipeline | `AIDC-AI/Ovis-Image-7B` | `OvisImageTransformer2DModel` | — | yes | — | `transformer` |
 | QwenImagePipeline | `Qwen/Qwen-Image` | `QwenImageTransformer2DModel` | yes | yes | — | `transformer_blocks` |
@@ -50,6 +49,7 @@ higher-priority strategy is selected.
 | StableDiffusion3Pipeline | `stabilityai/stable-diffusion-3.5-medium` | `SD3Transformer2DModel` | — | yes | — | `transformer_blocks` |
 | Wan22I2VPipeline | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | `WanTransformer3DModel` | yes | yes | — | `blocks` |
 | Wan22Pipeline | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | yes | yes | — | `blocks` |
+| LingBotVideoPipeline | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | `LingBotVideoTransformer3DModel` | yes | yes | — | `blocks`; text encoder `model.visual.blocks`, `model.language_model.layers` |
 | BagelPipeline | `ByteDance-Seed/BAGEL-7B-MoT` | `Qwen2MoTModel` | — | yes | — | `layers`, customized modules |
 | Cosmos3OmniDiffusersPipeline | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | `Cosmos3VFMTransformer`, `Cosmos3LanguageModel` | yes | yes | yes | `layers`, `gen_layers` |
 | HyNomasModularPipeline | `tencent/Hy-Nomas-Diffusers` | reference `CPTHYNomasDiffusionTransformer` | yes | — | — | — |

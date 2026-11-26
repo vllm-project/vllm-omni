@@ -22,7 +22,20 @@ First-frame delivery requires `talker_first_audio: true` in connector extra,
 a one-frame initial codec chunk, CUDA, a local single-rank Talker and prefix caching disabled.
 Other deployments retain the regular Code2Wav path.
 `codec_fused_snake` explicitly opts CUDA profiles into fused decoder blocks;
-the base V1 profile retains its original blocks and indexed text cache.
+profiles that do not opt in retain their original blocks and indexed text cache.
+
+## ROCm generation stages
+
+The default `qwen3_omni_moe.yaml` selects MRv2 for Thinker, Talker and
+Code2Wav on ROCm. It preserves the ROCm stage-0 prefix-cache disable and keeps
+Code2Wav eager because its MIOpen transposed convolutions are not safe inside
+the outer graph capture. Async chunks, sampling defaults and the three-stage
+payload contract are unchanged.
+
+This runner migration does not enable the H200 profile's CUDA graphs, fused
+sampling, cuDNN search, first-frame decoder or CUDA-only kernels on ROCm. It
+does not by itself establish ROCm performance or audio-quality qualification;
+the exact ROCm deployment remains subject to hardware CI.
 
 ## Ascend generation stage
 
@@ -47,6 +60,23 @@ host materialization path before the native data plane publishes output and
 releases each chunk slot. CUDA retains its asynchronous output path. This
 adaptation alone does not establish a performance or audio-quality gain.
 The duplex profile remains on MRv1.
+
+Non-streaming NPU Code2Wav uses longer windows: 300 codec frames for the
+first chunk and 325 for subsequent chunks including left context. It caps
+each decoder batch at 8 rows and captures both windows for row counts 1–8
+(or fewer when the stage's `max_num_seqs` is smaller). Larger batches are
+split in row order before temporal chunking. The same limit applies with
+`enforce_eager: true` and to uncaptured tail windows. This bounds decoder
+activation pressure while preserving each request's existing chunk trimming;
+it does not cap memory for model weights or accumulated output waveforms.
+Changing the decoder batch shape can change BF16 numerical results, so this
+split does not promise bitwise equality with an unsplit batch. Audio-quality
+acceptance requires representative speech inputs in addition to shape and
+trimming regressions.
+The limit is separate from request concurrency and does not change the
+streaming graph plan. Talker and Code2Wav share a device in the default NPU
+deployment, so graph-count limits alone do not provide a memory budget for
+these longer non-streaming windows (#10090).
 
 ## Ascend prefix cache
 

@@ -7,6 +7,7 @@ import torch
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.worker.gpu.block_table import BlockTables
 
+from tests.helpers.device import DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
     duplex_window_geometry,
@@ -16,7 +17,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
 pytestmark = pytest.mark.core_model
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("computed", [8121, 8200, 16384])
 def test_duplex_keeps_history_beyond_allocation_window(computed: int) -> None:
     geometry = duplex_window_geometry(
@@ -41,15 +42,15 @@ def test_duplex_keeps_history_beyond_allocation_window(computed: int) -> None:
         max_num_reqs=2,
         max_num_batched_tokens=128,
         max_num_blocks_per_group=[2560, 2560],
-        device=torch.device("cuda"),
+        device=torch.device(DEVICE_TYPE),
         sliding_window_reach=[duplex.num_retained_tokens, ordinary.num_retained_tokens],
     )
     count = (computed + 1 + 15) // 16
     blocks = list(range(1, count + 1))
     tables.append_block_ids(1, (blocks, blocks), overwrite=True)
     tables.apply_staged_writes()
-    slots = torch.tensor([1], device="cuda", dtype=torch.int32)
-    positions = torch.tensor([0, computed], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([1], device=DEVICE_TYPE, dtype=torch.int32)
+    positions = torch.tensor([0, computed], device=DEVICE_TYPE, dtype=torch.int32)
     gathered = tables.gather_block_tables(slots, 1, num_computed_tokens=positions)
     assert gathered[0][0, :count].tolist() == blocks
     null_count = max(0, computed - ordinary.num_retained_tokens) // 16

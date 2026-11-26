@@ -23,6 +23,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _assign_rows(rows: torch.Tensor, index: torch.Tensor, values: torch.Tensor) -> None:
+    """``rows[mask] = values`` through the mask's precomputed row ``index``, which needs no host sync.
+
+    Every caller passes one value row per target row (sampler latents and
+    locked audio rows are both sized to the target rows), so any other shape
+    is a bug and raises instead of broadcasting.
+    """
+    expected = (index.shape[0], *rows.shape[1:])
+    if tuple(values.shape) != expected:
+        raise ValueError(f"target row values have shape {tuple(values.shape)}, expected {expected}")
+    rows.index_copy_(0, index, values)
+
+
 class MiniMaxH3Model:
     """Translate sampler evaluations into H3 inputs and raw velocity into x0."""
 
@@ -35,26 +48,44 @@ class MiniMaxH3Model:
         cond_timesteps: tuple[float, float] = (0.999, 1.0),
         model_rows: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_schedule=None,
+        attention_sigma_schedule=(),
     ):
         self.transformer, self.branch, self.rows = transformer, branch, rows
         self.attention_schedule = attention_schedule
+        self.attention_sigma_schedule = attention_sigma_schedule
         self.edits, self.cond_timesteps = edits, cond_timesteps
         # Fixed condition rows stay in this buffer; each prediction replaces
         # the target rows. Keep it for the entire request, including retries.
         self.model_rows = model_rows if model_rows is not None else tuple(row.clone() for row in rows)
+        self._indices: tuple[torch.Tensor, ...] = ()
+        self._indices_branch = None
 
     def rows_for(self, latents):
         """Fill reusable model inputs; valid until this request's next prediction."""
         rows = self.model_rows
-        for row, mask, latent in zip(rows, self.masks, latents, strict=True):
-            row[mask] = latent
+        for row, index, latent in zip(rows, self.indices, latents, strict=True):
+            _assign_rows(row, index, latent)
         if self.branch.locked_audio_rows is not None:
-            rows[1][self.masks[1]] = self.branch.locked_audio_rows
+            _assign_rows(rows[1], self.indices[1], self.branch.locked_audio_rows)
         return tuple(rows)
 
     @property
     def masks(self):
         return self.branch.update_mask_dev, self.branch.audio_update_mask_dev
+
+    @property
+    def indices(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._indices_branch is not self.branch:
+            self._indices = tuple(
+                index if index is not None else mask.nonzero().view(-1)
+                for index, mask in zip(
+                    (getattr(self.branch, "update_idx_dev", None), getattr(self.branch, "audio_update_idx_dev", None)),
+                    self.masks,
+                    strict=True,
+                )
+            )
+            self._indices_branch = self.branch
+        return self._indices
 
     def prepare(self, evaluation: ModelEvaluation):
         rows = self.rows_for(evaluation.latents)
@@ -73,11 +104,15 @@ class MiniMaxH3Model:
     def to_denoised(self, prepared, velocities):
         rows, model_rows, times, _ = prepared
         return tuple(
-            minimax_h3_rf_v_to_x0(row[mask], v.float()[mask], row.new_tensor(t))
+            minimax_h3_rf_v_to_x0(
+                row.index_select(0, index),
+                v.float().index_select(0, index),
+                torch.full((), t, dtype=row.dtype, device=row.device),
+            )
             if edit is None
             else edit.x0(model_row[0][mask], v.float()[mask], t)
-            for row, model_row, mask, edit, t, v in zip(
-                rows, model_rows, self.masks, self.edits, times, velocities, strict=True
+            for row, model_row, mask, index, edit, t, v in zip(
+                rows, model_rows, self.masks, self.indices, self.edits, times, velocities, strict=True
             )
         )
 
@@ -85,17 +120,17 @@ class MiniMaxH3Model:
         """Check both streams before any request's full rows are updated."""
         if self.branch.locked_audio_rows is not None:
             state.latents = (state.latents[0], self.branch.locked_audio_rows)
-        for row, mask, latent in zip(self.rows, self.masks, state.latents, strict=True):
-            shape = (int(mask.count_nonzero().item()), *row.shape[1:])
+        for row, index, latent in zip(self.rows, self.indices, state.latents, strict=True):
+            shape = (index.shape[0], *row.shape[1:])
             if latent.shape != shape or latent.dtype != row.dtype or latent.device != row.device:
                 raise ValueError("Sampled latents must match the target rows' shape, dtype, and device")
-            if not bool(torch.isfinite(latent).all().item()):
-                raise ValueError("Sampled latents must be finite before writing rows")
+        if not bool(torch.stack([torch.isfinite(latent).all() for latent in state.latents]).all().item()):
+            raise ValueError("Sampled latents must be finite before writing rows")
 
     def write_back(self, state: SamplingState):
         """Write checked latents into the existing full video/audio rows."""
-        for row, mask, latent in zip(self.rows, self.masks, state.latents, strict=True):
-            row[mask] = latent
+        for row, index, latent in zip(self.rows, self.indices, state.latents, strict=True):
+            _assign_rows(row, index, latent)
         return self.rows
 
 
@@ -118,8 +153,15 @@ class MiniMaxH3ModelBatch:
         if any("reference_kv_state" in m.branch.static_kwargs for m in models):
             # Packed kwargs carry no per-request reference-KV state.
             return logger.debug, "MiniMax H3 reference-KV requests run separately."
-        if scheduled and (not uniform_progress or len({m.attention_schedule for m in models}) > 1):
+        if scheduled and (
+            not uniform_progress
+            or len({m.attention_schedule for m in models}) > 1
+            or len({m.attention_sigma_schedule for m in models}) > 1
+        ):
             # A packed forward selects one attention profile from the published progress.
+            # Sigma windows split like step ranges. The resolved windows are in the step batch key, and
+            # the runner's batch_attention_sigma_schedule() rejects differing ones before denoise_step,
+            # so differing windows cannot reach one batch; the check mirrors the step-range one.
             return (
                 logger.info_once,
                 "MiniMax H3 runs a scheduled step batch whose requests differ in progress or schedule "
@@ -165,7 +207,9 @@ class MiniMaxH3ModelBatch:
         try:
             pdd = getattr(getattr(models[0].transformer, "arch", None), "pdd_steps", None) is not None
             if len(models) > 1:
-                scheduled = context is not None and bool(getattr(context, "attention_schedule", None))
+                scheduled = context is not None and bool(
+                    getattr(context, "attention_schedule", None) or getattr(context, "attention_sigma_schedule", None)
+                )
                 reason = self._unpacked_reason(models, pdd=pdd, scheduled=scheduled, uniform_progress=uniform_progress)
                 if reason is not None:
                     level, message = reason

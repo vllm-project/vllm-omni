@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.mixfusion.scheduling import fits_chunk_budget
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -77,6 +78,15 @@ class StepScheduler(BaseScheduler):
                 progress.wait_deadline = None
                 progress.resume = "timeout"
         output = super().schedule()
+        packed_requests = [
+            info
+            for rid in output.scheduled_request_ids
+            if (info := self._request_states[rid].req.mixfusion_info) is not None
+        ]
+        if packed_requests:
+            if len(packed_requests) != output.num_scheduled_reqs:
+                raise RuntimeError("Scheduler mixed dense and MixFusion requests")
+            output.use_mixfusion = True
         for request_id in output.scheduled_request_ids:
             progress = self._request_progress[request_id]
             progress.scheduled_interaction_generation = progress.interaction_generation
@@ -113,6 +123,13 @@ class StepScheduler(BaseScheduler):
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
         if not super()._can_schedule_waiting(state):
             return False
+
+        if state.req.mixfusion_info is not None:
+            candidates = [
+                info for rid in self._running if (info := self._request_states[rid].req.mixfusion_info) is not None
+            ] + [state.req.mixfusion_info]
+            if not fits_chunk_budget(candidates):
+                return False
 
         is_first_step = self._request_progress[state.request_id].current_step == 0
         for request_id in self._running:

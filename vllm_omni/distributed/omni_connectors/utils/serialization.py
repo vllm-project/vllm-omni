@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Mapping
 from dataclasses import asdict, fields, is_dataclass
@@ -91,13 +91,10 @@ class OmniMsgpackEncoder:
 
     def _encode_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
         """Encode torch.Tensor to dict."""
-        t = tensor.detach().cpu()
-        # Handle 0-dimensional (scalar) tensors by reshaping to 1D first
-        if t.dim() == 0:
-            t = t.reshape(1)
-        if not t.is_contiguous():
-            t = t.contiguous()
-        t = t.view(torch.uint8)
+        # Flatten: a contiguous tensor can still have a non-unit last stride
+        # beside a size-1 dimension, which view(uint8) rejects. This also
+        # covers 0-d tensors; decode restores the shape.
+        t = tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
         return {
             _TENSOR_MARKER: True,
             "dtype": str(tensor.dtype).removeprefix("torch."),

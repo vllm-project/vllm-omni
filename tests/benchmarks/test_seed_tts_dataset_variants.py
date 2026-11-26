@@ -166,6 +166,29 @@ def test_seed_tts_eval_keeps_session_pcm_for_single_turn_chat():
     assert outputs[0].tts_output_pcm_bytes == pcm
 
 
+@pytest.mark.parametrize(
+    ("hypothesis", "reference", "lang", "expected"),
+    [
+        ("", "", "en", 0.0),
+        ("One two", "", "en", 2.0),
+        ("One   two", "  \t\n", "en", 2.0),
+        ("One\ttwo\nthree", "", "en", 1.0),
+        ("Hello, world!", "...!", "en", 2.0),
+        ("你好世界！", "……", "zh", 4.0),
+        ("Hello, WORLD!", "hello world", "en", 0.0),
+        ("hello", "hello world", "en", 0.5),
+    ],
+)
+def test_seed_tts_wer_preserves_empty_reference_insertions(hypothesis, reference, lang, expected):
+    from vllm_omni.benchmarks.data_modules.seed_tts_eval import process_one_official
+
+    wer, raw_reference, raw_hypothesis = process_one_official(hypothesis, reference, lang)
+
+    assert wer == expected
+    assert raw_reference == reference
+    assert raw_hypothesis == hypothesis
+
+
 def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root, mock_tokenizer):
     ds = SeedTTSTextDataset(
         dataset_path=str(seed_tts_root),

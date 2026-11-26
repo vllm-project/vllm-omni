@@ -28,6 +28,8 @@ class HyNomasARConfig:
     history_latent_frames: int = 72
     max_total_latent_frames: int = 4096
     max_total_segments: int = 1024
+    history_archive_max_bytes: int = 0
+    history_archive_max_frames: int = 4096
 
     @property
     def max_chunk_latent_frames(self) -> int:
@@ -38,6 +40,11 @@ class HyNomasARConfig:
     def from_args(cls, args: Mapping[str, Any]) -> HyNomasARConfig:
         values = {name: args.get(f"ar_{name}", info.default) for name, info in cls.__dataclass_fields__.items()}
         mode = values.pop("history_mode")
+        archive_bytes = values.pop("history_archive_max_bytes")
+        if type(archive_bytes) is not int or archive_bytes < 0:
+            raise ValueError("Hy-Nomas ar_history_archive_max_bytes must be a nonnegative integer.")
+        if archive_bytes and mode != "recent":
+            raise ValueError("Hy-Nomas CPU history archival requires ar_history_mode=recent.")
         if mode not in ("full", "recent"):
             raise ValueError("Hy-Nomas ar_history_mode must be full or recent.")
         for name, value in values.items():
@@ -49,4 +56,4 @@ class HyNomasARConfig:
             raise ValueError("Hy-Nomas ar_chunk_latent_frames must not exceed ar_max_latent_frames.")
         if mode == "recent" and values["chunk_latent_frames"] > values["history_latent_frames"]:
             raise ValueError("Hy-Nomas nominal chunk size must not exceed its recent history budget.")
-        return cls(history_mode=mode, **values)
+        return cls(history_mode=mode, history_archive_max_bytes=archive_bytes, **values)

@@ -41,6 +41,9 @@ REF_AUDIO_URL = "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/HEAD/assets
 # Reject a response that contains only a header or a very short audio payload.
 # Advanced and full runs also validate the transcript.
 _MIN_AUDIO_BYTES = 10_000
+# Keep weekly quality verdicts reproducible while still exercising the normal
+# request-level seed propagation used by MOSS sampling.
+_SEED = 42
 
 
 @pytest.fixture(scope="session")
@@ -118,6 +121,7 @@ def test_text_to_audio_001(omni_server, online_client, ref_audio_data_url) -> No
         "response_format": "wav",
         "ref_audio": ref_audio_data_url,
         "min_audio_bytes": _MIN_AUDIO_BYTES,
+        "seed": _SEED,
     }
 
     online_client.send_audio_speech_request(request_config)
@@ -147,6 +151,7 @@ def test_text_to_audio_002_streaming(omni_server, online_client, ref_audio_data_
         "response_format": "pcm",
         "ref_audio": ref_audio_data_url,
         "min_hnr_db": -5.0,
+        "seed": _SEED,
     }
 
     online_client.send_audio_speech_request(request_config)
@@ -173,6 +178,7 @@ def test_text_to_audio_003_chinese(omni_server, online_client, ref_audio_data_ur
         "response_format": "wav",
         "ref_audio": ref_audio_data_url,
         "min_audio_bytes": _MIN_AUDIO_BYTES,
+        "seed": _SEED,
     }
 
     online_client.send_audio_speech_request(request_config)
