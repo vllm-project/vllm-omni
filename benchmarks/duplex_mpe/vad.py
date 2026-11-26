@@ -6,22 +6,24 @@
 
 from __future__ import annotations
 
+import importlib
+import importlib.metadata
 import math
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from math import gcd
 from typing import Protocol
 
 import numpy as np
-import silero_vad
 import torch
 from numpy.typing import NDArray
 from pydantic import JsonValue
 from scipy.signal import resample_poly
-from silero_vad import load_silero_vad
 
 ENDPOINT_EPSILON_SECONDS = 1e-9
 SILERO_MODEL_LOAD_LOCK = threading.Lock()
+SILERO_UNINSTALLED_SENTINEL = "uninstalled"
 
 
 class SileroVadModel(Protocol):
@@ -30,8 +32,38 @@ class SileroVadModel(Protocol):
     def __call__(self, audio_tensor: torch.Tensor, sample_rate_hz: int) -> torch.Tensor: ...
 
 
+SileroVadModelFactory = Callable[[], SileroVadModel]
+
+
 def silero_package_version() -> str:
-    return str(silero_vad.__version__)
+    try:
+        return importlib.metadata.version("silero-vad")
+    except importlib.metadata.PackageNotFoundError:
+        return SILERO_UNINSTALLED_SENTINEL
+
+
+def ensure_default_silero_vad_importable() -> object:
+    try:
+        silero_module = importlib.import_module("silero_vad")
+    except ModuleNotFoundError as exc:
+        if exc.name == "silero_vad":
+            raise ModuleNotFoundError(
+                "Duplex-MPE speech activity detection requires `silero-vad`. "
+                'Install it with `pip install "silero-vad==6.2.1"` (or `pip install -e ".[server-vad]"`).'
+            ) from exc
+        raise
+    if not callable(getattr(silero_module, "load_silero_vad", None)):
+        raise RuntimeError("Installed `silero_vad` package does not expose callable `load_silero_vad`")
+    return silero_module
+
+
+def load_default_silero_vad_model() -> SileroVadModel:
+    silero_module = ensure_default_silero_vad_importable()
+    loader = getattr(silero_module, "load_silero_vad", None)
+    if not callable(loader):
+        raise RuntimeError("Installed `silero_vad` package does not expose callable `load_silero_vad`")
+    loaded_model: SileroVadModel = loader()
+    return loaded_model
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -75,8 +107,8 @@ class SileroActivityConfig:
     def minimum_speech_frames(self) -> int:
         return max(1, int(round(self.minimum_speech_milliseconds / self.frame_milliseconds)))
 
-    def to_report_dict(self) -> dict[str, JsonValue]:
-        return {
+    def to_report_dict(self, *, custom_vad_injected: bool = False) -> dict[str, JsonValue]:
+        payload: dict[str, JsonValue] = {
             "detector": "silero_streaming_hysteresis_hangover",
             "silero_vad_version": silero_package_version(),
             "silero_sr": self.silero_sample_rate_hz,
@@ -95,6 +127,9 @@ class SileroActivityConfig:
             "frames_hangover": self.hangover_frames,
             "frames_min_speech": self.minimum_speech_frames,
         }
+        if custom_vad_injected:
+            payload["custom_vad_injected"] = True
+        return payload
 
 
 class SileroActivityDetector:
@@ -120,7 +155,7 @@ class SileroActivityDetector:
             self.vad_model: SileroVadModel = vad_model
         else:
             with SILERO_MODEL_LOAD_LOCK:
-                self.vad_model = load_silero_vad()
+                self.vad_model = load_default_silero_vad_model()
         self.vad_model.reset_states()
 
         rate_gcd = gcd(self.vad_config.silero_sample_rate_hz, self.sample_rate_hz)

@@ -51,6 +51,7 @@ from benchmarks.duplex_mpe.dataset import (
 from benchmarks.duplex_mpe.metrics import (
     REFERENCE_SILERO_VAD_VERSION,
     format_markdown_score_table,
+    is_supported_silero_vad_version,
     score_scenario_reports,
     validate_scenario_reports,
 )
@@ -91,7 +92,12 @@ from benchmarks.duplex_mpe.semantic import (
     validate_http_endpoint_url,
     validate_transcribed_against_tasks,
 )
-from benchmarks.duplex_mpe.vad import silero_package_version
+from benchmarks.duplex_mpe.vad import (
+    SILERO_UNINSTALLED_SENTINEL,
+    SileroVadModelFactory,
+    ensure_default_silero_vad_importable,
+    silero_package_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -142,17 +148,8 @@ def read_first_prefixed_line(file_path: str, prefix: str) -> str | None:
     return None
 
 
-def collect_benchmark_provenance(
-    *,
-    model_id: str,
-    model_revision: str | None,
-    dataset_id: str,
-    dataset_revision: str | None,
-    launch_command: str | None,
-    server_config: dict[str, JsonValue],
-    evaluation_input_sha256: str | None = None,
-) -> dict[str, JsonValue]:
-    """Collect reproducible host, GPU, git, and package metadata for vLLM-Omni."""
+def collect_runtime_environment_snapshot() -> dict[str, JsonValue]:
+    """Capture host, GPU, repository commit, and Python package versions of the current process."""
     inventory: dict[str, str] = {}
     for dist in importlib.metadata.distributions():
         name = dist.name
@@ -168,7 +165,6 @@ def collect_benchmark_provenance(
     cudnn_version: int | None = int(cudnn_raw) if isinstance(cudnn_raw, int) else None
 
     return {
-        "schema_version": 1,
         "repository": {
             "commit": run_short_command("git", "rev-parse", "HEAD", cwd=REPO_ROOT),
             "branch": run_short_command("git", "branch", "--show-current", cwd=REPO_ROOT),
@@ -205,6 +201,69 @@ def collect_benchmark_provenance(
         },
         "dependency_inventory": ordered_inventory,
         "dependency_freeze_sha256": hashlib.sha256(package_payload.encode("utf-8")).hexdigest(),
+    }
+
+
+def validate_saved_environment_snapshot(
+    raw_snapshot: JsonValue,
+    *,
+    manifest_label: str = "run.json",
+) -> dict[str, JsonValue] | None:
+    if raw_snapshot is None:
+        return None
+    if not isinstance(raw_snapshot, dict):
+        raise ValueError(f"Malformed generation_environment in {manifest_label}: expected object or null")
+    required_blocks = ("repository", "host", "gpu", "packages", "dependency_inventory")
+    if not all(isinstance(raw_snapshot.get(block), dict) for block in required_blocks):
+        raise ValueError(f"Malformed generation_environment structure in {manifest_label}")
+    raw_freeze = raw_snapshot.get("dependency_freeze_sha256")
+    if not isinstance(raw_freeze, str) or not raw_freeze:
+        raise ValueError(f"Malformed generation_environment dependency_freeze_sha256 in {manifest_label}")
+    return {
+        "repository": raw_snapshot["repository"],
+        "host": raw_snapshot["host"],
+        "gpu": raw_snapshot["gpu"],
+        "packages": raw_snapshot["packages"],
+        "dependency_inventory": raw_snapshot["dependency_inventory"],
+        "dependency_freeze_sha256": raw_freeze,
+    }
+
+
+def collect_benchmark_provenance(
+    *,
+    model_id: str,
+    model_revision: str | None,
+    dataset_id: str,
+    dataset_revision: str | None,
+    launch_command: str | None,
+    server_config: dict[str, JsonValue],
+    evaluation_input_sha256: str | None = None,
+    saved_generation_environment: dict[str, JsonValue] | None = None,
+    saved_generation_environment_history: list[JsonValue] | None = None,
+) -> dict[str, JsonValue]:
+    """Collect reproducible generation and scoring environment metadata for vLLM-Omni."""
+    current_environment = collect_runtime_environment_snapshot()
+    primary_environment = (
+        saved_generation_environment if saved_generation_environment is not None else current_environment
+    )
+    if saved_generation_environment is not None:
+        environment_source = "saved_generation_manifest"
+    elif saved_generation_environment_history:
+        environment_source = "partial_resume_without_initial_environment"
+    else:
+        environment_source = "scoring_process_fallback"
+
+    payload: dict[str, JsonValue] = {
+        "schema_version": 2,
+        "environment_source": environment_source,
+        "repository": primary_environment["repository"],
+        "host": primary_environment["host"],
+        "gpu": primary_environment["gpu"],
+        "packages": primary_environment["packages"],
+        "dependency_inventory": primary_environment["dependency_inventory"],
+        "dependency_freeze_sha256": primary_environment["dependency_freeze_sha256"],
+        "generation_environment": saved_generation_environment,
+        "scoring_environment": current_environment,
         "artifacts": {
             "requested_model_id": model_id,
             "declared_model_revision": model_revision,
@@ -215,6 +274,9 @@ def collect_benchmark_provenance(
         "launch_command": launch_command,
         "declared_server_config": server_config,
     }
+    if saved_generation_environment_history is not None:
+        payload["generation_environment_history"] = saved_generation_environment_history
+    return payload
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1124,8 +1186,19 @@ def is_compatible_saved_run_manifest(
     saved_manifest: dict[str, JsonValue],
     current_manifest: dict[str, JsonValue],
 ) -> bool:
-    comparable_saved = {key: value for key, value in saved_manifest.items() if key != "concurrency_history"}
-    comparable_current = {key: value for key, value in current_manifest.items() if key != "concurrency_history"}
+    ignored_keys = {"concurrency_history", "generation_environment", "generation_environment_history"}
+    comparable_saved = {key: value for key, value in saved_manifest.items() if key not in ignored_keys}
+    comparable_current = {key: value for key, value in current_manifest.items() if key not in ignored_keys}
+    comparable_saved.setdefault("custom_vad_injected", False)
+    comparable_current.setdefault("custom_vad_injected", False)
+    if (
+        type(comparable_saved.get("custom_vad_injected")) is not bool
+        or type(comparable_current.get("custom_vad_injected")) is not bool
+    ):
+        return False
+    if comparable_saved.get("custom_vad_injected") is True or comparable_current.get("custom_vad_injected") is True:
+        # Arbitrary Python VAD callables have no portable cross-process identity; disallow resuming injected runs.
+        return False
     if set(comparable_saved) != set(comparable_current):
         return False
     for field_name, current_value in comparable_current.items():
@@ -1232,6 +1305,7 @@ def prepare_generate_manifest_and_reports_sync(
     effective_max_concurrency: int,
     current_vad_version: str | None,
     ref_audio_sha256: str | None,
+    custom_vad_injected: bool = False,
 ) -> PreparedGenerateState:
     seeds = load_reference_seeds()
     for scenario in scenarios:
@@ -1295,6 +1369,7 @@ def prepare_generate_manifest_and_reports_sync(
         "evaluation_clock": "realtime_wall_clock",
         "seed_policy": SEED_POLICY_METADATA_ONLY,
         "silero_vad_version": current_vad_version,
+        "custom_vad_injected": custom_vad_injected,
         "code_fingerprint": compute_protocol_fingerprint(),
         "dataset_sha256": dataset_sha256,
         "preamble_sha256": preamble_sha256,
@@ -1306,6 +1381,8 @@ def prepare_generate_manifest_and_reports_sync(
     }
 
     existing_manifest: dict[str, JsonValue] | None = None
+    prior_env_history: list[JsonValue] = []
+    saved_initial_env: dict[str, JsonValue] | None = None
     if run_manifest_path.is_file():
         loaded_manifest = read_json_file(run_manifest_path)
         if not isinstance(loaded_manifest, dict) or not is_compatible_saved_run_manifest(
@@ -1314,8 +1391,42 @@ def prepare_generate_manifest_and_reports_sync(
         ):
             raise ValueError(f"Run configuration in {run_manifest_path} changed; choose a new --output-dir")
         existing_manifest = loaded_manifest
+        saved_initial_env = validate_saved_environment_snapshot(
+            existing_manifest.get("generation_environment"),
+            manifest_label=str(run_manifest_path),
+        )
+        raw_env_history = existing_manifest.get("generation_environment_history")
+        if raw_env_history is not None:
+            if not isinstance(raw_env_history, list):
+                raise ValueError(f"Malformed generation_environment_history in {run_manifest_path}: expected list")
+            for entry in raw_env_history:
+                validated_entry = validate_saved_environment_snapshot(
+                    entry,
+                    manifest_label=str(run_manifest_path),
+                )
+                if validated_entry is not None and validated_entry not in prior_env_history:
+                    prior_env_history.append(validated_entry)
+        if saved_initial_env is not None and saved_initial_env not in prior_env_history:
+            prior_env_history.insert(0, saved_initial_env)
 
+    scenarios_by_id = {scenario.scenario_id: scenario for scenario in scenarios}
     saved_reports = load_saved_reports(report_path)
+    for saved_sid, saved_entry in saved_reports.items():
+        saved_aed = saved_entry.get("aed_config")
+        if isinstance(saved_aed, dict) and saved_aed.get("custom_vad_injected") is True:
+            raise ValueError(
+                f"Existing custom-VAD report {saved_sid} in {report_path} cannot be reused or resumed; "
+                "choose a new --output-dir"
+            )
+        if isinstance(saved_aed, dict) and current_vad_version is not None:
+            saved_entry_vad_version = saved_aed.get("silero_vad_version")
+            if isinstance(saved_entry_vad_version, str) and saved_entry_vad_version != current_vad_version:
+                raise ValueError(
+                    f"Existing report {saved_sid} in {report_path} recorded "
+                    f"silero_vad_version={saved_entry_vad_version!r} != current {current_vad_version!r}; "
+                    "choose a new --output-dir"
+                )
+    selected_saved_reports: dict[str, dict[str, JsonValue]] = {}
     pending_scenarios: list[DuplexMpeScenarioRecord] = []
     for scenario in scenarios:
         if scenario.scenario_id in saved_reports:
@@ -1330,12 +1441,24 @@ def prepare_generate_manifest_and_reports_sync(
                 raise ValueError(f"Saved audio missing or modified for {scenario.scenario_id}") from exc
             if compute_file_sha256(wav_path) != recorded_sha256:
                 raise ValueError(f"Saved audio missing or modified for {scenario.scenario_id}")
+            selected_saved_reports[scenario.scenario_id] = saved_reports[scenario.scenario_id]
             continue
         pending_scenarios.append(scenario)
 
+    if selected_saved_reports:
+        validate_scenario_reports(
+            selected_saved_reports,
+            scenarios_by_id,
+            strict_reference_vad_version=config.strict_reference_vad_version,
+        )
+
     if not pending_scenarios:
         if existing_manifest is None:
+            current_generation_env = collect_runtime_environment_snapshot()
             run_manifest["concurrency_history"] = [effective_max_concurrency]
+            run_manifest["generation_environment"] = current_generation_env if not saved_reports else None
+            if saved_reports:
+                run_manifest["generation_environment_history"] = [current_generation_env]
             write_json_atomic(run_manifest_path, run_manifest)
         if failures_path.is_file():
             failures_path.unlink()
@@ -1350,6 +1473,22 @@ def prepare_generate_manifest_and_reports_sync(
             pending_scenarios=[],
             existing_failure_ledger={},
         )
+
+    current_generation_env = collect_runtime_environment_snapshot()
+
+    # Preserve unknown initial provenance if pre-existing saved_reports lack generation_environment!
+    if saved_initial_env is not None:
+        primary_generation_env: dict[str, JsonValue] | None = saved_initial_env
+    elif not saved_reports:
+        primary_generation_env = current_generation_env
+    else:
+        primary_generation_env = None
+
+    if current_generation_env not in prior_env_history:
+        prior_env_history.append(current_generation_env)
+    run_manifest["generation_environment"] = primary_generation_env
+    if len(prior_env_history) > 1 or primary_generation_env is None:
+        run_manifest["generation_environment_history"] = prior_env_history
 
     prior_history: list[int] = []
     if existing_manifest is not None:
@@ -1384,13 +1523,24 @@ def prepare_generate_manifest_and_reports_sync(
 async def run_generate_phase(
     config: DuplexMpeEvalConfig,
     scenarios: list[DuplexMpeScenarioRecord],
+    *,
+    vad_model_factory: SileroVadModelFactory | None = None,
 ) -> GeneratePhaseResult:
     assert config.base_url is not None
+    if config.strict_reference_vad_version and vad_model_factory is not None:
+        raise ValueError("Injected custom VAD factory is not permitted with --strict-reference-vad-version")
+    if vad_model_factory is None:
+        await asyncio.to_thread(ensure_default_silero_vad_importable)
     current_vad_version = await asyncio.to_thread(silero_package_version)
     if config.strict_reference_vad_version and current_vad_version != REFERENCE_SILERO_VAD_VERSION:
         raise ValueError(
             f"--strict-reference-vad-version requires silero-vad=={REFERENCE_SILERO_VAD_VERSION}, "
             f"found {current_vad_version}"
+        )
+    if vad_model_factory is None and not is_supported_silero_vad_version(current_vad_version):
+        raise ValueError(
+            f"Default Silero VAD requires installed distribution metadata >= 5.1 (found {current_vad_version!r}); "
+            'install `pip install "silero-vad==6.2.1"`'
         )
 
     dataset_root = await asyncio.to_thread(resolve_path_sync, config.dataset_root)
@@ -1439,6 +1589,7 @@ async def run_generate_phase(
         effective_max_concurrency=effective_max_concurrency,
         current_vad_version=current_vad_version,
         ref_audio_sha256=ref_audio_sha256,
+        custom_vad_injected=(vad_model_factory is not None),
     )
     output_dir = prep_state.output_dir
     report_path = prep_state.report_path
@@ -1467,11 +1618,13 @@ async def run_generate_phase(
         async def run_warmup_one(warmup_index: int) -> None:
             async with warmup_semaphore:
                 try:
+                    session_vad = vad_model_factory() if vad_model_factory is not None else None
                     await run_realtime_scenario(
                         warmup_scenario,
                         dataset_root=dataset_root,
                         endpoint_spec=endpoint_spec,
                         output_audio_path=warmup_directory / f"warmup_{warmup_index}.wav",
+                        vad_model=session_vad,
                         session_timeout_seconds=config.session_timeout_seconds,
                         seed_mapping=seeds,
                     )
@@ -1519,11 +1672,13 @@ async def run_generate_phase(
                 must_exist=False,
             )
             try:
+                session_vad = vad_model_factory() if vad_model_factory is not None else None
                 scenario_report = await run_realtime_scenario(
                     scenario,
                     dataset_root=dataset_root,
                     endpoint_spec=endpoint_spec,
                     output_audio_path=wav_path,
+                    vad_model=session_vad,
                     session_timeout_seconds=config.session_timeout_seconds,
                     seed_mapping=seeds,
                 )
@@ -1775,7 +1930,11 @@ def persist_summary_outputs_sync(
     return summary_path
 
 
-async def run_duplex_mpe_evaluation(config: DuplexMpeEvalConfig) -> dict[str, JsonValue]:
+async def run_duplex_mpe_evaluation(
+    config: DuplexMpeEvalConfig,
+    *,
+    vad_model_factory: SileroVadModelFactory | None = None,
+) -> dict[str, JsonValue]:
     """Execute the selected Duplex-MPE phase(s) and write summary artifacts."""
     boot = await asyncio.to_thread(bootstrap_evaluation_sync, config)
     dataset_root = boot.dataset_root
@@ -1801,7 +1960,7 @@ async def run_duplex_mpe_evaluation(config: DuplexMpeEvalConfig) -> dict[str, Js
     failed_semantic_task_keys: tuple[str, ...] = ()
     allowed_unselected_task_keys: frozenset[str] = frozenset()
     if config.phase in ("all", "generate"):
-        generate_result = await run_generate_phase(config, scenarios)
+        generate_result = await run_generate_phase(config, scenarios, vad_model_factory=vad_model_factory)
         reports_by_id = generate_result.reports_by_id
         failed_scenarios = dict(generate_result.failed_scenarios)
     else:
@@ -2043,6 +2202,40 @@ async def run_duplex_mpe_evaluation(config: DuplexMpeEvalConfig) -> dict[str, Js
     first_report = next(iter(reports_by_id.values()))
     first_aed = first_report.get("aed_config")
     recorded_vad_version = first_aed.get("silero_vad_version") if isinstance(first_aed, dict) else None
+    reports_custom_vad = bool(isinstance(first_aed, dict) and first_aed.get("custom_vad_injected") is True)
+    if "custom_vad_injected" in saved_run_manifest:
+        raw_manifest_custom_vad = saved_run_manifest.get("custom_vad_injected")
+        if type(raw_manifest_custom_vad) is not bool:
+            raise ValueError(f"Invalid custom_vad_injected={raw_manifest_custom_vad!r} in {run_manifest_path}")
+        if config.strict_reference_vad_version and raw_manifest_custom_vad is True:
+            raise ValueError(
+                f"Manifest {run_manifest_path} declares custom_vad_injected=True, "
+                "which is not permitted with --strict-reference-vad-version"
+            )
+        if raw_manifest_custom_vad != reports_custom_vad:
+            raise ValueError(
+                f"custom_vad_injected mismatch between {run_manifest_path} ({raw_manifest_custom_vad!r}) "
+                f"and {report_path} ({reports_custom_vad!r})"
+            )
+    if "silero_vad_version" in saved_run_manifest and saved_run_manifest.get("silero_vad_version") is not None:
+        raw_manifest_vad_version = saved_run_manifest.get("silero_vad_version")
+        if not isinstance(raw_manifest_vad_version, str) or not raw_manifest_vad_version:
+            raise ValueError(f"Invalid silero_vad_version={raw_manifest_vad_version!r} in {run_manifest_path}")
+        if config.strict_reference_vad_version and raw_manifest_vad_version != REFERENCE_SILERO_VAD_VERSION:
+            raise ValueError(
+                f"Manifest {run_manifest_path} declares silero_vad_version={raw_manifest_vad_version!r} != "
+                f"{REFERENCE_SILERO_VAD_VERSION!r} under --strict-reference-vad-version"
+            )
+        if not config.strict_reference_vad_version and not (
+            is_supported_silero_vad_version(raw_manifest_vad_version)
+            or (reports_custom_vad and raw_manifest_vad_version == SILERO_UNINSTALLED_SENTINEL)
+        ):
+            raise ValueError(f"Unsupported silero_vad_version={raw_manifest_vad_version!r} in {run_manifest_path}")
+        if recorded_vad_version is not None and raw_manifest_vad_version != recorded_vad_version:
+            raise ValueError(
+                f"silero_vad_version mismatch between {run_manifest_path} ({raw_manifest_vad_version!r}) "
+                f"and {report_path} ({recorded_vad_version!r})"
+            )
     observed_report_protocols = {
         str(report.get("realtime_protocol"))
         for report in reports_by_id.values()
@@ -2233,6 +2426,25 @@ async def run_duplex_mpe_evaluation(config: DuplexMpeEvalConfig) -> dict[str, Js
         "judge": inferred_judge_metadata,
         "trust_env": config.trust_env,
     }
+    saved_generation_environment = validate_saved_environment_snapshot(
+        saved_run_manifest.get("generation_environment"),
+        manifest_label=str(run_manifest_path),
+    )
+    raw_saved_env_history = saved_run_manifest.get("generation_environment_history")
+    saved_generation_environment_history: list[JsonValue] | None = None
+    if raw_saved_env_history is not None:
+        if not isinstance(raw_saved_env_history, list):
+            raise ValueError(f"Malformed generation_environment_history in {run_manifest_path}: expected list")
+        validated_hist: list[JsonValue] = [
+            item
+            for item in (
+                validate_saved_environment_snapshot(entry, manifest_label=str(run_manifest_path))
+                for entry in raw_saved_env_history
+            )
+            if item is not None
+        ]
+        if validated_hist:
+            saved_generation_environment_history = validated_hist
     provenance = await asyncio.to_thread(
         collect_benchmark_provenance,
         model_id=effective_model,
@@ -2246,6 +2458,8 @@ async def run_duplex_mpe_evaluation(config: DuplexMpeEvalConfig) -> dict[str, Js
         launch_command=effective_launch_command,
         server_config=server_declaration,
         evaluation_input_sha256=evaluation_input_sha256,
+        saved_generation_environment=saved_generation_environment,
+        saved_generation_environment_history=saved_generation_environment_history,
     )
 
     unattempted_scenarios = sorted(set(scenarios_by_id) - set(reports_by_id) - set(failed_scenarios))

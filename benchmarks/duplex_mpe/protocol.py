@@ -278,14 +278,12 @@ def iter_scenario_schedule(
 
     schedule_result = ScenarioScheduleResult(
         protocol_id=PROTOCOL_ID,
-        aed_config=resolved_vad_config.to_report_dict(),
+        aed_config=resolved_vad_config.to_report_dict(custom_vad_injected=(vad_model is not None)),
     )
     schedule_result.aed_config["code_fingerprint"] = compute_protocol_fingerprint()
     schedule_result.aed_config["t_endpoint_hangover_ms"] = endpoint_hangover_milliseconds
     schedule_result.aed_config["input_sr"] = input_sample_rate_hz
     schedule_result.aed_config["assistant_sr"] = output_sample_rate_hz
-    if vad_model is not None:
-        schedule_result.aed_config["custom_vad_injected"] = True
 
     chunk_samples = max(1, int(round(input_sample_rate_hz * chunk_milliseconds / 1000.0)))
     captured_chunks: list[NDArray[np.float32]] = []

@@ -122,12 +122,12 @@ python -m benchmarks.duplex_mpe run \
 
 | File | Purpose |
 | --- | --- |
-| `run.json` | Frozen run manifest (protocol, sample rates, dataset/scenario/audio SHA-256 bindings, sanitized launch command). |
+| `run.json` | Frozen run manifest (protocol, sample rates, dataset/scenario/audio SHA-256 bindings, sanitized launch command, and `generation_environment` host/GPU/git/package snapshot). |
 | `audio/<scenario_id>.wav` | Continuous sample-aligned assistant output audio retained for audit and ASR slicing. |
 | `report.json` | Per-scenario `mpeval.unified.v3` turn windows, `T` timing outcome, and Silero VAD segments. |
 | `tasks.json` / `transcribed.json` | Deterministic semantic evaluation tasks and window ASR transcripts. |
 | `labels.json` | Prompt-locked semantic judge verdicts bound to `assistant_audio_sha256`. |
-| `RESULTS.md` / `duplex_mpe_results.json` | Markdown summary table and machine-readable metrics + host/package provenance. |
+| `RESULTS.md` / `duplex_mpe_results.json` | Markdown summary table and machine-readable metrics + preserved `generation_environment` and separate `scoring_environment` provenance. |
 
 ---
 

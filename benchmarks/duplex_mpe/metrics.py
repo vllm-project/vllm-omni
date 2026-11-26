@@ -26,6 +26,7 @@ from benchmarks.duplex_mpe.protocol import (
     TARGET_OVERLONG_OUTCOME,
     TargetOutcome,
 )
+from benchmarks.duplex_mpe.vad import SILERO_UNINSTALLED_SENTINEL
 
 NON_TARGET_SILENCE_EVENTS: tuple[Literal["N1"], Literal["N2"], Literal["N3"]] = (
     "N1",
@@ -632,6 +633,7 @@ def validate_scenario_reports(
     if not reports_by_id:
         raise ValueError("No completed scenario reports to validate")
     observed_vad_versions: set[str] = set()
+    observed_custom_vad_flags: set[bool] = set()
     observed_clocks: set[str] = set()
     for scenario_id, report in reports_by_id.items():
         if scenario_id not in scenarios_by_id:
@@ -784,13 +786,24 @@ def validate_scenario_reports(
             "min_speech_ms": 120.0,
             "silero_window": 512,
         }
+        raw_custom_vad = aed_config.get("custom_vad_injected", False)
+        if type(raw_custom_vad) is not bool:
+            raise ValueError(f"Invalid custom_vad_injected flag in {scenario_id}: {raw_custom_vad!r}")
+        observed_custom_vad_flags.add(raw_custom_vad)
         raw_vad_version = aed_config.get("silero_vad_version")
-        if not isinstance(raw_vad_version, str) or not is_supported_silero_vad_version(raw_vad_version):
+        is_custom_stub_without_silero = (
+            not strict_reference_vad_version
+            and raw_custom_vad is True
+            and raw_vad_version == SILERO_UNINSTALLED_SENTINEL
+        )
+        if not isinstance(raw_vad_version, str) or (
+            not is_supported_silero_vad_version(raw_vad_version) and not is_custom_stub_without_silero
+        ):
             raise ValueError(f"Invalid or unsupported silero_vad_version in {scenario_id}: {raw_vad_version!r}")
         observed_vad_versions.add(raw_vad_version)
         if strict_reference_vad_version:
             required_settings["silero_vad_version"] = REFERENCE_SILERO_VAD_VERSION
-            if aed_config.get("custom_vad_injected") is True:
+            if raw_custom_vad is True:
                 raise ValueError(f"Injected stub VAD model is not permitted in strict mode for {scenario_id}")
         if any(
             aed_config.get(setting_key) != setting_value for setting_key, setting_value in required_settings.items()
@@ -798,6 +811,8 @@ def validate_scenario_reports(
             raise ValueError(f"Incompatible Silero AED settings in {scenario_id}")
     if len(observed_vad_versions) > 1:
         raise ValueError(f"Mixed silero_vad_version values across scenario reports: {sorted(observed_vad_versions)}")
+    if len(observed_custom_vad_flags) > 1:
+        raise ValueError("Mixed custom_vad_injected states across scenario reports")
     if len(observed_clocks) > 1:
         raise ValueError(f"Mixed evaluation_clock values across scenario reports: {sorted(observed_clocks)}")
 

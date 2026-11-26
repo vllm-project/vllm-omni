@@ -89,8 +89,11 @@ from benchmarks.duplex_mpe.semantic import (  # noqa: E402
     validate_transcribed_against_tasks,
 )
 from benchmarks.duplex_mpe.vad import (  # noqa: E402
+    SILERO_UNINSTALLED_SENTINEL,
     SileroActivityConfig,
     SileroActivityDetector,
+    SileroVadModel,
+    silero_package_version,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -399,7 +402,7 @@ def test_n4_yielding_and_scored_vs_probe_metrics(tmp_path: Path) -> None:
         "protocol_id": "mpeval.unified.v3",
         "total_duration_s": 12.0,
         "assistant_audio_sha256": "abc123",
-        "aed_config": SileroActivityConfig().to_report_dict(),
+        "aed_config": SileroActivityConfig().to_report_dict(custom_vad_injected=True),
         "assistant_speech_segments": [[0.2, 0.5], [2.5, 6.2], [9.2, 10.2]],
         "T": {
             "outcome": "T_HIT_5S",
@@ -840,7 +843,7 @@ async def test_semantic_asr_judge_and_partial_score_cli_exit_code(
         "realtime_protocol": "native",
         "total_duration_s": 5.5,
         "assistant_audio_sha256": audio_sha,
-        "aed_config": SileroActivityConfig().to_report_dict(),
+        "aed_config": SileroActivityConfig().to_report_dict(custom_vad_injected=True),
         "assistant_speech_segments": [[0.1, 0.5], [4.2, 5.0]],
         "T": {
             "outcome": "T_HIT_5S",
@@ -1687,7 +1690,7 @@ async def test_control_sender_failure_wakes_drain_and_close_timeout_cancels_task
             warmup_sessions=0,
             session_timeout_seconds=0.05,
         )
-        gen_res = await run_generate_phase(eval_cfg, [scenario])
+        gen_res = await run_generate_phase(eval_cfg, [scenario], vad_model_factory=EnergyThresholdVadStub)
         assert close_send_attempted.is_set()
         assert scenario.scenario_id in gen_res.failed_scenarios
         assert (tmp_path / "timeout_eval_out" / "failures.json").is_file()
@@ -1836,7 +1839,7 @@ def test_validate_scenario_reports_rejects_forged_overlong_and_inconsistent_targ
         return {
             "protocol_id": "mpeval.unified.v3",
             "total_duration_s": 5.5,
-            "aed_config": SileroActivityConfig().to_report_dict(),
+            "aed_config": SileroActivityConfig().to_report_dict(custom_vad_injected=True),
             "assistant_speech_segments": [[4.2, 5.0]],
             "T": t_block,
             "rows": [
@@ -1984,7 +1987,7 @@ async def test_offline_score_sanitizes_saved_manifest_credentials_and_base_url(t
         "realtime_protocol": "native",
         "total_duration_s": 5.5,
         "assistant_audio_sha256": audio_sha,
-        "aed_config": SileroActivityConfig().to_report_dict(),
+        "aed_config": SileroActivityConfig().to_report_dict(custom_vad_injected=True),
         "assistant_speech_segments": [],
         "T": {
             "outcome": "T_MISS_5S",
@@ -2094,3 +2097,730 @@ async def test_offline_score_sanitizes_saved_manifest_credentials_and_base_url(t
     assert isinstance(legacy_srv, dict)
     assert legacy_srv["retained_audio_verified"] is False
     assert legacy_srv["retained_audio_verified_scenarios"] == 0
+
+
+def test_silero_vad_optional_import_and_uninstalled_metadata_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib.metadata as importlib_metadata
+
+    import benchmarks.duplex_mpe.vad as vad_mod
+
+    dataset_root = create_synthetic_duplex_mpe_dataset(tmp_path / "dataset")
+    scenario = load_duplex_mpe_scenarios(dataset_root, addressing="explicit", max_scenarios=1)[0]
+
+    real_version = importlib_metadata.version
+
+    def fake_missing_version(distribution_name: str) -> str:
+        if distribution_name == "silero-vad":
+            raise importlib_metadata.PackageNotFoundError("silero-vad")
+        return real_version(distribution_name)
+
+    def fake_missing_import(module_name: str, package: str | None = None) -> object:
+        if module_name == "silero_vad":
+            raise ModuleNotFoundError("No module named 'silero_vad'", name="silero_vad")
+        raise AssertionError(f"Unexpected dynamic import: {module_name}")
+
+    monkeypatch.setattr(importlib_metadata, "version", fake_missing_version)
+    monkeypatch.setattr(vad_mod.importlib, "import_module", fake_missing_import)
+
+    assert silero_package_version() == SILERO_UNINSTALLED_SENTINEL
+    stub_cfg = SileroActivityConfig().to_report_dict(custom_vad_injected=True)
+    assert stub_cfg["silero_vad_version"] == SILERO_UNINSTALLED_SENTINEL
+    assert stub_cfg["custom_vad_injected"] is True
+
+    # Default detector without injected stub raises a clear actionable error when silero-vad is absent,
+    # while a broken transitive dependency inside silero_vad propagates its own ModuleNotFoundError name!
+    with pytest.raises(ModuleNotFoundError, match="pip install"):
+        SileroActivityDetector(sample_rate_hz=16000, vad_model=None)
+
+    def fake_broken_subdep_import(module_name: str, package: str | None = None) -> object:
+        if module_name == "silero_vad":
+            raise ModuleNotFoundError("No module named 'onnxruntime'", name="onnxruntime")
+        raise AssertionError(f"Unexpected dynamic import: {module_name}")
+
+    monkeypatch.setattr(vad_mod.importlib, "import_module", fake_broken_subdep_import)
+    with pytest.raises(ModuleNotFoundError, match="onnxruntime"):
+        SileroActivityDetector(sample_rate_hz=16000, vad_model=None)
+    monkeypatch.setattr(vad_mod.importlib, "import_module", fake_missing_import)
+
+    # Injected deterministic stub works end-to-end without silero-vad installed, while strict mode still rejects it!
+    turns = [
+        ScenarioTurnInput(
+            turn_index=t.turn_index,
+            event_type=t.event_type,
+            speaker=t.speaker,
+            waveform_samples=np.zeros(4000, dtype=np.float32),
+        )
+        for t in scenario.turns
+    ]
+    adapter = ClockedAudioAdapter(
+        ScheduledReplyAdapter(
+            input_sample_rate_hz=16000,
+            output_sample_rate_hz=24000,
+            voiced_intervals_seconds=[],
+        )
+    )
+    stub_report = run_scenario_schedule(
+        adapter,
+        turns,
+        vad_model=EnergyThresholdVadStub(),
+        onset_deadline_seconds=0.5,
+        maximum_response_seconds=1.0,
+        target_endpoint_hangover_milliseconds=2000.0,
+    ).to_report_dict()
+    validate_scenario_reports({scenario.scenario_id: stub_report}, {scenario.scenario_id: scenario})
+    with pytest.raises(ValueError, match="Invalid or unsupported silero_vad_version"):
+        validate_scenario_reports(
+            {scenario.scenario_id: stub_report},
+            {scenario.scenario_id: scenario},
+            strict_reference_vad_version=True,
+        )
+
+
+async def test_phased_generation_vs_scoring_environment_provenance_separation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import benchmarks.duplex_mpe.evaluate as eval_mod
+
+    dataset_root = create_synthetic_duplex_mpe_dataset(tmp_path / "dataset")
+    out_dir = tmp_path / "phased_prov_out"
+
+    gen_snapshot: dict[str, JsonValue] = {
+        "repository": {"commit": "111111111111", "branch": "gen-branch", "dirty": False},
+        "host": {
+            "platform": "Linux-gen-gpu-host",
+            "cpu_model": "GenCPU",
+            "logical_cpus": 128,
+            "memory_total_kib": "1024",
+        },
+        "gpu": {
+            "nvidia_smi_csv": "0, NVIDIA H20, GPU-gen, 97871, 535.0, P0, 500.0, 1980, 2619, 9.0",
+            "cuda_visible_devices": "0",
+            "torch_cuda_build": "13.0",
+            "cudnn_version": 92501,
+        },
+        "packages": {"torch": "2.14.0+cu130", "vllm": "0.34.0", "silero-vad": "6.2.1"},
+        "dependency_inventory": {"vllm": "0.34.0"},
+        "dependency_freeze_sha256": "deadbeef" * 8,
+    }
+    score_snapshot: dict[str, JsonValue] = {
+        "repository": {"commit": "222222222222", "branch": "score-branch", "dirty": True},
+        "host": {
+            "platform": "Linux-score-cpu-host",
+            "cpu_model": "ScoreCPU",
+            "logical_cpus": 16,
+            "memory_total_kib": "512",
+        },
+        "gpu": {"nvidia_smi_csv": None, "cuda_visible_devices": None, "torch_cuda_build": None, "cudnn_version": None},
+        "packages": {"torch": "2.14.0+cpu", "vllm": None, "silero-vad": None},
+        "dependency_inventory": {"numpy": "2.0.0"},
+        "dependency_freeze_sha256": "cafebabe" * 8,
+    }
+
+    async def handle_ws(websocket: websockets.ServerConnection) -> None:
+        _ = json.loads(await websocket.recv())
+        session_obj: dict[str, JsonValue] = {
+            "id": "prov-gen-01",
+            "model": "nvidia/personaplex-7b-v1",
+            "turn_detection": None,
+            "capabilities": {
+                "implementation_level": "model_native_duplex",
+                "supports_model_native_turn_policy": True,
+                "supports_barge_in": False,
+                "supports_playback_ack": False,
+                "supports_audio_truncate": False,
+                "supports_client_commit": False,
+                "chunk_period_ms": 80,
+            },
+        }
+        await websocket.send(json.dumps({"type": "session.created", "session": session_obj}))
+        await websocket.send(json.dumps({"type": "session.updated", "session": session_obj}))
+        async for raw_frame in websocket:
+            msg = json.loads(raw_frame)
+            if msg.get("type") == "session.close":
+                await websocket.send(json.dumps({"type": "session.closed", "session_id": "prov-gen-01"}))
+                return
+
+    real_run_scenario = eval_mod.run_realtime_scenario
+
+    async def fast_stub_run_scenario(
+        scen: eval_mod.DuplexMpeScenarioRecord,
+        *,
+        dataset_root: Path,
+        endpoint_spec: eval_mod.RealtimeEndpointSpec,
+        output_audio_path: Path,
+        vad_model: SileroVadModel | None = None,
+        session_timeout_seconds: float,
+        seed_mapping: dict[str, int],
+    ) -> dict[str, JsonValue]:
+        return await real_run_scenario(
+            scen,
+            dataset_root=dataset_root,
+            endpoint_spec=endpoint_spec,
+            output_audio_path=output_audio_path,
+            vad_model=vad_model,
+            session_timeout_seconds=session_timeout_seconds,
+            seed_mapping=seed_mapping,
+            realtime_pacing=False,
+        )
+
+    monkeypatch.setattr(eval_mod, "run_realtime_scenario", fast_stub_run_scenario)
+    monkeypatch.setattr(eval_mod, "collect_runtime_environment_snapshot", lambda: gen_snapshot)
+
+    async with websockets.serve(handle_ws, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        # Verify default generation WITHOUT silero-vad fails BEFORE freezing run.json,
+        # so installing silero-vad and retrying the SAME --output-dir succeeds cleanly!
+        import importlib.metadata as importlib_metadata
+
+        import benchmarks.duplex_mpe.vad as vad_mod
+
+        real_meta_version = importlib_metadata.version
+        real_import_mod = vad_mod.importlib.import_module
+        monkeypatch.setattr(
+            importlib_metadata,
+            "version",
+            lambda dist_name: (_ for _ in ()).throw(importlib_metadata.PackageNotFoundError(dist_name))
+            if dist_name == "silero-vad"
+            else real_meta_version(dist_name),
+        )
+        monkeypatch.setattr(
+            vad_mod.importlib,
+            "import_module",
+            lambda mod_name, pkg=None: (_ for _ in ()).throw(
+                ModuleNotFoundError("No module named 'silero_vad'", name="silero_vad")
+            )
+            if mod_name == "silero_vad"
+            else real_import_mod(mod_name, pkg),
+        )
+        with pytest.raises(ModuleNotFoundError, match="pip install"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=out_dir,
+                    phase="generate",
+                    addressing="explicit",
+                    max_scenarios=1,
+                    base_url=f"http://127.0.0.1:{port}",
+                    warmup_sessions=0,
+                )
+            )
+        assert not (out_dir / "run.json").exists()
+
+        # Simulate installing silero-vad==6.2.1 and retrying on the EXACT SAME out_dir via the default loader path!
+        class FakeInstalledSileroModule:
+            @staticmethod
+            def load_silero_vad() -> EnergyThresholdVadStub:
+                return EnergyThresholdVadStub()
+
+        fake_silero_mod = FakeInstalledSileroModule()
+        monkeypatch.setattr(
+            importlib_metadata,
+            "version",
+            lambda dist_name: "6.2.1" if dist_name == "silero-vad" else real_meta_version(dist_name),
+        )
+        monkeypatch.setattr(
+            vad_mod.importlib,
+            "import_module",
+            lambda mod_name, pkg=None: fake_silero_mod if mod_name == "silero_vad" else real_import_mod(mod_name, pkg),
+        )
+
+        # Reject strict generation when a custom vad_model_factory is injected, even if silero-vad==6.2.1 is installed!
+        with pytest.raises(ValueError, match="not permitted with --strict-reference-vad-version"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=out_dir,
+                    phase="generate",
+                    addressing="explicit",
+                    max_scenarios=1,
+                    base_url=f"http://127.0.0.1:{port}",
+                    warmup_sessions=0,
+                    strict_reference_vad_version=True,
+                ),
+                vad_model_factory=EnergyThresholdVadStub,
+            )
+        assert not (out_dir / "run.json").exists()
+
+        # Retry default generation (no vad_model_factory!) on the same out_dir — must succeed cleanly!
+        gen_summary = await run_duplex_mpe_evaluation(
+            DuplexMpeEvalConfig(
+                dataset_root=dataset_root,
+                output_dir=out_dir,
+                phase="generate",
+                addressing="explicit",
+                max_scenarios=1,
+                base_url=f"http://127.0.0.1:{port}",
+                warmup_sessions=0,
+                strict_reference_vad_version=True,
+            )
+        )
+    assert gen_summary["status"] == "complete"
+    saved_manifest = json.loads((out_dir / "run.json").read_text(encoding="utf-8"))
+    assert saved_manifest["generation_environment"] == gen_snapshot
+
+    # Now switch to a completely different CPU scoring host (`score_snapshot`) and run `--phase score`!
+    monkeypatch.setattr(eval_mod, "collect_runtime_environment_snapshot", lambda: score_snapshot)
+    score_summary = await run_duplex_mpe_evaluation(
+        DuplexMpeEvalConfig(
+            dataset_root=dataset_root,
+            output_dir=out_dir,
+            phase="score",
+            addressing="explicit",
+            max_scenarios=1,
+        )
+    )
+    prov = score_summary["provenance"]
+    assert isinstance(prov, dict)
+    assert prov["environment_source"] == "saved_generation_manifest"
+    # Top-level provenance preserves the generation host/GPU/commit rather than overwriting with the score host!
+    assert prov["repository"] == gen_snapshot["repository"]
+    assert prov["gpu"] == gen_snapshot["gpu"]
+    assert prov["packages"] == gen_snapshot["packages"]
+    assert prov["generation_environment"] == gen_snapshot
+    assert prov["scoring_environment"] == score_snapshot
+
+
+async def test_custom_vad_factory_isolation_resume_guards_and_partial_unknown_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib.metadata as importlib_metadata
+
+    import benchmarks.duplex_mpe.evaluate as eval_mod
+    import benchmarks.duplex_mpe.vad as vad_mod
+
+    dataset_root = create_synthetic_duplex_mpe_dataset(tmp_path / "dataset")
+    real_meta_version = importlib_metadata.version
+    monkeypatch.setattr(
+        importlib_metadata,
+        "version",
+        lambda dist_name: "6.2.1" if dist_name == "silero-vad" else real_meta_version(dist_name),
+    )
+
+    class FakeInstalledSileroModule:
+        @staticmethod
+        def load_silero_vad() -> EnergyThresholdVadStub:
+            return EnergyThresholdVadStub()
+
+    fake_silero_mod = FakeInstalledSileroModule()
+    real_import_mod = vad_mod.importlib.import_module
+    monkeypatch.setattr(
+        vad_mod.importlib,
+        "import_module",
+        lambda mod_name, pkg=None: fake_silero_mod if mod_name == "silero_vad" else real_import_mod(mod_name, pkg),
+    )
+
+    # 1. Per-session stateful VAD factory creates distinct instances across concurrent scenarios!
+    created_instances: list[object] = []
+
+    class StatefulIsolatedVadStub:
+        def __init__(self) -> None:
+            self.resets: int = 0
+            self.frames_seen: int = 0
+            created_instances.append(self)
+
+        def reset_states(self) -> None:
+            self.resets += 1
+            self.frames_seen = 0
+
+        def __call__(self, audio_tensor: torch.Tensor, sample_rate_hz: int) -> torch.Tensor:
+            del audio_tensor, sample_rate_hz
+            self.frames_seen += 1
+            return torch.tensor([[0.05]], dtype=torch.float32)
+
+    async def handle_ws(websocket: websockets.ServerConnection) -> None:
+        _ = json.loads(await websocket.recv())
+        session_obj: dict[str, JsonValue] = {
+            "id": "iso-01",
+            "model": "nvidia/personaplex-7b-v1",
+            "turn_detection": None,
+            "capabilities": {
+                "implementation_level": "model_native_duplex",
+                "supports_model_native_turn_policy": True,
+                "supports_barge_in": False,
+                "supports_playback_ack": False,
+                "supports_audio_truncate": False,
+                "supports_client_commit": False,
+                "chunk_period_ms": 80,
+            },
+        }
+        await websocket.send(json.dumps({"type": "session.created", "session": session_obj}))
+        await websocket.send(json.dumps({"type": "session.updated", "session": session_obj}))
+        async for raw_frame in websocket:
+            msg = json.loads(raw_frame)
+            if msg.get("type") == "session.close":
+                await websocket.send(json.dumps({"type": "session.closed", "session_id": "iso-01"}))
+                return
+
+    real_run_scenario = eval_mod.run_realtime_scenario
+
+    async def fast_run_scenario(
+        scen: eval_mod.DuplexMpeScenarioRecord,
+        *,
+        dataset_root: Path,
+        endpoint_spec: eval_mod.RealtimeEndpointSpec,
+        output_audio_path: Path,
+        vad_model: SileroVadModel | None = None,
+        session_timeout_seconds: float,
+        seed_mapping: dict[str, int],
+    ) -> dict[str, JsonValue]:
+        return await real_run_scenario(
+            scen,
+            dataset_root=dataset_root,
+            endpoint_spec=endpoint_spec,
+            output_audio_path=output_audio_path,
+            vad_model=vad_model,
+            session_timeout_seconds=session_timeout_seconds,
+            seed_mapping=seed_mapping,
+            realtime_pacing=False,
+        )
+
+    monkeypatch.setattr(eval_mod, "run_realtime_scenario", fast_run_scenario)
+
+    inj_dir = tmp_path / "injected_partial_out"
+    async with websockets.serve(handle_ws, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        await run_duplex_mpe_evaluation(
+            DuplexMpeEvalConfig(
+                dataset_root=dataset_root,
+                output_dir=inj_dir,
+                phase="generate",
+                addressing="explicit",
+                max_scenarios=2,
+                max_concurrency=2,
+                base_url=f"http://127.0.0.1:{port}",
+                warmup_sessions=1,
+            ),
+            vad_model_factory=StatefulIsolatedVadStub,
+        )
+        # 1 warmup + 2 concurrent measured scenarios -> 3 independent instances!
+        assert len(created_instances) == 3
+        assert len({id(inst) for inst in created_instances}) == 3
+
+        # 2. Resuming an injected-VAD output directory (either with default VAD or another factory) MUST be rejected,
+        # AND a no-op strict resume over custom-VAD reports must ALSO fail!
+        with pytest.raises(ValueError, match="Run configuration"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=inj_dir,
+                    phase="generate",
+                    addressing="explicit",
+                    max_scenarios=2,
+                    max_concurrency=2,
+                    base_url=f"http://127.0.0.1:{port}",
+                    warmup_sessions=1,
+                )
+            )
+        with pytest.raises(ValueError, match="Run configuration"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=inj_dir,
+                    phase="generate",
+                    addressing="explicit",
+                    max_scenarios=2,
+                    max_concurrency=2,
+                    base_url=f"http://127.0.0.1:{port}",
+                    warmup_sessions=1,
+                ),
+                vad_model_factory=StatefulIsolatedVadStub,
+            )
+
+        # 3. Partial resume when initial run.json lacks generation_environment MUST keep generation_environment=None
+        # and record the resume snapshot in generation_environment_history!
+        partial_dir = tmp_path / "partial_no_init_env"
+        await run_duplex_mpe_evaluation(
+            DuplexMpeEvalConfig(
+                dataset_root=dataset_root,
+                output_dir=partial_dir,
+                phase="generate",
+                addressing="explicit",
+                max_scenarios=1,
+                base_url=f"http://127.0.0.1:{port}",
+                warmup_sessions=0,
+            )
+        )
+        # Strip generation_environment from saved run.json (simulating a pre-provenance partial checkpoint)
+        # and expand max_scenarios=1 -> missing scenario #2 via a compatible 2-scenario manifest!
+        # Specifically, delete scenario #2 from a 2-scenario run while stripping generation_environment:
+        two_dir = tmp_path / "two_partial_no_env"
+        await run_duplex_mpe_evaluation(
+            DuplexMpeEvalConfig(
+                dataset_root=dataset_root,
+                output_dir=two_dir,
+                phase="generate",
+                addressing="explicit",
+                max_scenarios=2,
+                base_url=f"http://127.0.0.1:{port}",
+                warmup_sessions=0,
+            )
+        )
+        saved_two_manifest = json.loads((two_dir / "run.json").read_text(encoding="utf-8"))
+        saved_two_manifest.pop("generation_environment", None)
+        saved_two_manifest.pop("generation_environment_history", None)
+        write_json_atomic(two_dir / "run.json", saved_two_manifest)
+
+        saved_two_reports = json.loads((two_dir / "report.json").read_text(encoding="utf-8"))
+        second_sid = sorted(saved_two_reports.keys())[1]
+        del saved_two_reports[second_sid]
+        write_json_atomic(two_dir / "report.json", saved_two_reports)
+
+        resume_env_snapshot: dict[str, JsonValue] = {
+            "repository": {"commit": "333333333333", "branch": "resume-branch", "dirty": False},
+            "host": {
+                "platform": "Linux-resume-host",
+                "cpu_model": "ResumeCPU",
+                "logical_cpus": 64,
+                "memory_total_kib": "2048",
+            },
+            "gpu": {
+                "nvidia_smi_csv": None,
+                "cuda_visible_devices": None,
+                "torch_cuda_build": None,
+                "cudnn_version": None,
+            },
+            "packages": {"torch": "2.14.0", "vllm": "0.34.0", "silero-vad": "6.2.1"},
+            "dependency_inventory": {"vllm": "0.34.0"},
+            "dependency_freeze_sha256": "feedface" * 8,
+        }
+        monkeypatch.setattr(eval_mod, "collect_runtime_environment_snapshot", lambda: resume_env_snapshot)
+
+        await run_duplex_mpe_evaluation(
+            DuplexMpeEvalConfig(
+                dataset_root=dataset_root,
+                output_dir=two_dir,
+                phase="generate",
+                addressing="explicit",
+                max_scenarios=2,
+                base_url=f"http://127.0.0.1:{port}",
+                warmup_sessions=0,
+            )
+        )
+        resumed_manifest = json.loads((two_dir / "run.json").read_text(encoding="utf-8"))
+        assert resumed_manifest["generation_environment"] is None
+        assert resumed_manifest["generation_environment_history"] == [resume_env_snapshot]
+
+        scored_partial = await run_duplex_mpe_evaluation(
+            DuplexMpeEvalConfig(
+                dataset_root=dataset_root,
+                output_dir=two_dir,
+                phase="score",
+                addressing="explicit",
+                max_scenarios=2,
+            )
+        )
+        partial_prov = scored_partial["provenance"]
+        assert isinstance(partial_prov, dict)
+        assert partial_prov["generation_environment"] is None
+        assert partial_prov["environment_source"] == "partial_resume_without_initial_environment"
+        assert partial_prov["generation_environment_history"] == [resume_env_snapshot]
+
+        # 4. Importable silero_vad module WITHOUT distribution metadata (`silero_package_version() == "uninstalled"`)
+        # MUST fail preflight BEFORE freezing `run.json` on default generation!
+        unpacked_dir = tmp_path / "unpacked_no_dist_meta"
+        monkeypatch.setattr(
+            importlib_metadata,
+            "version",
+            lambda dist_name: (_ for _ in ()).throw(importlib_metadata.PackageNotFoundError(dist_name))
+            if dist_name == "silero-vad"
+            else real_meta_version(dist_name),
+        )
+        with pytest.raises(ValueError, match="distribution metadata >= 5.1"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=unpacked_dir,
+                    phase="generate",
+                    addressing="explicit",
+                    max_scenarios=1,
+                    base_url=f"http://127.0.0.1:{port}",
+                    warmup_sessions=0,
+                )
+            )
+        assert not (unpacked_dir / "run.json").exists()
+        monkeypatch.setattr(
+            importlib_metadata,
+            "version",
+            lambda dist_name: "6.2.1" if dist_name == "silero-vad" else real_meta_version(dist_name),
+        )
+
+        # 5. Saved reports with `custom_vad_injected=True` MUST block no-op and partial generation resume
+        # EVEN IF `custom_vad_injected` was stripped from `run.json`!
+        stripped_flag_manifest = json.loads((inj_dir / "run.json").read_text(encoding="utf-8"))
+        stripped_flag_manifest.pop("custom_vad_injected", None)
+        write_json_atomic(inj_dir / "run.json", stripped_flag_manifest)
+        with pytest.raises(ValueError, match="custom-VAD report"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=inj_dir,
+                    phase="generate",
+                    addressing="explicit",
+                    max_scenarios=2,
+                    max_concurrency=2,
+                    base_url=f"http://127.0.0.1:{port}",
+                    warmup_sessions=1,
+                )
+            )
+        # Also delete 1 of the 2 custom-VAD reports to verify partial resume is equally blocked:
+        inj_reports = json.loads((inj_dir / "report.json").read_text(encoding="utf-8"))
+        del inj_reports[sorted(inj_reports.keys())[1]]
+        write_json_atomic(inj_dir / "report.json", inj_reports)
+        with pytest.raises(ValueError, match="custom-VAD report"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=inj_dir,
+                    phase="generate",
+                    addressing="explicit",
+                    max_scenarios=2,
+                    max_concurrency=2,
+                    base_url=f"http://127.0.0.1:{port}",
+                    warmup_sessions=1,
+                )
+            )
+
+        # 6. Contradictory `run.json` (`custom_vad_injected=True`) vs `report.json` (`custom_vad_injected` absent)
+        # MUST be rejected during offline `--phase score` (both strict and non-strict)!
+        contradictory_manifest = json.loads((two_dir / "run.json").read_text(encoding="utf-8"))
+        contradictory_manifest["custom_vad_injected"] = True
+        write_json_atomic(two_dir / "run.json", contradictory_manifest)
+        with pytest.raises(ValueError, match="not permitted with --strict-reference-vad-version"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=two_dir,
+                    phase="score",
+                    addressing="explicit",
+                    max_scenarios=2,
+                    strict_reference_vad_version=True,
+                )
+            )
+        with pytest.raises(ValueError, match="custom_vad_injected mismatch"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=two_dir,
+                    phase="score",
+                    addressing="explicit",
+                    max_scenarios=2,
+                )
+            )
+        # Restore valid custom_vad_injected=False so we can test silero_vad_version mismatch & no-op env validation:
+        contradictory_manifest["custom_vad_injected"] = False
+        write_json_atomic(two_dir / "run.json", contradictory_manifest)
+
+        # 7. Contradictory `run.json` (`silero_vad_version="5.1"`) vs `report.json` (`silero_vad_version="6.2.1"`)
+        # MUST be rejected in both strict and non-strict `--phase score`, AND contradictory report version MUST
+        # fail partial resume before generating additional reports!
+        version_mismatch_manifest = json.loads((two_dir / "run.json").read_text(encoding="utf-8"))
+        version_mismatch_manifest["silero_vad_version"] = "5.1"
+        write_json_atomic(two_dir / "run.json", version_mismatch_manifest)
+        with pytest.raises(ValueError, match="silero_vad_version"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=two_dir,
+                    phase="score",
+                    addressing="explicit",
+                    max_scenarios=2,
+                    strict_reference_vad_version=True,
+                )
+            )
+        with pytest.raises(ValueError, match="silero_vad_version mismatch"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=two_dir,
+                    phase="score",
+                    addressing="explicit",
+                    max_scenarios=2,
+                )
+            )
+        # Restore manifest silero_vad_version="6.2.1", corrupt saved report #1 to "5.1" and delete report #2 ->
+        # partial resume MUST reject the report/manifest version mismatch before generating!
+        version_mismatch_manifest["silero_vad_version"] = "6.2.1"
+        write_json_atomic(two_dir / "run.json", version_mismatch_manifest)
+        full_two_reports_text = (two_dir / "report.json").read_text(encoding="utf-8")
+        partial_version_reports = json.loads(full_two_reports_text)
+        first_sid, second_sid_again = sorted(partial_version_reports.keys())
+        del partial_version_reports[second_sid_again]
+        partial_version_reports[first_sid]["aed_config"]["silero_vad_version"] = "5.1"
+        write_json_atomic(two_dir / "report.json", partial_version_reports)
+        with pytest.raises(ValueError, match="silero_vad_version"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=two_dir,
+                    phase="generate",
+                    addressing="explicit",
+                    max_scenarios=2,
+                    base_url=f"http://127.0.0.1:{port}",
+                    warmup_sessions=0,
+                )
+            )
+        (two_dir / "report.json").write_text(full_two_reports_text, encoding="utf-8")
+
+        # 8. Strict offline scoring (`--strict-reference-vad-version --phase score`) of valid 6.2.1 reports
+        # MUST succeed even when `silero-vad` is NOT installed on the scoring host!
+        monkeypatch.setattr(
+            importlib_metadata,
+            "version",
+            lambda dist_name: (_ for _ in ()).throw(importlib_metadata.PackageNotFoundError(dist_name))
+            if dist_name == "silero-vad"
+            else real_meta_version(dist_name),
+        )
+        strict_offline_no_pkg = await run_duplex_mpe_evaluation(
+            DuplexMpeEvalConfig(
+                dataset_root=dataset_root,
+                output_dir=two_dir,
+                phase="score",
+                addressing="explicit",
+                max_scenarios=2,
+                strict_reference_vad_version=True,
+            )
+        )
+        assert strict_offline_no_pkg["status"] == "complete"
+        monkeypatch.setattr(
+            importlib_metadata,
+            "version",
+            lambda dist_name: "6.2.1" if dist_name == "silero-vad" else real_meta_version(dist_name),
+        )
+
+        # 9. Completed no-op `--phase generate` resume MUST still validate `generation_environment` and
+        # `generation_environment_history` in `run.json` rather than silently bypassing malformed snapshots!
+        bad_env_manifest = json.loads((two_dir / "run.json").read_text(encoding="utf-8"))
+        bad_env_manifest["generation_environment"] = 42
+        write_json_atomic(two_dir / "run.json", bad_env_manifest)
+        with pytest.raises(ValueError, match="Malformed generation_environment"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=two_dir,
+                    phase="generate",
+                    addressing="explicit",
+                    max_scenarios=2,
+                    base_url=f"http://127.0.0.1:{port}",
+                    warmup_sessions=0,
+                )
+            )
+        bad_env_manifest["generation_environment"] = None
+        bad_env_manifest["generation_environment_history"] = "not-a-list"
+        write_json_atomic(two_dir / "run.json", bad_env_manifest)
+        with pytest.raises(ValueError, match="Malformed generation_environment_history"):
+            await run_duplex_mpe_evaluation(
+                DuplexMpeEvalConfig(
+                    dataset_root=dataset_root,
+                    output_dir=two_dir,
+                    phase="generate",
+                    addressing="explicit",
+                    max_scenarios=2,
+                    base_url=f"http://127.0.0.1:{port}",
+                    warmup_sessions=0,
+                )
+            )
