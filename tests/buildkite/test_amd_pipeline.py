@@ -4816,6 +4816,11 @@ def test_voxtral_tts_nightly_splits_c1_latency_from_throughput_and_stress() -> N
     assert res["rocm"] == "MI325"
     assert res["cuda"] == ["H100", "B200"]
     assert voxtral["mark"][0]["hardware_marks"]["num_cards"] == 1
+    phases = {phase["eval_phase"]: phase for phase in voxtral["benchmark_params"]}
+    assert set(phases) == {"latency", "throughput", "stress"}
+    assert "ready_check_timeout_sec" not in phases["latency"]
+    assert phases["throughput"]["ready_check_timeout_sec"] == 600
+    assert phases["stress"]["ready_check_timeout_sec"] == 600
     for case in config:
         for phase in case["benchmark_params"]:
             baseline = phase.get("baseline")
