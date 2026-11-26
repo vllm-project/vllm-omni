@@ -103,6 +103,12 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
     generated_tokens: list[int] = field(default_factory=list)
+    # Sage-Interaction protocol switches (default False so stock MiniCPM-o 4.5 is unchanged).
+    wrap_unit_audio_markers: bool = False
+    allow_speech_interruption: bool = False
+    max_speak_tokens_per_chunk: int | None = None
+    max_delegate_query_tokens: int | None = None
+    in_delegate_unit: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +137,9 @@ class MiniCPMO45Stage0DuplexRuntime:
     chunk_tts_eos_token_id: int = -1
     turn_eos_token_id: int = -1
     audio_placeholder_token_id: int = -1
+    audio_start_token_id: int = -1
+    audio_end_token_id: int = -1
+    delegate_token_id: int = -1
     image_start_token_id: int = -1
     image_end_token_id: int = -1
 
@@ -269,6 +278,18 @@ class MiniCPMO45Stage0DuplexRuntime:
                 )
         return processor
 
+    @staticmethod
+    def _sync_session_runtime_config(
+        state: _MiniCPMO45Stage0SessionState,
+        runtime_config: dict[str, object],
+    ) -> None:
+        if "duplex_max_speak_tokens_per_chunk" in runtime_config:
+            speak_cap = _optional_int(runtime_config.get("duplex_max_speak_tokens_per_chunk"))
+            state.max_speak_tokens_per_chunk = speak_cap if speak_cap is not None and speak_cap > 0 else None
+        if "duplex_max_delegate_query_tokens" in runtime_config:
+            delegate_cap = _optional_int(runtime_config.get("duplex_max_delegate_query_tokens"))
+            state.max_delegate_query_tokens = delegate_cap if delegate_cap is not None and delegate_cap > 0 else None
+
     def _prepare_session_context(
         self,
         state: _MiniCPMO45Stage0SessionState,
@@ -281,6 +302,10 @@ class MiniCPMO45Stage0DuplexRuntime:
             "basic",
             "context",
         }
+        rt = runtime_config or {}
+        state.wrap_unit_audio_markers = bool(rt.get("duplex_wrap_unit_audio_markers", False))
+        state.allow_speech_interruption = bool(rt.get("duplex_allow_speech_interruption", False))
+        self._sync_session_runtime_config(state, rt)
         if not self._stage_runtime_ready():
             return
         self._require_special_token_ids()
@@ -291,8 +316,11 @@ class MiniCPMO45Stage0DuplexRuntime:
         # template is shared with the serving adapter so the first-append
         # scheduler reserve can count these tokens exactly.
         initial_user_text = (runtime_config or {}).get("initial_user_text")
+        effective_instructions = (runtime_config or {}).get("instructions")
+        if not (isinstance(effective_instructions, str) and effective_instructions):
+            effective_instructions = session_config.get("instructions")
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
-            session_config.get("instructions"),
+            effective_instructions,
             ref_audio is not None,
             initial_user_text,
         )
@@ -477,6 +505,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         force_listen: bool = False,
         stage0_window: dict[str, object] | None = None,
         text_token_ids: list[int] | None = None,
+        prepend_text_token_ids: list[int] | None = None,
     ) -> _PrefillSteps:
         """Build scheduler-owned Stage0 input embeddings for one input unit.
 
@@ -630,6 +659,10 @@ class MiniCPMO45Stage0DuplexRuntime:
                     state.pending_window_unit.token_ids.extend(closure_token_ids)
             unit_embed_start = len(embed_parts)
             unit_token_start = len(token_ids)
+            if units_built == 0 and prepend_text_token_ids:
+                for prepend_token_id in prepend_text_token_ids:
+                    embed_parts.append(self._embed_token(prepend_token_id))
+                    token_ids.append(int(prepend_token_id))
             embed_parts.append(self._embed_token(self.unit_token_id))
             token_ids.append(self.unit_token_id)
             if frame_blocks:
@@ -650,10 +683,22 @@ class MiniCPMO45Stage0DuplexRuntime:
                         token_ids.append(int(end_id))
                 frame_blocks = []
             if audio_embeds is not None:
-                embed_parts.append(audio_embeds)
-                token_ids.extend(
-                    [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
-                )
+                if state.wrap_unit_audio_markers:
+                    audio_start_id = self._required_optional_token_id("audio_start_token_id")
+                    audio_end_id = self._required_optional_token_id("audio_end_token_id")
+                    embed_parts.append(self._embed_token(audio_start_id))
+                    token_ids.append(int(audio_start_id))
+                    embed_parts.append(audio_embeds)
+                    token_ids.extend(
+                        [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
+                    )
+                    embed_parts.append(self._embed_token(audio_end_id))
+                    token_ids.append(int(audio_end_id))
+                else:
+                    embed_parts.append(audio_embeds)
+                    token_ids.extend(
+                        [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
+                    )
             if input_text_token_ids and units_built == 0:
                 # Match native streaming_prefill(text_list=...): raw text after
                 # this unit's media, without a new chat template or audio clock.
@@ -722,7 +767,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         # Standalone VISION input can open a response without speech. Camera
         # frames accompanying silent audio must retain the OMNI speech gate:
         # otherwise every frame can re-open a completed conversation turn.
-        if (is_speech or has_text or (vision_only and num_frames)) and (
+        if (is_speech or has_text or (vision_only and num_frames) or bool(prepend_text_token_ids)) and (
             append_identity is None or state.pending_speech_append_identity != append_identity
         ):
             state.pending_speech_context = True
@@ -1320,6 +1365,9 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "chunk_eos_token_id": self.chunk_eos_token_id,
                 "chunk_tts_eos_token_id": self.chunk_tts_eos_token_id,
                 "turn_eos_token_id": self.turn_eos_token_id,
+                "audio_start_token_id": self.audio_start_token_id,
+                "audio_end_token_id": self.audio_end_token_id,
+                "delegate_token_id": self.delegate_token_id,
                 "delegate_open_token_id": getattr(self, "delegate_open_token_id", -1),
                 "delegate_close_token_id": getattr(self, "delegate_close_token_id", -1),
             }.items()

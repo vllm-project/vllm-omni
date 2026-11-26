@@ -148,6 +148,7 @@ th {
 | `VoxtralTTSForConditionalGeneration` | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✅︎ | ✅︎ | | | — |
 | `CovoAudioForConditionalGeneration` | Covo-Audio-Chat | `tencent/Covo-Audio-Chat` | ✅︎ | | | ✅︎ | — |
 | `MiniCPMO45OmniForConditionalGeneration` | MiniCPM-o 4.5 | `openbmb/MiniCPM-o-4_5` | ✅︎ | | ✅︎ | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/OpenBMB/MiniCPM-o-4_5.md) |
+| `MiniCPMO45OmniForConditionalGeneration` | Sage-Interaction (full duplex with native `<\|delegate\|>` over `/v1/realtime?duplex=1`) | `internlm/Sage-Interaction` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/InternLM/Sage-Interaction.md) |
 | `RealtimeVenusOmni` (MiniCPM-o 4.5 pipeline) | Realtime-Venus Omni | `inclusionAI/Realtime-Venus` (Omni subdirectory) | ✅︎ | | | | [Recipe](gh-file:recipes/inclusionAI/Realtime-Venus.md) |
 | `PersonaPlexTalkerForConditionalGeneration` | PersonaPlex (full duplex, 24 kHz speech in/out over `/v1/realtime?duplex=1`) | `nvidia/personaplex-7b-v1` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/PersonaPlex.md) |
 | `HaruForConditionalGeneration` | Haru-4B (full duplex, 24 kHz speech in/out over `/v1/realtime?duplex=1`) | `higurashi-ai/Haru-4B` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/higurashi-ai/Haru-4B-H200.md) |

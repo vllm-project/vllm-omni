@@ -744,6 +744,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     def _minicpmo45_duplex_session_state(self, helper, session_id: str, duplex: dict[str, Any]):
         """The Stage-0 state of ``session_id``, created with its session context on first use."""
         state = helper.sessions.get(session_id)
+        runtime_config = duplex.get("runtime_config")
+        runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
         if state is None:
             from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
                 _MiniCPMO45Stage0SessionState,
@@ -753,8 +755,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             helper.sessions[session_id] = state
             session_config = duplex.get("session_config")
             session_config = dict(session_config) if isinstance(session_config, dict) else {}
-            runtime_config = duplex.get("runtime_config")
-            runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
             if hasattr(helper.thinker, "audio_past_key_values"):
                 helper.thinker.audio_past_key_values = None
             helper._configure_streaming_processor(state)
@@ -762,6 +762,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             replay = duplex.get(REPLAY_CONTEXT_KEY)
             if replay:
                 helper.restore_completed_turns(state, replay, duplex["duplex_replay_token_budget"])
+        elif runtime_config and hasattr(helper, "_sync_session_runtime_config"):
+            helper._sync_session_runtime_config(state, runtime_config)
         return state
 
     @staticmethod
@@ -772,6 +774,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         window = duplex.get("stage0_window")
         runtime_config = duplex.get("runtime_config")
         text_token_ids = runtime_config.get(APPEND_TEXT_TOKEN_IDS_KEY) if isinstance(runtime_config, dict) else None
+        raw_prepend = payload.get("prepend_text_token_ids")
+        prepend_ids = (
+            [int(token_id) for token_id in raw_prepend if isinstance(token_id, int)]
+            if isinstance(raw_prepend, list) and raw_prepend
+            else None
+        )
         return {
             "epoch": _optional_int(duplex.get("epoch")),
             "seq": _optional_int(duplex.get("seq")),
@@ -780,6 +788,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             "force_listen": payload.get("force_listen") is True,
             "stage0_window": window if isinstance(window, dict) else None,
             "text_token_ids": text_token_ids if isinstance(text_token_ids, list) else None,
+            "prepend_text_token_ids": prepend_ids,
         }
 
     def _duplex_data_plane_helper(self):
@@ -1260,8 +1269,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         limit = self._minicpmo45_policy_limit(
             "max_new_speak_tokens_per_chunk", MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK
         )
+        delegate_id = token_ids.get("delegate_token_id", -1)
         request_max = {row_idx: self._minicpmo45_duplex_row_request_max_tokens(row_idx) for row_idx in row_idxs}
-        row_limit = {row: limit if request is None else min(limit, request) for row, request in request_max.items()}
+        in_delegate: dict[int, bool] = {}
+        row_limit: dict[int, int] = {}
+        for row, request in request_max.items():
+            state = self._minicpmo45_duplex_state_for_row(row)
+            is_delegate = delegate_id >= 0 and (
+                delegate_id in recent[row] or bool(getattr(state, "in_delegate_unit", False))
+            )
+            in_delegate[row] = is_delegate
+            if is_delegate:
+                delegate_cap = getattr(state, "max_delegate_query_tokens", None)
+                effective = delegate_cap if isinstance(delegate_cap, int) and delegate_cap > 0 else (request or 256)
+                row_limit[row] = effective if request is None else min(effective, request)
+            else:
+                speak_cap = getattr(state, "max_speak_tokens_per_chunk", None)
+                effective = speak_cap if isinstance(speak_cap, int) and speak_cap > 0 else limit
+                row_limit[row] = effective if request is None else min(effective, request)
         capped = {row for row, row_cap in row_limit.items() if len(recent[row]) >= max(1, row_cap - 1)}
         max_chars = self._minicpmo45_policy_limit(
             "max_speak_chars_per_chunk", MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK
@@ -1271,7 +1296,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return capped
         for row in row_idxs:
             payload = self._minicpmo45_duplex_payload_for_row(row)
-            if row in capped or isinstance(payload, dict) and payload.get("force_listen") is True:
+            if (
+                row in capped
+                or in_delegate.get(row)
+                or (isinstance(payload, dict) and payload.get("force_listen") is True)
+            ):
                 continue
             chunk = self._minicpmo45_current_chunk_tokens(recent[row], token_ids)
             try:
@@ -1668,7 +1697,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 and getattr(state, "pending_speech_response_open", False)
             )
             and (
-                not getattr(state, "current_turn_ended", True)
+                (
+                    not getattr(state, "current_turn_ended", True)
+                    and not getattr(state, "allow_speech_interruption", False)
+                )
                 or (
                     getattr(state, "pending_speech_context", False)
                     and (
@@ -1720,23 +1752,42 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         listen_id = token_ids.get("listen_token_id", -1)
         tts_bos_id = token_ids.get("tts_bos_token_id", -1)
         turn_eos_id = token_ids.get("turn_eos_token_id", -1)
+        delegate_id = token_ids.get("delegate_token_id", -1)
         if not force_listen and getattr(state, "idle_reply_due", False):
             logger.info("MiniCPM-o duplex post-idle reply decision session=%s token=%d", state.session_id, sampled)
             state.idle_reply_due = False
         if sampled in self._minicpmo45_chunk_terminator_token_ids(token_ids):
             state.pending_terminator_token = int(sampled)
             state.last_terminator_token = int(sampled)
+            with suppress(Exception):
+                state.in_delegate_unit = False
             opening_explicit_response = (
                 isinstance(payload, dict)
                 and payload.get("open_assistant_turn") is True
                 and getattr(state, "pending_speech_response_open", False)
             )
-            if sampled == listen_id and (force_listen or opening_explicit_response):
+            if sampled == listen_id and (
+                force_listen or opening_explicit_response or getattr(state, "allow_speech_interruption", False)
+            ):
                 state.current_turn_ended = True
                 with suppress(Exception):
                     state.pending_speech_response_open = False
             return
         state.speech_after_idle = False
+        if delegate_id >= 0 and sampled == delegate_id:
+            with suppress(Exception):
+                state.in_delegate_unit = True
+                state.pending_speech_response_open = False
+                state.pending_speech_context = False
+            state.pending_terminator_token = None
+            state.last_terminator_token = None
+            state.current_turn_ended = True
+            return
+        if getattr(state, "in_delegate_unit", False):
+            state.pending_terminator_token = None
+            state.last_terminator_token = None
+            state.current_turn_ended = True
+            return
         if sampled == turn_eos_id:
             # Official streaming_generate feeds <|turn_eos|> like text (its
             # hidden state conditions the Talker) and keeps sampling until a
