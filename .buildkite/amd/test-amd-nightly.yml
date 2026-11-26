@@ -142,6 +142,48 @@ steps:
             tests/e2e/online_serving/test_minicpmo_4_5_expansion.py
             tests/e2e/online_serving/test_joyai_vl_interaction.py
 
+  # MI300 owners for CUDA NIGHTLY "Diffusion · Quantization Test with H100 ·
+  # Single-GPU" and "with L4" (one job: same pool, same selector minus the
+  # NVIDIA-only FlashInfer/CuTe DSL backends), and for "Diffusion X2V · Wan2.2
+  # Autoround Function Test". Non-blocking until burn-in.
+  - group: ":full_moon: Diffusion Quantization MI300 Nightly"
+    steps:
+      - label: "Diffusion · Quantization · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: diffusion_quantization
+        env:
+          ROCM_E2E_TIMEOUT_MINUTES: "165"
+        artifact_paths:
+          - artifacts/rocm-diffusion-quantization/**/*
+        commands:
+          - pip install "vllm-gguf-plugin==0.0.4"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/diffusion/quantization 22 diffusion rocm-diffusion-quantization
+
+      # GPTQ-packed W4A16 weights, as in the weekly Qwen-Image AutoRound job.
+      - label: "Diffusion X2V · Wan2.2 AutoRound · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        source_file_dependencies: diffusion_wan22_function
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+          ROCM_E2E_TIMEOUT_MINUTES: "105"
+        artifact_paths:
+          - artifacts/rocm-wan22-autoround/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_wan22_autoround_w4a16_expansion.py 8 diffusion rocm-wan22-autoround
+
   # MI325 is the repository's legacy ROCm pytest marker. The AMD template maps
   # agent_pool to the current MI300 Buildkite queues independently of that mark.
   - group: ":full_moon: Qwen3-Omni MI300 Nightly"

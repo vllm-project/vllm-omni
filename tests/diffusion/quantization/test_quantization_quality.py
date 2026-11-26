@@ -191,7 +191,8 @@ QUALITY_CONFIGS = [
         quantization={"text_encoder": "fp8", "transformer": None, "vae": None},
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
-        max_lpips={"H100": 0.15, "B200": 0.17},
+        # gfx942 uses the strictest existing budget until MI300 runs calibrate it.
+        max_lpips={"H100": 0.15, "B200": 0.17, "gfx942": 0.15},
         num_inference_steps=10,
         enable_cpu_offload=True,
         height=1024,
@@ -554,7 +555,7 @@ def test_ltx_quality_gate_uses_official_eager_defaults(monkeypatch):
     assert captured.sampling.guidance_scale is None
 
 
-_marks = hardware_marks(res={"cuda": ["H100", "B200"]})
+_marks = hardware_marks(res={"cuda": ["H100", "B200"], "rocm": "MI325"})
 _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUALITY_OUTPUT_DIR" in os.environ else None
 
 
@@ -563,6 +564,8 @@ def _quality_param(c: QualityTestConfig):
     if c.id == "fp8_sensenova_u1":
         marks = hardware_marks(res={"cuda": "H200"})
     if c.id == "fp8_qwen_image":
+        # Disabled everywhere; keep it out of the ROCm selection rather than skipped there.
+        marks = list(hardware_marks(res={"cuda": ["H100", "B200"]}))
         marks.append(
             pytest.mark.skip(reason="Qwen-Image FP8 quality gate temporarily disabled (see CI / issue tracker).")
         )

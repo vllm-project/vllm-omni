@@ -21,7 +21,7 @@ from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config, 
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.models.cosmos3.mixed_precision import (
     Cosmos3MixedPrecisionConfig,
@@ -36,11 +36,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import
 )
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [
-    pytest.mark.full_model,
-    pytest.mark.diffusion,
-    *hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=1),
-]
+pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 NUM_EXPERTS, HIDDEN, INTERMEDIATE, TOP_K, NUM_TOKENS = 8, 256, 128, 2, 32
 # BF16 rounding of the intermediate and the output; the inputs keep outputs O(1).
@@ -111,7 +107,15 @@ def _load_fp8_routed_experts(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a CUDA GPU")
-@pytest.mark.parametrize("backend", ["triton", "flashinfer_cutlass", "triton_lora"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param("triton", marks=hardware_marks(res={"cuda": ["H100", "B200"], "rocm": "MI325"})),
+        # FlashInfer CUTLASS fused MoE is NVIDIA-only.
+        pytest.param("flashinfer_cutlass", marks=hardware_marks(res={"cuda": ["H100", "B200"]})),
+        pytest.param("triton_lora", marks=hardware_marks(res={"cuda": ["H100", "B200"], "rocm": "MI325"})),
+    ],
+)
 def test_modelopt_fp8_moe_maps(moe_env, backend: str) -> None:
     if torch.cuda.get_device_capability(0) < (8, 9):
         pytest.skip("Requires native FP8 support")
@@ -209,6 +213,7 @@ def _hunyuan_file(filename: str) -> str:
     return str(local) if local.is_file() else hf_hub_download(HUNYUAN_FP8, filename)
 
 
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"})
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a CUDA GPU")
 def test_hunyuan_image3_fp8_moe_maps(moe_env) -> None:
     """Real public FP8 MoE weights, with the shared expert inside the MoE runner."""

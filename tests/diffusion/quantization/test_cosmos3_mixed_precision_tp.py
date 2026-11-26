@@ -369,10 +369,10 @@ def _run_parallel(
             backend,
             *case.values,
             id=f"{precision}-{backend or 'native'}-{case.id}",
-            marks=hardware_marks(
-                res={"cuda": "B200" if backend == "flashinfer_cutedsl" else ["H100", "B200"]},
-                num_cards=prod(case.values[0]),
-            ),
+            # FlashInfer CuTe DSL is NVIDIA-only; FP8 and NVFP4 emulation also run on MI300.
+            marks=hardware_marks(res={"cuda": "B200"}, num_cards=prod(case.values[0]))
+            if backend == "flashinfer_cutedsl"
+            else hardware_marks(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=prod(case.values[0])),
         )
         for precision, backend in (("fp8", None), ("nvfp4", "emulation"), ("nvfp4", "flashinfer_cutedsl"))
         for case in TOPOLOGIES

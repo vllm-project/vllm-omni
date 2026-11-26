@@ -205,10 +205,10 @@ def _run_hsdp(rank, world_size, init_method, fmt, backend, parallel):
             parallel,
             world_size,
             id=f"{fmt}-{backend}-{parallel}-{world_size}",
-            marks=hardware_marks(
-                res={"cuda": "B200" if backend == "flashinfer_cutedsl" else ["H100", "B200"]},
-                num_cards=world_size,
-            ),
+            # FlashInfer CuTe DSL is NVIDIA-only; FP8 and NVFP4 emulation also run on MI300.
+            marks=hardware_marks(res={"cuda": "B200"}, num_cards=world_size)
+            if backend == "flashinfer_cutedsl"
+            else hardware_marks(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=world_size),
         )
         for fmt, backend in (("FP8", "auto"), ("NVFP4", "emulation"), ("NVFP4", "flashinfer_cutedsl"))
         for parallel, world_size in (
