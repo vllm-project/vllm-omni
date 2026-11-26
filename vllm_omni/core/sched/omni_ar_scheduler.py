@@ -190,7 +190,7 @@ def _slice_sampled_logprobs(logprobs: Any, req_index: int, sampled_token_ids: li
 class _SeededIsolationStep:
     """Queue surgery applied for one scheduling step of the seeded policy."""
 
-    limit: int | None
+    limit: int
     deferred: bool
     drain: bool
     solo: bool
@@ -1116,7 +1116,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         solo_queue = None
         solo_group = 1
         drain_kv = False
-        unit_origins: list[tuple[object, str]] = []
+        unit_origins: list[tuple[Request, str]] = []
         if seeded_solo:
             # Upstream drains KV-holding requests first: their blocks are already
             # allocated, so they can finish and release memory for the requests
@@ -1152,7 +1152,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     # A CFG unit can straddle the two queues: the companion may
                     # already hold KV blocks while the seeded branch still waits.
                     # Gather both members so the unit is admitted together.
-                    for member in unit:
+                    for item in unit:
+                        member = cast(Request, item)
                         origin = next(
                             (
                                 name
@@ -1198,12 +1199,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # the cap: the queue is pre-built by `OmniCFGARScheduler` and a
                 # cap wide enough for a pair would otherwise admit an unrelated
                 # request that sits between its branches (#9937).
+                restricted = create_request_queue(self.policy)
                 for member, origin in unit_origins:
                     origin_queue = self.waiting if origin == "waiting" else self.kv_holding_waiting
                     origin_queue.remove_requests([member])
-                restricted = create_request_queue(self.policy)
-                for request in unit:
-                    restricted.add_request(request)
+                    restricted.add_request(member)
                 if solo_queue == "waiting":
                     self.waiting = restricted
                     self.kv_holding_waiting = create_request_queue(self.policy)

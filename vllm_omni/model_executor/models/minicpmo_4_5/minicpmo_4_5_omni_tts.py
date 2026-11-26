@@ -1800,27 +1800,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # The repetition-penalty window is carried through the state
                 # and ``codes`` above, so only the counters and the cached
                 # input tensors reset.
-                self._reset_host_codec_segment(
-                    request_id, new_turn=isinstance(meta, Mapping) and bool(meta.get("turn_start"))
-                )
+                if isinstance(condition_seq, int) and not isinstance(condition_seq, bool):
+                    self._reset_host_codec_segment(request_id, condition_seq, new_turn=bool(meta.get("turn_start")))
                 codec_states = getattr(self, "_request_codec_device_states", None)
                 if isinstance(codec_states, dict):
                     codec_states.pop(request_id, None)
                 codec_inputs = getattr(self, "_request_codec_device_inputs", None)
                 if isinstance(codec_inputs, dict):
                     codec_inputs.pop(request_id, None)
-                host_states = getattr(self, "_request_host_codec_states", None)
-                host_state = host_states.get(request_id) if isinstance(host_states, dict) else None
-                if (
-                    host_state is not None
-                    and isinstance(condition_seq, int)
-                    and not isinstance(condition_seq, bool)
-                    and host_state.get("condition_seq") != condition_seq
-                ):
-                    # Finishing one segment must not stop the next; retries of
-                    # the same segment must preserve its finished state.
-                    host_state["finished"] = False
-                    host_state["condition_seq"] = condition_seq
             empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
             return (
                 input_ids,
@@ -3839,16 +3826,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 bins[sampled_id] = bins.get(sampled_id, 0) + 1
         return sampled_id, finished, emit
 
-    def _reset_host_codec_segment(self, request_id: str, *, new_turn: bool) -> None:
+    def _reset_host_codec_segment(self, request_id: str, condition_seq: int, *, new_turn: bool) -> None:
         host_states = getattr(self, "_request_host_codec_states", None)
         state = host_states.get(request_id) if host_states is not None else None
-        if state is None:
+        if state is None or state["condition_seq"] == condition_seq:
             return
         # K-step keeps host sampling state for the request, across native
         # duplex conditions. Codec EOS stops the current condition only.
         # Keep the seeded draw stream and within-turn repetition history.
         state["finished"] = False
         state["step"] = 0
+        state["condition_seq"] = condition_seq
         state.pop("params", None)
         if new_turn:
             state["history"].clear()
