@@ -393,7 +393,15 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         """
         if not self.has_pending_tool_followup(runtime_config):
             raise ValueError("AURA duplex tool followup has no pending result")
-        outputs = tuple(pending["output"] for pending in runtime_config["aura_tool_pending"])
+        results = runtime_config["aura_tool_pending"]
+        batch = runtime_config.get("aura_tool_batch")
+        if isinstance(batch, list) and batch:
+            # Results arrive in whatever order the tools finish; the prompt
+            # keeps no call ids, so it must follow the order Stage1 called them.
+            by_id = {pending["call_id"]: pending["output"] for pending in results}
+            outputs = tuple(by_id[call_id] for call_id in batch)
+        else:
+            outputs = tuple(pending["output"] for pending in results)
         rounds = int(runtime_config.get("aura_tool_rounds") or 0) + 1
         # A plan that never reached commit (failed submit) is replaced, not stacked.
         for staged_id in [k for k, v in self._staged_tool_history.items() if v[0] == fence.session_id]:

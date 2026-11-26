@@ -96,6 +96,7 @@ async def test_early_response_create_keeps_the_rest_of_the_tool_batch() -> None:
     """A result for call A must not drop call B that has not arrived yet."""
     plugin = AuraDuplexPlugin(lambda audio, sample_rate, fmt, speed: "ZmFrZQ==")
     h = await open_harness(plugin=plugin, model="aura", modalities=("text", "audio"), stage_count=4)
+    drop_session_history(h.session.session_id)
     try:
         fence = helpers.append_fence(h.session, None)
         request_id = DuplexSessionManager.stage_request_id(fence, stage_id=1, resumable=False)
@@ -139,12 +140,14 @@ async def test_early_response_create_keeps_the_rest_of_the_tool_batch() -> None:
             "台北",
         ]
     finally:
+        drop_session_history(h.session.session_id)
         await close_harness(h)
 
 
 @pytest.mark.asyncio
-async def test_timed_out_tool_call_settles_so_the_accepted_result_can_follow_up() -> None:
-    """A expires in the ledger; B's result must still be able to start one follow-up."""
+@pytest.mark.parametrize("answered_index", [0, 1])
+async def test_timed_out_tool_call_settles_so_the_accepted_result_can_follow_up(answered_index: int) -> None:
+    """One call expires; the other's result still starts one follow-up, in call order."""
     plugin = AuraDuplexPlugin(lambda audio, sample_rate, fmt, speed: "ZmFrZQ==")
     clock = FakeClock(100.0)
     scheduler = FakeTimerScheduler()
@@ -179,25 +182,31 @@ async def test_timed_out_tool_call_settles_so_the_accepted_result_can_follow_up(
         events = await h.settle()
         done = [event for event in events if event.type == "response.function_call_arguments.done"]
         assert len(done) == 2
-        accepted, expired = done
+        outputs = ["10:00", "台北"]
+        accepted = done[answered_index]
+        expired = done[1 - answered_index]
 
         before = len(h.port.submissions)
-        assert error_codes(await h.run(commands.CreateItem(item=output_item(accepted.call_id, "10:00")))) == []
+        assert (
+            error_codes(await h.run(commands.CreateItem(item=output_item(accepted.call_id, outputs[answered_index]))))
+            == []
+        )
         clock.advance(5.0)
         scheduler.fire_all()
         timed_out = await h.settle()
         assert error_codes(timed_out) == ["tool_result_timeout"]
-        late = await h.run(commands.CreateItem(item=output_item(expired.call_id, "台北")))
+        late = await h.run(commands.CreateItem(item=output_item(expired.call_id, "late")))
         assert error_codes(late) == ["invalid_function_call_output"]
 
         follow = await h.run(commands.CreateResponse())
         assert error_codes(follow) == []
         assert len(h.port.submissions) == before + 1
         history = get_or_create_session_history(h.session.session_id)
-        assert [message["content"] for message in history.messages if message["role"] == "tool_response"] == [
-            "10:00",
-            abandoned_tool_call_notice(ToolCallAbandonReason.TIMEOUT),
-        ]
+        notice = abandoned_tool_call_notice(ToolCallAbandonReason.TIMEOUT)
+        expected = [notice if index != answered_index else outputs[index] for index in range(2)]
+        assert [message["content"] for message in history.messages if message["role"] == "tool_response"] == expected
+        rendered = history.render_prefix()
+        assert rendered.index(expected[0]) < rendered.index(expected[1])
     finally:
         drop_session_history(h.session.session_id)
         await close_harness(h)
