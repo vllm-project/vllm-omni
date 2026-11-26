@@ -27,6 +27,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.dit_fused import (
 from vllm_omni.model_executor.models.minicpmo_4_5.ops import qkv_head_layer_norm
 
 from .cosyvoice2_dit_attn import _expand_attn_mask_for_npu
+from .minicpmo_cfm_layer_norm import fused_residual_layer_norm
 
 
 def supports_packed_qkv(attn: nn.Module) -> bool:
@@ -201,8 +202,20 @@ def gated_residual_norm(x, gate, branch, norm):
     return residual, normalized
 
 
-def _add_layer_norm(x, branch, weight, bias, eps):
+def _add_layer_norm(x, branch, weight, bias, eps, *, gate=None):
     """``(x + branch, LayerNorm(x + branch) * weight + bias)`` in one ACLNN AddLayerNorm."""
+    if (
+        x.device.type == "npu"
+        and x.dtype == branch.dtype == weight.dtype == bias.dtype == torch.float32
+        and x.shape[-1] == 512
+        and x.stride(-1) == branch.stride(-1) == 1
+        and weight.shape == bias.shape == (512,)
+        and weight.stride(0) == bias.stride(0) == 1
+        and (gate is None or (gate.dtype == x.dtype and gate.shape == (512,) and gate.stride(0) == 1))
+    ):
+        return fused_residual_layer_norm(x, branch, weight, bias, float(eps), gate=gate)
+    if gate is not None:
+        branch = gate * branch
     op = _add_layer_norm_op(x)
     if op is None:
         added = x + branch
@@ -378,7 +391,7 @@ def blocks_forward_chunk_fused_npu(
         block_width = int(conv1.kernel_size[0]) - 1
         old1 = None if old is None else old[block_index][..., : conv1.in_channels]
         old2 = None if old is None else old[block_index][..., conv1.in_channels :]
-        x, conv_in = _add_layer_norm(x, mod[_GATE_MSA] * x_att, mod[_SCALE_CONV], mod[_SHIFT_CONV], block.norm3.eps)
+        x, conv_in = _add_layer_norm(x, x_att, mod[_SCALE_CONV], mod[_SHIFT_CONV], block.norm3.eps, gate=mod[_GATE_MSA])
         history = _attach_history(old1, conv_in, block_width)
         conv_hidden = _causal_conv(conv1, history, frames)
         conv_weight, conv_bias = _norm_affine(conv_norm, conv_hidden)
@@ -388,20 +401,22 @@ def blocks_forward_chunk_fused_npu(
         history2 = _attach_history(old2, conv_hidden, block_width)
         x, mlp_in = _add_layer_norm(
             x,
-            mod[_GATE_CONV] * _causal_conv(conv2, history2, frames),
+            _causal_conv(conv2, history2, frames),
             mod[_SCALE_MLP],
             mod[_SHIFT_MLP],
             block.norm2.eps,
+            gate=mod[_GATE_CONV],
         )
         mlp_out = _mlp(block.mlp, mlp_in)
         # Table row ``depth`` holds the final layer's shift and 1 + scale where a block keeps its MSA pair.
         last = block_index + 1 == depth
         x, hidden = _add_layer_norm(
             x,
-            mod[_GATE_MLP] * mlp_out,
+            mlp_out,
             modulation[block_index + 1][_SCALE_MSA],
             modulation[block_index + 1][_SHIFT_MSA],
             estimator.final_layer.norm_final.eps if last else blocks[block_index + 1].norm1.eps,
+            gate=mod[_GATE_MLP],
         )
 
         if staged:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 
 _CLASS_TO_MODULE: dict[str, str] = {
+    "RealtimeVenusOmniConfig": "vllm_omni.transformers_utils.configs.realtime_venus",
     "Audio8TTSConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "Audio8TTSSlowARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "Audio8TTSFastARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
@@ -29,6 +30,8 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "VoxCPM2Config": "vllm_omni.transformers_utils.configs.voxcpm2",
     "VoxtralTTSConfig": "vllm_omni.transformers_utils.configs.voxtral_tts",
     "CosyVoice3Config": "vllm_omni.transformers_utils.configs.cosyvoice3",
+    "Confucius4Config": "vllm_omni.transformers_utils.configs.confucius4_tts",
+    "Confucius4TTSConfig": "vllm_omni.transformers_utils.configs.confucius4_tts",
     "MiniMaxMusic3Config": "vllm_omni.transformers_utils.configs.minimax_music3",
     "Yue2Config": "vllm_omni.transformers_utils.configs.yue2",
     "OmniVoiceConfig": "vllm_omni.transformers_utils.configs.omnivoice",
@@ -68,6 +71,8 @@ __all__ = [
     "VoxCPM2Config",
     "VoxtralTTSConfig",
     "CosyVoice3Config",
+    "Confucius4Config",
+    "Confucius4TTSConfig",
     "MiniMaxMusic3Config",
     "Yue2Config",
     "OmniVoiceConfig",
@@ -104,6 +109,7 @@ def __dir__():
 from vllm_omni.transformers_utils.configs import audio8_tts as _audio8_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import auk as _auk  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import chatterbox as _chatterbox  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import confucius4_tts as _confucius4_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_omni as _fish_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
@@ -116,6 +122,7 @@ from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_
 from vllm_omni.transformers_utils.configs import minimax_music3 as _minimax_music3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import phonon as _phonon  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import realtime_venus as _realtime_venus  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import sensenova_u1 as _sensenova_u1  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import vibevoice as _vibevoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402

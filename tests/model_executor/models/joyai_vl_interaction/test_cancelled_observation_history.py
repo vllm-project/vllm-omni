@@ -26,8 +26,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("speech_followup", [False, True], ids=["camera", "speech"])
 @pytest.mark.parametrize("delete_response", [False, True], ids=["retained", "deleted"])
 @pytest.mark.parametrize("image_limit", [1, 2], ids=["one-image", "two-images"])
-async def test_cancelled_observation_preserves_empty_assistant_boundary(
-    mocker, speech_followup, delete_response, image_limit
+@pytest.mark.parametrize("finished", [False, True], ids=["partial", "complete"])
+async def test_cancelled_observation_preserves_response_action_boundary(
+    mocker, speech_followup, delete_response, image_limit, finished
 ):
     h = await open_joyai(asr=True)
     h.runner.plugin.max_images = image_limit
@@ -52,9 +53,9 @@ async def test_cancelled_observation_preserves_empty_assistant_boundary(
         request_id = h.port.submissions[-1].context.request_id
         response_item_id = f"item_{h.session.active_response_id}"
         await h.deliver_and_settle(
-            tts_output(request_id, text="</response> Green. One, two, three.", finished=True),
+            tts_output(request_id, text="</response> Green. One, two, three.", finished=finished),
             stage_id=1,
-            segment_finished=True,
+            segment_finished=finished,
         )
         await h.run(CancelResponse())
         assert h.session.history_item_ids[response_item_id]["content"] == ""
@@ -93,7 +94,7 @@ async def test_cancelled_observation_preserves_empty_assistant_boundary(
         messages = template.call_args.args[0]
         assistants = [message for message in messages if message["role"] == "assistant"]
         keep_boundary = not delete_response and image_limit > 1
-        assert assistants == ([{"role": "assistant", "content": ""}] if keep_boundary else [])
+        assert assistants == ([{"role": "assistant", "content": "</response>"}] if keep_boundary else [])
         image_messages = [
             index
             for index, message in enumerate(messages)
@@ -102,7 +103,7 @@ async def test_cancelled_observation_preserves_empty_assistant_boundary(
         assert len(image_messages) == image_limit
         assert sum(part["type"] == "image" for part in messages[-1]["content"]) == 1
         if keep_boundary:
-            assert messages[-2] == {"role": "assistant", "content": ""}
+            assert messages[-2] == {"role": "assistant", "content": "</response>"}
             assert image_messages == [len(messages) - 3, len(messages) - 1]
         if image_limit > 1:
             assert query not in str(messages[image_messages[0]]["content"])
@@ -164,7 +165,7 @@ async def test_audio_only_followup_retains_latest_frame_until_summarized(mocker,
             assert [image.getpixel((0, 0)) for image in prompt["multi_modal_data"]["image"]] == [(0, 128, 0)]
             assert messages[-3:] == [
                 {"role": "user", "content": [{"type": "text", "text": timestamp}, {"type": "image"}]},
-                {"role": "assistant", "content": ""},
+                {"role": "assistant", "content": "</response>"},
                 {"role": "user", "content": [{"type": "text", "text": f"{USER_QUERY_HEADER}\n{query}"}]},
             ]
         assert "</response> Green." not in prompt["prompt"]
@@ -255,7 +256,7 @@ def test_asr_context_budget_evicts_frames_with_their_turns_without_mutating_hand
     expected = [
         {"role": "system", "content": "policy"},
         {"role": "user", "content": "Keep answers short."},
-        {"role": "user", "content": [*current, {"type": "text", "text": f"{USER_QUERY_HEADER}\n{query}"}]},
+        {"role": "user", "content": [{"type": "text", "text": f"{USER_QUERY_HEADER}\n{query}"}, *current]},
     ]
     if retain_text:
         expected.insert(2, {"role": "user", "content": [{"type": "text", "text": old_text}]})

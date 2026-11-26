@@ -32,7 +32,7 @@ SEED = 42
 MIN_PSNR_DB = 28.0
 MIN_SSIM = 0.95
 
-SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
+SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI300"})
 
 HELIOS_DISTILLED_EXTRA_PARAMS = {
     "is_enable_stage2": True,
