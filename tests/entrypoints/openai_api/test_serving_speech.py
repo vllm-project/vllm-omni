@@ -6468,6 +6468,7 @@ class TestTTSAsyncOffloading:
 
     @pytest.mark.parametrize("overrides", [{"temperature": 3.0}, {"extra_params": {"temperature": 3.0}}])
     def test_temperature_limit_checked_before_adapter_build(self, qwen3_tts_server, mocker: MockerFixture, overrides):
+        qwen3_tts_server.engine_client.default_sampling_params_list = [SamplingParams()]
         adapter = qwen3_tts_server._get_tts_adapter()
         adapter.build = mocker.AsyncMock()
         request = OpenAICreateSpeechRequest(input="hello", **overrides)
