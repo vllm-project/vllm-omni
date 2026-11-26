@@ -943,6 +943,21 @@ class MiniMaxH3DiTModel(nn.Module):
             quant_config,
             prefix="token_refiner",
         )
+        requested_path = (getattr(od_config, "additional_config", None) or {}).get("rocm_h3_wide_fmha_path")
+        if requested_path is not None and (not isinstance(requested_path, str) or not requested_path):
+            raise ValueError("rocm_h3_wide_fmha_path must be a non-empty path to a gfx950 code object")
+        parallel = getattr(od_config, "parallel_config", None)
+        self._wide_fmha_path = (
+            requested_path
+            if requested_path
+            and attention_cls is MiniMaxH3Attention
+            and current_omni_platform.is_rocm()
+            and parallel is not None
+            and parallel.ulysses_degree == 4
+            and parallel.ring_degree == parallel.allgather_degree == 1
+            and parallel.ulysses_mode == "strict"
+            else None
+        )
         self.blocks = nn.ModuleList(
             [
                 MiniMaxH3DiTBlock(
@@ -952,6 +967,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     layer_index=i,
                     adaln_cache=self.adaln_cache,
                     attention_cls=attention_cls,
+                    wide_fmha=self._wide_fmha_path is not None,
                 )
                 for i in range(arch.num_layers)
             ]
@@ -1682,6 +1698,23 @@ class MiniMaxH3DiTModel(nn.Module):
         if getattr(self, "adaln_cache", None) is not None:
             self.adaln_cache.prepare(t_emb)
 
+        wide_fmha_kwargs = {}
+        if (
+            (wide_fmha_path := getattr(self, "_wide_fmha_path", None)) is not None
+            and num_requests == 1
+            and reference_kv_state is None
+            and reference_isolation is None
+            and vdn_window is None
+            and hidden.is_cuda
+            and hidden.dtype == torch.bfloat16
+            and hidden.shape[0] == 9440
+            and not torch.is_grad_enabled()
+            and torch.cuda.get_device_properties(hidden.device).gcnArchName.split(":")[0] == "gfx950"
+        ):
+            from .attention.wide_fmha import verified_wide_cut
+
+            if verified_wide_cut(cu_seqlens, block_max_seqlen, block_packed_total):
+                wide_fmha_kwargs["wide_fmha_path"] = wide_fmha_path
         last_block = len(self.blocks) - 1
         handover = {}
         for block_index, block in enumerate(self.blocks):
@@ -1701,6 +1734,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 reference_kv_compact=compact_reference,
                 reference_isolation=reference_isolation,
                 vdn_window=vdn_window,
+                **wide_fmha_kwargs,
                 **handover,
                 **({"defer_gate": True} if defer_gate else {}),
             )

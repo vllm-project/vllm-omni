@@ -22,6 +22,7 @@ from vllm.model_executor.layers.linear import (
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
+    AttentionImpl,
     AttentionMetadata,
     PackedPaddingMetadata,
     VideoTokenLayout,
@@ -215,6 +216,7 @@ class MiniMaxH3Attention(nn.Module):
         role: str = "self",
         role_category: str | None = None,
         skip_sequence_parallel: bool = False,
+        wide_fmha: bool = False,
     ) -> None:
         super().__init__()
         self.total_num_heads = arch.num_attention_heads
@@ -259,6 +261,11 @@ class MiniMaxH3Attention(nn.Module):
         self._prefix = prefix
         from .attention.fastvideo_h3 import MiniMaxH3VSAImpl
 
+        impl_overrides: dict[str, type[AttentionImpl]] = {"FASTVIDEO_VSA": MiniMaxH3VSAImpl}
+        if wide_fmha:
+            from .attention.wide_fmha import MiniMaxH3WideFlashImpl
+
+            impl_overrides["FLASH_ATTN"] = MiniMaxH3WideFlashImpl
         self.attention = Attention(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -271,7 +278,7 @@ class MiniMaxH3Attention(nn.Module):
             role_category=role_category,
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
-            impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
+            impl_overrides=impl_overrides,
         )
 
     def enable_vsa_gate(self) -> None:
@@ -353,6 +360,7 @@ class MiniMaxH3Attention(nn.Module):
         max_seqlen: int,
         packed_total: int,
         num_requests: int = 1,
+        wide_fmha_path: str | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         gate_compress: torch.Tensor | None = None,
@@ -397,7 +405,21 @@ class MiniMaxH3Attention(nn.Module):
         # Read once per forward: during an active scheduled denoise step this is
         # the candidate the layer dispatches to, and the packed layout below
         # must match that backend rather than the baseline.
-        backend = self.attention.effective_attention()[1]
+        impl, backend, _ = self.attention.effective_attention()
+        use_wide_fmha = (
+            wide_fmha_path is not None
+            and backend is FlashAttentionBackend
+            and getattr(impl, "_kernel_variant", None) == "aiter"
+            and num_requests == 1
+            and not use_ring
+            and self.attention._get_active_parallel_strategy().name == "ulysses"
+            and gate_compress is None
+            and self.vsa_sparsity is None
+            and reference_isolation is None
+            and reference_kv_state is None
+            and not reference_kv_compact
+            and vdn_window is None
+        )
         if num_requests > 1:
             if not _attention_isolates_packed_requests(self.attention, backend):
                 backend_name = backend.get_name()
@@ -421,7 +443,9 @@ class MiniMaxH3Attention(nn.Module):
                     and FlashAttentionBackend.supports_packed_mask_free()
                 )
             )
-            no_mask = not use_ring and (backend.supports_prefix_kv_slicing or mask_free_packed_padding)
+            # Both the experimental kernel and the ROCm Flash fallback use the
+            # actual two document boundaries for this verified H3 request.
+            no_mask = not use_ring and (backend.supports_prefix_kv_slicing or mask_free_packed_padding or use_wide_fmha)
             # Hybrid Ulysses reshards Q to one ring partition before the ring
             # kernel runs, so a global key mask cannot pass its query-length
             # check. Ring consumes valid_kv_length directly.
@@ -441,6 +465,8 @@ class MiniMaxH3Attention(nn.Module):
             "vsa_h3_ref_policy": self.vsa_ref_policy,
             "vsa_h3_ref_keep_rate": self.vsa_ref_keep_rate,
         }
+        if use_wide_fmha:
+            extra["rocm_h3_wide_fmha_path"] = wide_fmha_path
         if gate_compress is not None:
             extra["gate_compress"] = gate_compress.unsqueeze(0)
             if video_layout is not None and video_layout.video_spans:
@@ -523,6 +549,7 @@ class MiniMaxH3Attention(nn.Module):
         max_seqlen: int,
         packed_total: int | None = None,
         num_requests: int = 1,
+        wide_fmha_path: str | None = None,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
@@ -580,6 +607,7 @@ class MiniMaxH3Attention(nn.Module):
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
             gate_compress=gate_compress,
+            wide_fmha_path=wide_fmha_path,
             reference_kv_state=reference_kv_state,
             reference_kv_layer_index=reference_kv_layer_index,
             reference_kv_compact=reference_kv_compact,
@@ -784,6 +812,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         layer_index: int,
         adaln_cache: MiniMaxH3RuntimeAdalnCache | None = None,
         attention_cls: type[MiniMaxH3Attention] = MiniMaxH3Attention,
+        wide_fmha: bool = False,
     ) -> None:
         super().__init__()
         self.layer_index = int(layer_index)
@@ -798,6 +827,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
+            **({"wide_fmha": True} if wide_fmha else {}),
         )
         # Startup checks for attention schedule candidates. Only DiT blocks see
         # padded packed documents and can carry a VSA gate. The token refiner's
@@ -831,6 +861,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         max_seqlen: int,
         packed_total: int,
         num_requests: int = 1,
+        wide_fmha_path: str | None = None,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
@@ -888,6 +919,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
+            **({"wide_fmha_path": wide_fmha_path} if wide_fmha_path is not None else {}),
             reference_kv_state=reference_kv_state,
             reference_kv_layer_index=self.layer_index,
             reference_kv_compact=reference_kv_compact,

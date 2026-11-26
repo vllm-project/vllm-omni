@@ -175,6 +175,16 @@ MiniMax-H3 supplies `MiniMaxH3VSAImpl` through `impl_overrides`.
 learned compression gate. Pooling, block-map construction, and tile64 provider
 calls are shared through `attention/ops/block_sparse.py`.
 
+## MiniMax-H3 dense BF16 on gfx950
+
+MiniMax-H3 can override the ROCm implementation of `FLASH_ATTN` for eager
+inference on four gfx950 GPUs. H3 verifies the two segment boundaries before
+passing them to attention. After strict Ulysses redistribution, the model
+adapter supplies the Q/K/V strides expected by the specialized kernel.
+Unsupported layouts use the selected FlashAttention implementation. See the
+[four-GPU ROCm recipe](../../../recipes/MiniMaxAI/MiniMax-H3.md#experimental-bf16-dense-attention-on-gfx950)
+for the opt-in setting and supported geometry.
+
 ## CosyVoice3 Ascend graph region
 
 CosyVoice3 has an opt-in, model-owned NPU graph adapter around the complete
