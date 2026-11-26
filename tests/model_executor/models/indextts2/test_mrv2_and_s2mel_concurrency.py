@@ -3,9 +3,10 @@
 """Regression tests for IndexTTS 2 & 2.5 MRv2 data plane, Stage-1 concurrency, and scoped TF32."""
 
 import threading
-from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -33,7 +34,6 @@ from vllm_omni.model_executor.stage_input_processors.indextts2 import (
     talker2s2mel_token_only,
 )
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker_v2.delivery import OmniDeliveryManager
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -209,38 +209,43 @@ def test_mrv2_postprocess_before_make_omni_output_preserves_step_latent_alignmen
 
 
 def _make_mrv2_data_plane_with_indextts():
-    plane = object.__new__(OmniRunnerDataPlane)
     sent_packets: list[tuple[str, dict]] = []
     cleaned_reqs: list[str] = []
 
     class _FakeConnector:
+        config: dict[str, Any] = {"extra": {"delivery_timeout_s": 1.0}}
+
         def put(self, from_stage, to_stage, put_key, data):
             sent_packets.append((put_key, data))
             return True, 1, None
 
-    plane.__dict__.update(
-        _native_requests={},
-        _native_output_lock=threading.RLock(),
-        _native_send_lock=threading.Lock(),
-        _native_output_error=None,
-        _native_output_error_lock=threading.Lock(),
-        _native_output_closed=False,
-        _native_outputs_in_flight=defaultdict(int),
-        _native_terminal_pending=set(),
-        _deferred_shm_releases=set(),
-        _async_chunk=False,
-        _can_send=True,
-        _pending_full_payload_send={},
-        _request_ids_mapping={},
-        _put_req_chunk=defaultdict(int),
-        _ramp_chunk_count=defaultdict(int),
-        _stage_id=0,
-        _next_stage_id="1",
-        _omni_connector=_FakeConnector(),
-        _custom_process_func=talker2s2mel_full_payload,
-        _custom_process_batch_func=None,
-        _delivery_manager=OmniDeliveryManager(delivery_timeout_s=1.0, shutdown_timeout_s=1.0),
+    model_config = SimpleNamespace(
+        stage_id=0,
+        model_stage="talker",
+        async_chunk=False,
+        worker_type="ar",
+        custom_process_next_stage_input_func=(
+            "vllm_omni.model_executor.stage_input_processors.indextts2.talker2s2mel_full_payload"
+        ),
+        stage_connector_config=None,
     )
+    vllm_config = SimpleNamespace(model_config=model_config, speculative_config=None)
+
+    def _init_output_worker_no_thread(self, *, max_pending_batches: int) -> None:
+        self._native_output_error_lock = threading.Lock()
+        self._native_output_error = None
+        self._connector_send_error_sink = self._record_output_error
+        self._native_output_closed = False
+        self._native_output_worker = None
+
+    with (
+        patch.object(OmniRunnerDataPlane, "_create_connector", lambda self, _mc: None),
+        patch.object(OmniRunnerDataPlane, "_start_output_worker", _init_output_worker_no_thread),
+    ):
+        plane = OmniRunnerDataPlane(vllm_config, model_config)
+
+    plane._omni_connector = _FakeConnector()
+    plane._next_stage_id = "1"
     plane.is_data_transfer_rank = lambda: True
     plane._return_stage_payload = lambda *_a, **_kw: False
     plane._enqueue_chunk_payload = lambda req, payload, **_kw: (
