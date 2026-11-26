@@ -7008,9 +7008,35 @@ def test_tiny_diffusion_base_ready_pins_one_card_nodes() -> None:
     assert all("cards_1" not in marker for marker in _marker_expressions(nightly))
 
 
+# Online video determinism/multi-output subtests skip by design on every platform.
+_TINY_DIFFUSION_BASE_KNOWN_SKIPS = (
+    ("LTX2Pipeline", "Online determinism isn't supported for DiffusionTasks.TEXT_TO_VIDEO."),
+    ("LTX2Pipeline", "Online determinism isn't supported for DiffusionTasks.IMAGE_TO_VIDEO."),
+    ("LTX2Pipeline", "Online multi-output isn't supported for DiffusionTasks.TEXT_TO_VIDEO."),
+    ("LTX2Pipeline", "Online multi-output isn't supported for DiffusionTasks.IMAGE_TO_VIDEO."),
+    ("SanaImageToVideoPipeline", "Online determinism isn't supported for DiffusionTasks.IMAGE_TO_VIDEO."),
+    ("SanaVideoPipeline", "Online determinism isn't supported for DiffusionTasks.TEXT_TO_VIDEO."),
+    ("WanPipeline", "Online determinism isn't supported for DiffusionTasks.TEXT_TO_VIDEO."),
+    ("WanPipeline", "Online multi-output isn't supported for DiffusionTasks.TEXT_TO_VIDEO."),
+)
+
+
 @pytest.mark.parametrize(
     "scenario",
-    ["pass", "subtests", "missing", "duplicate", "wrong-node", "skipped", "failure", "error", "subtest-skip"],
+    [
+        "pass",
+        "subtests",
+        "missing",
+        "duplicate",
+        "wrong-node",
+        "skipped",
+        "failure",
+        "error",
+        "subtest-skip",
+        "missing-known-skip",
+        "offline-video-skip",
+        "image-skip",
+    ],
 )
 def test_tiny_diffusion_base_ready_checks_executed_nodes(tmp_path: Path, scenario: str) -> None:
     step = _find_step("ROCm · Tiny Diffusion Base GPU Test", AMD_READY_PIPELINE)
@@ -7021,11 +7047,20 @@ def test_tiny_diffusion_base_ready_checks_executed_nodes(tmp_path: Path, scenari
     root = ET.Element("testsuites")
     # Pytest 9 counts successful subtests in this total without adding testcase nodes.
     suite = ET.SubElement(
-        root, "testsuite", tests="80" if scenario == "subtests" else "22", skipped="0", failures="0", errors="0"
+        root, "testsuite", tests="186" if scenario == "subtests" else "54", skipped="8", failures="0", errors="0"
     )
+    cases = {}
     for node in _TINY_DIFFUSION_BASE_NODES:
         module, name = node.split("::", 1)
-        ET.SubElement(suite, "testcase", classname=module.removesuffix(".py").replace("/", "."), name=name)
+        cases[node] = ET.SubElement(
+            suite, "testcase", classname=module.removesuffix(".py").replace("/", "."), name=name
+        )
+    online = "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks"
+    known_skips = list(_TINY_DIFFUSION_BASE_KNOWN_SKIPS)
+    if scenario == "missing-known-skip":
+        known_skips.pop()
+    for model, message in known_skips:
+        ET.SubElement(cases[f"{online}[{model}]"], "skipped", type="pytest.skip", message=message)
     if scenario == "missing":
         suite.remove(suite[-1])
     elif scenario == "duplicate":
@@ -7035,7 +7070,15 @@ def test_tiny_diffusion_base_ready_checks_executed_nodes(tmp_path: Path, scenari
     elif scenario in {"skipped", "failure", "error"}:
         ET.SubElement(suite[-1], scenario)
     elif scenario == "subtest-skip":
-        suite.set("skipped", "1")
+        suite.set("skipped", "9")
+    elif scenario == "offline-video-skip":
+        skip = cases[f"{online}[WanPipeline]"].findall("skipped")[-1]
+        cases[f"{online}[WanPipeline]"].remove(skip)
+        offline = "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[WanPipeline]"
+        cases[offline].append(skip)
+    elif scenario == "image-skip":
+        skip = cases[f"{online}[WanPipeline]"].findall("skipped")[-1]
+        skip.set("message", "Online multi-output isn't supported for DiffusionTasks.TEXT_TO_IMAGE.")
     report = tmp_path / "pytest.xml"
     ET.ElementTree(root).write(report)
     result = subprocess.run(
