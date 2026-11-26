@@ -198,6 +198,9 @@ def _download_reference_asset(
         backoff_factor=2,
         status_forcelist=(500, 502, 503, 504),
         allowed_methods=("GET",),
+        # urllib3 additionally retries 413/429 responses carrying Retry-After;
+        # keep retries to the explicit 5xx list above so 4xx fails fast.
+        respect_retry_after_header=False,
     )
     session = requests.Session()
     session.mount("https://", requests.adapters.HTTPAdapter(max_retries=retries))
