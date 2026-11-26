@@ -598,10 +598,22 @@ class MiniMaxH3FinalLayer(nn.Module):
         """
         from safetensors import safe_open
 
-        if self.pdd_steps is not None:
-            raise ValueError("fused PDD heads cannot replace the FastH3 pdd_steps heads")
         with safe_open(path, "pt", device="cpu") as handle:
             heads = {key: handle.get_tensor(key) for key in handle.keys()}
+        steps = self.check_fused_pdd_heads(heads)
+        device = self.video_out.weight.device
+        self.fused_pdd_heads = {key: value.to(device=device, dtype=_FP32_DTYPE) for key, value in heads.items()}
+        return steps
+
+    def check_fused_pdd_heads(self, heads: Mapping[str, torch.Tensor]) -> int:
+        """Hold a per-step head stack to this layer's projections; returns its step count.
+
+        Run when the heads are loaded, so a stack fused for another width or
+        without one of the heads is refused there rather than in the first
+        denoise step that projects with it.
+        """
+        if self.pdd_steps is not None:
+            raise ValueError("fused PDD heads cannot replace the FastH3 pdd_steps heads")
         names = ("video_out",) if self.audio_out is None else ("video_out", "audio_out")
         expected = {f"{name}.{suffix}" for name in names for suffix in ("weight", "bias")}
         if set(heads) != expected:
@@ -616,9 +628,21 @@ class MiniMaxH3FinalLayer(nn.Module):
                 key = f"{name}.{suffix}"
                 if steps == 0 or tuple(heads[key].shape) != shape:
                     raise ValueError(f"MiniMax-H3 PDD {key} must have shape {shape}, got {tuple(heads[key].shape)}")
-                heads[key] = heads[key].to(device=projection.weight.device, dtype=_FP32_DTYPE)
-        self.fused_pdd_heads = heads
         return steps
+
+    def set_fused_pdd_heads(self, heads: Mapping[str, torch.Tensor] | None) -> None:
+        """Project the next forwards with ``heads`` (one row per step), or with the released heads for ``None``.
+
+        A request-scoped PDD adapter owns its heads, so the pipeline binds them
+        per request instead of loading them once as a PDD release does.
+        """
+        if heads is None:
+            self.fused_pdd_heads = None
+            return
+        if self.pdd_steps is not None:
+            raise ValueError("fused PDD heads cannot replace the FastH3 pdd_steps heads")
+        device = self.video_out.weight.device
+        self.fused_pdd_heads = {key: value.to(device=device, dtype=_FP32_DTYPE) for key, value in heads.items()}
 
     def _fused_pdd_project(self, h: torch.Tensor, name: str, step: int | None) -> torch.Tensor:
         heads = self.fused_pdd_heads
@@ -1327,17 +1351,17 @@ class MiniMaxH3DiTModel(nn.Module):
             device=device,
             dtype=_BF16_DTYPE,
         )
-        embeddings.index_add_(
+        embeddings.index_copy_(
             0,
             text_local_pos,
             text_embed.to(_BF16_DTYPE)[: text_local_pos.shape[0]],
         )
-        embeddings.index_add_(
+        embeddings.index_copy_(
             0,
             img_local_pos,
             video_embed.to(_BF16_DTYPE)[: img_local_pos.shape[0]],
         )
-        embeddings.index_add_(
+        embeddings.index_copy_(
             0,
             audio_local_pos,
             audio_embed.to(_BF16_DTYPE)[: audio_local_pos.shape[0]],
@@ -1658,7 +1682,10 @@ class MiniMaxH3DiTModel(nn.Module):
         if getattr(self, "adaln_cache", None) is not None:
             self.adaln_cache.prepare(t_emb)
 
+        last_block = len(self.blocks) - 1
+        handover = {}
         for block_index, block in enumerate(self.blocks):
+            defer_gate = block_index < last_block and block_index not in hints
             hidden = block(
                 hidden,
                 t_emb=t_emb,
@@ -1674,7 +1701,13 @@ class MiniMaxH3DiTModel(nn.Module):
                 reference_kv_compact=compact_reference,
                 reference_isolation=reference_isolation,
                 vdn_window=vdn_window,
+                **handover,
+                **({"defer_gate": True} if defer_gate else {}),
             )
+            handover = {}
+            if defer_gate:
+                hidden, pending_gate = hidden
+                handover = {"pending_gate": pending_gate}
             if block_index in hints:
                 hidden = hidden + hints.pop(block_index) * control_scale
         if local_len == seq_len:

@@ -43,7 +43,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
             "talker.codec_head.": "language_model.lm_head.",
             "talker.model.": "language_model.model.",
             # projection weights
-            "talker.thinker_to_talker_proj.": "thinker_to_talker_proj.",
+            "talker.thinker_to_talker_proj.": "language_model.model.thinker_to_talker_proj.",
             # fallback root
             "talker.": "",
         }
@@ -78,10 +78,6 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         self.prefix = prefix
         self.quant_config = quant_config
 
-        self.thinker_to_talker_proj = nn.Linear(
-            self.config.embedding_size,
-            self.config.hidden_size,
-        )
         self.language_model = init_vllm_registered_model(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "language_model"),
@@ -95,6 +91,11 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
 
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
+
+    @property
+    def thinker_to_talker_proj(self) -> torch.nn.Module:
+        # Kept for qwen2_5_omni.py, which projects the BOS/EOS codec embeddings with it.
+        return self.language_model.model.thinker_to_talker_proj
 
     @cached_property
     def sampler(self):
@@ -125,9 +126,6 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
             inputs_embeds = self.embed_input_ids(input_ids)
 
         input_ids = None
-
-        # projection
-        inputs_embeds = self.thinker_to_talker_proj(inputs_embeds)
 
         hidden_states = self.language_model.model(
             input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds

@@ -34,7 +34,7 @@ def test_joyai_runner_and_transport_contract(monkeypatch, platform, asr, duplex)
         assert args["use_v2_model_runner"] is True
         assert args["supports_native_mrv2_data_plane"] is True
         assert args["session_mode"] == ("duplex" if duplex else "turn")
-        assert args["async_chunk"] is duplex
+        assert args["async_chunk"] is (duplex and not asr)
     assert stages[-2].yaml_engine_args["recompute_preemption"] == "fail"
     assert stages[-1].yaml_engine_args["requires_full_payload_input"] is True
     joyai = pipeline.stages[int(asr)]

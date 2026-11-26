@@ -625,26 +625,32 @@ def _drive_d2h(monkeypatch: pytest.MonkeyPatch, *, pin_error: Exception | None =
     """
 
     class FakeStream:
-        def synchronize(self) -> None:
-            pass
+        def __init__(self) -> None:
+            self.active = False
 
+        def __enter__(self) -> None:
+            self.active = True
+
+        def __exit__(self, *_exc_info: object) -> None:
+            self.active = False
+
+        def synchronize(self) -> None:
+            assert not self.active
+
+    stream = FakeStream()
     attempts: list[bool] = []
     real_empty = torch.empty
 
     def fake_empty(shape, dtype=None, pin_memory=False, **kwargs):
+        assert stream.active
         attempts.append(pin_memory)
         if pin_memory and pin_error is not None:
             raise pin_error
         return real_empty(shape, dtype=dtype)
 
-    monkeypatch.setattr(torch.accelerator, "current_stream", lambda *a, **k: None)
-    monkeypatch.setattr(torch.accelerator, "set_stream", lambda *a, **k: None)
     monkeypatch.setattr(torch, "empty", fake_empty)
-    # Drive the fallback contract (pinned attempt, then pageable) regardless
-    # of how the host resolves PIN_MEMORY. raising=False keeps this file
-    # runnable against a pre-PIN_MEMORY ipc.py for base comparisons.
-    monkeypatch.setattr(diffusion_ipc, "PIN_MEMORY", True, raising=False)
-    return attempts, FakeStream()
+    monkeypatch.setattr(diffusion_ipc, "PIN_MEMORY", True)
+    return attempts, stream
 
 
 def test_d2h_pinned_failure_falls_back_to_pageable(monkeypatch):
@@ -674,6 +680,7 @@ def test_d2h_re_raises_unrelated_pinned_allocation_errors(monkeypatch):
         _tensor_to_shm(_DeviceTensorDouble(x), stream, created=[])
 
     assert attempts == [True]
+    assert not stream.active
 
 
 def test_d2h_uses_pinned_buffer_when_available(monkeypatch):

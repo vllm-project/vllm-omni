@@ -17,6 +17,8 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, V
 from vllm_omni.diffusion.attention.parallel.ulysses_allgather import UlyssesAllGatherKVParallelAttention
 from vllm_omni.diffusion.data import MindIEParallelConfig
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelResources
+from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
+from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu]
 
@@ -221,20 +223,21 @@ def test_rf_hoist_preserves_modalities_and_declines_an_unresolved_plan(adapter, 
         root, "build_rf_attention_plan", lambda **kwargs: SimpleNamespace(permutation=plan, inverse=torch.argsort(plan))
     )
     monkeypatch.setitem(sys.modules, "mindiesd", root)
-    branch = SimpleNamespace(
-        seq_len=16,
-        used_len=14,
-        device=torch.device("cpu"),
-        img_pos=torch.arange(6, 14),
-        audio_pos=torch.tensor([4, 5]),
-        text_pos_dev=torch.arange(4),
-        token_tags_dev=torch.arange(16),
-        img_position_ids_dev=torch.arange(48).reshape(16, 3),
-        static_kwargs={
-            "video_token_layout": VideoTokenLayout(prefix_len=6, latent_grid=(2, 2, 2)),
-            "packed_seq_params": {"vsa_prefix_segments": ()},
-        },
+    packed = minimax_h3_packed_sequence(
+        text_len=4, latent_t=2, latent_h=4, latent_w=4, audio_t=1, include_keyframe_cond=False, seq_len=16
     )
+    packed["update_mask"][:2] = False
+    packed["audio_update_mask"] = torch.tensor([False, True])
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(4, 2),
+        token_tags=torch.arange(16),
+        device=torch.device("cpu"),
+    )
+    branch.img_position_ids_dev = torch.arange(48).reshape(16, 3)
+    position_names = ("video_target_pos_dev", "video_cond_pos_dev", "audio_target_pos_dev", "audio_cond_pos_dev")
+    positions = [getattr(branch, name).clone() for name in position_names]
+    groups = branch.timestep_group_dev.clone()
     model = SimpleNamespace(blocks=[SimpleNamespace(attn=SimpleNamespace(attention=adapter.attention))])
     use_cp(adapter, 4)
     config = adapter.impl.rainfusion
@@ -253,6 +256,9 @@ def test_rf_hoist_preserves_modalities_and_declines_an_unresolved_plan(adapter, 
     assert isinstance(layout, VideoTokenLayout) and layout.pre_rearranged
     assert isinstance(packed, dict) and "vsa_prefix_segments" not in packed
     padded = torch.cat((plan, torch.tensor([14, 15])))
+    for name, original in zip(position_names, positions, strict=True):
+        assert torch.equal(getattr(branch, name), torch.argsort(padded)[original])
+    assert torch.equal(branch.timestep_group_dev, groups[padded])
     assert padded.index_select(0, branch.img_pos_dev).tolist() == list(range(6, 14))
     assert padded.index_select(0, branch.audio_pos_dev).tolist() == [4, 5]
     assert padded.index_select(0, branch.text_pos_dev).tolist() == list(range(4))

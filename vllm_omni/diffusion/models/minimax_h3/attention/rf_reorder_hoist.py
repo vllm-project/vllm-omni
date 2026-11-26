@@ -26,6 +26,9 @@ def relabel_branch(branch, permutation: torch.Tensor, inverse: torch.Tensor) -> 
     branch.img_pos_dev = branch.img_pos.to(device)
     branch.audio_pos_dev = branch.audio_pos.to(device)
     index, back = permutation.to(device), inverse.to(device)
+    for name in ("video_target_pos_dev", "video_cond_pos_dev", "audio_target_pos_dev", "audio_cond_pos_dev"):
+        setattr(branch, name, back.index_select(0, getattr(branch, name)))
+    branch.timestep_group_dev = branch.timestep_group_dev.index_select(0, index)
     branch.text_pos_dev = back.index_select(0, branch.text_pos_dev)
     branch.token_tags_dev = branch.token_tags_dev.index_select(0, index)
     branch.img_position_ids_dev = branch.img_position_ids_dev.index_select(0, index)

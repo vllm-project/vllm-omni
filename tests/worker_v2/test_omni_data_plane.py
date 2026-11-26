@@ -743,7 +743,7 @@ def test_worker_failure_surfaces_and_close_drains_in_order(plane):
     assert events == ["send", "shutdown"]
 
 
-def test_permanent_put_failure_quarantines_and_holds_state(raw_plane):
+def test_permanent_put_failure_fails_request_without_quarantine(raw_plane):
     puts = []
 
     def put(**_kw):
@@ -755,12 +755,14 @@ def test_permanent_put_failure_quarantines_and_holds_state(raw_plane):
     raw_plane.register_request(_new_request())
     raw_plane.reserve_outputs(["internal"])
     raw_plane.request_terminal({"internal"})
-    with pytest.raises(RuntimeError, match="connector send failed"):
-        raw_plane.complete_outputs(req_ids=["internal"], inter_stage_outputs=[{"c": 0}], sampled_token_ids=[[21]])
-    assert len(puts) == 1 and raw_plane._native_output_error is not None  # fail fast, no retry
-    assert raw_plane._native_outputs_in_flight["internal"] == 1 and "internal" in raw_plane._native_terminal_pending
-    with pytest.raises(RuntimeError, match="quarantined"):  # the quarantine rejects new tickets
-        raw_plane._delivery_manager.create_ticket(request_id="other", put_key="other_0_0")
+    raw_plane.complete_outputs(req_ids=["internal"], inter_stage_outputs=[{"c": 0}], sampled_token_ids=[[21]])
+    assert puts  # the failed put is attempted, then given up
+    assert raw_plane._native_output_error is None
+    assert not raw_plane._delivery_manager.is_quarantined
+    failures = raw_plane._permanent_send_failure_map()
+    assert "external" in failures
+    assert "send failed permanently" in failures["external"][1]
+    raw_plane._delivery_manager.create_ticket(request_id="other", put_key="other_0_0")
     _stop_save_thread(raw_plane)
 
 
@@ -1402,6 +1404,8 @@ def test_release_reclaims_segments_no_downstream_stage_consumed(plane):
     """A text-only request never runs the Talker, so the producer must unlink."""
     ext_id = f"release_{uuid.uuid4().hex}"
     connector = SharedMemoryConnector({"stage_id": 0})
+    # The sender refuses a put to a stage with no visible peer, so keep a stage-1 receiver alive.
+    downstream = SharedMemoryConnector({"stage_id": 1})
     plane.__dict__.update(_omni_connector=connector, _stage_id=0, _request_ids_mapping={})
     plane.register_request(_new_request(external_req_id=ext_id))
     sibling_key = f"{ext_id}_1_0_0"
@@ -1423,6 +1427,7 @@ def test_release_reclaims_segments_no_downstream_stage_consumed(plane):
         assert connector.put("0", "1", f"{ext_id}_0_2", "late")[0]
         assert plane.release_shm_resources([ext_id, "unknown"]) == 1
     finally:
+        downstream.close()
         connector.close()
 
 

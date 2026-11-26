@@ -20,12 +20,14 @@ from vllm_omni.model_executor.models.alpamayo2_super import openpi as alpamayo_o
 from vllm_omni.model_executor.models.alpamayo2_super.alpamayo2_super import (
     Alpamayo2SuperPolicyForConditionalGeneration,
 )
+from vllm_omni.model_executor.models.alpamayo2_super.model_state import Alpamayo2SuperModelState
 from vllm_omni.model_executor.models.alpamayo2_super.processing import (
     SPECIAL_TOKENS,
     build_trajectory_messages,
     encode_history_tokens,
 )
 from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -133,6 +135,44 @@ def test_kv_metadata_survives_a_step_scheduled_after_the_trigger():
     _step(model, [FUTURE_START, 7], ["b", "c"], [100, 50], [1, 1])
     _step(model, [FUTURE_END, 8], ["b", "c"], [101, 51], [1, 1])
     assert model.get_kv_transfer_metadata("b") == {"prefix_len": 101, "trigger_position": [0, 10, 20]}
+
+
+def test_mrv2_state_feeds_the_trigger_to_the_kv_metadata(monkeypatch):
+    # Model Runner V2 calls the model's hooks through its model state, with the step's M-RoPE positions.
+    model = _make_model()
+    monkeypatch.setattr(
+        OmniModelState,
+        "prepare_inputs",
+        lambda self, input_batch, req_states: {"positions": torch.stack([torch.arange(4) + 10 * i for i in range(3)])},
+    )
+    state = Alpamayo2SuperModelState.__new__(Alpamayo2SuperModelState)
+    state.model = model
+    batch = SimpleNamespace(
+        num_reqs=3,
+        input_ids=torch.tensor([5, 6, FUTURE_START, FUTURE_START + 1]),
+        positions=torch.arange(4),
+        req_ids=["a", "b", "c"],
+        num_computed_tokens_np=np.array([0, 100, 50]),
+        num_scheduled_tokens=np.array([2, 1, 1]),
+    )
+
+    inputs = state.prepare_inputs(batch, req_states=None)
+
+    assert inputs["positions"].shape == (3, 4)
+    assert model._step_triggers.tolist() == [False, True, False]
+    assert model.get_kv_transfer_metadata("b") == {"prefix_len": 101, "trigger_position": [2, 12, 22]}
+
+
+def test_model_runs_on_its_mrv2_state(monkeypatch):
+    monkeypatch.setattr(Alpamayo2SuperModelState, "__init__", lambda self, *args: setattr(self, "args", args))
+    model = _make_model()
+    state = model.create_omni_model_state("vllm_config", "encoder_cache", "device")
+    assert isinstance(state, Alpamayo2SuperModelState) and state.args == (
+        "vllm_config",
+        model,
+        "encoder_cache",
+        "device",
+    )
 
 
 def test_requests_that_leave_the_batch_are_forgotten():

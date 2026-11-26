@@ -43,14 +43,18 @@ Model Runner V1 is rejected on vLLM 0.34 (`resolve_stage_model_runner()` in `vll
 3. model.forward(..., **kwargs)                      # Backbone (PagedAttention / Mamba-Hybrid); MUST accept **kwargs (model_intermediate_buffer)
 4. model_state.postprocess_model_output(...)         # Extracts (text_hidden, multimodal_outputs)
    (+ optional model_state.run_postprocess when postprocess_requires_multimodal_outputs=True)
-5. sample_with_output(sampler, ...)                  # Standard sampler OR OmniSampler from model.mrv2_custom_sampler(sampler) -> (sampler, rejection_sampler) | None
+5. sample_with_output(sampler, ...)                  # Standard sampler or OmniSampler from model_state.custom_sampler(sampler)
+   #   - The generic model state delegates sampler registration to model.mrv2_custom_sampler(sampler)
+   #   - Override model_state.compute_sample_logits to apply request-local logit rules (e.g. HaruModelState)
    #   - Override OmniSampler.__call__ for logits masking (e.g. MiniCPMO45DuplexSampler -> prepare_duplex_sampling)
    #   - Override OmniSampler.sample_step returning OmniSamplingOutput(multimodal_outputs=...) for in-step audio
 6. model_state.post_sample(input_batch, text_hidden, sampled_token_ids, multimodal_outputs, ...)
    # Optional post-sample hook on a custom OmniModelState (e.g. PersonaPlexModelState)
 ```
 
-> **Important MRv2 dispatch warning**: Generic `OmniModelState` and `OmniARModelRunner` do **not** automatically call bare `model.preprocess_batch`, `model.prepare_duplex_sampling`, `model.consume_sampled_token_ids_cpu_override`, or `model.post_sample_multimodal_outputs` (note: `haru/haru.py` still defines those legacy V1 methods — do not copy them for MRv2 models). On MRv2, wire batch prefill via `preprocess_batch_mrv2` (or a custom `OmniModelState.run_preprocess`), wire logits masking / in-step audio via `mrv2_custom_sampler(self, sampler) -> (omni_sampler, rejection_sampler) | None`, and wire post-sample state updates via `OmniModelState.post_sample` returned from `def create_mrv2_model_state(self, vllm_config, encoder_cache, device)` (instance method — **never** `@classmethod`, as `init_omni_model_state()` calls `getattr(type(model), "create_mrv2_model_state")(model, vllm_config, encoder_cache, device)`).
+Use the MRv2 hooks above for batch preparation, sampling, and audio output. Legacy callbacks such as `preprocess_batch`, `prepare_duplex_sampling`, `consume_sampled_token_ids_cpu_override`, and `post_sample_multimodal_outputs` require an explicit caller. Define `create_mrv2_model_state(self, vllm_config, encoder_cache, device)` as an instance method because the factory passes the model instance as the first argument.
+
+Haru's model state extends `OmniMambaHybridModelState` to preserve Qwen3.5 recurrent state and clears the temporary request rows in `run_preprocess` before delegating. Its sampler uses standard token sampling and commits each accepted frame, including its audio, in `OmniSampler.sample_step`. `compute_sample_logits` applies Haru's text-stream rules during sampling, while prompt logprobs and sampler profiling use the backbone's stateless logit projection.
 
 ### Single-Stage In-Step Audio (`sparse_audio` Contract on MRv2)
 
