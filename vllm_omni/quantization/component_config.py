@@ -158,3 +158,29 @@ class ComponentQuantizationConfig(QuantizationConfig):
     @property
     def default_config(self) -> QuantizationConfig | None:
         return self._default
+
+
+def enable_pattern_ignored_layers(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Switch supported quantization configs to substring matching for ``ignored_layers``.
+
+    Quantization configs default to exact full-prefix matching so short names do
+    not unexpectedly skip layers in models that expect full paths. Pipelines
+    that document short module-name patterns (such as ``to_out`` or ``img_mlp``)
+    call this helper to opt into substring matching across every wrapped config
+    that declares non-empty ``ignored_layers``.
+    """
+    if quant_config is None:
+        return quant_config
+    component_configs = getattr(quant_config, "component_configs", None)
+    if component_configs is not None:
+        configs = [*component_configs.values(), getattr(quant_config, "default_config", None)]
+    else:
+        configs = [quant_config]
+    for config in configs:
+        if config is None:
+            continue
+        if getattr(config, "ignored_layers", None) and hasattr(config, "ignored_layers_match_mode"):
+            config.ignored_layers_match_mode = "substring"
+    return quant_config
