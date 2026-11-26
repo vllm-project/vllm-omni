@@ -35,6 +35,7 @@ from vllm_omni.clients.duplex import (
     SessionConfig,
     SessionResumed,
     SessionUpdated,
+    acknowledge_collected_playback,
     build_realtime_url,
     chunk_period_ms,
     duplex_unit_boundary_ms,
@@ -172,9 +173,11 @@ class FakeInlineOmni:
     def __init__(self) -> None:
         self.opened: list[dict[str, object]] = []
         self.handles: list[FakeInlineHandle] = []
+        self.open_timeouts: list[float | None] = []
 
-    async def open_session(self, config: dict[str, object]) -> FakeInlineHandle:
+    async def open_session(self, config: dict[str, object], *, timeout: float | None = None) -> FakeInlineHandle:
         self.opened.append(dict(config))
+        self.open_timeouts.append(timeout)
         handle = FakeInlineHandle(SESSION_ID)
         self.handles.append(handle)
         handle.deliver(
@@ -214,8 +217,8 @@ def _inline_rig(*, handshake: dict[str, object] | None = SESSION_CREATED) -> Rig
     client, omni = make_inline_client()
     original_open = omni.open_session
 
-    async def open_session(config: dict[str, object]) -> FakeInlineHandle:
-        handle = await original_open(config)
+    async def open_session(config: dict[str, object], *, timeout: float | None = None) -> FakeInlineHandle:
+        handle = await original_open(config, timeout=timeout)
         if handshake is not SESSION_CREATED:
             # Replace the default session.created with the requested first event.
             handle._outbox = asyncio.Queue()
@@ -258,6 +261,11 @@ def test_session_config_payload_defaults():
     assert payload["extra_body"] == {"auto_response": True}
     assert "voice" not in payload
     assert "ref_audio" not in payload
+
+
+def test_session_config_payload_omits_unset_modalities():
+    payload = SessionConfig(modalities=None).to_session_payload(model="m")
+    assert "modalities" not in payload
 
 
 def test_session_config_payload_carries_preset_rates():
@@ -463,6 +471,25 @@ async def test_resync_required_drops_resume_credential():
 
 # ---------------------------------------------------------------------------
 # Input events (websocket wire shape)
+
+
+@pytest.mark.asyncio
+async def test_append_text_interleaves_with_audio_without_advancing_audio_clock():
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    client, _ = make_client(sock)
+    async with client:
+        await client.append_audio(b"\x00\x10" * 1600)
+        await client.append_text("hello", force_listen=True)
+        await client.append_audio(b"\x00\x10" * 1600)
+        await client.append_text("world")
+        appends = [e for e in sock.sent if e.get("type") in {"input.text.append", "input_audio_buffer.append"}]
+        assert [e.get("audio_end_ms") for e in appends] == [100, None, 200, None]
+        assert appends[1]["text"] == "hello" and appends[1]["force_listen"] is True
+        assert appends[3]["text"] == "world" and appends[3]["force_listen"] is False
+        with pytest.raises(ValueError, match="non-empty"):
+            await client.append_text("")
+        sock.feed(SESSION_CLOSED)
 
 
 @pytest.mark.asyncio
@@ -913,6 +940,27 @@ async def test_inline_handshake_opens_session_with_payload_and_adopts_id():
         await client.send({"type": "session.update", "session": {"instructions": "later"}})
         assert [type(command) for command in handle.commands] == [duplex_commands.UpdateSession]
         assert handle.commands[0].patch == {"instructions": "later"}
+
+
+@pytest.mark.asyncio
+async def test_inline_client_forwards_handshake_timeout_to_open_session():
+    client, omni = make_inline_client(handshake_timeout_s=7.5)
+    async with client:
+        assert client.session_id == SESSION_ID
+    # The client advertises a handshake budget; the session open must honour
+    # it instead of silently falling back to the engine default.
+    assert omni.open_timeouts == [7.5]
+
+
+@pytest.mark.asyncio
+async def test_inline_client_leaves_the_open_timeout_to_the_engine_by_default():
+    omni = FakeInlineOmni()
+    client = InlineDuplexClient(omni, model="test-model")
+    async with client:
+        assert client.session_id == SESSION_ID
+    # Without a caller-supplied budget the client must not forward one, so the
+    # engine's own open default (which a cold start relies on) stays in force.
+    assert omni.open_timeouts == [None]
 
 
 @pytest.mark.asyncio
@@ -1823,3 +1871,182 @@ def test_event_collector_response_text_joins_deltas_per_response():
     assert collector.response_text("r1") == "hello"
     assert collector.response_text("r2") == "other"
     assert collector.response_text("r3") == ""
+
+
+def _stage_event(response_id: str, stage_metrics: dict, *, event_type: str = "response.done") -> dict:
+    return {
+        "type": event_type,
+        "response": {"id": response_id},
+        "vllm_omni": {"stage_metrics": stage_metrics},
+    }
+
+
+def test_timing_summary_keeps_every_stage_snapshot_not_just_stage_zero():
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(
+        _stage_event("resp-a", {"0": {"num_tokens_out": 5, "stage_name": "llm"}}, event_type="response.text.delta"),
+        received_at_s=10.1,
+    )
+    collector.add(
+        _stage_event(
+            "resp-a",
+            {
+                "0": {"num_tokens_out": 20, "vllm_ttft_ms": 100.0, "stage_name": "llm"},
+                "1": {"output_unit_count": 3, "stage_name": "token2wav"},
+            },
+        ),
+        received_at_s=10.2,
+    )
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert timing["stage_metrics"] == {
+        "0": {"num_tokens_out": 20, "vllm_ttft_ms": 100.0, "stage_name": "llm"},
+        "1": {"output_unit_count": 3, "stage_name": "token2wav"},
+    }
+    assert timing["stage0_tokens"]["output_token_count"] == 20
+    assert timing["stage0_tokens"]["ttft_ms"] == 100.0
+
+
+def test_timing_summary_keeps_stages_absent_from_later_events():
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(
+        _stage_event(
+            "resp-a",
+            {"0": {"num_tokens_out": 4}, "1": {"output_unit_count": 2}},
+            event_type="response.text.delta",
+        ),
+        received_at_s=10.1,
+    )
+    collector.add(_stage_event("resp-a", {"0": {"num_tokens_out": 9}}), received_at_s=10.2)
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert timing["stage_metrics"] == {"0": {"num_tokens_out": 9}, "1": {"output_unit_count": 2}}
+
+
+def test_timing_summary_stage_snapshots_are_scoped_to_one_response():
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(_stage_event("resp-a", {"0": {"num_tokens_out": 20}}), received_at_s=10.1)
+    collector.add({"type": "response.created", "response": {"id": "resp-b"}}, received_at_s=11.0)
+    collector.add(_stage_event("resp-b", {"0": {"num_tokens_out": 30}}), received_at_s=11.1)
+
+    assert collector.response_ids == ["resp-a", "resp-b"]
+    first = collector.timing_summary(after_s=10.0, response_id="resp-a")
+    second = collector.timing_summary(after_s=10.0, response_id="resp-b")
+
+    assert first["stage_metrics"] == {"0": {"num_tokens_out": 20}}
+    assert second["stage_metrics"] == {"0": {"num_tokens_out": 30}}
+
+
+def test_timing_summary_does_not_hand_out_the_stored_event_snapshot():
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(_stage_event("resp-a", {"0": {"num_tokens_out": 20}}), received_at_s=10.1)
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+    timing["stage_metrics"]["0"]["num_tokens_out"] = 999
+
+    assert collector.events[-1]["vllm_omni"]["stage_metrics"]["0"]["num_tokens_out"] == 20
+
+
+def test_timing_summary_omits_stage_metrics_when_the_server_sent_none():
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add({"type": "response.done", "response": {"id": "resp-a"}}, received_at_s=10.1)
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert "stage_metrics" not in timing
+    assert "stage0_tokens" not in timing
+
+
+def _text_only_collector(*, server_ttft_ms: float | None = None) -> EventCollector:
+    collector = EventCollector()
+    created: dict[str, object] = {"type": "response.created", "response": {"id": "resp-a"}}
+    if server_ttft_ms is not None:
+        created["response_request_metrics"] = {
+            "source": "server_monotonic_request_start",
+            "measurement_origin": {"ttft": "native request start to first text output"},
+            "ttft_ms": server_ttft_ms,
+        }
+    collector.add(created, received_at_s=10.1)
+    for received_at_s, delta in ((10.3, "Hello"), (11.3, " there"), (12.5, ".")):
+        collector.add(
+            {"type": "response.output_text.delta", "response_id": "resp-a", "delta": delta},
+            received_at_s=received_at_s,
+        )
+    collector.add({"type": "response.done", "response": {"id": "resp-a"}}, received_at_s=12.6)
+    return collector
+
+
+def test_text_only_response_reports_text_timing_without_audio_fields():
+    timing = _text_only_collector().timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert "audio_output" not in timing
+    assert timing["request_metrics"] == {
+        "source": "client_monotonic_receive",
+        "output_modality": "text",
+        "measurement_origin": {"ttft": "response.created client receive to first non-empty text delta"},
+        "ttft_ms": 200.0,
+    }
+
+
+def test_text_only_response_prefers_server_ttft():
+    timing = _text_only_collector(server_ttft_ms=420.0).timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert timing["request_metrics"]["source"] == "server_request_start_and_client_receive"
+    assert timing["request_metrics"]["ttft_ms"] == 420.0
+    assert timing["request_metrics"]["measurement_origin"]["ttft"] == "native request start to first text output"
+    assert "ttfp_ms" not in timing["request_metrics"]
+
+
+@pytest.mark.parametrize(
+    ("response", "output_modality"),
+    [
+        ({"output_modalities": ["text"]}, "text"),
+        ({"modalities": ["text"]}, "text"),
+        ({"modalities": ["text", "audio"]}, None),
+        ({}, None),
+    ],
+)
+def test_textless_response_modality_comes_from_response_created(response, output_modality):
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a", **response}}, received_at_s=10.1)
+    collector.add({"type": "response.done", "response": {"id": "resp-a"}}, received_at_s=10.2)
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert timing.get("output_modality") == output_modality
+
+
+def test_session_summary_counts_text_turns_apart_from_audio_turns():
+    summary = summarize_session_request_metrics(
+        [{"ttft_ms": 100.0, "output_modality": "text"}, {"ttft_ms": 300.0, "ttfp_ms": 400.0, "rtf": 0.5}],
+        session_id="sess-1",
+    )
+
+    assert (summary["audio_turn_count"], summary["text_turn_count"]) == (1, 1)
+    assert summary["ttft_ms"]["count"] == 2
+    assert summary["ttfp_ms"]["count"] == 1
+
+
+@pytest.mark.parametrize("supports_playback_ack", [True, False])
+def test_collected_playback_ack_follows_session_capability(supports_playback_ack):
+    sent: list[float] = []
+
+    class _Client:
+        session_info = {"capabilities": {"supports_playback_ack": supports_playback_ack}}
+
+        async def ack_playback(self, played_ms, **_):
+            sent.append(played_ms)
+
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=1.0)
+
+    asyncio.run(acknowledge_collected_playback(_Client(), collector))
+
+    assert sent == ([0] if supports_playback_ack else [])

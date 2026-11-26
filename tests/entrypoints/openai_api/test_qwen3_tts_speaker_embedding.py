@@ -42,7 +42,12 @@ base_server_params = [
         OmniServerParams(
             model=MODEL_BASE,
             stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
-            server_args=["--trust-remote-code", "--enforce-eager", "--disable-log-stats"],
+            server_args=[
+                "--trust-remote-code",
+                "--stage-overrides",
+                '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}',
+                "--disable-log-stats",
+            ],
         ),
         id="qwen3-tts-0.6b-base",
     )
@@ -53,7 +58,12 @@ base_1_7b_server_params = [
         OmniServerParams(
             model=MODEL_BASE_1_7B,
             stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
-            server_args=["--trust-remote-code", "--enforce-eager", "--disable-log-stats"],
+            server_args=[
+                "--trust-remote-code",
+                "--stage-overrides",
+                '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}',
+                "--disable-log-stats",
+            ],
         ),
         id="qwen3-tts-1.7b-base",
     )

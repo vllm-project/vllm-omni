@@ -19,7 +19,7 @@ from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 MODEL = "Tongyi-MAI/Z-Image-Turbo"
 PROMPT = "A high-detail studio photo of an orange tabby cat sitting on a laptop keyboard."
 
-FOUR_CARD_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=4)
+FOUR_CARD_MARKS = hardware_marks(res={"cuda": "L4", "rocm": "MI300"}, num_cards=4)
 
 
 def _get_diffusion_feature_cases():

@@ -1,0 +1,368 @@
+{
+  "schema_version": 1,
+  "cases": {
+    "t2i": {
+      "case": "t2i",
+      "captured_at": "2026-11-24T01:34:19.633695+00:00",
+      "contract": {
+        "model_id": "SenseNova/SenseNova-U1-8B-MoT",
+        "model_revision": "bfa9b436503cb8aed4f2bc60e3236710cc77468d",
+        "prompt": "Close portrait of an elderly woman by a farmhouse window, textured skin, gentle smile, warm natural light, emotional documentary look. The portrait should feel polished and natural, with sharp eyes, realistic skin texture, accurate facial anatomy, and premium lighting that keeps the face as the main focus.",
+        "sampling_params": {
+          "height": 2720,
+          "width": 1536,
+          "seed": 42,
+          "num_inference_steps": 50,
+          "extra_args": {
+            "cfg_scale": 4.0,
+            "cfg_norm": "none",
+            "timestep_shift": 3.0,
+            "cfg_interval": [
+              0.0,
+              1.0
+            ],
+            "batch_size": 1,
+            "think": true,
+            "t_eps": 0.02
+          }
+        },
+        "output_size": [
+          1536,
+          2720
+        ],
+        "input_image": null
+      },
+      "reference_pixels": [
+        {
+          "position": [
+            100,
+            100
+          ],
+          "rgb": [
+            233,
+            242,
+            247
+          ]
+        },
+        {
+          "position": [
+            768,
+            200
+          ],
+          "rgb": [
+            138,
+            92,
+            38
+          ]
+        },
+        {
+          "position": [
+            400,
+            600
+          ],
+          "rgb": [
+            192,
+            194,
+            166
+          ]
+        },
+        {
+          "position": [
+            1200,
+            2000
+          ],
+          "rgb": [
+            20,
+            11,
+            4
+          ]
+        },
+        {
+          "position": [
+            750,
+            500
+          ],
+          "rgb": [
+            187,
+            183,
+            180
+          ]
+        },
+        {
+          "position": [
+            300,
+            1360
+          ],
+          "rgb": [
+            250,
+            228,
+            194
+          ]
+        },
+        {
+          "position": [
+            1000,
+            1800
+          ],
+          "rgb": [
+            37,
+            20,
+            10
+          ]
+        },
+        {
+          "position": [
+            500,
+            2400
+          ],
+          "rgb": [
+            63,
+            56,
+            44
+          ]
+        },
+        {
+          "position": [
+            768,
+            1360
+          ],
+          "rgb": [
+            224,
+            200,
+            181
+          ]
+        },
+        {
+          "position": [
+            200,
+            900
+          ],
+          "rgb": [
+            88,
+            57,
+            23
+          ]
+        }
+      ],
+      "environment": {
+        "reference_hardware": "MI300",
+        "gpu": "AMD_Instinct_MI300X",
+        "driver": [
+          "============================ ROCm System Management Interface ============================",
+          "============================== Version of System Component ===============================",
+          "================================== End of ROCm SMI Log ===================================",
+          "==========================================================================================",
+          "Driver version: 6.19.14.31400100"
+        ],
+        "python": "3.12.16",
+        "cuda": null,
+        "rocm": "7.15.26333",
+        "packages": {
+          "torch": "2.13.0+rocm10.0.0",
+          "vllm": "0.34.0+rocm100",
+          "transformers": "5.22.0",
+          "diffusers": "0.42.0",
+          "cache-dit": "1.5.0"
+        },
+        "ci_image": "amd-native:5b8c184f4d51c29fa81248846c21b264ac5d084c",
+        "build_url": "https://buildkite.com/vllm/vllm-omni-amd-ci/builds/17342"
+      },
+      "source": {
+        "git_commit": null,
+        "declared_commit": null,
+        "git_diff_sha256": null,
+        "test_source_sha256": {
+          "tests/e2e/accuracy/sensenova_u1.py": "7b7c1ecc8b5fc16caa0864bbb3b81a4222cb0e3bf29c4f5e4acedd71c2f92344",
+          "tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py": "7607c3cab4657fe922492e04e6ca984a371ac4a45470b362d085941250155343",
+          "tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py": "4be74e6f14aab6762091ad21ba2d3d3959cf12f92981870f161e36bb77ab79b0"
+        }
+      },
+      "output_png_sha256": "77891ad1afac16e7be3e8a17e9d536d6150fbe24bc435c47d7e29d51b05f6996"
+    },
+    "i2i": {
+      "case": "i2i",
+      "captured_at": "2026-11-24T01:36:26.818002+00:00",
+      "contract": {
+        "model_id": "SenseNova/SenseNova-U1-8B-MoT",
+        "model_revision": "bfa9b436503cb8aed4f2bc60e3236710cc77468d",
+        "prompt": "Turn this into an oil painting",
+        "sampling_params": {
+          "height": 1669,
+          "width": 2560,
+          "seed": 42,
+          "num_inference_steps": 50,
+          "extra_args": {
+            "cfg_scale": 4.0,
+            "img_cfg_scale": 1.0,
+            "cfg_norm": "none",
+            "timestep_shift": 3.0,
+            "cfg_interval": [
+              0.0,
+              1.0
+            ],
+            "batch_size": 1,
+            "think": true,
+            "t_eps": 0.02
+          }
+        },
+        "output_size": [
+          2560,
+          1664
+        ],
+        "input_image": {
+          "size": [
+            2560,
+            1669
+          ],
+          "rgb_sha256": "9df3acd8d65a7b6758b80d73f1f79833ea53529b73733b3cda4cb5f081391a6b"
+        }
+      },
+      "reference_pixels": [
+        {
+          "position": [
+            100,
+            100
+          ],
+          "rgb": [
+            88,
+            127,
+            169
+          ]
+        },
+        {
+          "position": [
+            400,
+            50
+          ],
+          "rgb": [
+            120,
+            141,
+            173
+          ]
+        },
+        {
+          "position": [
+            700,
+            100
+          ],
+          "rgb": [
+            119,
+            147,
+            176
+          ]
+        },
+        {
+          "position": [
+            150,
+            400
+          ],
+          "rgb": [
+            80,
+            136,
+            189
+          ]
+        },
+        {
+          "position": [
+            512,
+            336
+          ],
+          "rgb": [
+            173,
+            175,
+            178
+          ]
+        },
+        {
+          "position": [
+            700,
+            400
+          ],
+          "rgb": [
+            67,
+            121,
+            175
+          ]
+        },
+        {
+          "position": [
+            100,
+            600
+          ],
+          "rgb": [
+            204,
+            188,
+            162
+          ]
+        },
+        {
+          "position": [
+            400,
+            600
+          ],
+          "rgb": [
+            140,
+            169,
+            186
+          ]
+        },
+        {
+          "position": [
+            700,
+            600
+          ],
+          "rgb": [
+            181,
+            186,
+            178
+          ]
+        },
+        {
+          "position": [
+            256,
+            256
+          ],
+          "rgb": [
+            119,
+            149,
+            179
+          ]
+        }
+      ],
+      "environment": {
+        "reference_hardware": "MI300",
+        "gpu": "AMD_Instinct_MI300X",
+        "driver": [
+          "============================ ROCm System Management Interface ============================",
+          "============================== Version of System Component ===============================",
+          "================================== End of ROCm SMI Log ===================================",
+          "==========================================================================================",
+          "Driver version: 6.19.14.31400100"
+        ],
+        "python": "3.12.16",
+        "cuda": null,
+        "rocm": "7.15.26333",
+        "packages": {
+          "torch": "2.13.0+rocm10.0.0",
+          "vllm": "0.34.0+rocm100",
+          "transformers": "5.22.0",
+          "diffusers": "0.42.0",
+          "cache-dit": "1.5.0"
+        },
+        "ci_image": "amd-native:5b8c184f4d51c29fa81248846c21b264ac5d084c",
+        "build_url": "https://buildkite.com/vllm/vllm-omni-amd-ci/builds/17342"
+      },
+      "source": {
+        "git_commit": null,
+        "declared_commit": null,
+        "git_diff_sha256": null,
+        "test_source_sha256": {
+          "tests/e2e/accuracy/sensenova_u1.py": "7b7c1ecc8b5fc16caa0864bbb3b81a4222cb0e3bf29c4f5e4acedd71c2f92344",
+          "tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py": "7607c3cab4657fe922492e04e6ca984a371ac4a45470b362d085941250155343",
+          "tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py": "4be74e6f14aab6762091ad21ba2d3d3959cf12f92981870f161e36bb77ab79b0"
+        }
+      },
+      "output_png_sha256": "81847ab8f7ed870ee5e49ea97c58b857f69b5be55614509e9b1361f3ec7bb154"
+    }
+  }
+}

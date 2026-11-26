@@ -18,7 +18,7 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 pytestmark = [
     pytest.mark.full_model,
     pytest.mark.tts,
-    *hardware_marks(res={"cuda": ["L4", "H100", "B200"]}, num_cards=1),
+    *hardware_marks(res={"cuda": ["L4", "H100", "B200"], "rocm": "MI325"}, num_cards=1),
 ]
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -33,7 +33,6 @@ def vae_path() -> Path:
 
 
 @pytest.mark.parametrize("max_frames,truncated", [(200, True), (9000, False)], ids=["budget", "natural-eos"])
-@pytest.mark.skip(reason="YuE2 audio synthesis requires unsupported ModelRunnerV1 hooks")
 def test_offline_example_saves_audio(vae_path: Path, tmp_path: Path, max_frames: int, truncated: bool) -> None:
     model = Path(os.environ.get("YUE2_MODEL_DIR", get_model_prefix() + "m-a-p/YuE2-3B"))
     if not model.is_dir():

@@ -647,6 +647,110 @@ def test_forward_passes_variable_length_padded_batch_to_decoder():
     torch.testing.assert_close(audios[1], torch.arange(1008, 1016, dtype=torch.float32))
 
 
+def test_decoder_graphs_are_captured_by_the_warmup_hook_not_load_weights():
+    model = _make_model(async_chunk=True, device=torch.device("cuda"))
+
+    _load_weights_noop(model)
+    assert model.decoder.cudagraph_calls == []
+
+    model.capture_auxiliary_graphs()
+    model.capture_auxiliary_graphs()
+    assert len(model.decoder.cudagraph_calls) == 1
+
+
+def test_weight_reload_after_warmup_recaptures_decoder_graphs_at_once():
+    model = _make_model(async_chunk=True, device=torch.device("cuda"))
+    _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
+
+    _load_weights_noop(model)
+
+    assert len(model.decoder.cudagraph_calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("rocm", "eager", "async_chunk", "expected"),
+    [(True, True, True, 1), (False, True, True, 0), (True, False, True, 0), (True, True, False, 0)],
+)
+def test_rocm_eager_decoder_initialization_is_deferred_and_idempotent(rocm, eager, async_chunk, expected):
+    model = _make_model(async_chunk=async_chunk, device=torch.device("cuda"))
+    model.vllm_config.model_config.enforce_eager = eager
+    with (
+        patch("vllm_omni.platforms.current_omni_platform.is_rocm", return_value=rocm),
+        patch.object(model, "_warmup_eager_decoder") as warmup,
+    ):
+        _load_weights_noop(model)
+        warmup.assert_not_called()
+        model.capture_auxiliary_graphs()
+        model.capture_auxiliary_graphs()
+        assert warmup.call_count == expected
+        # Reloading weights must initialize the new decoder again.
+        _load_weights_noop(model)
+        assert warmup.call_count == expected * 2
+
+
+@pytest.mark.parametrize("ramp", [[], [1, 4, 8, 16, 25]])
+def test_eager_warmup_covers_partial_batches_without_retaining_request_state(ramp):
+    model = _make_model(async_chunk=True)
+    model.vllm_config.scheduler_config = SimpleNamespace(max_num_seqs=8)
+    model._decode_batch_max_size = 4
+    model._decoder_sliding_window = 72
+    model.decoder._initial_codec_chunk_frames = 1
+    model.decoder._incremental_chunk_frames = 25
+    model.decoder._incremental_chunk_ramp = ramp
+    model.decoder.capture_first_audio_state_only = True
+    sentinel = {"existing-request": {"prefix_frames": 12}}
+    model._decoder_state_cache = sentinel.copy()
+    random_state = torch.random.get_rng_state().clone()
+    with patch("torch.accelerator.synchronize") as synchronize:
+        model._warmup_eager_decoder(torch.device("cpu"))
+        synchronize.assert_called_once_with(torch.device("cpu"))
+    calls = model.decoder.batched_decode_calls
+    assert {call["codes_shape"][0] for call in calls} == {1, 2, 3, 4}
+    assert {call["caches"][0]["prefix_frames"] for call in calls} == {0, 72}
+    assert {call["caches"][0]["skip_first_audio"] for call in calls} == {False, True}
+    assert all(call["codes_shape"][0] == len(call["caches"]) for call in calls)
+    # Each simulated request owns its cache, including rows in the same batch.
+    for call in calls:
+        caches = call["caches"]
+        assert len({id(cache) for cache in caches}) == len(caches)
+    assert model._decoder_state_cache == sentinel
+    torch.testing.assert_close(torch.random.get_rng_state(), random_state, rtol=0, atol=0)
+
+
+def test_eager_warmup_preserves_uncapped_batching_startup():
+    model = _make_model(async_chunk=True)
+    assert model._decode_batch_max_size == 0
+    with patch("torch.accelerator.synchronize") as synchronize:
+        model._warmup_eager_decoder(torch.device("cpu"))
+        synchronize.assert_not_called()
+    assert model.decoder.batched_decode_calls == []
+
+
+def test_streaming_codec_is_built_by_the_warmup_hook(monkeypatch):
+    from vllm_omni.model_executor.models.qwen3_tts import streaming_code2wav
+    from vllm_omni.platforms import current_omni_platform
+
+    built = []
+    monkeypatch.setattr(streaming_code2wav, "StreamingCode2Wav", lambda decoder, **kwargs: built.append(kwargs))
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    model = _make_model(
+        async_chunk=True,
+        device=torch.device("cuda"),
+        stage_connector_config={"extra": {"decode_streaming": True}},
+    )
+    model.vllm_config.scheduler_config = SimpleNamespace(max_num_seqs=4)
+
+    _load_weights_noop(model)
+    assert built == []
+
+    model.capture_auxiliary_graphs()
+    model.capture_auxiliary_graphs()
+    assert len(built) == 1
+    assert built[0]["num_slots"] == 4
+    assert model.decoder.cudagraph_calls == []  # the streaming codec captures its own graphs
+
+
 def test_decode_chunking_override_is_passed_to_cudagraph():
     model = _make_model(
         async_chunk=True,
@@ -662,6 +766,7 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
     )
 
     _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
 
     assert model.decoder.cudagraph_calls[-1] == {
         "capture_modes": ("icl", "xvec"),
@@ -690,6 +795,7 @@ def test_cudagraph_batch_config_is_preserved():
     )
 
     _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
 
     call = model.decoder.cudagraph_calls[-1]
     assert call["capture_batch_sizes"] == [1, 2, 4, 8]
@@ -699,6 +805,7 @@ def test_cudagraph_captures_only_modes_used_by_the_model():
     model = _make_model(async_chunk=True, device=torch.device("cuda"))
     model.decoder_cudagraph_modes = ("xvec",)
     _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
     assert model.decoder.cudagraph_calls[-1]["capture_modes"] == ("xvec",)
 
 
@@ -714,6 +821,7 @@ def test_stateless_cudagraph_capture_sizes_are_passed_from_config():
     )
 
     _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
 
     assert model.decoder.cudagraph_calls[-1]["stateless_capture_sizes"] == [97, 400]
 
@@ -730,6 +838,7 @@ def test_async_cudagraph_ignores_stateless_capture_sizes():
     )
 
     _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
 
     assert model.decoder.cudagraph_calls[-1]["stateless_capture_sizes"] is None
 
@@ -1170,6 +1279,7 @@ def test_decode_autotune_restores_process_flags(mocker, monkeypatch, capture_fai
 
     capture_mock = mocker.patch.object(model, "_maybe_enable_decoder_cudagraph", side_effect=capture)
     _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
     capture_mock.assert_called_once()
     assert observed == [(True, 10, *original)]
     assert torch.backends.cudnn.benchmark is False

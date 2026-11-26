@@ -4,8 +4,9 @@
 
 import pytest
 import torch
+from transformers import PretrainedConfig
 from vllm import SamplingParams
-from vllm.config import ModelConfig, ParallelConfig, SchedulerConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig, ParallelConfig, SchedulerConfig, VllmConfig
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.engine import FinishReason
@@ -29,16 +30,34 @@ from vllm_omni.request import OmniRequest
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_v2_is_rejected_before_backbone_initialization(mocker):
+def test_v2_initializes_the_existing_acoustic_runtime(mocker):
+    config = mocker.Mock(
+        spec=VllmConfig,
+        parallel_config=mocker.Mock(spec=ParallelConfig, tensor_parallel_size=1, pipeline_parallel_size=1),
+        scheduler_config=mocker.Mock(spec=SchedulerConfig, async_scheduling=False),
+        model_config=mocker.Mock(spec=ModelConfig, use_v2_model_runner=True, hf_config=PretrainedConfig()),
+        cache_config=mocker.Mock(spec=CacheConfig, enable_prefix_caching=False),
+        speculative_config=None,
+        kv_transfer_config=None,
+    )
+    initialize = mocker.patch(
+        "vllm_omni.model_executor.models.yue2.runtime.Yue2Backbone.__init__", autospec=True, return_value=None
+    )
+    model = Yue2ForCausalLM(vllm_config=config)
+    initialize.assert_called_once_with(model, vllm_config=config, prefix="")
+    assert model.acoustic_started == []
+
+
+def test_speculative_decoding_is_rejected_before_backbone_initialization(mocker):
     config = mocker.Mock(
         spec=VllmConfig,
         parallel_config=mocker.Mock(spec=ParallelConfig, tensor_parallel_size=1, pipeline_parallel_size=1),
         scheduler_config=mocker.Mock(spec=SchedulerConfig, async_scheduling=False),
         model_config=mocker.Mock(spec=ModelConfig, use_v2_model_runner=True),
-        speculative_config=None,
+        speculative_config=object(),
     )
     initialize = mocker.patch("vllm_omni.model_executor.models.yue2.runtime.Yue2Backbone.__init__", return_value=None)
-    with pytest.raises(ValueError, match="YuE2 requires model runner v1 without speculative decoding"):
+    with pytest.raises(ValueError, match="YuE2 does not support speculative decoding"):
         Yue2ForCausalLM(vllm_config=config)
     initialize.assert_not_called()
 

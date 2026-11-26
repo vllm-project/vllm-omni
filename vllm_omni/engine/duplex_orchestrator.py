@@ -55,6 +55,8 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     _build_terminal_empty_output,
     build_engine_core_request_from_tokens,
+    stamp_downstream_stage_submit,
+    stamp_stage_submit,
 )
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.outputs import OmniRequestOutput
@@ -121,6 +123,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 frontend_count=frontend_count,
                 frontend_index=frontend_index,
             )
+            # Replicas that exited before READY never emit a runtime death notification.
+            for stage_id, pool in enumerate(self.stage_pools):
+                for replica_id, client in enumerate(pool.clients):
+                    if client is None:
+                        self.replica_placement.mark_unavailable(stage_id, replica_id)
             if frontend_count > 1:
                 admission_limit = self.replica_placement.frontend_session_limit(duplex_session_config.max_sessions)
         self.session_manager = DuplexSessionManager(
@@ -242,7 +249,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             # raced the submit); the cancel path aborts the stale request id.
             logger.debug("[DuplexOrchestrator] stale stage binding ignored for %s stage-%s", request_id, stage_id)
             return
-        req_state.stage_submit_ts[stage_id] = _time.time()
+        stamp_stage_submit(req_state, stage_id, refresh=False)
         if req_state.request_timestamp <= 0.0:
             req_state.request_timestamp = req_state.stage_submit_ts[stage_id]
         self._register_running_request(req_state)
@@ -287,6 +294,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         prompt = getattr(req_state, "prompt", None)
         info = prompt.get("additional_information") if isinstance(prompt, dict) else None
         item_id = info.get("realtime_item_id") if isinstance(info, dict) else None
+        duplex_bridge = req_state.streaming.bridge_states.get("duplex", {})
+        model_turn_id = duplex_bridge.get("model_turn_id") if isinstance(duplex_bridge, dict) else None
         context = DuplexOutputContext(
             identity=DuplexRequestIdentity(
                 session_id=req_state.session_id,
@@ -297,6 +306,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             segment_token_ids=tuple(segment.token_ids),
             segment_output_metadata=segment.output_metadata,
             perf_chunks=self._take_perf_chunks(req_state, stage_id),
+            model_turn_id=model_turn_id if stage_id == 0 and isinstance(model_turn_id, int) else None,
         )
         return runner.on_stage_output(
             stage_id,
@@ -304,6 +314,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             stage_metrics,
             request_id=request_id,
             context=context,
+            streaming_context=req_state.streaming,
             input_transcript=transcript,
             input_item_id=item_id if isinstance(item_id, str) else None,
         )
@@ -555,6 +566,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     @property
     def stage_count(self) -> int:
         return len(self.stage_pools)
+
+    def check_session_availability(self, session_id: str) -> None:
+        if self.replica_placement is not None:
+            self.replica_placement.check_session_availability(session_id)
 
     def reserve_session(self, session_id: str) -> None:
         if self.replica_placement is None:
@@ -812,6 +827,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             pool = self.stage_pools[context.stage_id]
             if mark_submitting is not None:
                 mark_submitting()
+            stamp_downstream_stage_submit(
+                request_state,
+                context.stage_id,
+                pool,
+                already_submitted=submission.already_submitted,
+                after_submit=False,
+            )
             try:
                 if submission.already_submitted:
                     if not submission.resumable:
@@ -829,10 +851,23 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 if pinned_replica_id is not None:
                     await self._handle_dead_replica(context.stage_id, pinned_replica_id, exc)
                 raise
+            stamp_downstream_stage_submit(
+                request_state,
+                context.stage_id,
+                pool,
+                already_submitted=submission.already_submitted,
+                after_submit=True,
+            )
 
         # The current-stage send has completed. Downstream prewarm
         # must not hold up another session's use of this stage's sender cache.
-        if not submission.already_submitted and self.async_chunk and context.stage_id == 0:
+        if (
+            not submission.already_submitted
+            and self.async_chunk
+            and context.stage_id == request_state.entry_stage_id
+            and request_state.final_stage_id > context.stage_id
+            and self.plugin.prewarms_downstream_stages(context.request_id)
+        ):
             prewarmed = await self._prewarm_async_chunk_stages(context.request_id, request, request_state)
             if not prewarmed:
                 # The prewarm already failed the request, aborted it and
@@ -843,7 +878,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 )
         request_state.stage_fences[context.stage_id] = context.fence
         now = _time.time()
-        request_state.stage_submit_ts[context.stage_id] = now
         request_state.request_timestamp = now
         self._register_running_request(request_state)
         return DuplexStageSubmissionResult(

@@ -629,6 +629,7 @@ class DiffusionWorker:
                 fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
                 use_hsdp=parallel_config.use_hsdp,
+                hsdp_data_parallel=getattr(parallel_config, "hsdp_data_parallel", False),
             )
             _setup_diffusion_worker_proc_title_and_log_prefix(
                 enable_ep=parallel_config.enable_expert_parallel,
@@ -892,6 +893,12 @@ class DiffusionWorker:
             "MixFusion capability discovery", lambda: inspect_mixfusion_capability(pipeline)
         )
 
+    def run_helios_vae_warmup(self) -> None:
+        """Run the optional, model-owned warmup once startup dummy work completes."""
+        if self.model_runner is None:
+            raise RuntimeError("Model runner must be initialized before Helios VAE warmup")
+        self.model_runner.run_helios_vae_warmup()
+
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Return native rank-local specs for every diffusion Worker."""
 
@@ -1149,19 +1156,42 @@ class DiffusionWorker:
         typed_init_info = engine.parse_init_info(init_info)
         engine.init_transfer_engine(typed_init_info)
 
-    def start_weight_update(self) -> None:
+    def start_weight_update(self, update_id: str | None = None) -> None:
         """Start a new weight update session for diffusion model."""
         engine = self._get_weight_transfer_engine()
         if self._weight_update_active:
             raise RuntimeError(
                 "start_weight_update called while a weight update is already active. Call finish_weight_update first."
             )
+        if update_id is not None and (not isinstance(update_id, str) or not update_id.strip()):
+            raise ValueError("update_id must be a non-empty string")
         try:
-            engine.start_weight_update()
+            if update_id is not None:
+                from vllm_omni.lora.weight_transfer import _accepts_update_id
+
+                if _accepts_update_id(engine.start_weight_update):
+                    engine.start_weight_update(update_id=update_id)
+                else:
+                    engine.start_weight_update()
+            else:
+                engine.start_weight_update()
         except BaseException:
-            engine.reset_weight_update_target()
+            try:
+                engine.reset_weight_update_target()
+            except Exception:
+                logger.warning(
+                    "Failed to reset weight update target while cleaning up a failed start_weight_update.",
+                    exc_info=True,
+                )
             raise
         self._weight_update_active = True
+        self._weight_update_id: str | None = update_id
+
+    def start_weight_update_with_id(self, update_id: str) -> None:
+        """Start a weight update session tagged with a caller-supplied ``update_id``."""
+        if not isinstance(update_id, str) or not update_id.strip():
+            raise ValueError("update_id must be a non-empty string")
+        self.start_weight_update(update_id=update_id)
 
     def update_weights(self, update_info: dict) -> None:
         """Receive one weight update chunk from the trainer.
@@ -1174,9 +1204,22 @@ class DiffusionWorker:
             raise RuntimeError("start_weight_update must be called before update_weights.")
         try:
             engine.update_weights(update_info)
-        except BaseException:
+        except BaseException as exc:
+            from vllm_omni.lora.weight_transfer import MergedLoRAUpdateIDMismatchError
+
+            if isinstance(exc, MergedLoRAUpdateIDMismatchError):
+                if hasattr(engine, "_skip_next_end_weight_update"):
+                    engine._skip_next_end_weight_update = False
+                raise
             self._weight_update_active = False
-            engine.reset_weight_update_target()
+            self._weight_update_id = None
+            try:
+                engine.reset_weight_update_target()
+            except Exception:
+                logger.warning(
+                    "Failed to reset weight update target while cleaning up a failed update_weights.",
+                    exc_info=True,
+                )
             raise
 
     def finish_weight_update(self) -> None:
@@ -1187,8 +1230,41 @@ class DiffusionWorker:
         try:
             engine.finish_weight_update()
         finally:
-            engine.reset_weight_update_target()
             self._weight_update_active = False
+            self._weight_update_id = None
+            try:
+                engine.reset_weight_update_target()
+            except Exception:
+                # Never turn an already-committed finish_weight_update into a
+                # false failure, and never mask a pre-existing finish exception.
+                logger.warning(
+                    "Failed to reset weight update target while finishing a weight update session.",
+                    exc_info=True,
+                )
+
+    def abort_weight_update(self, update_id: str | None = None) -> bool:
+        """Abort an active weight update session without committing staged tensors."""
+        engine = self._get_weight_transfer_engine()
+        if update_id is not None and (not isinstance(update_id, str) or not update_id.strip()):
+            raise ValueError("update_id must be a non-empty string")
+        if not self._weight_update_active:
+            return False
+        if update_id is not None and getattr(self, "_weight_update_id", None) != update_id:
+            return False
+        self._weight_update_active = False
+        self._weight_update_id = None
+        abort_fn = getattr(engine, "abort_weight_update", None)
+        try:
+            if callable(abort_fn):
+                abort_fn()
+            else:
+                engine.reset_weight_update_target()
+        except Exception:
+            logger.warning(
+                "Failed to clean up diffusion weight transfer engine during abort_weight_update.",
+                exc_info=True,
+            )
+        return True
 
     def execute_model(
         self,
@@ -1199,12 +1275,11 @@ class DiffusionWorker:
     ) -> DiffusionOutput | dict[str, int | DiffusionOutput]:
         """Execute a forward pass by delegating to the model runner.
 
-        If *req* is a list (DP multi-concurrency), each rank picks one complete
-        NewRequestData envelope based on its distributed rank. AllGather in
-        the layerwise offload only gathers weight shards (request-independent),
-        so all ranks stay synchronised at each AllGather call while computing
-        different activations. Selecting the envelope keeps Scheduler-issued
-        KV metadata bound to the request that owns its block tables.
+        If *req* is a list (rank-local DP concurrency), each rank picks one
+        complete NewRequestData envelope based on its distributed rank. Weight
+        collectives are request-independent, so ranks can compute different
+        activations while remaining synchronized. Selecting the envelope keeps
+        Scheduler-issued KV metadata bound to its owning request.
 
         Each rank returns its OWN DiffusionOutput (no gather). The executor
         collects N responses via the per-worker result queues.

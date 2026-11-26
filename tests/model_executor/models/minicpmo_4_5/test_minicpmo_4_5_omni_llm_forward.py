@@ -28,11 +28,12 @@ def test_multimodal_runner_preserves_forwarded_token_identities(monkeypatch):
         lambda **kwargs: stage_model,
     )
     monkeypatch.setattr(
-        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat.patch_minicpmo_remote_config",
+        "vllm_omni.model_executor.models.minicpmo_4_5.config.patch_minicpmo_remote_config",
         lambda config: None,
     )
     config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(), multimodal_config=None, model_stage="llm")
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(), multimodal_config=None, model_stage="llm"),
+        additional_config={},
     )
     wrapper = MiniCPMO45OmniForConditionalGeneration(vllm_config=config)
     assert wrapper.omni_pooler_payload_include_hidden
@@ -54,7 +55,12 @@ def test_multimodal_runner_preserves_forwarded_token_identities(monkeypatch):
     # This same upstream path prepares normal multimodal forwards and graph
     # capture inputs. Embeddings must not replace the real token identities.
     input_ids, inputs_embeds, _ = OmniGPUModelRunner._prepare_mm_inputs(runner, scheduler, batch, dummy_run=False)
-    out = wrapper.forward(input_ids=input_ids, positions=torch.tensor([10, 11]), inputs_embeds=inputs_embeds)
+    batch.positions = torch.tensor([10, 11])
+    forward_output = wrapper.forward(input_ids=input_ids, positions=batch.positions, inputs_embeds=inputs_embeds)
+    torch.testing.assert_close(forward_output, hidden)
+    out = wrapper.make_omni_output_mrv2(
+        forward_output, input_batch=batch, req_states=None, model_intermediate_buffer=[]
+    )
 
     torch.testing.assert_close(out.multimodal_outputs["latent_input_ids"], token_buffer[:2, None])
     torch.testing.assert_close(out.multimodal_outputs["latent_positions"], torch.tensor([[10], [11]]))
@@ -77,6 +83,7 @@ def test_thinker_forward_returns_bare_hidden_states():
     """
     model = MiniCPMO45OmniLLMForConditionalGeneration.__new__(MiniCPMO45OmniLLMForConditionalGeneration)
     torch.nn.Module.__init__(model)
+    model.rope_row_offsets = None
     model.llm = MagicMock()
     mock_hidden_states = torch.randn(4, 4096)
     model.llm.model = MagicMock(return_value=mock_hidden_states)
@@ -97,6 +104,7 @@ def test_thinker_forward_builds_embeddings_once_when_inputs_embeds_none():
     exactly once and forwards them to self.llm.model with input_ids=None."""
     model = MiniCPMO45OmniLLMForConditionalGeneration.__new__(MiniCPMO45OmniLLMForConditionalGeneration)
     torch.nn.Module.__init__(model)
+    model.rope_row_offsets = None
     model.llm = MagicMock()
     mock_hidden_states = torch.randn(4, 4096)
     model.llm.model = MagicMock(return_value=mock_hidden_states)
@@ -156,12 +164,8 @@ def test_wrapper_shape_normalization(thinker_shape, expected_shape):
         positions=torch.tensor([0]),
     )
 
-    assert out.text_hidden_states.shape == expected_shape, (
-        f"Expected text_hidden_states shape {expected_shape}, got {out.text_hidden_states.shape}"
-    )
-    assert out.multimodal_outputs["latent"].shape == expected_shape, (
-        f"Expected latent shape {expected_shape}, got {out.multimodal_outputs['latent'].shape}"
-    )
+    assert out.shape == expected_shape, f"Expected hidden states shape {expected_shape}, got {out.shape}"
+    torch.testing.assert_close(out, mock_hidden.reshape(expected_shape))
 
 
 if __name__ == "__main__":
@@ -175,3 +179,26 @@ if __name__ == "__main__":
     ]:
         test_wrapper_shape_normalization(shape, exp)
     print("ALL TESTS PASSED SUCCESSFULLY!")
+
+
+def test_embed_multimodal_delegates_to_get_multimodal_embeddings(monkeypatch):
+    """vLLM encoder profiling calls embed_multimodal; without an override the
+    SupportsMultiModal protocol stub returns None and startup fails downstream."""
+    sentinel = (object(),)
+    seen: dict[str, object] = {}
+
+    def fake_get_multimodal_embeddings(self, **kwargs):
+        seen.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        MiniCPMO45OmniLLMForConditionalGeneration,
+        "get_multimodal_embeddings",
+        fake_get_multimodal_embeddings,
+    )
+    model = object.__new__(MiniCPMO45OmniLLMForConditionalGeneration)
+
+    out = model.embed_multimodal(pixel_values="pv", audio_features="af")
+
+    assert out is sentinel
+    assert seen == {"pixel_values": "pv", "audio_features": "af"}

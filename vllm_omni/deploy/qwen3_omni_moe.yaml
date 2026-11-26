@@ -2,9 +2,9 @@
 # stages 1+2 on cuda:1).
 #
 # Runner selection:
-#   Model Runner V2 is the default on CUDA, NPU and XPU. V1 overrides
-#   are unsupported with vLLM 0.34; ROCm and MUSA still request V1.
-#   The Thinker prefix cache is on for CUDA (stage 0). NPU, the other
+#   Model Runner V2 is the default on CUDA, ROCm, NPU and XPU. V1 overrides
+#   are unsupported with vLLM 0.34; MUSA still requests V1.
+#   The Thinker prefix cache is on for CUDA (stage 0). ROCm, NPU, the other
 #   platforms and qwen3_omni_moe_mrv2.yaml keep it off.
 #   qwen3_omni_duplex.yaml retains V1 and is unsupported.
 #
@@ -61,8 +61,8 @@ stages:
       # correct -- the audio-vs-text nightly failures in #6090. This seed was
       # present from the original deploy schema and was dropped as collateral
       # in #4986; keep it so Qwen3-Omni speech is reproducible for a given
-      # request. It bounds sampling only: it does not make the talker immune
-      # to the underlying degeneration, which is tracked separately.
+      # request. The model applies it to request-local codebook-0 and residual
+      # streams; an explicit tts_local_seed can override the residual stream.
       seed: 42
       temperature: 0.9
       top_k: 50
@@ -140,7 +140,7 @@ platforms:
   # vLLM's outer graph capture, so stage 2 runs eager to avoid MIOpen/HIP
   # graph-capture failures.
   rocm:
-    model_runner: v1
+    model_runner: v2
     stages:
       - stage_id: 0
         enable_prefix_caching: false
