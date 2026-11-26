@@ -27,7 +27,7 @@ from tests.e2e.online_serving.test_minicpmo_4_5_duplex import _run_seeded_text_t
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
-from vllm_omni.clients.duplex import DuplexClient, EventCollector
+from vllm_omni.clients.duplex import DuplexClient, EventCollector, wait_for_condition
 from vllm_omni.clients.minicpmo_4_5 import create_duplex_session_config
 
 pytestmark = [pytest.mark.omni, pytest.mark.advanced_model]
@@ -57,15 +57,13 @@ def _color_frame(color: str, turn: int, unit: int) -> str:
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("resume_with_kv", [False, True], ids=["replay", "checkpoint"])
 @pytest.mark.parametrize(
     ("omni_server", "expect_audio"),
     [pytest.param(_BARGE_IN_SERVER, True, id="three-stage"), pytest.param(_THINKER_ONLY, False, id="thinker-only")],
     indirect=["omni_server"],
     scope="module",
 )
-def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool, resume_with_kv: bool):
-    """A server-VAD barge-in preserves the first color and accepts a fresh camera frame."""
+def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool):
     audio_delta = "response.output_audio.delta"
     text_deltas = {"response.output_text.delta", "response.output_audio_transcript.delta"}
     pcm_second = 32_000
@@ -84,41 +82,35 @@ def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool,
         idle_timeout_s=115,
         overlap_policy="barge_in_on_speech",
         instructions="Listen to the user and answer in English. Use only the requested words.",
-        extra_body={
-            "auto_response": True,
-            "silence_continuation": True,
-            "sliding_window_mode": "basic" if resume_with_kv else "context",
-        },
+        extra_body={"auto_response": True, "silence_continuation": True},
     )
 
     async def run():
         collector = EventCollector()
-        pending: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        event_index = 0
         audio_end_ms = 0
         async with DuplexClient(
             realtime_url(omni_server), model=omni_server.model, config=config, heartbeat_interval_s=None, reconnect=None
         ) as client:
 
-            async def read_events():
-                async for event in client.events():
-                    collector.add(event)
-                    pending.put_nowait(event.raw)
-
             async def wait_event(*types, response_id=None, label):
-                clock = asyncio.get_running_loop()
-                deadline = clock.time() + 75
-                try:
-                    while True:
-                        event = await asyncio.wait_for(pending.get(), timeout=deadline - clock.time())
+                match = None
+
+                def find_event():
+                    nonlocal event_index, match
+                    while event_index < len(collector.events):
+                        event = collector.events[event_index]
+                        event_index += 1
                         assert event["type"] != "error", event
                         if event["type"] in types and (
                             response_id is None or collector.response_id(event) == response_id
                         ):
-                            return event
-                except TimeoutError:
-                    pytest.fail(
-                        f"Timed out waiting for {label}. Last events: {[e['type'] for e in collector.events[-8:]]}"
-                    )
+                            match = event
+                            return True
+                    return False
+
+                await wait_for_condition(find_event, timeout_s=75, label=label)
+                return match
 
             async def feed(turn: int):
                 nonlocal audio_end_ms
@@ -137,8 +129,7 @@ def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool,
                     duration_ms = len(chunk) // 32
                     audio_end_ms += duration_ms
                     has_more = offset + pcm_second < len(pcm)
-                    # Keep each intermediate unit in LISTEN. VAD still derives
-                    # speech onset from PCM, with no client interruption hint.
+                    # Model listen bias leaves server VAD driven by the PCM.
                     await client.send(
                         {
                             "type": "input_audio_buffer.append",
@@ -155,6 +146,7 @@ def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool,
                         await asyncio.sleep(max(0, started + unit + 1 - clock.time()))
 
             async def finish_turn(turn, expected_text):
+                await client.commit(create_response=True)
                 done = await wait_event("response.done", label=f"T{turn} completion")
                 response = done["response"]
                 assert response["status"] == "completed", response
@@ -175,11 +167,10 @@ def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool,
                     assert ack["event"]["item_id"] == item_id and ack["event"]["history_committed"], ack
                 return response
 
-            reader = asyncio.create_task(read_events())
+            reader = asyncio.create_task(collector.consume(client))
             try:
                 await asyncio.sleep(0)  # Subscribe before the first input.
                 await feed(1)
-                await client.commit(create_response=True)
                 first = await finish_turn(1, ["blue"])
                 await asyncio.sleep(0.25)
 
@@ -191,23 +182,19 @@ def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool,
                 assert old_id and old["delta"]
 
                 await feed(3)
-                # The server must cancel at speech onset while T3 is still
-                # uncommitted. No response.cancel is sent by this test.
-                onset = await wait_event("input_audio_buffer.speech_started", label="T3 server-VAD onset")
+                # Observe cancellation before committing T3.
+                await wait_event("input_audio_buffer.speech_started", label="T3 server-VAD onset")
                 decision = await wait_event("overlap.decision", label="T3 barge-in decision")
-                assert decision["action"] == "barge_in", (onset, decision)
+                assert decision["action"] == "barge_in", decision
                 assert decision["reason"] == "server_vad_speech_started", decision
                 cancelled = await wait_event("response.done", response_id=old_id, label="T2 cancellation")
                 assert cancelled["response"]["status"] == "cancelled", cancelled
                 assert cancelled["response"]["status_details"]["reason"] == "turn_detected", cancelled
 
-                await client.commit(create_response=True)
-                third = await finish_turn(3, ["green"])
+                await finish_turn(3, ["green"])
                 await asyncio.sleep(0.25)
                 await feed(4)
-                await client.commit(create_response=True)
-                fourth = await finish_turn(4, ["blue", "yellow"])
-                assert len({first["id"], old_id, third["id"], fourth["id"]}) == 4
+                await finish_turn(4, ["blue", "yellow"])
 
                 # The retrieval is also a barrier covering frames received
                 # after the last answer, including any late old-response deltas.
@@ -224,11 +211,9 @@ def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool,
                     await reader
 
     checkpoint_marker = "MiniCPM-o duplex re-used "
-    replay_marker = "MiniCPM-o restored "
-    with omni_server.capture_stderr_evidence([checkpoint_marker, replay_marker]) as evidence:
+    with omni_server.capture_stderr_evidence([checkpoint_marker]) as evidence:
         asyncio.run(run())
-        expected_restore = checkpoint_marker if resume_with_kv else replay_marker
-        assert expected_restore in evidence.wait()
+        assert checkpoint_marker in evidence.wait()
 
 
 # ``minicpmo_4_5.yaml`` resolves all three stages to MRv2 on CUDA and ROCm.

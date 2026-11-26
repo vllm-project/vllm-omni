@@ -367,7 +367,7 @@ async def test_cancel_restore_keeps_committed_user_media_and_excludes_cancelled_
     assert len(recovered.prompt["prompt_token_ids"]) == (
         len(baseline.prompt["prompt_token_ids"]) + turn["token_budget"] + interrupted["token_budget"]
     )
-    assert envelope[module.CHECKPOINT_KEY]["reuse_turns"] == 1
+    assert envelope[module.CHECKPOINT_KEY]["interrupted_turn"] == cancelled.turn_id
 
     deleted_user = {
         **config,

@@ -2202,17 +2202,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     completed_terminator=completed_terminator,
                 )
                 reanchored = plan is not None
-                if reanchored:
-                    session._minicpmo_checkpoint_boundary = None
-                    session._minicpmo_checkpoint_rebased = True
-            if not reanchored and self._prepare_minicpmo45_stage0_window(
+            rebuild = not reanchored and self._prepare_minicpmo45_stage0_window(
                 session,
                 update,
                 segment_output_ids=segment_output_ids,
                 completed_terminator=completed_terminator,
-            ):
-                session._minicpmo_checkpoint_boundary = None
+            )
+            if reanchored or rebuild:
                 session._minicpmo_checkpoint_rebased = True
+            if rebuild:
                 # The rebuilt prompt is bounded by the client's window settings,
                 # not by the model (a camera unit is hundreds of tokens), so it
                 # needs the same max_model_len check as a plain extension. The

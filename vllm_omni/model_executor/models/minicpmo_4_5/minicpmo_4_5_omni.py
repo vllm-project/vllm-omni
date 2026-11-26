@@ -763,25 +763,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 helper.thinker.audio_past_key_values = None
             helper._configure_streaming_processor(state)
             checkpoint = duplex.get(CHECKPOINT_KEY, {})
-            if reused_tokens := checkpoint.get("reused_tokens"):
-                state.reused_context_tokens = reused_tokens
-                helper._prepare_session_context(
-                    state, session_config, runtime_config=runtime_config, reuse_context=True
-                )
-                helper.register_reused_window_prefix(state, reused_tokens, runtime_config)
-            else:
-                helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
+            state.reused_context_tokens = checkpoint.get("reused_tokens", 0)
+            helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
             replay = duplex.get(REPLAY_CONTEXT_KEY)
             if replay:
-                if reused_tokens:
-                    helper.restore_completed_turns(
-                        state,
-                        replay,
-                        duplex["duplex_replay_token_budget"],
-                        preceding_terminator=checkpoint["terminator"],
-                    )
-                else:
-                    helper.restore_completed_turns(state, replay, duplex["duplex_replay_token_budget"])
+                helper.restore_completed_turns(
+                    state,
+                    replay,
+                    duplex["duplex_replay_token_budget"],
+                    preceding_terminator=checkpoint.get("terminator"),
+                )
         elif runtime_config and hasattr(helper, "_sync_session_runtime_config"):
             helper._sync_session_runtime_config(state, runtime_config)
         return state

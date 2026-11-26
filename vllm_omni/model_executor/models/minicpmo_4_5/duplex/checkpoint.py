@@ -139,6 +139,7 @@ class MiniCPMO45DuplexCheckpoints:
             manager is None
             or boundary is None
             or current.get("turn_id") != boundary.turn_id
+            or getattr(request, "_minicpmo_checkpoint_rebased", False)
             or _layout(current) != boundary.layout
             or boundary.token_count > _MAX_PREFIX_TOKENS
             or request.num_preemptions
@@ -189,15 +190,15 @@ class MiniCPMO45DuplexCheckpoints:
         ):
             self._release(session_id)
             return
-        turns = incoming[REPLAY_CONTEXT_KEY]
-        reused = marker["reuse_turns"]
-        replay_budget = 2 + sum(turn["token_budget"] for turn in turns[reused:])
+        interrupted_turn = incoming[REPLAY_CONTEXT_KEY][-1]
         prefix_length = saved.boundary.token_count
         context_tokens = incoming["runtime_config"].get("duplex_first_append_context_tokens")
         if not isinstance(context_tokens, int):
             self._release(session_id)
             return
-        suffix_length = incoming["duplex_live_token_budget"] - context_tokens + replay_budget
+        replay_budget = interrupted_turn["token_budget"] + 2  # Previous terminator and </unit>.
+        live_length = request.num_prompt_tokens - incoming["duplex_replay_token_budget"]
+        suffix_length = live_length - context_tokens + replay_budget
         if (
             context_tokens >= prefix_length
             or suffix_length <= 0
@@ -223,7 +224,7 @@ class MiniCPMO45DuplexCheckpoints:
             ]
             request._minicpmo45_window_open_start = prefix_length
         incoming[CHECKPOINT_KEY] = {"reused_tokens": prefix_length, "terminator": saved.boundary.terminator}
-        incoming[REPLAY_CONTEXT_KEY] = turns[reused:]
+        incoming[REPLAY_CONTEXT_KEY] = [interrupted_turn]
         incoming["duplex_replay_token_budget"] = replay_budget
         incoming["scheduler_token_budget"] = request.num_prompt_tokens
         logger.info("MiniCPM-o duplex re-used %d committed Stage-0 KV tokens", prefix_length)

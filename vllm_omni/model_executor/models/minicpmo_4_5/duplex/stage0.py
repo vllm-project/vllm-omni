@@ -297,28 +297,27 @@ class MiniCPMO45Stage0DuplexRuntime:
         session_config: dict[str, object],
         *,
         runtime_config: dict[str, object] | None = None,
-        reuse_context: bool = False,
     ) -> None:
-        window_config = (runtime_config or {}).get("duplex_window_config")
+        rt = runtime_config or {}
+        window_config = rt.get("duplex_window_config")
         state.window_enabled = isinstance(window_config, dict) and window_config.get("sliding_window_mode", "off") in {
             "basic",
             "context",
         }
-        rt = runtime_config or {}
         state.wrap_unit_audio_markers = bool(rt.get("duplex_wrap_unit_audio_markers", False))
         state.allow_speech_interruption = bool(rt.get("duplex_allow_speech_interruption", False))
         self._sync_session_runtime_config(state, rt)
-        if (reuse_context and not state.window_enabled) or not self._stage_runtime_ready():
+        if (state.reused_context_tokens and not state.window_enabled) or not self._stage_runtime_ready():
             return
         self._require_special_token_ids()
-        ref_audio = self._decode_ref_audio_from_session_config(runtime_config or {})
+        ref_audio = self._decode_ref_audio_from_session_config(rt)
         # Matches MiniCPMODuplex.prepare() in the released checkpoint's
         # modeling_minicpmo.py: the <|audio_start|>/<|audio_end|> markers are
         # only present when reference audio is embedded between them. The
         # template is shared with the serving adapter so the first-append
         # scheduler reserve can count these tokens exactly.
-        initial_user_text = (runtime_config or {}).get("initial_user_text")
-        effective_instructions = (runtime_config or {}).get("instructions")
+        initial_user_text = rt.get("initial_user_text")
+        effective_instructions = rt.get("instructions")
         if not (isinstance(effective_instructions, str) and effective_instructions):
             effective_instructions = session_config.get("instructions")
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
@@ -358,13 +357,9 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.current_turn_ended = False
             state.pending_speech_response_open = True
 
-    def register_reused_window_prefix(
-        self, state: _MiniCPMO45Stage0SessionState, token_count: int, runtime_config: dict[str, object]
-    ) -> None:
-        if state.window_enabled:
-            # A full basic-window rebuild drops this unit first. In-place
-            # reanchor only needs its length to trim matching worker history.
-            length = token_count - int(runtime_config["duplex_first_append_context_tokens"])
+        if state.reused_context_tokens:
+            # Basic-window rebuild drops this KV-only unit before assembling embeddings.
+            length = state.reused_context_tokens - int(rt["duplex_first_append_context_tokens"])
             state.window_units.append(_MiniCPMO45WindowUnit(token_ids=[self.stage_padding_token_id()] * length))
 
     def restore_completed_turns(

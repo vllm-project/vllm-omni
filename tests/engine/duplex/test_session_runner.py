@@ -1277,8 +1277,33 @@ async def test_cleared_in_flight_append_cannot_release_later_audio(monkeypatch) 
         await h.settle()
         assert h.session.pending_input_bytes == 32_000
         assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+        assert not h.runner.model_state.replay_pending
     finally:
         release.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("committed", [False, True], ids=["uncommitted", "committed"])
+async def test_clear_keeps_only_committed_replay_history(committed: bool) -> None:
+    h = await open_harness()
+    try:
+        request_id = await _open_active_response(h)
+        if committed:
+            await h.run(commands.Commit(create_response=False))
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="original", turn_end=True))
+        state = h.runner.model_state
+        [old_turn] = state.replay_completed
+        assert (old_turn.source is not None) == committed
+
+        await h.run(commands.ClearInput())
+        await h.run(append_audio(value=0.12))
+        events = await h.run(commands.Commit(create_response=False))
+
+        assert "input_audio_buffer.committed" in types(events)
+        assert state.replay_completed == ([old_turn] if committed else [])
+        assert not state.replay_history_eligible
+    finally:
         await close_harness(h)
 
 

@@ -773,6 +773,9 @@ class DuplexModelPlugin(ABC):
     ) -> None:
         """Bind model-owned history material to a committed user input."""
 
+    def observe_input_clear(self, *, state: DuplexModelSessionState) -> None:
+        """Discard uncommitted material retained for history."""
+
     def observe_response_end(
         self,
         *,

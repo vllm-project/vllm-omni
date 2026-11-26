@@ -3,7 +3,6 @@
 
 from array import array
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -31,9 +30,10 @@ def _buffer(turn_id, *, epoch=0, seq=1, marker=None):
     }
 
 
-@pytest.fixture(params=[0, 2])
-def checkpoint_pair(request):
-    epoch = request.param
+@pytest.fixture
+def saved_checkpoint(request, monkeypatch):
+    epoch = getattr(request, "param", 0)
+    monkeypatch.setattr(checkpoint, "monotonic", lambda: 0)
     pool = BlockPool(256, enable_caching=False, hash_block_size=16)
     manager = FullAttentionManager(
         FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16),
@@ -66,9 +66,7 @@ def checkpoint_pair(request):
     )
     target = SimpleNamespace(
         request_id="new",
-        model_intermediate_buffer=_buffer(
-            3, epoch=epoch + 1, marker={"history": "completed", "interrupted_turn": 2, "reuse_turns": 1}
-        ),
+        model_intermediate_buffer=_buffer(3, epoch=epoch + 1, marker={"history": "completed", "interrupted_turn": 2}),
         prompt_token_ids=[99] * 35,
         _all_token_ids=array("q", [99] * 35),
         num_computed_tokens=0,
@@ -76,7 +74,6 @@ def checkpoint_pair(request):
     )
     target.model_intermediate_buffer["duplex"].update(
         {
-            "duplex_live_token_budget": 19,
             "scheduler_token_id": 99,
             "duplex_replay_token_budget": 16,
             REPLAY_CONTEXT_KEY: [{"token_budget": 12}, {"token_budget": 4}],
@@ -88,15 +85,16 @@ def checkpoint_pair(request):
     )
     cache.record_boundary(source, update, confirmed_end=23)
     source.model_intermediate_buffer = update.model_intermediate_buffer
-    manager.req_to_blocks[source.request_id] = pool.get_new_blocks(3)
-    return cache, scheduler, manager, source, target
-
-
-def test_stage0_checkpoint_transfers_only_the_confirmed_prefix(checkpoint_pair):
-    cache, _, manager, source, target = checkpoint_pair
-    first, tail, cancelled = manager.req_to_blocks[source.request_id]
+    blocks = pool.get_new_blocks(3)
+    manager.req_to_blocks[source.request_id] = blocks.copy()
     cache.retain_before_abort(source)
     manager.free(source.request_id)
+    return cache, scheduler, manager, blocks, target
+
+
+@pytest.mark.parametrize("saved_checkpoint", [0, 2], indirect=True)
+def test_stage0_checkpoint_transfers_only_the_confirmed_prefix(saved_checkpoint):
+    cache, _, manager, (first, tail, cancelled), target = saved_checkpoint
     assert (first.ref_cnt, tail.ref_cnt, cancelled.ref_cnt) == (1, 1, 0)
 
     cache.restore(target)
@@ -110,15 +108,13 @@ def test_stage0_checkpoint_transfers_only_the_confirmed_prefix(checkpoint_pair):
 
 
 @pytest.mark.parametrize("miss", ["expired", "in_flight", "edited_history", "different_session", "cache_pressure"])
-def test_checkpoint_miss_preserves_the_full_replay(checkpoint_pair, miss):
-    cache, scheduler, manager, source, target = checkpoint_pair
-    blocks = manager.req_to_blocks[source.request_id].copy()
-    with patch.object(checkpoint, "monotonic", return_value=0):
-        cache.retain_before_abort(source)
-    manager.free(source.request_id)
+def test_checkpoint_miss_preserves_the_full_replay(saved_checkpoint, miss, monkeypatch):
+    cache, scheduler, manager, blocks, target = saved_checkpoint
     duplex = target.model_intermediate_buffer["duplex"]
     pressure = []
-    if miss == "in_flight":
+    if miss == "expired":
+        monkeypatch.setattr(checkpoint, "monotonic", lambda: 16)
+    elif miss == "in_flight":
         scheduler.processed_step_seq = 1
     elif miss == "edited_history":
         duplex[CHECKPOINT_KEY]["history"] = "edited"
@@ -127,12 +123,11 @@ def test_checkpoint_miss_preserves_the_full_replay(checkpoint_pair, miss):
     elif miss == "cache_pressure":
         pool = manager.block_pool
         pressure = pool.get_new_blocks(pool.get_num_free_blocks() - 1)
-    with patch.object(checkpoint, "monotonic", return_value=16 if miss == "expired" else 1):
-        cache.restore(target)
+    cache.restore(target)
     assert target.num_computed_tokens == 0
     assert target.prompt_token_ids == [99] * 35
     assert duplex[REPLAY_CONTEXT_KEY] == [{"token_budget": 12}, {"token_budget": 4}]
     manager.block_pool.free_blocks(pressure)
-    with patch.object(checkpoint, "monotonic", return_value=16):
-        cache.sweep()
+    monkeypatch.setattr(checkpoint, "monotonic", lambda: 16)
+    cache.sweep()
     assert all(block.ref_cnt == 0 for block in blocks)

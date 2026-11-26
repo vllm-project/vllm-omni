@@ -1364,6 +1364,7 @@ class DuplexSessionRunner:
         model_state.clear_committed_audio()
         self.memory.forget_committed_input()
         session.cancel_pending_input()
+        self.plugin.observe_input_clear(state=model_state)
         # A clear starts a new turn: drop the detector's speech (and semantic
         # pause) state too, or a later stop would commit the cleared turn.
         self.control.reset_vad()
