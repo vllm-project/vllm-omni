@@ -126,6 +126,18 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # bookkeeping only, and full-payload coordinators do not receive chunks.
         return self._native_data_plane and coordinator is not None and coordinator.receives_chunks
 
+    def _requires_atomic_input(self) -> bool:
+        """Whether the current stage input must execute in one scheduler step.
+
+        Streamed codec chunks are already atomic. Full-payload consumers need
+        the same guarantee: their flattened prompt is one structured model
+        input, not a token stream that can be split across prefill steps.
+        """
+        if self._requires_atomic_chunk():
+            return True
+        coordinator = getattr(self, "input_coordinator", None)
+        return coordinator is not None and coordinator.receives_full_payload
+
     def _reject_oversized_ready_chunks(self) -> None:
         if not self._requires_atomic_chunk():
             return
@@ -596,11 +608,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             num_computed_tokens = request.num_computed_tokens
             required_tokens = len(request.prompt_token_ids) - num_computed_tokens
-            must_take_whole = self._requires_atomic_chunk() or not self.scheduler_config.enable_chunked_prefill
+            must_take_whole = self._requires_atomic_input() or not self.scheduler_config.enable_chunked_prefill
             if must_take_whole and required_tokens > token_budget:
-                # Connector-delivered stateful async chunks must remain intact.
-                # When chunked prefill is disabled, preserve the existing
-                # all-or-nothing scheduling behavior.
+                # Structured stage inputs must remain intact. When chunked
+                # prefill is disabled, preserve the existing all-or-nothing
+                # scheduling behavior for every other running request too.
                 break
             # async_chunk: don't schedule placeholder tokens when no new chunk is available.
             if required_tokens <= 0:
@@ -719,9 +731,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                             self.deferred_waiting.add(request)
                             skipped_requests.add_request(request)
                         continue
-            if self._requires_atomic_chunk() and required_tokens > token_budget:
-                # Oversized chunks were rejected before entering this loop.
-                # Defer intact before allocating slots or popping the request.
+            if self._requires_atomic_input() and required_tokens > token_budget:
+                # Structured stage inputs cannot be sliced to fill the
+                # remaining batch budget. Defer intact before allocating
+                # slots or popping the request.
                 break
             num_new_tokens = min(required_tokens, token_budget)
             new_blocks = self.kv_cache_manager.allocate_slots(
