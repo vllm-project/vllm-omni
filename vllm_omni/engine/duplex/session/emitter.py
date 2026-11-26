@@ -128,6 +128,7 @@ class SessionEmitter:
             "status_details": {"type": "failed", "reason": "output_backpressure"},
             "playback": session.playback.as_dict(),
         }
+        payload = self._with_ended_response_metrics(payload)
         if terminal is None:
             projected = project_internal_event(self.require_projector(), payload)
             terminal = next((event for event in projected if isinstance(event, ResponseDone)), None)
@@ -169,6 +170,7 @@ class SessionEmitter:
         internal dictionaries; stateless events are constructed typed at the
         emit site.
         """
+        payload = self._with_ended_response_metrics(payload)
         accepted, deferred_overlap_payload = self._apply_outbound_session_event(payload)
         if not accepted:
             return
@@ -184,6 +186,18 @@ class SessionEmitter:
             precreate_response = self._ctx.model_state.deferred_precreate_response
             self._ctx.model_state.deferred_precreate_response = False
             self._promote_deferred_overlap(deferred_overlap_payload, precreate_response)
+
+    def _with_ended_response_metrics(self, payload: dict[str, object]) -> dict[str, object]:
+        if payload.get("type") not in {"response.done", "audio.cancelled"}:
+            return payload
+        stage_metrics = self._ctx.session.pop_ended_response_stage_metrics(payload.get("response_id"))
+        if not stage_metrics:
+            return payload
+        vllm_omni = payload.get("vllm_omni")
+        return {
+            **payload,
+            "vllm_omni": {**(vllm_omni if isinstance(vllm_omni, Mapping) else {}), "stage_metrics": stage_metrics},
+        }
 
     # ------------------------------------------------------------------ #
     # Filtering and domain effects                                       #

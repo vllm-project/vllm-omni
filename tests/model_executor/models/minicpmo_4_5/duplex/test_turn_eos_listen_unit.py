@@ -48,24 +48,24 @@ def test_speech_unit_closed_by_listen(token_ids: list[int], closes_speech: bool)
     assert MiniCPMO45DuplexPolicy.speech_unit_closed_by_listen(token_ids, SPECIAL_TOKEN_IDS) is closes_speech
 
 
-def _stage0_output(token_ids: list[int], *, finished: bool = True) -> SimpleNamespace:
+def _stage0_output(token_ids: list[int], *, finished: bool = True, text_input: bool = False) -> SimpleNamespace:
     completion = SimpleNamespace(token_ids=token_ids, stop_reason=token_ids[-1], text="", multimodal_output={})
     return SimpleNamespace(
         request_id="duplex-s.c2Vzc2lvbg==.e.0.r.stage0",
         outputs=[completion],
         finished=finished,
-        multimodal_output={"special_token_ids": dict(SPECIAL_TOKEN_IDS)},
+        multimodal_output={"special_token_ids": dict(SPECIAL_TOKEN_IDS), "duplex_text_input": text_input},
     )
 
 
-def _decide(token_ids: list[int]):
+def _decide(token_ids: list[int], *, text_input: bool = False):
     return MiniCPMO45DuplexPlugin(lambda *args: None).decide_output(
         stage_id=0,
         final_stage_id=2,
         segment_finished=True,
         segment_token_ids=tuple(token_ids),
         segment_output_metadata={},
-        output=_stage0_output(token_ids),
+        output=_stage0_output(token_ids, text_input=text_input),
     )
 
 
@@ -78,6 +78,45 @@ def test_plugin_keeps_a_plain_listen_unit_a_listen_decision() -> None:
 
     assert decision is not None
     assert decision.metadata["duplex_native_decision"] == "listen"
+
+
+def test_empty_text_chunk_returns_to_the_session_without_hiding_speech() -> None:
+    decision = _decide([CHUNK_EOS], text_input=True)
+    assert decision is not None
+    assert decision.metadata["model_listen"] is False
+    assert decision.metadata["listen_source"] == "empty_input_unit"
+    assert _decide([TEXT, CHUNK_EOS], text_input=True) is None
+
+
+def test_empty_audio_chunk_keeps_its_talker_boundary_for_the_input_clock() -> None:
+    assert _decide([CHUNK_EOS]) is None
+
+
+@pytest.mark.parametrize(
+    ("history", "empty"),
+    [
+        ([LISTEN, LISTEN], True),
+        ([TEXT, CHUNK_EOS], True),
+        ([LISTEN, TEXT], False),
+    ],
+)
+@pytest.mark.parametrize("text_input", [False, True])
+def test_empty_chunk_uses_unit_boundaries_in_a_resumed_request(
+    history: list[int], empty: bool, text_input: bool
+) -> None:
+    output = _stage0_output([CHUNK_EOS], text_input=text_input)
+    output.outputs[0].cumulative_token_ids = [*history, CHUNK_EOS]
+    decision = MiniCPMO45DuplexPlugin(lambda *args: None).decide_output(
+        stage_id=0,
+        final_stage_id=2,
+        segment_finished=True,
+        segment_token_ids=(CHUNK_EOS,),
+        segment_output_metadata={},
+        output=output,
+    )
+    assert (decision is not None) is (empty and text_input)
+    if decision is not None:
+        assert decision.metadata["listen_source"] == "empty_input_unit"
 
 
 def _projected_model_listens(token_ids: list[int]) -> list[dict[str, object]]:

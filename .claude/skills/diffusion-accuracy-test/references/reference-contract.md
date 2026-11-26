@@ -235,12 +235,12 @@ Reuse `SimilarityThresholds`, `resolve_device_profile`, and
 `resolve_similarity_thresholds` from the shared
 [accuracy helpers](../../../../tests/e2e/accuracy/helpers.py) for SSIM/PSNR
 threshold tables. Include the required `default` entry. Match the actual device
-name to a profile, resolve its bounds, and save the device name, selected profile,
-resolved values, and accepted/proposed status with the metrics. Pass the captured
-device name to the profile resolver when the test already records it; otherwise
-the helper can query the current Omni platform. Keep model-specific metrics such
-as alpha error separate, using `resolve_device_threshold` if they need a scalar
-per-device policy.
+marketing name or architecture to a profile, resolve its bounds, and save the
+device identity, selected profile, resolved values, and accepted/proposed status
+with the metrics. Pass both the captured name and architecture to the profile
+resolver when the test already records them; otherwise the helper can query the
+current Omni platform. Keep model-specific metrics such as alpha error separate,
+using `resolve_device_threshold` if they need a scalar per-device policy.
 
 Start with an existing in-scope gate or evidenced provisional recommendation as
 `default`. Add differing SKU entries only with corresponding calibration evidence
@@ -248,10 +248,11 @@ and user selection; a failing run alone does not justify a looser entry. An
 unmatched device uses `default`, which is a lookup fallback, not proof that the
 gate is calibrated for that device. Do not copy another model's device values.
 
-This resolver matches device-name substrings; it does not account for drivers,
-library versions, attention backends, or workload changes. Record those conditions
-and use the calibration and headroom guidance above when their scope differs.
-The user still chooses final new or adjusted bounds as described below.
+This resolver matches substrings in the device marketing name and architecture;
+it does not account for drivers, library versions, attention backends, or workload
+changes. Record those conditions and use the calibration and headroom guidance
+above when their scope differs. The user still chooses final new or adjusted
+bounds as described below.
 
 ## Threshold recommendation and user selection
 

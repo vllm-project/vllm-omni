@@ -11,6 +11,7 @@ from typing import Any, Literal, cast
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
+from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.config.watermarking import WatermarkConfig
@@ -34,14 +35,15 @@ def is_frontend_only(single_stage_id_filter: int | None) -> bool:
 # Maps model architecture names to their HuggingFace model_type values.
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
+    "ChatterboxForConditionalGeneration": "chatterbox",
+    "Confucius4TTSS2ADecoder": "confucius4_tts",
+    "Confucius4TTSTalkerForConditionalGeneration": "confucius4_tts",
     "CosyVoice3Model": "cosyvoice3",
     "GLMTTSForConditionalGeneration": "glm_tts",
     "IndexTTS2S2MelDecoder": "indextts2",
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
     "IndexTTS25S2MelDecoder": "indextts2_5",
     "IndexTTS25TalkerForConditionalGeneration": "indextts2_5",
-    # Kokoro's config.json names neither model_type nor architectures.
-    "KokoroForConditionalGeneration": "kokoro",
     "OmniVoiceModel": "omnivoice",
     # PersonaPlex ships an empty config.json, so create_model_config() must patch
     # model_type=personaplex from the arch name or the staged pipeline can't load
@@ -56,6 +58,15 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
 
+# Model types whose official Hub repo ships no config.json, so
+# ``_patch_empty_hf_config`` writes one for a Hub id as well as for a local
+# directory instead of letting transformers fail on the missing file.
+_CONFIG_LESS_MODEL_TYPES: frozenset[str] = frozenset({"chatterbox"})
+
+# Model types whose local bundles may hold only checkpoint files; a missing
+# config.json is patched for a local directory only.
+_LOCAL_BUNDLE_MODEL_TYPES: frozenset[str] = frozenset({"indextts2_5", "confucius4_tts"})
+
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
 _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
     "CosyVoice3Model": "CosyVoice-BlankEN",
@@ -67,12 +78,18 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.alpamayo2_super.configuration_alpamayo2_super import (
+            Alpamayo2SuperConfig,
+        )
         from vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze import BreezeConfig
+        from vllm_omni.model_executor.models.confucius4_tts.configuration_confucius4_tts import (
+            Confucius4Config,
+            Confucius4TTSConfig,
+        )
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
             IndexTTS25Config,
         )
-        from vllm_omni.model_executor.models.kokoro.configuration_kokoro import KokoroConfig
         from vllm_omni.model_executor.models.ming3_tts.config_ming3_tts import (
             LingV3TTSConfig,
             Ming3TTSConfig,
@@ -94,12 +111,14 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.ming3_audio import (
             BailingMoeV3AudioConfig,
         )
         from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
+        from vllm_omni.transformers_utils.configs.realtime_venus import RealtimeVenusOmniConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
@@ -114,14 +133,16 @@ def _register_omni_hf_configs() -> None:
         _CONFIG_REGISTRY = None
 
     for model_type, config_cls in [
+        ("alpamayo2_super", Alpamayo2SuperConfig),
         ("breeze", BreezeConfig),
+        ("confucius4", Confucius4Config),
+        ("confucius4_tts", Confucius4TTSConfig),
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
         ("ming3_tts", Ming3TTSConfig),
         ("lingv3_tts", LingV3TTSConfig),
         ("indextts2", IndexTTS2Config),
         ("indextts2_5", IndexTTS25Config),
-        ("kokoro", KokoroConfig),
         ("moss_tts_local", MossTTSLocalConfig),
         ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
@@ -132,6 +153,8 @@ def _register_omni_hf_configs() -> None:
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
+        ("chatterbox", ChatterboxConfig),
+        ("realtime_venus_omni", RealtimeVenusOmniConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -226,6 +249,37 @@ def _map_offload_config(args: "OmniEngineArgs") -> None:
     kv_store = args.omni_kv_config.get("kv_store_config", {}) if isinstance(args.omni_kv_config, dict) else {}
 
     lmcache_config = kv_store.get("lmcache_config")
+    mooncake_config = kv_store.get("mooncake_config")
+
+    if mooncake_config is not None:
+        from vllm.config.kv_transfer import KVTransferConfig
+
+        from vllm_omni.distributed.kv_transfer.mooncake.config import (
+            CONNECTOR_MODULE,
+            CONNECTOR_NAME,
+            EXTRA_CONFIG_KEY,
+            MooncakeConfig,
+        )
+
+        if "lmcache_config" in kv_store:
+            raise ValueError("Select either mooncake_config or lmcache_config, not both")
+        config = MooncakeConfig.from_dict(mooncake_config)
+        if args.enable_prefix_caching:
+            raise ValueError("Mooncake KV/HS caching requires enable_prefix_caching=false")
+        if args.kv_transfer_config is not None:
+            raise ValueError("mooncake_config cannot be combined with an explicit kv_transfer_config")
+        if kv_store.get("kv_role", "kv_both") != "kv_both":
+            raise ValueError("Mooncake KV/HS caching requires kv_role=kv_both")
+        args.enable_prefix_caching = False
+        args.kv_transfer_config = KVTransferConfig(
+            kv_connector=CONNECTOR_NAME,
+            kv_connector_module_path=CONNECTOR_MODULE,
+            kv_connector_extra_config={EXTRA_CONFIG_KEY: config.to_dict()},
+            kv_role="kv_both",
+            kv_load_failure_policy="recompute",
+        )
+        logger.info("[Omni] kv_transfer_config: kv_connector=%s", CONNECTOR_NAME)
+        return
 
     if lmcache_config:
         # LMCacheConnectorV1 only (OffloadingConnector removed due to
@@ -312,7 +366,7 @@ class OmniEngineArgs(EngineArgs):
     supports_pending_generation: bool = False
     supports_running_prefix_cache_reset: bool = True
     recompute_preemption: Literal["allow", "fail"] = "allow"
-    use_v2_model_runner: bool = False
+    use_v2_model_runner: bool = True
     supports_native_mrv2_data_plane: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
@@ -324,6 +378,7 @@ class OmniEngineArgs(EngineArgs):
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
+    diffusion_flashinfer_autotune: bool | None = None
     worker_type: str | None = None
     scheduling_metadata_adapter: str | None = None
     # Dotted path of a per-stage pooling-output decoder applied worker-side.
@@ -334,7 +389,7 @@ class OmniEngineArgs(EngineArgs):
     enable_sleep_mode: bool = False
     omni: bool = False
     # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
-    request_batch_max_wait_ms: float = 0.0
+    request_batch_max_wait_ms: float | None = None
     fa_deterministic: bool = False
     # Tensor-parallel degree for the diffusion text encoder (forwarded to
     # DiffusionParallelConfig via the generic diffusion fallback). Declared
@@ -357,6 +412,7 @@ class OmniEngineArgs(EngineArgs):
     diffusion_load_format: str | None = None
     lora_path: list[str] | None = None
     lora_backend: str | None = None
+    lora_application: str | None = None
     lora_scale: float | None = None
     diffusers_load_kwargs: str | None = None
     diffusers_call_kwargs: str | None = None
@@ -364,9 +420,11 @@ class OmniEngineArgs(EngineArgs):
     diffusion_attention_backend: str | None = None
     fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: str | None = None
+    diffusion_attention_schedule: dict[str, Any] | None = None
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
     enable_cuda_graph_decode: bool | None = None
+    enable_cfg_batching: bool | None = None
     cache_backend: str | None = None
     cache_config: str | None = None
     video_output_transport: dict[str, object] | None = None
@@ -374,6 +432,7 @@ class OmniEngineArgs(EngineArgs):
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
+    vae_stack_tiles: bool | None = None
     vae_fast_path: str | None = None
     vae_encode_fast_path: str | None = None
     enable_multithread_weight_load: bool | None = None
@@ -410,6 +469,7 @@ class OmniEngineArgs(EngineArgs):
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
     ulysses_a2a_permute: bool | None = None
+    ulysses_overlap_chunks: int | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     use_hsdp: bool | None = None
@@ -446,6 +506,8 @@ class OmniEngineArgs(EngineArgs):
     sampling_extra_args_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if not self.use_v2_model_runner:
+            raise ValueError("Model Runner V1 is not supported with vLLM 0.34; select model_runner: v2")
         if self.worker_cls in (None, "auto"):
             if self.worker_type == "ar":
                 self.worker_cls = current_omni_platform.get_omni_ar_worker_cls()
@@ -462,10 +524,6 @@ class OmniEngineArgs(EngineArgs):
         _map_offload_config(self)
         _set_lmcache_env(self)
         super().__post_init__()
-        # The NPU runner implements the auxiliary connector on its legacy
-        # execution path; CUDA/ROCm Omni stages use the V2 implementation.
-        if self.aux_output_config.enabled and not self.use_v2_model_runner and not current_omni_platform.is_npu():
-            raise ValueError("Auxiliary outputs require use_v2_model_runner=True for this Omni stage.")
 
     def _ensure_omni_models_registered(self):
         if hasattr(self, "_omni_models_registered"):
@@ -486,13 +544,19 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
-            # Keep this exception model-scoped so other loader failures retain
-            # vLLM's normal error path.
-            if model_type != "indextts2_5" or not os.path.isdir(self.model):
+            # Some local native TTS bundles (IndexTTS 2.5, Confucius4-TTS) only
+            # contain checkpoint files and no HuggingFace config.json. Keep this
+            # exception model-scoped so other loader failures retain vLLM's
+            # normal error path.
+            # Chatterbox's Hub repo ships none either, so its Hub id is patched
+            # too, but only when the file is absent: a failure to load an
+            # existing one stays on that error path.
+            if model_type in _CONFIG_LESS_MODEL_TYPES:
+                if file_or_path_exists(self.model, "config.json", revision=self.revision):
+                    return
+            elif model_type not in _LOCAL_BUNDLE_MODEL_TYPES or not os.path.isdir(self.model):
                 return
-            config_path = os.path.join(self.model, "config.json")
-            if os.path.lexists(config_path):
+            elif os.path.lexists(os.path.join(self.model, "config.json")):
                 return
             config_dict = {}
 
@@ -770,27 +834,36 @@ class OrchestratorArgs:
     """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: list[str] | None = None
     lora_backend: str | None = None
+    lora_application: str | None = None
     lora_scale: float | None = None
     diffusers_load_kwargs: str = "{}"
     diffusers_call_kwargs: str = "{}"
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
     ulysses_a2a_permute: bool | None = None
+    ulysses_overlap_chunks: int | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
     use_hsdp: bool = False
+    hsdp_data_parallel: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = 1
     diffusion_attention_backend: str | None = None
     fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: str | None = None
+    diffusion_attention_schedule: dict[str, Any] | None = None
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
     # CUDA graph capture of fixed-shape KV-cache decode steps (Qwen-Image-2.1
     # today). None defers to the OmniDiffusionConfig default (enabled);
     # --enforce-eager also disables it.
     enable_cuda_graph_decode: bool | None = None
+    diffusion_use_graph: bool = False
+    diffusion_graph_release_after_denoise: bool = False
+    # Run both CFG branches as one batched denoiser call on pipelines that
+    # support it. None defers to the OmniDiffusionConfig default (disabled).
+    enable_cfg_batching: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
     video_output_transport: dict[str, object] | None = None
@@ -798,6 +871,7 @@ class OrchestratorArgs:
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_stack_tiles: bool = True
     vae_fast_path: str = "lossless"
     vae_encode_fast_path: str = "lossless"
     enable_multithread_weight_load: bool = True
@@ -828,6 +902,9 @@ class OrchestratorArgs:
     tts_max_instructions_length: int | None = None
     enable_diffusion_pipeline_profiler: bool = False
     enable_ar_profiler: bool = False
+    enable_mixfusion: bool = False
+    mixfusion_min_chunk_tokens: int = 256
+    mixfusion_max_chunks: int = 128
     log_file: str | None = None
     replica_id: int | None = None
     omni_replica_address: str | None = None
@@ -858,6 +935,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "diffusion_load_format",
         "lora_path",
         "lora_backend",
+        "lora_application",
         "lora_scale",
         "diffusers_load_kwargs",
         "diffusers_call_kwargs",
@@ -865,9 +943,11 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "diffusion_attention_backend",
         "fastvideo_vsa_topk",
         "diffusion_attention_config",
+        "diffusion_attention_schedule",
         "diffusion_compile_granularity",
         "diffusion_compile_dynamic",
         "enable_cuda_graph_decode",
+        "enable_cfg_batching",
         "cache_backend",
         "cache_config",
         "video_output_transport",
@@ -875,6 +955,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "step_execution",
         "vae_use_slicing",
         "vae_use_tiling",
+        "vae_stack_tiles",
         "vae_fast_path",
         "vae_encode_fast_path",
         "enable_multithread_weight_load",
@@ -903,6 +984,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "ulysses_degree",
         "ulysses_mode",
         "ulysses_a2a_permute",
+        "ulysses_overlap_chunks",
         "ring_degree",
         "allgather_degree",
         "use_hsdp",

@@ -61,7 +61,8 @@ async def test_received_audio_prevents_silence_before_pcm_buffering(monkeypatch,
                 return await original(fn, *args, **kwargs)
 
             monkeypatch.setattr(h.runner, "offload", gated_decode)
-            h.submit(append_audio(samples=1280))
+            # pcm16: the format the runner still converts off-loop (pcm_f32le skips it).
+            h.submit(append_audio(samples=1280, audio_format="pcm16"))
         else:
             original = h.runner._handle_item
             blocker = commands.UpdateSession(patch={})
@@ -113,7 +114,7 @@ async def test_rejected_audio_releases_silence_priority(monkeypatch, failure):
             return await original(fn, *args, **kwargs)
 
         monkeypatch.setattr(h.runner, "offload", reject_decode)
-        events = await h.run(append_audio(samples=1280))
+        events = await h.run(append_audio(samples=1280, audio_format="pcm16"))
         assert "error" in types(events)
         assert len(h.port.submissions) == 1
         # Neither the validation-error return nor the worker's exception path
@@ -149,7 +150,7 @@ async def test_ignored_overlap_frame_rearms_the_blocked_continuation(monkeypatch
         # is what keeps overlap active for continue_output / ack / drop.
         h.session.capabilities = replace(h.session.capabilities, supports_barge_in=True)
         h.session.config.overlap_policy = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
-        received = append_audio(samples=1280)
+        received = append_audio(samples=1280, audio_format="pcm16")  # still decoded off-loop
         ignored = commands.AppendAudio(
             audio=received.audio,
             format=received.format,
@@ -196,7 +197,8 @@ def enable_overlap_discard(h) -> None:
 
 
 def ignored_append(overlap_action: str) -> commands.AppendAudio:
-    received = append_audio(samples=1280)
+    # pcm16 so the frame is still decoded off-loop, where these tests hold it.
+    received = append_audio(samples=1280, audio_format="pcm16")
     return commands.AppendAudio(
         audio=received.audio,
         format=received.format,

@@ -7,14 +7,14 @@ import pytest
 from PIL import Image
 
 from tests.model_executor.models.joyai_vl_interaction.test_duplex_plugin import Processor, frame
-from vllm_omni.experimental.fullduplex.joyvl.memory.memory import MidTermSummary, Summarizer
-from vllm_omni.experimental.fullduplex.joyvl.serving.config import InteractionConfig
-from vllm_omni.model_executor.models.joyai_vl_interaction.duplex import memory as memory_module
-from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
+from vllm_omni.engine.duplex import visual_memory as memory_module
+from vllm_omni.engine.duplex.visual_memory import (
     EncodedVisualImage,
-    JoyAIVisualMemory,
+    VisualMemory,
     VisualMemoryCapacityError,
 )
+from vllm_omni.experimental.fullduplex.joyvl.memory.memory import MidTermSummary, Summarizer
+from vllm_omni.experimental.fullduplex.joyvl.serving.config import InteractionConfig
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -37,7 +37,7 @@ def summarize(memory, text="A red cup is visible."):
 
 
 def test_frames_retain_lossless_encoded_pixels_and_distinct_observations():
-    memory = JoyAIVisualMemory()
+    memory = VisualMemory()
     image = Image.new("RGB", (13, 7), "red")
     first = append(memory, 1, image)
     second = append(memory, 2, image)
@@ -52,7 +52,7 @@ def test_frames_retain_lossless_encoded_pixels_and_distinct_observations():
 
 def test_encoded_capacity_is_atomic_and_released_by_summary():
     encoded = EncodedVisualImage.from_image(Image.new("RGB", (32, 32), "red"))
-    memory = JoyAIVisualMemory(max_encoded_bytes=len(encoded.data))
+    memory = VisualMemory(max_encoded_bytes=len(encoded.data))
     first = memory.append(source_id="one", image=encoded, token_count=4)
     with pytest.raises(VisualMemoryCapacityError):
         memory.append(source_id="two", image=encoded, token_count=4)
@@ -72,7 +72,7 @@ def test_prepared_encoded_frames_admit_without_encoding_or_decoding(monkeypatch)
 
     monkeypatch.setattr(EncodedVisualImage, "from_image", unexpected)
     monkeypatch.setattr(EncodedVisualImage, "decode", unexpected)
-    memory = JoyAIVisualMemory()
+    memory = VisualMemory()
     memory.check_capacity([encoded])
     retained = memory.append(source_id="one", image=encoded, token_count=256)
     assert retained.encoded_image is encoded
@@ -81,7 +81,7 @@ def test_prepared_encoded_frames_admit_without_encoding_or_decoding(monkeypatch)
 
 
 def test_default_timestamp_uses_elapsed_monotonic_time(monkeypatch):
-    memory = JoyAIVisualMemory(start_time=100.0)
+    memory = VisualMemory(start_time=100.0)
     monkeypatch.setattr(memory_module, "monotonic", lambda: 103.125)
     frame = memory.append(source_id="camera", image=Image.new("RGB", (8, 8)), token_count=4)
     assert frame.time_s == 3.125
@@ -89,7 +89,7 @@ def test_default_timestamp_uses_elapsed_monotonic_time(monkeypatch):
 
 @pytest.mark.parametrize("limit", ["frames", "bytes"])
 def test_capacity_failure_is_atomic_and_successful_summary_releases_capacity(limit):
-    memory = JoyAIVisualMemory(
+    memory = VisualMemory(
         max_pending=1 if limit == "frames" else 32, max_pixel_bytes=10000 if limit == "frames" else 192
     )
     first = append(memory)
@@ -105,7 +105,7 @@ def test_capacity_failure_is_atomic_and_successful_summary_releases_capacity(lim
 
 
 def test_batch_admission_checks_total_size_without_mutation():
-    memory = JoyAIVisualMemory(max_pixel_bytes=300)
+    memory = VisualMemory(max_pixel_bytes=300)
     images = [Image.new("RGB", (8, 8)) for _ in range(2)]
     with pytest.raises(VisualMemoryCapacityError):
         memory.check_capacity(images)
@@ -116,7 +116,7 @@ def test_batch_admission_checks_total_size_without_mutation():
 
 @pytest.mark.parametrize("count", [1, 2, 3, 4])
 def test_frame_summary_replaces_exact_prefix_preserving_new_tail_and_times(count):
-    memory = JoyAIVisualMemory()
+    memory = VisualMemory()
     frames = [append(memory, index) for index in range(4)]
     source = memory.frame_source(count)
     tail = append(memory, 4)
@@ -134,7 +134,7 @@ def test_frame_summary_replaces_exact_prefix_preserving_new_tail_and_times(count
 @pytest.mark.parametrize("kind", ["frames", "long"])
 @pytest.mark.parametrize("text,tokens", [("", 1), ("   ", 1), ("too long", 4001), ("invalid", 0)])
 def test_invalid_summary_retains_source_and_previous_memory(kind, text, tokens):
-    memory = JoyAIVisualMemory()
+    memory = VisualMemory()
     append(memory)
     if kind == "long":
         summarize(memory)
@@ -148,7 +148,7 @@ def test_invalid_summary_retains_source_and_previous_memory(kind, text, tokens):
 
 
 def test_long_term_rollover_preserves_uncovered_mid_prefix_and_bounds_retention():
-    memory = JoyAIVisualMemory(mid_group=2, max_long=2)
+    memory = VisualMemory(mid_group=2, max_long=2)
     for index in range(3):
         append(memory, index)
         summarize(memory)
@@ -169,7 +169,7 @@ def test_long_term_rollover_preserves_uncovered_mid_prefix_and_bounds_retention(
 
 
 def test_full_mid_term_keeps_raw_evidence_until_long_term_compression_succeeds():
-    memory = JoyAIVisualMemory(mid_group=1)
+    memory = VisualMemory(mid_group=1)
     append(memory)
     summarize(memory)
     pending = append(memory, 1)
@@ -181,7 +181,7 @@ def test_full_mid_term_keeps_raw_evidence_until_long_term_compression_succeeds()
 
 
 def test_clear_revokes_all_sources_and_keeps_monotonic_identity_and_clock():
-    memory = JoyAIVisualMemory(start_time=50.0)
+    memory = VisualMemory(start_time=50.0)
     append(memory)
     summarize(memory)
     assert memory.apply(memory.long_source(), text="Archived event", token_count=2)
@@ -200,14 +200,14 @@ def test_clear_revokes_all_sources_and_keeps_monotonic_identity_and_clock():
 
 
 def test_no_work_has_no_source():
-    memory = JoyAIVisualMemory()
+    memory = VisualMemory()
     assert memory.frame_source() is None
     assert memory.long_source() is None
 
 
 @pytest.mark.parametrize("chunk_frames", [4, 100])
 def test_rollover_preserves_frame_and_time_range(chunk_frames):
-    memory = JoyAIVisualMemory(chunk_frames=chunk_frames)
+    memory = VisualMemory(chunk_frames=chunk_frames)
     for index in range(chunk_frames * 5):
         append(memory, index, Image.new("RGB", (1, 1)))
         if len(memory.pending) == chunk_frames:
@@ -223,7 +223,7 @@ def test_rollover_preserves_frame_and_time_range(chunk_frames):
 
 
 def test_experimental_defaults_and_independent_summary_token_budgets():
-    memory = JoyAIVisualMemory()
+    memory = VisualMemory()
     experimental = InteractionConfig()
     assert memory.chunk_frames == experimental.chunk_frames
     assert memory.mid_group == experimental.long_term_every_n_chunks
@@ -231,7 +231,7 @@ def test_experimental_defaults_and_independent_summary_token_budgets():
     assert memory.mid_max_tokens == experimental.mid_term_max_tokens
     assert memory.long_max_tokens == experimental.long_term_max_tokens
     assert (memory.max_pending, memory.max_pixel_bytes) == (200, 200 * experimental.max_pixels * 3)
-    memory = JoyAIVisualMemory(mid_max_tokens=9, long_max_tokens=3)
+    memory = VisualMemory(mid_max_tokens=9, long_max_tokens=3)
     append(memory)
     summarize(memory)
     source = memory.long_source()
@@ -248,7 +248,7 @@ async def test_visual_summary_request_matches_experimental(mocker, kind):
     template = mocker.spy(plugin.processor, "apply_chat_template")
     plugin.max_model_len = 16384
     plugin.max_images = 999
-    memory = JoyAIVisualMemory()
+    memory = VisualMemory()
     backend = Mock(generate=AsyncMock(return_value=("A visual summary.", None)))
     experimental = Summarizer(backend)
     if kind == "frames":
@@ -300,7 +300,7 @@ async def test_visual_summary_request_matches_experimental(mocker, kind):
 
 @pytest.mark.parametrize("reason", ["context", "image_limit"])
 def test_capacity_closed_chunks_keep_number_and_reason_across_retry_and_clear(reason):
-    memory = JoyAIVisualMemory()
+    memory = VisualMemory()
     for index in range(3):
         append(memory, index)
     source = memory.frame_source(2, closure_reason=reason)

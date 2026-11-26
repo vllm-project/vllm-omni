@@ -30,7 +30,8 @@ for helper in ("failure", "pixels", "pixel_output", "leased_post_attention"):
     for heavy in ("actions", "pipeline", "transformer"):
         assert f"{package}.{heavy}" not in sys.modules, (helper, heavy)
 """
-    environment = dict(os.environ, PYTHONPATH=str(_REPO_ROOT), TORCH_DEVICE_BACKEND_AUTOLOAD="0")
+    python_path = os.pathsep.join(filter(None, (str(_REPO_ROOT), os.environ.get("PYTHONPATH"))))
+    environment = dict(os.environ, PYTHONPATH=python_path, TORCH_DEVICE_BACKEND_AUTOLOAD="0")
     completed = subprocess.run(
         [sys.executable, "-c", script],
         cwd=_REPO_ROOT,

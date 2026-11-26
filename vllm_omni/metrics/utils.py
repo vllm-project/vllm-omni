@@ -5,13 +5,17 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import fields
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from prettytable import PrettyTable
 
 from vllm_omni.metrics import definitions as metric_defs
 
 if TYPE_CHECKING:
+    from typing import SupportsFloat, SupportsIndex, SupportsInt
+
+    from _typeshed import SupportsTrunc
+
     from vllm_omni.metrics.modality import OmniModalityMetrics
     from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
     from vllm_omni.metrics.stats import StageRequestStats
@@ -58,6 +62,28 @@ def extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float 
     if pipeline_timings is None or "queue_wait_ms" not in pipeline_timings:
         return None
     return float(pipeline_timings["queue_wait_ms"] or 0.0) / 1000.0
+
+
+def diffusion_output_metrics(engine_output: object) -> dict[str, object]:
+    """Return the metrics dict on one engine output, or an empty dict."""
+    raw = getattr(engine_output, "metrics", None)
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def extract_diffusion_scheduler_wait_ms(output: object) -> float | None:
+    """Diffusion scheduler admission on one output, in milliseconds.
+
+    A missing key means the stage did not measure it. A present ``0`` is a
+    real measurement.
+    """
+    wait_ms = diffusion_output_metrics(output).get(metric_defs.SCHEDULER_QUEUE_WAIT_MS)
+    if wait_ms is None:
+        return None
+    return float(wait_ms)
 
 
 def observe_stage_workload_metrics(
@@ -250,10 +276,10 @@ def coerce_positive_int_scalar(value: object) -> int | None:
         except Exception:
             return None
     try:
-        value = int(value)
+        converted = int(cast("str | bytes | bytearray | SupportsInt | SupportsIndex | SupportsTrunc", value))
     except (TypeError, ValueError):
         return None
-    return value if value > 0 else None
+    return converted if converted > 0 else None
 
 
 def coerce_positive_float_scalar(value: object) -> float | None:
@@ -278,10 +304,10 @@ def coerce_positive_float_scalar(value: object) -> float | None:
         except Exception:
             return None
     try:
-        value = float(value)
+        converted = float(cast("str | bytes | bytearray | SupportsFloat | SupportsIndex", value))
     except (TypeError, ValueError):
         return None
-    return value if value > 0 else None
+    return converted if converted > 0 else None
 
 
 def resolve_int_by_sequential_keys(
@@ -326,11 +352,26 @@ def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
     if isinstance(mm, Mapping) and mm:
         return mm
     outs = getattr(mm_source, "outputs", None)
-    if outs:
+    if isinstance(outs, Sequence) and outs:
         nested = getattr(outs[0], "multimodal_output", None)
         if isinstance(nested, Mapping) and nested:
             return nested
     return {}
+
+
+def iter_request_output_items(output_source: object) -> tuple[object, ...]:
+    """Normalize vLLM generation and pooling request outputs.
+
+    ``RequestOutput.outputs`` is a list of completion outputs, while
+    ``PoolingRequestOutput.outputs`` is one scalar ``PoolingOutput``. Runtime
+    metrics inspect both shapes, so normalize them before iterating.
+    """
+    outputs = getattr(output_source, "outputs", None)
+    if outputs is None:
+        return ()
+    if isinstance(outputs, (list, tuple)):
+        return tuple(outputs)
+    return (outputs,)
 
 
 def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
@@ -338,8 +379,9 @@ def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
 
     Lookup order:
       1. ``mm_source.multimodal_output`` — top-level attribute / property
-      2. each ``mm_source.outputs[i].multimodal_output`` — every CompletionOutput
-         entry that carries a non-empty multimodal Mapping
+      2. each normalized output item's ``multimodal_output`` — every
+         CompletionOutput entry that carries a non-empty multimodal Mapping.
+         A scalar PoolingOutput is accepted and normally contributes nothing.
 
     Accepts both plain ``dict`` and ``MultimodalPayload`` (a ``Mapping``).
     Used by stage-pool metrics aggregation that needs to visit every mm payload.
@@ -356,7 +398,7 @@ def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
     outer_mm = getattr(mm_source, "multimodal_output", None)
     if isinstance(outer_mm, Mapping) and outer_mm:
         multimodal_outputs.append(outer_mm)
-    for output in getattr(mm_source, "outputs", None) or []:
+    for output in iter_request_output_items(mm_source):
         inner_mm = getattr(output, "multimodal_output", None)
         if isinstance(inner_mm, Mapping) and inner_mm:
             multimodal_outputs.append(inner_mm)
@@ -495,7 +537,7 @@ def count_video_frames(video: object) -> int | None:
 def _build_field_defs(
     cls: type,
     exclude: set[str],
-    transforms: dict[str, tuple[str, Callable]] | None = None,
+    transforms: dict[str, tuple[str, Callable[[Any], Any]]] | None = None,
 ) -> list[tuple[str, Callable[[Any], Any]]]:
     """Auto-generate field definitions from a dataclass.
 
@@ -509,16 +551,29 @@ def _build_field_defs(
         List of (display_name, getter_fn) tuples for table generation.
     """
     transforms = transforms or {}
-    result = []
+    result: list[tuple[str, Callable[[Any], Any]]] = []
     for f in fields(cls):
         if f.name in exclude:
             continue
         if f.name in transforms:
             display_name, transform_fn = transforms[f.name]
+
             # Capture variables in closure to avoid late binding issues
-            result.append((display_name, lambda e, fn=transform_fn, n=f.name: fn(getattr(e, n))))
+            def transformed_getter(
+                event: Any,
+                *,
+                transform: Callable[[Any], Any] = transform_fn,
+                name: str = f.name,
+            ) -> Any:
+                return transform(getattr(event, name))
+
+            result.append((display_name, transformed_getter))
         else:
-            result.append((f.name, lambda e, n=f.name: getattr(e, n)))
+
+            def getter(event: Any, *, name: str = f.name) -> Any:
+                return getattr(event, name)
+
+            result.append((f.name, getter))
     return result
 
 

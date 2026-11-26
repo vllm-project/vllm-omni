@@ -29,7 +29,7 @@ from typing import Any
 
 import pytest
 
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode, _RpcTask
 from vllm_omni.diffusion.sched import RequestScheduler
 from vllm_omni.diffusion.sched.interface import RequestBatchSamplingParamsKey
@@ -161,6 +161,7 @@ def _make_engine_with_loop(
     engine in its bootstrap state (no busy-loop thread).
     """
     engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     engine._closed = False
     engine.od_config = SimpleNamespace(streaming_output=False)
     engine.executor = _ConcurrencyTrackingExecutor(rpc_delay=rpc_delay)
@@ -168,7 +169,9 @@ def _make_engine_with_loop(
     sched = scheduler
     if sched is None:
         sched = RequestScheduler()
-        sched.initialize(SimpleNamespace(max_num_seqs=1, request_batch_max_wait_ms=0.0))
+        sched.initialize(
+            OmniDiffusionConfig(max_num_seqs=1, request_batch_max_wait_ms=0.0, diffusion_attention_schedule=None)
+        )
     engine.scheduler = sched
     engine.step_execution = False
     engine.supports_request_batch = False
@@ -235,7 +238,7 @@ def _start_paced_engine(execute_fn) -> DiffusionEngine:
     from vllm_omni.diffusion.sched import StepScheduler
 
     scheduler = StepScheduler()
-    scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+    scheduler.initialize(OmniDiffusionConfig(max_num_seqs=1, diffusion_attention_schedule=None))
     engine = _make_engine_with_loop(asyncio.get_running_loop(), scheduler=scheduler, start_loop=False)
     engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
     engine.od_config.streaming_output = True
@@ -701,6 +704,7 @@ def test_collective_rpc_before_loop_starts_calls_executor_directly():
     on the caller's thread without enqueueing.
     """
     engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     engine._closed = False
     engine._loop_started = False
     engine._rpc_lock = threading.RLock()
@@ -722,6 +726,7 @@ def test_collective_rpc_before_loop_starts_serializes_concurrent_callers():
     serialize them so they cannot race on the shared executor MQ pair.
     """
     engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     engine._closed = False
     engine._loop_started = False
     engine._rpc_lock = threading.RLock()
@@ -1072,7 +1077,9 @@ async def test_pause_rejects_unsupported_modes_without_closing_the_gate():
 async def test_keep_pause_during_batching_wait_holds_the_batch():
     loop = asyncio.get_running_loop()
     sched = _GatedAdmissionScheduler()
-    sched.initialize(SimpleNamespace(max_num_seqs=4, request_batch_max_wait_ms=1000.0))
+    sched.initialize(
+        OmniDiffusionConfig(max_num_seqs=4, request_batch_max_wait_ms=1000.0, diffusion_attention_schedule=None)
+    )
     engine = _make_engine_with_loop(loop, scheduler=sched)
     try:
         waiting = _submit(engine, "W")

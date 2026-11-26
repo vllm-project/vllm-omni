@@ -1,0 +1,3 @@
+# Realtime-Venus Omni using the turn-based engine and ordinary HTTP serving.
+base_config: minicpmo_4_5_turn.yaml
+pipeline: realtime_venus_omni

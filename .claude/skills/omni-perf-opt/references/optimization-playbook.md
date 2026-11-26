@@ -100,7 +100,8 @@ Validate smoothness with `audio_continuity_ok_rate`, not mean RTF.
 
 Knob: `model_runner: v2` (top-level or per stage). Ready-made overlays:
 `qwen3_omni_moe_mrv2.yaml`, `qwen3_omni_moe_mrv2_h200.yaml`,
-`minicpmo_4_5_turn_mrv2.yaml` (+ `_h200`), `minicpmo_4_5_duplex_mrv2.yaml`.
+`minicpmo_4_5_turn_mrv2.yaml` (+ `_h200`). MiniCPM-o duplex runs llm and code2wav on MRv2
+on CUDA through the default `minicpmo_4_5.yaml`; tts keeps v1 for multi-frame decode.
 
 - CUDA only; overlays fall back to V1 on NPU, XPU, ROCm, and MUSA.
 - Gains come from keeping sampler and EOS state on device (no per-step D2H
@@ -146,8 +147,7 @@ regression test `test_decode_replays_encoder_graph_in_capture_autocast`).
   is high but GPUs idle.
 - Connectors: `SharedMemoryConnector` on a single node; Mooncake, NIXL,
   Mori, and Yuanrong connectors for cross-device or cross-node transport
-  (`distributed/omni_connectors/factory.py`). `--shm-threshold-bytes`
-  (default 65536) sets the shared-memory threshold.
+  (`distributed/omni_connectors/factory.py`).
 - Payload size: hand only the hidden layers and keys the next stage reads;
   oversized payloads show up as connector `tx_time_ms` and orchestrator
   saturation.

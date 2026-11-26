@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import multiprocessing
 import sys
@@ -16,6 +17,27 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+
+def load_class_methods(relative_path, class_name, method_names, namespace, *, base_class=object):
+    """Execute selected production methods without GPU-heavy module imports."""
+    path = Path(__file__).resolve().parents[3] / relative_path
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+    cls.bases = [ast.Name(id="_TestBase", ctx=ast.Load())]
+    namespace["_TestBase"] = base_class
+    cls.keywords = []
+    cls.decorator_list = []
+    methods = [
+        node
+        for node in cls.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in method_names
+    ]
+    assert {node.name for node in methods} == set(method_names)
+    cls.body = [*methods]
+    module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace[class_name]
 
 
 def load_weight_sharing() -> ModuleType:
