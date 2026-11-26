@@ -2112,6 +2112,55 @@ class TestSendRetry(unittest.TestCase):
         self.assertTrue(success)
         sender.shutdown_omni_connectors()
 
+    def test_in_flight_ticket_retries_until_send_give_up(self):
+        """A failed put must not look finished just because the ticket is in flight."""
+
+        class _Ticket:
+            def __init__(self):
+                self._state = "QUEUED"
+                self.errors = []
+
+            @property
+            def state(self):
+                return type("State", (), {"name": self._state})()
+
+            def mark_in_flight(self):
+                if self._state != "QUEUED":
+                    return False
+                self._state = "IN_FLIGHT"
+                return True
+
+            def set_error(self, error):
+                self.errors.append(error)
+                self._state = "FAILED"
+
+            def set_result(self):
+                self._state = "DELIVERED"
+
+        connector = _FailingConnector(fail_count=999)
+        sender = self._make_sender(connector)
+        ticket = _Ticket()
+        task = self._make_task()
+        task["completion"] = ticket
+        task["put_key"] = "r1_0_0"
+        task["client_index"] = 4
+        sender._pending_save_counts["r1"] = 1
+        stage_fatal: list[BaseException] = []
+        sender._connector_send_error_sink = stage_fatal.append
+
+        for _ in range(sender._MAX_SEND_RETRIES + 1):
+            success = sender._send_single_request(task)
+            self.assertFalse(success)
+            sender._requeue_or_drop_failed_send(task, error=RuntimeError("put rejected"))
+
+        self.assertEqual(ticket.state.name, "DELIVERED")
+        self.assertFalse(ticket.errors)
+        self.assertEqual(stage_fatal, [])
+        output = sender.get_omni_connector_output()
+        self.assertIn("r1", output.permanent_send_failures)
+        self.assertIn("put rejected", output.permanent_send_failures["r1"][1])
+        sender.shutdown_omni_connectors()
+
 
 if __name__ == "__main__":
     unittest.main()

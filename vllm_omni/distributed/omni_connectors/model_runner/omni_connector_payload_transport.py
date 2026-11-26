@@ -1411,9 +1411,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             )
             if cause is not None:
                 reason = f"{reason}: {type(cause).__name__}: {cause}"
-            failure = RuntimeError(reason)
-            if cause is not None:
-                failure.__cause__ = cause
             client_index = task.get("client_index", 0)
             try:
                 client_index = int(client_index)
@@ -1433,15 +1430,13 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 req_id,
                 self._MAX_SEND_RETRIES,
             )
-            sink = getattr(self, "_connector_send_error_sink", None)
-            if sink is not None:
-                try:
-                    sink(failure)
-                except Exception:
-                    logger.exception("Connector send error sink failed for %s", req_id)
+            # The scheduler output above is the client-visible request error.
+            # set_error() on an MRv2 ticket quarantines the stage and wait()
+            # then escapes execute_model, so the engine dies before that
+            # request error can be emitted.
             completion = task.get("completion")
             if completion is not None:
-                completion.set_error(failure)
+                completion.set_result()
             self._decrement_pending_save_count(req_id)
 
     # ------------------------------------------------------------------ #
@@ -1796,13 +1791,17 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         put_key = task.get("put_key")
         completion = task.get("completion")
         if completion is not None and not completion.mark_in_flight():
-            logger.debug(
-                "[Stage-%s] Skipping terminal connector delivery: put_key=%s",
-                task["stage_id"],
-                put_key,
-            )
-            self._decrement_pending_save_count(request_id)
-            return True
+            # MRv2 marks the ticket in flight on the first attempt. A retry of
+            # that same ticket is still this send, not a finished delivery.
+            state = getattr(completion, "state", None)
+            if getattr(state, "name", None) != "IN_FLIGHT":
+                logger.debug(
+                    "[Stage-%s] Skipping terminal connector delivery: put_key=%s",
+                    task["stage_id"],
+                    put_key,
+                )
+                self._decrement_pending_save_count(request_id)
+                return True
 
         success, _size, _metadata = connector.put(
             from_stage=str(task["stage_id"]),

@@ -1401,6 +1401,7 @@ def test_zero_byte_leaves_roundtrip_without_native_descriptors(
         "bad_dtype",
         "bad_spec",
         "missing_specs",
+        "bad_schema",
     ],
 )
 @pytest.mark.usefixtures("reliable_claim_queries")
@@ -1453,6 +1454,8 @@ def test_invalid_empty_tensor_metadata_rejected_before_native_calls(producer, co
         metadata["tensor_specs"][0] = None
     elif defect == "missing_specs":
         metadata.pop("tensor_specs")
+    elif defect == "bad_schema":
+        metadata["schema_version"] = 999
     with pytest.raises(PermanentTransferError):
         consumer.get("0", "1", "req-invalid-empty", metadata)
     assert copying_native_agent == {"agents": [], "descs": [], "transfers": [], "released": []}

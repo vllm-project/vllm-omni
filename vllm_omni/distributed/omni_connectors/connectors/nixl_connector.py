@@ -384,10 +384,12 @@ class NixlConnector(OmniConnectorBase):
             metadata = self._resolve_metadata(get_key, metadata)
             if metadata is None:
                 return None
+            # The handshake already claimed the producer buffer. Keep the
+            # reply so a schema rejection still acknowledges that claim.
+            if isinstance(metadata, dict):
+                source_metadata = metadata
             if not isinstance(metadata, dict) or metadata.get("schema_version") != _SCHEMA_VERSION:
                 raise PermanentTransferError(f"NixlConnector get has invalid metadata for {get_key}")
-
-            source_metadata = metadata
             deadline = getattr(self._req_local, "deadline", None)
             if deadline is not None and time.monotonic() >= deadline:
                 return None
