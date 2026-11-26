@@ -69,6 +69,12 @@ def npu_omni_platform_plugin() -> str | None:
     try:
         import torch
 
+        if not hasattr(torch, "npu"):
+            try:
+                import torch_npu  # noqa: F401
+            except ImportError:
+                pass
+
         if hasattr(torch, "npu") and torch.npu.is_available():
             is_npu = True
             logger.debug("Confirmed NPU OmniPlatform is available.")
