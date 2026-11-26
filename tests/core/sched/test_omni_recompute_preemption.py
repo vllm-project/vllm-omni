@@ -150,6 +150,29 @@ def test_allow_mode_capacity_preemption_requeues(requires_kv_delivery):
     assert scheduler.update_from_output(scheduled, _output()) == {}
 
 
+def test_preempted_resumable_stop_keeps_one_admission_entry():
+    scheduler = _scheduler("allow", num_blocks=8)
+    scheduler.vllm_config.model_config.stage_id = 0
+    params = SamplingParams(max_tokens=8, stop_token_ids=[1])
+    request = Request("stream", [7] * 16, params, None, resumable=True)
+    scheduler.add_request(request)
+    old_step = scheduler.schedule()
+    assert old_step.num_scheduled_tokens == {request.request_id: 16}
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, 1.0)
+
+    # A late listen/stop from the preempted slice parks the streaming request.
+    # It is already waiting after preemption, so parking must replace that entry.
+    scheduler.update_from_output(old_step, _output(request))
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert list(scheduler.waiting).count(request) == 1
+    scheduler.add_request(Request("stream", [8] * 16, params, None, resumable=True))
+    next_step = scheduler.schedule()
+    assert next_step.num_scheduled_tokens == {request.request_id: 32}
+    assert request not in scheduler.waiting
+    assert request not in scheduler.kv_holding_waiting
+
+
 @pytest.mark.parametrize("requires_kv_delivery", [False, True])
 def test_explicit_prefix_cache_reset_preserves_resume(requires_kv_delivery):
     scheduler = _scheduler(requires_kv_delivery=requires_kv_delivery)

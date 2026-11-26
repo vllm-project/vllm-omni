@@ -676,6 +676,14 @@ requests restore media from current committed user items and text from
 completed replies. This path excludes the cancelled reply and honours
 history deletion, including deletion followed by reuse of the public item ID.
 
+On a locally managed Stage-0 replica in `"basic"` mode, the first replacement
+can reuse full KV blocks from the settled prefix before the interrupted turn.
+The retained prefix must match the current user sources and completed replies.
+Window replacement, unsettled writes, expiry, or cache pressure can make this
+optimization unavailable. The replacement can still prefill the selected
+history without the checkpoint. An admitted replacement keeps the actual input
+rows available for recompute if it is preempted later.
+
 An independently hosted Stage-0 replica uses the bounded handoff in `"basic"`
 and `"context"`: the same replica can offer completed units for 10 seconds
 from the abort, subject to a limit of 32 waiting windows. In `"off"` mode this

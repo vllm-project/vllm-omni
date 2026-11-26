@@ -3123,3 +3123,41 @@ def test_minicpmo_audio_after_vision_unit_starts_audio_encoder_at_first_chunk():
     assert state.audio_encoder_chunk_idx == 1
     assert state.audio_chunk_idx == 2
     assert audio["input_token_ids"][:2] == [runtime.unit_end_token_id, runtime.unit_token_id]
+
+
+def test_minicpmo_committed_checkpoint_can_rebuild_after_the_live_input_advances(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45CarriedWindow,
+        _MiniCPMO45Stage0SessionState,
+        _MiniCPMO45WindowUnit,
+    )
+
+    runtime = _stage0_vision_runtime()
+    runtime._stage_audio_embeddings = lambda *args, **kwargs: torch.zeros((1, 2))
+    monkeypatch.setattr(runtime, "_decode_audio_payload", lambda payload: np.zeros(4, dtype=np.float32))
+    authorized = _MiniCPMO45WindowUnit([runtime._embed_token(81)], [81])
+    cancelled = _MiniCPMO45WindowUnit([runtime._embed_token(82)], [82])
+    snapshot = _MiniCPMO45CarriedWindow.pack([authorized, cancelled])
+    snapshot.header = _MiniCPMO45CarriedWindow.pack(
+        [_MiniCPMO45WindowUnit([runtime._embed_token(80)], [80]), _MiniCPMO45WindowUnit()]
+    )
+    runtime._replay_windows = {"old": snapshot}
+    state = _MiniCPMO45Stage0SessionState(session_id="restore", window_enabled=True)
+    runtime.restore_committed_checkpoint(
+        state,
+        {"source": "old", "rows": 2, "terminator": 3},
+        [{"epoch": 0, "inputs": [{}], "user_only": True}],
+        budget=6,
+    )
+    live = runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), epoch=1, seq=1)
+    assert live["input_token_ids"] == [80, 81, 3, 2, 1, 11, 3, 2, 1, 11]
+    first = live["inputs_embeds"].clone()
+
+    tail = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(4, dtype=np.float32), epoch=1, seq=2, stage0_window={"completed_terminator_token_id": 3}
+    )
+    embeds, ids = runtime._window_replacement_parts(
+        state, {"replace": True, "mode": "basic", "recompute": True, "replacement_prompt_len": 14}
+    )
+    assert ids == live["input_token_ids"] + tail["input_token_ids"]
+    torch.testing.assert_close(torch.cat(embeds)[: len(first)], first)

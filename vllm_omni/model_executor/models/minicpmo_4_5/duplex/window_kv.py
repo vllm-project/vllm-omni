@@ -841,6 +841,12 @@ class MiniCPMO45SchedulerWindowPolicy:
 
     def __init__(self) -> None:
         self.carry: MiniCPMO45CarriedWindows | None = None
+        self.committed_kv = None
+
+    def bind_scheduler(self, scheduler: OmniARScheduler) -> None:
+        from .committed_kv import MiniCPMO45CommittedKV
+
+        self.committed_kv = MiniCPMO45CommittedKV(scheduler)
 
     @staticmethod
     def observe_progress(request: Request) -> None:
@@ -936,7 +942,20 @@ class MiniCPMO45SchedulerWindowPolicy:
     def prepare_admission(self, request: Request, max_prompt_len: int) -> int | None:
         sid = duplex_stage0_session_id(request.request_id)
         info = getattr(request, "model_intermediate_buffer", None)
-        if sid is None or not duplex_window_replay_enabled(info):
+        if sid is None:
+            return None
+        if not duplex_window_replay_enabled(info):
+            duplex = info["duplex"]
+            cfg = duplex["runtime_config"]
+            if duplex.get("seq") == 1 and "duplex_first_append_context_tokens" in cfg:
+                duplex["open_input_start"] = cfg["duplex_first_append_context_tokens"]
+                if self.committed_kv is not None and self.carry is not None:
+                    window = self.carry.windows.get(sid, {})
+                    for old_id, pending in reversed(self.carry.pending.items()):
+                        if duplex_stage0_session_id(old_id) == sid:
+                            window = pending
+                            break
+                    self.committed_kv.prepare(request, max_prompt_len, window.get("source"))
             return None
         if self.carry is None:
             self.carry = MiniCPMO45CarriedWindows()
@@ -1043,6 +1062,8 @@ class MiniCPMO45SchedulerWindowPolicy:
         replay_enabled = duplex_window_replay_enabled(info)
         if replay_enabled:
             self.snapshot_window(request)
+            if self.committed_kv is not None:
+                self.committed_kv.record(request, update, request.num_prompt_tokens + len(segment_output_ids))
         # A carried window must be placed by replacing the prompt, never by an in-place trim.
         reanchored = None
         if (
@@ -1065,17 +1086,18 @@ class MiniCPMO45SchedulerWindowPolicy:
             segment_output_ids=segment_output_ids,
             completed_terminator=completed_terminator,
         )
-        if (
-            replay_enabled
-            and isinstance(duplex, dict)
-            and (start := getattr(request, "_minicpmo45_window_open_start", None)) is not None
-        ):
+        if reanchored is not None or replaced:
+            request._minicpmo45_checkpoint_rebased = True
+            request._minicpmo45_committed_boundary = None
+        if isinstance(duplex, dict) and (start := getattr(request, "_minicpmo45_window_open_start", None)) is not None:
             duplex["open_input_start"] = start
         if replaced:
             return len(update.prompt_token_ids)
         return None
 
     def release_session(self, session_id: str) -> None:
+        if self.committed_kv is not None:
+            self.committed_kv.release(session_id)
         if (carry := self.carry) is None:
             return
         carry.windows.pop(session_id, None)
@@ -1113,6 +1135,8 @@ class MiniCPMO45SchedulerWindowPolicy:
 
     def before_book(self, requests: Mapping[str, Request], output: SchedulerOutput) -> None:
         """Drop the snapshots of requests whose append this step hands to the worker."""
+        if self.committed_kv is not None:
+            self.committed_kv.sweep()
         carry = self.carry
         if carry is None or not carry.snapshot_ids:
             return
@@ -1147,6 +1171,8 @@ class MiniCPMO45SchedulerWindowPolicy:
                     if "source" not in window and window["time"] is None:
                         window["time"] = time.monotonic()
                     carry.pending[request_id] = window
+                    if self.committed_kv is not None and window.get("source") == request_id:
+                        self.committed_kv.retain(request)
             carry.snapshot_ids.discard(request_id)
 
     @staticmethod

@@ -1553,3 +1553,88 @@ def test_preempted_mixed_span_keeps_generated_rows_after_the_prompt(surplus):
     expected = [10, 11, 12, 13] + [99] * surplus + [14, 15, 16, 17]
     assert ids.tolist() == expected
     assert embeds[:, 0].tolist() == expected
+
+
+@pytest.mark.parametrize("invalidated", [None, "history", "pending_writes", "missing_snapshot"])
+def test_committed_checkpoint_falls_back_or_requeues_after_adoption(invalidated):
+    from tests.core.sched.test_omni_recompute_preemption import _output, _scheduler
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.committed_kv import MiniCPMO45CommittedKV
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import CHECKPOINT_KEY, REPLAY_CONTEXT_KEY
+
+    scheduler = _scheduler(mode="allow", num_blocks=128)
+    cache = MiniCPMO45CommittedKV(scheduler)
+
+    def buffer(turn, epoch, seq, marker):
+        return {
+            "duplex": {
+                "data_plane": True,
+                "session_window_owned": True,
+                "session_id": "s",
+                "turn_id": turn,
+                "epoch": epoch,
+                "seq": seq,
+                CHECKPOINT_KEY: marker,
+                "runtime_config": {
+                    "duplex_first_append_context_tokens": 8,
+                    "duplex_window_config": {"sliding_window_mode": "basic"},
+                },
+            }
+        }
+
+    old = SimpleNamespace(
+        request_id="old",
+        model_intermediate_buffer=buffer(1, 0, 1, None),
+        num_prompt_tokens=16,
+        num_tokens=24,
+        num_computed_tokens=40,
+        num_in_flight_tokens=4,
+        num_preemptions=0,
+        last_sched_seq=0,
+        _all_token_ids=list(range(40)),
+    )
+    update = SimpleNamespace(model_intermediate_buffer=buffer(2, 0, 2, {"completed_turn": 1, "history": "approved"}))
+    cache.record(old, update, settled_end=23)
+    old.model_intermediate_buffer = update.model_intermediate_buffer
+    manager = cache.manager
+    first, partial, cancelled = cache.pool.get_new_blocks(3)
+    manager.req_to_blocks[old.request_id] = [first, partial, cancelled]
+    cache.retain(old)
+    manager.free(old.request_id)
+    assert (first.ref_cnt, partial.ref_cnt, cancelled.ref_cnt) == (1, 0, 0)
+
+    history = "edited" if invalidated == "history" else "approved"
+    request = Request("resume", [99] * 35, SamplingParams(max_tokens=8), None)
+    request.model_intermediate_buffer = buffer(3, 1, 1, {"interrupted_turn": 2, "history": history})
+    duplex = request.model_intermediate_buffer["duplex"]
+    turns = [{"token_budget": 12}, {"token_budget": 4, "user_only": True}]
+    duplex.update(
+        {REPLAY_CONTEXT_KEY: turns, "duplex_replay_token_budget": 16, "open_input_start": 8, "scheduler_token_id": 99}
+    )
+    if invalidated == "pending_writes":
+        old_record = cache.saved["s"]
+        scheduler.processed_step_seq = old_record.last_step - 1
+    cache.prepare(request, 63, None if invalidated == "missing_snapshot" else old.request_id)
+    if invalidated:
+        assert first.ref_cnt == 0
+        assert request.num_computed_tokens == 0
+        assert request.prompt_token_ids == [99] * 35
+        assert duplex[REPLAY_CONTEXT_KEY] == turns
+        return
+
+    assert request.num_computed_tokens == 16
+    assert request.prompt_token_ids == [99] * 40
+    assert duplex[CHECKPOINT_KEY] == {"source": "old", "rows": 23, "terminator": 23}
+    assert duplex[REPLAY_CONTEXT_KEY] == turns[-1:]
+    scheduler.add_request(request)
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens == {request.request_id: 24}
+    scheduler.update_from_output(step, _output(request))
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, 1.0)
+
+    assert first.ref_cnt == 0
+    assert request.num_computed_tokens == 0
+    assert duplex[CHECKPOINT_KEY]["source"] == "old"
+    retry = scheduler.schedule()
+    assert retry.num_scheduled_tokens == {request.request_id: 41}
+    assert not retry.finished_req_ids

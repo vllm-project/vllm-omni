@@ -250,6 +250,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         policy_path = getattr(self.vllm_config.model_config, "scheduler_window_policy", None)
         if isinstance(policy_path, str) and policy_path:
             self._window_policy = resolve_obj_by_qualname(policy_path)()
+            if bind_scheduler := getattr(self._window_policy, "bind_scheduler", None):
+                bind_scheduler(self)
         self._thinker_ngram = is_thinker_ngram(self.vllm_config)
         self._scheduler_ngram: Callable[..., np.ndarray] | None = None
         if use_scheduler_ngram(self.vllm_config):
@@ -2147,6 +2149,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # a session. The segment output list is cleared on a resumable stop,
         # and, for an already queued append, can still include its terminator.
         confirmed_end = session.num_computed_tokens - outstanding_async_tokens
+        if self._window_policy is not None and confirmed_end == 0 and session.num_preemptions:
+            # A stop from before preemption can reach the scheduler while the
+            # request waits to recompute. Its tokens are committed, but its
+            # physical KV frontier has already been reset to zero.
+            confirmed_end = session.num_tokens - 1
         segment_output_ids = list(session._all_token_ids[session.num_prompt_tokens : confirmed_end])
         completed_terminator = (
             session._all_token_ids[confirmed_end]
@@ -2402,6 +2409,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Baseline ``Scheduler._handle_stopped_request`` enqueued here. The pin
         # moved that enqueue into ``update_from_output``, which omni replaces.
         # Direct callers still need the request in a waiting queue.
+        if request.num_preemptions:
+            # A late resumable stop can arrive after capacity preemption has
+            # already enqueued this request. Replace that entry with the one
+            # for the next segment instead of leaving two admission entries.
+            self.waiting.remove_requests((request,))
+            self.kv_holding_waiting.remove_requests((request,))
+            self.async_kv_waiting.remove_requests((request,))
+            self.deferred_waiting.discard(request)
         self._enqueue_waiting_request(request)
         return False
 

@@ -210,10 +210,13 @@ def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool)
                 with suppress(asyncio.CancelledError):
                     await reader
 
-    restored = "MiniCPM-o restored 1 completed response(s), 1 interrupted user turn(s)"
-    with omni_server.capture_stderr_evidence([restored]) as evidence:
+    restored = (
+        "MiniCPM-o restored 1 completed response(s), 1 interrupted user turn(s)",
+        "MiniCPM-o restored a committed checkpoint",
+    )
+    with omni_server.capture_stderr_evidence(restored) as evidence:
         asyncio.run(run())
-        assert restored in evidence.wait()
+        assert any(marker in evidence.wait() for marker in restored)
 
 
 # ``minicpmo_4_5.yaml`` resolves all three stages to MRv2 on CUDA and ROCm.

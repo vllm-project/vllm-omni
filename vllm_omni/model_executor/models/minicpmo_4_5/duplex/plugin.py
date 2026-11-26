@@ -22,6 +22,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
+from hashlib import sha256
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -65,6 +66,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import MiniCPMO45PcmAppendBuffer
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     APPEND_TEXT_TOKEN_IDS_KEY,
+    CHECKPOINT_KEY,
     REPLAY_CONTEXT_KEY,
     MiniCPMO45DuplexPolicy,
     MiniCPMO45DuplexWindowConfig,
@@ -107,6 +109,7 @@ class _ReplayTurn:
     inputs: list[_ReplayInput]
     epoch: int
     source: _ReplaySource | None
+    completed_text: str = ""
 
 
 @dataclass(slots=True)
@@ -123,6 +126,7 @@ class MiniCPMO45ServingSessionState(DefaultDuplexModelSessionState):
     replay_commits: dict[int, _ReplaySource] = field(default_factory=dict)
     replay_completed: list[_ReplayTurn] = field(default_factory=list)
     has_committed_history: bool = False
+    checkpoint_eligible: bool = True
 
 
 _DUPLEX_CHUNK_SAMPLES = 16000
@@ -164,6 +168,7 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "initial_user_text",
         APPEND_TEXT_TOKEN_IDS_KEY,
         REPLAY_CONTEXT_KEY,
+        CHECKPOINT_KEY,
         "duplex_window_config",
         "duplex_window_prefix_tokens",
         "duplex_window_suffix_token_ids",
@@ -396,6 +401,9 @@ def build_duplex_data_plane_prompt(
     if isinstance(append_text_ids, list):
         token_budget += len(append_text_ids)
     model_fields: dict[str, object] = {}
+    checkpoint = session_config.pop(CHECKPOINT_KEY, None) if CHECKPOINT_KEY in session_config else None
+    if isinstance(checkpoint, dict):
+        model_fields[CHECKPOINT_KEY] = checkpoint
     if fence.epoch > 0 and isinstance(replay, list):
         # An authoritative history and a retained native window must never both be applied.
         model_fields["session_window_replay"] = False
@@ -865,6 +873,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         ):
             state.replay_pending.clear()
             state.replay_overflow_turn = fence.turn_id
+            state.checkpoint_eligible = False
         if state.replay_overflow_turn is None or fence.turn_id > state.replay_overflow_turn:
             state.replay_pending.append(
                 _ReplayInput(
@@ -909,6 +918,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         assert isinstance(state, MiniCPMO45ServingSessionState)
         state.replay_pending = [unit for unit in state.replay_pending if unit.input_commit_seq in state.replay_commits]
         state.replay_completed = [turn for turn in state.replay_completed if turn.source is not None]
+        state.checkpoint_eligible = False
 
     @staticmethod
     def _input_commit_seq(inputs: list[_ReplayInput]) -> int | None:
@@ -923,6 +933,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         fence: DuplexFence,
         response_id: str,
         completed: bool,
+        assistant_text: str = "",
     ) -> None:
         assert isinstance(state, MiniCPMO45ServingSessionState)
         if state.replay_epoch != fence.epoch:
@@ -943,19 +954,24 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             if source is not None and inputs:
                 state.replay_completed.append(_ReplayTurn(None, inputs, fence.epoch, source))
         elif inputs and (state.replay_overflow_turn is None or fence.turn_id > state.replay_overflow_turn):
-            state.replay_completed.append(_ReplayTurn(item_id, inputs, fence.epoch, source))
+            state.replay_completed.append(_ReplayTurn(item_id, inputs, fence.epoch, source, assistant_text.strip()))
         while (
             sum(unit.num_bytes for turn in state.replay_completed for unit in turn.inputs) > _REPLAY_MAX_BYTES
             or sum(unit.token_budget for turn in state.replay_completed for unit in turn.inputs) > _REPLAY_MAX_TOKENS
         ):
             state.replay_completed.pop(0)
+            state.checkpoint_eligible = False
 
     def prepare_prompt_config(
         self, config: dict[str, object], *, state: DuplexModelSessionState, payload: dict[str, object]
     ) -> dict[str, object]:
         assert isinstance(state, MiniCPMO45ServingSessionState)
         if state.has_committed_history:
-            return {**config, REPLAY_CONTEXT_KEY: state.replay_completed.copy()}
+            return {
+                **config,
+                REPLAY_CONTEXT_KEY: state.replay_completed.copy(),
+                CHECKPOINT_KEY: state.checkpoint_eligible,
+            }
         return config
 
     @staticmethod
@@ -976,6 +992,18 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         message = messages.get(item_id, {})
         text = message.get("content")
         return text if message.get("role") == "assistant" and isinstance(text, str) and text.strip() else None
+
+    def _checkpoint_signature(self, turns: list[_ReplayTurn], messages: dict, sources: Mapping) -> str | None:
+        history = []
+        for turn in turns:
+            if turn.item_id is None or not self._source_is_current(turn, messages, sources):
+                return None
+            text = self._assistant_text(messages, turn.item_id)
+            if text is None or text.strip() != turn.completed_text:
+                return None
+            assert turn.source is not None
+            history.append((turn.source.source_id, turn.item_id, text))
+        return sha256(json.dumps(history).encode()).hexdigest() if history else None
 
     def _prepare_replay(self, session_config: dict[str, object], runtime_config: dict[str, object]) -> None:
         turns = session_config.get(REPLAY_CONTEXT_KEY)
@@ -1017,6 +1045,18 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             )
             remaining -= budget
         session_config[REPLAY_CONTEXT_KEY] = list(reversed(selected))
+        if (
+            session_config.get(CHECKPOINT_KEY) is True
+            and len(selected) == len(turns)
+            and turns
+            and turns[-1].item_id is None
+            and all(turn.epoch == 0 for turn in turns)
+        ):
+            if signature := self._checkpoint_signature(turns[:-1], messages, sources):
+                session_config[CHECKPOINT_KEY] = {
+                    "history": signature,
+                    "interrupted_turn": turns[-1].inputs[-1].turn_id,
+                }
 
     async def prepare_append_plan(
         self,
@@ -1044,7 +1084,13 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         if REPLAY_CONTEXT_KEY in session_config:
             session_config = dict(session_config)
             if fence.epoch == 0:
-                session_config.pop(REPLAY_CONTEXT_KEY)
+                turns = session_config.pop(REPLAY_CONTEXT_KEY)
+                if session_config.get(CHECKPOINT_KEY) is True and turn_seq == 1 and isinstance(turns, list) and turns:
+                    if signature := self._checkpoint_signature(turns, *self._history_sources(session_config)):
+                        session_config[CHECKPOINT_KEY] = {
+                            "history": signature,
+                            "completed_turn": turns[-1].inputs[-1].turn_id,
+                        }
             elif seq == 1:
                 self._prepare_replay(session_config, runtime_config)
             else:

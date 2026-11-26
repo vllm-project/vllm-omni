@@ -565,6 +565,33 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.current_turn_ended = False
             state.pending_speech_response_open = True
 
+    def restore_committed_checkpoint(self, state, checkpoint, turns, budget):
+        # The scheduler has validated the source and the old request's settled writes.
+        source = self._replay_windows.get(checkpoint["source"])
+        if source is None or source.header is None:
+            raise _UnrecoverableWindowError("Missing accepted MiniCPM-o checkpoint rows")
+        header = source.header.unpack()
+        state.context_prefix_embeds, state.context_prefix_token_ids = header[0].embeds, header[0].token_ids
+        state.context_suffix_embeds, state.context_suffix_token_ids = header[1].embeds, header[1].token_ids
+        state.context_embeds = [*state.context_prefix_embeds, *state.context_suffix_embeds]
+        state.context_token_ids = [*state.context_prefix_token_ids, *state.context_suffix_token_ids]
+        rows = checkpoint["rows"] - len(state.context_token_ids)
+        ids = [token for unit in source.token_ids for token in unit]
+        if source.embeds is not None:
+            embeds = [source.embeds[:rows].to(source.device, non_blocking=True)]
+        else:
+            units = source.unpack()
+            ids = [token for unit in units for token in unit.token_ids]
+            embeds = self._slice_embed_list([embed for unit in units for embed in unit.embeds], 0, rows)
+        if not 0 < rows <= len(ids) or sum(self._tensor_rows(t) for t in embeds) != rows:
+            raise _UnrecoverableWindowError("Invalid accepted MiniCPM-o checkpoint length")
+        closure = [checkpoint["terminator"], self.unit_end_token_id]
+        self.restore_completed_turns(state, turns, budget - len(closure))
+        context = state.restored_context
+        context.embeds[:0] = [*embeds, *(self._embed_token(token) for token in closure)]
+        context.token_ids[:0] = [*ids[:rows], *closure]
+        logger.info("MiniCPM-o restored a committed checkpoint with %d accepted rows", checkpoint["rows"])
+
     def restore_completed_turns(
         self,
         state: _MiniCPMO45Stage0SessionState,

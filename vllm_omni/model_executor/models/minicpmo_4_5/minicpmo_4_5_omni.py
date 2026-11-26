@@ -40,6 +40,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     APPEND_TEXT_TOKEN_IDS_KEY,
+    CHECKPOINT_KEY,
     REPLAY_CONTEXT_KEY,
     MiniCPMO45DuplexPolicy,
     record_turn_sample,
@@ -554,7 +555,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         # A deferred sample of this session updates the latches its append reads.
         self._commit_minicpmo45_duplex_pending_samples(session_ids={session_id})
-        state = self._minicpmo45_duplex_session_state(helper, session_id, duplex)
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _UnrecoverableWindowError
+
+        try:
+            state = self._minicpmo45_duplex_session_state(helper, session_id, duplex)
+        except _UnrecoverableWindowError as exc:
+            helper.sessions.pop(session_id, None)
+            embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
+            return input_ids, embeds, {"request_error": str(exc)}
         req_id = kwargs.get("req_id")
         if req_id is not None:
             # Own the session from its first append: MRv2 samples no partial
@@ -625,8 +633,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # Reserve surplus rows at the start of the pending unit. Rows of
             # the already accepted prefix must remain in their original positions.
             rebuild.update(recompute=True, replacement_prompt_len=prompt_len)
-            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _UnrecoverableWindowError
-
             try:
                 parts = helper._window_replacement_parts(state, rebuild)
             except _UnrecoverableWindowError as exc:
@@ -655,8 +661,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # embeddings last also places the decode position directly after the
             # final audio embedding, matching the official listen/speak decision
             # point.
-            full_req_embeds = torch.cat([pad_embeds, full_req_embeds], dim=0)
-            full_input_token_ids = [pad_token_id] * pad_len + full_input_token_ids
+            checkpoint = duplex.get(CHECKPOINT_KEY, {})
+            pad_at = checkpoint["rows"] + duplex["duplex_replay_token_budget"] if "source" in checkpoint else 0
+            full_req_embeds = torch.cat([full_req_embeds[:pad_at], pad_embeds, full_req_embeds[pad_at:]], dim=0)
+            full_input_token_ids[pad_at:pad_at] = [pad_token_id] * pad_len
         elif prompt_len < int(full_req_embeds.shape[0]):
             logger.warning(
                 "MiniCPM-o duplex append produced %d embeddings but the scheduler "
@@ -772,7 +780,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 kwargs.update(helper.frame_kwargs(duplex, payload))
             except ValueError:
                 continue
-            staged.append((self._minicpmo45_duplex_session_state(helper, session_id, duplex), audio_waveform, kwargs))
+            # An admitted checkpoint uses the per-request path, which can report
+            # a missing recovery record as a request error.
+            if "source" not in duplex.get(CHECKPOINT_KEY, {}):
+                staged.append(
+                    (self._minicpmo45_duplex_session_state(helper, session_id, duplex), audio_waveform, kwargs)
+                )
         if len(staged) >= 2:
             helper.stage_prefill_batch(staged)
 
@@ -821,7 +834,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
             restore_window_units = getattr(helper, "restore_window_units", None)
             if replay := duplex.get(REPLAY_CONTEXT_KEY):
-                helper.restore_completed_turns(state, replay, duplex["duplex_replay_token_budget"])
+                checkpoint = duplex.get(CHECKPOINT_KEY, {})
+                if "source" in checkpoint:
+                    helper.restore_committed_checkpoint(state, checkpoint, replay, duplex["duplex_replay_token_budget"])
+                else:
+                    helper.restore_completed_turns(state, replay, duplex["duplex_replay_token_budget"])
             elif restore_window_units is not None:
                 restore_window_units(state)
         elif runtime_config and hasattr(helper, "_sync_session_runtime_config"):

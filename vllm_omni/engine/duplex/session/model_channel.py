@@ -1815,6 +1815,7 @@ class ModelChannel:
                 fence=fence,
                 response_id=response_id,
                 completed=True,
+                assistant_text="".join(session.assistant_text_buffer),
             )
         return session.end_response(commit_text=should_commit, preserve_request=preserve_request)
 

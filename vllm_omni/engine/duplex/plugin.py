@@ -783,6 +783,7 @@ class DuplexModelPlugin(ABC):
         fence: DuplexFence,
         response_id: str,
         completed: bool,
+        assistant_text: str = "",
     ) -> None:
         """Observe cancellation or a normal response end eligible for history."""
 
