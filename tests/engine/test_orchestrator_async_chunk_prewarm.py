@@ -69,6 +69,9 @@ class _FakePool:
     def live_replica_ids(self) -> list[int]:
         return [0]
 
+    def select_code2wav_replica(self, request_id: str) -> int | None:
+        return None
+
     async def submit_initial(
         self,
         request_id,
@@ -393,7 +396,7 @@ async def test_prewarm_drops_deferred_multimodal_data_from_wire_payload() -> Non
 
     orchestrator = _orchestrator()
     image = Image.new("RGB", (4, 4), color=(12, 34, 56))
-    prompt = {
+    prompt: dict[str, Any] = {
         "prompt": "Please transcribe this speech.",
         "additional_information": {
             "tts_speaker": "vivian",

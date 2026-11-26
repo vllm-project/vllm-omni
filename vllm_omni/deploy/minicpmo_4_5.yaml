@@ -251,7 +251,6 @@ platforms:
     model_runner: v2
 
   npu:
-    # All three stages use MRv2.
     model_runner: v2
     stages:
       - stage_id: 0
@@ -313,10 +312,10 @@ platforms:
         kv_cache_memory_bytes: 4294967296  # 4 GiB
         gpu_memory_utilization: 0.10
         max_num_batched_tokens: 8192
-        # NPU also reserves eight codec positions with synchronous scheduling.
+        # The NPU Talker reserves sixteen codec positions with synchronous scheduling.
         speculative_config:
           method: ngram
-          num_speculative_tokens: 7
+          num_speculative_tokens: 15
           prompt_lookup_min: 1
           prompt_lookup_max: 1
         async_scheduling: false
@@ -362,6 +361,20 @@ platforms:
           # It buys shape-space coverage, not graph memory -- both settings
           # capture up to the pool limit.
           code2wav_max_npu_graphs: 32
+    connectors:
+      connector_of_shared_memory:
+        extra:
+          codec_chunk_frames: 32
+          token2wav_spk_cpu_reference: true
+          token2wav_runtime_prompt_cache_size: 64
+          # Bound device-resident reference state on the co-located card.
+          token2wav_setup_cache_size: 4
+          token2wav_setup_host_cache_size: 64
+          cfm_drop_upstream_att_buffer: true
+          code2wav_encoder_tail_precapture: true
+          # Fit singleton, batch and tail captures in the 32-entry pool.
+          cfm_graph_capture_frames: [64, 80]
+          token2wav_ref_prefetch_setup: true
 
   xpu:
     # Intel XPU builds the omni V2 runners; all three stages run on MRv2.

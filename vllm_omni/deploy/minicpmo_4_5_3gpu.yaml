@@ -1,16 +1,25 @@
-# MiniCPM-o 4.5 three-stage deploy with one GPU per stage.
-# Thinker, Talker, and Code2Wav run on GPUs 0, 1, and 2.
-base_config: minicpmo_4_5_2gpu.yaml
+# One GPU per stage on devices 0, 1, and 2.
+base_config: minicpmo_4_5.yaml
 
 stages:
   - stage_id: 0
-    interleave_mm_strings: true
-    media_io_kwargs:
-      video:
-        fps: 1
-        num_frames: 128
+    gpu_memory_utilization: 0.9
   - stage_id: 1
+    devices: "1"
     gpu_memory_utilization: 0.9
   - stage_id: 2
-    gpu_memory_utilization: 0.9
     devices: "2"
+    gpu_memory_utilization: 0.9
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        kv_cache_memory_bytes: null
+      - stage_id: 1
+        kv_cache_memory_bytes: null
+      - stage_id: 2
+        devices: "2"
+        num_replicas: 1
+        max_num_seqs: 16
+        gpu_memory_utilization: 0.9

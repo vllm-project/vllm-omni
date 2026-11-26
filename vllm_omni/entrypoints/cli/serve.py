@@ -16,6 +16,7 @@ import math
 import os
 import signal
 from collections.abc import Mapping
+from contextlib import ExitStack
 from types import FrameType
 from typing import TYPE_CHECKING, Any, cast
 
@@ -1542,7 +1543,16 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
     stage_runtime = None
     api_server_manager = None
     engine_launch = None
+    startup_environment = ExitStack()
     try:
+        deploy_config = getattr(args, "deploy_config", None)
+        if deploy_config:
+            from vllm_omni.platforms import current_omni_platform
+
+            if current_omni_platform.is_npu():
+                from vllm_omni.model_executor.models.minicpmo_4_5.config import npu_prefill_startup_environment
+
+                startup_environment.enter_context(npu_prefill_startup_environment(deploy_config))
         stage_runtime = _build_multi_api_stage_runtime(args, num_api_servers)
         with stage_runtime.launch_stage_engines(num_api_servers) as engine_launch:
             args._omni_stage_client_configs = engine_launch.client_configs
@@ -1564,14 +1574,17 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
         _wait_for_multi_api_server_completion(api_server_manager, engine_launch)
     finally:
         timeout = float(getattr(args, "shutdown_timeout", 5) or 5)
-        if api_server_manager is not None:
-            api_server_manager.shutdown(timeout=timeout)
-        if engine_launch is not None:
-            engine_launch.shutdown()
-        if stage_runtime is not None:
-            stage_runtime.shutdown()
-        sock.close()
-        remove_api_server_shared_dir(shared_dir)
+        try:
+            if api_server_manager is not None:
+                api_server_manager.shutdown(timeout=timeout)
+            if engine_launch is not None:
+                engine_launch.shutdown()
+            if stage_runtime is not None:
+                stage_runtime.shutdown()
+        finally:
+            startup_environment.close()
+            sock.close()
+            remove_api_server_shared_dir(shared_dir)
         if shutdown_requested:
             logger.info("Shared API server shutdown completed")
 
