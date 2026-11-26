@@ -26,7 +26,15 @@ stage_configs = [
         get_deploy_config_path("ci/qwen2_5_omni.yaml"),
         # This suite requests two cards. Share the Talker's card with
         # Code2Wav and leave room for its whole-sequence DiT workspace.
-        updates={"stages": {1: {"gpu_memory_utilization": 0.3}, 2: {"devices": "1"}}},
+        # The default 16384-token profiling step leaves the Thinker and the Talker too little KV cache on
+        # 22 GiB cards; no request in this file exceeds 8192 tokens, so the smaller step does not chunk any.
+        updates={
+            "stages": {
+                0: {"max_num_batched_tokens": 8192},
+                1: {"gpu_memory_utilization": 0.3, "max_num_batched_tokens": 8192},
+                2: {"devices": "1"},
+            }
+        },
     )
 ]
 
