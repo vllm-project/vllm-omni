@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Rolling-window mel slicing must match full-history slicing bit-for-bit.
+"""Rolling-window mel slicing must match full-history slicing.
 
 The duplex thinker keeps a bounded trailing audio window instead of the full
 session history (the mel featurizer is local: hop-aligned STFT columns, no
 cross-stream normalization).  These tests replay a stream both ways through
-the vendored preprocessor and require identical chunk tensors.
+the vendored preprocessor and require the chunk tensors to match up to
+floating-point noise: the trimmed window and the full history are
+different-length signals, so the STFT/FFT may take different vectorised code
+paths and differ by 1-2 ULP on features of magnitude ~10.  Shapes and the
+drop count stay exact.
 """
 
 from types import SimpleNamespace
@@ -23,7 +27,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_think
 FRAME_SAMPLES = 1280  # 80 ms @ 16 kHz
 HOP = 160  # 10 ms window stride
 
-pytestmark = pytest.mark.core_model
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _make_preprocessor():
@@ -110,7 +114,11 @@ def test_windowed_mel_chunks_match_full_history(streaming_cfg):
         )
         assert actual_drop == expected_drop
         assert actual.shape == expected.shape, f"frame {frame_idx}"
-        assert torch.equal(actual, expected), f"frame {frame_idx} mel chunk diverged (window_col0={window_col0})"
+        # 1e-5 sits ~10x above the observed 1-2 ULP STFT noise and far below a
+        # real windowing regression, which would move values much further.
+        assert torch.allclose(actual, expected, atol=1e-5, rtol=0), (
+            f"frame {frame_idx} mel chunk diverged (window_col0={window_col0})"
+        )
 
     assert trimmed, "test never exercised the trimmed-window path"
     # The rolling window must stay bounded instead of growing with the stream.
