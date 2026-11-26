@@ -1024,7 +1024,16 @@ def encode_media(
     The caller selects participating ranks and configures the VAE process group.
     Every visual participant must call this function with the same references.
     Component scopes allow the diffusion runner to stage one codec at a time.
+    All audio adapters encode through encode_waveform. The native H3 audio VAE
+    can also prepare a CPU waveform on a worker and return a (waveform, rate)
+    pair for encode_waveform on the calling thread.
     """
+    # Import lazily because the H3 diffusion pipeline imports this module.
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        MINIMAX_H3_AUDIO_SAMPLE_RATE,
+        MiniMaxH3AudioVAE,
+    )
+
     # Validate before the non-leader return so all participants reject bad input.
     audio_inputs = _effective_audio_inputs(
         media.video_audios,
@@ -1041,17 +1050,16 @@ def encode_media(
     guide_visual_rows: list[torch.Tensor | None] = [None] * len(media.timeline_guides)
     has_guide_frames = any(guide.frames is not None for guide in media.timeline_guides)
     has_visual = bool(media.images or media.videos or media.video_edit is not None or has_guide_frames)
-    prepare_waveform = getattr(audio_vae, "_prepare_waveform", None)
-    target_rate = getattr(audio_vae, "sample_rate", None)
-    if not (
+    prepare_waveform = None
+    if (
         emit_conditioning
         and has_visual
-        and callable(prepare_waveform)
+        and isinstance(audio_vae, MiniMaxH3AudioVAE)
         and not torch.is_autocast_enabled("cpu")
         and all(waveform.device.type == "cpu" for waveform, _ in audio_inputs)
-        and any(int(rate) != target_rate for _, rate in audio_inputs)
+        and any(int(rate) != MINIMAX_H3_AUDIO_SAMPLE_RATE for _, rate in audio_inputs)
     ):
-        prepare_waveform = None
+        prepare_waveform = audio_vae.prepare_waveform
     with _prepare_audio_during_visual_encode(audio_inputs, prepare_waveform) as audio_futures:
         if has_visual:
             if video_vae is None:

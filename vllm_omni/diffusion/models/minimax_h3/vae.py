@@ -1425,7 +1425,7 @@ class MiniMaxH3AudioVAE(nn.Module):
 
     @staticmethod
     @torch.inference_mode()
-    def _prepare_waveform(
+    def prepare_waveform(
         waveform: torch.Tensor,
         sample_rate: int,
     ) -> tuple[torch.Tensor, int]:
@@ -1460,7 +1460,7 @@ class MiniMaxH3AudioVAE(nn.Module):
     ) -> tuple[torch.Tensor, int]:
         if getattr(self, "decode_only", False):
             raise RuntimeError("MiniMax H3 decode-only audio VAE cannot encode waveforms")
-        waveform, _ = self._prepare_waveform(waveform, sample_rate)
+        waveform, _ = self.prepare_waveform(waveform, sample_rate)
         device = next(self.model.parameters()).device
         waveform = waveform.to(device)
 

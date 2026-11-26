@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from threading import Event, get_ident
 
 import numpy as np
@@ -50,25 +50,25 @@ def test_waveform_preparation_preserves_existing_order_and_samples(rate: int, ch
     if expected.shape[0] < 2:
         expected = expected.repeat(2, 1)
     expected = expected[:2]
-    actual, output_rate = MiniMaxH3AudioVAE._prepare_waveform(value, rate)
+    actual, output_rate = MiniMaxH3AudioVAE.prepare_waveform(value, rate)
     assert output_rate == 32000
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@dataclass
-class _AudioVAE:
-    started: Event
-    release: Event
-    owner: int
-    sample_rate: int = 32000
-    received: list[tuple[torch.Tensor, int]] = field(default_factory=list)
+class _AudioVAE(MiniMaxH3AudioVAE):
+    def __init__(self, started: Event, release: Event, owner: int):
+        torch.nn.Module.__init__(self)
+        self.started = started
+        self.release = release
+        self.owner = owner
+        self.received: list[tuple[torch.Tensor, int]] = []
 
-    def _prepare_waveform(self, waveform: torch.Tensor, rate: int) -> tuple[torch.Tensor, int]:
+    def prepare_waveform(self, waveform: torch.Tensor, rate: int) -> tuple[torch.Tensor, int]:
         assert get_ident() != self.owner
         self.started.set()
         assert self.release.wait(10), "visual encoder did not release preparation"
-        return MiniMaxH3AudioVAE._prepare_waveform(waveform, rate)
+        return MiniMaxH3AudioVAE.prepare_waveform(waveform, rate)
 
     def encode_waveform(self, waveform: torch.Tensor, rate: int) -> tuple[torch.Tensor, int]:
         assert get_ident() == self.owner
@@ -110,7 +110,7 @@ def test_cpu_preparation_overlaps_visual_and_preserves_crop_and_order() -> None:
     assert embedded is not None
     inputs = [embedded, (media.audios[0][0][..., : round(124 / 24 * 16000)], 16000)]
     for source, actual in zip(inputs, audio.received, strict=True):
-        expected = MiniMaxH3AudioVAE._prepare_waveform(*source)
+        expected = MiniMaxH3AudioVAE.prepare_waveform(*source)
         assert actual[1] == expected[1]
         torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
 
@@ -195,9 +195,27 @@ def test_cpu_autocast_keeps_preparation_on_calling_thread() -> None:
     assert audio.received[0][1] == 44100
 
 
+@pytest.mark.usefixtures("no_audio_worker")
+def test_unrelated_audio_adapter_with_same_method_name_stays_synchronous() -> None:
+    class OtherAudioVAE:
+        sample_rate = 32000
+
+        def _prepare_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
+            pytest.fail("an unrelated preparation method must never run")
+
+        def encode_waveform(self, waveform: torch.Tensor, rate: int) -> tuple[torch.Tensor, int]:
+            assert rate in (44100, 16000)
+            return torch.zeros((80, 96)), 80
+
+    assert (
+        processing.encode_media(_media(), video_vae=_VideoVAE(), audio_vae=OtherAudioVAE(), emit_conditioning=True)
+        is not None
+    )
+
+
 def test_preparation_failure_propagates_after_join(monkeypatch: pytest.MonkeyPatch) -> None:
     class FailingAudioVAE(_AudioVAE):
-        def _prepare_waveform(self, waveform: torch.Tensor, rate: int) -> tuple[torch.Tensor, int]:
+        def prepare_waveform(self, waveform: torch.Tensor, rate: int) -> tuple[torch.Tensor, int]:
             raise ValueError("waveform preparation failed")
 
     pool = processing.ThreadPoolExecutor(max_workers=1)
