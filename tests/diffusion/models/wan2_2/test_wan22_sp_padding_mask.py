@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.config import set_current_vllm_config
+from vllm.utils.network_utils import get_file_store_init_method
 
 from vllm_omni.diffusion.forward_context import ForwardContext
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import _build_sp_padding_mask
@@ -83,7 +84,6 @@ def test_sp_padding_mask_matches_ulysses_key_length(monkeypatch: pytest.MonkeyPa
 def diffusion_env(monkeypatch):
     from vllm.model_executor.layers.utils import default_unquantized_gemm
 
-    from tests.helpers.runtime import assign_ephemeral_master_port
     from vllm_omni.diffusion.config import set_current_diffusion_config
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.distributed.parallel_state import (
@@ -102,8 +102,14 @@ def diffusion_env(monkeypatch):
         dtype=torch.float32, diffusion_attention_config={"default": "TORCH_SDPA"}, linear_backend="TORCH"
     )
     vllm_config = create_diffusion_vllm_config(_device(), od_config)
-    assign_ephemeral_master_port()
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
+    # A fresh file store avoids the free-port probe/bind race of env://.
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=get_file_store_init_method(),
+        backend="gloo",
+    )
     initialize_model_parallel(backend="gloo")
     try:
         with set_current_vllm_config(vllm_config), set_current_diffusion_config(od_config):
