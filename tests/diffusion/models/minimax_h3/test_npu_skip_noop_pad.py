@@ -202,6 +202,13 @@ def test_unknown_encoder_and_decode_only_model_are_unchanged(ops, monkeypatch):
     assert ops.install_npu_skip_noop_pad(model, device=torch.device("cpu")) == 0
 
 
+def test_encoder_from_unregistered_module_is_unchanged(ops, monkeypatch):
+    model = _model()
+    monkeypatch.setattr(EncoderFCN3D, "__module__", f"{__name__}.unregistered")
+    assert _install(ops, model, monkeypatch) == 0
+    assert "_apply_padding" not in vars(model.encoder.downsample.conv)
+
+
 def test_changed_padding_abi_declines(ops, monkeypatch):
     model = _model()
     monkeypatch.setattr(SpatialParallelConv3d, "_apply_padding", lambda self, x: x)

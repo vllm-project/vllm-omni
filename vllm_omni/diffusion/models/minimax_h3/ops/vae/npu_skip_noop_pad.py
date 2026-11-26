@@ -104,10 +104,12 @@ def install_npu_skip_noop_pad(model: nn.Module, *, device: torch.device) -> int:
     if not _is_npu_device(device) or not _enabled():
         return 0
     encoder = getattr(model, "encoder", None)
-    namespace = vars(sys.modules[type(encoder).__module__]) if isinstance(encoder, nn.Module) else {}
-    if namespace.get("EncoderFCN3D") is not type(encoder):
+    if not isinstance(encoder, nn.Module):
         return 0
-    conv_type = namespace.get("SpatialParallelConv3d")
+    encoder_module = sys.modules.get(type(encoder).__module__)
+    if getattr(encoder_module, "EncoderFCN3D", None) is not type(encoder):
+        return 0
+    conv_type = getattr(encoder_module, "SpatialParallelConv3d", None)
     if not isinstance(conv_type, type) or not issubclass(conv_type, nn.Conv3d):
         return 0
     installed = 0
