@@ -172,26 +172,33 @@ class StageConfigFactory:
 
     @classmethod
     @functools.cache
-    def get_hf_config(cls, model: str, trust_remote_code: bool) -> PretrainedConfig | None:
+    def get_hf_config(
+        cls, model: str, trust_remote_code: bool, *, revision: str | None = None
+    ) -> PretrainedConfig | None:
         """Fetch the HF config (if it exists) from the model directory.
 
         Args:
             model: Model name or path.
             trust_remote_code: Whether to trust remote code for HF config loading.
+            revision: Model revision to use for config discovery.
 
         Returns:
             the model's config or None.
         """
         hf_config = None
         try:
-            return get_config(_materialize_object_storage_configs(model), trust_remote_code=trust_remote_code)
+            return get_config(
+                _materialize_object_storage_configs(model),
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+            )
         except Exception as e:
             logger.debug(f"`get_config` failed with exception {e}; inferred HF config is None")
         return hf_config
 
     @classmethod
     @functools.cache
-    def try_infer_model_type(cls, model: str, trust_remote_code: bool) -> str | None:
+    def try_infer_model_type(cls, model: str, trust_remote_code: bool, *, revision: str | None = None) -> str | None:
         """Auto-detect model_type from model directory and apply any model
         specific patches to get the correct model_type str. If we are unable
         to infer it from the model directory, we fall back to the PipelineConfig.
@@ -199,6 +206,7 @@ class StageConfigFactory:
         Args:
             model: Model name or path.
             trust_remote_code: Whether to trust remote code for HF config loading.
+            revision: Model revision to use for config discovery.
 
         Returns:
             model_type as a string; may be None on failure.
@@ -206,19 +214,20 @@ class StageConfigFactory:
         model_type = cls._try_infer_model_type(
             model=model,
             trust_remote_code=trust_remote_code,
+            revision=revision,
         )
-        if model_type == "vla":
-            if _looks_like_dreamzero(model):
-                model_type = "dreamzero"
+        if model_type == "vla" and _looks_like_dreamzero(model, revision=revision):
+            model_type = "dreamzero"
         return model_type
 
     @classmethod
-    def _try_infer_model_type(cls, model: str, trust_remote_code: bool) -> str | None:
+    def _try_infer_model_type(cls, model: str, trust_remote_code: bool, *, revision: str | None = None) -> str | None:
         """Auto-detect model_type from model directory.
 
         Args:
             model: Model name or path.
             trust_remote_code: Whether to trust remote code for HF config loading.
+            revision: Model revision to use for config discovery.
 
         Returns:
             model_type as a string; may be None on failure.
@@ -226,6 +235,7 @@ class StageConfigFactory:
         hf_config = cls.get_hf_config(
             model=model,
             trust_remote_code=trust_remote_code,
+            revision=revision,
         )
         if hf_config is not None:
             return hf_config.model_type
@@ -235,7 +245,7 @@ class StageConfigFactory:
         # Fallback: read config.json directly for custom model types that
         # are not registered with transformers (e.g. qwen3_tts).
         try:
-            config_dict = get_hf_file_to_dict("config.json", config_source, revision=None)
+            config_dict = get_hf_file_to_dict("config.json", config_source, revision=revision)
             if config_dict:
                 if "model_type" in config_dict:
                     return config_dict["model_type"]
@@ -252,7 +262,7 @@ class StageConfigFactory:
         # model_index.json with _class_name that maps to a pipeline key via
         # PipelineConfig.diffusers_class_name.
         try:
-            model_index = get_hf_file_to_dict("model_index.json", config_source, revision=None)
+            model_index = get_hf_file_to_dict("model_index.json", config_source, revision=revision)
             if model_index and "_class_name" in model_index:
                 class_name = model_index["_class_name"]
                 matches: list[PipelineConfig] = []
@@ -293,10 +303,12 @@ class StageConfigFactory:
         trust_remote_code: bool,
         deploy_config_path: str | None = None,
         user_deploy_config: DeployConfig | None = None,
+        *,
+        revision: str | None = None,
     ) -> PipelineConfig | None:
         """Resolve the PipelineConfig for a model path/name."""
-        model_type = cls.try_infer_model_type(model=model, trust_remote_code=trust_remote_code)
-        hf_config = cls.get_hf_config(model=model, trust_remote_code=trust_remote_code)
+        model_type = cls.try_infer_model_type(model=model, trust_remote_code=trust_remote_code, revision=revision)
+        hf_config = cls.get_hf_config(model=model, trust_remote_code=trust_remote_code, revision=revision)
 
         # Resolve the deploy config & check if the user set the pipeline;
         # If the pipeline is explicitly set, it takes highest priority
@@ -409,6 +421,7 @@ class StageConfigFactory:
             trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
             user_deploy_config=user_deploy_config,
+            revision=cli_overrides.get("revision"),
         )
         if pipeline_cfg is None:
             return None
@@ -465,6 +478,7 @@ class StageConfigFactory:
             trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
             user_deploy_config=user_deploy_config,
+            revision=cli_overrides.get("revision"),
         )
         if pipeline_cfg is None:
             return None, None

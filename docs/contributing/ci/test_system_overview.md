@@ -192,11 +192,12 @@ On CUDA **L2** and **L3**, **E2E Test** Buildkite jobs may be omitted at pipelin
 
 ### Test helper environment variables
 
-Some shared helpers under `tests/helpers/` honor optional environment variables for local debugging. These are **not** set in CI by default.
+Some shared helpers under `tests/helpers/` honor optional environment variables for local debugging. CI sets `VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR` on selected TTS steps and uploads the retained files as artifacts; `VLLM_OMNI_KEEP_REQUEST_MEDIA` is not set in CI.
 
 | Variable | Accepted values | Description |
 | -------- | --------------- | ----------- |
 | `VLLM_OMNI_KEEP_REQUEST_MEDIA` | `1`, `true`, `yes` (case-insensitive) | When enabled, temporary WAV files created by `tests.helpers.media.convert_audio_bytes_to_text` are **not** deleted when the pytest process exits. By default, each call writes a unique file under the system temp directory via `tempfile.mkstemp` and registers `atexit` cleanup. Use this when debugging audio output validation (Whisper transcription, keyword checks, text–audio similarity). The saved path is logged as `audio data is saved: <path>`. |
+| `VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR` | Directory path | When set, at the `advanced_model` and `full_model` run levels, `tests.helpers.assertions.assert_audio_speech_response` retains failing speech-API audio before the test fails: a transcript mismatch writes the exact audio given to ASR as `failed_speech_<hash>.wav`, and a PCM HNR failure writes the raw response as `failed_speech_<hash>.pcm`, each with a `.json` holding the transcript, expected text, assertion message, audio format and sample rate. Sample-rate and size failures, and tests that assert on audio without this helper, write nothing. `tests.helpers.speaker_similarity` uses the same directory for `failed_voice_isolation_*` files. |
 
 Example (Linux / macOS):
 

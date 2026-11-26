@@ -203,7 +203,7 @@ class FakeAsyncOmniEngine:
 def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) -> None:
     monkeypatch.setattr("vllm_omni.entrypoints.omni.AsyncOmniEngine", lambda *args, **kwargs: engine)
     monkeypatch.setattr("vllm_omni.entrypoints.async_omni.AsyncOmniEngine", lambda *args, **kwargs: engine)
-    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model, *, revision=None: model)
     # Don't add random UUIDs to requests calling .generate since we usually
     # just want to check for present requests anyway, and would need to just
     # strip the UUID. Explicit checks against the mapping are in tests for
