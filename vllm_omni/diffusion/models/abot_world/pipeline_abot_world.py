@@ -24,6 +24,8 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
+from vllm_omni.diffusion.distributed.autoencoders.streaming_decode import StreamingDecodeState
+from vllm_omni.diffusion.distributed.autoencoders.wan_streaming_decode import WanStreamingDecoder
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
@@ -45,7 +47,6 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
 )
-from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState, WanStreamingDecoder
 
 from .abot_world_transformer import (
     ABotAttentionCache,

@@ -19,7 +19,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
+from vllm_omni.diffusion.distributed.autoencoders.wan_streaming_decode import WanStreamingDecoder
 
 # Bound for cancel() waiting on the latent sender after posting the stop sentinel.
 _SENDER_CANCEL_JOIN_TIMEOUT_S = 5.0

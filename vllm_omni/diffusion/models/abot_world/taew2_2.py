@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState
+from vllm_omni.diffusion.distributed.autoencoders.streaming_decode import StreamingDecodeState
 
 
 def _conv(in_channels: int, out_channels: int, **kwargs: Any) -> nn.Conv2d:

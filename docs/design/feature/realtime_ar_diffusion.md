@@ -240,10 +240,16 @@ This contract does not currently provide:
 - session migration or replication across workers;
 - retry of an ambiguous partially executed chunk;
 - cross-stage KV transfer; or
-- stateful streaming VAE decode.
+- decoder state management by the explicit tick protocol.
 
 Those features can be layered on top without adding LingBot-specific identity
 or lifecycle fields to the generic runtime.
+
+For stepwise video output, the diffusion autoencoder layer owns
+`StreamingDecodeState` and the `SupportsStreamingDecode` protocol.
+`WanStreamingDecoder` uses the session's temporal cache across calls and
+expands the opening frame once per session. Pipelines own each session's
+state and release it on reset or close.
 
 ## Required regression coverage
 
