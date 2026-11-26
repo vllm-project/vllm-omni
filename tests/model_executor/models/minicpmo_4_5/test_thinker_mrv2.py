@@ -284,6 +284,7 @@ def test_mrv2_thinker_duplex_output_and_prompt_rows(mocker):
         {
             "duplex": {
                 "duplex_prompt_token_ids": [1, 2, 3],
+                "text_input": True,
                 "special_token_ids": {"tts_bos_token_id": 151703, "turn_start_token_id": 151644},
             }
         },
@@ -298,6 +299,7 @@ def test_mrv2_thinker_duplex_output_and_prompt_rows(mocker):
     assert out.text_hidden_states is hidden
     assert out.multimodal_outputs["latent"] is hidden
     assert out.multimodal_outputs["duplex_prompt_token_ids"] == [[1, 2, 3], None]
+    assert out.multimodal_outputs["duplex_text_input"] == [True, False]
     assert "tts_bos_token_id" in out.multimodal_outputs["meta"]
     assert out.multimodal_outputs["meta"]["tts_bos_token_id"][0].item() == 151703
     # Tokenizer constants fill rows that carry none (e.g. an append that built

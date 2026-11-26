@@ -928,19 +928,19 @@ def test_ming_glm_indextts_breeze_weekly_pr_validation_is_focused(monkeypatch: p
             "dependency": "tts_ming_weekly",
             "files": ("tests/e2e/offline_inference/test_ming_tts_expansion.py",),
             "retired_files": ("tests/e2e/online_serving/test_ming_tts_expansion.py",),
-            "env": {},
+            "env": {"VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."},
         },
         "TTS · GLM Offline · L4": {
             "dependency": "tts_glm_weekly",
             "files": ("tests/e2e/offline_inference/test_glm_tts_expansion.py",),
             "retired_files": ("tests/e2e/online_serving/test_glm_tts_expansion.py",),
-            "env": {},
+            "env": {"VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."},
         },
         "TTS · Breeze TTS 2 · L4": {
             "dependency": "tts_breeze_tts2_weekly",
             "extra_dependencies": ("tts_breeze_tts2_mrv2_weekly",),
             "files": ("tests/e2e/online_serving/test_breeze_tts_2.py",),
-            "env": {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"},
+            "env": {"VLLM_OMNI_CI_MODEL_RUNNER": "v2", "VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."},
         },
     }
     retired = {
@@ -996,7 +996,7 @@ def test_audex_cosyvoice_qwen3_weekly_pr_validation_is_focused(monkeypatch: pyte
     assert step["source_file_dependencies"] == [
         "tts_qwen3_tts_function",
     ]
-    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
+    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2", "VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."}
     command = "\n".join(step["commands"])
     assert "VLLM_OMNI_CI_MODEL_RUNNER" not in command
     assert "failed=0" in command
@@ -1082,7 +1082,7 @@ def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatc
         "tts_minimax_music3_weekly",
         "tts_yue2_weekly",
     ]
-    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
+    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2", "VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."}
     command = "\n".join(step["commands"])
     explicit_files = (
         "tests/e2e/offline_inference/test_audex_s2s.py",

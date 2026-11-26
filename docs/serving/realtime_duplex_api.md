@@ -942,6 +942,7 @@ It never contains client text.
 | Qwen3-Omni | As a tool message on the next prompt, for every reason except a suppressed repeat. A notice does not start a response by itself. |
 | Nemotron VoiceChat | On the function channel of the open request. After an epoch cancellation the model is told only if it repeats the call. |
 | JoyAI-VL-Interaction | As a delegated result on the next observation. After an epoch cancellation the question does not resurface, and the model is told only if it asks again. |
+| Realtime-Venus Omni | As a `<backend>` result on the next native input unit. After epoch cancellation, the notice is sent only if the model repeats the call. |
 
 **Interruptions.** `extra_body.function_call_interrupt_policy` sets what an epoch advance
 does to pending calls. It is fixed at session open. With `cancel` (the default),
@@ -965,14 +966,14 @@ model sets them; a client only reads them.
 | --- | --- | --- |
 | `none` | The model has no tool support. Non-empty `tools` is refused with `tools_unsupported`. | MiniCPM-o, PersonaPlex, Aura |
 | `declared` | The client defines the tools. The model reads their name, description and parameters in its prompt and calls them by name. | Qwen3-Omni, Nemotron VoiceChat |
-| `delegate_only` | The model has one built-in function, `delegate`, which hands a plain-language question to the application. Other tools are refused. | JoyAI-VL-Interaction |
+| `delegate_only` | The model has one built-in function, `delegate`, which hands a plain-language question to the application. Other tools are refused. | JoyAI-VL-Interaction, Realtime-Venus Omni |
 
 `function_call_output_continuation` values:
 
 | Value | What the client does after `function_call_output` | Models |
 | --- | --- | --- |
 | `client_response_create` | Send `response.create`. The model is turn-based, and the result is used in the response that event opens. Without it, the result waits for the next user turn. | Qwen3-Omni |
-| `automatic` | Nothing more. The result is fed into a later frame of the running request, and the model continues by itself. | Nemotron VoiceChat |
+| `automatic` | No `response.create`. The result is fed into a later frame of the running request. Keep streaming input or silence for native model time. | Nemotron VoiceChat, Realtime-Venus Omni |
 | `next_observation` | Nothing more. The next camera commit carries the result. To have it spoken, send a short user turn such as "Answer now with the result you received." | JoyAI-VL-Interaction |
 | `none` | Not applicable: the model has no tool support. | MiniCPM-o, PersonaPlex, Aura |
 
@@ -1061,6 +1062,17 @@ so audio playback and ACKs are not needed. List all flags with:
 ```bash
 python -m vllm_omni.clients.tool_calls --help
 ```
+
+For native input, replace `--prompt` with `--input-wav` (mono PCM16, 16 kHz),
+or `--initial-user-text` on a model that supports initial text seeding. These
+modes stream silence after the supplied input until the timeout, so tools run
+alongside incoming audio and native models can continue their answer. Native
+input requests text and audio; use `--output-wav answer.wav` to save the speech.
+For offline probes, `--ack-collected-audio` explicitly simulates immediate
+playback of received audio. Interactive applications must acknowledge audio
+actually played. See the
+[Venus tool examples](gh-file:recipes/inclusionAI/Realtime-Venus.md#tool-execution)
+for local arithmetic, inventory lookup and voice requests.
 
 Deployment setting `duplex_session.max_tool_calls_per_session` (default 4096)
 bounds the records one session may track, pending calls and settled tombstones
@@ -1212,6 +1224,43 @@ with no OpenAI counterpart.
 
 ### Capability negotiation by model
 
+Output availability is deployment-specific. `capabilities` includes
+`supported_output_modalities` and `default_output_modalities`. Omitting both
+`modalities` and `output_modalities` uses the deployment defaults. Explicit
+lists must be nonempty and contain `text` and/or `audio`. Names are
+case-insensitive and normalized to lowercase, so `["Audio", "Text"]` remains
+accepted by speech deployments. Duplicate entries after normalization and
+non-list values are rejected explicitly. If both aliases are supplied they
+must agree after normalization. A request for unavailable output fails with
+`unsupported_output_modality` at session open, `session.update`, or
+`response.create`, including the inline Python API. Rejected updates preserve
+the current configuration and rejected output requests allocate no model work.
+
+A deployment with one final text stage defaults to `text` and disables playback
+ACKs, audio truncation, and inter-stage handoff. Synthesis-only `voice` and
+non-default `speed` fail with `unsupported_parameter`; audio format defaults
+remain accepted for client compatibility. Text replies commit the emitted text
+without playback ACKs even under `ack_only`; cancellation retains the emitted
+prefix and discards stale output. Whitespace-only replies are not stored as
+assistant turns; meaningful text retains its emitted whitespace verbatim.
+The unconditional playback-policy bypass applies to deployments without audio
+output. On speech deployments, text replies with zero generated/sent audio and
+no audio-completion dependency commit without an ACK. Text that depends on
+complete audio follows alignment and playback checks. A text modality override
+alone does not implement per-request TTS skipping.
+Targeted playback ACKs for text-only items
+and audio truncation on text-only deployments fail with `unsupported_operation`
+without modifying history. The default MiniCPM three-stage deployment continues
+to advertise text and audio. `minicpmo_4_5_duplex_thinker_only.yaml`
+advertises text only. Text arrives as `response.output_text.delta` events; a
+delta does not mark a unit or reply boundary. `response.done` carries engine
+metrics under `metadata.vllm_omni.stage_metrics`, and the first non-empty text
+delta carries server TTFT under `metadata.vllm_omni.response_request_metrics`.
+A reply that ends without audio (continuation limit, failure, cancellation, or
+`conversation: "none"`) releases its playback state; uncommitted text is
+discarded. A late ACK for it fails with `playback_item_not_found` (or
+`unsupported_operation` on text-only deployments).
+
 The event vocabulary is uniform, but several surfaces are gated by the
 `capabilities` object the server returns in `session.created`; a client must
 branch on those flags rather than on the model name. MiniCPM-o 4.5 and
@@ -1226,6 +1275,7 @@ records what its integration advertises once the follow-up PR ports it:
 | `supports_barge_in` | yes | no | no | `barge_in`, `turn.signal{event:"barge_in"}`, `overlap_policy=barge_in_on_speech`, `turn_detection.server_vad` |
 | `supports_audio_truncate` | yes | no | no | `conversation.item.truncate` and truncating `playback.ack` adjusting the stored assistant item |
 | video input (`video_frames` on append) | consumed by Stage 0 | ignored | ignored | omni camera track |
+| text input (`input.text.append`) | incremental prefill | unsupported | unsupported | `text` in `optional_input_modalities`; `auto_response: true` |
 | tool calls | no | no | yes | `response.function_call_arguments.*`, `function_call` items |
 
 Everything else in the catalogue — session lifecycle, heartbeat and event
@@ -1397,9 +1447,36 @@ Input clocking is available only for models whose plugin declares it
 model's real unit boundaries to know when a unit's output is complete. On any
 other model, a session with `clock: "input"` is refused with error
 `input_clock_unsupported` — at session creation, or on a `session.update`
-that sets it. No model shipped with vLLM-Omni declares it yet: the option is
-for plugins that opt in once their unit boundaries are mapped (see
-*Input-clocked sessions* in the model's entry when it does).
+that sets it.
+
+Models that support input-clocked sessions, and how each maps onto units:
+
+| Model | Unit | Decision | A speaking unit is complete when | Input |
+| --- | --- | --- | --- | --- |
+| MiniCPM-o 4.5 | 1 s audio chunk (an append submits every whole chunk it completes) | Stage 0 `listen` ends the unit; any other Stage-0 segment end makes it a speaking unit | its Talker segment has ended and Code2Wav has emitted the chunk that flushes the unit's remaining codes (`tts_is_last_chunk`) | audio only |
+
+For a speaking MiniCPM-o 4.5 unit, the acknowledgement guarantees that the
+unit's text (unless the unit has 5 or fewer codec frames in all, whose text
+can follow with the next unit's audio) and all of its audio that the
+vocoder could synthesise by then have been emitted. The last codec frames
+of a speaking unit that does not end the turn are synthesised together with
+the next unit's codes, because of the vocoder's lookahead and because a
+remainder shorter than 5 frames is carried into the next unit's first
+chunk, so that audio goes out after the unit's acknowledgement, exactly
+when real-time operation emits it: usually 200–440 ms (p10–p90), measured
+up to about 0.76 s, and it can exceed 1 s under concurrent load. There is
+no structural bound on it. The next unit is a speaking unit of the same
+turn because the model rewrites a `<|listen|>` sampled while the turn is
+open to `<|tts_bos|>`; a model change that allowed a listen mid-turn would
+let the tail wait across listen units. The unit that ends the turn is
+flushed completely before its acknowledgement.
+
+An input-clocked MiniCPM-o 4.5 session takes audio only: its capabilities
+list no `video` input modality, and an `input_audio_buffer.append` with
+`video_frames` is refused with `invalid_input_modality` and acknowledged as
+`rejected`. A committed turn with video frames is split into separate vision
+units, which the clock does not account for when the commit is deferred
+behind a response. Sessions without the clock are unchanged.
 
 An input-clocked session never overlaps turns: a commit during a response
 waits for that response, also on a model that otherwise runs concurrent turn
@@ -1618,6 +1695,7 @@ A stock client ignores the extra keys; the extensions are additive.
 | `session.created` / `session.updated` | top-level `attachment_generation`, `resume_token`; inside `session`: `state`, `turn_state`, `epoch`, `turn_id`, `active_request_id`, `active_response_id`, `active_response_turn_id`, `overlap_policy`, `overlap_*_ms/rms`, `playback_commit_policy`, `playback`, `capabilities`, `ref_audio`, `extra_body`, `idle_timeout_s`, `response_format` |
 | `response.created` / `response.done` / `response.listen` | `response_id` at top level; the raw duplex event under `response.metadata` (`duplex_event`), whose `response.created` carries `response_request_metrics` (`ttft_ms` / `ttfp_ms` once known, `measurement_origin`); `status_details.reason` uses vLLM reasons (`barge_in`, `client_cancelled`, `new_response`, …) |
 | `response.output_audio.delta` | `format`, `sample_rate_hz`, `metadata{session_id, epoch, model_speak, end_of_turn, audio_duration_ms, audio_text_marks, playback, vllm_omni.response_request_metrics}` |
+| `response.output_text.delta` | optional `metadata.vllm_omni.response_request_metrics` with server TTFT |
 | `response.speak` (inserted before the first delta) | not an OpenAI event, but rides the OpenAI response envelope (`response_id`, `item_id`, `output_index`, `content_index`) |
 | `input_audio_buffer.append` | `is_speech`, `video_frames` (+ `max_slice_nums`), `duration_ms`, `audio_end_ms`, per-event `format` / `sample_rate_hz` |
 | `input_audio_buffer.commit` | `final`, `response_create`, `is_speech:false` (silence declaration) |
@@ -1749,7 +1827,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `input_audio_buffer.clear` | 1 | Drop un-committed input audio. |
 | `input.cancel` | 3 | Cancel pending input; advances `epoch`. |
 | `function_call.cancel` | 3 | End one pending function call (`call_id`, `reason`: `cancelled` or `failed`). |
-| `input.text.append` | 3 | Append text input; model-native sessions reject it with `native_text_append_unsupported`. |
+| `input.text.append` | 3 | Prefill a text fragment on models advertising text input; otherwise `native_text_append_unsupported`. |
 | `conversation.item.create` | 1 | Add a completed user item (text, audio, or `function_call_output`) to history. |
 | `conversation.item.retrieve` | 1 | Fetch a stored item by id. |
 | `conversation.item.delete` | 1 | Delete a stored item by id. |
@@ -1792,13 +1870,13 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `response.speak` | 3 | Model chose to speak (native lane); at most once per response, before the first audio delta. |
 | `response.output_audio.delta` | 2 | One ordered audio chunk. OpenAI name; adds `format`, `sample_rate_hz`, `metadata{epoch, model_speak, end_of_turn, audio_text_marks, playback}`. |
 | `response.output_audio_transcript.delta` | 1 | Transcript text paired one-to-one with each audio delta. |
-| `response.output_text.delta` | 1 | Text delta for text-modality responses. |
+| `response.output_text.delta` | 2 | Text delta for text-modality responses; optional server TTFT under `metadata.vllm_omni.response_request_metrics`. |
 | `response.output_text.done` | 1 | Final text of a text-modality response. |
 | `response.output_audio.done` | 1 | Audio stream closed for the response. |
 | `response.output_audio_transcript.done` | 1 | Full transcript (concatenation of the deltas). |
 | `response.content_part.done` | 1 | Content part finalized with its transcript/text. |
 | `response.output_item.done` | 1 | Assistant item finalized. |
-| `response.done` | 2 | Terminal event; `status` ∈ `completed` \| `cancelled` \| `failed`. OpenAI name; vLLM-Omni `status_details.reason` values and raw duplex event under `metadata`. |
+| `response.done` | 2 | Terminal event; `status` ∈ `completed` \| `incomplete` \| `cancelled` \| `failed` (`incomplete` with `status_details.reason: "continuation_limit"` when the continuation budget ends the response). OpenAI name; vLLM-Omni `status_details.reason` values and raw duplex event under `metadata`. |
 | `rate_limits.updated` | 1 | Compatibility event after every `response.done`; always an empty list. |
 | `response.listen` | 3 | Model chose to keep listening at a unit boundary or after a silence commit. Carries `response_id` when the decision terminates a precreated response (a `response.done` with the same id follows); otherwise no `response.created` precedes it. |
 | `response.function_call_arguments.delta` | 1 | Tool-call arguments delta (Nemotron VoiceChat). |
@@ -2179,6 +2257,48 @@ deferred commit during an active response (`event.response_create_deferred`)
 ```json
 {"type": "input.text.append", "text": "and tomorrow?"}
 ```
+
+MiniCPM-o 4.5 accepts non-empty text fragments in a native session with
+`extra_body.auto_response: true` (the default). Each fragment is tokenized and
+prefilled immediately as its own model unit, using the checkpoint's native
+`streaming_prefill(text_list=...)` format. It does not wait for the complete
+text, reset the session, or insert synthetic input audio. Tokenization occurs
+per fragment, so send complete words when possible.
+
+Text can be interleaved with microphone appends on the same connection:
+
+```python
+await client.append_text("Remember this code: ", force_listen=True)
+await client.append_audio(pcm_chunk, is_speech=True)
+await client.append_text("blue whale. Answer the spoken question.")
+```
+
+`force_listen: true` prefills the fragment while suppressing generation for
+that unit. It does not cancel speech already generated. Omit it, or set it to
+false, on a later text unit to open the assistant turn; an unforced audio
+unit retains the native listen/speak decision. Text fragments need no audio
+commit or `response.create`. To collect a complete mixed input
+before answering, send `force_listen: true` on **both** the intermediate text
+and audio events, then release it on the final text fragment. The low-level
+`client.send` method can set this hint on an audio event.
+
+Text and completed media units use the same ordered append queue. Complete
+buffered media units are submitted before the next text fragment. Audio appends
+that are eligible to run also submit all complete units on the default wall
+clock, even after text has opened the reply. A partial
+microphone unit stays buffered while a text unit is prefilled; text does not
+advance the audio clock or consume the partial PCM. With the default silence
+continuation enabled, that partial unit does not block the text-triggered
+response from continuing. The buffered audio reaches the model only when
+later audio completes its unit or an audio commit flushes it. To include all
+microphone samples in the answer, finish or commit the audio before releasing
+the final text fragment. Queued appends and complete media units retain
+priority over generated silence. Text is subject to the
+session's pending-input byte limit, counted as UTF-8. Text that cannot be encoded
+as UTF-8 is rejected with `bad_event` for that event. Empty text and manual
+`auto_response: false` sessions are rejected. This capability is separate from
+`supports_text_only_turn`, which controls `conversation.item.create` followed
+by `response.create`; that message-based path is unchanged.
 
 `C→S conversation.item.create` (text turn, or a tool result)
 
@@ -2629,14 +2749,12 @@ them out into typed events before they reach a client.
   barge-in, or audio truncation; Nemotron VoiceChat does not support barge-in
   or audio truncation; camera frames are consumed only by MiniCPM-o 4.5; tool
   calls are produced only by Nemotron VoiceChat.
-- A response is generated from committed **audio**, so the OpenAI text-prompt
-  shape does not drive one: `conversation.item.create` with an `input_text`
-  part adds the item to history, but a following `response.create` with no
-  committed audio is rejected with `response_create_without_input`, and
-  `input.text.append` is rejected with `native_text_append_unsupported`.
-  Text-to-speech has its own shape here — put the text in
-  `extra_body.duplex_initial_user_text` on `session.update`, then stream audio
-  units (silence is enough). The seeded turn is what the model answers.
+- MiniCPM-o accepts incremental text through `input.text.append` as described
+  above. `conversation.item.create` with an `input_text` part followed by
+  `response.create` still requires `supports_text_only_turn`; MiniCPM-o rejects
+  that path with `text_only_turn_unsupported`. An initial text prompt can also
+  be supplied through `initial_user_text` or the legacy
+  `extra_body.duplex_initial_user_text` on `session.update`.
 - `turn_detection` supports `server_vad` and, for turn-based sessions,
   `semantic_vad`, both with `interrupt_response=true`; `interrupt_response=false`
   is not supported.

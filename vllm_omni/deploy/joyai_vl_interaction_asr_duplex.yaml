@@ -1,10 +1,10 @@
 # Speech and text/video observations on the shared turn-commit Session.
 base_config: joyai_vl_interaction_asr.yaml
 session_mode: duplex
-# Single switch matching joyai_vl_interaction_duplex.yaml: streams JoyAI action
-# text, per-sentence Talker handoff, and async-chunk Talker -> Code2Wav audio
-# for both spoken (ASR -> JoyAI) and bypassed text/video observations.
-async_chunk: true
+# Keep ASR duplex on completed Code2Wav responses. Cancelling an in-flight
+# async response and reconnecting can otherwise resume stale speech from the
+# previous observation. The visual duplex profile keeps async chunk streaming.
+async_chunk: false
 duplex_session:
   max_sessions: 1
   # A full 4096-frame TTS response is ~22 MiB of base64 PCM16 at normal

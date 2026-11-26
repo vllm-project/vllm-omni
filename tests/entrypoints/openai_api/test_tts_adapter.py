@@ -15,6 +15,10 @@ from unittest.mock import AsyncMock
 import numpy as np
 import pytest
 import torch
+from tokenizers import AddedToken, Regex, Tokenizer, decoders, normalizers, pre_tokenizers
+from tokenizers.models import BPE
+from transformers import PreTrainedTokenizerFast
+from transformers.models.qwen2.tokenization_qwen2 import PRETOKENIZE_REGEX
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -37,7 +41,11 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters import ming3_tts as ming3_tts_module
 from vllm_omni.entrypoints.openai.tts_adapters.auk import AuKAdapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import TTSCapabilities, resolve_stage_model_path
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    IncrementalInputNotReadyError,
+    TTSCapabilities,
+    resolve_stage_model_path,
+)
 from vllm_omni.entrypoints.openai.tts_adapters.covo_audio import CovoAudioAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v2 import HiggsAudioV2Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
@@ -59,6 +67,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters.step_audio2 import StepAudio2Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.yue2 import Yue2Adapter
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
@@ -66,6 +75,10 @@ from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
 )
 from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import unpack_reference_audio
 from vllm_omni.model_executor.models.moss_tts import processor_loading as moss_processor_loading
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    PRECOMPUTED_TEXT_IDS_KEY,
+    build_assistant_text,
+)
 from vllm_omni.model_executor.stage_input_processors.auk import encoder2dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -74,6 +87,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # Every dedicated TTS model-type must have an adapter so the orchestrator's
 # uniform ``self._adapter.build(...)`` dispatch covers it.
 EXPECTED_MODEL_TYPES = {
+    "chatterbox",
+    "chatterbox_original",
     "phonon",
     "qwen3_tts",
     "voxcpm2",
@@ -862,6 +877,140 @@ def test_qwen3_tts_build_constructs_prepared_request():
     assert prepared.tts_params["text"] == ["hello"]
     assert prepared.tts_params["speaker"] == ["vivian"]
     assert prepared.model_type == "CustomVoice"
+
+
+class TestQwen3TTSIncrementalInput:
+    """Adapter lifecycle and token delivery, using a small in-memory tokenizer."""
+
+    @pytest.fixture
+    def tokenizer(self):
+        byte_level = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+        vocab = {token: index for index, token in enumerate(sorted(byte_level.alphabet()))}
+        merges = []
+        for text in ("assistant", "\n\n", "Hello", "自动驾驶"):
+            encoded = byte_level.pre_tokenize_str(text)[0][0]
+            left = encoded[0]
+            for right in encoded[1:]:
+                if left + right not in vocab:
+                    merges.append((left, right))
+                    vocab[left + right] = len(vocab)
+                left += right
+        backend = Tokenizer(BPE(vocab=vocab, merges=merges))
+        backend.decoder = decoders.ByteLevel()
+        backend.normalizer = normalizers.NFC()
+        backend.pre_tokenizer = pre_tokenizers.Sequence(
+            [pre_tokenizers.Split(Regex(PRETOKENIZE_REGEX), behavior="isolated"), byte_level]
+        )
+        backend.add_special_tokens(
+            [AddedToken(content, normalized=False, special=True) for content in ("<|im_start|>", "<|im_end|>")]
+        )
+        return PreTrainedTokenizerFast(tokenizer_object=backend)
+
+    @pytest.fixture
+    def adapter_context(self, tokenizer, mocker):
+        server = SimpleNamespace(
+            _tts_executor=None,
+            _tts_tokenizer=tokenizer,
+            _tts_stage=None,
+            uploaded_speakers={},
+            _voice_created_at=mocker.Mock(return_value=0),
+            _count_usage_text_tokens=lambda text: len(tokenizer.encode(text, add_special_tokens=False)),
+        )
+        engine = SimpleNamespace(append_text=mocker.AsyncMock())
+        adapter = Qwen3TTSAdapter(SpeechServingContext(server=server, engine_client=engine))
+        adapter.capabilities = TTSCapabilities(
+            supported_speakers=frozenset({"vivian"}),
+            default_speaker="vivian",
+        )
+
+        mocker.patch.object(adapter, "_estimate_prompt_len_async", new=mocker.AsyncMock(return_value=3))
+        request = OpenAICreateSpeechRequest(input="Hello ", voice="vivian", language="English")
+        return SimpleNamespace(adapter=adapter, engine=engine, tokenizer=tokenizer, request=request)
+
+    async def test_not_ready_build_preserves_text_across_initial_retries(self, adapter_context):
+        model_input = await adapter_context.adapter.create_incremental_input(adapter_context.request)
+        for candidate in ("自", "自动", "自动驾"):
+            adapter_context.request.input = candidate
+            with pytest.raises(IncrementalInputNotReadyError):
+                await model_input.build(candidate, final=False)
+        adapter_context.adapter._estimate_prompt_len_async.assert_not_awaited()
+        adapter_context.engine.append_text.assert_not_awaited()
+        adapter_context.request.input = "自动驾驶系统"
+        prepared = await model_input.build(adapter_context.request.input, final=True)
+        expected = adapter_context.tokenizer.encode(build_assistant_text("自动驾驶系统"), add_special_tokens=False)
+        assert prepared.tts_params["input_stream"] == {"token_ids": expected[3:-5], "final": True}
+
+    async def test_initial_build_preserves_prefill_length_and_generation_budget(self, adapter_context):
+        adapter = adapter_context.adapter
+        adapter_context.engine.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(codec_language_id={"english": 2050}, spk_is_dialect={})
+            )
+        )
+        adapter._estimate_prompt_len_async.side_effect = adapter._estimate_prompt_len
+        text = "自动驾驶系统正在运行"
+        adapter_context.request.input = text
+        model_input = await adapter.create_incremental_input(adapter_context.request)
+        prepared = await model_input.build(text, final=False)
+        complete_body = adapter_context.tokenizer.encode(build_assistant_text(text), add_special_tokens=False)[3:-5]
+        released = prepared.tts_params["input_stream"]["token_ids"]
+        assert 0 < len(released) < len(complete_body)
+        assert len(prepared.prompt["prompt_token_ids"]) == 3 + 6 + 1
+        params = adapter.apply_sampling_overrides(
+            [SamplingParams(max_tokens=1024)], adapter_context.request, prepared.prompt
+        )
+        assert params[0].max_tokens == 1024
+
+    async def test_append_buffers_without_an_engine_update_and_flushes_at_eof(self, adapter_context):
+        model_input = await adapter_context.adapter.create_incremental_input(adapter_context.request)
+        prepared = await model_input.build("Hello ", final=False)
+        await model_input.append("request", "自", final=False)
+        adapter_context.engine.append_text.assert_not_awaited()
+        await model_input.append("request", "", final=True)
+        complete_body = adapter_context.tokenizer.encode(build_assistant_text("Hello 自"), add_special_tokens=False)[
+            3:-5
+        ]
+        initial = prepared.tts_params["input_stream"]["token_ids"]
+        adapter_context.engine.append_text.assert_awaited_once_with(
+            "request", complete_body[len(initial) :], final=True
+        )
+
+    async def test_initial_template_ids_preserve_the_leading_newline(self, adapter_context):
+        text = "\nHello "
+        adapter_context.request.input = text
+        model_input = await adapter_context.adapter.create_incremental_input(adapter_context.request)
+        prepared = await model_input.build(text, final=False)
+        await model_input.append("request", "world.", final=True)
+        initial = prepared.tts_params[PRECOMPUTED_TEXT_IDS_KEY][0]
+        body = initial[3:-5] + adapter_context.engine.append_text.await_args.args[1]
+        expected = adapter_context.tokenizer.encode(build_assistant_text(text + "world."), add_special_tokens=False)
+        assert initial[:3] + body + initial[-5:] == expected
+
+    async def test_invalid_request_mode_is_not_reported_as_not_ready(self, adapter_context):
+        adapter_context.request.non_streaming_mode = True
+        model_input = await adapter_context.adapter.create_incremental_input(adapter_context.request)
+        with pytest.raises(ValueError, match="interleaved prompt construction"):
+            await model_input.build("Hello ", final=False)
+        adapter_context.adapter._estimate_prompt_len_async.assert_not_awaited()
+        adapter_context.engine.append_text.assert_not_awaited()
+
+    async def test_inputs_keep_pending_text_independent(self, adapter_context):
+        first_request = adapter_context.request.model_copy(update={"input": "自"})
+        second_request = adapter_context.request.model_copy(update={"input": "Hello"})
+        first = await adapter_context.adapter.create_incremental_input(first_request)
+        second = await adapter_context.adapter.create_incremental_input(second_request)
+        with pytest.raises(IncrementalInputNotReadyError):
+            await first.build("自", final=False)
+        prepared = await second.build("Hello", final=True)
+        assert prepared.tts_params[PRECOMPUTED_TEXT_IDS_KEY][0] == adapter_context.tokenizer.encode(
+            build_assistant_text("Hello"), add_special_tokens=False
+        )
+        first_request.input = "自动驾驶"
+        prepared = await first.build(first_request.input, final=True)
+        assert (
+            prepared.tts_params["input_stream"]["token_ids"]
+            == adapter_context.tokenizer.encode(build_assistant_text("自动驾驶"), add_special_tokens=False)[3:-5]
+        )
 
 
 def test_covo_audio_build_constructs_tokenized_prompt():
@@ -1884,3 +2033,57 @@ def test_phonon_rejects_invalid_request_budget(budget):
         input="Hello", voice="default", ref_audio=None, speaker_embedding=None, max_new_tokens=budget
     )
     assert "max_new_tokens" in adapter.validate(request)
+
+
+def _yue2_request(**overrides: Any) -> OpenAICreateSpeechRequest:
+    fields: dict[str, Any] = {
+        "input": "[Verse]\nTwinkle, twinkle, little star",
+        "instructions": "gentle acoustic folk, 90 BPM",
+    }
+    fields.update(overrides)
+    return OpenAICreateSpeechRequest(**fields)
+
+
+@pytest.mark.parametrize(
+    "overrides, err_substr",
+    [
+        pytest.param({"duration_seconds": 30.0}, "max_new_tokens", id="duration_seconds"),
+        pytest.param({"token_count": 250}, "token_count", id="token_count"),
+        pytest.param({"speaker_embedding": [0.1] * 16}, "speaker_embedding", id="speaker_embedding"),
+        pytest.param({"x_vector_only_mode": True}, "x_vector_only_mode", id="x_vector_only_mode"),
+        pytest.param({"ambient_sound": "rain"}, "ambient_sound", id="ambient_sound"),
+        pytest.param({"initial_codec_chunk_frames": 10}, "initial_codec_chunk_frames", id="initial_codec_chunk_frames"),
+        pytest.param({"non_streaming_mode": False}, "non_streaming_mode", id="non_streaming_mode"),
+        pytest.param({"ref_audio_2": "data:audio/wav;base64,AA=="}, "ref_audio_2", id="ref_audio_2"),
+        pytest.param(
+            {"extra_params": {"cot": "off", "yue2_max_audio_frames": 500}},
+            "yue2_max_audio_frames",
+            id="extra_params_unknown_key",
+        ),
+        pytest.param(
+            {"extra_params": {"temperature": 0.3, "foo": 1}},
+            "fixed sampling",
+            id="extra_params_sampling_key_reported_first",
+        ),
+    ],
+)
+def test_yue2_validate_rejects_unused_fields(overrides: dict[str, object], err_substr: str) -> None:
+    err = Yue2Adapter(SimpleNamespace()).validate(_yue2_request(**overrides))
+    assert err is not None
+    assert err_substr in err
+
+
+def test_yue2_validate_accepts_supported_request() -> None:
+    adapter = Yue2Adapter(SimpleNamespace())
+    assert adapter.validate(_yue2_request()) is None
+    full = _yue2_request(max_new_tokens=400, seed=7, extra_params={"cot": "full", "abc": "X:1\nK:C\nCDEF|"})
+    assert adapter.validate(full) is None
+    assert adapter.validate(_yue2_request(extra_params={"cot": "off", "foo": None})) is None
+
+
+@pytest.mark.parametrize(
+    "extra", [{"abc_max_tokens": 512}, {"cfg_scale": 1.5}, {"abc_max_tokens": 512, "cfg_scale": 1.5}]
+)
+def test_yue2_accepts_abc_budget_and_guidance(extra: dict[str, int | float]) -> None:
+    request = _yue2_request(extra_params={"cot": "full", **extra})
+    assert Yue2Adapter(SimpleNamespace()).validate(request) is None

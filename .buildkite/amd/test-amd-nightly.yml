@@ -27,6 +27,22 @@ steps:
           # Preserve the existing audio validators and the deploy's ROCm V1 override.
           - bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh tests/e2e/online_serving/test_qwen3_tts_base_expansion.py 8 tts rocm-qwen3-tts-base-expansion
 
+  - group: ":full_moon: Qwen3-TTS CustomVoice Expansion MI300 Nightly"
+    steps:
+      - label: "Qwen3-TTS CustomVoice Full-Model Expansion"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 120
+        source_file_dependencies: tts_qwen3_tts_function
+        env:
+          VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-tts-customvoice-expansion/failed-audio"
+        artifact_paths:
+          - artifacts/rocm-qwen3-tts-customvoice-expansion/**/*
+        commands:
+          - bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh tests/e2e/online_serving/test_qwen3_tts_customvoice_expansion.py 10 tts rocm-qwen3-tts-customvoice-expansion
+
   - group: ":full_moon: Wan2.2 Backend Similarity MI300 Nightly"
     steps:
       - label: "Wan2.2 Diffusers Backend Similarity"
@@ -95,6 +111,37 @@ steps:
         commands:
           - bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh tests/e2e/online_serving/test_minicpmo_4_5.py 5 omni rocm-minicpmo-online-modalities
 
+  # One-card Omni cases from the CUDA "Omni · Function Test with H100 · Single-GPU"
+  # selection that no AMD job ran: Qwen3-Omni colocate async (2), MiniCPM-o 4.5
+  # expansion (10) and JoyAI-VL visual duplex (1). Non-blocking until burn-in.
+  - group: ":full_moon: Omni Full-Model Additions MI300 Nightly"
+    steps:
+      - label: "Omni Full-Model Additions · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 150
+        source_file_dependencies:
+          - omni_qwen3_omni_function
+          - omni_minicpmo_4_5_function
+          - omni_joyai_duplex_function
+        retry:
+          automatic:
+            - exit_status: 134
+              limit: 1
+        env:
+          ROCM_E2E_TIMEOUT_MINUTES: "135"
+        artifact_paths:
+          - artifacts/rocm-omni-full-model-additions/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
+            13 omni rocm-omni-full-model-additions
+            tests/e2e/online_serving/test_minicpmo_4_5_expansion.py
+            tests/e2e/online_serving/test_joyai_vl_interaction.py
+
   # MI325 is the repository's legacy ROCm pytest marker. The AMD template maps
   # agent_pool to the current MI300 Buildkite queues independently of that mark.
   - group: ":full_moon: Qwen3-Omni MI300 Nightly"
@@ -106,9 +153,21 @@ steps:
         grade: NonBlocking
         timeout_in_minutes: 180
         source_file_dependencies: omni_qwen3_omni_function
+        env:
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          PYTHONFAULTHANDLER: "1"
+          QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-function-expansion"
+          VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-function-expansion/failed-audio"
+          QWEN3_OMNI_EXPECTED_GPUS: "2"
+          QWEN3_OMNI_EXPECTED_RESULTS: "0"
+          QWEN3_OMNI_EXPECTED_TESTS: "28"
+          QWEN3_OMNI_MARK_EXPRESSION: "full_model and rocm and MI325 and cards_2"
+          QWEN3_OMNI_TEST_TARGET: tests/e2e/online_serving/test_qwen3_omni_expansion.py
+          QWEN3_OMNI_TIMEOUT: 165m
+        artifact_paths:
+          - artifacts/rocm-qwen3-omni-function-expansion/**/*
         commands:
-          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+          - bash .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
 
       - label: "Qwen3-Omni Accuracy"
         agent_pool: mi300_2
@@ -195,12 +254,22 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 90
-        source_file_dependencies: omni_qwen3_omni_function
+        source_file_dependencies: [omni_qwen3_omni_function, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-qwen3-omni-aiter-smoke/**/*
+        env:
+          QWEN3_OMNI_EXPECT_AITER_MM_ENCODER: "1"
         commands:
           - export VLLM_ROCM_USE_AITER=1
-          - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001 -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 3 75m rocm-qwen3-omni-aiter-smoke
+            'tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001[default]'
+            'tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001[async_chunk]'
+            'tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001[batch_token_2048]'
+            -m 'full_model and rocm and MI325 and cards_2'
 
   - group: ":full_moon: Qwen3-Omni Scale and Performance MI300 Nightly"
     steps:
@@ -232,6 +301,10 @@ steps:
         timeout_in_minutes: 300
         source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
         env:
+          # Avoid solver searches on new codec shapes and oversized host pools.
+          MIOPEN_FIND_MODE: "FAST"
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
           QWEN3_OMNI_REQUIRE_BASELINE: "1"
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-no-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
@@ -254,6 +327,9 @@ steps:
         timeout_in_minutes: 180
         source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
         env:
+          MIOPEN_FIND_MODE: "FAST"
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
           QWEN3_OMNI_REQUIRE_BASELINE: "1"
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
@@ -295,6 +371,51 @@ steps:
             bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
             tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py
             3 tts rocm-cosyvoice3-e2e-nightly
+
+  # One-card TTS cases from the CUDA "TTS · Function Test with L4" selection that
+  # no AMD job ran: YuE2 offline example (2), Chatterbox encoded audio (4) and
+  # CosyVoice3 voice isolation (7). Non-blocking until burn-in.
+  - group: ":speaker: TTS Full-Model Additions MI300 Nightly"
+    steps:
+      - label: "TTS Full-Model Additions · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 150
+        source_file_dependencies:
+          - tts_yue2_function
+          - tts_chatterbox_function
+          - tts_cosyvoice3_voice_isolation
+        retry:
+          automatic:
+            - exit_status: 134
+              limit: 1
+        env:
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          ROCM_E2E_TIMEOUT_MINUTES: "135"
+          # The voice-isolation speaker embedders score on CPU. Cap BLAS/OpenMP
+          # at the pod's four-CPU quota (as the READY CPU suites do): with the
+          # host-visible 96 threads, scoring that takes 0.5 min on CUDA ran for
+          # over 40 min in AMD build 17564.
+          OMP_NUM_THREADS: "4"
+          MKL_NUM_THREADS: "4"
+          OPENBLAS_NUM_THREADS: "4"
+          NUMEXPR_NUM_THREADS: "4"
+        artifact_paths:
+          - artifacts/rocm-tts-full-model-additions/**/*
+        commands:
+          # CosyVoice3's code2wav stage otherwise cold-compiles the unmasked BF16
+          # AITER MHA module on its first request: 1580 s in AMD build 17564,
+          # long enough for the voice-isolation requests to hit their 600 s
+          # timeout twice. Restore the provenance-checked module instead.
+          - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_yue2.py
+            13 tts rocm-tts-full-model-additions
+            tests/e2e/online_serving/test_chatterbox_expansion.py
+            tests/e2e/online_serving/test_cosyvoice3_voice_isolation.py
 
   # π0.5 CPU units are mandatory on CUDA READY/MERGE. On AMD they exercise the
   # ROCm container/import path with CPU tensors only, so keep them off the
@@ -646,6 +767,26 @@ steps:
 
   - group: ":full_moon: Qwen-Image MI300 Nightly"
     steps:
+      - label: "Qwen-Image 2.1 Text-to-Image Documentation"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 90
+        source_file_dependencies: [diffusion_text_to_image_doc, rocm_diffusion_nightly_runner]
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-qwen-image-21-docs/**/*
+        commands:
+          - export OUTPUT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-21-docs/images/$${BUILDKITE_JOB_ID:?}"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 3 75m rocm-qwen-image-21-docs
+            'tests/examples/offline_inference/test_text_to_image.py::test_text_to_image[more_cli_examples_001]'
+            'tests/examples/online_serving/test_text_to_image.py::test_api_calls_001[omni_server0]'
+            'tests/examples/online_serving/test_text_to_image.py::test_api_calls_002[omni_server0]'
+            -m 'full_model and example and rocm and MI325 and cards_1'
+
       - label: "Qwen-Image Official-Weight Smoke"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
@@ -861,48 +1002,36 @@ steps:
       - label: "MiniCPM-o 4.5 Daily-Omni Accuracy"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: omni_minicpmo_4_5_accuracy
+        env:
+          ROCM_E2E_TIMEOUT_MINUTES: "165"
+          ACC_BENCH_RESULT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-daily-omni-accuracy/results"
         artifact_paths:
           - artifacts/rocm-minicpmo-daily-omni-accuracy/**/*
         commands:
-          - export ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-daily-omni-accuracy"
-          - mkdir -p "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR"
+          - mkdir -p "$$ACC_BENCH_RESULT_DIR"
+          - rm -f "$${ACC_BENCH_RESULT_DIR:?}"/result_acc_*_daily_omni_*.json
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::test_minicpmo_4_5_daily_omni_accuracy_bench
+            1 omni rocm-minicpmo-daily-omni-accuracy
           - |
-            node="tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::test_minicpmo_4_5_daily_omni_accuracy_bench"
-            pytest --collect-only -q "$$node" \
-              -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
-              > "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt"
-            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
-              "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 1 ]]; then
-              echo "Expected exactly one MiniCPM-o 4.5 Daily-Omni accuracy node, found $$count." >&2
-              cat "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
-            fi
-            if ! grep -Fq "$$node" "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt"; then
-              echo "MiniCPM-o 4.5 Daily-Omni accuracy node was not collected: $$node" >&2
-              cat "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
-            fi
-          - |
-            set +e
-            node="tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::test_minicpmo_4_5_daily_omni_accuracy_bench"
-            timeout --signal=TERM --kill-after=2m 165m \
-              pytest -s -v "$$node" \
-              -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
-              --junitxml="$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/pytest.xml" \
-              2>&1 | tee "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/pytest.log"
-            status=$${PIPESTATUS[0]}
-            set -e
-            if [[ -d tests/e2e/accuracy/minicpmo_4_5/results ]]; then
-              mkdir -p "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/results"
-              cp -a tests/e2e/accuracy/minicpmo_4_5/results/. \
-                "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/results/"
-            fi
+            python3 - "$$ACC_BENCH_RESULT_DIR" <<'PY'
+            import json
+            import sys
+            from pathlib import Path
 
-            exit "$$status"
+            results = list(Path(sys.argv[1]).glob("result_acc_*_daily_omni_*.json"))
+            if len(results) != 1:
+                raise SystemExit(f"Expected one Daily-Omni result, found {len(results)}")
+            result = json.loads(results[0].read_text())
+            expected = {"daily_omni_evaluated_ok": 1197, "daily_omni_no_gold": 0, "daily_omni_request_failed": 0}
+            for key, value in expected.items():
+                if result.get(key) != value:
+                    raise SystemExit(f"Expected {key}={value}, got {result.get(key)!r}")
+            PY
 
       - label: "MiniCPM-o 4.5 Seed-TTS Accuracy"
         agent_pool: mi300_1
@@ -1327,248 +1456,136 @@ steps:
 
   - group: ":full_moon: Voxtral TTS Perf MI300 Nightly"
     steps:
+      - label: "Voxtral TTS C1 Latency"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 180
+        source_file_dependencies: [tts_voxtral_tts_perf, rocm_tts_perf_runner]
+        env:
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+        artifact_paths:
+          - artifacts/rocm-voxtral-tts-latency/**/*
+        commands:
+          - >-
+            python3 .buildkite/amd/scripts/run_rocm_tts_perf.py
+            --gpus 1 --artifact-name rocm-voxtral-tts-latency
+            --expect-results test_voxtral_tts 1
+            --cases
+            test_voxtral_tts-default_voice_latency_seed-tts-text
+
       - label: "Voxtral TTS Perf"
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: tts_voxtral_tts_perf
+        source_file_dependencies: [tts_voxtral_tts_perf, rocm_tts_perf_runner]
         env:
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-voxtral-tts-perf/benchmark-results"
         artifact_paths:
           - artifacts/rocm-voxtral-tts-perf/**/*
         commands:
-          - export ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-voxtral-tts-perf"
-          - |
-            rm -rf "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR"
-            mkdir -p "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/benchmark-results"
-          # Latency, throughput, and stress. No MI325 numeric baseline yet.
-          - |
-            nodes=(
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_latency_seed-tts-text]"
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_throughput_seed-tts-text]"
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_stress_seed-tts-text]"
-            )
-            pytest --collect-only -q "$${nodes[@]}" \
-              --test-config-file tests/dfx/perf/tests/test_tts.json \
-              --shard-id=0 --num-shards=1 \
-              -m "full_model and tts and rocm and MI325 and cards_1" --run-level full_model \
-              > "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt"
-            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
-              "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != "$${#nodes[@]}" ]]; then
-              echo "Expected exactly $${#nodes[@]} Voxtral TTS perf nodes, found $$count." >&2
-              cat "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
-            fi
-            for node in "$${nodes[@]}"; do
-              if ! grep -Fq "$$node" "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt"; then
-                echo "Voxtral TTS perf node was not collected: $$node" >&2
-                cat "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
-                exit 5
-              fi
-            done
-          - |
-            if (
-              trap - ERR
-              set +e
-              nodes=(
-                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_latency_seed-tts-text]"
-                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_throughput_seed-tts-text]"
-                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_stress_seed-tts-text]"
-              )
-              timeout --signal=TERM --kill-after=2m 165m \
-                pytest -s -v -ra "$${nodes[@]}" --require-baseline \
-                --test-config-file tests/dfx/perf/tests/test_tts.json \
-                --shard-id=0 --num-shards=1 \
-                -m "full_model and tts and rocm and MI325 and cards_1" --run-level full_model \
-                --junitxml="$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest.xml" \
-                2>&1 | tee "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest.log"
-              exit "$${PIPESTATUS[0]}"
-            ); then
-              status=0
-            else
-              status=$$?
-            fi
-            tail -n 100 "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest.log" > \
-              "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest-summary.txt"
-            if [[ "$$status" -eq 0 ]]; then
-              if python3 -c 'import sys, xml.etree.ElementTree as ET
-            root = ET.parse(sys.argv[1]).getroot()
-            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
-            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
-            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 3 or skipped != 0:
-                print(
-                    f"Expected exactly three executed Voxtral TTS perf tests; "
-                    f"reported tests={tests}, skipped={skipped}.",
-                    file=sys.stderr,
-                )
-                raise SystemExit(5)
-            ' "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest.xml"
-              then
-                status=0
-              else
-                status=$$?
-              fi
-            fi
-            find "$$BENCHMARK_DIR" -maxdepth 1 -type f \
-              -name 'result_test_voxtral_tts_*.json' -print | sort > \
-              "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/result-files.txt"
-            if [[ "$$status" -eq 0 ]]; then
-              result_count=$$(wc -l < "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/result-files.txt" | tr -d '[:space:]')
-              if [[ "$$result_count" != 3 ]]; then
-                echo "Expected exactly 3 Voxtral TTS result JSON files, found $$result_count." >&2
-                cat "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/result-files.txt" >&2
-                status=5
-              fi
-            fi
-            (exit "$$status")
+          - >-
+            python3 .buildkite/amd/scripts/run_rocm_tts_perf.py
+            --gpus 1 --artifact-name rocm-voxtral-tts-perf
+            --expect-results test_voxtral_tts 2
+            --cases
+            test_voxtral_tts-default_voice_throughput_seed-tts-text
+            test_voxtral_tts-default_voice_stress_seed-tts-text
 
   - group: ":full_moon: Qwen3-TTS Perf MI300 Nightly"
     steps:
+      - label: "Qwen3-TTS C1 Latency Qualification"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: [tts_qwen3_tts_perf, rocm_tts_perf_runner]
+        env:
+          # Use cached/immediate solvers instead of searching during decoding.
+          MIOPEN_FIND_MODE: "FAST"
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+        artifact_paths:
+          - artifacts/rocm-qwen3-tts-latency/**/*
+        commands:
+          - >-
+            python3 .buildkite/amd/scripts/run_rocm_tts_perf.py
+            --gpus 2 --artifact-name rocm-qwen3-tts-latency
+            --expect-results test_qwen3_tts_base 1
+            --expect-results test_qwen3_tts_customvoice 1
+            --expect-results test_qwen3_tts_voicedesign 1
+            --cases
+            test_qwen3_tts_base-voice_clone_latency_seed-tts
+            test_qwen3_tts_customvoice-default_voice_latency_seed-tts-text
+            test_qwen3_tts_voicedesign-voice_design_latency_seed-tts-design
+
       - label: "Qwen3-TTS Perf"
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: tts_qwen3_tts_perf
+        source_file_dependencies: [tts_qwen3_tts_perf, rocm_tts_perf_runner]
         env:
+          # Use cached/immediate solvers instead of searching during decoding.
+          MIOPEN_FIND_MODE: "FAST"
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-tts-perf/benchmark-results"
         artifact_paths:
           - artifacts/rocm-qwen3-tts-perf/**/*
         commands:
-          - export ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-tts-perf"
-          - |
-            rm -rf "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR"
-            mkdir -p "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/benchmark-results"
-          # Latency, throughput sweeps, and stress. No MI325 numeric baseline yet.
-          - |
-            nodes=(
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_base-voice_clone_latency_seed-tts]"
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_base-voice_clone_throughput_seed-tts]"
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_latency_seed-tts-text]"
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_throughput_seed-tts-text]"
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_stress_seed-tts-text]"
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_latency_seed-tts-design]"
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_throughput_seed-tts-design]"
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_stress_seed-tts-design]"
-            )
-            pytest --collect-only -q "$${nodes[@]}" \
-              --test-config-file tests/dfx/perf/tests/test_tts.json \
-              --shard-id=0 --num-shards=1 \
-              -m "full_model and tts and rocm and MI325 and cards_2" --run-level full_model \
-              > "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt"
-            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
-              "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != "$${#nodes[@]}" ]]; then
-              echo "Expected exactly $${#nodes[@]} Qwen3-TTS perf nodes, found $$count." >&2
-              cat "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
-            fi
-            for node in "$${nodes[@]}"; do
-              if ! grep -Fq "$$node" "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt"; then
-                echo "Qwen3-TTS perf node was not collected: $$node" >&2
-                cat "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
-                exit 5
-              fi
-            done
-          - |
-            if (
-              trap - ERR
-              set +e
-              nodes=(
-                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_base-voice_clone_latency_seed-tts]"
-                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_base-voice_clone_throughput_seed-tts]"
-                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_latency_seed-tts-text]"
-                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_throughput_seed-tts-text]"
-                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_stress_seed-tts-text]"
-                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_latency_seed-tts-design]"
-                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_throughput_seed-tts-design]"
-                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_stress_seed-tts-design]"
-              )
-              timeout --signal=TERM --kill-after=2m 165m \
-                pytest -s -v -ra "$${nodes[@]}" --require-baseline \
-                --test-config-file tests/dfx/perf/tests/test_tts.json \
-                --shard-id=0 --num-shards=1 \
-                -m "full_model and tts and rocm and MI325 and cards_2" --run-level full_model \
-                --junitxml="$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest.xml" \
-                2>&1 | tee "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest.log"
-              exit "$${PIPESTATUS[0]}"
-            ); then
-              status=0
-            else
-              status=$$?
-            fi
-            tail -n 100 "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest.log" > \
-              "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest-summary.txt"
-            if [[ "$$status" -eq 0 ]]; then
-              if python3 -c 'import sys, xml.etree.ElementTree as ET
-            root = ET.parse(sys.argv[1]).getroot()
-            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
-            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
-            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 8 or skipped != 0:
-                print(
-                    f"Expected exactly eight executed Qwen3-TTS perf tests; "
-                    f"reported tests={tests}, skipped={skipped}.",
-                    file=sys.stderr,
-                )
-                raise SystemExit(5)
-            ' "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest.xml"
-              then
-                status=0
-              else
-                status=$$?
-              fi
-            fi
-            find "$$BENCHMARK_DIR" -maxdepth 1 -type f \
-              -name 'result_test_qwen3_tts_*.json' -print | sort > \
-              "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/result-files.txt"
-            if [[ "$$status" -eq 0 ]]; then
-              if python3 -c 'import json, sys
-            from pathlib import Path
-
-            manifest = Path(sys.argv[1])
-            paths = [Path(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line]
-            expected = {
-                "test_qwen3_tts_base": 4,
-                "test_qwen3_tts_customvoice": 5,
-                "test_qwen3_tts_voicedesign": 5,
-            }
-            counts = {name: 0 for name in expected}
-            if len(paths) != 14:
-                print(f"Expected exactly 14 Qwen3-TTS result JSON files, found {len(paths)}.", file=sys.stderr)
-                raise SystemExit(5)
-            for path in paths:
-                try:
-                    json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError) as exc:
-                    print(f"Unreadable Qwen3-TTS result JSON {path}: {exc}", file=sys.stderr)
-                    raise SystemExit(5) from exc
-                matches = [name for name in expected if path.name.startswith(f"result_{name}_")]
-                if len(matches) != 1:
-                    print(f"Unexpected Qwen3-TTS result filename: {path.name}", file=sys.stderr)
-                    raise SystemExit(5)
-                counts[matches[0]] += 1
-            if counts != expected:
-                print(f"Expected Qwen3-TTS result split {expected}, found {counts}.", file=sys.stderr)
-                raise SystemExit(5)
-            ' "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/result-files.txt"
-              then
-                status=0
-              else
-                status=$$?
-              fi
-            fi
-            (exit "$$status")
+          - >-
+            python3 .buildkite/amd/scripts/run_rocm_tts_perf.py
+            --gpus 2 --artifact-name rocm-qwen3-tts-perf
+            --expect-results test_qwen3_tts_base 3
+            --expect-results test_qwen3_tts_customvoice 4
+            --expect-results test_qwen3_tts_voicedesign 4
+            --cases
+            test_qwen3_tts_base-voice_clone_throughput_seed-tts
+            test_qwen3_tts_customvoice-default_voice_throughput_seed-tts-text
+            test_qwen3_tts_customvoice-default_voice_stress_seed-tts-text
+            test_qwen3_tts_voicedesign-voice_design_throughput_seed-tts-design
+            test_qwen3_tts_voicedesign-voice_design_stress_seed-tts-design
 
   - group: ":full_moon: Diffusion Collective Parity MI300 Nightly"
     steps:
+      - label: "FLUX TP2 and MOSS-Image SP2 Parity"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 45
+        source_file_dependencies: [diffusion_flux_mossimage_parallel, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-flux-mossimage-parallel/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 3 30m rocm-flux-mossimage-parallel
+            "tests/diffusion/distributed/test_merged_row_parallel_tp2.py::test_flux_merged_row_tp2_parity_device[2-flux1]"
+            "tests/diffusion/distributed/test_merged_row_parallel_tp2.py::test_flux_merged_row_tp2_parity_device[2-flux2]"
+            tests/diffusion/distributed/test_mossimage_sp.py::test_mossimage_sp_matches_single_gpu_with_odd_joint_length
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
+
+      - label: "Wan VAE Spatial-Shard Decode Parity"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 45
+        source_file_dependencies: diffusion_wan_vae_spatial_shard
+        artifact_paths:
+          - artifacts/rocm-wan-vae-spatial-shard/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 3 30m rocm-wan-vae-spatial-shard
+            tests/diffusion/distributed/test_wan_spatial_shard.py::test_streaming_shard_decode_matches_unsharded_streaming_on_every_rank
+            tests/diffusion/distributed/test_wan_spatial_shard.py::test_spatial_shard_decode_matches_reference
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
+
       - label: "Diffusion Exchange, Ring and CFG Parity · 2 GPUs"
         agent_pool: mi300_2
         depends_on: amd-build
@@ -1585,6 +1602,39 @@ steps:
             tests/diffusion/distributed/test_comm.py
             tests/diffusion/distributed/test_cfg_parallel.py
             -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
+
+      - label: "Diffusion Pipeline Parallel Parity · 2 GPUs"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 45
+        source_file_dependencies: [diffusion_pipeline_parallel_parity, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-diffusion-pipeline-parallel-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 5 30m rocm-diffusion-pipeline-parallel-2gpu
+            tests/diffusion/distributed/test_pipeline_parallel.py
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
+
+      - label: "Diffusion Pipeline Parallel and CFG Parity · 4 GPUs"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 45
+        source_file_dependencies: [diffusion_pipeline_parallel_parity, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-diffusion-pp2-cfg2-4gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 2 30m rocm-diffusion-pp2-cfg2-4gpu
+            'tests/diffusion/distributed/test_pipeline_parallel.py::test_predict_noise_parity[pp2-cfg2-bfloat16]'
+            'tests/diffusion/distributed/test_pipeline_parallel.py::test_scheduler_step_parity[pp2-cfg2-true_cfg]'
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_4"
 
       - label: "Diffusion Exchange and Ring Parity · 4 GPUs"
         agent_pool: mi300_4
@@ -1620,6 +1670,28 @@ steps:
             4 2 45m rocm-diffusion-cfg-3rank
             tests/diffusion/distributed/test_cfg_parallel.py::test_predict_noise_with_multi_branch_cfg_parity
             -m "full_model and diffusion and parallel and rocm and MI325 and cards_3"
+
+      - label: "Wan and Qwen-Image VAE Patch-Decode Equivalence"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 75
+        source_file_dependencies:
+          - diffusion_vae_patch_decode
+          - rocm_diffusion_nightly_runner
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-vae-patch-decode/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 2 60m rocm-vae-patch-decode
+            "tests/diffusion/distributed/test_vae_decode_parallelism.py::test_vae_patch_parallel_tp2[wan22_t2v_a14b]"
+            "tests/diffusion/distributed/test_vae_decode_parallelism.py::test_vae_patch_parallel_tp2[qwen_image]"
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_4"
+            --basetemp="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-vae-patch-decode/previews"
 
   - group: ":microscope: Tiny Diffusion Multi-GPU MI300 Nightly"
     # Flux2Klein distributed cold starts measure about 590-604s on MI325 and
@@ -1669,11 +1741,10 @@ steps:
             "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[StableDiffusion3Pipeline[cfg_parallel+tensor_parallel+cpu_offload]]"
             -m "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only"
 
-      # Keep the Flux2Klein and LongCatImage startup failures observational.
       - label: "ROCm · Tiny Diffusion Multi-GPU · 4-GPU"
         agent_pool: mi300_4
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 50
         source_file_dependencies: diffusion_tiny_model
         artifact_paths:
@@ -1693,9 +1764,11 @@ steps:
       - label: "MiniCPM-o Omni-DuplexEval CI Guard"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        # The benchmark requires all 120 correction sessions to complete and be judged.
+        # The guarded runner also fails the job if a worker survives teardown.
+        grade: Blocking
         timeout_in_minutes: 240
-        source_file_dependencies: [omni_duplex_eval_ci, ci_rocm]
+        source_file_dependencies: [omni_duplex_eval_ci, ci_rocm, rocm_diffusion_nightly_runner]
         env:
           BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-omni-duplex-eval/benchmark-results"
           ACC_BENCH_RESULT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-omni-duplex-eval/accuracy"
@@ -1913,6 +1986,26 @@ steps:
               fi
             fi
             (exit "$$status")
+
+  - group: ":full_moon: Image-to-Video Documentation MI300 Nightly"
+    steps:
+      - label: "Offline Image-to-Video Documentation"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 90
+        source_file_dependencies: [diffusion_image_to_video_doc, rocm_diffusion_nightly_runner]
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-image-to-video-docs/**/*
+        commands:
+          - export OUTPUT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-image-to-video-docs/videos/$${BUILDKITE_JOB_ID:?}"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 4 75m rocm-image-to-video-docs
+            tests/examples/offline_inference/test_image_to_video.py
+            -m 'full_model and example and rocm and MI325 and cards_1'
 
   - group: ":full_moon: Wan2.2 Function 1 GPU Group"
     steps:

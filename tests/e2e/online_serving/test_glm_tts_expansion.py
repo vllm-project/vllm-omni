@@ -24,6 +24,7 @@ MODEL = os.environ.get("GLM_TTS_MODEL_PATH", "zai-org/GLM-TTS")
 REF_TEXT = "他当时还跟线下其他的站姐吵架，然后，打架进局子了。"
 TRANSCRIPT_LANGUAGE = "zh"
 TRANSCRIPT_ESCALATION_MODEL = "large-v3"
+MAX_NEW_TOKENS = 2048
 
 DEPLOY_CONFIG = get_deploy_config_path("glm_tts.yaml")
 REF_AUDIO_URL = get_asset_path("glm_tts/jiayan_zh.wav", as_data_url=True)
@@ -81,6 +82,7 @@ def test_voice_clone_zh_sync(omni_server, online_client) -> None:
         "response_format": "wav",
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
+        "max_new_tokens": MAX_NEW_TOKENS,
         "transcript_language": TRANSCRIPT_LANGUAGE,
         "transcript_escalation_model": TRANSCRIPT_ESCALATION_MODEL,
     }
@@ -105,6 +107,7 @@ def test_voice_clone_zh_async_chunk(omni_server, online_client) -> None:
         "response_format": "wav",
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
+        "max_new_tokens": MAX_NEW_TOKENS,
         "transcript_language": TRANSCRIPT_LANGUAGE,
         "transcript_escalation_model": TRANSCRIPT_ESCALATION_MODEL,
     }

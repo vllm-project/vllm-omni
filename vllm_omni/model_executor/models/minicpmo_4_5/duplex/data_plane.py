@@ -7,6 +7,8 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 
 import numpy as np
+from tokenizers import Tokenizer
+from tokenizers.decoders import DecodeStream
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.contracts import (
@@ -16,6 +18,7 @@ from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneConte
 from vllm_omni.model_executor.common.request_outputs import coerce_int
 from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import TEXT_WITHOUT_AUDIO_KEY
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
 logger = init_logger(__name__)
@@ -33,6 +36,20 @@ class _TurnState:
     turn_eos_done: bool = False
 
 
+_MAX_GAP_STEP_IDS = 1024
+
+
+@dataclass(slots=True)
+class _EOSCursor:
+    """TTS EOS scan state for one stage; downstream stages reuse the Stage0 request id."""
+
+    scanned_tokens: int = 0
+    #: Step ids scanned while cumulative snapshots were incomplete; dropped past ``_MAX_GAP_STEP_IDS``.
+    gap_step_ids: list[int] = field(default_factory=list)
+    #: Turn whose scanned EOS has not ended a segment yet; only kept for a known turn.
+    pending_turn: int | None = None
+
+
 @dataclass(slots=True)
 class _RequestState:
     audio_offset: int = 0
@@ -43,6 +60,15 @@ class _RequestState:
     pending_audio_without_text: list[dict[str, object]] = field(default_factory=list)
     terminal: bool = False
     turns: dict[int | None, _TurnState] = field(default_factory=dict)
+    stage0_consumed_tokens: int = 0
+    stage0_decoded_tokens: int = 0
+    stage0_decoder: DecodeStream | None = None
+    #: A skipped stale snapshot ended inside a unit; drop the rest of it up to its terminator.
+    stage0_skip_open_unit: bool = False
+    eos_cursors: dict[int | None, _EOSCursor] = field(default_factory=dict)
+
+    def eos_cursor(self, stage_id: int | None) -> _EOSCursor:
+        return self.eos_cursors.setdefault(stage_id, _EOSCursor())
 
     def turn(self, turn_id: int | None) -> _TurnState:
         return self.turns.setdefault(turn_id, _TurnState())
@@ -59,6 +85,8 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
     def __init__(self, encode_audio: EncodeAudio) -> None:
         self._encode_audio = encode_audio
         self._requests: dict[str, _RequestState] = {}
+        self.thinker_only = False
+        self.tokenizer: Tokenizer | None = None
 
     def begin_request(self, request_id: str) -> None:
         state = self._requests.setdefault(request_id, _RequestState())
@@ -79,12 +107,14 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         self._requests.setdefault(request_id, _RequestState()).terminal = True
 
     def close_stream(self, request_id: str) -> None:
-        """Release non-resumable request cursors after its drain finishes."""
+        """Reset stream-local audio cursors; Stage0 decoding stays cumulative per request."""
         state = self._requests.get(request_id)
         if state is None:
             return
         state.audio_offset = 0
         state.turns.pop(None, None)
+        for cursor in state.eos_cursors.values():
+            cursor.pending_turn = None
 
     def close_request(self, request_id: str) -> None:
         self._requests.pop(request_id, None)
@@ -167,13 +197,47 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         mm_output = dict(mm_output) if isinstance(mm_output, Mapping) else {}
 
         output_turn_id = output_turn_id_from_metadata(mm_output)
+        text_input = coerce_int(mm_output.get("duplex_text_input")) == 1
+        if text_input and context.model_turn_id is not None:
+            output_turn_id = context.model_turn_id
         output_epoch = output_epoch_from_metadata(mm_output)
         expected_turn_id = context.active_response_turn_id
         stale_turn = expected_turn_id is not None and output_turn_id is not None and output_turn_id < expected_turn_id
         if expected_turn_id is None and output_turn_id is not None:
             stale_turn = output_turn_id < context.turn_id
         stale_epoch = output_epoch is not None and output_epoch != context.epoch
-        if context.auto_responds and (stale_turn or stale_epoch):
+        # Advance the cumulative EOS cursor before skipping stale output, so a later
+        # empty step does not rescan the skipped tokens.
+        eos_cursor = None
+        if request_state is not None and not self.thinker_only:
+            eos_cursor = request_state.eos_cursor(coerce_int(getattr(output, "stage_id", None)))
+        eos_scan_ids = [] if self.thinker_only else self._unscanned_token_ids(eos_cursor, completion)
+        stale = context.auto_responds and (stale_turn or stale_epoch)
+        if self.thinker_only:
+            # No TTS stage reports segment or turn ends, and the latent is not audio.
+            if request_state is not None:
+                projected = self._project_stage0_text(
+                    request_id=request_id,
+                    request_state=request_state,
+                    completion=completion,
+                    mm_output=mm_output,
+                    finished=bool(getattr(output, "finished", False)),
+                    text_input=text_input,
+                    context=context,
+                    runtime_result=runtime_result,
+                )
+                if not stale:
+                    yield from projected
+                else:
+                    # Consume skipped tokens so their text and boundaries do not reach the next reply.
+                    for _ in projected:
+                        pass
+                    snapshot_len, _ = _stage0_snapshot_ids(completion, request_state.stage0_consumed_tokens)
+                    if snapshot_len > request_state.stage0_consumed_tokens:
+                        request_state.stage0_consumed_tokens = snapshot_len
+                        request_state.stage0_skip_open_unit = True
+            return
+        if stale:
             return
 
         mm_text = _llm_output_text(mm_output)
@@ -185,21 +249,33 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             text = ""
 
         finished = bool(getattr(output, "finished", False))
-        tts_is_last_chunk = _bool_metadata(mm_output, ("tts_is_last_chunk",), default=False)
+        tts_is_last_chunk = is_last_tts_chunk(mm_output)
         token_ids = _completion_token_ids(completion)
         native_decision = _native_decision(completion, mm_output, token_ids=token_ids, finished=finished)
         if native_decision == "listen":
             listen_result = runtime_result(
                 stage_role="llm",
                 is_listen=True,
-                model_listen=True,
-                listen_source="model_listen",
+                model_listen=mm_output.get("model_listen") is not False,
+                listen_source=mm_output.get("listen_source") or "model_listen",
                 data_plane_request_id=request_id,
                 end_of_turn=False,
+                continue_with_partial_input=text_input,
             )
             if output_turn_id is not None:
                 listen_result["model_turn_id"] = output_turn_id
             yield listen_result
+            return
+
+        if text_input:
+            # Stage0 projection only records continuation ownership. Do not
+            # encode its hidden states or emit its text before Talker output.
+            yield runtime_result(
+                requires_stage_handoff=True,
+                data_plane_request_id=request_id,
+                model_turn_id=output_turn_id,
+                continue_with_partial_input=True,
+            )
             return
 
         raw_audio = next((mm_output[key] for key in ("audio", "model_outputs", "latent") if key in mm_output), None)
@@ -231,15 +307,25 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             new_tts_boundary = (
                 terminal_turn_state.last_tts_chunk is None or chunk_key > terminal_turn_state.last_tts_chunk
             )
+        scanned_eos = 151645 in eos_scan_ids
+        pending_eos = (
+            eos_cursor is not None and output_turn_id is not None and eos_cursor.pending_turn == output_turn_id
+        )
         stage_tts_eos = (
             context.auto_responds
-            and 151645 in token_ids
+            and (scanned_eos or pending_eos)
             and not audio_chunks
             and raw_audio_samples is not None
             and (raw_audio_samples == 0 or raw_audio_samples == offset_before)
             and new_tts_boundary
         )
         tts_segment_end = bool(tts_is_last_chunk or stage_tts_eos) and new_tts_boundary
+        if eos_cursor is not None:
+            # An EOS scanned on a step that still had audio ends the turn's next empty step.
+            if tts_segment_end:
+                eos_cursor.pending_turn = None
+            elif scanned_eos and new_tts_boundary:
+                eos_cursor.pending_turn = output_turn_id
         if tts_segment_end and terminal_turn_state is not None:
             terminal_turn_state.tts_eos_done = True
             if chunk_key is not None:
@@ -345,6 +431,29 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     yield from pending_audio
                     return
                 request_state.pending_audio_without_text = pending_audio
+
+        if tts_segment_end and _bool_metadata(mm_output, (TEXT_WITHOUT_AUDIO_KEY,), default=False) and text:
+            # Venus text also carries delegation control. Deliver it even
+            # when a mixed speech unit reaches codec EOS without a waveform.
+            delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id, chunk_key=chunk_key)
+            result = runtime_result(
+                stage_role="tts",
+                is_listen=False,
+                data_plane_request_id=request_id,
+                text=delta_text,
+                audio_data="",
+                audio_duration_ms=0,
+                audio_format=context.response_format,
+                audio_text_mark=False,
+                end_of_turn=unit_end_of_turn,
+                abort_data_plane_request=True,
+            )
+            if output_turn_id is not None:
+                result["model_turn_id"] = output_turn_id
+            if delta_text and text_turn_state is not None:
+                text_turn_state.has_text = True
+            yield result
+            return
 
         if tts_segment_end:
             if unit_end_of_turn and request_state is not None and request_state.pending_audio_without_text:
@@ -459,6 +568,149 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             audio_data="",
             end_of_turn=unit_end_of_turn,
         )
+
+    def _project_stage0_text(
+        self,
+        *,
+        request_id: str | None,
+        request_state: _RequestState,
+        completion: object,
+        mm_output: dict[str, object],
+        finished: bool,
+        text_input: bool,
+        context: DuplexDataPlaneContext,
+        runtime_result: Callable[..., dict[str, object]],
+    ) -> Iterator[dict[str, object]]:
+        if request_state.terminal:
+            return
+        metrics_attached = False
+        has_text = False
+
+        def make_result(**values: object) -> dict[str, object]:
+            nonlocal metrics_attached
+            if text_input and "error_code" not in values:
+                # Text input releases the reply past partial PCM, as on the Talker path.
+                values["continue_with_partial_input"] = True
+            result = runtime_result(stage_role="llm", data_plane_request_id=request_id, **values)
+            if metrics_attached or (has_text and not values.get("text")):
+                # stage_metrics counts once per snapshot: on the first text event when
+                # the snapshot has text, or on the first decision when it has none.
+                result.pop("stage_metrics", None)
+            else:
+                metrics_attached = True
+            return result
+
+        start = request_state.stage0_consumed_tokens
+        _, new_token_ids = _stage0_snapshot_ids(completion, start)
+        if not new_token_ids:
+            return
+        if self.tokenizer is None:
+            yield make_result(
+                error_code="runtime_data_plane_missing_tokenizer",
+                error="MiniCPM-o Stage0 text projection requires a fast tokenizer.",
+            )
+            return
+        if request_state.stage0_decoder is None:
+            request_state.stage0_decoder = DecodeStream(skip_special_tokens=True)
+        decoded_text: list[str] = []
+        for index, token_id in enumerate(new_token_ids):
+            delta = ""
+            # Partial units are scanned again; the decoder only accepts new tokens.
+            if start + index >= request_state.stage0_decoded_tokens:
+                delta = request_state.stage0_decoder.step(self.tokenizer, token_id) or ""
+                request_state.stage0_decoded_tokens = start + index + 1
+            decoded_text.append(delta)
+        turn_id = context.active_response_turn_id if context.active_response_turn_id is not None else context.turn_id
+        if text_input and context.model_turn_id is not None:
+            turn_id = context.model_turn_id
+        special_token_ids = _special_token_ids(mm_output)
+        listen_id = special_token_ids.get("listen_token_id")
+        turn_eos_id = special_token_ids.get("turn_eos_token_id")
+        terminators = {
+            token_id
+            for token_id in (
+                listen_id,
+                special_token_ids.get("chunk_eos_token_id"),
+                special_token_ids.get("chunk_tts_eos_token_id"),
+            )
+            if token_id is not None
+        }
+        unit_start = 0
+        if request_state.stage0_skip_open_unit:
+            terminator = next((i for i, token_id in enumerate(new_token_ids) if token_id in terminators), None)
+            if terminator is None:
+                request_state.stage0_consumed_tokens = start + len(new_token_ids)
+                return
+            request_state.stage0_skip_open_unit = False
+            unit_start = terminator + 1
+        has_text = any(decoded_text[unit_start:])
+        text_parts: list[str] = []
+        for index, token_id in enumerate(new_token_ids[unit_start:], start=unit_start):
+            if decoded_text[index]:
+                text_parts.append(decoded_text[index])
+            if token_id not in terminators:
+                continue
+            if text_parts:
+                yield make_result(is_listen=False, text="".join(text_parts), end_of_turn=False, model_turn_id=turn_id)
+                text_parts.clear()
+            # Later text or a SPEAK token reopens a turn after an intermediate EOS.
+            ends_turn = index > unit_start and new_token_ids[index - 1] == turn_eos_id
+            unit_start = index + 1
+            if ends_turn:
+                yield make_result(is_listen=False, text="", end_of_turn=True, model_turn_id=turn_id)
+                turn_id += 1
+            elif token_id == listen_id:
+                yield make_result(
+                    is_listen=True,
+                    model_listen=True,
+                    listen_source="model_listen",
+                    end_of_turn=False,
+                    model_turn_id=turn_id,
+                )
+            else:
+                yield make_result(
+                    is_listen=False, text="", end_of_turn=False, segment_complete=True, model_turn_id=turn_id
+                )
+        if text_parts:
+            yield make_result(is_listen=False, text="".join(text_parts), end_of_turn=False, model_turn_id=turn_id)
+        # A resumable stop leaves ``finished`` false and sets finish_reason. An
+        # unterminated tail (e.g. a length cap) fails, even if it holds turn_eos.
+        if (finished or getattr(completion, "finish_reason", None) is not None) and unit_start < len(new_token_ids):
+            unit_start = len(new_token_ids)
+            yield make_result(
+                error_code="runtime_data_plane_unterminated_unit",
+                error=(
+                    "MiniCPM-o Stage0 stopped without a unit terminator "
+                    f"(finish_reason={getattr(completion, 'finish_reason', None)!r})."
+                ),
+            )
+        request_state.stage0_consumed_tokens = start + unit_start
+
+    @staticmethod
+    def _unscanned_token_ids(cursor: _EOSCursor | None, completion: object) -> list[int]:
+        """Token ids to scan for a TTS EOS; cumulative ids replay earlier turns, so skip scanned ones."""
+        if cursor is None:
+            return _completion_token_ids(completion)
+        scanned = cursor.scanned_tokens
+        cumulative_len, unscanned = _token_ids_from(getattr(completion, "cumulative_token_ids", None), scanned)
+        step_ids = _coerce_int_list(getattr(completion, "token_ids", None))
+        if not cumulative_len or cumulative_len < scanned:
+            # Incomplete snapshots must not rewind the cursor and replay old EOS tokens.
+            cursor.gap_step_ids.extend(step_ids)
+            if len(cursor.gap_step_ids) > _MAX_GAP_STEP_IDS:
+                cursor.gap_step_ids.clear()
+            return step_ids
+        # Skip the step ids already scanned during the gap, as far as the restored list matches them.
+        matched = 0
+        for seen, token_id in zip(cursor.gap_step_ids, unscanned):
+            if seen != token_id:
+                break
+            matched += 1
+        if unscanned:
+            # Once the list grows past the cursor, leftovers (e.g. from a replayed gap step) must not hide a later EOS.
+            cursor.gap_step_ids.clear()
+        cursor.scanned_tokens = cumulative_len
+        return step_ids or unscanned[matched:]
 
     def segment_text_delta(
         self,
@@ -686,6 +938,28 @@ def _completion_token_ids(completion: object) -> list[int]:
     return []
 
 
+def _stage0_snapshot_ids(completion: object, start: int) -> tuple[int, list[int]]:
+    # A queued snapshot reads its own cumulative ids, even when empty: token_ids may be
+    # a live list that has since grown. Only a snapshot without the field uses token_ids.
+    snapshot_ids = getattr(completion, "cumulative_token_ids", None)
+    if snapshot_ids is None:
+        snapshot_ids = getattr(completion, "token_ids", None)
+    return _token_ids_from(snapshot_ids, start)
+
+
+def _token_ids_from(value: object, start: int) -> tuple[int, list[int]]:
+    """A token list's length and its ids from ``start``, coercing only that tail.
+
+    Resident requests resend the whole cumulative list each step, so coercing the
+    consumed prefix would cost the full history on every update. A list's raw
+    length is its token count, since producers emit one int per token.
+    """
+    if isinstance(value, (list, tuple)):
+        return len(value), _coerce_int_list(value[start:])
+    ids = _coerce_int_list(value)
+    return len(ids), ids[start:]
+
+
 def _audio_num_samples(audio_data: object) -> int | None:
     try:
         import torch
@@ -695,6 +969,11 @@ def _audio_num_samples(audio_data: object) -> int | None:
         return int(np.asarray(audio_data, dtype=np.float32).size)
     except Exception:
         return None
+
+
+def is_last_tts_chunk(mm_output: dict[str, object]) -> bool:
+    """Whether a Code2Wav output carries the connector's flush of a unit's remaining codes (``tts_is_last_chunk``)."""
+    return _bool_metadata(mm_output, ("tts_is_last_chunk",), default=False)
 
 
 def _bool_metadata(

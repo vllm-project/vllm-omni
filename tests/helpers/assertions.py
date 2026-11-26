@@ -1014,7 +1014,15 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                             f"transcript={transcript!r}"
                         )
                     else:
-                        assert similarity > similarity_threshold, AUDIO_MISMATCH_MESSAGE
+                        try:
+                            assert similarity > similarity_threshold, AUDIO_MISMATCH_MESSAGE
+                        except AssertionError as error:
+                            if request_config.get("stream"):
+                                # The chat client joins streamed audio chunks into a WAV before ASR.
+                                _retain_failed_speech_audio(
+                                    getattr(response, "audio_bytes", None), transcript, text_output, error
+                                )
+                            raise
             if audio_ref_text:
                 assert transcript is not None, "No audio transcript for reference-text validation"
                 audio_similarity = cosine_similarity_text(
