@@ -500,7 +500,8 @@ WEATHER_TOOL = {
 }
 INSTRUCTIONS = (
     "You are a helpful assistant. For any question about the weather you must call the get_weather tool "
-    "instead of guessing. For anything else, answer directly in one short sentence without calling a tool."
+    "instead of guessing. After receiving its result, answer with only the temperature_c integer, "
+    "without units or other text. For anything else, answer directly in one short sentence without calling a tool."
 )
 WEATHER_QUESTION = "What is the weather in Paris right now?"
 WEATHER_RESULT = json.dumps({"city": "Paris", "temperature_c": 17})
@@ -545,18 +546,56 @@ class _ToolSession:
             codes.append(error.get("code") if isinstance(error, dict) else None)
         return codes
 
-    async def finish_response(self, start: int) -> str:
+    async def finish_response(self, start: int, *, after_tool_result: str | None = None) -> str:
         """Wait for the turn's own response, and return its text.
 
         The turn's response opens first. A function call inside it is projected
         as a separate response, which must not be mistaken for the end.
+        For a tool continuation, require its result acknowledgement before a
+        newly created response; earlier responses cannot satisfy this wait.
         """
         deadline = asyncio.get_running_loop().time() + TURN_TIMEOUT_S
         while asyncio.get_running_loop().time() < deadline:
             events = self.events_since(start)
-            created = next((event for event in events if event.get("type") == "response.created"), None)
+            previous_response_ids = set()
+            if after_tool_result is not None:
+                accepted = next(
+                    (
+                        index
+                        for index, event in enumerate(events)
+                        if event.get("type") == "conversation.item.created"
+                        and isinstance(item := event.get("item"), dict)
+                        and item.get("type") == "function_call_output"
+                        and item.get("call_id") == after_tool_result
+                    ),
+                    None,
+                )
+                if accepted is None:
+                    await asyncio.sleep(0.1)
+                    continue
+                previous_response_ids = {
+                    self.collector.response_id(event) for event in self.collector.events[: start + accepted + 1]
+                }
+                events = events[accepted + 1 :]
+            created = next(
+                (
+                    event
+                    for event in events
+                    if event.get("type") == "response.created"
+                    and self.collector.response_id(event) not in previous_response_ids
+                ),
+                None,
+            )
             response_id = self.collector.response_id(created) if created is not None else None
             if response_id is not None and self.collector.response_is_done(response_id):
+                if after_tool_result is not None:
+                    assert any(
+                        event.get("type") == "response.done"
+                        and self.collector.response_id(event) == response_id
+                        and isinstance(response := event.get("response"), dict)
+                        and response.get("status") == "completed"
+                        for event in events
+                    ), events
                 text = self.collector.response_text(response_id)
                 print(f"[qwen-tools] answer {response_id}: {text!r}")
                 return text
@@ -762,7 +801,7 @@ class TestQwen3OmniDuplexPlayback:
         async def body(session: _ToolSession) -> None:
             call_id = await session.ask_for_weather()
             answer = await session.continue_with_result(call_id, WEATHER_RESULT)
-            assert "17" in answer, answer
+            assert answer.strip() == str(json.loads(WEATHER_RESULT)["temperature_c"]), answer
             assert session.error_codes() == []
 
         _run_tool_session(qwen_duplex_server.server, _tool_session_config(), body)
@@ -854,27 +893,18 @@ class TestQwen3OmniDuplexPlayback:
                 return WEATHER_RESULT
 
             runner = DuplexToolRunner(session.client, {"get_weather": get_weather})
+            start = len(session.collector.events)
             task = asyncio.create_task(runner.run())
             try:
                 await asyncio.sleep(0)
-                await session.ask_for_weather()
-                deadline = asyncio.get_running_loop().time() + TURN_TIMEOUT_S
-                while asyncio.get_running_loop().time() < deadline:
-                    if task.done():
-                        await task
-                    answers = [
-                        session.collector.response_text(rid)
-                        for event in session.collector.events
-                        if event.get("type") == "response.done"
-                        and (rid := session.collector.response_id(event)) is not None
-                    ]
-                    if any("17" in text for text in answers):
-                        assert len(handled) == 1
-                        assert session.error_codes() == []
-                        assert runner.undelivered_results == {}
-                        return
-                    await asyncio.sleep(0.1)
-                raise AssertionError("runner did not continue the immediate tool result")
+                call_id = await session.ask_for_weather()
+                answer = await session.finish_response(start, after_tool_result=call_id)
+                if task.done():
+                    await task
+                assert answer.strip() == str(json.loads(WEATHER_RESULT)["temperature_c"]), answer
+                assert len(handled) == 1
+                assert session.error_codes() == []
+                assert runner.undelivered_results == {}
             finally:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
