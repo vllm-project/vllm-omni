@@ -100,6 +100,51 @@ if not hasattr(torch.ops.vllm_omni, "fa4_dense_attention"):
 _fa4_dense_attention_op = torch.ops.vllm_omni.fa4_dense_attention
 
 
+# AITER's flash_attn_func is a Python autograd.Function whose dispatch calls
+# os.stat and lru_cache helpers. Dynamo graph-breaks inside it, and the split
+# graphs fail AOTAutograd view-input merging under dynamic shapes, so keep the
+# call opaque to torch.compile.
+if not hasattr(torch.ops.vllm_omni, "aiter_dense_attention"):
+
+    @torch.library.custom_op("vllm_omni::aiter_dense_attention", mutates_args=())
+    def _aiter_dense_attention_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        softmax_scale: float,
+        causal: bool,
+        deterministic: bool,
+    ) -> torch.Tensor:
+        from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_func
+
+        if flash_attn_func is None:
+            raise RuntimeError("AITER FlashAttention is unavailable")
+        kwargs = {
+            "causal": causal,
+            "softmax_scale": softmax_scale,
+        }
+        if deterministic:
+            kwargs["deterministic"] = True
+        out = flash_attn_func(query, key, value, **kwargs)
+        out = out[0] if isinstance(out, tuple) else out
+        # AITER slices padded head dimensions; return the layout the fake declares.
+        return out.contiguous()
+
+    @_aiter_dense_attention_op.register_fake
+    def _aiter_dense_attention_fake(
+        query,
+        key,
+        value,
+        softmax_scale,
+        causal,
+        deterministic,
+    ):
+        return query.new_empty((*query.shape[:-1], value.shape[-1]))
+
+
+_aiter_dense_attention_op = torch.ops.vllm_omni.aiter_dense_attention
+
+
 _PACKED_KEYS = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
 
 
@@ -744,6 +789,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """CUDA/ROCm/MUSA flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             HAS_FLASH_ATTN,
+            IS_AITER,
             IS_FLASH_ATTN_4,
             dense_flash_attn_func_for,
             flash_attn_func,
@@ -832,6 +878,15 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         if dense_attn_func is not None:
             if IS_FLASH_ATTN_4:
                 return _fa4_dense_attention_op(
+                    query,
+                    key,
+                    value,
+                    self.softmax_scale,
+                    self.causal,
+                    self.fa_deterministic,
+                )
+            if IS_AITER:
+                return _aiter_dense_attention_op(
                     query,
                     key,
                     value,

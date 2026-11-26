@@ -170,6 +170,9 @@ platforms:
           # Full decode graphs require Model Runner V2 on NPU.
           cudagraph_mode: FULL_AND_PIECEWISE
       - stage_id: 1
+        async_scheduling: false
+        additional_config:
+          npu_incremental_codec: false
         compilation_config:
           cudagraph_mode: PIECEWISE
   xpu:

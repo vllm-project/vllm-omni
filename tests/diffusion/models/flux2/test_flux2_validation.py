@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from vllm_omni.diffusion.models.flux2.pipeline_flux2 import Flux2Pipeline
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -76,3 +77,18 @@ def test_forward_keeps_kwarg_steps_when_sampling_is_none():
     with pytest.raises(RuntimeError, match="stopped_after_check"):
         pipeline.forward(_request("valid prompt", None), num_inference_steps=7)
     assert seen["num_inference_steps"] == 7
+
+
+@pytest.mark.parametrize(("height", "width", "dimension"), [(16, 1, "width"), (0, 16, "height"), (16, 0, "width")])
+def test_forward_rejects_empty_output_grid(height, width, dimension):
+    request = _request("valid prompt", 4)
+    request.sampling_params.height = height
+    request.sampling_params.width = width
+    with pytest.raises(OmniClientError, match=rf"{dimension}.*at least 16") as exc:
+        _pipeline().forward(request, height=64, width=64)
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize(("height", "width"), [(16, 16), (205, 333), (None, None)])
+def test_check_inputs_accepts_nonempty_or_default_dimensions(height, width):
+    _pipeline().check_inputs(prompt="valid prompt", height=height, width=width)
