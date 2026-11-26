@@ -35,6 +35,7 @@ from vllm_omni.platforms import current_omni_platform
 
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
+from .ops.vae.npu_temporal_pad import install_npu_temporal_pad_fusion
 from .packed_tokens import minimax_h3_patchify_video_latent
 from .vae_temporal import install_temporal_stream_patches
 
@@ -428,6 +429,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 decoder,
                 device=device,
             )
+        install_npu_temporal_pad_fusion(self.remote.model, device=device)
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
         # The three decoder fast paths below are XPU-only: they were written
         # against the XPU kernels/compile stack and validated there. CUDA keeps

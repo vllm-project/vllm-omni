@@ -34,6 +34,32 @@ kept separate so the evidence remains clear.
 
 ## Extending platform support
 
+### Experimental NPU encoder temporal padding
+
+`VLLM_OMNI_H3_VAE_TEMPORAL_PAD_FUSION=1` opts into a separate encoder-only
+Conv3D path. It is disabled by default and read at NPU video VAE construction;
+`true`/`on` also enable it, `0`/`false`/`off` or an empty value disable it,
+and any other value raises `ValueError`. Restart workers when changing it.
+This temporary model switch is classified as deprecate/remove: remove it or
+move validated behavior into the normal operator dispatch after device
+accuracy and latency qualification.
+
+The loaded checkpoint must expose `EncoderFCN3D` and its concrete
+`SpatialParallelConv3d`, with a CPU-probed causal padding contract. In eager
+FP32 inference, D=17, temporal kernel 3, dilation 1, groups 1, and temporal
+stride 1 or 2, the path replaces the explicit left two-frame zero pad with
+Conv3D's symmetric `(2, 0, 0)` padding, then keeps the original output prefix.
+Spatial padding retains the checkpoint's operation. The cropped output is a
+view and may be non-contiguous; downstream layout cost must be included in
+device measurements. Other shapes, devices, spatial parallelism, training,
+gradients, autocast, hooks, and compilation use the original forward.
+
+CPU operator tests cover prefix equivalence and the fallbacks. Public NPU
+bitwise accuracy, complete encoding latency, and end-to-end media checks have
+not been run; mathematical equivalence alone does not establish those gates.
+
+### Platform qualification
+
 Validation and improvements for other platforms are welcome. A contribution
 should keep the model-facing installation path unchanged and add a complete
 operator-set entry with conservative fallback behavior. Please include:
