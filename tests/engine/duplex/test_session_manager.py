@@ -25,6 +25,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageSubmission,
     DuplexStageSubmissionResult,
     duplex_resource_request_belongs_to_session,
+    parse_duplex_resource_request_id,
 )
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import (
@@ -561,6 +562,10 @@ def test_stage_request_id_is_derived_from_the_fence() -> None:
     assert request_id == stage0_request_id("sid/with+special", epoch=2)
     assert duplex_resource_request_belongs_to_session(request_id, "sid/with+special")
     assert not duplex_resource_request_belongs_to_session(request_id, "sid/other")
+    parsed = parse_duplex_resource_request_id(request_id)
+    assert parsed is not None
+    assert (parsed.session_id, parsed.epoch, parsed.role) == ("sid/with+special", fence.epoch, "stage0")
+    assert parse_duplex_resource_request_id(request_id.replace(".e.", ".e.invalid")) is None
 
 
 async def test_ensure_stage_request_ignores_stages_beyond_the_pipeline() -> None:
@@ -1332,7 +1337,7 @@ async def test_in_progress_request_cleanup_is_finalized_by_the_orchestrator_not_
         assert harness.stage_port.cleanup_calls == []
         assert (await harness.open("sid-replacement")).error_code == "resource_exhausted"
 
-        harness.manager.finalize_closed_sessions(["sid-in-progress"])
+        await harness.manager.finalize_closed_sessions(["sid-in-progress"])
 
         assert session.resource_request_ids() == []
         assert session.state == DuplexSessionState.CLOSED
@@ -2118,7 +2123,8 @@ async def test_each_open_failure_releases_its_replica_reservation(failure_point,
 
                 patch.setattr(harness.manager, "_put_result", fail_success_result)
             assert not (await harness.open("failed")).ok
-        assert port.release_calls == ["failed"]
+        # Capability validation now precedes reservation entirely.
+        assert port.release_calls == ([] if failure_point == "capabilities" else ["failed"])
         assert port.placement.snapshot()["sessions"] == {}
         assert harness.manager.get("failed") is None
         assert (await harness.open("replacement")).ok

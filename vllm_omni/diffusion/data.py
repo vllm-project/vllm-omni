@@ -323,7 +323,8 @@ class DiffusionParallelConfig:
     ulysses_a2a_permute: bool = False
     """Use platform symmetric memory for eligible strict Ulysses exchanges.
 
-    On CUDA, enables CE (copy engines) on a single NVLink-connected node;
+    On CUDA, enables CE (copy engines) on a single node whose GPUs have CUDA
+    peer access (NVLink or PCIe P2P);
     when disabled, Ulysses uses NCCL. NPU retains its eager, pure Ulysses
     implementation over WORLD in one HCCS domain, using TorchNPU's NPUSHMEM
     allocator, Triton-Ascend and a symmetric-memory runtime.
@@ -333,8 +334,9 @@ class DiffusionParallelConfig:
     """Overlap the CUDA copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
 
     Requires ``ulysses_a2a_permute`` and strict pure Ulysses. Each chunk's Q/K/V move to their head owners while
-    earlier chunks compute, and outputs return as each chunk finishes. Results match the unchunked path exactly when
-    the attention backend's per-head output does not depend on the number of heads per call.
+    earlier chunks compute, and outputs return as each chunk finishes. The first call for each attention kernel and
+    shape runs the overlap and the standard path on every rank and keeps the overlap only if all ranks are
+    bit-identical, so results match the unchunked path exactly; other kernels and shapes keep the standard exchange.
     """
 
     cfg_parallel_size: int = 1
@@ -868,7 +870,7 @@ def resolve_model_class_name(
 
     if model_type == "praxis":
         return "Praxis1Pipeline"
-    if _looks_like_hidream_o1(model, cfg):
+    if _looks_like_hidream_o1(model, cfg, revision=revision):
         return "HiDreamO1ImagePipeline"
     if _looks_like_flux3(model, cfg):
         return "Flux3Pipeline"
@@ -903,7 +905,7 @@ def resolve_model_class_name(
     if model_type == "vla":
         from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
-        return "DreamZeroPipeline" if _looks_like_dreamzero(model) else None
+        return "DreamZeroPipeline" if _looks_like_dreamzero(model, revision=revision) else None
     if len(architectures) == 1:
         return architectures[0]
     return None
@@ -1854,7 +1856,11 @@ class OmniDiffusionConfig:
             )
             # Mixed Flux3 packages also ship a Diffusers index. Native loading
             # must resolve variant quantization from the package config below.
-            if config_dict is not None and self.diffusion_load_format != "diffusers" and _looks_like_flux3(self.model):
+            if (
+                config_dict is not None
+                and self.diffusion_load_format != "diffusers"
+                and _looks_like_flux3(self.model, revision=self.revision)
+            ):
                 config_dict = None
             if config_dict is not None:
                 if self.model_class_name is None:
@@ -1960,7 +1966,7 @@ class OmniDiffusionConfig:
                 from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
 
                 assert self.model is not None
-                is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg)
+                is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg, revision=self.revision)
                 is_flux3 = _looks_like_flux3(self.model, cfg)
                 if self.model_class_name == "HiDreamO1ImagePipeline" and not is_hidream_o1:
                     raise ValueError(f"Checkpoint {self.model} does not have the HiDream-O1 signature")
@@ -2040,7 +2046,7 @@ class OmniDiffusionConfig:
                     from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
                     assert self.model is not None
-                    if _looks_like_dreamzero(self.model):
+                    if _looks_like_dreamzero(self.model, revision=self.revision):
                         self.model_class_name = "DreamZeroPipeline"
                         self.set_tf_model_config(TransformerConfig())
                         self.update_multimodal_support()

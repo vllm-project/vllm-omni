@@ -210,6 +210,40 @@ def test_pipeline_loads_native_adapter_without_distilled_schedule(
     assert pipeline._native_lora_specs == {}
 
 
+@pytest.mark.parametrize("as_directory", [False, True])
+def test_pipeline_pins_a_pika_turbo_adapter_by_its_filename(tmp_path, transformer, as_directory):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    path = tmp_path / "pika_h3_flex_turbo_4step_fl2va_lite_r32.safetensors"
+    save_file(
+        {
+            "diffusion_model.blocks.0.attn.out_proj.lora_A.weight": torch.ones(2, 4),
+            "diffusion_model.blocks.0.attn.out_proj.lora_B.weight": torch.ones(4, 2),
+        },
+        path,
+    )
+    lora_path = tmp_path if as_directory else path
+
+    def load(partition):
+        pipeline = object.__new__(MiniMaxH3Pipeline)
+        torch.nn.Module.__init__(pipeline)
+        pipeline.partition = partition
+        pipeline.od_config = SimpleNamespace(enable_distributed_layerwise_offload=False)
+        pipeline.transformer = transformer
+        pipeline._turbo_lora_specs = {}
+        pipeline._native_lora_specs = {}
+        pipeline._load_diffusion_lora_adapter(
+            lora_request=LoRARequest("pika", 42, str(lora_path)), lora_path=lora_path, dtype=torch.float32
+        )
+        return pipeline._turbo_lora_specs
+
+    # The name pins the sampler whether the request names the file or the directory holding it.
+    spec = load("fl2va")[42]
+    assert (spec.task_family, spec.denoise_steps, spec.video_shift, spec.audio_shift) == ("fl2v", 4, 6.0, 3.0)
+    with pytest.raises(ValueError, match="binds to the FL2VA DiT.*--task-type fl2va"):
+        load("ref2va")
+
+
 def test_loaded_packed_adapters_compose_without_double_scaling(tmp_path, transformer):
     from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 

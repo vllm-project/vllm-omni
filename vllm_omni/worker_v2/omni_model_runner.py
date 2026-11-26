@@ -324,6 +324,14 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         with self._staged_writes.deferred() if static_staged_writes else nullcontext():
             super().add_requests(scheduler_output)
 
+        apply_update = getattr(self.model, "apply_text_input_update", None)
+        if callable(apply_update):
+            for data in scheduler_output.scheduled_new_reqs:
+                payload = getattr(data, "model_intermediate_buffer", None)
+                if payload:
+                    req_idx = self.req_states.req_id_to_index[data.req_id]
+                    apply_update(self.model_state.intermediate_buffer.buffers[req_idx], payload, replace=True)
+
     def shutdown(self) -> None:
         if self._mm_rng_state is not None:
             self._mm_rng_state.clear()
@@ -1300,6 +1308,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         """
         super().update_requests(scheduler_output)
 
+        apply_update = getattr(self.model, "apply_text_input_update", None)
         cached = scheduler_output.scheduled_cached_reqs
         addl_info = getattr(cached, "additional_information", None)
         if not addl_info:
@@ -1312,6 +1321,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 continue
             resolved = _resolve_additional_information(info)
             if resolved:
+                if callable(apply_update):
+                    apply_update(self.model_state.intermediate_buffer.buffers[req_idx], resolved, replace=False)
                 gpu_keys: set[tuple[str, str]] = getattr(self.model, "gpu_resident_buffer_keys", set())
                 self.model_state.intermediate_buffer.update(req_idx, resolved, gpu_keys)
 
@@ -1333,6 +1344,10 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         # because super() calls req_states.remove_request(req_id) which pops the
         # mapping and returns the slot index to free_indices.
         finished = scheduler_output.finished_req_ids
+        # Scheduler decisions the model follows this step, before it frees finished requests' state.
+        on_scheduled = getattr(self.model, "on_scheduler_output", None)
+        if callable(on_scheduled):
+            on_scheduled(scheduler_output)
         if self._mm_rng_state is not None:
             for req_id in finished:
                 self._mm_rng_state.discard(req_id)

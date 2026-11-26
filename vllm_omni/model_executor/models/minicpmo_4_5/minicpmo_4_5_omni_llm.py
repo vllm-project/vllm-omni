@@ -3432,9 +3432,19 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             architectures=[llm_arch],
         )
 
+        self.rope_row_offsets: torch.Tensor | None
+        if (
+            current_omni_platform.is_npu()
+            and (vllm_config.additional_config or {}).get("minicpmo_request_rope") is True
+        ):
+            self._init_request_rope(vllm_config)
+        else:
+            self.rope_row_offsets = None
+
         embed_dim = self.llm.config.hidden_size
 
         # Initialize 3D Resampler
+        self.resampler_max_frames = int((vllm_config.additional_config or {}).get("minicpmo_resampler_max_frames", 0))
         if self.vpm is not None:
             vision_dim = self.vpm.embed_dim
             self.resampler = Resampler(
@@ -3471,6 +3481,40 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         )
         self._audio_encoder_graph = make_encoder_graph(audio_forward, vllm_config)
         self.make_empty_intermediate_tensors = self.llm.make_empty_intermediate_tensors
+
+    def _init_request_rope(self, vllm_config) -> None:
+        from copy import copy
+
+        if self.llm.config.rope_parameters.get("rope_type") != "yarn":
+            raise ValueError("Per-request MiniCPM-o RoPE requires the long-context YaRN configuration")
+        if vllm_config.cache_config.enable_prefix_caching:
+            raise ValueError("Per-request MiniCPM-o RoPE requires prefix caching to be disabled")
+        layers = self.llm.model.layers
+        rotary = layers[0].self_attn.rotary_emb
+        if any(layer.self_attn.rotary_emb is not rotary for layer in layers):
+            raise ValueError("Per-request MiniCPM-o RoPE requires one shared rotary embedding")
+        length = 10240
+        yarn = rotary.cos_sin_cache
+        freq = 1.0 / (
+            rotary.base
+            ** (torch.arange(0, rotary.rotary_dim, 2, dtype=torch.float, device=yarn.device) / rotary.rotary_dim)
+        )
+        phases = torch.einsum("i,j -> ij", torch.arange(length, device=yarn.device, dtype=torch.float), freq)
+        native = torch.cat((phases.cos(), phases.sin()), dim=-1).to(yarn.dtype)
+        rotary = copy(rotary)
+        rotary._buffers = rotary._buffers.copy()
+        # CustomOp dispatch stores a bound method. Rebind it to this model-owned copy.
+        rotary._forward_method = rotary.dispatch_forward(compile_native=False)
+        rotary.cos_sin_cache = torch.cat((native, yarn), dim=0)
+        for layer in layers:
+            layer.self_attn.rotary_emb = rotary
+        self.rope_long_offset = length
+        self.register_buffer(
+            "rope_row_offsets",
+            torch.zeros(vllm_config.scheduler_config.max_num_batched_tokens, device=yarn.device, dtype=torch.int64),
+            persistent=False,
+        )
+        logger.info("MiniCPM-o Thinker request RoPE uses native and YaRN tables")
 
     def get_language_model(self) -> torch.nn.Module:
         return self.llm
@@ -3635,6 +3679,15 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             return vision_embedding
 
         vision_batch_size = max(1, int(self.config.vision_batch_size))
+        if 0 < self.resampler_max_frames < B:
+            chunk_size = min(vision_batch_size, self.resampler_max_frames)
+            outputs = []
+            for start in range(0, B, chunk_size):
+                end = min(start + chunk_size, B)
+                embeddings = encode_vision(start, end)
+                patches = int(num_patches[start:end].max().item())
+                outputs.append(self.resampler(embeddings[:, :patches], tgt_sizes[start:end]))
+            return torch.cat(outputs, dim=0)
         if B <= vision_batch_size:
             return self.resampler(encode_vision(0, B), tgt_sizes)
 
@@ -4057,6 +4110,8 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             inputs_embeds = self.get_input_embeddings(input_ids, multimodal_embeddings)
             input_ids = None
 
+        if self.rope_row_offsets is not None:
+            positions = positions + self.rope_row_offsets[: positions.shape[0]]
         # Forward through language model
         hidden_states = self.llm.model(input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds)
 
