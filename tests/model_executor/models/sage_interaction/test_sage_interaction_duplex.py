@@ -613,21 +613,28 @@ def test_decide_output_does_not_retrigger_delegate_on_following_listen_units() -
             finished=True,
         )
 
-    # 1. Delegate unit emits delegate DIRECT_RESPONSE.
-    out_delegate = _make_output(delegate_unit, delegate_unit, 151718)
+    # Live MRv2 orchestrator passes only the final step's new_token_ids as
+    # segment_token_ids (e.g. (151718,) or (151705,)), while completion.token_ids
+    # and cumulative_token_ids hold the full cumulative sequence across units.
+    # 1. Delegate unit after two prior listens emits delegate DIRECT_RESPONSE.
+    prior_listens = [151705, 151705]
+    cum_delegate = [*prior_listens, *delegate_unit]
+    out_delegate = _make_output(cum_delegate, cum_delegate, 151718)
     dec1 = plugin.decide_output(
         stage_id=0,
         final_stage_id=2,
         segment_finished=True,
-        segment_token_ids=tuple(delegate_unit),
+        segment_token_ids=(151718,),
         segment_output_metadata={"special_token_ids": specials},
         output=out_delegate,
     )
     assert dec1 is not None
+    assert dec1.action == DuplexOutputAction.DIRECT_RESPONSE
     assert dec1.metadata["duplex_native_decision"] == "delegate"
+    assert dec1.metadata["delegate_text"] == '{"query":"weather in Tokyo"}'
 
-    # 2. Listen-only unit after delegate (even when cumulative IDs are passed) must resolve to listen.
-    cum_listen_1 = [*delegate_unit, 151705]
+    # 2. Listen-only unit directly after delegate resolves to listen, never a repeat delegate.
+    cum_listen_1 = [*cum_delegate, 151705]
     for seg_ids in ((151705,), tuple(cum_listen_1)):
         out_listen = _make_output(cum_listen_1, cum_listen_1, 151705)
         dec_listen = plugin.decide_output(
@@ -643,13 +650,13 @@ def test_decide_output_does_not_retrigger_delegate_on_following_listen_units() -
         assert dec_listen.metadata["duplex_native_decision"] == "listen"
 
     # 3. Second consecutive listen-only unit after delegate also stays listen.
-    cum_listen_2 = [*delegate_unit, 151705, 151705]
+    cum_listen_2 = [*cum_delegate, 151705, 151705]
     out_listen_2 = _make_output(cum_listen_2, cum_listen_2, 151705)
     dec_listen_2 = plugin.decide_output(
         stage_id=0,
         final_stage_id=2,
         segment_finished=True,
-        segment_token_ids=tuple(cum_listen_2),
+        segment_token_ids=(151705,),
         segment_output_metadata={"special_token_ids": specials},
         output=out_listen_2,
     )
@@ -659,12 +666,12 @@ def test_decide_output_does_not_retrigger_delegate_on_following_listen_units() -
     # 4. Speak unit after delegate + listens forwards to Talker (returns None).
     speak_unit = [151706, 200, 201, 151718]
     cum_speak = [*cum_listen_2, *speak_unit]
-    out_speak = _make_output(speak_unit, cum_speak, 151718)
+    out_speak = _make_output(cum_speak, cum_speak, 151718)
     dec_speak = plugin.decide_output(
         stage_id=0,
         final_stage_id=2,
         segment_finished=True,
-        segment_token_ids=tuple(speak_unit),
+        segment_token_ids=(151718,),
         segment_output_metadata={"special_token_ids": specials},
         output=out_speak,
     )

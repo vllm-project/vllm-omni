@@ -539,15 +539,18 @@ class SageInteractionDuplexPlugin(MiniCPMO45DuplexPlugin):
             special_token_ids.update(_special_token_ids(output_metadata))
             delegate_id = special_token_ids.get("delegate_token_id")
             if delegate_id is not None:
-                source_ids = (
-                    list(segment_token_ids)
-                    if segment_token_ids
-                    else (
-                        _completion_token_ids(completion)
-                        or _coerce_int_list(getattr(completion, "cumulative_token_ids", None))
-                    )
+                token_ids = _completion_token_ids(completion) or list(segment_token_ids)
+                unit_ids = _current_unit_tokens(
+                    max(
+                        (
+                            token_ids,
+                            _coerce_int_list(getattr(completion, "cumulative_token_ids", None)),
+                            list(segment_token_ids),
+                        ),
+                        key=len,
+                    ),
+                    special_token_ids,
                 )
-                unit_ids = _current_unit_tokens(source_ids, special_token_ids)
                 if delegate_id in unit_ids:
                     delegate_pos = unit_ids.index(delegate_id)
                     terminators = {
