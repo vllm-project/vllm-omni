@@ -22,6 +22,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexOutputAction,
     DuplexOutputDecision,
+    ToolCallAbandonReason,
 )
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError, EncodeAudio
 from vllm_omni.engine.duplex.response_judge import judge_rejects
@@ -168,6 +169,10 @@ class AuraDuplexPlugin(DuplexModelPlugin):
 
     plugin_id = "aura"
     private_runtime_config_keys = _PRIVATE_KEYS
+    # A timed-out call stays in aura_tool_batch until something settles it.
+    # The shared notice is that settlement, so the calls that did return can
+    # still follow up. Cancel and epoch-change keep the default no-op.
+    abandoned_tool_call_reasons = frozenset({ToolCallAbandonReason.TIMEOUT})
     stages: AuraStageLayout = AURA_STAGE_LAYOUT
 
     def __init__(self, encode_audio: EncodeAudio) -> None:

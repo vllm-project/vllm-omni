@@ -12,7 +12,8 @@ from vllm.sampling_params import SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence
-from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError, validate_session_tools
+from vllm_omni.model_executor.models.aura_omni.duplex.capabilities import aura_duplex_capabilities
 from vllm_omni.model_executor.models.aura_omni.duplex.history import (
     drop_session_history,
     get_or_create_session_history,
@@ -460,6 +461,13 @@ def test_plan_append_tool_followup_without_pending_raises() -> None:
             sampling_params=SamplingParams(max_tokens=8),
         )
     drop_session_history("sess-no-pending")
+
+
+def test_session_tools_are_declared() -> None:
+    validate_session_tools(
+        aura_duplex_capabilities(),
+        {"realtime_tools": [{"type": "function", "name": "get_current_time", "parameters": {}}]},
+    )
 
 
 # -- history --
