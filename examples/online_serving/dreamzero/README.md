@@ -4,8 +4,8 @@ DreamZero is the robot-policy serving example for the OpenPI-compatible `/v1/rea
 
 ## Supported checkpoints
 
-| Model           | HuggingFace repo              |
-| --------------- | ----------------------------- |
+| Model | HuggingFace repo |
+|---|---|
 | DreamZero-DROID | `GEAR-Dreams/DreamZero-DROID` |
 
 ## Quick start
@@ -45,7 +45,7 @@ If you run the DROID client on Python < 3.12, also install `typing-extensions`.
 The bundled DreamZero configs intentionally keep only:
 
 | Config | Purpose |
-| --- | --- |
+|---|---|
 | `vllm_omni/deploy/dreamzero.yaml` | Default TP=1, CFG parallel disabled |
 | `vllm_omni/deploy/dreamzero_tp1_cfg2.yaml` | TP=1, CFG parallel size=2 |
 
