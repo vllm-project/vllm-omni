@@ -566,6 +566,19 @@ class DuplexSessionManager:
 
     def sampling_params_for(self, session: DuplexEngineSession) -> tuple[object, ...]:
         defaults = tuple(self.stage_port.sampling_defaults())
+        watermarking = bool(session.config.watermarking)
+        # Asked for on every append: reuse the configured params until the
+        # runtime config generation, watermarking flag, or a stage's default
+        # object (compared by identity, so a replaced stage client counts) changes.
+        cached = session.configured_sampling
+        if (
+            cached is not None
+            and cached[0] == session.config_generation
+            and cached[1] is watermarking
+            and len(cached[2]) == len(defaults)
+            and all(held is default for held, default in zip(cached[2], defaults, strict=True))
+        ):
+            return cached[3]
         configured = self.plugin.configure_sampling_params(
             runtime_config=dict(session.runtime_config),
             defaults=defaults,
@@ -574,8 +587,9 @@ class DuplexSessionManager:
             raise TypeError("duplex plugin must return sampling parameters as a tuple")
         if len(configured) != len(defaults):
             raise ValueError("duplex plugin must return one sampling parameter per stage")
-        if not session.config.watermarking:
+        if not watermarking:
             configured = tuple(disable_watermarking(configured))
+        session.configured_sampling = (session.config_generation, watermarking, defaults, configured)
         return configured
 
     @staticmethod

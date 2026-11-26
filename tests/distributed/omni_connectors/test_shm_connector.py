@@ -86,7 +86,7 @@ class TestKeyBasedReadWrite:
         from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
         # Isolate the publication lock from the host's coordination directory.
-        monkeypatch.setattr(module, "open", lambda path, mode: (tmp_path / "writer.lock").open(mode), raising=False)
+        monkeypatch.setattr(connector, "_lock_file", lambda _name: str(tmp_path / "writer.lock"))
         entered, release = threading.Event(), threading.Event()
         original = os.ftruncate
         opens = mocker.spy(module.shm_pkg, "SharedMemory")
@@ -664,3 +664,36 @@ def test_reaping_keeps_consumed_records_bounded_behind_unread_keys(connector):
         assert not connector._pending_keys
     finally:
         receiver.close()
+
+
+def test_poll_miss_does_not_open_lock_file_or_attach_shared_memory(connector, monkeypatch):
+    """A poll miss is answered by os.access without raising FileNotFoundError."""
+    from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+    def unexpected_open(*args, **kwargs):
+        raise AssertionError("missing key must not open lock file")
+
+    def unexpected_attach(*args, **kwargs):
+        raise AssertionError("missing segment must not be attached")
+
+    monkeypatch.setattr(module, "open", unexpected_open, raising=False)
+    monkeypatch.setattr(module.shm_pkg, "SharedMemory", unexpected_attach)
+    missing_key = f"missing_{uuid.uuid4().hex}"
+    assert connector.get("0", "1", missing_key) is None
+    assert connector.get("0", "1", missing_key, metadata={"shm": {"name": missing_key, "size": 16}}) is None
+
+
+def test_key_read_roundtrip_after_poll_miss(connector):
+    key = f"probe_{uuid.uuid4().hex}"
+    assert connector.get("0", "1", key) is None
+    payload = {"codes": torch.arange(28, dtype=torch.long), "meta": {"chunk_seq": 3}}
+    assert connector.put("0", "1", key, payload)[0]
+
+    result = connector.get("0", "1", key)
+    assert result is not None
+    obj, _ = result
+
+    assert torch.equal(obj["codes"], payload["codes"]) and obj["meta"] == {"chunk_seq": 3}
+    assert connector.get("0", "1", key) is None
+    assert not os.path.exists(f"/dev/shm/{key}")
+    assert not os.path.exists(connector._lock_file(key))

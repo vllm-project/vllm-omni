@@ -22,7 +22,7 @@ import torch
 from pytest_mock import MockerFixture
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput, RequestError, RequestOutput
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
@@ -57,6 +57,7 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     StreamingSegmentState,
     _build_terminal_empty_output,
+    build_engine_core_request_from_tokens,
 )
 from vllm_omni.engine.orchestrator_monitor import OrchestratorMonitorBase
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
@@ -5395,3 +5396,146 @@ async def test_empty_next_input_aborts_only_prewarmed_downstream(prewarmed: bool
     aborted = [index for index, client in enumerate(clients) if client.abort_calls]
     assert aborted == ([0, 1, 4] if prewarmed else [])
     assert clients[2].add_request_calls == []
+
+
+def _audio_pool() -> StagePool:
+    stage = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    return StagePool(
+        0,
+        [stage],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+
+
+def _audio_output(request_id: str, frames: int, *, finished: bool = False, index: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=request_id,
+        outputs=[
+            SimpleNamespace(
+                index=index,
+                finish_reason=FinishReason.STOP if finished else None,
+                multimodal_output={"audio": torch.zeros(frames), "sr": 24000},
+            )
+        ],
+    )
+
+
+async def _submit_audio_request(pool: StagePool, request_id: str, output_kind: RequestOutputKind) -> None:
+    params = SamplingParams(max_tokens=4, output_kind=output_kind)
+    req_state = OrchestratorRequestState(request_id=request_id, sampling_params_list=[params], final_stage_id=0)
+    request = SimpleNamespace(request_id=request_id, prompt_token_ids=[1], sampling_params=params)
+    await pool.submit_initial(request_id, req_state, request)
+
+
+def _audio_metrics(pool: StagePool, output: SimpleNamespace):
+    return pool.build_stage_metrics([output], submit_ts=time.time(), request_timestamp=time.time(), replica_id=0)
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_counts_cumulative_audio_once() -> None:
+    # A CUMULATIVE output carries all of the request's audio so far: 100,
+    # then 250, then 400 frames in total, so 400 frames were generated.
+    pool = _audio_pool()
+    await _submit_audio_request(pool, "req-audio", RequestOutputKind.CUMULATIVE)
+    outputs = [_audio_output("req-audio", 100), _audio_output("req-audio", 250)]
+    final = _audio_output("req-audio", 400, finished=True)
+    for output in (*outputs, final):
+        pool.record_output_timestamps([output], output_ts=time.time())
+
+    metrics = _audio_metrics(pool, final)
+
+    assert metrics.audio_generated_frames == metrics.output_unit_count == 400
+    assert metrics.audio_sample_rate == 24000
+    assert metrics.audio_duration_s == pytest.approx(400 / 24000)
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_reports_cumulative_audio_per_segment() -> None:
+    # A resumable request reports once per segment and consumers sum the
+    # events, so each event carries only the frames of its own segment.
+    pool = _audio_pool()
+    await _submit_audio_request(pool, "req-seg", RequestOutputKind.CUMULATIVE)
+    per_event = []
+    for total in (100, 250, 400):
+        output = _audio_output("req-seg", total, finished=True)
+        pool.record_output_timestamps([output], output_ts=time.time())
+        per_event.append(_audio_metrics(pool, output))
+
+    assert [metrics.audio_generated_frames for metrics in per_event] == [100, 150, 150]
+    # An audio event's units are the frames it reports.
+    assert [(metrics.output_unit_type, metrics.output_unit_count) for metrics in per_event] == [
+        ("audio", 100),
+        ("audio", 150),
+        ("audio", 150),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_sums_delta_audio_chunks() -> None:
+    # DELTA outputs carry only their own frames; the count is their sum.
+    pool = _audio_pool()
+    await _submit_audio_request(pool, "req-delta", RequestOutputKind.DELTA)
+    chunks = [_audio_output("req-delta", 100), _audio_output("req-delta", 150)]
+    final = _audio_output("req-delta", 150, finished=True)
+    for output in (*chunks, final):
+        pool.record_output_timestamps([output], output_ts=time.time())
+
+    # The final DELTA output alone holds only the last chunk.
+    metrics = _audio_metrics(pool, final)
+    assert metrics.audio_generated_frames == metrics.output_unit_count == 400
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_counts_cumulative_audio_across_parallel_samples() -> None:
+    # For n > 1 CUMULATIVE requests, ParentRequest.get_outputs emits each child
+    # completion under the shared parent request_id with its own completion index.
+    # Each child's cumulative audio must be tracked separately and summed.
+    pool = _audio_pool()
+    await _submit_audio_request(pool, "req-parallel", RequestOutputKind.CUMULATIVE)
+    child0_mid = _audio_output("req-parallel", 60, index=0)
+    child1_mid = _audio_output("req-parallel", 80, index=1)
+    child0_done = _audio_output("req-parallel", 100, finished=True, index=0)
+    child1_done = _audio_output("req-parallel", 150, finished=True, index=1)
+    for output in (child0_mid, child1_mid, child0_done, child1_done):
+        pool.record_output_timestamps([output], output_ts=time.time())
+
+    metrics = _audio_metrics(pool, child1_done)
+    assert metrics.audio_generated_frames == metrics.output_unit_count == 250
+    assert metrics.audio_sample_rate == 24000
+    assert metrics.audio_duration_s == pytest.approx(250 / 24000)
+
+
+def test_build_engine_core_request_from_tokens_preserves_caller_params() -> None:
+    params = SamplingParams(max_tokens=10, min_tokens=2, temperature=0.7)
+    model_config = SimpleNamespace(max_model_len=100)
+    prompt = {"prompt_token_ids": [1, 2, 3]}
+
+    req1 = build_engine_core_request_from_tokens("req-1", prompt, params, model_config=model_config)
+    req2 = build_engine_core_request_from_tokens("req-2", prompt, params, model_config=model_config)
+
+    # When no clamping is required, params can be aliased and remain unmutated.
+    assert req1.sampling_params is params
+    assert req2.sampling_params is params
+    assert params.max_tokens == 10
+    assert params.min_tokens == 2
+    assert params.temperature == 0.7
+
+    # Clamping min_tokens creates a clone and does not mutate caller's params.
+    tight_config = SimpleNamespace(max_model_len=4)
+    req3 = build_engine_core_request_from_tokens("req-3", prompt, params, model_config=tight_config)
+    assert req3.sampling_params is not params
+    assert req3.sampling_params.max_tokens == 10
+    assert req3.sampling_params.min_tokens == 1
+    assert params.max_tokens == 10
+    assert params.min_tokens == 2
+
+    # Defaulting max_tokens=None also clones and leaves caller's params untouched.
+    unbounded = SamplingParams(min_tokens=0, temperature=0.7)
+    unbounded.max_tokens = None
+    req4 = build_engine_core_request_from_tokens(
+        "req-4", prompt, unbounded, model_config=SimpleNamespace(max_model_len=5)
+    )
+    assert req4.sampling_params is not unbounded
+    assert req4.sampling_params.max_tokens == 2
+    assert unbounded.max_tokens is None

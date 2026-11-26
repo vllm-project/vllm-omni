@@ -428,57 +428,68 @@ class ModelChannel:
             )
             # View policy is deployment-owned; request runtime config below
             # contains the plugin's per-request state (for example tool turns).
-            view_policy = self._ctx.plugin.context_view_policy(
-                stage_id=stage_id, runtime_config=self._ctx.manager.runtime_config
-            )
-            if view_policy is None and not self._ctx.plugin.uses_history_context:
-                history, item_ids = session.history_for_prompt()
-                snapshot = None
+            plans_from_session_config = getattr(self._ctx.plugin, "plans_from_session_config", True)
+            uses_history_context = getattr(self._ctx.plugin, "uses_history_context", False)
+            if plans_from_session_config or uses_history_context:
+                view_policy = self._ctx.plugin.context_view_policy(
+                    stage_id=stage_id, runtime_config=self._ctx.manager.runtime_config
+                )
+                if view_policy is None and not uses_history_context:
+                    history, item_ids = session.history_for_prompt()
+                    snapshot = None
+                else:
+                    snapshot = session.history_snapshot()
+                    history, item_ids = session.history, snapshot.item_ids
+                if uses_history_context:
+                    assert snapshot is not None
+                    session.context_ledger.refresh(snapshot)
+                    self._ctx.plugin.bind_history_context(
+                        state=self._ctx.model_state, snapshot=snapshot, ledger=session.context_ledger
+                    )
+                if plans_from_session_config:
+                    user_item_ids = tuple(
+                        item_id
+                        for item_id, message in zip(item_ids, history)
+                        if item_id is not None and message.get("role") == "user"
+                    )
+                    prompt_session = {
+                        **request_context.session_config,
+                        # Keep the prompt accessor's nested content identity: Qwen
+                        # binds retained PCM to those containers. History and IDs
+                        # are captured synchronously on the owner loop.
+                        # Consumers must treat shared nested containers and payloads
+                        # as read-only; only the session writes authoritative history.
+                        "conversation": list(history),
+                        "conversation_item_ids": item_ids,
+                        # Public IDs can be reused; source IDs survive transcript
+                        # updates but change when an item is deleted and recreated.
+                        "conversation_user_source_ids": dict(
+                            zip(user_item_ids, session.user_source_ids_for_items(user_item_ids))
+                        ),
+                        "modalities": list(session.response_config.resolved_modalities),
+                    }
+                    prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
+                    prompt_session["stage_sampling_params"] = request_context.sampling_params
+                    if view_policy is not None:
+                        assert snapshot is not None
+                        prompt_session["conversation_view"] = list(
+                            session.render_history_view(view_policy, snapshot=snapshot).messages
+                        )
+                    prepared_session_config = self._ctx.plugin.prepare_prompt_config(
+                        prompt_session,
+                        state=self._ctx.model_state,
+                        payload=prompt_payload,
+                    )
+                else:
+                    prepared_session_config = {}
             else:
-                snapshot = session.history_snapshot()
-                history, item_ids = session.history, snapshot.item_ids
-            user_item_ids = tuple(
-                item_id
-                for item_id, message in zip(item_ids, history)
-                if item_id is not None and message.get("role") == "user"
-            )
-            prompt_session = {
-                **request_context.session_config,
-                # Keep the prompt accessor's nested content identity: Qwen
-                # binds retained PCM to those containers. History and IDs
-                # are captured synchronously on the owner loop.
-                # Consumers must treat shared nested containers and payloads
-                # as read-only; only the session writes authoritative history.
-                "conversation": list(history),
-                "conversation_item_ids": item_ids,
-                # Public IDs can be reused; source IDs survive transcript
-                # updates but change when an item is deleted and recreated.
-                "conversation_user_source_ids": dict(
-                    zip(user_item_ids, session.user_source_ids_for_items(user_item_ids))
-                ),
-                "modalities": list(session.response_config.resolved_modalities),
-            }
-            prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
-            prompt_session["stage_sampling_params"] = request_context.sampling_params
-            if view_policy is not None:
-                assert snapshot is not None
-                prompt_session["conversation_view"] = list(
-                    session.render_history_view(view_policy, snapshot=snapshot).messages
-                )
-            if self._ctx.plugin.uses_history_context:
-                assert snapshot is not None
-                session.context_ledger.refresh(snapshot)
-                self._ctx.plugin.bind_history_context(
-                    state=self._ctx.model_state, snapshot=snapshot, ledger=session.context_ledger
-                )
+                # The history copy grows with the conversation: skip it for a
+                # plugin that reads neither session_config nor history context.
+                prepared_session_config = {}
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
                 fence=fence,
-                session_config=self._ctx.plugin.prepare_prompt_config(
-                    prompt_session,
-                    state=self._ctx.model_state,
-                    payload=prompt_payload,
-                ),
+                session_config=prepared_session_config,
                 runtime_config=dict(request_context.runtime_config),
                 seq=reservation.update.seq,
                 turn_seq=reservation.update.turn_seq,
@@ -739,12 +750,18 @@ class ModelChannel:
         if not isinstance(metrics, StageRequestStats):
             return None
         event = metrics
-        if event.stage_id is None:
-            event = replace(event, stage_id=stage_id)
-        if event.final_output_type is None:
-            final_output_type = getattr(output, "final_output_type", None)
-            if isinstance(final_output_type, str):
-                event = replace(event, final_output_type=final_output_type)
+        final_output_type = event.final_output_type
+        if final_output_type is None:
+            output_type = getattr(output, "final_output_type", None)
+            if isinstance(output_type, str):
+                final_output_type = output_type
+        if event.stage_id is None or final_output_type is not event.final_output_type:
+            # One shallow copy (what ``dataclasses.replace`` made, twice): the
+            # orchestrator still owns *metrics*.
+            event = copy.copy(event)
+            if event.stage_id is None:
+                event.stage_id = stage_id
+            event.final_output_type = final_output_type
         self._ctx.session.observe_stage_request_stats(stage_id, event)
         try:
             merged = OrchestratorAggregator._merge_stage_metric_event(None, event)
@@ -1604,7 +1621,7 @@ class ModelChannel:
         previous_sent_ms = session.playback_for_response(target_id).sent_ms
         # Transcript lengths only align text with audio; a text-only reply has none.
         emits_audio = session.capabilities.emits_audio
-        text_chars_before_append = len(session.assistant_transcript(target_id)) if emits_audio else 0
+        text_chars_before_append = session.assistant_transcript_chars(target_id) if emits_audio else 0
         if isinstance(text, str) and text:
             if target_id is not None:
                 session.append_draining_assistant_text(target_id, text)
@@ -1612,7 +1629,7 @@ class ModelChannel:
                 session.append_assistant_text(text)
         duration_ms = model_result.get("audio_duration_ms")
         mark_duration_ms = None
-        mark_text_chars: int | None = len(session.assistant_transcript(target_id)) if emits_audio else None
+        mark_text_chars: int | None = session.assistant_transcript_chars(target_id) if emits_audio else None
         if model_result.get("audio_text_mark") is False:
             mark_text_chars = None
         if isinstance(duration_ms, int | float):

@@ -94,6 +94,9 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
     #: One codec frame: the runner keeps a model turn clocked with these when the client pauses.
     silence_continuation_samples = FRAME_SIZE
     silence_continuation_sample_rate_hz = SAMPLE_RATE
+    # The Stage 0 worker reads the voice/persona from the runtime config and
+    # never the session config, so no append builds or ships one.
+    plans_from_session_config = False
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
