@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """IndexTTS2 Stage 1: S2Mel decoder + BigVGAN vocoder.
 
 Receives mel_codes + latent from Stage 0 (GPT AR talker), runs flow matching
@@ -25,6 +25,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.model_loader.hub_prefetch import _repo_prefetch_lock
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 from .configuration_indextts2 import (
     INDEXTTS25_MAX_DURATION_FACTOR,
@@ -220,6 +221,11 @@ class IndexTTS2S2MelDecoder(nn.Module):
             use_gpt_latent=self.use_gpt_latent,
         )
 
+        # The rate the S2Mel stage's BigVGAN vocoder emits at, resolved from
+        # the checkpoint config (``s2mel.preprocess_params.sr``) rather than
+        # hardcoded per emission site.
+        self._sample_rate = int(self.config.output_sample_rate)
+
         # Diffusion config — configurable via deploy YAML hf_overrides
         self.diffusion_steps: int = getattr(self.config, "diffusion_steps", 25)
         self.inference_cfg_rate: float = getattr(self.config, "inference_cfg_rate", 0.7)
@@ -365,7 +371,10 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 # inputs and no upstream payload during engine initialization.
                 return OmniOutput(
                     text_hidden_states=torch.zeros(1, device=device),
-                    multimodal_outputs={"audio": torch.zeros(1, device=device), "sr": 22050},
+                    multimodal_outputs={
+                        "audio": torch.zeros(1, device=device),
+                        SAMPLE_RATE_KEY: make_sample_rate_tensors(self._sample_rate),
+                    },
                 )
             raise ValueError("S2Mel decoder requires mel_codes" + (" and latent" if self.use_gpt_latent else ""))
 
@@ -628,7 +637,12 @@ class IndexTTS2S2MelDecoder(nn.Module):
             text_hidden_states=None,
             multimodal_outputs={
                 "audio": audio_cpu,
-                "sr": torch.tensor(22050, dtype=torch.int32),
+                # One 0-d rate tensor per decoded waveform, matching the
+                # per-request audio list above (the warmup path used to emit
+                # a plain int here — the two sites disagreed in type).
+                SAMPLE_RATE_KEY: make_sample_rate_tensors(
+                    self._sample_rate, len(audio_cpu) if isinstance(audio_cpu, list) else 1
+                ),
             },
         )
 

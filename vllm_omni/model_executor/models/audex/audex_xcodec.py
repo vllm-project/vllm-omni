@@ -28,6 +28,7 @@ from vllm_omni.model_executor.models.audex.tta import (
     XCODEC1_NUM_CODEBOOKS,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 logger = init_logger(__name__)
 
@@ -160,7 +161,6 @@ class AudexXCodec1(nn.Module):
             num_reqs = len(runtime_infos)
 
         audios: list[torch.Tensor] = []
-        sr_tensor = torch.tensor(self._sample_rate, dtype=torch.int32)
         for i in range(num_reqs):
             info = runtime_infos[i] if i < len(runtime_infos) else {}
             info = info if isinstance(info, dict) else {}
@@ -175,5 +175,8 @@ class AudexXCodec1(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": [sr_tensor] * num_reqs},
+            multimodal_outputs={
+                "model_outputs": audios,
+                SAMPLE_RATE_KEY: make_sample_rate_tensors(self._sample_rate, num_reqs),
+            },
         )

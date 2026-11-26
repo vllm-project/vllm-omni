@@ -28,6 +28,7 @@ from vllm.logger import init_logger
 from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_vae_codec import CausalConv1dCache
 from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import scalar_bool
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 logger = init_logger(__name__)
 
@@ -191,13 +192,12 @@ class NemotronVoiceChatCode2Wav(nn.Module):
         request_ids: list[str] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        sr_tensor = torch.tensor(self._sample_rate, dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32)
 
         infos = runtime_additional_information or []
         num_req = max(len(infos), 1)
         audios: list[torch.Tensor] = [empty] * num_req
-        srs = [sr_tensor] * num_req
+        srs = make_sample_rate_tensors(self._sample_rate, num_req)
 
         if self.audio_codec is None:
             raise RuntimeError("NemotronVoiceChatCode2Wav.forward called before load_weights().")
@@ -318,7 +318,7 @@ class NemotronVoiceChatCode2Wav(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs},
+            multimodal_outputs={"model_outputs": audios, SAMPLE_RATE_KEY: srs},
         )
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
