@@ -108,6 +108,9 @@ class FakePrewarmPool:
     stage_type = "llm"
     get_payload_sender_info = StagePool.get_payload_sender_info
 
+    def select_code2wav_replica(self, request_id: str) -> int | None:
+        return None
+
     def __init__(self, role: str) -> None:
         self.stage_client = SimpleNamespace(get_payload_sender_info=lambda: None)
         self._stage_payloads: dict[str, bytes] = {}

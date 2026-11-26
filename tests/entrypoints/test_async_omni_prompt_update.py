@@ -211,7 +211,6 @@ async def test_submit_interaction_async_forwards_unsupported_dict_shape_to_engin
 def _make_rejection_omni(mocker, messages: list) -> tuple[AsyncOmni, ClientRequestState, list[str]]:
     """AsyncOmni whose output loop reads ``messages`` once and records RPC/callback order."""
     omni = object.__new__(AsyncOmni)
-    omni.final_output_task = None
     req_state = ClientRequestState(request_id="req-uuid", external_request_id="req")
     omni.request_states = {"req-uuid": req_state}
     order: list[str] = []
@@ -227,7 +226,9 @@ def _make_rejection_omni(mocker, messages: list) -> tuple[AsyncOmni, ClientReque
         order.append(f"rpc:{method}:{args}")
         return [None]
 
-    omni.engine = SimpleNamespace(get_outputs_async=get_outputs_async)  # pyright: ignore[reportAttributeAccessIssue]
+    omni.engine = mocker.Mock(get_outputs_async=get_outputs_async)
+    omni._initialize_async_frontend()
+    omni._pause_cond = asyncio.Condition()
     mocker.patch.object(omni, "_engine_core_rpc", side_effect=engine_core_rpc)
     return omni, req_state, order
 
@@ -385,10 +386,8 @@ async def test_drain_cancels_callbacks_added_while_it_waits(monkeypatch) -> None
 
 @pytest.mark.asyncio
 async def test_shutdown_cancels_pending_rejection_callbacks(mocker) -> None:
-    omni = object.__new__(AsyncOmni)
-    omni.final_output_task = None
-    req_state = ClientRequestState(request_id="req-uuid")
-    omni.request_states = {"req-uuid": req_state}
+    omni, req_state, _ = _make_rejection_omni(mocker, [])
+    omni._final_output_handler()
     task = asyncio.ensure_future(asyncio.Event().wait())
     req_state.interaction_error_tasks.add(task)
     mocker.patch("vllm_omni.entrypoints.async_omni_base.OmniBase.shutdown")

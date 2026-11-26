@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
+import numpy as np
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from vllm.config.compilation import CUDAGraphMode
@@ -18,6 +19,7 @@ from vllm.forward_context import (
     set_forward_context,
 )
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, set_dummy_context
@@ -137,6 +139,19 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         self._exclude_full_graph = (self._model_has_structured_output and not self._full_graph_aux_outputs) or hasattr(
             self.model, "_last_captured_layers"
         )
+
+    def _shares_drafter_aux_output(self) -> bool:
+        return (
+            self.use_aux_hidden_state_outputs
+            and getattr(self.model, "supports_speculative_payload", False) is True
+            and callable(getattr(self.model, "extract_aux_hidden_states", None))
+        )
+
+    def _shared_drafter_aux(self, hidden_states, payload):
+        _, layers = self.model.extract_aux_hidden_states(
+            OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=payload)
+        )
+        return layers
 
     def _aux_hidden_state_contract_conflicts(self) -> bool:
         """Whether a target-hidden-layer drafter conflicts with the model output.
@@ -309,6 +324,14 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         with self._staged_writes.deferred() if static_staged_writes else nullcontext():
             super().add_requests(scheduler_output)
 
+        apply_update = getattr(self.model, "apply_text_input_update", None)
+        if callable(apply_update):
+            for data in scheduler_output.scheduled_new_reqs:
+                payload = getattr(data, "model_intermediate_buffer", None)
+                if payload:
+                    req_idx = self.req_states.req_id_to_index[data.req_id]
+                    apply_update(self.model_state.intermediate_buffer.buffers[req_idx], payload, replace=True)
+
     def shutdown(self) -> None:
         if self._mm_rng_state is not None:
             self._mm_rng_state.clear()
@@ -335,6 +358,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         plane = getattr(self, "_omni_data_plane", None)
         if plane is None:
             return
+        commits = getattr(scheduler_output, "chunk_commits", ())
+        if commits:
+            plane.commit_resumable_outputs(commits)
+        receivers = getattr(scheduler_output, "resume_chunk_receivers", ())
+        if receivers:
+            plane.resume_chunk_receivers(receivers)
         for request_data in getattr(scheduler_output, "scheduled_new_reqs", []):
             if is_warmup_request(request_data.req_id):
                 continue
@@ -342,7 +371,10 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         plane.register_receivers(list(getattr(scheduler_output, "pending_input_registrations", [])))
         if not getattr(self.model_config, "async_chunk", False):
             plane.recv_full_payload_inputs(scheduler_output)
-        natural_terminal_req_ids = set(getattr(scheduler_output, "data_plane_terminal_req_ids", set()))
+        discarded_req_ids = set(getattr(scheduler_output, "discarded_req_ids", set()) or ())
+        natural_terminal_req_ids = set(getattr(scheduler_output, "data_plane_terminal_req_ids", set())).difference(
+            discarded_req_ids
+        )
         aborted_req_ids = set(getattr(scheduler_output, "finished_req_ids", set())).difference(natural_terminal_req_ids)
         if natural_terminal_req_ids:
             plane.request_terminal(natural_terminal_req_ids)
@@ -453,7 +485,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         self._last_aux_output = None
         self._last_multimodal_outputs = None
         self._configure_cudagraph_output_contract()
-        if self._aux_hidden_state_contract_conflicts():
+        if self._aux_hidden_state_contract_conflicts() and not self._shares_drafter_aux_output():
             # Both would use the forward's tuple output slot.
             raise NotImplementedError(
                 f"{type(self.model).__name__} returns its own auxiliary output; a drafter that "
@@ -760,11 +792,40 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         supports_multi_frame_decode(self.model, mrv2=frames > 1)
         return frames
 
+    def _prompt_logits_fn(self) -> Any:
+        """Resolve stateless logits for prompt chunks and sampler warmup."""
+        prompt_logits_fn = getattr(self.model, "compute_prompt_logits", None)
+        return prompt_logits_fn if callable(prompt_logits_fn) else self.model.compute_logits
+
+    @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: Any) -> Any:
-        """The Talker's two control logits cannot satisfy profiling's top-k request."""
+        """Warm the sampler without consuming request-local model state."""
         if self._kstep_frames > 1:
             return None
-        return super()._dummy_sampler_run(hidden_states)
+        prompt_logits_fn = getattr(self.model, "compute_prompt_logits", None)
+        if not callable(prompt_logits_fn):
+            return super()._dummy_sampler_run(hidden_states)
+
+        assert self.sampler is not None
+        if self.model_state.dummy_sampler_run(self.sampler, hidden_states):
+            return None
+
+        num_reqs = hidden_states.shape[0]
+        logits = prompt_logits_fn(hidden_states)
+        dummy_input_batch = InputBatch.make_dummy(num_reqs, num_reqs, self.input_buffers)
+
+        # Mirror vLLM 0.34's default sampler profiling passes. Only the logits
+        # projection differs: dummy rows have no request-local sampling state.
+        self.sampler(logits, dummy_input_batch)
+        if current_omni_platform.is_cpu():
+            return None
+
+        warmup_params = SamplingParams.for_sampler_warmup()
+        for req_idx in range(num_reqs):
+            self.sampler.add_request(req_idx, warmup_params)
+        self.sampler.apply_staged_writes()
+        self.sampler(logits, dummy_input_batch)
+        return None
 
     def _build_kstep_model_kwargs_extra(self, model_inputs: dict[str, Any], input_batch: InputBatch) -> dict[str, Any]:
         """Build per-request spans and codec state for the multi-frame loop."""
@@ -853,6 +914,16 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             )
         finally:
             narrow.restore()
+
+    def _set_lora_inputs(self, input_batch: InputBatch) -> None:
+        """Activate the step's adapters: one adapter id per scheduled token and one per logits row."""
+        lora_inputs = self.lora_state.make_lora_inputs(
+            input_batch.req_ids,
+            input_batch.idx_mapping_np,
+            input_batch.num_scheduled_tokens,
+            np.diff(input_batch.cu_num_logits_np),
+        )
+        self._set_active_loras(*lora_inputs)
 
     @torch.inference_mode()
     @staged_writes.runner_context
@@ -976,12 +1047,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             )
 
             if self.lora_config:
-                lora_inputs = self.lora_state.make_lora_inputs(
-                    input_batch.req_ids,
-                    input_batch.idx_mapping_np,
-                    input_batch.num_scheduled_tokens,
-                )
-                self._set_active_loras(*lora_inputs)
+                self._set_lora_inputs(input_batch)
             # Encode vision and audio before language-model attention metadata.
             # A long video's ViT FlashAttention workspace and the prefill's FA3
             # scheduler workspace do not fit together; V1 runs the encoder first.
@@ -1114,9 +1180,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     self._last_multimodal_outputs = cast(dict[str, Any], stepped.multimodal_outputs)
             else:
                 replayed = self.cudagraph_manager.run_fullgraph(batch_desc)
-                if self.use_aux_hidden_state_outputs:
+                shared_aux = self._shares_drafter_aux_output()
+                if self.use_aux_hidden_state_outputs and not shared_aux:
                     replayed, draft_aux_hidden_states = replayed
                 hidden_states, self._last_aux_output = self._split_fullgraph_output(replayed)
+                if shared_aux:
+                    draft_aux_hidden_states = self._shared_drafter_aux(hidden_states, self._last_aux_output)
                 if hasattr(self.model, "_last_captured_layers"):
                     self.model._last_captured_layers = self._last_aux_output
         else:
@@ -1166,7 +1235,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             # Extract hidden_states from model output.
             self._last_aux_output = None
             self._last_multimodal_outputs = None
-            if self.use_aux_hidden_state_outputs:
+            shared_aux = self._shares_drafter_aux_output()
+            if self.use_aux_hidden_state_outputs and not shared_aux:
                 model_output, draft_aux_hidden_states = model_output
             if isinstance(model_output, OmniOutput):
                 hidden_states = model_output.text_hidden_states
@@ -1178,6 +1248,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     self.model._last_captured_layers = self._last_aux_output
             else:
                 hidden_states = model_output
+            if shared_aux:
+                payload = self._last_multimodal_outputs or self._last_aux_output
+                draft_aux_hidden_states = self._shared_drafter_aux(hidden_states, payload)
         if kstep_extra and kstep_frames == 0 and isinstance(hidden_states, torch.Tensor):
             kstep_extra["request_sample_eligible"] = [
                 int(input_batch.num_computed_prefill_tokens_np[i]) + int(input_batch.num_scheduled_tokens[i])
@@ -1235,6 +1308,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         """
         super().update_requests(scheduler_output)
 
+        apply_update = getattr(self.model, "apply_text_input_update", None)
         cached = scheduler_output.scheduled_cached_reqs
         addl_info = getattr(cached, "additional_information", None)
         if not addl_info:
@@ -1247,6 +1321,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 continue
             resolved = _resolve_additional_information(info)
             if resolved:
+                if callable(apply_update):
+                    apply_update(self.model_state.intermediate_buffer.buffers[req_idx], resolved, replace=False)
                 gpu_keys: set[tuple[str, str]] = getattr(self.model, "gpu_resident_buffer_keys", set())
                 self.model_state.intermediate_buffer.update(req_idx, resolved, gpu_keys)
 
@@ -1255,6 +1331,15 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     # ------------------------------------------------------------------
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
+        lifecycle_hook = getattr(type(self.model_state), "get_request_lifecycle", None)
+        lifecycle = lifecycle_hook(self.model_state, scheduler_output) if lifecycle_hook is not None else None
+        if lifecycle is not None and lifecycle.reset_req_ids:
+            # Keep scheduler-owned completion metadata unchanged. Only the
+            # worker resets the old phase before add_requests admits its reuse.
+            scheduler_output = replace(
+                scheduler_output,
+                finished_req_ids=scheduler_output.finished_req_ids | lifecycle.reset_req_ids,
+            )
         # IMPORTANT: Must query req_id_to_index BEFORE super().finish_requests()
         # because super() calls req_states.remove_request(req_id) which pops the
         # mapping and returns the slot index to free_indices.
@@ -1283,3 +1368,6 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             if idx is not None:
                 self.model_state.remove_request(idx)
         super().finish_requests(scheduler_output)
+        if lifecycle is not None:
+            for req_id in sorted(lifecycle.release_req_ids - all_done):
+                self._remove_request(req_id)

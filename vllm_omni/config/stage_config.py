@@ -31,6 +31,7 @@ logger = init_logger(__name__)
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
+SERVE_CLI_SCOPE_KEY = "_scope_serve_stage_flags"
 
 _RUNTIME_ONLY_OVERRIDE_FIELDS = frozenset(
     {
@@ -120,6 +121,7 @@ def build_stage_runtime_overrides(
     cli_overrides: dict[str, Any],
     *,
     internal_keys: set[str] | frozenset[str] | None = None,
+    warn_dropped: bool = True,
 ) -> dict[str, Any]:
     """Build per-stage runtime overrides from global and ``stage_<id>_*`` kwargs.
 
@@ -131,6 +133,7 @@ def build_stage_runtime_overrides(
     uniformly for every stage, they are not per-stage knobs. Callers can
     pass an explicit set for tests or specialized flows.
     """
+    stage_internal_keys: set[str] | frozenset[str]
     if internal_keys is None:
         from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
@@ -140,6 +143,11 @@ def build_stage_runtime_overrides(
         # allowing any field explicitly represented by the deploy schema to
         # continue flowing into per-stage overrides.
         internal_keys = (internal_blacklist_keys() | SHARED_FIELDS) - deploy_runtime_override_keys()
+        # The top-level object belongs to the orchestrator, but a nested
+        # per-stage parallel config is consumed by the stage builder.
+        stage_internal_keys = internal_keys - {"parallel_config"}
+    else:
+        stage_internal_keys = internal_keys
 
     result: dict[str, Any] = {}
     stage_overrides: dict[str, Any] = {}
@@ -152,8 +160,15 @@ def build_stage_runtime_overrides(
         if match is not None:
             override_stage_id = int(match.group(1))
             param_name = match.group(2)
-            if override_stage_id == stage_id and param_name not in internal_keys:
-                stage_overrides[param_name] = value
+            if override_stage_id == stage_id:
+                if param_name not in stage_internal_keys:
+                    stage_overrides[param_name] = value
+                elif warn_dropped:
+                    logger.warning(
+                        "Ignoring --stage-overrides[%s].%s: this field is not a per-stage override.",
+                        stage_id,
+                        param_name,
+                    )
             continue
 
         result[key] = value
@@ -169,6 +184,7 @@ def normalize_pipeline_cli_overrides(
 ) -> dict[str, Any]:
     """Translate pipeline-owned global CLI aliases into stage-scoped overrides."""
     normalized = dict(cli_overrides)
+    selected_stage_id = normalized.get("stage_id") if normalized.get(SERVE_CLI_SCOPE_KEY) else None
     for source, (stage_id, target) in pipeline.stage_cli_aliases.items():
         invalid_stage_keys = [
             key
@@ -187,6 +203,12 @@ def normalize_pipeline_cli_overrides(
         value = normalized.pop(source, None)
         if value is None:
             continue
+        if isinstance(selected_stage_id, int) and selected_stage_id >= 0 and selected_stage_id != stage_id:
+            flag = "--" + source.replace("_", "-")
+            raise ValueError(
+                f"{flag} is not used by stage {selected_stage_id} of pipeline {pipeline.model_type!r}; "
+                f"use it on stage {stage_id}, or set {target} in that stage's deploy YAML or --stage-overrides."
+            )
         stage_key = f"stage_{stage_id}_{target}"
         stage_value = normalized.get(stage_key)
         if stage_value is not None and stage_value != value:
@@ -632,6 +654,7 @@ class StageDeployConfig:
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
     ulysses_a2a_permute: bool | None = None
+    ulysses_overlap_chunks: int | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     sequence_parallel_size: int | None = None
@@ -640,6 +663,7 @@ class StageDeployConfig:
     vae_parallel_mode: str | None = None
     text_encoder_tp_size: int | None = None
     use_hsdp: bool | None = None
+    hsdp_data_parallel: bool | None = None
     hsdp_shard_size: int | None = None
     hsdp_replicate_size: int | None = None
 
@@ -678,6 +702,7 @@ class StageDeployConfig:
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
+    vae_stack_tiles: bool | None = None
     vae_fast_path: str | None = None
     vae_encode_fast_path: str | None = None
     boundary_ratio: float | None = None
@@ -693,6 +718,7 @@ class StageDeployConfig:
     num_weight_load_threads: int | None = None
     diffusion_offload_config: dict[str, Any] | None = None
     kv_offload_config: dict[str, Any] | None = None
+    kv_isolate: bool | None = None
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool | None = None
@@ -952,6 +978,23 @@ _STAGE_RESERVED_KEYS = frozenset(
     }
 )
 
+# These fields need a deploy-config route. They do not have a supported
+# --stage-overrides route. Keep env and default_sampling_params out: env has a
+# runtime owner, and default_sampling_params is valid for generic diffusion.
+NON_STAGE_OVERRIDE_FIELDS = frozenset(
+    {
+        "session_mode",
+        "connectors",
+        "edges",
+        "stages",
+        "platforms",
+        "pipeline",
+        "duplex_session",
+        "input_connectors",
+        "output_connectors",
+    }
+)
+
 # Pipeline-wide DeployConfig fields that are propagated to every stage's
 # engine args during merge. These live at top level of the deploy YAML.
 PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
@@ -967,8 +1010,6 @@ PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "custom_voice_dir",
     "weight_transfer_config",
 )
-
-
 # Fields on StageDeployConfig that are populated from engine_args dict
 _STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_RESERVED_KEYS}
 

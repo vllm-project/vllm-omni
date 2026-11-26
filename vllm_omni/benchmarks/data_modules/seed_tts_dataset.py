@@ -31,7 +31,30 @@ from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.hf import get_cached_tokenizer
 
+from vllm_omni.benchmarks.data_modules import DatasetSource
+
 logger = logging.getLogger(__name__)
+
+
+def prepare_seed_tts_inputs(source: DatasetSource, count: int, work: Path) -> dict[str, str]:
+    """Keep the exact requested source prefix even when a row is invalid."""
+    locale = Path(source.manifest).parent
+    root = source.resolve([f"{locale}/**"])
+    lines = [
+        line for line in (root / source.manifest).read_text().splitlines() if line.strip() and not line.startswith("#")
+    ]
+    if len(lines) != source.count:
+        raise ValueError("Pinned Seed-TTS utterance count changed")
+    if not 0 < count <= source.count:
+        raise ValueError("Request count exceeds the pinned dataset")
+    target = work / locale
+    target.mkdir(parents=True)
+    for child in (root / locale).iterdir():
+        if child.name != Path(source.manifest).name:
+            (target / child.name).symlink_to(child.resolve(), target_is_directory=child.is_dir())
+    (work / source.manifest).write_text("\n".join(lines[:count]) + "\n", encoding="utf-8")
+    return {"dataset_path": str(work), "seed_tts_root": str(work), "seed_tts_locale": str(locale)}
+
 
 # Keep the Qwen3-Omni identity prefix, but distinguish reading from conversation:
 # Seed-TTS contains questions and instructions that must be spoken, not answered.

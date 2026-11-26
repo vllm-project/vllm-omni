@@ -65,8 +65,9 @@ parent produced, so the kernel's choice -- not this module's -- is the one the
 chunk arithmetic uses.
 
 The arithmetic it delegates to is CPU-covered by
-``tests/model_executor/models/minicpmo_4_5/duplex/test_window_plan.py``, which
-also checks the RoPE identity behind :func:`rotate_cached_keys` numerically.
+``tests/model_executor/models/minicpmo_4_5/duplex/test_window_plan.py``. The
+neighboring ``test_window_wiring.py`` checks :func:`rotate_cached_keys`
+against attention and BF16 rotation references.
 ``tests/worker_v2/test_minicpmo_duplex_block_table.py`` exercises MRv2's actual
 GPU block-table gather across the allocation bound and after compaction. The
 spec disables ordinary sliding-window masking: that bound sizes admission,
@@ -672,6 +673,21 @@ class MiniCPMO45DuplexSchedulerHelper:
         duplex_mgr = cls.find_duplex_window_manager(scheduler)
         if duplex_mgr is None:
             return None
+
+        coordinator = scheduler.kv_cache_manager.coordinator
+        managers = coordinator.single_type_managers
+        # The in-place path compacts one table and uses standard RoPE frequencies.
+        # Leave all tables untouched when the scheduler must rebuild the retained prompt.
+        if len(managers) != 1:
+            return None
+        for config in (
+            getattr(model_config, "hf_text_config", None),
+            getattr(model_config, "hf_config", None),
+        ):
+            for field in ("rope_parameters", "rope_scaling"):
+                rope = getattr(config, field, None)
+                if isinstance(rope, dict) and rope.get("rope_type", rope.get("type", "default")) != "default":
+                    return None
 
         # Free and compact blocks via explicit request-local sink boundary on KV manager.
         # Rejection before state mutation: if compaction returns 0, no state is changed.

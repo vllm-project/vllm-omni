@@ -233,7 +233,7 @@ class DiffusionInt8Config(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
             if not self.is_checkpoint_int8_serialized:
-                if current_omni_platform.is_cuda():
+                if current_omni_platform.is_cuda() or current_omni_platform.is_rocm():
                     online_method = Int8OnlineLinearMethod(self)
                 elif current_omni_platform.is_npu():
                     online_method = NPUInt8OnlineLinearMethod(self)
@@ -241,7 +241,7 @@ class DiffusionInt8Config(QuantizationConfig):
                     raise NotImplementedError("The current platform is not supported int8 online quant.")
                 return online_method
             else:
-                if current_omni_platform.is_cuda():
+                if current_omni_platform.is_cuda() or current_omni_platform.is_rocm():
                     offline_method = Int8LinearMethod(self)
                 elif current_omni_platform.is_npu():
                     offline_method = NPUInt8LinearMethod(self)
@@ -490,7 +490,9 @@ class Int8LinearMethod(BaseInt8LinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.int8_linear.apply_weights(layer, x, bias)
+        # ROCm INT8 kernels accept matrices; diffusion also passes batched states.
+        output = self.int8_linear.apply_weights(layer, x.reshape(-1, x.shape[-1]).contiguous(), bias)
+        return output.reshape(*x.shape[:-1], output.shape[-1])
 
 
 class NPUInt8LinearMethod(BaseInt8LinearMethod):
