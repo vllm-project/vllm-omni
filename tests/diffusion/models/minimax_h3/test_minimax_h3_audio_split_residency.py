@@ -3,6 +3,7 @@
 """CPU regression coverage for audio encoder-component staging."""
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from torch import nn
 from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3AudioVAE, _VAEPartProxy
+from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderMediaInput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -137,6 +139,57 @@ def _pipeline(vae):
     nn.Module.__init__(pipeline)
     pipeline.audio_vae = vae
     return pipeline
+
+
+@pytest.mark.parametrize("module_encoder", [False, True])
+def test_encode_waveform_uses_model_device_for_parameterless_encoder(module_encoder):
+    vae = _vae()
+    vae._stager = vae._encoder_stager = vae._decoder_stager = None
+    del vae.model.encoder
+    vae.model.encoder = nn.Identity() if module_encoder else lambda value: value
+    vae.model.preprocess = lambda waveform, sample_rate: waveform
+    vae.config_dict = {"latent_channels": 4, "latents_mean": [0] * 4, "latents_std": [1] * 4}
+
+    rows, length = vae.encode_waveform(torch.zeros(2, 4), 32000)
+
+    assert rows.shape == (2, 4)
+    assert length == 1
+
+
+@pytest.mark.parametrize("entry_point", ["reference", "silence"])
+def test_production_audio_entry_points_stage_only_encoder(monkeypatch, entry_point):
+    vae = _vae()
+    pipeline = _pipeline(vae)
+    pipeline._uses_manual_component_offload = lambda component: True
+    calls = []
+
+    def encode_waveform(waveform, sample_rate):
+        assert vae._encoder_stager.loaded
+        assert not vae._decoder_stager.loaded
+        assert sample_rate == 32000
+        calls.append(waveform)
+        return torch.zeros(80, 96), 80
+
+    vae.encode_waveform = encode_waveform
+    if entry_point == "reference":
+        pipeline.video_vae = SimpleNamespace(is_distributed_enabled=lambda: False)
+        monkeypatch.setattr(pipeline_module, "_dit_rank_world", lambda: (None, 0, 1))
+        media = MiniMaxH3EncoderMediaInput(
+            task="ref2va",
+            height=32,
+            width=32,
+            num_frames=96,
+            latent_t=24,
+            audio_t=160,
+            audios=((torch.zeros(64000), 32000),),
+        )
+        assert pipeline._encode_local_media(media).audio_condition_lengths == (80,)
+    else:
+        assert pipeline._regenerate_silence_rows(48, 80).shape == (80, 96)
+
+    assert len(calls) == 1
+    assert not vae._encoder_stager.loaded
+    assert not vae._decoder_stager.loaded
 
 
 def test_encoding_scope_releases_encoder_after_failure():

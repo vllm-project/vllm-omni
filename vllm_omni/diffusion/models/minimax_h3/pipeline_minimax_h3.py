@@ -3053,8 +3053,8 @@ class MiniMaxH3Pipeline(
 
     @contextmanager
     def _audio_encoding_component_on_device(self, component: nn.Module) -> Iterator[None]:
-        if component is self.audio_vae:
-            component = self.audio_vae.encoder_component
+        if component is self.audio_vae and isinstance(component, MiniMaxH3AudioVAE):
+            component = component.encoder_component
         with self._component_on_device(component):
             yield
 
@@ -3941,7 +3941,7 @@ class MiniMaxH3Pipeline(
         if cached is not None and cached[0] == key:
             return cached[1]
         samples = round(num_frames / MINIMAX_H3_FPS * MINIMAX_H3_AUDIO_SAMPLE_RATE)
-        with self._component_on_device(self.audio_vae.encoder_component):
+        with self._audio_encoding_component_on_device(self.audio_vae):
             rows, encoded_t = self.audio_vae.encode_waveform(torch.zeros(2, samples), MINIMAX_H3_AUDIO_SAMPLE_RATE)
         if encoded_t != audio_t:
             raise RuntimeError(f"encoded silence has {encoded_t} audio latents, the canvas {audio_t}")
