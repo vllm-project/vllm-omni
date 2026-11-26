@@ -29,6 +29,7 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 MODEL = "black-forest-labs/FLUX.2-dev"
 PROMPT = "A cinematic mountain landscape at sunrise, dramatic clouds, ultra-detailed, realistic photography."
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
+FLUX_2_DEV_INIT_TIMEOUT_S = 1800
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -41,6 +42,7 @@ def _get_flux_2_dev_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                init_timeout=FLUX_2_DEV_INIT_TIMEOUT_S,
                 server_args=[
                     "--enable-cpu-offload",
                 ],
@@ -51,6 +53,7 @@ def _get_flux_2_dev_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                init_timeout=FLUX_2_DEV_INIT_TIMEOUT_S,
                 server_args=[
                     "--enable-layerwise-offload",
                 ],
@@ -61,6 +64,7 @@ def _get_flux_2_dev_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                init_timeout=FLUX_2_DEV_INIT_TIMEOUT_S,
                 server_args=[
                     "--enable-cpu-offload",
                     "--cfg-parallel-size",
@@ -73,6 +77,7 @@ def _get_flux_2_dev_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                init_timeout=FLUX_2_DEV_INIT_TIMEOUT_S,
                 server_args=[
                     "--enable-cpu-offload",
                     "--ulysses-degree",
@@ -85,6 +90,7 @@ def _get_flux_2_dev_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                init_timeout=FLUX_2_DEV_INIT_TIMEOUT_S,
                 server_args=[
                     "--enable-cpu-offload",
                     "--ring-degree",
@@ -97,6 +103,7 @@ def _get_flux_2_dev_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                init_timeout=FLUX_2_DEV_INIT_TIMEOUT_S,
                 server_args=[
                     "--enable-cpu-offload",
                     "--tensor-parallel-size",

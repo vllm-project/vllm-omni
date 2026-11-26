@@ -34,7 +34,7 @@ test_params = [
 ]
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_multi_stage_diffusion_uses_multi_replica_dit_stage(omni_server, online_client) -> None:
     request_config = {

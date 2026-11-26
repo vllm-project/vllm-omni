@@ -231,6 +231,39 @@ def test_talker_turn_end_follows_last_condition_token(condition_ids, turn_end, a
     assert _native_duplex_row_meta(info)[-1] is turn_end
 
 
+def test_venus_delegated_eos_closes_turn_without_a_speech_row():
+    info = {
+        "native_duplex": True,
+        "duplex": {"epoch": 0, "turn_id": 10},
+        "ids": {"tts": []},
+        "meta": {"turn_eos_token_id": 99, "turn_end": True},
+    }
+    assert _native_duplex_row_meta(info)[-1] is True
+
+
+def test_venus_speech_flush_embeds_only_audio_bos_and_runs_one_tail_chunk():
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(8, 4)
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 4)])
+    talker._text_eos_id = 5
+    talker._tts_bos_id = 6
+    _, embeds, updates = talker.preprocess(
+        torch.zeros(1, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        request_id="req-flush",
+        native_duplex=True,
+        meta={"speech_flush": True},
+        tts_token_ids=torch.empty(0, dtype=torch.long),
+        tts_hidden_states=torch.empty(0, 4),
+    )
+    assert torch.equal(embeds, talker.emb_text(torch.tensor([6])))
+    assert updates["audio_state"]["finished"] is False
+    assert updates["audio_state"]["min_tokens"] == 0
+    assert updates["audio_state"]["max_tokens"] == _DUPLEX_CODEC_TOKENS_PER_CHUNK
+    assert updates["audio_state"]["turn_end_drain"] == 0
+
+
 def test_decode_preprocess_embeds_the_sampled_codec_id() -> None:
     talker = _make_talker()
     talker.emb_code = nn.ModuleList([nn.Embedding(8, 4)])

@@ -12,16 +12,23 @@ capability boundary, and validation scope, see
 
 ## Installation
 
-Install vLLM-Omni with the MiniCPM-o talker dependencies:
+Install vLLM-Omni with the MiniCPM-o Code2Wav dependency:
 
 ```bash
-pip install stepaudio2-minicpmo
+pip install step-audio2==1.0.0
 ```
 
-The `minicpmo` extra installs `stepaudio2-minicpmo` and its audio dependencies,
-including `librosa`.
+`step-audio2` provides the top-level `cosyvoice2` package that the checkpoint's
+`flow.yaml` loads, and pulls in its audio dependencies (`librosa`,
+`hyperpyyaml`, `s3tokenizer`, `onnxruntime`). Do not co-install
+`stepaudio2-minicpmo`; its `stepaudio2` package conflicts with this one.
 
 ## Start the backend server
+
+Realtime output defaults follow the deployment's advertised
+`default_output_modalities`. `minicpmo_4_5_duplex_thinker_only.yaml` serves text
+only (see [Thinker-only full duplex](#thinker-only-full-duplex)); audio requests
+are rejected.
 
 The deploy config auto-loads via `--omni`.
 The default `vllm_omni/deploy/minicpmo_4_5.yaml` keeps all three stages on
@@ -61,6 +68,26 @@ vllm serve openbmb/MiniCPM-o-4_5 \
 For local ModelScope checkpoints, replace `openbmb/MiniCPM-o-4_5` with the
 checkpoint path. For native full-duplex, connect `/v1/realtime?duplex=1` on
 this same server.
+
+### Thinker-only full duplex
+
+`minicpmo_4_5_duplex_thinker_only.yaml` starts only the Thinker on one GPU
+for native full duplex with text output. Audio and video input and the
+model's listen/speak decisions are the same as in the three-stage profiles;
+no Talker or Code2Wav starts.
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 \
+    --omni \
+    --deploy-config vllm_omni/deploy/minicpmo_4_5_duplex_thinker_only.yaml \
+    --trust-remote-code \
+    --host 0.0.0.0 --port 8099
+```
+
+The server advertises `supported_output_modalities: ["text"]` and
+`supports_playback_ack: false`. Requests for audio fail with
+`unsupported_output_modality`; `playback.ack` and audio truncation fail with
+`unsupported_operation`.
 
 ### Per-stage overrides
 

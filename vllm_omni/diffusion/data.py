@@ -47,6 +47,7 @@ from vllm_omni.diffusion.diffusion_kv.config import (
 from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.media import DiffusionMediaOutput
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+from vllm_omni.diffusion.utils.flow_matching import normalize_shift
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.quantization import build_quant_config
@@ -328,6 +329,14 @@ class DiffusionParallelConfig:
     allocator, Triton-Ascend and a symmetric-memory runtime.
     """
 
+    ulysses_overlap_chunks: int = 0
+    """Overlap the CUDA copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
+
+    Requires ``ulysses_a2a_permute`` and strict pure Ulysses. Each chunk's Q/K/V move to their head owners while
+    earlier chunks compute, and outputs return as each chunk finishes. Results match the unchunked path exactly when
+    the attention backend's per-head output does not depend on the number of heads per call.
+    """
+
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
 
@@ -427,6 +436,20 @@ class DiffusionParallelConfig:
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
+        if self.ulysses_overlap_chunks < 0:
+            raise ValueError(f"ulysses_overlap_chunks must be >= 0, but got {self.ulysses_overlap_chunks}")
+        if self.ulysses_overlap_chunks > 0 and (
+            not self.ulysses_a2a_permute
+            or self.ulysses_mode != "strict"
+            or self.ring_degree != 1
+            or self.allgather_degree != 1
+        ):
+            raise ValueError(
+                "ulysses_overlap_chunks requires ulysses_a2a_permute and strict pure Ulysses "
+                "(ulysses_mode='strict', ring_degree=1, allgather_degree=1). "
+                f"Got ulysses_a2a_permute={self.ulysses_a2a_permute}, ulysses_mode={self.ulysses_mode!r}, "
+                f"ring_degree={self.ring_degree}, allgather_degree={self.allgather_degree}."
+            )
 
         # Validate HSDP configuration
         if self.use_hsdp:
@@ -845,7 +868,7 @@ def resolve_model_class_name(
 
     if model_type == "praxis":
         return "Praxis1Pipeline"
-    if _looks_like_hidream_o1(model, cfg):
+    if _looks_like_hidream_o1(model, cfg, revision=revision):
         return "HiDreamO1ImagePipeline"
     if _looks_like_flux3(model, cfg):
         return "Flux3Pipeline"
@@ -880,7 +903,7 @@ def resolve_model_class_name(
     if model_type == "vla":
         from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
-        return "DreamZeroPipeline" if _looks_like_dreamzero(model) else None
+        return "DreamZeroPipeline" if _looks_like_dreamzero(model, revision=revision) else None
     if len(architectures) == 1:
         return architectures[0]
     return None
@@ -1082,6 +1105,7 @@ class OmniDiffusionConfig:
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_stack_tiles: bool = True
     # Wan VAE decoder fast path. ``"lossless"`` installs the bit-exact fused
     # kernels on every diffusers Wan VAE, ``"channels_last"`` additionally
     # converts decoder convolution weights to channels-last memory format and
@@ -1485,6 +1509,8 @@ class OmniDiffusionConfig:
                     "request_batch_max_wait_ms must be a finite non-negative number, "
                     f"got {self.request_batch_max_wait_ms}."
                 )
+        if self.flow_shift is not None:
+            self.flow_shift = normalize_shift(self.flow_shift, name="flow_shift")
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig
@@ -1828,7 +1854,11 @@ class OmniDiffusionConfig:
             )
             # Mixed Flux3 packages also ship a Diffusers index. Native loading
             # must resolve variant quantization from the package config below.
-            if config_dict is not None and self.diffusion_load_format != "diffusers" and _looks_like_flux3(self.model):
+            if (
+                config_dict is not None
+                and self.diffusion_load_format != "diffusers"
+                and _looks_like_flux3(self.model, revision=self.revision)
+            ):
                 config_dict = None
             if config_dict is not None:
                 if self.model_class_name is None:
@@ -1934,7 +1964,7 @@ class OmniDiffusionConfig:
                 from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
 
                 assert self.model is not None
-                is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg)
+                is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg, revision=self.revision)
                 is_flux3 = _looks_like_flux3(self.model, cfg)
                 if self.model_class_name == "HiDreamO1ImagePipeline" and not is_hidream_o1:
                     raise ValueError(f"Checkpoint {self.model} does not have the HiDream-O1 signature")
@@ -2014,7 +2044,7 @@ class OmniDiffusionConfig:
                     from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
                     assert self.model is not None
-                    if _looks_like_dreamzero(self.model):
+                    if _looks_like_dreamzero(self.model, revision=self.revision):
                         self.model_class_name = "DreamZeroPipeline"
                         self.set_tf_model_config(TransformerConfig())
                         self.update_multimodal_support()

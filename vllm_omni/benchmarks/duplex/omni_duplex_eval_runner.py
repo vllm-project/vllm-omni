@@ -851,6 +851,8 @@ async def generate_sample(
             extra_body=extra_body,
             auto_response=not server_turns,
             turn_detection=session_turn_detection(turn_detection),
+            # Use the deployment default; a text-only deployment rejects audio.
+            modalities=None,
         )
         frame_transport = select_frame_transport(_session_capabilities(client))
         if not server_turns:
@@ -1078,7 +1080,13 @@ async def generate_sample(
             finished.add(response.get("id"))
             # Barge-in cancels an individual turn, not the input clip. Its
             # preceding responses and already emitted text remain judge input.
-            if response.get("status", "completed") not in {"completed", "cancelled"}:
+            status = response.get("status", "completed")
+            details = response.get("status_details")
+            # A reply stopped at the continuation limit keeps the text it already emitted.
+            at_limit = (
+                status == "incomplete" and isinstance(details, dict) and details.get("reason") == "continuation_limit"
+            )
+            if status not in {"completed", "cancelled"} and not at_limit:
                 errors.append(f"Response did not complete: {response}")
     # A turn may be created while closing the continuous session. Record this
     # boundary in metadata; drain/close timeouts and server errors above still
