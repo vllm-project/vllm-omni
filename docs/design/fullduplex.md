@@ -1661,7 +1661,8 @@ what forcing* — the two surfaces this contract adds.
   Cap-resolved, force-listen and re-emitted rows record no draw; the
   mid-turn listen rewrite is a forced emission of the policy's own raw
   draw, whose joint log-probability is its `logprob` and whose token id
-  rides `sampled_token` in the namespaced `model` extension.
+  rides `sampled_token` in the namespaced `model` extension. A unit marked
+  `is_speech` keeps a sampled listen and ends the turn.
   Records also carry the forcing taxonomy (`sampled` / `forced` with reason /
   `reemit`), input origins (`client` / engine-injected silence), effective
   sampling parameters, and the derived seed

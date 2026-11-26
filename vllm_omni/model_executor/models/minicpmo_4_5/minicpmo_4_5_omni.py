@@ -2084,12 +2084,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         state = self._minicpmo45_duplex_state_for_row(row_idx)
         payload = self._minicpmo45_duplex_payload_for_row(row_idx)
         force_listen = isinstance(payload, dict) and payload.get("force_listen") is True
+        # User speech is the caller's audio. A sampled listen there is the
+        # policy yielding; rewriting it to tts_bos speaks through the user.
+        user_speech = isinstance(payload, dict) and payload.get("is_speech") is True
         if (
             sampled == listen_id
             and 0 <= tts_bos_id
             and state is not None
             and not getattr(state, "current_turn_ended", True)
             and not force_listen
+            and not user_speech
         ):
             return int(tts_bos_id)
         return int(sampled)
@@ -2136,7 +2140,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if sampled in self._minicpmo45_chunk_terminator_token_ids(token_ids):
             state.pending_terminator_token = int(sampled)
             state.last_terminator_token = int(sampled)
-            if sampled == listen_id and force_listen:
+            user_speech = isinstance(payload, dict) and payload.get("is_speech") is True
+            if sampled == listen_id and (force_listen or user_speech):
                 state.current_turn_ended = True
                 with suppress(Exception):
                     state.pending_speech_response_open = False

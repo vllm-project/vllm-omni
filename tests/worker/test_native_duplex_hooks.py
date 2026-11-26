@@ -2890,6 +2890,60 @@ def test_minicpmo_stage0_native_sampler_converts_mid_turn_listen_to_tts_bos():
     assert state.current_turn_ended is False
 
 
+def test_minicpmo_stage0_native_sampler_keeps_listen_during_user_speech():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Tokenizer:
+        eos_token_id = 151705
+        unk_token_id = -1
+        bad_token_ids = []
+        all_special_ids = []
+
+        def convert_tokens_to_ids(self, token):
+            return {
+                "<unit>": 151683,
+                "</unit>": 151684,
+                "<|listen|>": 151705,
+                "<|speak|>": 151706,
+                "<|tts_bos|>": 151703,
+                "<|tts_eos|>": 151704,
+                "<|tts_pad|>": 151722,
+                "<|chunk_eos|>": 151718,
+                "<|chunk_tts_eos|>": 151721,
+                "<|turn_eos|>": 151717,
+            }.get(token, -1)
+
+    state = SimpleNamespace(current_turn_ended=False)
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "llm"
+    model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
+    model._minicpmo45_duplex_row_sessions = {0: ("sid-native", 0)}
+    model._minicpmo45_duplex_row_payloads = {0: {"is_speech": True}}
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={("sid-native", 0): state})
+    vocab_size = 151723
+    logits = torch.full((1, vocab_size), -100.0)
+    logits[0, 151705] = 30.0
+    sampling_metadata = SimpleNamespace(
+        all_greedy=True,
+        all_random=False,
+        temperature=torch.tensor([0.0]),
+        top_k=torch.tensor([1]),
+        top_p=torch.tensor([1.0]),
+        generators={},
+        prompt_token_ids=torch.tensor([[151683] * 16]),
+        output_token_ids=[[]],
+    )
+
+    sampled = model.sample(logits, sampling_metadata)
+    model._commit_minicpmo45_duplex_pending_samples()
+
+    assert sampled is not None
+    assert sampled.sampled_token_ids.tolist() == [[151705]]
+    assert state.current_turn_ended is True
+
+
 def test_minicpmo_stage0_native_sampler_forced_listen_yields_floor():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
