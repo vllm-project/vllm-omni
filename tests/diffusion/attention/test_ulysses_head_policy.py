@@ -1,17 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Fast scheduled GPU API checks, outside model inference or policy learning."""
+"""Selection and fallback on supported diffusion layouts."""
 
 from dataclasses import replace
 from types import MethodType, SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.diffusion.attention.parallel.head_overlap.head_policy import candidate_index, choose
 from vllm_omni.diffusion.attention.parallel.head_overlap.query_tail import candidate, eligible
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
-def check_video_query_tail():
+
+def test_video_query_tail():
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
     from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 
@@ -39,8 +42,7 @@ def check_video_query_tail():
     assert not eligible(kernel, md, rows)
 
 
-def main():
-    check_video_query_tail()
+def test_candidate_selection_and_fallback():
     assert choose([[100] * 10, [97] * 10]) == 0
     assert choose([[100] * 10, [90] * 10]) == 1
     assert choose([[100] * 5, [80] * 5]) == 0
@@ -51,8 +53,22 @@ def main():
             assert choices[0] == (heads,)
             assert len(choices) <= 2 and all(sum(parts) == heads and min(parts) > 0 for parts in choices)
             assert 0 <= tail <= rows // 4
-    print("Passed candidate selection, fallback and dense-layout checks")
 
 
-if __name__ == "__main__":
-    main()
+def test_mismatched_layer_order_skips_collective_preparation(monkeypatch):
+    from vllm_omni.diffusion.attention.parallel.head_overlap import head_policy
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(head_policy.dist, "get_world_size", lambda group: 2)
+
+    def gather(peers, local, group):
+        peers[:] = [local, list(reversed(local))]
+
+    monkeypatch.setattr(head_policy.dist, "all_gather_object", gather)
+    policy = head_policy.HeadPolicy(None, 120)
+    policy.component_key = "shape"
+    policy.discovered["layout"] = head_policy.Trial((3, 5), 0, example=("cuda", "pg"))
+    policy.discovery = [("first", "layout"), ("second", "layout")]
+    policy.finish_component(None, (), None)
+    assert policy.visits["shape"] == {}
+    assert not policy.layouts and not policy.pending and not policy.discovered

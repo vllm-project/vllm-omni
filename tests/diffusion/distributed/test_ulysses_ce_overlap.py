@@ -8,6 +8,7 @@ Run through the shared GPU scheduler with fresh worker processes.
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from tests.helpers.mark import hardware_marks
@@ -30,6 +31,54 @@ def _attention(q, k, v):
         for h in range(q.shape[2])
     ]
     return torch.cat(heads, dim=2)
+
+
+def _check_uneven(group, device, rank):
+    from vllm_omni.diffusion.attention.parallel.ulysses_ce_overlap import (
+        CEOverlapUlysses,
+        PreparationError,
+        prepare_local,
+    )
+
+    def fail_one_rank():
+        if rank == 1:
+            raise torch.OutOfMemoryError("injected before rendezvous")
+        return 1
+
+    with pytest.raises(PreparationError, match="injected"):
+        prepare_local(fail_one_rank, group.cpu_group)
+
+    plan = CEOverlapUlysses(group.ulysses_group, device=device)
+    s, h, d = 127, 16, 64
+    torch.manual_seed(31)
+    prefix = tuple(torch.randn(1, 19, h, d, device=device, dtype=torch.bfloat16) for _ in range(2))
+    torch.manual_seed(101 + rank)
+    packed = torch.randn(1, s, 3, h, d, device=device, dtype=torch.bfloat16)
+    inputs = packed.unbind(2)
+    peers = [torch.empty_like(packed) for _ in range(2)]
+    dist.all_gather(peers, packed, group=group.ulysses_group)
+    q, k, v = torch.cat(peers, dim=1).unbind(2)
+    for front in (False, True):
+        kv = [torch.cat((p, x) if front else (x, p), dim=1) for p, x in zip(prefix, (k, v))]
+        expected = _attention(q, *kv)[:, rank * s : (rank + 1) * s]
+        for tail in (0, s // 2, s):
+            plan._configure(s, h, d, (3, 5), q.dtype, prefix=19, front=front, tail=tail)
+            actual = plan.run(*inputs, _attention, joint_kv=prefix)
+            torch.testing.assert_close(actual, expected, rtol=1e-2, atol=5e-3)
+
+    # Change input values between graph replays. Stale peer signals otherwise
+    # pass a constant-input comparison even if a rank reads the previous call.
+    static = torch.empty_like(packed)
+    static.copy_(packed)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = plan.run(*static.unbind(2), _attention, joint_kv=prefix).clone()
+    for scale in (0.5, 2.0, -1.0):
+        static.copy_(packed * scale)
+        graph.replay()
+        kv = [torch.cat((p, x * scale), dim=1) for p, x in zip(prefix, (k, v))]
+        expected = _attention(q * scale, *kv)[:, rank * s : (rank + 1) * s]
+        torch.testing.assert_close(captured, expected, rtol=1e-2, atol=5e-3)
 
 
 def _worker(rank, init_method, world_size=2):
@@ -61,6 +110,7 @@ def _worker(rank, init_method, world_size=2):
                         actual, expected, rtol=0, atol=0, msg=lambda m: f"{seq=} {heads=} {chunks=}: {m}"
                     )
                     checks += 1
+            _check_uneven(group, device, rank)
             assert len(ulysses_ce_overlap._RUNNERS) == 1
             print(f"CE overlap rank={rank}: {checks} bit-exact checks passed", flush=True)
     finally:

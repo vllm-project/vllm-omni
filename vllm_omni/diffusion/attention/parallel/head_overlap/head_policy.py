@@ -4,10 +4,10 @@
 
 import math
 import statistics
+from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field, is_dataclass, replace
-from dataclasses import fields as dataclass_fields
+from dataclasses import dataclass, field, replace
 from weakref import WeakSet
 
 import torch
@@ -16,7 +16,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cuda_graph import kwargs_signature
 
-from .ce_plan import HeadPlan, prepare_plan
+from ..ulysses_ce_overlap import CEOverlapUlysses, PreparationError, prepare_local
 from .query_tail import candidate, eligible
 
 
@@ -32,26 +32,6 @@ def canonical_strides(value):
 
 def tensor_spec(value):
     return tuple(value.shape), canonical_strides(value), str(value.dtype), value.device.type
-
-
-def metadata_spec(value):
-    """Describe host semantics and tensor layouts without reading device data."""
-    if hasattr(value, "shape"):
-        return tensor_spec(value), True
-    if isinstance(value, (int, float, bool, str, type(None))):
-        return value, True
-    if isinstance(value, dict):
-        rows = [(key, metadata_spec(item)) for key, item in sorted(value.items())]
-        return tuple((key, item[0]) for key, item in rows), all(item[1] for _, item in rows)
-    if isinstance(value, (tuple, list)):
-        rows = [metadata_spec(item) for item in value]
-        return tuple(item[0] for item in rows), all(item[1] for item in rows)
-    if is_dataclass(value):
-        rows = [(item.name, metadata_spec(getattr(value, item.name))) for item in dataclass_fields(value)]
-        return (type(value).__qualname__, tuple((name, item[0]) for name, item in rows)), all(
-            item[1] for _, item in rows
-        )
-    return ("opaque", type(value).__module__, type(value).__qualname__), False
 
 
 def qualified_cycles(choices):
@@ -92,6 +72,12 @@ def candidate_index(index):
     return position ^ (cycle % 2) ^ ((cycle // 2) % 2)
 
 
+# Experiment defaults for a 32-layer denoiser: leave six visits untimed, then
+# sample twelve position-balanced pairs. The 80% win rate and median/MAD
+# margins prevent a single fast pair from enabling a split.
+_UNTIMED = 6
+_SAMPLES = 24
+
 logger = init_logger(__name__)
 _OWNERS = WeakSet()
 
@@ -103,7 +89,8 @@ def clear():
         policy.layouts.clear()
         policy.pending.clear()
         policy.component_layouts.clear()
-        policy.comm = None
+        policy.visits.clear()
+        policy.slots.clear()
 
 
 _PREPARING_GRAPH = ContextVar("ulysses_preparing_graph", default=False)
@@ -125,9 +112,9 @@ class Trial:
     widths: tuple
     tail_rows: int
     example: tuple = ()
-    observations: list = field(default_factory=list)
+    observations: dict = field(default_factory=dict)
     timers: list = field(default_factory=list)
-    plan: HeadPlan | None = None
+    plan: CEOverlapUlysses | None = None
     seen: int = 0
     selected: bool | None = None
 
@@ -144,9 +131,11 @@ class HeadPolicy:
         self.component_layouts = {}
         self.component_key = None
         self.discovery = None
+        self.discovered = {}
         self.enabled_for_call = False
         self.generation = 0
-        self.comm = None
+        self.visits = {}
+        self.slots = {}
 
     def begin_component(self, module, args, kwargs):
         # Component inputs precede sequence sharding. All SP peers enter a new
@@ -155,13 +144,26 @@ class HeadPolicy:
         keys = self.component_layouts.get(self.component_key)
         frozen = _PREPARING_GRAPH.get() or torch.cuda.is_current_stream_capturing()
         discover = keys is None and not frozen and len(self.component_layouts) < 16
+        self.discovered.clear()
         self.discovery = [] if discover else None
+        self.routes = self.visits.get(self.component_key, {})
         self.enabled_for_call = discover or any(
             self.layouts[key].selected or (not frozen and key in self.pending) for key in keys or ()
         )
 
+        self.slots = {}
+        if not frozen:
+            for name, key in self.routes.items():
+                trial = self.layouts[key]
+                if key in self.pending and trial.seen < _UNTIMED + _SAMPLES:
+                    index = trial.seen - _UNTIMED
+                    trial.seen += 1
+                    if index >= 0:
+                        self.slots[name] = index
+
     def try_run(self, strategy, layer, q, k, v, md):
         """Return None to execute the normal attention path, including native CE."""
+        name = strategy.head_layer_name
         if q.ndim != 4 or q.shape[0] != 1 or not q.is_cuda or q.dtype != torch.bfloat16:
             return None
         world = strategy._sp_group.ulysses_world_size
@@ -184,7 +186,7 @@ class HeadPolicy:
         md = layer._with_kv_cache_dtype(md)
         if not eligible(layer._run_local_attention, md, q.shape[1] * world):
             return None
-        joint = None
+        joint = ()
         if md is not None and any(x is not None for x in (md.joint_query, md.joint_key, md.joint_value)):
             joint = md.joint_query, md.joint_key, md.joint_value
             if (
@@ -205,43 +207,45 @@ class HeadPolicy:
                 return None
         # Each owner is bound to one device, process group and installed BF16 FA3 backend.
         # A cached signature describes every participating Q/K/V layout, including the prefix KV.
-        signature = (world, tuple(tensor_spec(x) for x in (q, k, v)), metadata_spec(md)[0])
+        signature = (
+            world,
+            tuple(tensor_spec(x) for x in (q, k, v)),
+            tuple(tensor_spec(x) for x in joint),
+            md.joint_strategy if joint else None,
+            md.video_layout.latent_grid if md is not None and md.video_layout else None,
+            layer.softmax_scale,
+            layer.borrow_ulysses_output,
+        )
         trial = self.layouts.get(signature)
-        frozen_only = _PREPARING_GRAPH.get() or torch.cuda.is_current_stream_capturing()
-        if self.discovery is not None and not frozen_only:
-            self.discovery.append(signature)
-        if trial is None:
-            if self.discovery is None or frozen_only or len(self.layouts) >= 16:
-                return None
-            choices, tail = candidate(q.shape[2] // world, q.shape[1] * world, world, self.sms)
-            trial = self.layouts[signature] = Trial(choices[-1], tail)
-            if len(choices) == 1:
-                trial.selected = False
-            else:
-                # Only this first layer's example survives to the component boundary.
-                trial.example = ((q, k, v), joint, strategy._ulysses_pg, layer._run_local_attention, md)
+        if self.discovery is not None:
+            trial = trial or self.discovered.get(signature)
+            if trial is None and len(self.layouts) + len(self.discovered) < 16:
+                choices, tail = candidate(q.shape[2] // world, q.shape[1] * world, world, self.sms)
+                trial = self.discovered[signature] = Trial(choices[-1], tail)
+                if len(choices) == 1:
+                    trial.selected = False
+                else:
+                    trial.example = (q.device, strategy._ulysses_pg)
+            if trial is not None:
+                self.discovery.append((name, signature))
             return None
-        if self.discovery is not None or signature not in self.component_layouts.get(self.component_key, ()):
-            return None
-        if trial.selected is False or trial.plan is None or (frozen_only and trial.selected is None):
+        if self.routes.get(name) != signature or trial is None or trial.plan is None:
             return None
 
         kernel = layer._run_local_attention
 
         def split():
-            metadata = None if md is None else replace(md, joint_query=None, joint_key=None, joint_value=None)
-            trial.plan.bind((q, k, v), joint, kernel, metadata)
-            # The plan writes to a reusable symmetric slot. Attention's caller
-            # owns its result and may retain it across later layers and requests.
-            return trial.plan.run().clone()
+            metadata = replace(md, joint_query=None, joint_key=None, joint_value=None) if joint else md
+            out = trial.plan.run(
+                q, k, v, lambda a, b, c: kernel(a, b, c, metadata), joint_kv=joint[1:] if trial.plan.prefix else ()
+            )
+            return out if layer.borrow_ulysses_output else out.clone()
 
         if trial.selected:
             return split()
-        i = trial.seen
-        trial.seen += 1
-        if i < 6 or i - 6 >= len(trial.timers):
+        index = self.slots.pop(name, None)
+        if index is None:
             return None
-        index = i - 6
         start, end = trial.timers[index]
         choice = candidate_index(index)
         start.record()
@@ -251,7 +255,7 @@ class HeadPolicy:
             qq, kk, vv, native_md, ctx = strategy.pre_attention(q, k, v, md)
             result = strategy.post_attention(kernel(qq, kk, vv, native_md), ctx)
         end.record()
-        trial.observations.append((choice, start, end, not start.query()))
+        trial.observations[index] = start, end, not start.query()
         return result
 
     def finish_component(self, module, inputs, output):
@@ -263,45 +267,58 @@ class HeadPolicy:
             order, self.discovery = self.discovery, None
             # Include ordered visits: a different order would issue unmatched
             # native/split collectives even if the set of layouts agreed.
-            info = [
-                (key, self.layouts[key].widths, self.layouts[key].tail_rows) for key in order if key in self.layouts
-            ]
+            trials = self.layouts | self.discovered
+            self.discovered.clear()
+            info = [(name, key, trials[key].widths, trials[key].tail_rows) for name, key in order]
             peers = [None] * dist.get_world_size(self.group)
             dist.all_gather_object(peers, info, group=self.group)
             agreed = all(peer == info for peer in peers)
-            keys = tuple(dict.fromkeys(key for key, _, _ in info)) if agreed else ()
-            self.component_layouts[self.component_key] = keys
-            for key in dict.fromkeys(order):
-                trial = self.layouts.get(key)
-                if trial is None or not trial.example:
+            # Only uniquely identifiable layer visits get a sampling slot. All
+            # ranks derive the entire next component schedule from this table.
+            names = Counter(name for name, _ in order)
+            visits = {name: key for name, key in order if agreed and names[name] == 1}
+            self.visits[self.component_key] = visits
+            keys = self.component_layouts[self.component_key] = tuple(dict.fromkeys(visits.values()))
+            for key in keys:
+                trial = self.layouts.setdefault(key, trials[key])
+                if not trial.example:
                     continue
-                inputs, joint, pg, kernel, md = trial.example
+                device, pg = trial.example
                 trial.example = ()
-                if not agreed:
+                try:
+                    trial.plan, trial.timers = prepare_local(lambda: self._prepare(key, trial, device, pg), self.group)
+                except PreparationError as exc:
+                    logger.warning("Keeping native Ulysses: %s", exc)
                     trial.selected = False
                     continue
-                if self.comm is None:
-                    self.comm = torch.cuda.Stream(device=inputs[0].device)
-                trial.plan = prepare_plan(
-                    inputs,
-                    joint,
-                    pg,
-                    trial.widths,
-                    self.comm,
-                    kernel,
-                    md,
-                    joint_strategy="front" if md is None else md.joint_strategy,
-                    query_tail_rows=trial.tail_rows,
-                )
-                trial.timers = [
-                    (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(24)
-                ]
-                for start, end in trial.timers:
-                    start.record()
-                    end.record()
+                trial.plan.connect()
                 self.pending.add(key)
             return
         self.resolve_pending(self.component_key)
+
+    @staticmethod
+    def _prepare(key, trial, device, pg):
+        _, qkv, joint, placement, *_ = key
+        _, rows, heads, dim = qkv[0][0]
+        plan = CEOverlapUlysses(pg, device=device)
+        plan._configure(
+            rows,
+            heads,
+            dim,
+            trial.widths,
+            torch.bfloat16,
+            prefix=joint[1][0][1] if joint else 0,
+            front=placement == "front",
+            tail=trial.tail_rows,
+            defer_rendezvous=True,
+        )
+        timers = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(_SAMPLES)]
+        for event in (*plan.ev_attn, *plan.ev_in_done.values(), *plan.ev_out_done.values(), plan.ev_inputs):
+            event.record()
+        for start, end in timers:
+            start.record()
+            end.record()
+        return plan, timers
 
     def resolve_pending(self, component_key):
         """Read completed measurements without waiting on the GPU."""
@@ -311,18 +328,24 @@ class HeadPolicy:
         reports = {}
         for key in keys:
             observations = self.layouts[key].observations
-            if len(observations) == 24 and all(end.query() for _, _, end, _ in observations):
-                reports[key] = [(c, start.elapsed_time(end) * 1000, queued) for c, start, end, queued in observations]
+            if self.layouts[key].seen >= _UNTIMED + _SAMPLES and len(observations) < _SAMPLES:
+                reports[key] = []  # A discovered layer changed layout or skipped a visit.
+            elif len(observations) == _SAMPLES and all(end.query() for _, end, _ in observations.values()):
+                reports[key] = [
+                    (candidate_index(i), start.elapsed_time(end) * 1000, queued)
+                    for i, (start, end, queued) in sorted(observations.items())
+                ]
             else:
                 reports[key] = None
         peers = [None] * dist.get_world_size(self.group)
         dist.all_gather_object(peers, reports, group=self.group)
         for key in keys:
             trial = self.layouts[key]
-            if any(peer[key] is None for peer in peers):
+            if not any(peer[key] == [] for peer in peers) and any(peer[key] is None for peer in peers):
                 continue
             choices = [[], []]
-            for values in zip(*(peer[key] for peer in peers), strict=True):
+            complete = all(peer[key] for peer in peers)
+            for values in zip(*(peer[key] or [] for peer in peers), strict=complete):
                 choice = values[0][0]
                 if any(value[0] != choice for value in values):
                     raise RuntimeError("Ulysses ranks sampled different head partitions")
@@ -366,9 +389,10 @@ def configure_head_overlap(pipeline):
         if module is None:
             continue
         policy = HeadPolicy(group, props.multi_processor_count)
-        for layer in module.modules():
+        for layer_name, layer in module.named_modules():
             strategy = getattr(layer, "parallel_strategy", None)
             if getattr(strategy, "auto_head_overlap", False):
+                strategy.head_layer_name = layer_name
                 strategy.head_policy = policy
         module._ulysses_head_policy = policy
         module.register_forward_pre_hook(policy.begin_component, with_kwargs=True)

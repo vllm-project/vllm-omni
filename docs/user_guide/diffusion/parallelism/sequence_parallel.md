@@ -263,6 +263,12 @@ prepare and time an uneven split against native packed-QKV CE. The worker logs t
 and keeps one group when the split does not clear the timing margin. Unsupported attention stays native.
 The initial request includes exploration. Measure it separately from steady-state latency.
 
+The trial layers contribute their real outputs to the first request. Head grouping and query tiling can change
+floating-point rounding, including for a layout that later selects native attention. Numerical equivalence is
+tested with tolerances. A replicated reference K/V prefix is supported when its joint query has zero rows
+(Qwen Image 2.1 decode). A nonempty joint query uses native Ulysses. Fixed and automatic splits share the CE
+transport. The automatic policy compares one candidate against the unsplit, configured native path.
+
 ## Best Practices
 
 ### When to Use

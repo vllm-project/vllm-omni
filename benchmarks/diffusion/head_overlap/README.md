@@ -27,20 +27,11 @@ python -m benchmarks.diffusion.head_overlap.benchmark --model "$MODEL" \\
   --rounds 24 --out "$OUT"
 ```
 
-The CUDA runtime submits individual peer copies by default. To use the batched host submitter from the
-original experiment, build it before starting either engine.
-
-```bash
-export VLLM_OMNI_HEAD_OVERLAP_COPY_SUBMITTER="$PWD/copy_submitter.so"
-c++ -O2 -std=c++17 -shared -fPIC "$bench/copy_submitter.cpp" -o "$VLLM_OMNI_HEAD_OVERLAP_COPY_SUBMITTER"
-```
-
 Use `wan_t2v.json` for 832×480 at 33 or 65 frames and `wan_i2v.json` for 81-frame image-to-video.
-The transport and policy can also be exercised independently of model weights.
+Run the selection and two-GPU transport tests with pytest.
 
 ```bash
-python -m benchmarks.diffusion.head_overlap.check_policy
-torchrun --standalone --nproc-per-node=2 --module benchmarks.diffusion.head_overlap.check_transport
+pytest tests/diffusion/attention/test_ulysses_head_policy.py tests/diffusion/distributed/test_ulysses_ce_overlap.py
 ```
 
 ## Historical measurements
