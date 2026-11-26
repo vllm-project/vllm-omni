@@ -83,6 +83,7 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
     StageMetricsMessage,
     StageSubmissionMessage,
+    TextInputUpdate,
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import (
@@ -3468,6 +3469,9 @@ class OrchestratorBase:
                 return
 
             final_stage_id = req_state.final_stage_id
+            # async-chunk may have prewarmed stages past this one; they will
+            # never receive input, so abort them instead of waiting for timeout.
+            prewarmed_downstream = any(stage > src_stage_id for stage in req_state.stage_submit_ts)
             final_pool = self.stage_pools[final_stage_id]
             final_output_type = getattr(final_pool.stage_client, "final_output_type", None)
             terminal_output = _build_terminal_empty_output(
@@ -3496,7 +3500,9 @@ class OrchestratorBase:
                     stage_submit_ts=submit_ts,
                 )
             )
-            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+            await self._cleanup_request_ids(
+                [req_id, *self._cfg_tracker.cleanup_parent(req_id)], abort=prewarmed_downstream
+            )
             return
 
         self._annotate_next_stage_inputs(src_stage_id, req_state, next_inputs)
@@ -3862,6 +3868,11 @@ class OrchestratorBase:
                             memo,
                             shared_types=(torch.Tensor,),
                         )
+                        additional_information = base_input["additional_information"]
+                        if isinstance(additional_information, dict):
+                            for key in list(additional_information):
+                                if key == "input_stream" or key.startswith("input_stream."):
+                                    additional_information.pop(key)
                 else:
                     base_input = {}
 
@@ -4110,6 +4121,25 @@ class Orchestrator(OrchestratorBase):
             await self._handle_add_request(cast(StageSubmissionMessage, msg))
         elif msg_type == "streaming_update":
             await self._handle_streaming_update(cast(StageSubmissionMessage, msg))
+        elif msg_type == "append_text":
+            append = cast(TextInputUpdate, msg)
+            state = self.request_states.get(append.request_id)
+            if state is None:
+                await self.output_async_queue.put(
+                    ErrorMessage(
+                        request_id=append.request_id,
+                        error="No active request for text input append",
+                        fatal=False,
+                        status_code=400,
+                    )
+                )
+            else:
+                await self._dispatch_or_fail_request(
+                    lambda: self.stage_pools[state.entry_stage_id].append_text(append),
+                    req_id=state.request_id,
+                    stage_id=state.entry_stage_id,
+                    operation="append_text",
+                )
         elif msg_type == "add_companion_request":
             await self._handle_add_companion(cast(AddCompanionRequestMessage, msg))
         elif msg_type == "interaction":

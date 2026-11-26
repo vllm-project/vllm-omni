@@ -147,6 +147,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self._async_chunk_streaming = True
 
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        super().configure_pipeline(pipeline_config)
         stages = {stage.model_stage: stage.stage_id for stage in pipeline_config.stages}
         self.joyai_stage_id = stages["joyvl"]
         self.asr_stage_id = stages.get("asr")
@@ -530,6 +531,27 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             # source awaits consolidation. Preserve the original visual turn;
             # summarized or deleted sources are no longer in pending.
             working_frames = tuple(state.visual_memory.pending[-1:])
+        user_sources = config.get("conversation_user_source_ids", {})
+        observations = []
+        for observation in state.observations:
+            stale_items = {
+                item_id
+                for item_id, source_id in observation.user_item_sources
+                if user_sources.get(item_id) != source_id
+            }
+            # Recreated user items must not inherit old ordering anchors or
+            # suppress the new observation's accept-time query.
+            observations.append(
+                replace(
+                    observation,
+                    query="" if observation.query_item_id in stale_items else observation.query,
+                    history_anchor_item_ids=tuple(
+                        item_id for item_id in observation.history_anchor_item_ids if item_id not in stale_items
+                    ),
+                )
+                if stale_items
+                else observation
+            )
         return {
             **config,
             "joyai_state": state,
@@ -537,7 +559,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             "joyai_conversation_images": images,
             "joyai_new_frames": new_images,
             "joyai_pending_frames": working_frames,
-            "joyai_observations": tuple(state.observations),
+            "joyai_observations": tuple(observations),
             "joyai_queries": tuple(state.queries),
             "joyai_closed_frame_id": state.closed_frame_id,
             "joyai_visual_summaries": tuple([*state.visual_memory.long_term, *state.visual_memory.mid_term]),
@@ -882,7 +904,13 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         request.visual_generation = state.visual_memory.generation
         request.frame_time_s = monotonic() - state.visual_memory.start_time
         awaiting_transcript = isinstance(payload, Mapping) and bool(payload.get("audio"))
-        if not awaiting_transcript:
+        if awaiting_transcript:
+            # ASR fills this Session item after the observation is accepted.
+            # Keep its owner so later prompts can restore the original visual turn.
+            transcript_item_id = payload.get("realtime_item_id")
+            if isinstance(transcript_item_id, str):
+                request.transcript_item_id = transcript_item_id
+        else:
             request.query, request.query_index = self._current_query(config, runtime_config)
         item_ids = config.get("conversation_item_ids", ())
         if 0 <= request.query_index < len(item_ids):
@@ -893,6 +921,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             request.query = ""
         request.history_anchor_item_ids = tuple(
             item_id for item_id in item_ids[-(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES) :] if item_id
+        )
+        referenced_items = {*request.history_anchor_item_ids, request.query_item_id, request.transcript_item_id}
+        request.user_item_sources = tuple(
+            (item_id, source_id)
+            for item_id, source_id in config.get("conversation_user_source_ids", {}).items()
+            if item_id in referenced_items
         )
         latest_query, latest_index = self._latest_query(config, runtime_config)
         latest_item_id = item_ids[latest_index] if 0 <= latest_index < len(item_ids) else None
@@ -963,6 +997,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                         request.query,
                         request.query_index,
                         query_item_id=request.query_item_id,
+                        transcript_item_id=request.transcript_item_id,
+                        user_item_sources=request.user_item_sources,
                         history_anchor_item_ids=request.history_anchor_item_ids,
                     )
                 )
@@ -1109,16 +1145,26 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         retained_queries = {-1: runtime_config.get("initial_user_text") or "", **user_queries}
         for _, frames, observation in groups:
             content = []
-            query_key = observation.query_item_id or observation.query_index
+            query_key = observation.transcript_item_id or observation.query_item_id or observation.query_index
+            observation_query = observation.query
+            if observation.transcript_item_id is not None:
+                source_id = dict(observation.user_item_sources).get(observation.transcript_item_id)
+                observation_query = (
+                    user_queries.get(observation.transcript_item_id, "")
+                    if source_id is not None
+                    and session_config.get("conversation_user_source_ids", {}).get(observation.transcript_item_id)
+                    == source_id
+                    else ""
+                )
             included_query_key = None
             # Text edits/deletions remain authoritative in Session.history.
             if (
-                observation.query
-                and (observation.query != last_query or query_key != last_query_key)
-                and retained_queries.get(query_key) == observation.query
+                observation_query
+                and (observation_query != last_query or query_key != last_query_key)
+                and retained_queries.get(query_key) == observation_query
             ):
-                content.append({"type": "text", "text": f"{USER_QUERY_HEADER}\n{observation.query}"})
-                last_query = observation.query
+                content.append({"type": "text", "text": f"{USER_QUERY_HEADER}\n{observation_query}"})
+                last_query = observation_query
                 last_query_key = included_query_key = query_key
             for frame in frames:
                 content.extend([{"type": "text", "text": f"<{frame.time_s:.1f} seconds>"}, {"type": "image"}])
@@ -1224,9 +1270,14 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             # An unheard visual reply still separates observations after cancellation.
             # Retain its empty Session item without inventing speech or restoring a deletion.
             if text or (role == "assistant" and item_key in response_refs):
+                content = text
+                if role == "assistant":
+                    # Even unheard replies need JoyAI's action token to close the
+                    # previous observation in the model's conversation format.
+                    content = "</response>" + (f" {text}" if text else "")
                 message = {
                     "role": role,
-                    "content": ("</response> " if role == "assistant" and text else "") + text,
+                    "content": content,
                     "_item_key": item_key,
                 }
                 if role == "user":
@@ -1462,6 +1513,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
         if stage_id != self.joyai_stage_id or not segment_finished:
             return None

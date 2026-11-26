@@ -1327,17 +1327,17 @@ class MiniMaxH3DiTModel(nn.Module):
             device=device,
             dtype=_BF16_DTYPE,
         )
-        embeddings.index_add_(
+        embeddings.index_copy_(
             0,
             text_local_pos,
             text_embed.to(_BF16_DTYPE)[: text_local_pos.shape[0]],
         )
-        embeddings.index_add_(
+        embeddings.index_copy_(
             0,
             img_local_pos,
             video_embed.to(_BF16_DTYPE)[: img_local_pos.shape[0]],
         )
-        embeddings.index_add_(
+        embeddings.index_copy_(
             0,
             audio_local_pos,
             audio_embed.to(_BF16_DTYPE)[: audio_local_pos.shape[0]],
@@ -1658,7 +1658,10 @@ class MiniMaxH3DiTModel(nn.Module):
         if getattr(self, "adaln_cache", None) is not None:
             self.adaln_cache.prepare(t_emb)
 
+        last_block = len(self.blocks) - 1
+        handover = {}
         for block_index, block in enumerate(self.blocks):
+            defer_gate = block_index < last_block and block_index not in hints
             hidden = block(
                 hidden,
                 t_emb=t_emb,
@@ -1674,7 +1677,13 @@ class MiniMaxH3DiTModel(nn.Module):
                 reference_kv_compact=compact_reference,
                 reference_isolation=reference_isolation,
                 vdn_window=vdn_window,
+                **handover,
+                **({"defer_gate": True} if defer_gate else {}),
             )
+            handover = {}
+            if defer_gate:
+                hidden, pending_gate = hidden
+                handover = {"pending_gate": pending_gate}
             if block_index in hints:
                 hidden = hidden + hints.pop(block_index) * control_scale
         if local_len == seq_len:

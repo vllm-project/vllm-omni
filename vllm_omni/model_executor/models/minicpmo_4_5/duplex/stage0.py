@@ -31,7 +31,6 @@ logger = init_logger(__name__)
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
-_MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
 _MINICPMO45_FRAME_POOL_LOCK = Lock()
 _MINICPMO45_FRAME_POOL: ThreadPoolExecutor | None = None
 
@@ -396,18 +395,23 @@ class MiniCPMO45Stage0DuplexRuntime:
         *,
         video_frames: list[Image.Image] | None = None,
         encoded_frames: list[list[torch.Tensor]] | None = None,
+        input_text_token_ids: list[int] | None = None,
         epoch: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
+        force_listen: bool = False,
         stage0_window: dict[str, object] | None = None,
+        text_token_ids: list[int] | None = None,
     ) -> _PrefillSteps:
-        """Build scheduler-owned Stage0 input embeddings for one audio append.
+        """Build scheduler-owned Stage0 input embeddings for one input unit.
 
         Unlike the legacy worker-control path, this method never calls an eager
         model forward. The normal vLLM runner consumes the returned embeddings
         and owns attention metadata, block tables, KV cache, and sampling.
         Yields each unit's encoder request; the caller sends back its embeddings.
         """
+        import torch
+
         start_time = time.time()
         processor = self._configure_streaming_processor(state)
         append_identity = (epoch, seq) if seq is not None else None
@@ -433,8 +437,11 @@ class MiniCPMO45Stage0DuplexRuntime:
                 # the scheduler's canonical boundary, just like its content.
                 state.pending_terminator_token = completed_terminator
         num_frames = len(encoded_frames) if encoded_frames is not None else len(video_frames or ())
+        # Client TEXT units are separate from server-owned result tokens
+        # appended after the unit's media embeddings below.
+        has_text = bool(input_text_token_ids)
         vision_only = audio_waveform is None or len(audio_waveform) == 0
-        if vision_only and not num_frames:
+        if vision_only and not num_frames and not has_text:
             return self._stage_prefill_result(False, start_time, "empty audio")
         if not vision_only:
             state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
@@ -567,6 +574,12 @@ class MiniCPMO45Stage0DuplexRuntime:
                 token_ids.extend(
                     [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
                 )
+            if input_text_token_ids and units_built == 0:
+                # Match native streaming_prefill(text_list=...): raw text after
+                # this unit's media, without a new chat template or audio clock.
+                text_ids = torch.tensor(input_text_token_ids, dtype=torch.long, device=self._model_device())
+                embed_parts.append(self._token_embedder()(text_ids))
+                token_ids.extend(input_text_token_ids)
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             units_built += 1
@@ -576,13 +589,31 @@ class MiniCPMO45Stage0DuplexRuntime:
                 state.pending_window_unit.embeds.extend(embed_parts[unit_embed_start:])
                 state.pending_window_unit.token_ids.extend(token_ids[unit_token_start:])
             chunk_size = self._streaming_chunk_size(processor)
-        # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
-        # turn is opened once at session init; re-emitting the turn-open prefix per chunk
+        if text_token_ids and units_built:
+            # Official mixed-mode prefill puts <backend> text after the media
+            # and samples from its final token, in the same resident KV.
+            import torch
+
+            ids = torch.tensor(text_token_ids, dtype=torch.long, device=self._model_device())
+            text_embeds = self._as_2d_tensor(self._token_embedder()(ids))
+            embed_parts.append(text_embeds)
+            token_ids.extend(text_token_ids)
+            if state.pending_window_unit is not None:
+                state.pending_window_unit.embeds.append(text_embeds)
+                state.pending_window_unit.token_ids.extend(text_token_ids)
+            state.pending_speech_context = True
+            state.pending_speech_append_identity = append_identity
+            # A server-owned result resumes the assistant after delegation,
+            # even if the model already ended that turn. Match a seeded
+            # response's open-turn state so silence advances the answer until
+            # its next turn_eos instead of leaving it in the listening loop.
+            state.current_turn_ended = False
+            state.pending_speech_response_open = True
+        # Match official streaming_prefill: a unit carries media and optional text.
+        # The assistant turn opens once at session init; re-emitting its prefix per chunk
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
         # model-generated and tracked via current_turn_ended (mirrors streaming_generate).
         prompt_suffix_len = 0
-
-        import torch
 
         window_result = self._window_replacement_parts(state, stage0_window)
         if window_result is not None:
@@ -600,16 +631,23 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "runner_kv_backed": True,
                 "runtime_impl": "scheduler_data_plane",
                 "stage0_window_replaced": window_result is not None,
+                "text_input": has_text and not force_listen,
             }
         )
         # Standalone VISION input can open a response without speech. Camera
         # frames accompanying silent audio must retain the OMNI speech gate:
         # otherwise every frame can re-open a completed conversation turn.
-        if (is_speech or (vision_only and num_frames)) and (
+        if (is_speech or has_text or (vision_only and num_frames)) and (
             append_identity is None or state.pending_speech_append_identity != append_identity
         ):
             state.pending_speech_context = True
             state.pending_speech_append_identity = append_identity
+            if has_text and not force_listen and state.current_turn_ended:
+                # Like the initial text prompt, an unforced fragment opens an
+                # assistant turn. Apply this once at prefill, never on each
+                # decode step: turn_eos must keep the turn closed afterward.
+                state.current_turn_ended = False
+                state.pending_speech_response_open = True
         if append_identity is not None:
             state.prepared_append_identity = append_identity
             state.prepared_inputs_embeds = inputs_embeds
@@ -1187,6 +1225,8 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "chunk_eos_token_id": self.chunk_eos_token_id,
                 "chunk_tts_eos_token_id": self.chunk_tts_eos_token_id,
                 "turn_eos_token_id": self.turn_eos_token_id,
+                "delegate_open_token_id": getattr(self, "delegate_open_token_id", -1),
+                "delegate_close_token_id": getattr(self, "delegate_close_token_id", -1),
             }.items()
             if isinstance(value, int) and value >= 0
         }
@@ -1196,27 +1236,12 @@ class MiniCPMO45Stage0DuplexRuntime:
         if not model_path:
             return None
         try:
-            from transformers import AutoImageProcessor, AutoProcessor
+            from transformers import AutoProcessor
 
-            original_register = AutoImageProcessor.register
+            from vllm_omni.model_executor.models.minicpmo_4_5.processor import legacy_image_processor_registration
 
-            def register_image_processor(config_class, *args, **kwargs):
-                # The checkpoint's auto_map already loads this class. Its
-                # legacy string registration is incompatible with some
-                # Transformers versions and is otherwise redundant.
-                if config_class == "MiniCPMVImageProcessor":
-                    return None
-                return original_register(config_class, *args, **kwargs)
-
-            with _MINICPMO45_PROCESSOR_LOAD_LOCK:
-                setattr(AutoImageProcessor, "register", staticmethod(register_image_processor))
-                try:
-                    processor = AutoProcessor.from_pretrained(
-                        model_path,
-                        trust_remote_code=True,
-                    )
-                finally:
-                    setattr(AutoImageProcessor, "register", staticmethod(original_register))
+            with legacy_image_processor_registration():
+                processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         except Exception as exc:
             raise RuntimeError(f"Failed to load MiniCPM-o duplex processor from {model_path!r}") from exc
         if getattr(processor, "tokenizer", None) is None:
@@ -1291,7 +1316,7 @@ class MiniCPMO45Stage0DuplexRuntime:
     @staticmethod
     def _decode_audio_payload(payload: dict[str, object]) -> NDArray[np.float32]:
         audio = payload.get("audio") or payload.get("data")
-        if not audio and payload.get("video_frames"):
+        if not audio and (payload.get("video_frames") or payload.get("text_token_ids")):
             return np.empty(0, dtype=np.float32)
         if not isinstance(audio, str):
             raise ValueError("audio append payload requires base64 audio")

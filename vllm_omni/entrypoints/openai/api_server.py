@@ -37,11 +37,11 @@ from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.common.cli_args import make_arg_parser, resolve_default_chat_template_kwargs
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
+from vllm.entrypoints.launchers.app import build_app as build_openai_app
 from vllm.entrypoints.launchers.launcher import serve_http
+from vllm.entrypoints.launchers.launcher import setup_server as setup_openai_server
 from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
-from vllm.entrypoints.openai.api_server import build_app as build_openai_app
-from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
 from vllm.entrypoints.openai.chat_completion.protocol import (
     BatchChatCompletionRequest,
     ChatCompletionRequest,
@@ -685,6 +685,7 @@ def _should_serve_duplex(model: str, kwargs: dict[str, Any]) -> bool:
         model=model,
         trust_remote_code=bool(kwargs.get("trust_remote_code")),
         deploy_config_path=kwargs.get("deploy_config"),
+        revision=kwargs.get("revision"),
     )
     if pipeline_config is None or not getattr(pipeline_config, "duplex_plugin", None):
         return False
@@ -755,7 +756,7 @@ async def build_async_omni_from_stage_config(
             saved = os.environ.get("CUDA_VISIBLE_DEVICES")
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
             try:
-                AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+                AutoConfig.from_pretrained(args.model, trust_remote_code=True, revision=getattr(args, "revision", None))
             finally:
                 if saved is not None:
                     os.environ["CUDA_VISIBLE_DEVICES"] = saved

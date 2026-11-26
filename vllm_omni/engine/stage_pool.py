@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from vllm.logger import init_logger
+from vllm.outputs import PoolingRequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.output_processor import RequestState
@@ -38,6 +39,7 @@ from vllm_omni.engine import (
     OmniEngineCoreOutputs,
     PayloadSenderInfo,
 )
+from vllm_omni.engine.messages import TextInputUpdate
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     DiffusionSubmitKwargs,
@@ -1420,6 +1422,8 @@ class StagePool:
         return self._has_non_empty_output(request_output)
 
     def _has_non_empty_output(self, request_output: Any) -> bool:
+        if isinstance(request_output, PoolingRequestOutput):
+            return self._is_non_empty_value(request_output.outputs.data)
         final_output_type = getattr(request_output, "final_output_type", None)
         if final_output_type is None:
             final_output_type = getattr(self.stage_client, "final_output_type", None)
@@ -1770,6 +1774,15 @@ class StagePool:
                         )
                 raise
         return replica_id
+
+    async def append_text(self, update: TextInputUpdate) -> None:
+        """Route only to the replica already owning this active request."""
+        replica_id = self.get_bound_replica_id(update.request_id)
+        if self.stage_type == "diffusion":
+            raise ValueError("Text input append requires an AR stage")
+        if replica_id is None or self.clients[replica_id] is None:
+            raise StageUnavailableError(f"No active replica binding for input append: {update.request_id}")
+        await self._llm_client(replica_id).append_text_async(update)
 
     async def submit_interaction(
         self,

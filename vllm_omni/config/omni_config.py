@@ -303,6 +303,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     allgather_degree: int
     ulysses_mode: str
     ulysses_a2a_permute: bool
+    ulysses_overlap_chunks: int
     cfg_parallel_size: int
     vae_patch_parallel_size: int
     vae_parallel_mode: str
@@ -905,6 +906,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     allgather_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
     ulysses_a2a_permute: bool = False
+    ulysses_overlap_chunks: int = Field(default=0, ge=0)
     cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
     text_encoder_tp_size: int = Field(default=1, ge=1)
@@ -1096,6 +1098,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     enable_cfg_batching: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_stack_tiles: bool = True
     vae_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
     vae_encode_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
     mask_strategy_file_path: str | None = None
