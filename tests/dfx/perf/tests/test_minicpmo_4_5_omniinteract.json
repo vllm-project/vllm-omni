@@ -5,7 +5,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": ["H100", "L20X"]
+            "cuda": ["H100", "H200"]
           },
           "num_cards": 2
         }
@@ -72,7 +72,7 @@
           "duplex_stall_ratio"
         ],
         "baseline": {
-          "L20X": {
+          "H200": {
             "mean_duplex_busy_rtf": [
               2.9727
             ]
@@ -115,7 +115,7 @@
           "duplex_stall_ratio"
         ],
         "baseline": {
-          "L20X": {
+          "H200": {
             "mean_duplex_busy_rtf": [
               0.9506
             ]
@@ -158,7 +158,7 @@
           "duplex_stall_ratio"
         ],
         "baseline": {
-          "L20X": {
+          "H200": {
             "mean_duplex_busy_rtf": [
               0.7246
             ]
@@ -166,6 +166,6 @@
         }
       }
     ],
-    "description": "L20X Busy RTF references use equal daily means from 2026-11-18 and 2026-11-23 at C8/N8, separately for 1q1a, 1q1a_math and 1qna. This is a provisional two-day calibration with higher variability permitted. L20X is a distinct device and these values do not calibrate H200 or the newer N60 workload. The pooled IA-QTF1 floor passed on both dates; the weak 1qna subset scores remain a quality limitation. Source: JiusiServe/omni-reviewbot@2b499afbfc2719740a1869ac20b5c5b9afafde10."
+    "description": "H200 Busy RTF references use equal daily means from 2026-11-18 and 2026-11-23 at C8/N8, separately for 1q1a, 1q1a_math and 1qna. This is a provisional two-day calibration with higher variability permitted. The confirmed local H200 host reports L20X; the performance archive canonicalizes that host label to H200 while retaining the raw label. Runtime hardware detection is unchanged. H100 calibration remains pending, and these N8 values do not calibrate the newer N60 workload. The pooled IA-QTF1 floor passed on both dates; weak 1qna scores remain a quality limitation. Source: JiusiServe/omni-reviewbot@2b499afbfc2719740a1869ac20b5c5b9afafde10."
   }
 ]
