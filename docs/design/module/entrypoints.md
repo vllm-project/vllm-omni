@@ -102,7 +102,8 @@ This document owns offline API semantics, CLI and serve composition,
 supported OpenAI-compatible routes, request validation and normalization,
 response conversion, streaming/session behavior, and engine handoff.
 
-An explicit model revision applies to startup prefetch and pipeline discovery.
+An explicit model revision applies to startup prefetch, pipeline discovery,
+and the frontend's fallback lookup of diffusion pipeline metadata.
 In Hugging Face offline mode, these steps use the cached snapshot for that
 revision.
 
