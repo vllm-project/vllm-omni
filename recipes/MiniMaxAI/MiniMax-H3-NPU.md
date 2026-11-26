@@ -672,11 +672,10 @@ per-clip tile assignment, gather/blend order, temporal padding and one posterior
 sample. The flag follows the legacy preparation flag syntax. It defaults to
 `0`, ignores case and surrounding whitespace, and is disabled by an empty
 value, `0`, `false`, or `off`. Other values, including `1`, `true`, and `on`,
-enable it. The accelerator path has been validated on Ascend NPUs. CUDA
-deployments use ordinary preparation. Unsupported checkpoint configurations
-also use ordinary preparation, and `VLLM_OMNI_VAE_ENCODE_LEGACY_PREP=1` takes
-precedence. If tile streaming is enabled and skipped, the worker logs the
-reason once.
+enable it on CPU and Ascend NPUs. CUDA, ROCm, XPU, and other devices use
+ordinary preparation, as do unsupported checkpoint configurations.
+`VLLM_OMNI_VAE_ENCODE_LEGACY_PREP=1` takes precedence. Workers log the reason
+when they skip the streamed path or fall back after a local encoding failure.
 
 On one Ascend 950PR card (256x448, 33 frames, real weights) the streamed path
 produced bit-identical encoder rows and lowered peak allocated device memory
@@ -688,4 +687,20 @@ encode's allocator peak fell by 1.6 GiB allocated and 2.2 GiB reserved
 (31.8%/32.4%) against baseline `085d7dba3` for candidate `5e4f260d`. These are
 PyTorch/NPU allocator high-water marks for the encode stage, not device HBM
 peaks. VAE latency stayed inside the 3% gate with a 95% confidence interval
-that included zero, so no speed-up is claimed.
+that included zero.
+
+The eight-rank run used one public Ref2VA request at a time, the FP32 video
+encoder with FP16 latent output, and the checkpoint's native spatial tile
+geometry with VAE patch parallel size 8. Both arms used USP 8, ring 1,
+text-encoder TP 8, eager execution, and layer offload. The baseline used
+ordinary preparation and the candidate set `VLLM_OMNI_H3_VAE_STREAM_TILE=1`.
+The ABBA run collected ten formal VAE encode samples and six formal HTTP
+requests at 50 inference steps per arm after block warm-ups. VAE device-event
+time and allocator peaks were taken as the maximum across the eight ranks per
+request. The median paired device-event change was -1.29% (95% percentile
+bootstrap CI -1.46% to +0.56%, 10,000 resamples).
+
+The [validation archive](https://github.com/cflin27/iskill-archive/blob/cc5f986ec608dbecd85743acbac95567d9cd43d4/materials/prs/vllm-omni-11003-h3-stream-tile/validation-and-benefit.md)
+links the pinned serving recipe and public fixture and gives the request
+parameters and measurement boundaries. The experimental timing harness was
+unpublished. These measurements apply to the commit pair above.

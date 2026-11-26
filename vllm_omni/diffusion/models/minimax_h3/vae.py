@@ -1127,7 +1127,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
         The supported CNN path has no class-token aggregation or isolated
         frames. All other checkpoint contracts retain ordinary preparation.
-        Collectives run once per clip, exactly as in native tiled_encode.
+        Each clip keeps the native tile gather order.
         """
         model = self.model
         if device.type not in ("cpu", "npu"):
@@ -1137,13 +1137,14 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if metadata is None:
             logger.info_once("MiniMax H3 video tile streaming skipped: unsupported frame or preprocessing layout.")
             return None
+        encoder = getattr(model, "encoder", None)
         if (
             model.training
             or not getattr(model, "encoder_tiling", False)
             or getattr(model, "encoder_parallel", False)
             or getattr(model, "stack_tiling", False)
-            or model.encoder.__class__.__name__ != "EncoderFCN3D"
-            or hasattr(model.encoder, "loss_info")
+            or not any(cls.__name__ == "EncoderFCN3D" for cls in type(encoder).__mro__)
+            or hasattr(encoder, "loss_info")
             or any(
                 getattr(model, name, False)
                 for name in ("isolated_first_frame", "isolated_last_frame", "isolated_key_frame")
@@ -1182,48 +1183,84 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if tile_count < world:
             logger.info_once("MiniMax H3 video tile streaming skipped: fewer spatial tiles than participating ranks.")
             return None
-        mean_t = torch.as_tensor(mean, dtype=torch.float32, device=device).view(3, 1, 1, 1)
-        std_t = torch.as_tensor(std, dtype=torch.float32, device=device).view(3, 1, 1, 1)
+        group = state["sp_process_group"] if world > 1 else None
+        failed = torch.zeros(1, dtype=torch.int32, device=device) if world > 1 else None
+        local_error: str | None = None
+
+        @contextmanager
+        def local_work() -> Iterator[None]:
+            nonlocal local_error
+            try:
+                yield
+            except Exception as exc:
+                local_error = f"{type(exc).__name__}: {exc}"
+
+        def should_fall_back() -> bool:
+            # Make the same fallback decision on every rank before entering
+            # another collective. Communication errors propagate to the caller.
+            if failed is not None:
+                if local_error is not None:
+                    failed.fill_(1)
+                dist.all_reduce(failed, group=group)
+                if not failed.item():
+                    return False
+            elif local_error is None:
+                return False
+            reason = local_error if local_error is not None else "local work failed on another VAE rank"
+            logger.warning_once("MiniMax H3 video tile streaming failed; using ordinary preparation: %s", reason)
+            return True
+
+        with local_work():
+            mean_t = torch.as_tensor(mean, dtype=torch.float32, device=device).view(3, 1, 1, 1)
+            std_t = torch.as_tensor(std, dtype=torch.float32, device=device).view(3, 1, 1, 1)
         total = used + (-used) % clip_length
         last_real = min(used, len(frames)) - 1
         clips: list[torch.Tensor] = []
         ratio = int(model.vae_ratio)
         for start in range(0, total, clip_length):
-            indices = np.minimum(np.arange(start, start + clip_length), last_real)
             tasks = []
-            for index in range(rank, tile_count, world):
-                row, col = divmod(index, len(x_idx))
-                y, x = top + y_idx[row], left + x_idx[col]
-                host = np.ascontiguousarray(frames[indices, y : y + y_len[row], x : x + x_len[col]])
-                tile = torch.from_numpy(host).to(device=device)
-                tile = tile.permute(3, 0, 1, 2).float().div_(255.0).sub_(mean_t).div_(std_t)
-                tasks.append(model.encode(tile.unsqueeze(0).contiguous()))
+            if local_error is None:
+                with local_work():
+                    indices = np.minimum(np.arange(start, start + clip_length), last_real)
+                    for index in range(rank, tile_count, world):
+                        row, col = divmod(index, len(x_idx))
+                        y, x = top + y_idx[row], left + x_idx[col]
+                        host = np.ascontiguousarray(frames[indices, y : y + y_len[row], x : x + x_len[col]])
+                        tile = torch.from_numpy(host).to(device=device)
+                        tile = tile.permute(3, 0, 1, 2).float().div_(255.0).sub_(mean_t).div_(std_t)
+                        tasks.append(model.encode(tile.unsqueeze(0).contiguous()))
+            if should_fall_back():
+                return None
             if world > 1:
-                dist.barrier(group=state["sp_process_group"])
                 encoded = model._all_gather_tiled_results(tasks, tile_count)
             else:
                 encoded = tasks
-            rows = []
-            for row in range(len(y_idx)):
-                columns = []
-                for col in range(len(x_idx)):
-                    index = row * len(x_idx) + col
-                    value = encoded[index]
-                    if row > 0:
-                        value = model.blend(encoded[index - len(x_idx)], value, y_overlap[row - 1] // ratio, dim=-2)
-                    if col > 0:
-                        value = model.blend(encoded[index - 1], value, x_overlap[col - 1] // ratio, dim=-1)
-                    if row < len(y_idx) - 1:
-                        value = value[..., : -(y_overlap[row] // ratio), :]
-                    if col < len(x_idx) - 1:
-                        value = value[..., :, : -(x_overlap[col] // ratio)]
-                    columns.append(value)
-                rows.append(torch.cat(columns, dim=-1))
-            clips.append(torch.cat(rows, dim=-2))
-        moments = torch.cat(clips, dim=2)
-        if model.token_drop > 0:
-            moments = moments[:, :, : -int(model.token_drop)]
-        return sample(moments).sample().squeeze(0).contiguous().half()
+            with local_work():
+                rows = []
+                for row in range(len(y_idx)):
+                    columns = []
+                    for col in range(len(x_idx)):
+                        index = row * len(x_idx) + col
+                        value = encoded[index]
+                        if row > 0:
+                            value = model.blend(encoded[index - len(x_idx)], value, y_overlap[row - 1] // ratio, dim=-2)
+                        if col > 0:
+                            value = model.blend(encoded[index - 1], value, x_overlap[col - 1] // ratio, dim=-1)
+                        if row < len(y_idx) - 1:
+                            value = value[..., : -(y_overlap[row] // ratio), :]
+                        if col < len(x_idx) - 1:
+                            value = value[..., :, : -(x_overlap[col] // ratio)]
+                        columns.append(value)
+                    rows.append(torch.cat(columns, dim=-1))
+                clips.append(torch.cat(rows, dim=-2))
+        latent = None
+        if local_error is None:
+            with local_work():
+                moments = torch.cat(clips, dim=2)
+                if model.token_drop > 0:
+                    moments = moments[:, :, : -int(model.token_drop)]
+                latent = sample(moments).sample().squeeze(0).contiguous().half()
+        return None if should_fall_back() else latent
 
     @torch.inference_mode()
     def encode_video(
@@ -1260,7 +1297,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 stream_tile = _env_flag_enabled(_VAE_STREAM_TILE_ENV)
                 if isinstance(frames, np.ndarray) and not legacy_prep:
                     if stream_tile:
-                        latent = self._stream_encode_video_tiles(frames, parameter.device)
+                        # Restore the seeded state if a streamed posterior was
+                        # sampled on some ranks before the group chose fallback.
+                        with torch.random.fork_rng(devices=devices, device_type=parameter.device.type):
+                            latent = self._stream_encode_video_tiles(frames, parameter.device)
                     if latent is None:
                         prepared = self._stream_prepare_video_tensor(frames, parameter.device)
                 elif stream_tile:

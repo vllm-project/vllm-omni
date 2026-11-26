@@ -139,16 +139,21 @@ def test_only_assigned_tiles_are_uploaded_and_each_clip_gathers(monkeypatch, ran
     vae.model.parallel_tiling = True
     group = object()
     vae._native_parallel_state = lambda: {"sp_rank": rank, "sp_size": 3, "sp_process_group": group}
-    barriers: list[dict] = []
+    collectives = []
     gathered: list[int] = []
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.minimax_h3.vae.dist.barrier", lambda **kwargs: barriers.append(kwargs)
-    )
+
+    def agree(failed, *, group):
+        assert group is vae._native_parallel_state()["sp_process_group"]
+        assert failed.item() == 0
+        collectives.append("agree")
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.minimax_h3.vae.dist.all_reduce", agree)
     y_idx, _, _ = vae.model.split_tiles(expected.shape[-2])
     x_idx, _, _ = vae.model.split_tiles(expected.shape[-1])
     all_inputs = []
 
     def gather(tasks, tile_count):
+        collectives.append("gather")
         start = len(gathered) * 4
         inputs = [expected[:, :, start : start + 4, y : y + 4, x : x + 4] for y in y_idx for x in x_idx]
         assert tile_count == len(inputs)
@@ -161,11 +166,57 @@ def test_only_assigned_tiles_are_uploaded_and_each_clip_gathers(monkeypatch, ran
     vae.model._all_gather_tiled_results = gather
     latent = vae._stream_encode_video_tiles(frames, torch.device("cpu"))
     assert latent is not None
-    assert len(barriers) == len(gathered) == 2
+    assert collectives == ["agree", "gather", "agree", "gather", "agree"]
     assert len(vae.model.inputs) == len(all_inputs) == 8
     for actual, reference in zip(vae.model.inputs, all_inputs, strict=True):
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
     torch.testing.assert_close(latent, expected.squeeze(0).half(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("failure", ["local", "peer", "reduce", "gather"])
+def test_parallel_tile_failure_before_blend(monkeypatch, failure):
+    vae = _vae()
+    group = object()
+    vae.model.parallel_tiling = True
+    vae._native_parallel_state = lambda: {"sp_rank": 0, "sp_size": 2, "sp_process_group": group}
+    collectives = []
+
+    def fail_encode(value):
+        raise RuntimeError("local tile encode failed")
+
+    def agree(failed, *, group):
+        collectives.append("agree")
+        assert failed.item() == int(failure == "local")
+        if failure == "peer":
+            failed.fill_(1)
+        if failure == "reduce":
+            raise RuntimeError("status reduction failed")
+
+    def gather(tasks, tile_count):
+        collectives.append("gather")
+        raise RuntimeError("tile gather failed")
+
+    if failure == "local":
+        vae.model.encode = fail_encode
+    vae.model._all_gather_tiled_results = gather
+    monkeypatch.setattr("vllm_omni.diffusion.models.minimax_h3.vae.dist.all_reduce", agree)
+    if failure in ("reduce", "gather"):
+        with pytest.raises(RuntimeError, match="failed"):
+            vae._stream_encode_video_tiles(_frames(), torch.device("cpu"))
+    else:
+        assert vae._stream_encode_video_tiles(_frames(), torch.device("cpu")) is None
+    assert collectives == (["agree", "gather"] if failure == "gather" else ["agree"])
+    assert DiagonalGaussianDistribution.calls == 0
+
+
+def test_encoder_subclass_can_stream_tiles():
+    class EncoderSubclass(EncoderFCN3D):
+        pass
+
+    vae, frames = _vae(), _frames()
+    vae.model.encoder = EncoderSubclass()
+    latent = vae._stream_encode_video_tiles(frames, torch.device("cpu"))
+    torch.testing.assert_close(latent, _reference(vae, frames).squeeze(0).half(), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -270,3 +321,24 @@ def test_enabled_encode_falls_back_to_whole_video_preparation(monkeypatch):
     assert rows.shape == (8 * 4 * 5, 12)
     assert vae.model.inputs == []
     assert messages == ["MiniMax H3 video tile streaming skipped: unsupported checkpoint encoder layout."]
+
+
+def test_fallback_after_sampling_reuses_seeded_rng_state(monkeypatch):
+    vae, frames = _vae(), _frames()
+    monkeypatch.setenv("VLLM_OMNI_VAE_ENCODE_LEGACY_PREP", "0")
+
+    def stream_then_fall_back(frames, device):
+        torch.randn(1, device=device)
+        return None
+
+    def encode_videos(videos, *, use_fp16_latent):
+        return [torch.randn_like(videos[0][:, :, :8, :10]).half()]
+
+    vae._stream_encode_video_tiles = stream_then_fall_back
+    vae.model.encode_videos = encode_videos
+    monkeypatch.setenv("VLLM_OMNI_H3_VAE_STREAM_TILE", "0")
+    expected, expected_shape = vae.encode_video(frames)
+    monkeypatch.setenv("VLLM_OMNI_H3_VAE_STREAM_TILE", "1")
+    actual, actual_shape = vae.encode_video(frames)
+    assert actual_shape == expected_shape
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
