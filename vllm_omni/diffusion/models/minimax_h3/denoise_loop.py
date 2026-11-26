@@ -9,6 +9,8 @@ rows stay pinned to their noised step-0 anchors.
 
 from __future__ import annotations
 
+import logging
+import math
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
@@ -28,6 +30,7 @@ from vllm_omni.diffusion.sampler import SamplingState, sampler_object
 from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit
+from .packed_sequence import MINIMAX_H3_SEQ_ALIGN
 from .reference_isolation import MiniMaxH3ReferenceIsolation, reference_isolation_enabled
 from .sampling import MiniMaxH3Model, MiniMaxH3ModelBatch
 
@@ -38,6 +41,7 @@ MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
 # (24 * 1 * 2 * 2 = 96); audio rows carry the 32-dim audio latent.
 MINIMAX_H3_VIDEO_ROW_WIDTH = 96
 MINIMAX_H3_AUDIO_ROW_WIDTH = 32
+_LOG = logging.getLogger(__name__)
 
 
 def minimax_h3_publish_denoise_progress(
@@ -183,6 +187,69 @@ class MiniMaxH3DenoiseBranch:
                 prefix_len=int(packed["video_row_start"]),
                 latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
             )
+
+    def prepare_reference_kv_sp_padding(self, model: Any) -> None:
+        """Reserve only padding that compact reference-KV SP may need.
+
+        Real rows keep their original positions. On reuse, the transformer
+        removes at most SP-1 trailing padding rows to make equal SP shards.
+        Do this before RoPE preparation and before any reference-KV capture.
+        """
+        config = getattr(model, "od_config", None)
+        if not reference_isolation_enabled(config) and getattr(config, "kv_offload_config", None) is None:
+            return
+        local_span = getattr(model, "_rope_local_span", None)
+        if not callable(local_span):
+            return
+        _, local_len = local_span(self.seq_len)
+        if local_len == self.seq_len:
+            return
+        if local_len <= 0 or self.seq_len % local_len:
+            raise ValueError("reference-KV requires equal original SP shards")
+        sp_size = self.seq_len // local_len
+        reference_rows = int((~self.update_mask).sum())
+        trim = (self.seq_len - reference_rows) % sp_size
+        if trim <= self.seq_len - self.used_len:
+            return
+
+        # Keep both the existing 64-row packing buckets and SP alignment.
+        alignment = math.lcm(MINIMAX_H3_SEQ_ALIGN, sp_size)
+        old_len = self.seq_len
+        self.seq_len = ((self.used_len + trim + alignment - 1) // alignment) * alignment
+        extra = self.seq_len - old_len
+        self.x_base = torch.cat(
+            (self.x_base, self.x_base.new_zeros((1, extra, self.x_base.shape[-1]))),
+            dim=1,
+        )
+        self.audio_x_base = torch.cat(
+            (
+                self.audio_x_base,
+                self.audio_x_base.new_zeros((1, extra, self.audio_x_base.shape[-1])),
+            ),
+            dim=1,
+        )
+        self.token_tags_dev = torch.cat((self.token_tags_dev, self.token_tags_dev.new_full((extra,), -1)))
+        self.timestep_group_dev = torch.cat((self.timestep_group_dev, self.timestep_group_dev.new_zeros((extra,))))
+        self.timestep_groups_present = tuple(sorted({0, *self.timestep_groups_present}))
+        self.img_position_ids_dev = torch.cat(
+            (self.img_position_ids_dev, self.img_position_ids_dev.new_zeros((extra, 3)))
+        )
+        self.static_kwargs["token_tags"] = self.token_tags_dev
+        self.static_kwargs["img_position_ids"] = self.img_position_ids_dev[None]
+        packed_params = dict(self.static_kwargs["packed_seq_params"])
+        cu = packed_params["cu_seqlens_q"].clone()
+        cu[-1] = self.seq_len
+        packed_params["cu_seqlens_q"] = cu
+        self.static_kwargs["packed_seq_params"] = packed_params
+        self.static_kwargs.pop("rope_table", None)
+        _LOG.info(
+            "MiniMax H3 reference-KV SP padding: original=%d padded=%d used=%d reference=%d sp=%d",
+            old_len,
+            self.seq_len,
+            self.used_len,
+            reference_rows,
+            sp_size,
+        )
 
     def prepare_rope_table(self, model: Any) -> None:
         """Materialize the branch-local DiT RoPE table once per denoise run.
@@ -437,6 +504,7 @@ def minimax_h3_denoise_loop(
         raise ValueError("video/audio sigma schedules must have equal length")
     if len(sigmas_video) < 2:
         raise ValueError("sigma schedules need at least 2 entries")
+    positive.prepare_reference_kv_sp_padding(model)
     # Keep CUDA/CPU on the reference path: its accuracy CI compares the
     # generated video against the official artifact. The table reuse is an
     # Ascend-specific performance optimization and must not alter that path.
