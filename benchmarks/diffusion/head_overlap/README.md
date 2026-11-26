@@ -1,7 +1,9 @@
 # Adaptive head overlap for dense diffusion attention
 
 This offline experiment compares native Ulysses with an adaptive head split on a single NVLink node.
-Both arms use grouped CE, packed QKV, the same graph boundary and the same inputs.
+Both engines enable `ulysses_a2a_permute` and set `VLLM_OMNI_PACKED_QKV=1`. With permute enabled,
+the native baseline uses the grouped Q/K/V CE exchange. A selected split sends the Q, K and V head
+slices for each peer through the fixed-chunk CE runner. Both engines use the same graph boundary and inputs.
 
 Enable the runtime policy with `--ulysses-a2a-backend copy_engine --ulysses-overlap-chunks auto`. The worker attaches
 one policy to each declared DiT component. An eligible native forward discovers actual layouts. Later real
