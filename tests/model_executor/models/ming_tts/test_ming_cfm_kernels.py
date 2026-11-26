@@ -13,6 +13,7 @@ from vllm_omni.model_executor.models.common.ming import cfm_kernels
 from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
 from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import CFMGraphExecutor, CFMSampler
 from vllm_omni.model_executor.models.common.ming.cfm_dit import DiT
+from vllm_omni.model_executor.models.common.ming.cfm_head import FlowLoss
 from vllm_omni.model_executor.models.common.ming.cfm_kernels import (
     MAX_FUSED_ATTN_SEQ_LEN,
     cfm_qkv_rope_attn_supported,
@@ -20,6 +21,8 @@ from vllm_omni.model_executor.models.common.ming.cfm_kernels import (
     fused_cfm_euler_sde_step,
 )
 from vllm_omni.model_executor.models.common.ming.cfm_solver import build_timesteps
+from vllm_omni.model_executor.models.ming_tts.config_ming_tts import MingTTSConfig
+from vllm_omni.model_executor.models.ming_tts.ming_tts_llm import MingLLMModel
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.tts]
@@ -235,3 +238,83 @@ def test_cfm_sampler_fast_matches_native_and_replays_in_cudagraph(
     assert compiles == []
     assert graph_out[0].shape == (3, patch_size, 16)
     torch.testing.assert_close(graph_out[0], got.to(torch.bfloat16), atol=1e-2, rtol=1e-2)
+
+
+@nvidia_cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.inference_mode()
+def test_maybe_build_cfm_graph_with_real_flowloss_skips_compile_and_captures(monkeypatch: pytest.MonkeyPatch):
+    """Regression test: FlowLoss.cfm is a plain nn.Module, not a CFMSampler."""
+    torch.manual_seed(3)
+    flowloss = (
+        FlowLoss(
+            z_channels=16,
+            llm_cond_dim=32,
+            hidden_size=128,
+            depth=2,
+            num_heads=2,
+            mlp_ratio=2.0,
+            dropout=0.0,
+            attn_mask_enabled=False,
+        )
+        .to(device="cuda", dtype=torch.bfloat16)
+        .eval()
+    )
+    for block in flowloss.cfm.model.blocks:
+        block.attn.short_attention = True
+        block.mlp.fused_gelu = True
+
+    model = object.__new__(MingLLMModel)
+    torch.nn.Module.__init__(model)
+    model.ming_config = MingTTSConfig(llm_hidden_size=32, history_patch_size=1, latent_dim=16, patch_size=1)
+    model.fm_dtype = torch.bfloat16
+    model._dense_single_frame = True
+    model._cfm_graph_enabled = True
+    model._cfm_graphs = {}
+    model._cfm_graph_failed_batch_sizes = set()
+    model._cfm_graph_warmed_up = False
+    model._cfm_graph_batch_sizes = [1, 4]
+    model._cfm_graph_num_warmups = 1
+    model.flowloss = flowloss
+    model.linear_proj_audio = (
+        Aggregator(
+            in_channels=16,
+            hidden_size=64,
+            depth=1,
+            num_heads=2,
+            llm_input_dim=32,
+            dropout=0.0,
+            attn_mask_enabled=False,
+        )
+        .to(device="cuda", dtype=torch.bfloat16)
+        .eval()
+    )
+    model.stop_head = torch.nn.Linear(32, 2).to(device="cuda", dtype=torch.bfloat16).eval()
+
+    compile_calls = 0
+
+    def _fail_if_compiled(*args, **kwargs):
+        nonlocal compile_calls
+        compile_calls += 1
+        raise AssertionError("torch.compile should be skipped when Triton CFM fast path is active")
+
+    monkeypatch.setattr(torch, "compile", _fail_if_compiled)
+
+    z_diff_cond = torch.randn(1, 1, 32, device="cuda", dtype=torch.bfloat16)
+    graph_exec = model._maybe_build_cfm_graph(z_diff_cond)
+    assert graph_exec is not None
+    assert model._cfm_graph_failed_batch_sizes == set()
+    assert compile_calls == 0
+    assert not getattr(flowloss.cfm.model, "_ming_compiled", False)
+
+    model._warmup_cfm_graphs()
+    assert set(model._cfm_graphs) == {1, 4}
+    assert model._cfm_graph_failed_batch_sizes == set()
+    assert compile_calls == 0
+
+    hist = torch.randn(3, 1, 16, device="cuda", dtype=torch.bfloat16)
+    cond3 = torch.randn(3, 1, 32, device="cuda", dtype=torch.bfloat16)
+    exec_b4 = model._maybe_build_cfm_graph(cond3)
+    assert exec_b4 is model._cfm_graphs[4]
+    out = exec_b4.execute(cond3, hist, 2.0, 0.25, 0.5)
+    assert out is not None and out[0].shape == (3, 1, 16)

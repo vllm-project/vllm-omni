@@ -714,9 +714,8 @@ class MingLLMModel(nn.Module):
             # TODO(perf): move the compile into a vLLM support_torch_compile
             # adapter once the shared Ming CFM modules are migrated.
             dit_model = self.flowloss.cfm.model
-            if not self.flowloss.cfm.supports_fast_path_for(z_diff_cond) and not getattr(
-                dit_model, "_ming_compiled", False
-            ):
+            sampler = CFMSampler(dit_model, steps=DEFAULT_CFM_STEPS, include_final_noise=self._dense_single_frame)
+            if not sampler.supports_fast_path_for(z_diff_cond) and not getattr(dit_model, "_ming_compiled", False):
                 try:
                     # Static shapes compile once per graph bucket (plus once
                     # for the lazily fused QKV weights); past dynamo's
@@ -740,9 +739,7 @@ class MingLLMModel(nn.Module):
                     logger.warning("Ming CFM torch.compile failed (%s); using uncompiled DiT.", exc)
 
             graph_exec = CFMGraphExecutor(
-                CFMSampler(
-                    self.flowloss.cfm.model, steps=DEFAULT_CFM_STEPS, include_final_noise=self._dense_single_frame
-                ),
+                sampler,
                 self.linear_proj_audio,
                 self.stop_head,
                 patch_size=self.ming_config.patch_size,
