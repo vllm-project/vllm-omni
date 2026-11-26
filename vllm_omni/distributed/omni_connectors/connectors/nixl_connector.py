@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
 import socket
@@ -124,10 +125,11 @@ class NixlConnector(OmniConnectorBase):
         if nixl_agent_config is None:
             agent_config = None
         else:
-            from nixl import nixl_thread_sync_t
-
+            # vLLM loads nixl_agent_config from ``nixl`` or, on ROCm, ``nixl_rocm``.
             config_module = sys.modules.get(nixl_agent_config.__module__)
-            sync_type = getattr(config_module, "nixl_thread_sync_t", nixl_thread_sync_t)
+            sync_type: Any = getattr(config_module, "nixl_thread_sync_t", None)
+            if sync_type is None:
+                sync_type = importlib.import_module("nixl").nixl_thread_sync_t
             sync_mode = sync_type.NIXL_THREAD_SYNC_STRICT
             non_ucx_backends = [backend for backend in self._backends if backend != "UCX"]
             if non_ucx_backends:

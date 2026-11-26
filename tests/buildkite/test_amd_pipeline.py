@@ -1619,6 +1619,35 @@ def test_diffusion_quantization_nightly_jobs_mirror_cuda_scopes(label: str, expe
         assert all(node in command for node in _QUANTIZATION_LTX2_NODES)
 
 
+@pytest.mark.parametrize(
+    ("label", "pool", "expected", "marker"),
+    [
+        (
+            "ROCm · Distributed Test · 1-GPU",
+            "mi300_1",
+            "1 27 20m rocm-distributed-1gpu",
+            "-m 'core_model and rocm and MI325 and not cards_2'",
+        ),
+        (
+            "ROCm · Distributed Test · 2-GPU",
+            "mi300_2",
+            "2 8 20m rocm-distributed-2gpu",
+            "-m 'core_model and rocm and MI325 and cards_2'",
+        ),
+    ],
+)
+def test_distributed_ready_jobs_mirror_cuda_scopes(label: str, pool: str, expected: str, marker: str) -> None:
+    step = _find_step(label, AMD_READY_PIPELINE)
+    command = " ".join("\n".join(step["commands"]).split())
+
+    assert step["agent_pool"] == pool
+    assert step["grade"] == "NonBlocking"
+    assert step["env"]["ROCM_DIFFUSION_RUN_LEVEL"] == "core_model"
+    assert f"run-rocm-diffusion-nightly.sh {expected} tests/distributed/omni_connectors/ {marker}" in command
+    # Only the single-process Mooncake connector tests need the TCP path.
+    assert ("MC_DISABLE_HIP" in step["env"]) is (pool == "mi300_1")
+
+
 def test_wan22_autoround_nightly_job_mirrors_cuda_function_test() -> None:
     step = _find_step("Diffusion X2V · Wan2.2 AutoRound · 1-GPU", AMD_NIGHTLY_PIPELINE)
 
