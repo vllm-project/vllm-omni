@@ -15,15 +15,20 @@ from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.resolver import resolve_omni_config
 from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+from vllm_omni.model_executor.models.common.ming.audio_vae import StreamingLinearUpsample
+from vllm_omni.model_executor.models.ming3_tts.batched_vae_decoder import BatchedStreamingVAEDecoder, _StreamState
 from vllm_omni.model_executor.models.ming_tts import ming_tts as ming_tts_module
 from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
     KEY_DECODE_STEP,
     KEY_LATENT_HISTORY,
     KEY_NEXT_EMBEDS,
     KEY_REQUEST_ID,
+    KEY_TEXT_MODE,
+    MingTTSConfig,
 )
-from vllm_omni.model_executor.models.ming_tts.ming_tts import MingTTSForConditionalGeneration
+from vllm_omni.model_executor.models.ming_tts.ming_tts import MingTTSForConditionalGeneration, _feedback_tensor
 from vllm_omni.model_executor.models.ming_tts.ming_tts_audio_vae import MingAudioVAEModel
+from vllm_omni.model_executor.models.ming_tts.ming_tts_llm import _flow_host_stops
 from vllm_omni.model_executor.models.ming_tts.pipeline import MING_TTS_MOE_PIPELINE, MING_TTS_PIPELINE
 from vllm_omni.platforms import current_omni_platform
 
@@ -179,3 +184,86 @@ def test_ming_audio_vae_releases_aborted_request_state():
     # A payload without a runner id could never be freed, so it must fail loudly.
     with pytest.raises(RuntimeError, match="no runner request id"):
         vae(model_intermediate_buffer=[chunk, dict(chunk)], request_ids=["runner-c"])
+
+
+@pytest.mark.parametrize("patch_size", [1, 4])
+def test_flow_host_stops_and_gpu_resident_feedback_support_dense_patch_sizes(patch_size: int):
+    history_size = 1 if patch_size == 1 else 32
+    hidden = torch.zeros((2, 8), dtype=torch.bfloat16)
+    latent = torch.zeros((2, patch_size, 4), dtype=torch.bfloat16)
+    embeds = torch.arange(16, dtype=torch.bfloat16).reshape(2, 1, 8)
+    stops = torch.tensor([0.25, 0.75], dtype=torch.bfloat16)
+
+    assert _flow_host_stops([([1, 0], hidden, latent, embeds, stops)]) == {1: 0.25, 0: 0.75}
+    latent[1, 0, 0] = float("nan")
+    with pytest.raises(RuntimeError, match="Non-finite Ming flow-head output"):
+        _flow_host_stops([([1, 0], hidden, latent, embeds, stops)])
+
+    model = object.__new__(MingTTSForConditionalGeneration)
+    nn.Module.__init__(model)
+    model._resident_feedback = True
+    model.model_stage = "llm"
+    model.ming_config = MingTTSConfig(
+        llm_hidden_size=8, history_patch_size=history_size, latent_dim=4, patch_size=patch_size
+    )
+    backbone = nn.Module()
+    backbone.embed_input_ids = nn.Embedding(4, 8, dtype=torch.bfloat16)
+    model.model = backbone
+
+    ids = torch.tensor([2, 1])
+    history = torch.ones((history_size, 4))
+    flat_embeds = embeds.squeeze(1)
+    infos = [
+        {KEY_NEXT_EMBEDS: row, KEY_LATENT_HISTORY: history, "req_id": str(i), KEY_DECODE_STEP: i}
+        for i, row in enumerate(flat_embeds.flip(0))
+    ]
+    _, out, updates = model._decode_feedback_batch(input_ids=ids, input_embeds=flat_embeds, req_infos=infos)
+    assert torch.equal(out, flat_embeds.flip(0))
+    assert updates == [{KEY_REQUEST_ID: str(i), KEY_DECODE_STEP: i} for i in range(2)]
+    assert _feedback_tensor(model, history).device == history.device
+
+    # Mixed text-mode cohort falls back cleanly to per-request preprocess.
+    infos[0] = {KEY_TEXT_MODE: True, "req_id": "text"}
+    scalar = [model.preprocess(ids[i : i + 1], None, **info) for i, info in enumerate(infos)]
+    _, out, updates = model._decode_feedback_batch(input_ids=ids, input_embeds=flat_embeds, req_infos=infos)
+    assert torch.equal(out, torch.cat([s[1] for s in scalar]))
+    assert updates[0] == scalar[0][2]
+
+
+@pytest.mark.parametrize("patch_size", [1, 4])
+def test_batched_vae_orders_chunks_flushes_held_back_frame_and_cleans_up(patch_size: int):
+    upsampling = StreamingLinearUpsample(scale_factor=4)
+    upsampling.frame_holdback = True
+    stub_decoder = nn.Module()
+    stub_decoder.fc1 = nn.Identity()
+    stub_decoder.register_parameter("weight", nn.Parameter(torch.zeros(1)))
+    stub_decoder.upsampling = upsampling
+    stub_decoder.head = lambda hidden, **kw: (
+        hidden.reshape(-1) + (100.0 if kw["last_chunk"] else 0.0),
+        None,
+        None,
+        None,
+    )
+
+    batched = object.__new__(BatchedStreamingVAEDecoder)
+    batched.decoder = stub_decoder
+    batched._packed = None
+    batched._free = [1, 0]
+    batched._streams = {}
+    batched._forward_rows = lambda states, hiddens: hiddens
+
+    vae = _vae_stage()
+    vae.ming_config.patch_size = patch_size
+    vae._batched_vae_enabled = True
+    vae._batched_vae_decoder = batched
+
+    chunk = {KEY_REQUEST_ID: "p", "latent": torch.ones(2, patch_size, 64), "meta": {"stream_finished": False}}
+    end = {KEY_REQUEST_ID: "p", "meta": {"stream_finished": True}}
+    result = vae(model_intermediate_buffer=[chunk, chunk, end], request_ids=["a", "b", "a"])
+    outs = result.multimodal_outputs["model_outputs"]
+    assert outs[0].numel() > 0 and outs[1].numel() > 0
+    # Empty terminal flush emits the held-back frame and frees stream "a" while keeping "b" live.
+    assert outs[2].numel() > 0 and outs[2].min().item() >= 100.0
+    assert set(batched._streams) == {"b"} and isinstance(batched._streams["b"], _StreamState)
+    vae.on_requests_finished({"b"})
+    assert not batched._streams and sorted(batched._free) == [0, 1]

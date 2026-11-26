@@ -61,6 +61,7 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
 from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
 from vllm_omni.model_executor.models.causvid_wan.pipeline import CAUSVID_WAN_PIPELINE
 from vllm_omni.model_executor.models.chatterbox.pipeline import CHATTERBOX_ORIGINAL_PIPELINE, CHATTERBOX_TURBO_PIPELINE
+from vllm_omni.model_executor.models.confucius4_tts.pipeline import CONFUCIUS4_TTS_PIPELINE
 from vllm_omni.model_executor.models.cosmos3.pipeline import (
     COSMOS3_OMNI_DEPLOY_PIPELINE,
     COSMOS3_POLICY_PIPELINE,
@@ -93,6 +94,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
     JOYAI_VL_INTERACTION_ASR_PIPELINE,
     JOYAI_VL_INTERACTION_PIPELINE,
 )
+from vllm_omni.model_executor.models.kimi_audio.pipeline import KIMI_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.lfm3_audio.pipeline import LFM3_AUDIO_PIPELINE, LFM3_AUDIO_TEXT_PIPELINE
 from vllm_omni.model_executor.models.lfm3_omni.pipeline import LFM3_OMNI_PIPELINE, LFM3_OMNI_TEXT_PIPELINE
@@ -148,6 +150,7 @@ from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
 )
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE, QWEN3_TTS_PIPELINE
 from vllm_omni.model_executor.models.realtime_venus.pipeline import REALTIME_VENUS_OMNI_PIPELINE
+from vllm_omni.model_executor.models.sage_interaction.pipeline import SAGE_INTERACTION_PIPELINE
 from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
@@ -190,6 +193,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "causvid_wan": CAUSVID_WAN_PIPELINE,
     "chatterbox": CHATTERBOX_ORIGINAL_PIPELINE,
     "chatterbox_turbo": CHATTERBOX_TURBO_PIPELINE,
+    "confucius4": CONFUCIUS4_TTS_PIPELINE,
+    "confucius4_tts": CONFUCIUS4_TTS_PIPELINE,
     "cosmos3_nano_sim_auto": COSMOS3_NANO_SIM_AUTO_PIPELINE,
     "cosmos3_nano_sim_bimanual": COSMOS3_NANO_SIM_BIMANUAL_PIPELINE,
     # Cosmos3 policy / omni-deploy topologies share HF metadata with video
@@ -219,6 +224,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "indextts2_5": INDEXTTS25_PIPELINE,
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
     "joyai_vl_interaction_asr": JOYAI_VL_INTERACTION_ASR_PIPELINE,
+    "kimi_audio": KIMI_AUDIO_PIPELINE,
     "lance": LANCE_PIPELINE,
     "lfm3_audio": LFM3_AUDIO_PIPELINE,
     "lfm3_audio_text": LFM3_AUDIO_TEXT_PIPELINE,
@@ -273,6 +279,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen3_tts": QWEN3_TTS_PIPELINE,
     "qwen3_tts_fused": QWEN3_TTS_FUSED_PIPELINE,
     "realtime_venus_omni": REALTIME_VENUS_OMNI_PIPELINE,
+    "sage_interaction": SAGE_INTERACTION_PIPELINE,
     "step_audio_2": STEP_AUDIO2_PIPELINE,
     "step_audio_2_asr": STEP_AUDIO2_ASR_PIPELINE,
     "taomate_h3": TAOMATE_H3_PIPELINE,

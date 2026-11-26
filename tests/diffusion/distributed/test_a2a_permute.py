@@ -218,12 +218,12 @@ def test_ce_direct_copies_match_independent_4d_exchange(monkeypatch, size, batch
                         rank=rank, buffer_ptrs=[x.data_ptr() for x in shared], barrier=lambda: None
                     )
                     plans.append(a2a_permute._CEPlan(inputs[rank], shared[rank], handle, size, reverse, Stream()))
-                # Graph capture records transport only; eager calls own their output.
+                # Copy-out calls own their output; zero-copy calls return the workspace.
                 result = plans[rank]._run_eager(inputs[rank], copy_out=bool(iteration))
                 if iteration:
                     assert result.data_ptr() != shared[rank].data_ptr()
                 else:
-                    assert result is None
+                    assert result is shared[rank]
             for rank in range(size):
                 for index, (part, shape) in enumerate(
                     zip(shared[rank].split([torch.Size(s).numel() for s in shapes]), shapes)
