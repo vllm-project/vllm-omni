@@ -18,6 +18,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     init_int8_linear_kernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+    Int8ScaledMMLinearLayerConfig,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -45,6 +48,10 @@ from vllm.model_executor.utils import replace_parameter
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization._copy_missing_attrs import (
     copy_missing_attrs as _copy_missing_attrs,
+)
+from vllm_omni.quantization.int8_sm100 import (
+    Int8Sm100ScaledMMLinearKernel,
+    sm100_int8_fallback_needed,
 )
 
 if current_omni_platform.is_npu():
@@ -518,12 +525,23 @@ class Int8LinearMethod(BaseInt8LinearMethod):
     def __init__(self, quant_config: DiffusionInt8Config):
         super().__init__(quant_config)
 
-        self.int8_linear = init_int8_linear_kernel(
-            is_channelwise=False,
-            is_static_input_scheme=quant_config.activation_scheme == "static",
-            input_symmetric=True,
-            module_name=self.__class__.__name__,
-        )
+        if current_omni_platform.is_cuda() and sm100_int8_fallback_needed():
+            # vLLM CUTLASS INT8 refuses SM100; use torch._int_mm instead.
+            self.int8_linear = Int8Sm100ScaledMMLinearKernel(
+                Int8ScaledMMLinearLayerConfig(
+                    is_channelwise=False,
+                    is_static_input_scheme=quant_config.activation_scheme == "static",
+                    input_symmetric=True,
+                ),
+                layer_param_names=["weight", "weight_scale", "input_scale", "input_zero_point", "azp_adj"],
+            )
+        else:
+            self.int8_linear = init_int8_linear_kernel(
+                is_channelwise=False,
+                is_static_input_scheme=quant_config.activation_scheme == "static",
+                input_symmetric=True,
+                module_name=self.__class__.__name__,
+            )
 
     def process_weights_after_loading(self, layer: Module) -> None:
         self.int8_linear.process_weights_after_loading(layer)
@@ -535,6 +553,15 @@ class Int8LinearMethod(BaseInt8LinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         pre_quant_scale = getattr(layer, "pre_quant_scale", None)
+        x2d = x.reshape(-1, x.shape[-1])
+        if (
+            pre_quant_scale is not None
+            and isinstance(self.int8_linear, Int8Sm100ScaledMMLinearKernel)
+            and self.int8_linear.fuses_pre_quant_scale(layer, x2d)
+        ):
+            # SM100 dynamic path: the multiply runs inside the quantization kernel.
+            output = self.int8_linear.apply_weights(layer, x2d.contiguous(), bias, pre_quant_scale=pre_quant_scale)
+            return output.reshape(*x.shape[:-1], output.shape[-1])
         if pre_quant_scale is not None:
             # Naive SmoothQuant: not fused into the previous norm.
             x = x * pre_quant_scale.to(x.dtype)

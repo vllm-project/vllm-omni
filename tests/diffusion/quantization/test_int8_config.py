@@ -3,6 +3,7 @@
 """Unit tests for Int8 quantization config."""
 
 import math
+import types
 
 import pytest
 import torch
@@ -103,6 +104,14 @@ def test_quantization_config_string_and_dict_equivalent():
     )
     assert config_str.quantization_config.get_name() == config_dict.quantization_config.get_name()
     assert config_str.quantization_config.activation_scheme == config_dict.quantization_config.activation_scheme
+
+
+@pytest.fixture(autouse=True)
+def _no_sm100_fallback(request, mocker: MockerFixture):
+    """Mocked kernel tests exercise the CUTLASS selection path, also on an SM100 host."""
+    if "sm100" in request.node.name or (request.cls is not None and request.cls.__name__ == "TestGPUInt8Smoke"):
+        return
+    mocker.patch("vllm_omni.quantization.int8_config.sm100_int8_fallback_needed", return_value=False)
 
 
 @pytest.mark.parametrize("platform", ["cuda", "rocm"])
@@ -882,3 +891,149 @@ def test_scaled_int8_quant_static_matches_reference_cuda():
     ref = _ref_static_quant(x, scale)
     assert (q.int() - ref.int()).abs().max() <= 1
     assert torch.allclose(x_scale.float(), scale)
+
+
+# ---------------------------------------------------------------------------
+# SM100 torch._int_mm fallback
+# ---------------------------------------------------------------------------
+
+
+def _ref_weight_quant(w: torch.Tensor):
+    """Per-output-channel INT8 weights, same formula as ops.scaled_int8_quant."""
+    amax = w.abs().amax(dim=1, keepdim=True)
+    q = torch.round(w * (127.0 / amax)).clamp(-128, 127).to(torch.int8)
+    return q, amax / 127.0
+
+
+def test_sm100_activation_quant_reference_dynamic_and_static():
+    from vllm_omni.quantization.int8_sm100 import quantize_activations_reference
+
+    x = torch.randn(5, 16)
+    q, s = quantize_activations_reference(x, None)
+    assert tuple(s.shape) == (5, 1)
+    assert int(q.abs().amax(dim=1).min()) == 127
+    assert torch.allclose(q.float() * s, x, atol=float(s.max()) / 2 + 1e-6)
+    scale = x.abs().max() / 127
+    q, s = quantize_activations_reference(x, scale.reshape(1))
+    assert tuple(s.shape) == (1, 1)
+    assert int(q.abs().max()) == 127
+
+
+@pytest.mark.parametrize("static", [False, True])
+def test_sm100_epilogue_matches_dequantized_reference(static):
+    from vllm_omni.quantization.int8_sm100 import int8_epilogue, quantize_activations_reference
+
+    torch.manual_seed(0)
+    x = torch.randn(7, 32)
+    w = torch.randn(24, 32)
+    bias = torch.randn(24)
+    w_q, w_s = _ref_weight_quant(w)
+    i_s = (x.abs().max() / 127).reshape(1) if static else None
+    x_q, x_s = quantize_activations_reference(x, i_s)
+    acc = x_q.int() @ w_q.int().t()  # int32 [M, N]
+    out = int8_epilogue(acc, x_s, w_s, bias, torch.float32)
+    ref = (x_q.float() * x_s) @ (w_q.float() * w_s).t() + bias
+    assert torch.allclose(out, ref, rtol=1e-5, atol=1e-4)
+    # And it stays close to the unquantized GEMM.
+    assert torch.allclose(out, x @ w.t() + bias, atol=0.5)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
+    reason="SM100 CUDA device required",
+)
+@pytest.mark.parametrize("m", [4, 64])
+def test_sm100_kernel_matches_dequantized_reference_cuda(m):
+    from vllm_omni.quantization.int8_sm100 import Int8Sm100ScaledMMLinearKernel
+
+    torch.manual_seed(0)
+    k, n = 256, 128
+    w = torch.randn(n, k, device="cuda")
+    w_q, w_s = _ref_weight_quant(w)
+    layer = Module()
+    layer.weight = Parameter(w_q.t(), requires_grad=False)  # [K, N] view, as after CUTLASS processing
+    layer.weight_scale = Parameter(w_s, requires_grad=False)
+    kernel = object.__new__(Int8Sm100ScaledMMLinearKernel)
+    kernel.config = types.SimpleNamespace(input_symmetric=True)
+    kernel.layer_param_names = ["weight", "weight_scale", "input_scale", "input_zero_point", "azp_adj"]
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    out = kernel.apply_weights(layer, x)
+    ref = x.float() @ (w_q.float() * w_s).t()
+    assert out.dtype == torch.bfloat16
+    # Activation INT8 rounding noise (max ~0.45 over 8192 outputs, K=256) plus bf16 output rounding.
+    assert torch.allclose(out.float(), ref, rtol=3e-2, atol=6e-1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels need CUDA")
+@pytest.mark.parametrize("m,k", [(1, 256), (37, 4096), (300, 12288)])
+def test_sm100_triton_quant_matches_scaled_int8_quant_cuda(m, k):
+    from vllm import _custom_ops as ops
+
+    from vllm_omni.quantization.int8_sm100_triton import dynamic_per_token_quant
+
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    q_ref, s_ref, _ = ops.scaled_int8_quant(x, None, None, symmetric=True)
+    q, s = dynamic_per_token_quant(x)
+    assert torch.equal(q, q_ref)
+    assert torch.equal(s, s_ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels need CUDA")
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("static_scale", [False, True])
+def test_sm100_triton_epilogue_matches_torch_epilogue_cuda(with_bias, static_scale):
+    from vllm_omni.quantization.int8_sm100 import int8_epilogue
+    from vllm_omni.quantization.int8_sm100_triton import int8_scale_epilogue
+
+    torch.manual_seed(0)
+    m, n = 53, 300
+    acc = torch.randint(-(2**20), 2**20, (m, n), device="cuda", dtype=torch.int32)
+    x_s = torch.rand(1 if static_scale else m, 1, device="cuda") + 0.01
+    w_s = torch.rand(n, 1, device="cuda") + 0.01
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16) if with_bias else None
+    ref = int8_epilogue(acc, x_s, w_s, bias, torch.float32)
+    out = int8_scale_epilogue(acc, x_s, w_s, bias, torch.float32)
+    assert torch.equal(out, ref)  # FMA is disabled in the kernel: bit-identical
+    out_bf16 = int8_scale_epilogue(acc, x_s, w_s, bias, torch.bfloat16)
+    assert out_bf16.dtype == torch.bfloat16
+    assert torch.equal(out_bf16, int8_epilogue(acc, x_s, w_s, bias, torch.bfloat16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels need CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m,k", [(1, 256), (37, 4096), (300, 12288)])
+def test_sm100_triton_quant_fused_pre_quant_scale_bit_identical_cuda(m, k, dtype):
+    from vllm_omni.quantization.int8_sm100_triton import dynamic_per_token_quant
+
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device="cuda", dtype=dtype)
+    pq = torch.rand(k, device="cuda", dtype=torch.float32) * 3 + 0.1
+    q_ref, s_ref = dynamic_per_token_quant((x * pq.to(x.dtype)).contiguous())
+    q, s = dynamic_per_token_quant(x, pq)
+    assert torch.equal(q, q_ref)
+    assert torch.equal(s, s_ref)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
+    reason="SM100 CUDA device required",
+)
+def test_sm100_kernel_apply_weights_fused_pre_quant_scale_cuda():
+    from vllm_omni.quantization.int8_sm100 import Int8Sm100ScaledMMLinearKernel
+
+    torch.manual_seed(0)
+    k, n = 512, 256
+    w_q, w_s = _ref_weight_quant(torch.randn(n, k, device="cuda"))
+    layer = Module()
+    layer.weight = Parameter(w_q.t(), requires_grad=False)
+    layer.weight_scale = Parameter(w_s, requires_grad=False)
+    kernel = object.__new__(Int8Sm100ScaledMMLinearKernel)
+    kernel.config = types.SimpleNamespace(input_symmetric=True)
+    kernel.layer_param_names = ["weight", "weight_scale", "input_scale", "input_zero_point", "azp_adj"]
+    x = torch.randn(64, k, device="cuda", dtype=torch.bfloat16)
+    pq = torch.rand(k, device="cuda") + 0.5
+    assert kernel.fuses_pre_quant_scale(layer, x)
+    fused = kernel.apply_weights(layer, x, pre_quant_scale=pq)
+    unfused = kernel.apply_weights(layer, (x * pq.to(x.dtype)).contiguous())
+    assert torch.equal(fused, unfused)
