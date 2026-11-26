@@ -1158,6 +1158,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         sampling_metadata: HiggsAudioSamplingParams,
         *,
         sample_text: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        restored_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Model-owned sampler with delay-pattern audio dispatch.
 
@@ -1202,6 +1203,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         qsl = self._last_step_query_start_loc
         fused_guard = (
             use_sample_graph
+            and restored_rows is None
             and graph_forced_audio
             and self._eos_token_id is not None
             and (decode_only or (isinstance(qsl, torch.Tensor) and int(qsl.numel()) == num_rows + 1))
@@ -1220,9 +1222,10 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 if getattr(self, "_step_audio_mode_rows", 0) == num_rows:
                     # Reset new prefill rows before accepting old active state.
                     if not decode_only:
-                        self._reset_decode_state_rows(
-                            self._prefill_row_mask(num_rows, hidden.device), num_rows, hidden.device
-                        )
+                        pfmask = self._prefill_row_mask(num_rows, hidden.device)
+                        if restored_rows is not None:
+                            pfmask[restored_rows] = False
+                        self._reset_decode_state_rows(pfmask, num_rows, hidden.device)
                     actual_audio = (
                         actual_audio | self._decode_has_codes[:num_rows] | self._decode_generation_done[:num_rows]
                     )
@@ -1230,6 +1233,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             if not decode_only:
                 if not fused_guard:
                     pfmask = self._prefill_row_mask(num_rows, hidden.device)
+                    if restored_rows is not None:
+                        pfmask[restored_rows] = False
                     self._reset_decode_state_rows(pfmask, num_rows, hidden.device)
                 self._fast_audio_direct_rows = num_rows
             sampled = run_dense_sample(self, hidden, logits, sampling_metadata, force_audio_inputs=graph_forced_audio)
@@ -1239,6 +1244,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if not decode_only:
             self._fast_audio_direct_rows = 0
             pfmask = self._prefill_row_mask(num_rows, hidden.device)
+            if restored_rows is not None:
+                pfmask[restored_rows] = False
             self._reset_decode_state_rows(pfmask, num_rows, hidden.device)
         prev_audio_mask = self._audio_seed_mask_from_step_input(num_rows, hidden.device)
         if prev_audio_mask is None:

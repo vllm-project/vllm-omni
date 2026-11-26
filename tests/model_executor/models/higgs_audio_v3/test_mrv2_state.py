@@ -28,6 +28,10 @@ def make_state():
     state.rope_state = state.prompt_embeds_state = state._static_inputs_embeds = None
     state.requests = {}
     state.generators = {}
+    state.audio_history = None
+    state.replay = {}
+    state.parked = {}
+    state.restored_rows = None
     state.metadata_key = state.metadata = None
     state.intermediate_buffer = OmniIntermediateBuffer(4)
     state.model = SimpleNamespace(
@@ -45,7 +49,11 @@ def make_state():
 
 def request(name, seed, **kwargs):
     return SimpleNamespace(
-        req_id=name, prompt_token_ids=[1, 2, 99], mm_features=[], sampling_params=SamplingParams(seed=seed, **kwargs)
+        req_id=name,
+        prompt_token_ids=[1, 2, 99],
+        prefill_token_ids=[1, 2, 99],
+        mm_features=[],
+        sampling_params=SamplingParams(seed=seed, **kwargs),
     )
 
 
@@ -248,3 +256,52 @@ def test_registered_audio_sampler_rejects_unsupported_modes(draft, grammar):
     batch = SimpleNamespace(req_ids=["real-request"], num_draft_tokens=draft)
     with pytest.raises(ValueError, match="grammar or speculative"):
         sampler.sample_step(None, batch, None, grammar, Mock())
+
+
+def test_preemption_replays_feedback_on_reused_slot_and_restores_rng_at_last_chunk():
+    state = make_state()
+    state.audio_history = torch.zeros((4, 8, 2), dtype=torch.int16)
+    state.audio_history_len = torch.zeros(4, dtype=torch.int32)
+    state.add_request(0, request("replayed", None))
+    state.audio_history[0, :2] = torch.tensor([[11, 12], [21, 22]])
+    state.audio_history_len[0] = 2
+    model = state.model
+    model._last_batch_req_ids = ["replayed"]
+    model._decode_has_codes = torch.tensor([True])
+    model._decode_last_codes = torch.tensor([[21, 22]])
+    model._decode_delay_count = torch.tensor([2])
+    model._decode_eoc_countdown = torch.tensor([-1])
+    model._decode_generation_done = torch.tensor([False])
+    model.multimodal_embedding = lambda codes: codes.float()
+    state.generators["replayed"] = Mock(get_offset=Mock(return_value=8))
+    state.on_request_preempted("replayed", 0)
+    state.remove_request(0)
+    state.audio_history[0].fill_(-1)
+    model._decode_last_codes.zero_()
+
+    resumed = request("replayed", None)
+    resumed.prefill_token_ids = [1, 2, 99, 99, 99]
+    state.add_request(2, resumed)
+    generator = state.generators["replayed"] = Mock()
+    batch = SimpleNamespace(
+        req_ids=["replayed"],
+        idx_mapping_np=np.array([2]),
+        num_computed_tokens_np=np.array([2]),
+        num_scheduled_tokens=np.array([2]),
+        query_start_loc_np=np.array([0, 2]),
+    )
+    state._restore_replayed_rows(batch)
+    generator.set_offset.assert_not_called()
+    first_chunk = torch.zeros(2, 2)
+    state._replace_replay_feedback(first_chunk, batch)
+    assert first_chunk.tolist() == [[0, 0], [11, 12]]
+    batch.num_computed_tokens_np[0] = 4
+    batch.num_scheduled_tokens[0] = 1
+    state._restore_replayed_rows(batch)
+    assert state.restored_rows.tolist() == [0]
+    assert model._decode_last_codes.tolist() == [[21, 22]]
+    generator.set_offset.assert_called_once_with(8)
+    last_chunk = torch.zeros(1, 2)
+    state._replace_replay_feedback(last_chunk, batch)
+    assert last_chunk.tolist() == [[21, 22]]
+    assert not state.replay

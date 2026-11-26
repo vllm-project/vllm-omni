@@ -148,3 +148,45 @@ def decode_embeddings(
     _decode_embeddings_kernel[(padded_rows, triton.cdiv(hidden, block))](
         out, ids, text_weight, audio_weight, codes, has_codes, rows, hidden, audio_vocab, BOOKS=books, BLOCK=block
     )
+
+
+@triton.jit
+def _record_audio_history_kernel(
+    history,
+    history_len,
+    snapshot,
+    count,
+    slots,
+    total,
+    prompt,
+    CAPACITY: tl.constexpr,
+    BOOKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    i = tl.program_id(0)
+    slot = tl.load(slots + i)
+    n = tl.load(count + i)
+    valid = tl.load(snapshot + i * (BOOKS + 2) + BOOKS) != 0
+    if n > 0 and valid:
+        pos = tl.load(total + slot) - tl.load(prompt + slot)
+        cols = tl.arange(0, BLOCK)
+        first = tl.load(snapshot + i * (BOOKS + 2) + cols, mask=cols < BOOKS, other=0)
+        base = history + (slot * CAPACITY + pos) * BOOKS
+        tl.store(base + cols, first, mask=(cols < BOOKS) & (pos >= 0) & (pos < CAPACITY))
+        tl.store(history_len + slot, pos + n)
+
+
+def record_audio_history(history, history_len, snapshot, count, slots, total, prompt):
+    _, capacity, books = history.shape
+    _record_audio_history_kernel[(count.numel(),)](
+        history,
+        history_len,
+        snapshot,
+        count,
+        slots,
+        total,
+        prompt,
+        capacity,
+        books,
+        triton.next_power_of_2(books),
+    )
