@@ -1232,6 +1232,12 @@ def test_step_audio2_base_encodes_upstream_segments():
     assert prepared.model_type == "step_audio2"
 
 
+def test_step_audio2_rejects_think_variant():
+    adapter = StepAudio2Adapter(SimpleNamespace(engine_client=_step_audio2_engine("think")))
+    with pytest.raises(ValueError, match=r"think.*chat/completions"):
+        asyncio.run(adapter.build(OpenAICreateSpeechRequest(input="hello"), [], False))
+
+
 def test_step_audio2_rejects_unknown_variant():
     adapter = StepAudio2Adapter(SimpleNamespace(engine_client=_step_audio2_engine("unknown")))
     with pytest.raises(ValueError, match="unknown"):

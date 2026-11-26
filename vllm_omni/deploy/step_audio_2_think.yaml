@@ -1,0 +1,14 @@
+# Step-Audio-2-mini-Think deploy: thinker -> token2wav.
+# Inherits all settings from step_audio_2.yaml; marks stage 0 as the Think
+# variant, restores <|EOT|> (151665) stopping (the Think checkpoint tokenizer
+# sets eos_token to <|endoftext|>, while upstream StepAudio2 overrides EOS to
+# <|EOT|>), and matches upstream examples-think.py's 2048-token budget.
+base_config: step_audio_2.yaml
+
+stages:
+  - stage_id: 0
+    hf_overrides:
+      step_audio2_variant: think
+    default_sampling_params:
+      max_tokens: 2048
+      stop_token_ids: [151665]  # <|EOT|>
