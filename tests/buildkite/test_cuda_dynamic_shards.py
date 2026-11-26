@@ -151,6 +151,8 @@ def test_uploader_splits_without_timings_up_to_the_job_cap(monkeypatch: pytest.M
     assert "timings/jobs/*.json" in step["artifact_paths"]
     text = "\n".join(step["commands"])
     assert PLUGIN_MODULE in text
+    assert "-n 4 --dist loadgroup" in text
+    assert "tests/" in text
     assert ".buildkite/common/scripts" in text
     assert "$${PYTHONPATH:+:$$PYTHONPATH}" in text
     assert NUM_SHARDS not in text
@@ -265,7 +267,7 @@ def test_two():
     pass
 """
 
-SIMPLE_TEST_COMMAND = "pytest -sv tests/ -m 'core_model and cpu'"
+SIMPLE_TEST_COMMAND = "pytest -sv tests/ -m 'core_model and cpu' -n 4 --dist loadgroup"
 
 
 def _write_marker_suite(root: Path, cpu_files: int = 6) -> tuple[list[str], list[str]]:
@@ -990,14 +992,17 @@ def test_file_shard_command_reads_the_parallel_job_list(tmp_path: Path) -> None:
     )
     interpreter = _shell_python(bash)
     dumper_arg = _bash_command(dumper, bash=bash)
-    rendered = _inject_plugin(_file_shard_command("pytest -sv tests/ -m 'core_model and cpu'", slug))
+    rendered = _inject_plugin(
+        _file_shard_command("pytest -sv tests/ -m 'core_model and cpu' -n 4 --dist loadgroup", slug)
+    )
     assert NUM_SHARDS not in rendered
     assert SHARD_ID not in rendered
     assert "'$" not in rendered
     assert PLUGIN_MODULE in rendered
     assert "VLLM_OMNI_FILE_SHARD_LIST" in rendered
     # Directory targets stay so each directory conftest.py is collected.
-    assert "pytest -p pytest_file_timings -sv tests/ -m 'core_model and cpu'" in rendered
+    # -p pytest_file_timings is injected; -n 4 --dist loadgroup stays.
+    assert "pytest -p pytest_file_timings -sv tests/ -m 'core_model and cpu' -n 4 --dist loadgroup" in rendered
     expanded = rendered.replace("$$", "$").replace("pytest ", f"{interpreter} {dumper_arg} ", 1)
     if sys.platform == "win32" and "system32" in bash.lower():
         expanded = expanded.replace("$", r"\$")
@@ -1016,6 +1021,8 @@ def test_file_shard_command_reads_the_parallel_job_list(tmp_path: Path) -> None:
     assert "tests/b_test.py" not in argv, completed.stderr
     assert any(line.startswith("SHARD=") and line.endswith("1.txt") for line in argv), completed.stderr
     assert "pytest_file_timings" in argv
+    assert "-n" in argv and argv[argv.index("-n") + 1] == "4", completed.stderr
+    assert "--dist" in argv and argv[argv.index("--dist") + 1] == "loadgroup", completed.stderr
 
 
 def test_shard_list_keeps_directory_conftest_and_drops_other_files(tmp_path: Path) -> None:
