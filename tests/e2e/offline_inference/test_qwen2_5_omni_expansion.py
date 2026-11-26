@@ -14,6 +14,7 @@ from tests.helpers.media import (
     generate_synthetic_video,
 )
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
 
@@ -26,9 +27,14 @@ _CI_DEPLOY = get_deploy_config_path("ci/qwen2_5_omni.yaml")
 # The bundled deploy YAML runs the talker with CUDA graphs on CUDA and keeps
 # eager on ROCm, on the NPU talker and on XPU through its ``platforms:``
 # section, so every platform runs this test on the same resolved config.
-# The default 16384-token profiling step leaves the Thinker too little KV cache on 22 GiB cards; no request
-# in this file exceeds 8192 tokens, so the smaller step does not chunk any.
-stage_config = modify_stage_config(_CI_DEPLOY, updates={"stages": {0: {"max_num_batched_tokens": 8192}}})
+
+# The default 16384-token profiling step leaves the Thinker too little KV cache on 22 GiB L4 cards; no request
+# in this file exceeds 8192 tokens, so the smaller step does not chunk any. Other platforms keep the shared config.
+stage_config = (
+    modify_stage_config(_CI_DEPLOY, updates={"stages": {0: {"max_num_batched_tokens": 8192}}})
+    if current_omni_platform.is_cuda()
+    else _CI_DEPLOY
+)
 
 # Create parameter combinations for model and stage config
 # Qwen2.5-Omni with TP=3 needs longer init timeout
