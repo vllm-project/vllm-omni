@@ -1746,12 +1746,22 @@ frame's postprocess consumes it once.
 
 Inside a call, Nemotron decodes back to back. The thinker publishes
 `nvc_function_fast_path` on frames decoded while its function head is inside a
-tool call, and the session's plugin reports `fast_path_active`. The session then
+tool call, using the current frame's function decision before MRv2 sampling
+commits the call state. The session's plugin reports `fast_path_active` only
+for continuation scheduling. When synthetic silence continuation is permitted,
+the session then
 answers each such frame with its own silence unit at once instead of waiting for
 the client's next 80 ms unit. One token per append still holds; only the frame
-that feeds it changes. Client appends that arrive meanwhile are dropped after
-counting on the input clock and are never buffered, appended or replayed, and
-Stage-2 audio decoded alongside a fast step is not delivered. Fast steps do not
+that feeds it changes. Client appends that arrive meanwhile are dropped and
+are never buffered, appended or replayed. Disabling
+`silence_continuation`, using the input clock, or failing to schedule the next
+synthetic unit preserves client-paced decoding instead. Session updates invalidate
+queued fast appends, including an off/on update before that append runs.
+Stage-2 suppression follows each originating Stage-0 acoustic frame, not the
+current scheduling flag: delayed call audio remains silent after `EOTC`, while
+earlier speech still plays during a call. Suppressed frames still count toward
+audio coverage and response completion. Coalesced codec chunks filter only the
+call's frames. Fast steps do not
 count against the response continuation limit: the plugin caps them
 (`_FAST_PATH_MAX_STEPS`, like NVIDIA's `MAX_TOOL_TOKENS`) and the frame that
 decodes `EOTC` clears the flag, after which client-paced continuation resumes.

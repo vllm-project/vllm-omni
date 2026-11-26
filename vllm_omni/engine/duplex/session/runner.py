@@ -355,6 +355,7 @@ class DuplexSessionRunner:
             self.out,
             close_from_runtime=self._close_from_runtime,
             schedule_silence_continuation=self._schedule_silence_continuation,
+            silence_continuation_enabled=self._silence_continuation_enabled,
             abort_request=self._abort_request_background,
         )
         self.control = SessionControl(
@@ -1751,52 +1752,22 @@ class DuplexSessionRunner:
         self.tasks.active_response_task = None
         return True
 
-    async def _dropped_frame_audio(self, event: dict[str, object], audio: str | bytes) -> tuple[int, int]:
-        """Samples and rate of a client frame the fast path discards.
-
-        Counted exactly as the buffering path counts it, so ``audio_end_ms``
-        keeps naming the client's input position: the payload is converted the
-        same way, which is what makes G.711 count one byte per sample.
-        """
-        fmt_raw = event.get("format")
-        fmt = fmt_raw if isinstance(fmt_raw, str) else "pcm16"
-        sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
-        sample_rate_hz = int(sr_raw) if isinstance(sr_raw, int | float) else 16000
-        if fmt.lower() not in CONVERTIBLE_INPUT_FORMATS:
-            return helpers.pcm_sample_count(audio, fmt), sample_rate_hz
-        encoded = base64.b64encode(audio).decode("ascii") if isinstance(audio, bytes) else audio
-        try:
-            converted, converted_fmt, converted_rate = await self.offload(
-                convert_input_audio_with_rate,
-                encoded,
-                fmt,
-                sample_rate_hz=sample_rate_hz,
-            )
-        except ValueError:
-            # The buffering path refuses this frame; a dropped one only owes
-            # the clock its position, which the raw count still gives.
-            return helpers.pcm_sample_count(audio, fmt), sample_rate_hz
-        if converted_rate is not None:
-            sample_rate_hz = int(converted_rate)
-        return helpers.pcm_sample_count(converted, converted_fmt), sample_rate_hz
-
-    async def _drop_frame_on_fast_path(self, event: dict[str, object]) -> bool:
+    def _drop_frame_on_fast_path(self) -> bool:
         """Consume one client append without submitting it while the model decodes a tool call.
 
         A fast-path append already supplies the model's next 80 ms frame, so a
-        real frame would queue a second unit for the same step. The frame is
-        accounted for on the input clock (the client's position still moves)
-        but never buffered, appended or replayed.
+        real frame would queue a second unit for the same step. It is never
+        buffered, appended or replayed. Input-clocked sessions never enter
+        this path: their real input must drive every model step.
         """
-        if not self.run.fast_path_active:
+        if (
+            not self.run.fast_path_active
+            or not self._silence_continuation_enabled()
+            or self.run.fast_path_config_generation != self.session.config_generation
+            or self.session.active_request_id is None
+        ):
+            self.run.fast_path_active = False
             return False
-        audio = event.get("audio") or event.get("data")
-        clock = self._input_clock
-        ack = self._current_input_ack
-        if clock is not None and ack is not None and isinstance(audio, str | bytes) and audio:
-            samples, sample_rate_hz = await self._dropped_frame_audio(event, audio)
-            clock.note_input_audio(ack, samples=samples, sample_rate_hz=sample_rate_hz)
-            clock.note_input_handled(ack, samples=samples, sample_rate_hz=sample_rate_hz)
         self.run.fast_path_dropped_frames += 1
         logger.debug(
             "Duplex session %s: dropped client frame #%d while the model decodes a tool call",
@@ -1812,7 +1783,7 @@ class DuplexSessionRunner:
         release_queued_input: Callable[[], None] | None = None,
     ) -> None:
         """Prepare audio, then replace its admission charge with a PCM reservation."""
-        if await self._drop_frame_on_fast_path(event):
+        if self._drop_frame_on_fast_path():
             return
         session = self.session
         session.mark_user_input_activity()
@@ -2562,6 +2533,11 @@ class DuplexSessionRunner:
         model_state = self.model_state
         if not self._silence_continuation_enabled():
             return False
+        if fast_path and (
+            not self.run.fast_path_active or self.run.fast_path_config_generation != session.config_generation
+        ):
+            return False
+        config_generation = session.config_generation
         # Captured before every await. A continuation that stores the slot
         # while this one waits is newer, even when both saw append_tail None
         # or the same already-finished task.
@@ -2647,6 +2623,8 @@ class DuplexSessionRunner:
             return False
 
         def _still_valid() -> bool:
+            if fast_path and (not self.run.fast_path_active or session.config_generation != config_generation):
+                return False
             if not self._silence_continuation_enabled():
                 # Still allowed: a session.update may have turned continuation off
                 # while this unit waited behind the append in flight.
@@ -2665,7 +2643,11 @@ class DuplexSessionRunner:
                 expected_model_turn_id=expected_model_turn_id,
             )
 
+        append_accepted = False
+
         def _on_append_accepted(submit_time: float) -> None:
+            nonlocal append_accepted
+            append_accepted = True
             # Commit timing state once the runtime accepts the append.
             model_state.last_native_submit_monotonic = submit_time
             if not fast_path:
@@ -2690,6 +2672,12 @@ class DuplexSessionRunner:
             on_append_accepted=_on_append_accepted,
             before_append=_still_valid,
         )
+        if fast_path:
+            # Creating a wire-order task is not acceptance: its validity guard
+            # or the preceding append can still refuse it. A refused fast unit
+            # must release client input instead of leaving the session dropping.
+            await task
+            return append_accepted
         return task is not None
 
     # ------------------------------------------------------------------ #

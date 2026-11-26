@@ -536,18 +536,6 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 multimodal_outputs["nvc_function_response_consumed_generation"] = [
                     torch.tensor([generation], dtype=torch.int64) for generation in generations
                 ]
-            # Whether this frame was decoded inside a tool call, one entry per
-            # request: the engine drives the call back to back while it is set.
-            fast_path = [
-                int(bool(self._sessions.get(info.get("request_id"), {}).get("function_call_active", False)))
-                if isinstance(info, dict)
-                else 0
-                for info in info_dicts
-            ]
-            if any(fast_path):
-                multimodal_outputs["nvc_function_fast_path"] = [
-                    torch.tensor([flag], dtype=torch.int64) for flag in fast_path
-                ]
         # One client token per request, taken from that request's scheduled
         # tail. A shared padded tail would publish another request's decision,
         # and omitting the key drops concurrent tool calls: the data plane
@@ -555,6 +543,23 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         # frame 0, so it publishes nothing and leaves a forced token queued.
         if self._use_function_head and model_outputs.numel() and isinstance(info_dicts, list) and info_dicts:
             function_tokens = self._client_function_tokens(model_outputs, info_dicts, kwargs.get("request_token_spans"))
+            # MRv2 publishes before sample commits function_call_active. Apply
+            # this frame's boundary without mutating the sampling-owned state.
+            fast_path = []
+            for info, token in zip(info_dicts, function_tokens):
+                session = self._sessions.get(info.get("request_id"), {}) if isinstance(info, dict) else {}
+                active = bool(session.get("function_call_active", False))
+                if token is None:
+                    active = False
+                elif not isinstance(session.get("forced_function_token"), int):
+                    decision = int(token.item())
+                    if decision == session.get("nvc_function_sotc_id"):
+                        active = True
+                    elif decision == session.get("nvc_function_eotc_id"):
+                        active = False
+                fast_path.append(torch.tensor([int(active)], dtype=torch.int64))
+            if any(bool(flag.item()) for flag in fast_path):
+                multimodal_outputs["nvc_function_fast_path"] = fast_path
             if len(info_dicts) == 1:
                 if function_tokens[0] is not None:
                     multimodal_outputs["nvc_function_token"] = function_tokens[0]

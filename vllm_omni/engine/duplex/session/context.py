@@ -69,6 +69,8 @@ class DuplexRunState:
     #: The plugin wants the next silence append issued immediately instead of on
     #: the 80 ms pacing clock (for example while a model decodes a tool call).
     fast_path_active: bool = False
+    #: Invalidate queued fast appends and dropping across session updates.
+    fast_path_config_generation: int | None = None
     #: Client frames dropped because the model was on the fast path.
     fast_path_dropped_frames: int = 0
 

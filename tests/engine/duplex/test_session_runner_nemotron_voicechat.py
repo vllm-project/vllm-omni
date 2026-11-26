@@ -49,6 +49,7 @@ from vllm_omni.engine.duplex.session import runner as runner_module
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallState
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex import plugin as plugin_module
+from vllm_omni.model_executor.models.nemotron_voicechat.duplex.input import decode_pcm_f32le
 from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_thinker import (
     NemotronVoiceChatThinkerForConditionalGeneration as Thinker,
 )
@@ -1161,3 +1162,129 @@ async def test_audio_decoded_alongside_a_fast_step_is_not_delivered(harness):
         tts_output(h.stage0_request_id(), samples=1764), stage_id=2, segment_finished=True
     )
     assert "response.output_audio.delta" in types(events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_body", [{"silence_continuation": False}, {"clock": "input"}])
+async def test_disallowed_fast_continuation_keeps_real_client_frames(monkeypatch, extra_body):
+    # Nemotron currently rejects input-clock admission. Exercise the generic
+    # runner guard too, without changing the plugin's production capability.
+    if extra_body.get("clock") == "input":
+        monkeypatch.setattr(plugin_module.NemotronVoiceChatDuplexPlugin, "supports_input_clock", True)
+    async with open_nemotron_harness(monkeypatch, extra_body=extra_body) as h:
+        await h.run(append_audio(samples=1280))
+        await deliver_decoded_frame(h, fast_path=True)
+        before = len(h.port.submissions)
+        assert before == 1
+        client_frame = append_audio(samples=1280, value=0.25)
+        events = await h.run(client_frame)
+        assert error_codes(events) == []
+        assert len(h.port.submissions) == before + 1
+        assert submitted_payloads(h)[-1].get("fast_path") is not True
+        assert decode_pcm_f32le(submitted_payloads(h)[-1]) == client_frame.audio
+
+
+@pytest.mark.asyncio
+async def test_session_update_off_then_on_does_not_keep_dropping_client_audio(harness):
+    h = harness
+    await h.run(append_audio(samples=1280))
+    await deliver_decoded_frame(h, fast_path=True)
+    for enabled in (False, True):
+        await h.run(commands.UpdateSession(patch={"extra_body": {"silence_continuation": enabled}}))
+        before = len(h.port.submissions)
+        client_frame = append_audio(samples=1280, value=0.25)
+        await h.run(client_frame)
+        assert len(h.port.submissions) == before + 1
+        assert submitted_payloads(h)[-1].get("fast_path") is not True
+        assert decode_pcm_f32le(submitted_payloads(h)[-1]) == client_frame.audio
+    await deliver_decoded_frame(h, fast_path=True)
+    assert submitted_payloads(h)[-1]["fast_path"] is True
+
+
+@pytest.mark.asyncio
+async def test_refused_fast_append_keeps_client_paced_decoding(harness, monkeypatch):
+    h = harness
+    await h.run(append_audio(samples=1280))
+    start_append = h.runner._start_append
+
+    async def refuse_fast_append(payload, **kwargs):
+        if payload.get("fast_path"):
+            kwargs["before_append"] = lambda: False
+        return await start_append(payload, **kwargs)
+
+    monkeypatch.setattr(h.runner, "_start_append", refuse_fast_append)
+    await deliver_decoded_frame(h, fast_path=True)
+    assert len(h.port.submissions) == 1
+    client_frame = append_audio(samples=1280, value=0.25)
+    await h.run(client_frame)
+    assert len(h.port.submissions) == 2
+    assert submitted_payloads(h)[-1].get("fast_path") is not True
+    assert decode_pcm_f32le(submitted_payloads(h)[-1]) == client_frame.audio
+
+
+@pytest.mark.asyncio
+async def test_queued_fast_append_is_invalidated_even_if_continuation_is_reenabled(harness, monkeypatch):
+    h = harness
+    await h.run(append_audio(samples=1280))
+    entered, release = asyncio.Event(), asyncio.Event()
+    start_append = h.runner._start_append
+
+    async def pause_fast_append(payload, **kwargs):
+        if payload.get("fast_path"):
+            entered.set()
+            await release.wait()
+        return await start_append(payload, **kwargs)
+
+    monkeypatch.setattr(h.runner, "_start_append", pause_fast_append)
+    # Hold the synthetic append after planning but before its wire-order task
+    # starts, so both real session updates can run through the owner mailbox.
+    delivery = asyncio.create_task(deliver_decoded_frame(h, fast_path=True))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        for enabled in (False, True):
+            await h.run(commands.UpdateSession(patch={"extra_body": {"silence_continuation": enabled}}))
+        release.set()
+        await delivery
+        await h.settle()
+        assert len(h.port.submissions) == 1
+        client_frame = append_audio(samples=1280, value=0.25)
+        await h.run(client_frame)
+        assert len(h.port.submissions) == 2
+        assert submitted_payloads(h)[-1].get("fast_path") is not True
+        assert decode_pcm_f32le(submitted_payloads(h)[-1]) == client_frame.audio
+    finally:
+        release.set()
+        await asyncio.gather(delivery, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_delayed_fast_audio_preserves_response_completion_and_prior_speech(harness):
+    h = harness
+    await h.run(append_audio(samples=1280))
+    for _ in range(3):
+        await open_speaking_response(h)
+        await deliver_decoded_frame(h, fast_path=True)
+        submissions = len(h.port.submissions)
+        # The codec's earlier speech arrives after SOTC: it must still play.
+        events = await h.deliver_and_settle(
+            tts_output(h.stage0_request_id(), samples=1764), stage_id=2, segment_finished=True
+        )
+        assert "response.output_audio.delta" in types(events)
+        # A codec completion is not another thinker decision and must not
+        # schedule a second synthetic append for the same frame.
+        assert len(h.port.submissions) == submissions
+        await deliver_decoded_frame(h, fast_path=False)
+        # Audio for the fast frame arrives after EOTC: it must still be silent.
+        events = await h.deliver_and_settle(
+            tts_output(h.stage0_request_id(), samples=1764), stage_id=2, segment_finished=True
+        )
+        assert "response.output_audio.delta" not in types(events)
+        await deliver(h, token_id=1)
+        events = await h.deliver_and_settle(
+            tts_output(h.stage0_request_id(), samples=3528), stage_id=2, segment_finished=True
+        )
+        assert "response.output_audio.delta" in types(events)
+        assert "response.done" in types(events)
+        state = h.runner.plugin.data_plane._requests[h.stage0_request_id()]
+        assert state.audio_frames == state.text_frames
+        assert state.pending_speech_end_frames == []

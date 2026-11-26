@@ -184,12 +184,14 @@ class ModelChannel:
         *,
         close_from_runtime: Callable[[str], Awaitable[None]],
         schedule_silence_continuation: SilenceContinuationScheduler,
+        silence_continuation_enabled: Callable[[], bool] = lambda: False,
         abort_request: Callable[..., Awaitable[None]],
     ) -> None:
         self._ctx = ctx
         self._out = out
         self._close_from_runtime = close_from_runtime
         self._schedule_silence_continuation = schedule_silence_continuation
+        self._silence_continuation_enabled = silence_continuation_enabled
         self._abort_request = abort_request
         self._input_transcriptions: dict[str, CommittedInputContinuation] = {}
         self._deferred_text_listen: tuple[int, dict[str, object]] | None = None
@@ -860,12 +862,6 @@ class ModelChannel:
             # projector. Its metrics and transcript still use this mailbox.
             return None
         fast_path = self._note_fast_path(item)
-        if fast_path and item.stage_id >= item.context.final_stage_id:
-            # Stage-2 audio decoded alongside a fast-path frame is not speech:
-            # the call's tokens are on the function channel. Delivering it would
-            # speak whatever the draining codec emitted while the model fills a
-            # tool call.
-            return None
         engine_output = self._build_stage_output(item)
         runtime_config = self._ctx.plugin.runtime_config_after_model_output(
             dict(session.runtime_config),
@@ -2035,10 +2031,20 @@ class ModelChannel:
         the client's frames must be appended again instead of dropped.
         """
         if item.stage_id != 0 or not item.context.segment_finished:
-            return self._ctx.run.fast_path_active
+            return False
         finished = bool(getattr(item.output, "finished", False))
         active = not finished and bool(
             self._ctx.plugin.fast_path_active(item.request_id, self._fast_path_output_metadata(item))
+        )
+        session = self._ctx.session
+        turn_id = item.context.model_turn_id
+        if turn_id is None:
+            turn_id = item.context.identity.fence.turn_id
+        active = (
+            active
+            and self._silence_continuation_enabled()
+            and session.active_request_id == item.request_id
+            and (session.active_response_id is not None or (self._out.auto_responds() and session.turn_id == turn_id))
         )
         if active and not self._ctx.run.fast_path_active:
             self._ctx.run.fast_path_dropped_frames = 0
@@ -2055,6 +2061,7 @@ class ModelChannel:
                 self._ctx.run.fast_path_dropped_frames,
             )
         self._ctx.run.fast_path_active = active
+        self._ctx.run.fast_path_config_generation = self._ctx.session.config_generation if active else None
         return active
 
     async def _continue_fast_path(
@@ -2097,7 +2104,7 @@ class ModelChannel:
         payload["duplex_turn_id"] = payload_turn_id
         payload["fast_path"] = True
         try:
-            await self._schedule_silence_continuation(
+            scheduled = await self._schedule_silence_continuation(
                 payload,
                 request_id=request_id,
                 owner_id=owner_id,
@@ -2107,9 +2114,12 @@ class ModelChannel:
                 expected_model_turn_id=model_turn_id,
                 fast_path=True,
             )
+            if not scheduled:
+                self._ctx.run.fast_path_active = False
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._ctx.run.fast_path_active = False
             logger.exception("Failed to schedule a duplex tool-call fast-path append: %s", exc)
 
     def silence_continuation_is_stale(
