@@ -77,7 +77,7 @@ Install the optional client dependencies, download the sample camera inputs,
 and run the client:
 
 ```bash
-pip install openpi-client websockets opencv-python
+pip install openpi-client websockets opencv-python-headless
 
 hf download YangshenDeng/vllm-omni-dreamzero-assets \
   --repo-type dataset \

@@ -4,8 +4,8 @@ DreamZero is the robot-policy serving example for the OpenPI-compatible `/v1/rea
 
 ## Supported checkpoints
 
-| Model | HuggingFace repo |
-|---|---|
+| Model           | HuggingFace repo              |
+| --------------- | ----------------------------- |
 | DreamZero-DROID | `GEAR-Dreams/DreamZero-DROID` |
 
 ## Quick start
@@ -32,7 +32,7 @@ Override `MODEL`, `PORT`, `HOST`, `DEPLOY_CONFIG`, or `SERVED_MODEL_NAME` throug
 The core `pip install -e .` setup does not include the extra packages used by the DreamZero example scripts.
 
 - `openpi_client.py`:
-  `openpi-client`, `websockets`, `opencv-python`
+  `openpi-client`, `websockets`, `opencv-python-headless`
 - `droid_sim_eval_client.py`:
   `mediapy`, `websockets`, `openpi-client`
 
@@ -45,7 +45,7 @@ If you run the DROID client on Python < 3.12, also install `typing-extensions`.
 The bundled DreamZero configs intentionally keep only:
 
 | Config | Purpose |
-|---|---|
+| --- | --- |
 | `vllm_omni/deploy/dreamzero.yaml` | Default TP=1, CFG parallel disabled |
 | `vllm_omni/deploy/dreamzero_tp1_cfg2.yaml` | TP=1, CFG parallel size=2 |
 
