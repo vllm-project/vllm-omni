@@ -205,6 +205,14 @@ def test_has_pending_tool_followup() -> None:
     assert plugin.has_pending_tool_followup({"aura_tool_pending": []}) is False
     assert plugin.has_pending_tool_followup({"aura_tool_pending": [{"output": "18C"}]}) is True
     assert plugin.has_pending_tool_followup({"aura_tool_pending": [{"output": "18C"}, {"output": 123}]}) is False
+    pending: list[dict[str, str]] = [{"call_id": "call_a", "output": "now"}]
+    partial = {
+        "aura_tool_batch": ["call_a", "call_b"],
+        "aura_tool_pending": pending,
+    }
+    assert plugin.has_pending_tool_followup(partial) is False
+    pending.append({"call_id": "call_b", "output": "here"})
+    assert plugin.has_pending_tool_followup(partial) is True
 
 
 def test_runtime_config_for_function_output_accumulates_pending_results() -> None:

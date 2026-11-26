@@ -289,9 +289,11 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             raise ValueError("AURA duplex plan_append expects a mapping payload")
         if not final and not payload.get("aura_turn_commit"):
             return _skip()
-        if payload.get("type") == "conversation" and len(payload) == 1:
-            # A bare response.create answering an accepted tool result
-            # (``has_pending_tool_followup``): no new audio/video this turn.
+        # A bare response.create. The runner may attach ``_native_explicit_reply``;
+        # that flag is not user audio or video. ``has_pending_tool_followup``
+        # decides whether the whole tool batch is ready to answer.
+        public_payload = {key: value for key, value in payload.items() if not str(key).startswith("_")}
+        if public_payload.get("type") == "conversation" and len(public_payload) == 1:
             return self._plan_tool_followup(request_id=request_id, fence=fence, runtime_config=runtime_config)
 
         mm = _video_frames_to_mm(payload.get("video_frames"))
@@ -653,12 +655,31 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         return model_result.get("aura_tool_call_ends_turn") is True
 
     def has_pending_tool_followup(self, runtime_config: Mapping[str, object]) -> bool:
+        """True when every call in the open batch has a string result.
+
+        A partial batch must not start the follow-up. ``response.create`` then
+        finds nothing to answer and leaves ``aura_tool_batch`` in place, so a
+        result that arrives later is still accepted. The batch is cleared only
+        when that follow-up is actually submitted.
+        """
         pending = runtime_config.get("aura_tool_pending")
-        return (
+        if not (
             isinstance(pending, list)
             and bool(pending)
             and all(isinstance(entry, Mapping) and isinstance(entry.get("output"), str) for entry in pending)
-        )
+        ):
+            return False
+        batch = runtime_config.get("aura_tool_batch")
+        if not isinstance(batch, list) or not batch:
+            return True
+        ready = {
+            entry.get("call_id")
+            for entry in pending
+            if isinstance(entry, Mapping)
+            and isinstance(entry.get("call_id"), str)
+            and isinstance(entry.get("output"), str)
+        }
+        return all(isinstance(call_id, str) and call_id in ready for call_id in batch)
 
     def runtime_config_for_function_output(
         self,

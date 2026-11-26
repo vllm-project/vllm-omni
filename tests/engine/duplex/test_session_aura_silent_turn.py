@@ -13,6 +13,7 @@ from tests.engine.duplex.test_session_runner_nemotron_voicechat import error_cod
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
+from vllm_omni.model_executor.models.aura_omni.duplex.history import get_or_create_session_history
 from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
 from vllm_omni.model_executor.stage_input_processors.aura_omni import SILENT_TEXT
 from vllm_omni.outputs import OmniRequestOutput
@@ -80,5 +81,56 @@ async def test_box_plus_tool_completes_the_response_and_admits_the_followup() ->
         assert error_codes(follow) == []
         assert len(h.port.submissions) == before + 1
         assert h.port.submissions[-1].prompt["additional_information"]["aura_tool_followup"] is True
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_early_response_create_keeps_the_rest_of_the_tool_batch() -> None:
+    """A result for call A must not drop call B that has not arrived yet."""
+    plugin = AuraDuplexPlugin(lambda audio, sample_rate, fmt, speed: "ZmFrZQ==")
+    h = await open_harness(plugin=plugin, model="aura", modalities=("text", "audio"), stage_count=4)
+    try:
+        fence = helpers.append_fence(h.session, None)
+        request_id = DuplexSessionManager.stage_request_id(fence, stage_id=1, resumable=False)
+        plugin.data_plane.begin_request(request_id)
+        h.session.bind_request(request_id)
+        text = (
+            "<|respond|>"
+            "<tool_call>\n<function=get_current_datetime>\n</function>\n</tool_call>\n"
+            "<tool_call>\n<function=get_current_location>\n</function>\n</tool_call>"
+        )
+        output = OmniRequestOutput(
+            request_id=request_id,
+            finished=True,
+            stage_id=1,
+            outputs=[CompletionOutput(index=0, text=text, token_ids=[], cumulative_logprob=None, logprobs=None)],
+        )
+        for event in plugin.data_plane.project({"data_plane_outputs": [output]}):
+            await h.runner.model._send_one_model_output_event(event)
+        events = await h.settle()
+        done = [event for event in events if event.type == "response.function_call_arguments.done"]
+        assert len(done) == 2
+        assert len({event.call_id for event in done}) == 2
+        assert h.session.runtime_config["aura_tool_batch"] == [event.call_id for event in done]
+
+        before = len(h.port.submissions)
+        assert error_codes(await h.run(commands.CreateItem(item=output_item(done[0].call_id, "10:00")))) == []
+        early = await h.run(commands.CreateResponse())
+        assert error_codes(early) == ["response_create_without_input"]
+        assert len(h.port.submissions) == before
+        assert h.session.runtime_config["aura_tool_batch"] == [event.call_id for event in done]
+        assert [entry["call_id"] for entry in h.session.runtime_config["aura_tool_pending"]] == [done[0].call_id]
+
+        assert error_codes(await h.run(commands.CreateItem(item=output_item(done[1].call_id, "台北")))) == []
+        follow = await h.run(commands.CreateResponse())
+        assert error_codes(follow) == []
+        assert len(h.port.submissions) == before + 1
+        assert h.port.submissions[-1].prompt["additional_information"]["aura_tool_followup"] is True
+        history = get_or_create_session_history(h.session.session_id)
+        assert [message["content"] for message in history.messages if message["role"] == "tool_response"] == [
+            "10:00",
+            "台北",
+        ]
     finally:
         await close_harness(h)
