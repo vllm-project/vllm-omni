@@ -397,7 +397,7 @@ def test_cat_pad_5d_is_bitwise_and_layout_exact(
     output_with_cache, next_cache = pair
     assert torch.equal(output_with_cache, reference)
     pad_height, pad_width = padding[2], padding[0]
-    keep_frames = min(CACHE_T, reference.shape[2])
+    keep_frames = min(CACHE_T, cache_frames + frames)  # like upstream, never the zero front padding
     expected_cache = reference[:, :, -keep_frames:, pad_height : pad_height + height, pad_width : pad_width + width]
     assert torch.equal(next_cache, expected_cache)
     assert next_cache.is_contiguous(memory_format=torch.channels_last_3d) is channels_last
@@ -443,7 +443,7 @@ def test_cat_pad_5d_assembles_channels_last_output_from_channels_first_input(
     output_with_cache, next_cache = pair
     assert output_with_cache.is_contiguous(memory_format=torch.channels_last_3d)
     assert torch.equal(output_with_cache, reference)
-    keep_frames = min(CACHE_T, reference.shape[2])
+    keep_frames = min(CACHE_T, cache_frames + frames)
     assert next_cache.is_contiguous()  # follows x's layout, not the output's
     assert torch.equal(next_cache, reference[:, :, -keep_frames:, 1 : 1 + height, 1 : 1 + width])
 
@@ -461,13 +461,16 @@ def test_conv_out_channels_last_verdict_is_recorded_and_exact(layout: str) -> No
     reference = WanCausalConv3d.forward(conv, chunk, cache)
     fast_cache = [cache.clone()]
     out = fp._run_conv_out_channels_last(conv, chunk, fast_cache, 0)
-    assert out is not None  # the verdict decides which formulation's result is returned, both are exact
-    assert out.is_contiguous()
-    assert _bits_equal(out, reference)
     verdicts = fp._CONV_OUT_LAYOUT_VERDICTS[conv]
-    assert len(verdicts) == 1
-    assert torch.equal(fast_cache[0], torch.cat([cache, chunk], dim=2)[:, :, -CACHE_T:])
-    assert fast_cache[0].is_contiguous()
+    assert len(verdicts) == 1  # probed on a template before assembling
+    if next(iter(verdicts.values())):
+        assert out is not None and out.is_contiguous()
+        assert _bits_equal(out, reference)
+        assert torch.equal(fast_cache[0], torch.cat([cache, chunk], dim=2)[:, :, -CACHE_T:])
+        assert fast_cache[0].is_contiguous()
+    else:
+        assert out is None  # declined before assembling: the standard path gets the untouched cache
+        assert torch.equal(fast_cache[0], cache)
     again = fp._run_conv_out_channels_last(conv, chunk, [cache.clone()], 0)
     if next(iter(verdicts.values())):
         assert again is not None and _bits_equal(again, reference)
@@ -512,7 +515,7 @@ def test_cat_time_5d_is_bitwise_and_layout_exact(
     assembled, next_cache = pair
     assert assembled.stride() == reference.stride()
     assert torch.equal(assembled, reference)
-    assert torch.equal(next_cache, reference[:, :, -CACHE_T:])
+    assert torch.equal(next_cache, reference[:, :, -min(CACHE_T, cache_frames + frames) :])
     assert next_cache.is_contiguous(memory_format=torch.channels_last_3d) is channels_last
     assert torch.equal(dm.cat_time_5d(x, cache, pad_front), reference)
 
@@ -533,7 +536,7 @@ def test_input_assembly_keeps_aten_layout_for_1x1_activations(dtype: torch.dtype
     assert output.stride() == reference.stride()
     assert torch.equal(output, reference)
     assert next_cache.is_contiguous()
-    assert torch.equal(next_cache, reference[:, :, -CACHE_T:, 1:2, 1:2])
+    assert torch.equal(next_cache, reference[:, :, -min(CACHE_T, cache_frames + 1) :, 1:2, 1:2])
 
     temporal = _reference_cat_pad(x, cache, (0, 0, 0, 0, 2, 0))
     assembled = dm.cat_time_5d(x, cache, pad_front=2)
@@ -566,7 +569,7 @@ def test_cat_time_5d_exceeds_grid_y_limit(monkeypatch: pytest.MonkeyPatch, cache
     assembled, next_cache = pair
     assert _bits_equal(assembled, reference)
     assert assembled.stride() == reference.stride()
-    assert _bits_equal(next_cache, reference[:, :, -CACHE_T:])
+    assert _bits_equal(next_cache, reference[:, :, -min(CACHE_T, cache_frames + frames) :])
     assert next_cache.is_contiguous(memory_format=torch.channels_last_3d)
     assert _bits_equal(dm.cat_time_5d(x, cache, pad_front=2), reference)
 
@@ -1039,7 +1042,8 @@ def test_first_frame_conv2d_preserves_following_cached_frame(dtype, temporal_onl
             tol = dict(rtol=1e-4, atol=1e-5) if dtype is torch.float32 else dict(rtol=2e-2, atol=2e-2)
             torch.testing.assert_close(actual, expected, **tol)
             previous = torch.zeros_like(chunk) if index == 0 else chunks[index - 1]
-            assert _bits_equal(cache[0], torch.cat([previous, chunk], dim=2))
+            # Like upstream, the cache never holds the zero front padding; the next call pads it again.
+            assert _bits_equal(cache[0], chunk if index == 0 else torch.cat([previous, chunk], dim=2))
             assert cache[0].is_contiguous(memory_format=torch.channels_last_3d)
             reference_cache = chunk.clone() if index == 0 and start is None else torch.cat([previous, chunk], dim=2)
     assert calls == [True], "A later T=1 chunk with history must retain the temporal convolution"
@@ -1070,7 +1074,7 @@ def test_first_frame_conv2d_deferred_bias_matches_autocast(dtype, with_bias) -> 
             assert bias is None
     assert isinstance(cache[0], torch.Tensor)
     assert cache[0].dtype == x.dtype, "Autocast must not round the temporal cache"
-    assert _bits_equal(cache[0], torch.cat([torch.zeros_like(x), x], dim=2))
+    assert _bits_equal(cache[0], x)
     torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
 
 
@@ -1347,3 +1351,43 @@ def test_channels_last_decoder_keeps_layout_and_stays_close(
     mse = (difference**2).mean().item()
     psnr = float("inf") if mse == 0 else 10 * torch.log10(torch.tensor(4.0 / mse)).item()
     assert error <= tolerance and psnr >= 45.0, f"max_abs_diff={error:.3e} psnr={psnr:.2f} dB tolerance={tolerance}"
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("warm_allocator", [False, True])
+def test_qwen_image_cold_first_lossless_decode_fits_where_reference_fits(warm_allocator: bool) -> None:
+    """The default ``lossless`` level must not OOM on a cold first decode that ``off`` fits (PR #9553).
+
+    Both cost the reference extra memory on that call: the feature cache used to keep the zero front padding
+    frames, and the first-use probes allocate full-size scratch tensors. The process is capped a little above
+    ``off``'s cold-decode memory, so the probes must decline (memory check or OutOfMemoryError) instead of failing.
+    """
+    from diffusers.models.autoencoders import AutoencoderKLQwenImage
+
+    device_module = torch.get_device_module(DEVICE)
+    if not hasattr(device_module, "set_per_process_memory_fraction"):
+        pytest.skip(f"{DEVICE} has no per-process memory limit")
+    torch.manual_seed(0)
+    reference = AutoencoderKLQwenImage().to(DEVICE, torch.bfloat16).eval()  # real channel widths, random weights
+    candidate = AutoencoderKLQwenImage().to(DEVICE, torch.bfloat16).eval()
+    candidate.load_state_dict(reference.state_dict())
+    latents = torch.randn(1, reference.config.z_dim, 1, 64, 64, device=DEVICE, dtype=torch.bfloat16)
+
+    device_module.synchronize()
+    device_module.empty_cache()
+    device_module.reset_peak_memory_stats()
+    expected = reference.decode(latents, return_dict=False)[0]
+    device_module.synchronize()
+    reference_peak = device_module.max_memory_reserved()
+    del reference
+    assert install_wan_vae_fastpath(candidate, level="lossless").installed
+
+    total = device_module.get_device_properties(DEVICE).total_memory
+    if not warm_allocator:  # warm: keep the reference decode's cached blocks, as a serving process would
+        device_module.empty_cache()
+    device_module.set_per_process_memory_fraction(min(1.0, 1.15 * reference_peak / total))
+    try:
+        actual = candidate.decode(latents, return_dict=False)[0]
+    finally:
+        device_module.set_per_process_memory_fraction(1.0)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))

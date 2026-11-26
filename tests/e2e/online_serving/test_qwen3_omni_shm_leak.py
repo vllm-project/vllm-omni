@@ -28,8 +28,14 @@ from pathlib import Path
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.runtime import (
+    QWEN3_OMNI_COLD_INIT_TIMEOUT_S,
+    QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S,
+    OmniServerParams,
+    dummy_messages_from_mix_data,
+)
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -52,6 +58,8 @@ test_params = [
             model=_MODEL,
             stage_config_path=_ASYNC_CHUNK_DEPLOY,
             use_stage_cli=True,
+            stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None),
+            init_timeout=QWEN3_OMNI_COLD_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None,
         ),
         id="async_chunk",
     )

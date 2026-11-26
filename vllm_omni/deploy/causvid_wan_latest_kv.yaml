@@ -4,7 +4,7 @@
 # noisy step + clean). cell_schedule: latest_kv.
 # Self-Forcing (S=1 layer PP): causvid_wan_self_forcing.yaml
 #
-# Design: docs/design/feature/noisy_kv.md
+# Design: docs/design/feature/noisy_pp.md
 
 pipeline: causvid_wan
 async_chunk: false

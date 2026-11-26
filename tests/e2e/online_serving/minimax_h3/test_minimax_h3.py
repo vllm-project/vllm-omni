@@ -55,7 +55,8 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
                         if current_omni_platform.is_npu()
                         else ["--enable-cpu-offload"]
                     ),
-                    "--enforce-eager",
+                    "--stage-overrides",
+                    '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}',
                     "--diffusion-attention-backend",
                     "TORCH_SDPA" if current_omni_platform.is_npu() else "FLASH_ATTN",
                     "--additional-config",

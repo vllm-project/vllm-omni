@@ -42,3 +42,6 @@ stages:
       ar_diffusion_kv_config:
         gpu_memory_fraction: 0.6
         warmup_cudagraph: true
+        # Superpage KV: set to the FlashAttention key tile, 160 on H100/H200
+        # (FA3) or 128 on B200 (FA4). Output is not bitwise identical to off.
+        # superpage_tokens: 160

@@ -1,18 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import multiprocessing
+import os
+import queue
+import signal
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import msgspec
 import pytest
+from pytest_mock import MockerFixture
+from vllm.config import VllmConfig
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.request import RequestStatus
+from vllm.v1.serial_utils import run_method
 
+from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
+from vllm_omni.engine import OmniEngineCoreOutputs
 from vllm_omni.engine.stage_engine_core_proc import (
     StageEngineCoreProc,
     _bind_first_audio_sink,
@@ -23,6 +35,66 @@ from vllm_omni.worker_v2.first_audio_sender import supports_in_process_first_aud
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux fork and process signals")
+@pytest.mark.parametrize("repeated_signal", [signal.SIGTERM, signal.SIGINT])
+def test_shutdown_survives_repeated_termination_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, repeated_signal: int
+) -> None:
+    from vllm_omni.engine import stage_engine_core_proc as module
+
+    monkeypatch.setenv("VLLM_OMNI_SHM_WAKEUP", "1")
+    created = tmp_path / "created"
+    connector: SharedMemoryConnector | None = None
+
+    def construct(self: StageEngineCoreProc, *args: object, **kwargs: object) -> None:
+        nonlocal connector
+        self.input_queue = queue.Queue()
+        connector = SharedMemoryConnector({"stage_id": 0, "wakeup_scope": str(tmp_path)})
+        assert connector.get_wakeup_generation() is not None
+        assert connector._wake_path is not None
+        created.write_text(connector._wake_path)
+
+    def run(self: StageEngineCoreProc) -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    def shutdown(self: StageEngineCoreProc) -> None:
+        assert connector is not None
+        os.kill(os.getpid(), repeated_signal)
+        connector.close()
+
+    # Substitute model construction/execution, retaining the real process
+    # entrypoint, signal handlers and an owned OS FIFO in the forked child.
+    mocker.patch.object(StageEngineCoreProc, "__init__", construct)
+    mocker.patch.object(StageEngineCoreProc, "run_busy_loop", run)
+    mocker.patch.object(StageEngineCoreProc, "shutdown", shutdown)
+    mocker.patch.object(module, "maybe_register_config_serialize_by_value")
+    config = object.__new__(VllmConfig)
+    config.model_config = None
+    config.logging_config = None
+    process = multiprocessing.get_context("fork").Process(
+        target=StageEngineCoreProc.run_stage_core, kwargs={"vllm_config": config, "omni_stage_id": 0}
+    )
+    process.start()
+    try:
+        process.join(timeout=15)
+        assert not process.is_alive(), "Stage shutdown did not finish"
+        assert created.exists(), "Child did not create its FIFO"
+        assert not Path(created.read_text()).exists(), "Termination interrupted FIFO cleanup"
+        assert process.exitcode == 128 + signal.SIGTERM
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+        if created.exists():
+            owned = Path(created.read_text())
+            owned.unlink(missing_ok=True)
+            try:
+                owned.parent.rmdir()
+            except FileNotFoundError:
+                pass
+        process.close()
+
+
 def test_ordered_abort_supports_scheduler_without_overflow_fences(mocker):
     engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
     engine.scheduler = mocker.Mock(spec=Scheduler)
@@ -30,6 +102,80 @@ def test_ordered_abort_supports_scheduler_without_overflow_fences(mocker):
     engine._handle_client_request(EngineCoreRequestType.ABORT, ["request"])
 
     engine.scheduler.finish_requests.assert_called_once_with(["request"], RequestStatus.FINISHED_ABORTED)
+
+
+@pytest.mark.parametrize("unsupported_model", [False, True])
+def test_input_stream_admission_error_does_not_enter_the_scheduler(mocker, unsupported_model):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    reason = (
+        "This model does not support text input append"
+        if unsupported_model
+        else "Text input exceeds its token capacity"
+    )
+    engine._input_stream_factory = None if unsupported_model else mocker.Mock(side_effect=ValueError(reason))
+    engine.vllm_config = SimpleNamespace()
+    engine.output_queue = mocker.Mock()
+    engine.scheduler = mocker.Mock()
+    request = SimpleNamespace(
+        request_id="invalid",
+        client_index=3,
+        additional_information={"input_stream": {"token_ids": [31, 32]}},
+        model_intermediate_buffer=None,
+    )
+
+    with patch.object(EngineCoreProc, "add_request") as add_request:
+        engine.add_request(request)
+
+    add_request.assert_not_called()
+    engine.scheduler.register_input_stream.assert_not_called()
+    output = engine.output_queue.put_nowait.call_args.args[0][1]
+    assert output.finished_requests == {"invalid"}
+    assert output.outputs[0].finish_reason == FinishReason.ERROR
+    assert output.outputs[0].stop_reason == reason
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(output), type=OmniEngineCoreOutputs)
+    assert decoded.finished_requests == {"invalid"}
+    assert decoded.outputs[0].stop_reason == reason
+
+
+def test_input_stream_is_registered_only_after_parent_admission(mocker):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    stream = object()
+    engine._input_stream_factory = mocker.Mock(return_value=stream)
+    engine.vllm_config = SimpleNamespace()
+    engine.output_queue = mocker.Mock()
+    engine.scheduler = mocker.Mock()
+    request = SimpleNamespace(
+        request_id="valid",
+        client_index=0,
+        additional_information={"input_stream": {"token_ids": [31]}},
+        model_intermediate_buffer=None,
+        is_finished=lambda: False,
+    )
+
+    with patch.object(
+        EngineCoreProc,
+        "add_request",
+        side_effect=lambda *_args: engine.scheduler.register_input_stream.assert_not_called(),
+    ) as add_request:
+        engine.add_request(request, request_wave=4)
+
+    add_request.assert_called_once_with(request, 4)
+    engine.scheduler.register_input_stream.assert_called_once_with("valid", stream)
+
+
+def test_release_reaches_native_data_plane_runner(mocker):
+    """MRv2 sends from the runner, so the release must reach its data plane."""
+    runner = mocker.Mock()
+    worker_wrapper = SimpleNamespace(worker=SimpleNamespace(model_runner=runner))
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    engine.scheduler = SimpleNamespace(chunk_transfer_adapter=None, _native_data_plane=True)
+    engine.model_executor = SimpleNamespace(
+        collective_rpc=lambda method, args=(): [run_method(worker_wrapper, method, args, {})]
+    )
+
+    engine.omni_release_request_resources(["a", "b"])
+
+    runner.release_omni_shm_resources.assert_called_once_with(["a", "b"])
 
 
 class WrappedUniProcExecutor(UniProcExecutor):

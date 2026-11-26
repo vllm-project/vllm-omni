@@ -325,7 +325,8 @@ def causal_conv(
         K=kernel_size,
         HAS_BIAS=bias is not None,
         HAS_RES=residual is not None,
-        PRECISION="ieee" if x.dtype == torch.float32 else "tf32",
+        # ROCm Triton rejects input_precision="tf32"; it is a no-op for bf16/fp16 operands anyway.
+        PRECISION="ieee" if x.dtype == torch.float32 or torch.version.hip else "tf32",
     )
     return out
 

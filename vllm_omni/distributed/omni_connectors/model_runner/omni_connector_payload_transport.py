@@ -10,19 +10,21 @@ import math
 import os
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from copy import copy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
 
-from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.data_entry_keys import OmniPayload, OmniPayloadStruct, returns_stage_payload, to_dict
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
     should_accumulate_full_payload_output,
 )
+from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
 from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 from vllm_omni.worker.scheduling_metadata_adapter import DefaultSchedulingMetadataAdapter
 
@@ -51,17 +53,21 @@ def _recv_poll_seconds() -> float:
 
 
 _RECV_POLL_S = _recv_poll_seconds()
+# Upper bound, in drain passes, on how long a missed request waits behind a burst.
+_RECV_DRAIN_REPOLL_PASSES = 8
 
 if TYPE_CHECKING:
     from vllm_omni.distributed.omni_connectors.connectors.base import (
         OmniConnectorBase,
     )
+    from vllm_omni.engine import AdditionalInformationPayload
 
 
 class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     """Own payload caching, full/chunk transport, and connector I/O."""
 
     _full_payload_replace_keys_cached: frozenset[str]
+    _paused_chunk_receivers: set[str]
 
     # ------------------------------------------------------------------ #
     #  Local payload cache (RFC §2.4 – Model Runner ownership)
@@ -104,6 +110,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     # ------------------------------------------------------------------ #
 
     _NON_CONSUMABLE_PAYLOAD_KEYS: set[tuple[str, str]] = {
+        ("meta", "is_segment_finished"),
+        ("meta", "replace_streaming_prompt"),
         ("meta", "finished"),
         ("meta", "override_keys"),
         ("meta", "next_stage_prompt_len"),
@@ -122,6 +130,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         if isinstance(value, (list, tuple, dict, set)):
             return len(value) > 0
         return True
+
+    @staticmethod
+    def _payload_segment_finished(payload: Any) -> bool:
+        meta = payload.get("meta") if isinstance(payload, dict) else None
+        flag = meta.get("is_segment_finished", False) if isinstance(meta, dict) else False
+        return bool(flag)
 
     @staticmethod
     def _payload_finished(payload: Any) -> bool:
@@ -188,13 +202,23 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 return True
         return False
 
-    @staticmethod
-    def _get_local_tp_group() -> Any | None:
-        """Return the local TP group when tensor parallelism is initialized."""
+    def _get_local_tp_group(self) -> Any | None:
+        """Return the local TP group when tensor parallelism is initialized.
+
+        The group does not change after distributed init, and the receive
+        loop calls this on every poll. Cache a resolved group. A call made
+        before init returns None without caching, so a later call can succeed.
+        """
+        group = getattr(self, "_local_tp_group", None)
+        if group is not None:
+            return group
         try:
-            return get_tp_group()
+            group = get_tp_group()
         except Exception:
             return None
+        if group is not None:
+            self._local_tp_group = group
+        return group
 
     def _recv_ordinary_stage_result(
         self,
@@ -333,6 +357,30 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             logger.warning("Stage payload %s was not delivered; caller must validate inline fallback", get_key)
         return payload
 
+    def _return_stage_payload(
+        self,
+        req_id: str,
+        tags: Mapping[str, object] | AdditionalInformationPayload | None,
+        payload: OmniPayload,
+    ) -> bool:
+        """Keep the payload for the connector output instead of sending it if the tags ask for it."""
+        if not returns_stage_payload(tags):
+            return False
+        with self._lock:
+            self._run_stage_payloads[req_id] = OmniSerializer.serialize(payload)
+        return True
+
+    def _stage_full_payload_locked(self, req_id: str, payload: OmniPayload) -> None:
+        """Cache a received full payload for recv_full_payload_inputs() to publish."""
+        self._local_stage_payload_cache[req_id] = self._snapshot_payload(payload)
+        # Publish full-payload readiness only after the aligned TP broadcast
+        # path in recv_full_payload_inputs() has materialized the payload on all
+        # local ranks. Publishing metadata / stage_recv from the background recv
+        # thread can let the scheduler observe a request before the payload is
+        # actually visible to the model thread.
+        self._full_payload_pending_broadcast_req_ids.add(req_id)
+        self._pending_load_reqs.pop(req_id, None)
+
     def _apply_staged_payloads_locked(self, staged_payloads: dict[str, Any]) -> None:
         for req_id, payload in staged_payloads.items():
             self._local_stage_payload_cache[req_id] = self._snapshot_payload(payload)
@@ -432,6 +480,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             or output.kv_sent_req_ids
             or output.stage_recv_req_ids
             or output.has_pending_kv_work
+            or output.stage_payloads
         )
 
     def attach_omni_connector_output(self, result: Any | None) -> Any:
@@ -652,17 +701,77 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         )
         return self._full_payload_replace_keys_cached
 
+    def _full_payload_token_ends_map(self) -> dict[str, dict[str, int]]:
+        ends = getattr(self, "_full_payload_token_ends", None)
+        if ends is None:
+            ends = {}
+            self._full_payload_token_ends = ends
+        return ends
+
+    def _drop_full_payload_token_end(self, req_id: str) -> None:
+        ends = getattr(self, "_full_payload_token_ends", None)
+        if ends is not None:
+            ends.pop(req_id, None)
+
+    def _reconcile_full_payload_output(
+        self,
+        req_id: str,
+        output: dict[str, Any],
+        token_range: tuple[int, int],
+        replace_keys: frozenset[str],
+        prefix_cache_keys: frozenset[str],
+    ) -> dict[str, Any]:
+        """Keep previously emitted positions when an AR step replays a prefix."""
+        start, end = token_range
+        token_ends = self._full_payload_token_ends_map().setdefault(req_id, {})
+        reconciled: dict[str, Any] = {}
+        for key, value in output.items():
+            if value is None:
+                continue
+            previous_end = token_ends.get(key)
+            if previous_end is not None:
+                if end <= previous_end:
+                    continue
+                if _is_full_payload_row_tensor(key, value) and key not in replace_keys:
+                    num_rows = int(value.shape[0])
+                    # Only cache-merged token-aligned tensors carry rows before this step.
+                    row_start = end - num_rows if key in prefix_cache_keys else start
+                    overlap = previous_end - row_start
+                    if overlap > 0:
+                        if num_rows != end - row_start:
+                            raise ValueError(
+                                f"Cannot reconcile replayed full payload {key!r} for {req_id!r}: "
+                                f"{num_rows} rows do not align with token range [{row_start}, {end})."
+                            )
+                        # Drop the replayed prefix so the accumulator retains only the new suffix.
+                        value = value[overlap:].clone()
+            reconciled[key] = value
+        token_ends.update({key: end for key in reconciled})
+        return reconciled
+
     def accumulate_full_payload_output(
         self,
         req_id: str,
         pooler_output: Any,
         request: Any,
+        *,
+        token_range: tuple[int, int] | None = None,
+        prefix_cache_keys: frozenset[str] = frozenset(),
     ) -> None:
         """Accumulate pooler_output for a request across steps (full_payload_mode).
 
         Per-token tensors (2-D+, matching trailing dims) and the 1-D codec
         validity mask are concatenated along dim-0. Scalar / global tensors
         are replaced with the latest value.
+
+        AR callers provide the executed input-token range [start, end).
+        ``prefix_cache_keys`` identifies token-aligned tensors that the prefix
+        cache merged, which may include rows before this step. Previously
+        emitted positions survive preemption: replayed prefixes are skipped
+        and only a new suffix is appended. A partially overlapping
+        non-token-aligned tensor raises, because its rows cannot be sliced by
+        token position. One-shot generation outputs omit ``token_range`` and
+        keep the append/replace policy below.
 
         Note: codec rows are NOT filtered for zero placeholders here. The
         downstream consumer ``_extract_qwen3_full_payload_codec_rows`` crops
@@ -676,6 +785,14 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """
         replace_keys = self._resolve_full_payload_replace_keys()
         existing = self._pending_full_payload_send.get(req_id)
+        if token_range is not None:
+            if existing is None:
+                self._drop_full_payload_token_end(req_id)
+            pooler_output = self._reconcile_full_payload_output(
+                req_id, pooler_output, token_range, replace_keys, prefix_cache_keys
+            )
+            if not pooler_output:
+                return
 
         if existing is None:
             chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
@@ -718,8 +835,13 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
-    def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
-        """Send accumulated full_payload outputs for requests that just finished."""
+    def flush_full_payload_outputs(
+        self,
+        finished_req_ids: set[str],
+        *,
+        finished_req_output_token_ids: Mapping[str, list[int]] | None = None,
+    ) -> None:
+        """Send accumulated full-payload outputs for finished requests."""
         pending_req_ids = set(self._pending_full_payload_send.keys())
         if not (finished_req_ids & pending_req_ids):
             return
@@ -733,8 +855,16 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         to_send: dict[str, tuple[Any, Any]] = {}
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
+            self._drop_full_payload_token_end(req_id)
             if entry is not None:
-                to_send[req_id] = self._materialize_full_payload_entry(entry)
+                output, request = self._materialize_full_payload_entry(entry)
+                if finished_req_output_token_ids is not None and req_id in finished_req_output_token_ids:
+                    # Give the processor authoritative terminal IDs without
+                    # modifying the runner's live cached request or its lists.
+                    request = copy(request)
+                    request.output_token_ids = list(finished_req_output_token_ids[req_id])
+                    request.all_token_ids = list(request.prompt_token_ids or []) + request.output_token_ids
+                to_send[req_id] = (output, request)
         logger.debug("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
             self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
@@ -783,6 +913,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     continue
             if payload is None:
                 logger.debug("[Stage-%s] send_full_payload_outputs: payload is None for %s", self._stage_id, req_id)
+                continue
+            # V1 request state only has decoded tags when the request carried some.
+            if self._return_stage_payload(req_id, getattr(request, "additional_information_cpu", None), payload):
                 continue
             if isinstance(payload, dict):
                 audio_codes = self._payload_audio_codes(payload)
@@ -854,7 +987,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             if request_id in self._stage_recv_req_ids:
                 return
             # Don't re-register if the finish sentinel was already received
-            if request_id in self._chunk_stream_completed:
+            if request_id in self._chunk_stream_completed or request_id in getattr(self, "_paused_chunk_receivers", ()):
+                return
+            if isinstance(request.payload_sender_info, bytes):
+                # The payload came on the request: stage it as if fetched, on the rank that fetches.
+                if self.is_data_transfer_rank():
+                    self._stage_full_payload_locked(request_id, OmniSerializer.deserialize(request.payload_sender_info))
                 return
             self._pending_load_reqs[request_id] = request
         self._work_available.set()
@@ -952,7 +1090,20 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     # ------------------------------------------------------------------ #
 
     def _recv_loop(self) -> None:
-        """Background thread: poll connector for incoming data."""
+        """Background thread: poll connector for incoming data.
+
+        Drain chunks that are already queued, then wait. A request that just
+        returned a chunk may already have the next one, so only those
+        requests are polled again. A miss means that chunk is not in the
+        connector yet; rescanning it opens a missing lock file and holds the
+        GIL against the model thread for the whole burst. Requests registered
+        during a burst join it on the next pass, and every
+        ``_RECV_DRAIN_REPOLL_PASSES`` passes the requests that missed are
+        polled again, so a long stream does not hold back another request's
+        first or next chunk. The wait is also the
+        recheck for a non-AR payload deferred until the scheduler takes the
+        previous one.
+        """
         _recv_poll_count = 0
         while not self._stop_event.is_set():
             snapshot = getattr(self._omni_connector, "get_wakeup_generation", None)
@@ -975,19 +1126,35 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     _recv_poll_count,
                 )
 
-            made_progress = self._poll_pending_requests_once(pending_ids)
+            known = set(pending_ids)
+            active = pending_ids
+            passes = 0
+            while active and not self._stop_event.is_set():
+                active = self._poll_pending_requests_once(active)
+                if not active:
+                    break
+                passes += 1
+                with self._lock:
+                    if passes % _RECV_DRAIN_REPOLL_PASSES == 0:
+                        polled = set(active)
+                        joined = [req_id for req_id in self._pending_load_reqs if req_id not in polled]
+                    else:
+                        joined = [req_id for req_id in self._pending_load_reqs if req_id not in known]
+                if joined:
+                    known.update(joined)
+                    active = [*active, *joined]
 
-            if not made_progress and not self._stop_event.is_set():
-                # Wait for a *new* arrival: existing future chunks may be
-                # blocked by scheduler ownership of the previous payload.
-                # A key-presence predicate would spin and compete for the
-                # GIL. Honor the configured readiness recheck interval.
-                wait_for_change = getattr(self._omni_connector, "wait_for_change", None)
-                if generation is not None and callable(wait_for_change):
-                    wait_for_change(generation, timeout=_RECV_POLL_S)
-                else:
-                    self._work_available.wait(timeout=_RECV_POLL_S)
-                    self._work_available.clear()
+            if not self._stop_event.is_set():
+                self._wait_for_next_payload(generation)
+
+    def _wait_for_next_payload(self, generation: int | None) -> None:
+        """Block until a new payload arrives, or until the recheck interval."""
+        wait_for_change = getattr(self._omni_connector, "wait_for_change", None)
+        if generation is not None and callable(wait_for_change):
+            wait_for_change(generation, timeout=_RECV_POLL_S)
+            return
+        self._work_available.wait(timeout=_RECV_POLL_S)
+        self._work_available.clear()
 
     _MAX_SEND_RETRIES = 3
 
@@ -1182,11 +1349,18 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         if self._async_chunk:
             is_finished = self._payload_finished(payload_data)
+            segment_finished = getattr(self, "_native_resumable", False) and self._payload_segment_finished(
+                payload_data
+            )
             incoming_payload_consumable = self._payload_is_consumable(payload_data)
+            incoming_meta = payload_data.get("meta", {}) if isinstance(payload_data, dict) else {}
+            replace_prompt = bool(
+                getattr(self, "_native_resumable", False) and incoming_meta.get("replace_streaming_prompt")
+            )
 
             if self._model_mode != "ar":
                 new_ids = self._payload_audio_codes(payload_data)
-                if not self._payload_value_has_content(new_ids) and not is_finished:
+                if not self._payload_value_has_content(new_ids) and not (is_finished or segment_finished):
                     return False
                 payload_consumable = self._payload_is_consumable(payload_data)
 
@@ -1202,6 +1376,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     # before the recv thread publishes it to the local cache.
                     payload_data = self._accumulate_payload(external_req_id, payload_data)
                     payload_consumable = incoming_payload_consumable
+                if segment_finished:
+                    self._paused_chunk_receivers.add(req_id)
+                    self._pending_load_reqs.pop(req_id, None)
                 if is_finished:
                     self._chunk_finished_req_ids.add(req_id)
                     self._chunk_stream_completed.add(req_id)
@@ -1214,14 +1391,36 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 else:
                     self._local_stage_payload_cache[req_id] = payload_data
                 self._async_chunk_updated_req_ids.add(req_id)
-                update = self._extract_scheduling_metadata_update(self._local_stage_payload_cache[req_id])
+                metadata_payload = (
+                    payload_data
+                    if self._model_mode != "ar" or not getattr(self, "_native_resumable", False)
+                    else {"meta": incoming_meta}
+                )
+                update = self._extract_scheduling_metadata_update(metadata_payload)
+                if segment_finished or replace_prompt:
+                    update = replace(
+                        update or SchedulingMetadataUpdate(),
+                        segment_finished=segment_finished,
+                        replace_prompt=replace_prompt,
+                    )
+                if (
+                    getattr(self, "_native_resumable", False)
+                    and self._model_mode != "ar"
+                    and (is_finished or segment_finished)
+                    and not payload_consumable
+                ):
+                    # A boundary-only message must retire without decoding a dummy codec frame.
+                    update = replace(update or SchedulingMetadataUpdate(), prompt_token_ids=())
                 if update is not None:
+                    previous = self._local_request_metadata.get(req_id)
+                    if previous is not None and previous.replace_prompt:
+                        update = replace(update, replace_prompt=True, resize_prompt_to=previous.resize_prompt_to)
                     self._local_request_metadata[req_id] = update
                 # A finish-only sentinel still needs one terminal wake-up so
                 # the downstream stage can sync the merged local payload and
                 # flush/finish even when the last recv carries no new
                 # consumable chunk bytes.
-                if payload_consumable or is_finished:
+                if payload_consumable or is_finished or segment_finished:
                     self._finished_load_reqs.add(req_id)
                 if is_finished and not payload_consumable:
                     logger.debug(
@@ -1245,14 +1444,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             else:
                 engine_inputs = payload_data
             with self._lock:
-                self._local_stage_payload_cache[req_id] = self._snapshot_payload(engine_inputs)
-                # Publish full-payload readiness only after the aligned TP broadcast
-                # path in recv_full_payload_inputs() has materialized the payload on all
-                # local ranks. Publishing metadata / stage_recv from the background recv
-                # thread can let the scheduler observe a request before the payload is
-                # actually visible to the model thread.
-                self._full_payload_pending_broadcast_req_ids.add(req_id)
-                self._pending_load_reqs.pop(req_id, None)
+                self._stage_full_payload_locked(req_id, engine_inputs)
             logger.debug(
                 "[Stage-%s] full_payload recv complete: req=%s key=%s payload_type=%s",
                 self._stage_id,
@@ -1261,7 +1453,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 type(engine_inputs).__name__,
             )
 
-        if publish_ready and self._async_chunk and (payload_consumable or is_finished):
+        if publish_ready and self._async_chunk and (payload_consumable or is_finished or segment_finished):
             self.publish_omni_connector_output_to_sink()
         logger.debug("[Stage-%s] Received data for key %s", self._stage_id, connector_get_key)
         return True
@@ -1310,6 +1502,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 if propagate_errors:
                     raise
 
+        if request is not None and hasattr(request, "is_segment_finished"):
+            if supports_is_finished is not False:
+                kwargs["is_finished"] = kwargs.get("is_finished", False) or request.is_segment_finished
+            if "new_token_ids" in inspect.signature(self._custom_process_func).parameters:
+                kwargs["new_token_ids"] = request.sampled_token_ids
         try:
             return self._custom_process_func(**kwargs)
         except TypeError as exc:
@@ -1489,7 +1686,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
     def _drain_omni_connector_output(self) -> OmniConnectorOutput:
         tp_group = self._get_local_tp_group()
-        if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+        # Stage zero has no upstream payload to fan out. In MRv2 its output
+        # is materialized only on the reply rank, so a receive-side collective
+        # here has no matching reader and eventually fills the TP SHM ring.
+        if self._stage_id > 0 and self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             if self.is_data_transfer_rank():
                 with self._lock:
                     fanout_packet = self._collect_async_chunk_fanout_packet_locked()
@@ -1527,6 +1727,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     if ext_req_id != req_id:
                         self._send_side_request_payload.pop(req_id, None)
         self._chunk_ready_req_ids.update(newly_finished)
+        with self._lock:
+            stage_payloads, self._run_stage_payloads = self._run_stage_payloads, {}
 
         output = OmniConnectorOutput(
             chunk_ready_req_ids=set(self._chunk_ready_req_ids),
@@ -1535,6 +1737,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             kv_sent_req_ids=list(self._kv_sent_req_ids),
             stage_recv_req_ids=set(self._stage_recv_req_ids),
             has_pending_kv_work=self.has_pending_kv_work(),
+            stage_payloads=stage_payloads,
         )
         if output.stage_recv_req_ids or chunk_finished or newly_finished:
             logger.debug(
@@ -1597,19 +1800,29 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         self._save_work_available.set()
         return True, completion
 
-    def _poll_pending_requests_once(self, pending_ids: list[str]) -> bool:
-        """Poll one receiver pass and publish its ready requests as a cohort."""
-        made_progress = False
+    def _poll_pending_requests_once(self, pending_ids: list[str]) -> list[str]:
+        """Poll one pass and return requests that still have a stream open.
+
+        A request whose terminal chunk arrived in this pass is not returned,
+        so the drain does not poll it again. Ready requests are published as
+        one cohort.
+        """
+        ready: list[str] = []
         for req_id in pending_ids:
             if self._stop_event.is_set():
                 break
             try:
-                made_progress = self._poll_single_request(req_id, publish_ready=False) or made_progress
+                if self._poll_single_request(req_id, publish_ready=False):
+                    ready.append(req_id)
             except Exception:
                 logger.warning("Error receiving data for %s", req_id, exc_info=True)
-        if made_progress and self._async_chunk:
+        if ready and self._async_chunk:
             self.publish_omni_connector_output_to_sink()
-        return made_progress
+        if not ready:
+            return ready
+        with self._lock:
+            pending = self._pending_load_reqs
+            return [req_id for req_id in ready if req_id in pending]
 
     @staticmethod
     def _finish_marker_payload() -> OmniPayload:
@@ -1620,21 +1833,54 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         is_finished = getattr(request, "is_finished", None)
         return bool(is_finished()) if callable(is_finished) else False
 
+    def _annotate_resumable_chunk(self, request: Any, payload: Any) -> dict | None:
+        from vllm_omni.data_entry_keys import OmniPayloadStruct, to_dict
+
+        finished = self._request_is_finished(request)
+        segment_finished = request.is_segment_finished
+        if payload is None and not (finished or segment_finished):
+            return None
+        if isinstance(payload, OmniPayloadStruct):
+            payload = to_dict(payload)
+        payload = dict(payload or {})
+        payload["meta"] = {**payload.get("meta", {}), "finished": finished, "is_segment_finished": segment_finished}
+        return payload
+
     def _publish_chunk_cohort(self, entries: list[tuple[Any, Any]], *, wait_for_delivery: bool) -> int:
         # A request's last chunk must carry its finish marker even when the
         # processor has nothing left to send (e.g. its frames ended exactly on
         # a chunk boundary), as the V1 chunk adapter guarantees; otherwise the
         # receiver waits for input until its deadline.
         entries = [
+            (request, self._annotate_resumable_chunk(request, payload))
+            if hasattr(request, "is_segment_finished")
+            else (request, payload)
+            for request, payload in entries
+        ]
+        entries = [
             (request, payload if payload is not None else self._finish_marker_payload())
             for request, payload in entries
             if payload is not None or self._request_is_finished(request)
+        ]
+        # MRv2 request snapshots carry the serialized tags.
+        entries = [
+            (request, payload)
+            for request, payload in entries
+            if not self._return_stage_payload(request.req_id, request.additional_information, payload)
         ]
         if not entries:
             return 0
         emitted = 0
         completions: list[Any] = []
         for request, payload in entries:
+            # Read only the tag frozen with this output, not a request buffer
+            # that may already describe the next chunk. Builders can reuse
+            # payloads, so keep request-specific metadata off shared objects.
+            perf_chunk = getattr(request, "_omni_duplex_perf_chunk", None)
+            if perf_chunk is not None:
+                if isinstance(payload, OmniPayloadStruct):
+                    payload = to_dict(payload)
+                payload = {**payload, "meta": {**(payload.get("meta") or {}), "duplex_perf_chunk": list(perf_chunk)}}
             enqueued, completion = self._enqueue_chunk_payload(request, payload, wait_for_delivery=wait_for_delivery)
             if enqueued:
                 emitted += 1

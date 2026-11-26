@@ -5,6 +5,7 @@
 import pytest
 import torch
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 
 pytestmark = pytest.mark.core_model
@@ -15,7 +16,7 @@ pytestmark = pytest.mark.core_model
 def test_settled_frames_match_torch(step_dtype):
     from vllm_omni.worker_v2.model_states.eager_mtp_kernels import settled_frames
 
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     H = 2048
     eager = torch.randn(16, H, device=device).to(torch.bfloat16)
     step = torch.randn(1, H, device=device, dtype=step_dtype)
@@ -35,7 +36,7 @@ def test_codec_graph_inputs_match_the_copies(n, size, frames):
 
     from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import _graph_inputs_kernel
 
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     nq, scratch = 16, 99
     codes = torch.randint(0, 2048, (n, frames, nq), device=device, dtype=torch.int64)
     meta = torch.randint(0, 64, (5 * n,), device=device, dtype=torch.int64)
@@ -64,7 +65,7 @@ def test_codec_graph_inputs_match_the_copies(n, size, frames):
 def test_eager_post_fills_codec_graph_inputs_and_scratch(n, size):
     from vllm_omni.worker_v2.model_states.eager_mtp_kernels import eager_post
 
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     hidden, nq, scratch = 128, 16, 15
     slots = torch.arange(n, device=device).flip(0)
     pos = torch.arange(n, device=device) + 7
@@ -109,14 +110,18 @@ def test_eager_post_fills_codec_graph_inputs_and_scratch(n, size):
     assert valid.all() and valid_out.all()
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(
+    DEVICE_TYPE == "xpu",
+    reason="VLLMZ-3554: the packed metadata holds device pointers as signed int64, and XPU USM addresses do not fit",
+)
 def test_history_scatter_preserves_independent_storage_and_offsets():
     import numpy as np
 
     from vllm_omni.utils.device_copy import DeviceStager
     from vllm_omni.worker_v2.model_states.eager_mtp_kernels import record_history
 
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     inputs = torch.randn(5, 128, device=device, dtype=torch.bfloat16)
     histories = [torch.full((9, 128), -1, device=device, dtype=inputs.dtype) for _ in range(3)]
     starts, offsets, counts = [2, 0, 5], [4, 1, 0], [3, 2, 0]
@@ -132,7 +137,8 @@ def test_history_scatter_preserves_independent_storage_and_offsets():
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(DEVICE_TYPE == "xpu", reason="VLLMZ-3554: no graph-pool handle on torch.xpu")
 @torch.inference_mode()
 def test_codec_direct_inputs_wait_for_slow_side_stream():
     from types import SimpleNamespace
@@ -140,7 +146,7 @@ def test_codec_direct_inputs_wait_for_slow_side_stream():
     from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import StreamingDecodeGraphs
     from vllm_omni.worker_v2.model_states.mtp_model_state import FrameBatch, MTPState
 
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     hidden, n = 128, 2
 
     class Decoder:
@@ -149,7 +155,7 @@ def test_codec_direct_inputs_wait_for_slow_side_stream():
         def __init__(self):
             self.device = device
 
-        def __call__(self, codes, slots, pos):
+        def __call__(self, codes, slots, pos, *, initial=False):
             return codes[:, 0, :1].float().repeat(1, 4)
 
     decoder = Decoder()
@@ -180,8 +186,8 @@ def test_codec_direct_inputs_wait_for_slow_side_stream():
         codes = torch.full((n, 2), value, device=device, dtype=torch.long)
         frames = torch.full((n, hidden), value, device=device)
         state._mtp_forward = lambda *args, _codes=codes, _frames=frames, **kwargs: (_frames, _codes)
-        with torch.cuda.stream(state._decode_stream):
-            torch.cuda._sleep(5_000_000)
+        with DEVICE_MODULE.stream(state._decode_stream):
+            DEVICE_MODULE._sleep(5_000_000)
         out = torch.zeros(n, 4, device=device)
         state._run_mtp_fused(
             batch,
@@ -200,7 +206,7 @@ def test_codec_direct_inputs_wait_for_slow_side_stream():
         torch.testing.assert_close(out.cpu(), torch.full((n, 4), float(value)))
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @torch.inference_mode()
 def test_batched_history_recording_preserves_ragged_reordered_requests():
     from types import SimpleNamespace
@@ -226,7 +232,7 @@ def test_batched_history_recording_preserves_ragged_reordered_requests():
         ids = [str(i) for i in (range(n - 1, -1, -1) if reverse else range(n))]
         offsets = np.array([sum(t.shape[0] for t in expected[rid]) for rid in ids])
         batch = SimpleNamespace(num_reqs=n, req_ids=ids, query_start_loc_np=starts, num_computed_tokens_np=offsets)
-        inputs = torch.randn(int(counts.sum()), hidden, device="cuda", dtype=torch.bfloat16)
+        inputs = torch.randn(int(counts.sum()), hidden, device=DEVICE_TYPE, dtype=torch.bfloat16)
         state.record_inputs(batch, inputs)
         for row, rid in enumerate(ids):
             expected[rid].append(inputs[starts[row] : starts[row + 1]].clone())
@@ -235,3 +241,56 @@ def test_batched_history_recording_preserves_ragged_reordered_requests():
         history = state._talker_inputs[rid]
         assert history.length == want.shape[0]
         torch.testing.assert_close(history.embeds[: history.length], want, rtol=0, atol=0)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_eager_mtp_kernels_compile_once_for_every_batch_size(monkeypatch):
+    # Batches of one or of a multiple of 16 rows, and a first_audio view that
+    # starts n bytes into a shared buffer, must reuse the kernels compiled for
+    # the first batch: a compile mid-serving stalls every stream.
+    from triton import knobs
+
+    from vllm_omni.worker_v2.model_states import eager_mtp_kernels as kernels
+    from vllm_omni.worker_v2.model_states.eager_mtp_kernels import (
+        eager_post,
+        eager_pre,
+        record_history,
+        settled_frames,
+    )
+
+    # Earlier tests may have compiled kernels for other batch sizes already.
+    for kernel in (kernels._pre_kernel, kernels._post_kernel, kernels._settled_kernel, kernels._history_kernel):
+        kernel.device_caches.clear()
+    device = torch.device(DEVICE_TYPE, 0)
+    # Request slots cover the largest batch below (33 rows).
+    hidden, nq, vocab, slots_total = 128, 16, 64, 64
+
+    def step(n):
+        meta = torch.stack([torch.arange(n, device=device)] * 2 + [torch.zeros(n, device=device)] * 3).long()
+        qsl = torch.arange(n + 1, device=device, dtype=torch.int32)
+        sampled = torch.randint(0, vocab, (n, 1), device=device)
+        text_hidden = torch.randn(n, hidden, device=device, dtype=torch.bfloat16)
+        emb_w = torch.randn(vocab, hidden, device=device, dtype=torch.bfloat16)
+        buffers = [torch.empty(n, hidden, device=device, dtype=torch.bfloat16) for _ in range(3)]
+        last, layer0 = eager_pre(meta, n, qsl, sampled, text_hidden, emb_w, sampled.new_empty(n), *buffers)
+        eager = torch.empty(slots_total, hidden, device=device, dtype=torch.bfloat16)
+        codes = torch.randint(0, vocab, (n, nq), device=device)
+        shared = torch.zeros(2 * n, device=device, dtype=torch.int8)
+        eager_post(
+            meta, n, last, layer0, buffers[0], eager, codes, torch.empty_like(codes),
+            torch.zeros(n, device=device, dtype=torch.long), shared[:n],
+            shared[n:], torch.ones(slots_total, device=device, dtype=torch.bool), vocab,
+        )  # fmt: skip
+        settled_frames(meta[:2].contiguous(), n, eager, torch.randn(1, hidden, device=device), text_hidden)
+        # One input row per request into its own history; the fused profile packs from 32 requests.
+        history = torch.empty(n, 2, hidden, device=device, dtype=torch.bfloat16)
+        rows = torch.arange(n, device=device)
+        addresses = torch.full((n,), history.data_ptr(), device=device) + rows * history[0].nbytes
+        record_history(torch.cat((addresses, rows, rows * 0, rows, rows)), text_hidden, n, n)
+
+    step(3)
+    compiles = []
+    monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", lambda **kw: compiles.append(kw["fn"].name))
+    for n in (1, 16, 5, 32, 33):
+        step(n)
+    assert compiles == []

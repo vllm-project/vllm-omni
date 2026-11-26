@@ -2,12 +2,29 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """FP8 options backed by vLLM's quantization kernels."""
 
+from __future__ import annotations
+
 from typing import Any, Literal
 
 import regex as re
+from torch import nn
 from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import RoutedExperts, UnquantizedFusedMoEMethod
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
 from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+from vllm.model_executor.layers.quantization.online.fp8 import Fp8PerBlockOnlineLinearMethod
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    QuantKey,
+    create_fp8_quant_key,
+    is_layer_skipped,
+)
+from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 
 class SerializedPerChannelFp8Config(ModelOptFp8Config):
@@ -27,7 +44,7 @@ class SerializedPerChannelFp8Config(ModelOptFp8Config):
         self.quantized_modules = re.compile(quantized_modules)
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "SerializedPerChannelFp8Config":
+    def from_config(cls, config: dict[str, Any]) -> SerializedPerChannelFp8Config:
         for key, expected in (
             ("fmt", "e4m3"),
             ("weight_scheme", "per_channel"),
@@ -47,6 +64,24 @@ class SerializedPerChannelFp8Config(ModelOptFp8Config):
         return "fp8"
 
 
+class OnlineBlockFp8LinearMethod(Fp8PerBlockOnlineLinearMethod):
+    """Online FP8 with matching configurable weight and activation groups."""
+
+    accepts_activation_override = True
+
+    def __init__(self, block_size: int) -> None:
+        super().__init__()
+        self.weight_block_size = [block_size, block_size]
+        self.activation_quant_key = create_fp8_quant_key(
+            static=False,
+            group_shape=GroupShape(1, block_size),
+        )
+        self.weight_quant_key = create_fp8_quant_key(
+            static=True,
+            group_shape=GroupShape(block_size, block_size),
+        )
+
+
 class DiffusionFp8Config(OnlineQuantizationConfig):
     """Keep the diffusion ``fp8`` option for quantizing BF16/FP16 weights.
 
@@ -62,6 +97,7 @@ class DiffusionFp8Config(OnlineQuantizationConfig):
         ignored_layers: list[str] | None = None,
         weight_block_size: list[int] | None = None,
         store_dtype: str | None = None,
+        online_block_size: int | None = None,
     ) -> None:
         if is_checkpoint_fp8_serialized:
             raise ValueError("Serialized FP8 checkpoints require upstream Fp8Config")
@@ -71,9 +107,31 @@ class DiffusionFp8Config(OnlineQuantizationConfig):
             raise ValueError("Block-wise FP8 quantization requires a serialized checkpoint or fp8_per_block")
         if store_dtype is not None:
             raise ValueError("Online FP8 quantization does not support store_dtype")
+
+        block_weight_key: QuantKey | None = None
+        block_activation_key: QuantKey | None = None
+        if online_block_size is not None:
+            if type(online_block_size) is not int or online_block_size not in (32, 64, 128):
+                raise ValueError("online_block_size must be 32, 64 or 128")
+            if not current_platform.is_rocm():
+                raise ValueError("online_block_size is currently supported on ROCm only")
+            block_weight_key = create_fp8_quant_key(
+                static=True,
+                group_shape=GroupShape(online_block_size, online_block_size),
+            )
+            block_activation_key = create_fp8_quant_key(
+                static=False,
+                group_shape=GroupShape(1, online_block_size),
+            )
+
+        linear_spec = (
+            QuantSpec(weight=block_weight_key, activation=block_activation_key)
+            if block_weight_key is not None
+            else QuantSpec(weight="fp8_per_tensor_static")
+        )
         super().__init__(
             QuantizationConfigArgs(
-                linear=QuantSpec(weight="fp8_per_tensor_static"),
+                linear=linear_spec,
                 moe=QuantSpec(weight="fp8_per_tensor_static"),
                 ignore=list(ignored_layers or []),
             )
@@ -82,6 +140,98 @@ class DiffusionFp8Config(OnlineQuantizationConfig):
         self.activation_scheme = activation_scheme
         self.weight_block_size = None
         self.store_dtype = None
+        self.online_block_size = online_block_size
+        self._online_block_weight_key = block_weight_key
+        self._online_block_activation_key = block_activation_key
+        self._reported_rocm_alignment_fallback = False
+        # `ignored_layers` entries name a layer's full prefix. A pipeline that documents
+        # them as short module-name patterns raises this mode, as DiffusionMXFP8Config does.
+        self.ignored_layers_match_mode: Literal["exact", "substring", "suffix"] = "exact"
+
+    def _get_method_cls(
+        self,
+        spec: QuantSpec | None,
+        table: dict[QuantKey, type],
+        layer_cls: type[nn.Module],
+    ) -> type | None:
+        if (
+            spec is not None
+            and self._online_block_weight_key is not None
+            and spec.weight == self._online_block_weight_key
+        ):
+            if spec.activation != self._online_block_activation_key:
+                raise ValueError(
+                    f"online_block_size requires matching dynamic activation groups; got activation={spec.activation}"
+                )
+            return OnlineBlockFp8LinearMethod
+        return super()._get_method_cls(spec, table, layer_cls)
+
+    def _skips_layer(self, prefix: str) -> bool:
+        """Whether a raised ``ignored_layers_match_mode`` covers ``prefix``.
+
+        The ``exact`` mode needs no help: the base class already matches a full prefix.
+        """
+        if not self.ignored_layers or self.ignored_layers_match_mode == "exact":
+            return False
+        return is_layer_skipped(
+            prefix=prefix,
+            ignored_layers=self.ignored_layers,
+            fused_mapping=self.packed_modules_mapping,
+            match_mode=self.ignored_layers_match_mode,
+        )
+
+    @staticmethod
+    def _requires_rocm_alignment_fallback(layer: nn.Module) -> bool:
+        """Keep unsupported ROCm FP8 projections in their original precision.
+
+        PyTorch's ROCm ``torch._scaled_mm`` path requires both local matrix
+        dimensions to be divisible by 16. CUDA can route the same online-FP8
+        layer through kernels that pad or otherwise accept a non-aligned shape,
+        but the ROCm fallback fails at runtime. Inspect local shard dimensions
+        when available so tensor-parallel projections are handled correctly.
+        """
+        if not current_platform.is_rocm() or not isinstance(layer, LinearBase):
+            return False
+        input_size = getattr(layer, "input_size_per_partition", None)
+        if input_size is None:
+            input_size = getattr(layer, "input_size", None)
+        output_size = getattr(layer, "output_size_per_partition", None)
+        if output_size is None:
+            output_size = getattr(layer, "output_size", None)
+        return any(isinstance(size, int) and size % 16 != 0 for size in (input_size, output_size))
+
+    def get_quant_method(self, layer: nn.Module, prefix: str) -> QuantizeMethodBase | None:
+        if self._skips_layer(prefix):
+            if isinstance(layer, LinearBase):
+                return UnquantizedLinearMethod()
+            if isinstance(layer, RoutedExperts):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+        if self._requires_rocm_alignment_fallback(layer):
+            if not self._reported_rocm_alignment_fallback:
+                input_size = getattr(layer, "input_size_per_partition", getattr(layer, "input_size", None))
+                output_size = getattr(layer, "output_size_per_partition", getattr(layer, "output_size", None))
+                logger.warning(
+                    "ROCm online FP8 requires local matrix dimensions divisible by 16; "
+                    "keeping non-aligned linear layers in their original precision "
+                    "(first layer: %s, K=%s, N=%s).",
+                    prefix,
+                    input_size,
+                    output_size,
+                )
+                self._reported_rocm_alignment_fallback = True
+            return UnquantizedLinearMethod()
+        if self.online_block_size is not None:
+            resolved = self.resolve_quant_method_cls(type(layer), prefix)
+            if resolved is not None:
+                source, quant_key_str, target_pattern, _, quant_method_cls = resolved
+                if quant_method_cls is OnlineBlockFp8LinearMethod:
+                    self.quantized_layers[prefix] = (
+                        source.value,
+                        quant_key_str,
+                        target_pattern,
+                    )
+                    return OnlineBlockFp8LinearMethod(self.online_block_size)
+        return super().get_quant_method(layer, prefix)
 
     @classmethod
     def get_name(cls) -> str:

@@ -12,10 +12,12 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import (
+    JOYAI_FINISH_ON_NEXT_STOP_KEY,
     CodesStruct,
     MetaStruct,
     OmniPayload,
     OmniPayloadStruct,
+    request_flag_is_set,
     to_dict,
 )
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
@@ -155,6 +157,29 @@ def _append_tensor_frame(transfer_manager: Any, request_id: str, frame: torch.Te
     transfer_manager.code_prompt_token_ids[request_id].append(frame.detach().to(torch.long).reshape(-1).contiguous())
 
 
+def _stamp_finish_on_next_stop(meta: MetaStruct, request: object, *, finished: bool) -> None:
+    """Copy the last-sentence terminal stamp onto this chunk's meta.
+
+    Independent Qwen3-TTS never sets the request flag, so empty finished
+    payloads stay unstamped and Code2Wav keeps the pending_finish path.
+    """
+    if finished and request_flag_is_set(request, JOYAI_FINISH_ON_NEXT_STOP_KEY):
+        meta.joyai_finish_on_next_stop = True
+
+
+def _empty_finished_async_chunk(request_id: str, request: object) -> OmniPayloadStruct:
+    meta = MetaStruct(
+        request_id=request_id,
+        left_context_size=0,
+        finished=torch.tensor(True, dtype=torch.bool),
+    )
+    _stamp_finish_on_next_stop(meta, request, finished=True)
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+        meta=meta,
+    )
+
+
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     multimodal_output: OmniPayload | dict[str, Any] | None,
@@ -265,10 +290,7 @@ def talker2code2wav_async_chunk(
         transfer_manager._qwen3_tts_emitted_frames = emitted_frames
     if request_id in emitted_frames and length <= emitted_frames[request_id]:
         if finished:
-            return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(request_id=request_id, left_context_size=0, finished=torch.tensor(True)),
-            )
+            return _empty_finished_async_chunk(request_id, request)
         return None
 
     # Full-utterance Code2Wav is gated by ``full_utterance_decode`` (explicit
@@ -282,18 +304,11 @@ def talker2code2wav_async_chunk(
 
     if length <= 0:
         if finished:
-            return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(
-                    request_id=request_id,
-                    left_context_size=0,
-                    finished=torch.tensor(True, dtype=torch.bool),
-                ),
-            )
+            return _empty_finished_async_chunk(request_id, request)
         return None
 
     if full_utterance_decode is True:
-        first_chunk = int(transfer_manager.put_req_chunk.get(request_id, 0)) <= 0
+        first_chunk = request_id not in emitted_frames
         context_length = length
     elif adaptive_enabled:
         _adaptive_states = getattr(transfer_manager, "_adaptive_states", None)
@@ -350,14 +365,7 @@ def talker2code2wav_async_chunk(
                 return None
             if context_length == 0:
                 ctrl.log_summary(request_id)
-                return OmniPayloadStruct(
-                    codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                    meta=MetaStruct(
-                        request_id=request_id,
-                        left_context_size=0,
-                        finished=torch.tensor(True, dtype=torch.bool),
-                    ),
-                )
+                return _empty_finished_async_chunk(request_id, request)
 
     elif ramp is not None:
         chunk_index = transfer_manager.ramp_chunk_count.get(request_id, 0)
@@ -366,16 +374,9 @@ def talker2code2wav_async_chunk(
         if not emit:
             return None
         if context_length == 0:
-            return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(
-                    request_id=request_id,
-                    left_context_size=0,
-                    finished=torch.tensor(True, dtype=torch.bool),
-                ),
-            )
+            return _empty_finished_async_chunk(request_id, request)
     else:
-        first_chunk = int(transfer_manager.put_req_chunk.get(request_id, 0)) <= 0
+        first_chunk = request_id not in emitted_frames
         use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
 
         if use_first_chunk and length <= initial_chunk_size:
@@ -410,7 +411,6 @@ def talker2code2wav_async_chunk(
     # ICL reference codes are part of the first decoder initialization only.
     # Follow-up chunks rely entirely on the request-local decoder cache.
     ref_code = request_payload.get(request_id)
-    emitted_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
     ref_context_size = 0
     ref_context_request_id: str | None = None
     ref_context_included = False
@@ -440,7 +440,10 @@ def talker2code2wav_async_chunk(
             ref_context = ref_context[-ref_code_context_frames:]
         ref_context_size = int(ref_context.shape[0]) if ref_context.ndim > 1 else 0
         if ref_context_size > 0:
-            if emitted_chunks <= 0:
+            # Transport chunk IDs span segments. The adapter clears this watermark
+            # in OmniChunkTransferAdapter._send_single_request_for_generation
+            # when is_segment_finished is set, so the next segment re-sends reference.
+            if request_id not in emitted_frames:
                 ref_context_request_id = request_id
                 ref_frames = list(ref_context.to(device="cpu").unbind(0))
                 window_frames = ref_frames + window_frames
@@ -473,6 +476,7 @@ def talker2code2wav_async_chunk(
     request_text_tokens = _precomputed_assistant_text_tokens(request)
     if request_text_tokens is not None:
         meta.request_text_tokens = request_text_tokens
+    _stamp_finish_on_next_stop(meta, request, finished=finished)
 
     emitted_frames[request_id] = length
     return OmniPayloadStruct(

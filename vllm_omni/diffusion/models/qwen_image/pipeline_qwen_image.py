@@ -24,8 +24,10 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
+from vllm_omni.diffusion.distributed.text_encoder_tp import maybe_shard_text_encoder
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
+from vllm_omni.diffusion.mixfusion.request import image_token_grid
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -278,8 +280,48 @@ class QwenImagePipeline(
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
     supports_step_execution: ClassVar[bool] = True
+    # Opt-in: this pipeline packs mixed-resolution requests into one denoise
+    # step via ragged latents, so the scheduler may relax height/width out of
+    # the batch key when MixFusion is enabled.
+    supports_mixfusion: ClassVar[bool] = True
 
     supports_weight_reload: ClassVar[bool] = True
+
+    def _get_diffusion_lora_name_aliases(self, full_module_name: str) -> list[str]:
+        """Map Qwen-Image engine module names to Diffusers PEFT adapter keys.
+
+        Diffusers exports attention output projections as ``*.to_out.0`` (and
+        may omit the leading ``transformer.`` component prefix), whereas the
+        engine registers ``QwenImageAttention.to_out`` directly.
+        """
+        aliases: list[str] = []
+        if full_module_name.endswith(".to_out") or full_module_name == "to_out":
+            aliases.append(f"{full_module_name}.0")
+        if full_module_name.startswith("transformer."):
+            stripped = full_module_name.removeprefix("transformer.")
+            aliases.append(stripped)
+            if stripped.endswith(".to_out") or stripped == "to_out":
+                aliases.append(f"{stripped}.0")
+        return list(dict.fromkeys(aliases))
+
+    def merged_lora_spec(self):
+        """Return the validated merged-LoRA capability contract for Qwen-Image."""
+        from vllm_omni.lora.capability import (
+            MergedLoRASpec,
+            derive_packed_modules_mapping_from_stacked,
+        )
+
+        stacked = getattr(
+            getattr(self, "transformer", None),
+            "stacked_params_mapping",
+            QwenImageTransformer2DModel.stacked_params_mapping,
+        )
+        return MergedLoRASpec(
+            components=tuple(self._dit_modules),
+            packed_modules_mapping=derive_packed_modules_mapping_from_stacked(stacked),
+            name_aliases=self._get_diffusion_lora_name_aliases,
+            unquantized_linear_only=True,
+        )
 
     def __init__(
         self,
@@ -346,7 +388,8 @@ class QwenImagePipeline(
         # offload, CPU for layerwise / unquantized HSDP defer).
         cpu_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
         enc_vae_device = torch.device("cpu") if cpu_offload else self.device
-        self.text_encoder = self.text_encoder.to(enc_vae_device)
+        # Shard on CPU (no-op unless text_encoder_tp_size > 1) before moving to device.
+        self.text_encoder = maybe_shard_text_encoder(self.text_encoder, od_config).to(enc_vae_device)
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLQwenImage.from_pretrained,
             model,
@@ -590,8 +633,8 @@ class QwenImagePipeline(
         # generator=torch.Generator(device="cuda").manual_seed(42)
         # VAE applies 8x compression on images but we must also account for packing which requires
         # latent height and width to be divisible by 2.
-        height = 2 * (int(height) // (self.vae_scale_factor * 2))
-        width = 2 * (int(width) // (self.vae_scale_factor * 2))
+        token_height, token_width = image_token_grid(height, width, self.vae_scale_factor, patch_size=2)
+        height, width = 2 * token_height, 2 * token_width
 
         shape = (batch_size, 1, num_channels_latents, height, width)
 
@@ -622,6 +665,7 @@ class QwenImagePipeline(
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
+            device=self.device,
             sigmas=sigmas,
             mu=mu,
         )
@@ -834,7 +878,7 @@ class QwenImagePipeline(
 
     def _build_denoise_kwargs(
         self,
-        latents: torch.Tensor,
+        latents: torch.Tensor | list[torch.Tensor],
         timestep: torch.Tensor,
         guidance: torch.Tensor | None,
         prompt_embeds: torch.Tensor,
@@ -850,15 +894,20 @@ class QwenImagePipeline(
     ) -> tuple[dict[str, Any], dict[str, Any] | None, int | None]:
         """Build positive/negative kwargs and output_slice for one denoise step.
 
+        ``latents`` may be one tensor per request (a packed MixFusion step);
+        the list is forwarded unchanged and the transformer's root hook packs
+        it. The adapter declines image-conditioned batches.
+
         Returns:
             (positive_kwargs, negative_kwargs, output_slice)
         """
         extra_transformer_kwargs = extra_transformer_kwargs or {}
 
         # Broadcast timestep to match batch size
-        t_for_model = timestep.expand(latents.shape[0]).to(
-            device=latents.device,
-            dtype=latents.dtype,
+        rows = latents if isinstance(latents, list) else [latents]
+        t_for_model = timestep.expand(sum(row.shape[0] for row in rows)).to(
+            device=rows[0].device,
+            dtype=rows[0].dtype,
         )
 
         # Concatenate image latents if available (editing pipelines)
@@ -928,7 +977,7 @@ class QwenImagePipeline(
         self,
         input_batch: "InputBatch",
         **kwargs: Any,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor | list[torch.Tensor] | None:
         """One denoise step: read from *input_batch*, delegate to CFGParallelMixin.
 
         Reuses ``predict_noise_maybe_with_cfg`` so that CFG-parallel,

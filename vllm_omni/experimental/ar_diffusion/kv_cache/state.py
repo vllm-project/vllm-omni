@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -12,6 +13,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.conditioning import ConditioningKVScope
 from vllm_omni.experimental.ar_diffusion.kv_cache.first_block import FirstBlockKVSnapshot
+from vllm_omni.experimental.ar_diffusion.kv_cache.lifecycle import KVBackend, KVCacheLifecycle
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ARDiffusionPagedForwardContext,
@@ -19,16 +21,27 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import ARDiffusionSegmentedKVState
 
+
+@dataclass(frozen=True)
+class PagedKVTask:
+    """One legacy paged-attention request to prepare and optionally commit."""
+
+    kv_branch: str
+    seq_len: int
+    commit_current: bool
+
+
 if TYPE_CHECKING:
     from vllm_omni.experimental.ar_diffusion.kv_cache.manager import (
         ARDiffusionKVCache,
         ARDiffusionRequestAdapter,
     )
+    from vllm_omni.experimental.ar_diffusion.worldkv import WorldKV, WorldKVConfig
 
 _log = init_logger(__name__)
 
 
-class ARDiffusionKVState:
+class ARDiffusionKVState(KVBackend[PagedKVTask, list[ARDiffusionPagedLayerContext]], KVCacheLifecycle[str]):
     """Runner-owned KV state for one session and any number of KV branches.
 
     KV branches are addressed by the names in ``ARDiffusionKVCacheSpec``. Each
@@ -57,9 +70,27 @@ class ARDiffusionKVState:
         self.num_layers = num_layers
         self._committed: dict[str, int] = dict.fromkeys(expected, 0)
         self._paged_pending: dict[str, ARDiffusionPagedForwardContext | None] = dict.fromkeys(expected)
+        self._paged_tasks: dict[str, PagedKVTask] = {}
         self._closed = False
         self._segments: dict[str, ARDiffusionSegmentedKVState] = {}
+        self._worldkv_memories: dict[str, WorldKV] = {}
         self.conditioning_kv = ConditioningKVScope(kv_cache, session_id, num_layers)
+
+    def worldkv(self, kv_branch: str, config: WorldKVConfig, *, tokens_per_frame: int) -> WorldKV:
+        """Return runner-owned policy memory; its capacity is reserved by the model spec."""
+        from vllm_omni.experimental.ar_diffusion.worldkv import WorldKV
+
+        self.adapter(kv_branch)
+        if kv_branch not in self._worldkv_memories:
+            self._worldkv_memories[kv_branch] = WorldKV(
+                config,
+                num_layers=self.num_layers,
+                tokens_per_frame=tokens_per_frame,
+            )
+        memory = self._worldkv_memories[kv_branch]
+        if (memory.config, memory.tokens_per_frame) != (config, tokens_per_frame):
+            raise ValueError("WorldKV configuration cannot change within a session")
+        return memory
 
     def segmented(self, kv_branch: str) -> ARDiffusionSegmentedKVState:
         """Return this branch's runner-owned exact-token segment state."""
@@ -77,7 +108,9 @@ class ARDiffusionKVState:
         if self._closed:
             raise RuntimeError(f"AR-Diffusion session {self.session_id!r} is closed")
         try:
-            return self.adapters[kv_branch]
+            adapter = self.adapters[kv_branch]
+            self.kv_cache._require_current_adapter(adapter)
+            return adapter
         except KeyError as exc:
             raise KeyError(f"Unknown AR-Diffusion KV branch {kv_branch!r}; expected {self.kv_branch_names}") from exc
 
@@ -91,11 +124,45 @@ class ARDiffusionKVState:
             raise ValueError("AR-Diffusion paged self-attention requires seq_len in get_kv_caches()")
         return self.prepare_paged_context(kv_branch, seq_len, commit_current)
 
+    def prepare(self, tasks: Sequence[PagedKVTask]) -> list[list[ARDiffusionPagedLayerContext]]:
+        """Prepare branch-local paged views, without converting segmented KV."""
+        if len({task.kv_branch for task in tasks}) != len(tasks):
+            raise ValueError("A paged KV batch cannot write the same branch twice")
+        for task in tasks:
+            self.adapter(task.kv_branch)
+            if task.seq_len <= 0:
+                raise ValueError("seq_len must be positive")
+            if task.seq_len % self.kv_cache.spec.chunk_size:
+                raise AssertionError("AR-Diffusion expects frame-aligned seq_len")
+            pending = self._paged_pending.get(task.kv_branch)
+            if pending is not None and pending.commit_current and pending._allocated_video and not pending._committed:
+                raise RuntimeError("AR-Diffusion paged context replaced before its managed current chunk was committed")
+        views = [self._prepare_paged_context(task.kv_branch, task.seq_len, task.commit_current) for task in tasks]
+        self._paged_tasks.update((task.kv_branch, task) for task in tasks)
+        return views
+
+    def publish(self, tasks: Sequence[PagedKVTask]) -> None:
+        """Advance only the prepared branches after their successful forward."""
+        if len({task.kv_branch for task in tasks}) != len(tasks):
+            raise ValueError("A paged KV batch cannot publish the same branch twice")
+        for task in tasks:
+            self.adapter(task.kv_branch)
+            ctx = self._paged_pending.get(task.kv_branch)
+            if ctx is None or self._paged_tasks.get(task.kv_branch) is not task:
+                raise RuntimeError("Paged KV publication does not match a prepared task")
+        for task in tasks:
+            self._commit_paged_context(task.kv_branch)
+
     def prepare_paged_context(
         self,
         kv_branch: str,
         seq_len: int,
         commit_current: bool,
+    ) -> list[ARDiffusionPagedLayerContext]:
+        return self.prepare((PagedKVTask(kv_branch, seq_len, commit_current),))[0]
+
+    def _prepare_paged_context(
+        self, kv_branch: str, seq_len: int, commit_current: bool
     ) -> list[ARDiffusionPagedLayerContext]:
         """Return per-layer paged attention contexts for one KV branch forward.
 
@@ -141,6 +208,12 @@ class ARDiffusionKVState:
         """Commit managed current blocks after one successful KV branch forward."""
         self.adapter(kv_branch)
         ctx = self._paged_pending.get(kv_branch)
+        if ctx is not None:
+            self.publish((self._paged_tasks[kv_branch],))
+
+    def _commit_paged_context(self, kv_branch: str) -> None:
+        self.adapter(kv_branch)
+        ctx = self._paged_pending.get(kv_branch)
         if ctx is None:
             return
         if ctx.commit_current and ctx._allocated_video:
@@ -158,6 +231,7 @@ class ARDiffusionKVState:
             )
         ctx.mark_committed()
         self._paged_pending[kv_branch] = None
+        self._paged_tasks.pop(kv_branch, None)
 
     def snapshot_first_block(self, kv_branch: str, token_count: int) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         """Copy a successfully committed opening block into immutable CPU storage."""
@@ -253,22 +327,39 @@ class ARDiffusionKVState:
         self.conditioning_kv.invalidate()
         self.kv_cache.release_cross_attention(self.session_id)
 
+    def finish_request(self, owner: str | None = None) -> None:
+        """Finish a compute call while keeping all branches' session history."""
+        if owner is not None and owner != self.session_id:
+            raise ValueError("KV lifecycle owner does not match the bound session")
+        for kv_branch in self.adapters:
+            self.kv_cache.finish_request(self.adapter(kv_branch))
+
+    def release_history(self, owner: str) -> None:
+        """Release this session's backend state after its compute has retired."""
+        if owner != self.session_id:
+            raise ValueError("KV lifecycle owner does not match the bound session")
+        self.close()
+
     def close(self) -> None:
         """Release all self- and cross-attention storage owned by this session."""
         if self._closed:
             return
+        for memory in self._worldkv_memories.values():
+            memory.close()
+        self._worldkv_memories.clear()
         for segments in self._segments.values():
             segments.close()
         self._segments.clear()
         errors: list[Exception] = []
         for adapter in self.adapters.values():
             try:
-                self.kv_cache.end_request(adapter)
+                self.kv_cache.release_history(adapter)
             except Exception as exc:  # noqa: BLE001 - release all owned storage even on failure
                 errors.append(exc)
         self.kv_cache.release_cross_attention(self.session_id)
         self.conditioning_kv.close()
         self._paged_pending = dict.fromkeys(self.adapters)
+        self._paged_tasks.clear()
         self._closed = True
         if errors:
             raise errors[0]
@@ -284,12 +375,15 @@ class ARDiffusionKVState:
         if unknown:
             raise KeyError(f"Unknown AR-Diffusion cross-attention caches to keep: {sorted(unknown)}")
         request_ids = {kv_branch: adapter.request_id for kv_branch, adapter in self.adapters.items()}
+        for memory in self._worldkv_memories.values():
+            memory.close()
+        self._worldkv_memories.clear()
         if keep_cross_attention:
             for segments in self._segments.values():
                 segments.close()
             self._segments.clear()
             for adapter in self.adapters.values():
-                self.kv_cache.end_request(adapter)
+                self.kv_cache.release_history(adapter)
             self.kv_cache.retain_cross_attention(self.session_id, keep_cross_attention)
             self.conditioning_kv.retain(keep_cross_attention)
         else:
@@ -299,6 +393,7 @@ class ARDiffusionKVState:
         }
         self._committed = dict.fromkeys(self.adapters, 0)
         self._paged_pending = dict.fromkeys(self.adapters)
+        self._paged_tasks.clear()
         self._closed = False
         if not keep_cross_attention:
             self.conditioning_kv = ConditioningKVScope(self.kv_cache, self.session_id, self.num_layers)

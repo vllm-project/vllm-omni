@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Omni autoregressive runner on Ascend Model Runner V2.
+"""Omni autoregressive and generation runners on Ascend Model Runner V2.
 
 ``OmniARModelRunner`` owns the speech lifecycle (frame outputs, connectors).
 ``NPUModelRunner`` owns Ascend input state (``AscendRequestState``,
@@ -13,16 +13,51 @@ the same step.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+import numpy as np
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.worker.gpu import model_runner as gpu_runner
+from vllm_ascend.worker.v2 import model_runner as ascend_runner
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
+    MINICPMO_TALKER_FRAMES_MAX,
+    talker_kstep_frames,
+)
+from vllm_omni.worker_v2.ngram_adapter import scheduler_ngram_factory, use_scheduler_ngram
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+
 logger = init_logger(__name__)
+
+# GPUModelRunner initializes a speculator first. NPUModelRunner rebuilds
+# it with Ascend request state. Each constructor imports its own factory.
+gpu_runner.init_speculator = scheduler_ngram_factory(gpu_runner.init_speculator)
+ascend_runner.init_speculator = scheduler_ngram_factory(ascend_runner.init_speculator)
+
+
+def _minicpmo_mixed_long_prefill(config: VllmConfig, batch: AscendInputBatch) -> bool:
+    model = config.model_config
+    if (
+        (config.additional_config or {}).get("minicpmo_long_prefill_eager") is not True
+        or model.model_stage != "llm"
+        or "MiniCPMO45OmniForConditionalGeneration" not in (model.architectures or ())
+        or not batch.has_prefill
+        or batch.is_dummy
+    ):
+        return False
+    prefill = batch.is_prefilling_np
+    long_prefill = (batch.prefill_len_np > config.scheduler_config.max_num_batched_tokens) & prefill
+    return bool(long_prefill.any() and (~prefill).any())
 
 
 def _call_without_unknown_kwargs(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -145,8 +180,10 @@ def _default_ascend_decode_graph_flag() -> None:
     AscendInputBatch.__init__ = wrapped  # type: ignore[method-assign]
 
 
-class NPUOmniARModelRunner(OmniARModelRunner, NPUModelRunner):
-    """Drama 3 (and any other NPU-ready AR model) on Model Runner V2."""
+class NPUOmniV2RunnerMixin:
+    """Ascend input buffers, batches and forward context for Omni V2 runners."""
+
+    input_buffers: AscendInputBuffers
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         _default_ascend_decode_graph_flag()
@@ -216,13 +253,471 @@ class NPUOmniARModelRunner(OmniARModelRunner, NPUModelRunner):
     def _close_omni_aux_output(self) -> None:
         """V1 aux-output streams are not used by this runner."""
 
+
+class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunner):
+    """NPU autoregressive models with Ascend attention metadata."""
+
+    _scheduler_ngram = False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        import os
+
+        # The static-shape decode backend rewrites AscendAttentionBackend's
+        # impl/builder classes process-wide. It is a MiniCPM-o MRv2 optimizer
+        # (fixed-capacity FULL graph replays for the talker's K-step frame
+        # loop, engagement gated by a stage's max_model_len <= 8192). Drama 3
+        # also runs on this runner -- a GDN-hybrid model at exactly
+        # max_model_len 8192 with FULL_AND_PIECEWISE graphs -- and must keep
+        # the stock backend, so arm the install only for MiniCPM-o stages.
+        cfg = kwargs.get("vllm_config") or (args[0] if args else None)
+        architectures = getattr(getattr(cfg, "model_config", None), "architectures", None) or []
+        excluded_op = os.environ.get("MINICPMO_TALKER_STATIC_EXCLUDED_OP")
+        if excluded_op and getattr(getattr(cfg, "model_config", None), "model_stage", None) == "tts":
+            from vllm_ascend.compilation import compiler_interface
+
+            set_blacklist = compiler_interface._set_static_kernel_blacklist
+
+            def set_talker_blacklist(blacklist):
+                set_blacklist([*blacklist, excluded_op])
+                logger.info("MiniCPM-o Talker static kernel keeps %s on the default path", excluded_op)
+
+            compiler_interface._set_static_kernel_blacklist = set_talker_blacklist
+        if (
+            any("MiniCPMO45" in str(a) for a in architectures)
+            and os.environ.get("VLLM_OMNI_STATIC_SHAPE_V2", "1") == "1"
+        ):
+            try:
+                from vllm_omni.platforms.npu.attention import static_shape_decode
+
+                static_shape_decode.install_into_ascend_backend()
+                logger.info_once(
+                    "[minicpmo] v2 static-shape decode backend installed (arch=%s)",
+                    tuple(architectures),
+                )
+            except Exception:
+                logger.exception("[minicpmo] v2 static-shape install failed; stock backend kept")
+        super().__init__(*args, **kwargs)
+        self._scheduler_ngram = use_scheduler_ngram(self.vllm_config)
+        self._minicpmo_native_rope_reqs: set[str] = set()
+        self._minicpmo_rope_offsets_dirty = False
+        self._visual_a16_prefill = (
+            self.model_config.model_stage == "llm"
+            and (self.vllm_config.additional_config or {}).get("minicpmo_visual_a16_prefill") is True
+        )
+        self._visual_a16_reqs: set[str] = set()
+        self._thinker_prefill_startup_path = (
+            os.getenv("MINICPMO_NPU_THINKER_PREFILL_STARTUP")
+            if self.model_config.model_stage == "llm" and "MiniCPMO45" in str(self.model_config.architectures)
+            else None
+        )
+
+    def _minicpmo_rope_model(self):
+        thinker = getattr(self.model, "thinker", None)
+        return thinker if getattr(thinker, "rope_row_offsets", None) is not None else None
+
+    def add_requests(self, scheduler_output):
+        if self._visual_a16_prefill:
+            for data in scheduler_output.scheduled_new_reqs:
+                if not getattr(data, "resumable", False) and any(
+                    feature.modality in {"image", "video"} for feature in (data.mm_features or ())
+                ):
+                    self._visual_a16_reqs.add(data.req_id)
+        if self._minicpmo_rope_model() is not None:
+            for data in scheduler_output.scheduled_new_reqs:
+                params = data.sampling_params
+                prompt = data.prompt_token_ids
+                if (
+                    not getattr(data, "resumable", False)
+                    and params is not None
+                    and params.max_tokens is not None
+                    and prompt is not None
+                    and len(prompt) + params.max_tokens <= 10240
+                ):
+                    self._minicpmo_native_rope_reqs.add(data.req_id)
+        super().add_requests(scheduler_output)
+
+    def finish_requests(self, scheduler_output):
+        self._minicpmo_native_rope_reqs.difference_update(scheduler_output.finished_req_ids)
+        self._visual_a16_reqs.difference_update(scheduler_output.finished_req_ids)
+        super().finish_requests(scheduler_output)
+
+    def _prepare_minicpmo_rope(self, batch):
+        model = self._minicpmo_rope_model()
+        if model is None:
+            return
+        offsets = model.rope_row_offsets
+        long_rows = [rid not in self._minicpmo_native_rope_reqs for rid in batch.req_ids]
+        if not any(long_rows):
+            if self._minicpmo_rope_offsets_dirty:
+                offsets.zero_()
+                self._minicpmo_rope_offsets_dirty = False
+            return
+        values = np.zeros(batch.num_tokens_after_padding, dtype=np.int64)
+        starts = batch.query_start_loc_np
+        for i, is_long in enumerate(long_rows):
+            if is_long:
+                values[starts[i] : starts[i + 1]] = model.rope_long_offset
+        async_tensor_h2d(values, out=offsets[: len(values)])
+        self._minicpmo_rope_offsets_dirty = True
+
+    def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc, num_active_loras=0):
+        drafts = scheduler_output.scheduled_spec_decode_tokens
+        if self._scheduler_ngram and drafts:
+            # Upload the scheduler's drafts as one batch.
+            draft_ids = np.zeros(self.req_states.draft_tokens.shape, dtype=np.int64)
+            for req_id, tokens in drafts.items():
+                row = self.req_states.req_id_to_index[req_id]
+                draft_ids[row, : len(tokens)] = tokens
+            async_tensor_h2d(draft_ids, out=self.req_states.draft_tokens)
+        batch = super().prepare_inputs(scheduler_output, batch_req_state, batch_desc, num_active_loras)
+        self._prepare_minicpmo_rope(batch)
+        return batch
+
+    def _can_skip_spec_cpu_length_sync(self) -> bool:
+        # The synchronous scheduler already supplies rejection-adjusted lengths.
+        return self._scheduler_ngram or super()._can_skip_spec_cpu_length_sync()
+
+    def _kstep_active(self) -> bool:
+        """Talker K-step block armed, per the shared contract."""
+        cfg = getattr(self, "vllm_config", None)
+        stage = getattr(getattr(cfg, "model_config", None), "model_stage", None)
+        return talker_kstep_frames(stage, getattr(cfg, "speculative_config", None)) > 0
+
+    def _dummy_sampler_run(self, hidden_states: Any) -> None:
+        # K-step control rows are two-wide (continue/stop). The upstream
+        # profile warmup asks the sampler for 20 logprobs, which makes
+        # aclnnTopkV2 fail with "Selected index k out of range" on NPU. The
+        # real talker step goes through the model's MRv2 sampler (no logprobs),
+        # so skipping this warmup pass only costs first-step kernel compilation.
+        if self._kstep_active():
+            return
+        return super()._dummy_sampler_run(hidden_states)
+
+    def _dummy_run(self, num_tokens: int, *args: Any, **kwargs: Any):
+        was_profile = getattr(self, "_omni_kstep_dummy_profile", False)
+        self._omni_kstep_dummy_profile = bool(kwargs.get("is_profile", False))
+        try:
+            return super()._dummy_run(num_tokens, *args, **kwargs)
+        finally:
+            self._omni_kstep_dummy_profile = was_profile
+
+    def _call_model(self, model_inputs, *, input_batch, batch_desc):
+        if (
+            self._visual_a16_prefill
+            and input_batch.has_prefill
+            and not input_batch.is_dummy
+            and input_batch.req_ids
+            and all(req_id in self._visual_a16_reqs for req_id in input_batch.req_ids)
+        ):
+            from vllm_omni.platforms.npu.models import minicpmo_visual_precision
+
+            context = get_forward_context()
+            previous = context.skip_compiled
+            context.skip_compiled = True
+            minicpmo_visual_precision.visual_prefill_active = True
+            logger.info_once("MiniCPM-o uses W8A16 for all-visual prefill")
+            try:
+                return super()._call_model(model_inputs, input_batch=input_batch, batch_desc=batch_desc)
+            finally:
+                minicpmo_visual_precision.visual_prefill_active = False
+                context.skip_compiled = previous
+        startup_path = self._thinker_prefill_startup_path
+        if (
+            startup_path
+            and input_batch.has_prefill
+            and input_batch.num_reqs == 1
+            and input_batch.req_ids[0] in self._minicpmo_native_rope_reqs
+        ):
+            from vllm_omni.platforms.npu.worker.prefill_graph import run_prefill
+
+            output = run_prefill(self, model_inputs, input_batch, batch_desc, thinker=True, startup_path=startup_path)
+            if output is not None:
+                return output
+        if self._kstep_active():
+            if input_batch.has_prefill:
+                output = self._call_talker_prefill(model_inputs, input_batch, batch_desc)
+                if output is not None:
+                    return output
+            kstep_output = self._run_kstep_frames(model_inputs, input_batch)
+            if kstep_output is not None:
+                return kstep_output
+        if _minicpmo_mixed_long_prefill(self.vllm_config, input_batch):
+            # Pure prefill stays compiled. The mixed shape can change the point
+            # at which a near-limit request emits its stop token.
+            context = get_forward_context()
+            previous = context.skip_compiled
+            context.skip_compiled = True
+            try:
+                return super()._call_model(model_inputs, input_batch=input_batch, batch_desc=batch_desc)
+            finally:
+                context.skip_compiled = previous
+        return super()._call_model(model_inputs, input_batch=input_batch, batch_desc=batch_desc)
+
+    def _call_talker_prefill(self, model_inputs, input_batch, batch_desc):
+        use_eager = False
+        if (
+            (self.vllm_config.additional_config or {}).get("minicpmo_talker_short_prefill_eager") is True
+            and not input_batch.is_dummy
+            and input_batch.num_reqs == 1
+            and 2 <= input_batch.num_tokens <= 32
+        ):
+            infos = model_inputs.get("model_intermediate_buffer") or ()
+            if len(infos) == 1 and isinstance(infos[0], dict):
+                duplex = infos[0].get("duplex")
+                use_eager = not infos[0].get("native_duplex") and not (
+                    isinstance(duplex, dict) and duplex.get("data_plane") is True
+                )
+                if use_eager:
+                    logger.info_once("MiniCPM-o Talker uses eager prefill for short single-request turns")
+        context = get_forward_context() if use_eager else None
+        if context is not None:
+            # Avoid blocking the Talker worker on first-use static kernel
+            # compilation. Exact prefill graphs qualify against eager.
+            previous = context.skip_compiled
+            context.skip_compiled = True
+        try:
+            startup_path = os.getenv("MINICPMO_NPU_TALKER_PREFILL_STARTUP")
+            if startup_path:
+                from vllm_omni.platforms.npu.worker.prefill_graph import run_prefill
+
+                output = run_prefill(self, model_inputs, input_batch, batch_desc, startup_path=startup_path)
+                if output is not None:
+                    self._kstep_ran_last = False
+                    return output
+            if use_eager:
+                self._kstep_ran_last = False
+                return super()._call_model(model_inputs, input_batch=input_batch, batch_desc=batch_desc)
+            return None
+        finally:
+            if context is not None:
+                context.skip_compiled = previous
+
+    def _full_graph_step_output(self, batch_desc, *, model_inputs, input_batch):
+        """Drive the K-step frame loop on top of FULL graph replays."""
+        if not self._kstep_active() or getattr(self, "cudagraph_manager", None) is None:
+            return None
+
+        from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+        from vllm_ascend.compilation.updatable_graph import UpdatableGraph
+
+        manager = self.cudagraph_manager
+        graph = manager.graphs.get(batch_desc)
+        static_replay = (
+            isinstance(graph, UpdatableGraph)
+            and not graph.tasks
+            and not graph.provider_sizes
+            and getattr(self.model_state, "device_metadata", None) is None
+            and not callable(getattr(self.model_state, "prepare_engram", None))
+        )
+        if static_replay:
+            logger.info_once("MiniCPM-o MRv2 Talker static graph replays without an update stream")
+
+        def run_model():
+            # Preserve vLLM's offload barrier and output buffer handling. A
+            # static graph has no attention parameters for Ascend to refresh.
+            replayed = (
+                ModelCudaGraphManager.run_fullgraph(manager, batch_desc)
+                if static_replay
+                else manager.run_fullgraph(batch_desc)
+            )
+            if self.use_aux_hidden_state_outputs:
+                replayed, _draft_aux = replayed
+            hidden, _aux = self._split_fullgraph_output(replayed)
+            return hidden
+
+        options = self.vllm_config.additional_config or {}
+        if static_replay and options.get("minicpmo_talker_fused_decode") is True:
+            from vllm_omni.platforms.npu.worker.talker_fused_decode import run_fused_step
+
+            return run_fused_step(self, batch_desc, model_inputs, input_batch, run_model)
+        return self._run_kstep_frames(model_inputs, input_batch, run_model=run_model)
+
+    def _run_kstep_frames(self, model_inputs, input_batch, run_model=None):
+        """Replay one codec frame for each booked query position.
+
+        Each replay feeds the prior sampled codec into the persistent input
+        row. The causal mask isolates later rows, while replay rewrites the
+        booked KV slots. run_model may be eager or a graph replay."""
+        from vllm_omni.model_executor.models.output_templates import OmniOutput
+        from vllm_omni.worker import talker_multiframe as multiframe
+
+        cfg = getattr(self, "vllm_config", None)
+        stage = getattr(getattr(cfg, "model_config", None), "model_stage", None)
+        frames = talker_kstep_frames(stage, getattr(cfg, "speculative_config", None))
+        if frames <= 1 or getattr(self, "model_state", None) is None:
+            return None
+        spans = self.model_state._request_token_spans(input_batch)
+        infos = model_inputs.get("model_intermediate_buffer") or []
+        # Each booked row is one codec frame; replay the booked width to keep
+        # stop rows in request-major order.
+        widths = [int(e) - int(s) for s, e in spans]
+        uniform = bool(widths) and len(set(widths)) == 1
+        width = widths[0] if uniform else 0
+        prefill = bool(getattr(input_batch, "has_prefill", False))
+        if prefill:
+            # Single forward is the correct path for prefill steps (the frame
+            # loop only replays booked decode rows).
+            self._kstep_decline_logs = getattr(self, "_kstep_decline_logs", 0) + 1
+            if self._kstep_decline_logs <= 5:
+                logger.warning(
+                    "[kstep] frame loop declined (prefill step): infos=%d spans=%d width=%d",
+                    len(infos),
+                    len(spans),
+                    width,
+                )
+            # Disarm the per-step K-step state: this step falls back to the
+            # plain forward, so drafts and postprocess must follow suit.
+            self._kstep_ran_last = False
+            return None
+        if not uniform or len(infos) != len(spans):
+            if not uniform and getattr(self, "_omni_kstep_dummy_profile", False):
+                # Memory profiling distributes its token budget across dummy
+                # requests. Uneven spans still need a full-sized forward.
+                self._kstep_ran_last = False
+                return None
+            # K-step-armed decode step the frame loop cannot run. Falling back
+            # to a single forward would sample one frame from the last row of
+            # each span and report one stop row for K booked positions,
+            # silently corrupting both the codec stream and the scheduler's
+            # accounting; V1 raises in the same situation.
+            raise RuntimeError(
+                "[kstep] multi-token decode step cannot run through the frame "
+                f"loop: uniform={uniform} infos={len(infos)} spans={len(spans)} width={width}"
+            )
+        if width < 2 or width > MINICPMO_TALKER_FRAMES_MAX:
+            # Uniform spans outside the K-step window: one-token decode rows or
+            # warmup/sizing batches booked at prompt length. A single forward
+            # is the correct (and only) path here.
+            self._kstep_decline_logs = getattr(self, "_kstep_decline_logs", 0) + 1
+            if self._kstep_decline_logs <= 5:
+                logger.warning(
+                    "[kstep] frame loop declined (width outside K window): width=%d max=%d",
+                    width,
+                    MINICPMO_TALKER_FRAMES_MAX,
+                )
+            # Same as the prefill decline: disarm per-step K-step state.
+            self._kstep_ran_last = False
+            return None
+        # One replay per booked row. A width below the configured K would leave
+        # rows unsampled; a width above it would write past the request's span.
+        frames = width
+        using_full_graph = run_model is not None
+        if run_model is None:
+
+            def run_model():
+                out = self.model(**model_inputs)
+                if isinstance(out, OmniOutput):
+                    return out.text_hidden_states
+                if isinstance(out, (list, tuple)):
+                    return out[0]
+                return out
+
+        # No vocab sync is needed on this runner. The MRv2 step's input_batch
+        # carries no vocab_size field (the sampling vocab lives on
+        # model_config) and nothing on this path reads it: the two-wide
+        # control logits are consumed by the talker's device-side sampler
+        # stages, the duplex K-step dispatch installs no rejection speculator
+        # (minicpmo_4_5_omni_tts.py:2041 returns no speculator for K > 0), and
+        # the only consumer that needs a wider row, ``ensure_stop_token_vocab``
+        # is called only from the V1 NPU runner
+        # (npu_model_runner.py:566) and the GPU runner (gpu_model_runner.py:2444)
+        # -- never from this runner or from multiframe.run.
+        # Setting the field here would only create an attribute no one reads,
+        # and raising on its absence killed every real MRv2 deployment at the
+        # first decode step (observed on the 910B3 bench).
+        # make_omni_output reads its per-request info from the extra kwargs;
+        # forwarding the whole forward-input dict duplicates that key.
+        model_kwargs = {
+            "runtime_additional_information": infos,
+            "intermediate_tensors": model_inputs.get("intermediate_tensors"),
+        }
+        model_kwargs_extra = {
+            "request_token_spans": spans,
+            "model_intermediate_buffer": infos,
+        }
+        # The MRv2 stage loads the outer omni wrapper; the codec frame hooks
+        # (preprocess/make_omni_output/take_batch_stop_logits/merge_frame_outputs)
+        # live on the inner talker, which the wrapper only partially forwards.
+        codec_model = getattr(self.model, "talker", self.model)
+        frame_forward = None
+        options = self.vllm_config.additional_config or {}
+        if using_full_graph and options.get("minicpmo_talker_compact_decode") is True:
+            from vllm_omni.platforms.npu.worker.talker_batched_decode import prepare
+
+            frame_forward = prepare(self, codec_model, model_inputs, input_batch, width)
+        out = multiframe.run(
+            model=codec_model,
+            run_model=run_model,
+            after_forward=lambda: None,
+            inputs_embeds=model_inputs.get("inputs_embeds"),
+            input_ids=model_inputs.get("input_ids"),
+            frames=frames,
+            model_kwargs=model_kwargs,
+            model_kwargs_extra=model_kwargs_extra,
+            narrow=None,
+            frame_forward=frame_forward,
+        )
+        # Arm the per-step K-step state only after a successful frame loop:
+        # drafts and postprocess now follow the frame-loop semantics until
+        # the next decline re-disarms them.
+        self._kstep_ran_last = True
+        return out
+
+    def _propose_draft_tokens(self, input_batch, draft, num_sampled, num_rejected, mm_inputs):
+        if self._scheduler_ngram:
+            # Return request IDs so the scheduler can draft after committing this step.
+            self.draft_tokens_handler.set_draft_tokens(
+                input_batch, self.req_states.draft_tokens[: input_batch.num_reqs, :0]
+            )
+            return
+        # K-step drafts are not predictions: they reserve the K-1 extra KV
+        # rows of the next step. V1 feeds CONTINUE_TOKEN_ID (0) for every row;
+        # MRv2's speculator (if any) would propose real token ids instead.
+        if not getattr(self, "_kstep_ran_last", False):
+            # A declined step fell back to the plain forward: leave no
+            # speculative CONTINUE rows behind and defer to the base flow.
+            return super()._propose_draft_tokens(input_batch, draft, num_sampled, num_rejected, mm_inputs)
+        n = int(draft.num_spec_tokens or 0)
+        if n > 0:
+            self.req_states.draft_tokens[input_batch.idx_mapping, :n] = 0
+        self.draft_tokens_handler.set_draft_tokens(
+            input_batch,
+            self.req_states.draft_tokens[input_batch.idx_mapping, :n],
+        )
+
+    def initialize_kv_cache(self, kv_cache_config: Any, *args: Any, **kwargs: Any) -> None:
+        # ``_scheduler_ngram`` defaults to False as a class attribute and is only
+        # set once ``__init__`` has run, so read ``speculative_config`` behind it:
+        # the flag is the precondition that the config carries a speculator to
+        # narrow, and reading it first would fail on runners built without
+        # ``__init__`` (unit tests use ``object.__new__``).
+        spec = self.speculative_config if self._scheduler_ngram else None
+        if spec is not None and not spec.uses_dynamic_speculative_decoding():
+            # Capture ordinary decode and full-width verification.
+            spec.num_speculative_tokens_per_batch_size = [
+                (1, 1, 0),
+                (2, 2, self.num_speculative_steps),
+            ]
+            try:
+                super().initialize_kv_cache(kv_cache_config, *args, **kwargs)
+            finally:
+                spec.num_speculative_tokens_per_batch_size = None
+        else:
+            super().initialize_kv_cache(kv_cache_config, *args, **kwargs)
+        # The Ascend override initializes native KV directly, bypassing the
+        # shared MRv2 mixin. Thinker hits also need cached stage-output rows.
+        is_profiling = bool(kwargs.get("is_profiling", args[0] if args else False))
+        self._init_omni_prefix_cache(is_profiling=is_profiling)
+        if self.omni_prefix_cache is not None:
+            logger.info("NPU MRv2 stage-output prefix cache initialized.")
+
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         OmniGPUModelRunner.load_model(self, *args, **kwargs)
         if not getattr(self.model_state, "uses_ascend_attn_metadata", False):
             raise NotImplementedError(
                 "NPU Model Runner V2 needs a model state that builds Ascend attention "
-                f"metadata; {type(self.model_state).__name__} does not. Keep this stage "
-                "on model_runner v1, or provide an NPU state (Drama 3 does)."
+                f"metadata; {type(self.model_state).__name__} does not. Provide "
+                "an NPU-compatible model state before enabling this stage."
             )
         logger.info(
             "NPU Model Runner V2 loaded %s with Ascend attention metadata.",

@@ -137,6 +137,50 @@ Selectors use comma-separated integers and inclusive ranges. Listed steps or
 layers run floating-point attention through the selected Dense or BSA backend;
 all other eligible forwards use `diffusion_kv_cache_dtype`.
 
+### Qwen-Image-2.1 on Ascend
+
+Qwen-Image-2.1 prefill uses block-causal spans or a mask, which the current
+Omni NPU quantized attention path does not support. Keep that first denoising step
+in BF16 explicitly and quantize the subsequent dense decode calls:
+
+Save the following as `qwen21_mxfp8.yaml`:
+
+```yaml
+stages:
+  - stage_id: 0
+    diffusion_attention_config:
+      default:
+        backend: FLASH_ATTN
+    diffusion_kv_cache_dtype: mxfp8
+    diffusion_kv_cache_skip_steps: "0"
+```
+
+Pass this file through the offline script's supported `--deploy-config` option:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+    --model Qwen/Qwen-Image-2.1 \
+    --prompt "A ceramic teapot on a wooden table" \
+    --width 1024 --height 1024 --num-inference-steps 50 \
+    --cfg-scale 1.0 --seed 42 --enforce-eager \
+    --deploy-config qwen21_mxfp8.yaml \
+    --output qwen21_mxfp8.png
+```
+
+This requires an Ascend installation with compatible MindIE-SD MXFP8
+attention operators. It changes attention compute only; Linear weights and
+the persistent prefix KV cache keep their existing precision.
+
+The selector counts denoising forwards from zero in both whole-request and
+step execution. With the configuration above, step 0 uses the model's native
+precision and subsequent eligible dense decode steps use MXFP8.
+
+Without the explicit step-0 exclusion, structural prefill still fails rather
+than silently changing precision. Padded decode batches carrying a mask are
+also unsupported by quantized NPU attention. Validate output quality against
+BF16 for the intended workload; successful generation alone is not quality
+acceptance.
+
 ## Validation and Notes
 
 1. Compare generated images or videos against a BF16 baseline with the same

@@ -9,7 +9,7 @@
 The *wire* half of each command --- which client event it decodes from and what
 fields survive decoding --- now lives in ``vllm_omni.protocol.duplex.commands``,
 which carries the whole vocabulary: the eight Tier 1 classes re-exported from
-``vllm_omni.protocol.realtime.commands``, the two Tier 2 ones and the eight
+``vllm_omni.protocol.realtime.commands``, the two Tier 2 ones and the nine
 Tier 3 ones. The engine imports that module and never the Tier 1 one directly,
 so a command that later grows a duplex extension changes one file
 (RFC #6592 P0a).
@@ -103,7 +103,8 @@ class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
     #: Empty ``audio`` with ``video_frames`` is legal when capabilities allow video without audio.
     audio: bytes = b""
 
-    def payload(self) -> dict[str, object]:
+    def payload(self, *, encode_audio: bool = True) -> dict[str, object]:
+        """The legacy append dict; ``encode_audio=False`` keeps ``audio`` as the decoded bytes."""
         data = DuplexCommand.payload(self)
         hints = data.pop("hints", None)
         if isinstance(hints, Mapping):
@@ -117,7 +118,7 @@ class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
             merged.update(data)
             data = merged
         if self.audio:
-            data["audio"] = base64.b64encode(self.audio).decode("ascii")
+            data["audio"] = base64.b64encode(self.audio).decode("ascii") if encode_audio else self.audio
         else:
             data.pop("audio", None)
         if not data.get("video_frames"):
@@ -218,6 +219,11 @@ class CancelInput(DuplexCommand, _duplex_wire.CancelInput):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class CancelFunctionCall(DuplexCommand, _duplex_wire.CancelFunctionCall):
+    type: ClassVar[str] = "function_call.cancel"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class BargeIn(DuplexCommand, _duplex_wire.BargeIn):
     type: ClassVar[str] = "barge_in"
 
@@ -273,6 +279,7 @@ REALTIME_COMMAND_TYPES: frozenset[str] = frozenset(
         "turn.signal",
         "input.text.append",
         "input.cancel",
+        "function_call.cancel",
         "barge_in",
     }
 )
@@ -304,6 +311,7 @@ __all__ = [
     "BargeIn",
     "CancelInput",
     "CancelResponse",
+    "CancelFunctionCall",
     "ClearInput",
     "ClearOutputAudio",
     "CloseSession",

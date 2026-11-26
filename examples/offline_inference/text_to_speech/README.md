@@ -17,7 +17,9 @@ list of supported architectures across all modalities, see
 | AuK | `tencent/AuK`, `tencent/AuK-Flash` (assembled with `tools/prepare_auk_checkpoint.py`) | 2 (thinker encoder + DiT) | ✓ | — | instruction-driven editing, enhancement, separation; no example script (use `vllm_omni.model_extras.auk`) | 24 kHz |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | dual-AR | ✓ | ✓ | 11 languages | 44.1 kHz |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | 2 (talker + codec) | ✓ | ✓ (async chunk) | voice design / voice direction (`--instruction`) | 24 kHz |
+| Chatterbox Turbo / Original | `ResembleAI/chatterbox-turbo`, `ResembleAI/chatterbox` | 2 (AR + S3Gen/HiFT) | ✓ (no transcript) | ✓ (async chunk) | English; Original CFG / exaggeration | 24 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
+| Confucius4-TTS | `netease-youdao/Confucius4-TTS` | 2 (talker + S2A diffusion/BigVGAN) | ✓ (required) | — | 14 languages (`--lang`) | 22.05 kHz |
 | Fish Audio Drama 3 | `fishaudio/drama-3` | 2 (AR + DAC codec) | ✓ | ✓ (online) | speaker and event tags; no example script | 44.1 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | single (native AR + NanoCodec) | — (zero-shot; cloning later) | ✓ (online) | zero-shot | 22.05 kHz |
@@ -32,6 +34,23 @@ list of supported architectures across all modalities, see
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
+
+## Chatterbox Turbo and Original
+
+Two-stage English speech synthesis at 24 kHz, with a built-in voice or a single
+reference recording. No reference transcript is needed. Install the conditioning
+extra with `uv pip install -e '.[chatterbox]'`.
+
+Use the production `load_text_tokenizer`, `tokenize_text`, `build_prompt`, and
+`VoiceConditioning` helpers with `Omni.generate`; Original's `build_prompt` takes
+`exaggeration` and `cfg_weight` (upstream's defaults are 0.5 each). The [offline command in the
+H100 recipe](../../../recipes/ResembleAI/Chatterbox-H100.md#command)
+saves a complete mono 24 kHz WAV and uses the same preparation as serving.
+
+See the [H100 recipe](../../../recipes/ResembleAI/Chatterbox-H100.md) for
+profiles, qualification scope and concurrency limitations.
+
+---
 
 ## Common Quick Start
 
@@ -106,6 +125,77 @@ smoke-test magnitudes, not a benchmark.
 
 ---
 
+## Confucius4-TTS
+
+Confucius4-TTS uses a native vLLM GPT-2 talker followed by an S2A diffusion
+decoder and BigVGAN. Reference audio is required, and inference is currently
+non-streaming.
+
+On the first connected run, vLLM-Omni downloads the model plus
+`facebook/w2v-bert-2.0`, `funasr/campplus`, and
+`nvidia/bigvgan_v2_22khz_80band_256x` as needed. For a fully offline host,
+prepare one self-contained directory:
+
+```bash
+MODEL_DIR=/models/Confucius4-TTS
+hf download netease-youdao/Confucius4-TTS --local-dir "$MODEL_DIR"
+hf download facebook/w2v-bert-2.0 \
+    --local-dir "$MODEL_DIR/pretrained/w2v-bert-2.0"
+hf download funasr/campplus campplus_cn_common.bin \
+    --local-dir "$MODEL_DIR/pretrained/campplus"
+hf download nvidia/bigvgan_v2_22khz_80band_256x \
+    --local-dir "$MODEL_DIR/bigvgan"
+```
+
+Use the packaged request helpers with either the Hugging Face model ID or
+`MODEL_DIR`. The same self-contained directory works for OpenAI Speech API
+serving.
+
+```python
+import soundfile as sf
+
+from vllm_omni import Omni
+from vllm_omni.model_extras.confucius4_tts import (
+    SAMPLE_RATE,
+    confucius4_tts_audio,
+    confucius4_tts_prompt,
+    confucius4_tts_sampling_params,
+)
+
+model = "netease-youdao/Confucius4-TTS"
+omni = Omni(model=model)
+try:
+    output = omni.generate(
+        confucius4_tts_prompt(
+            model,
+            "你好，这是一个语音合成测试。",
+            "/path/to/reference.wav",
+            lang="zh",
+        ),
+        sampling_params_list=confucius4_tts_sampling_params(),
+        use_tqdm=False,
+    )[0]
+finally:
+    omni.shutdown()
+
+sf.write("output.wav", confucius4_tts_audio(output).numpy(), SAMPLE_RATE)
+```
+
+Supported language codes are `zh`, `en`, `ja`, `ko`, `de`, `fr`, `es`, `id`,
+`it`, `th`, `pt`, `ru`, `ms`, and `vi`. The formatted prompt, including the
+language instruction, is limited to 520 tokens. The integration does not add
+text normalization or automatic long-text segmentation, so callers should
+split longer input into suitable utterances.
+
+Stage 0 generates at most 1518 semantic tokens; Stage 1 recomputes the
+matching latent rows from the finished sequence. At about 50 semantic tokens
+per second, one request yields at most about 30 seconds of audio; longer text
+is cut off without an error, and a truncation warning is logged.
+`confucius4_tts_sampling_params(max_new_tokens=...)` sets that budget and
+configures token 8193 as the stop token. Output is 22.05 kHz mono audio.
+
+---
+
 ## CosyVoice3
 
 2-stage TTS pipeline (`talker` + `code2wav`) at 24 kHz.
@@ -161,6 +251,21 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 ### Streaming
 
 Streaming is enabled by default via `async_chunk: true` in `vllm_omni/deploy/cosyvoice3.yaml`. Pass `--no-async-chunk` on `vllm serve` to switch to the legacy synchronous path.
+
+### Packed Flow precision
+
+The opt-in packed profiles (`cosyvoice3_full_response.yaml` and
+`cosyvoice3_packed_streaming.yaml`) disable BF16 reduced-precision GEMM
+reductions during each packed Flow solve, including eager solves, graph warmup,
+capture and replay. The previous setting is restored after every solve, so other
+models in the worker keep their own. Batch composition and graph padding can
+otherwise select a different GEMM with larger intermediate rounding errors.
+
+FlashInfer graph plans can choose different attention tiles from eager plans,
+so bitwise graph/eager equivalence is not guaranteed. Validate audio quality
+and performance using the same hardware, software and final deployment settings.
+This precision setting does not change streaming position noise or chunk-causal
+attention semantics.
 
 ### Notes
 
@@ -358,7 +463,7 @@ Override the default text per case with `--text`, write to a custom path with `-
 
 ### Notes
 
-- Talker-only deployment — for the multimodal Ming-flash-omni example, see [`examples/offline_inference/ming_flash_omni/`](../../ming_flash_omni/).
+- Talker-only deployment — for the multimodal Ming-flash-omni example, see [`examples/offline_inference/ming_flash_omni/`](../ming_flash_omni/).
 - Deploy config: `vllm_omni/deploy/ming_flash_omni_tts.yaml` (single GPU, `enforce_eager`, `max_num_seqs: 1`).
 - Decode defaults from the Ming cookbook: `max_decode_steps=200`, `cfg=2.0`, `sigma=0.25`, `temperature=0.0`, `use_zero_spk_emb=True`.
 
@@ -637,11 +742,22 @@ Single-stage native AR TTS at 48 kHz. Pipeline: `feat_encoder → MiniCPM4 → F
 
 ### Prerequisites
 
+The native model requires `voxcpm==2.0.3`, including its Gradio dependency.
+After the matching vLLM and Omni source installation, run from the repository
+root using the [source dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies):
+
 ```bash
-pip install voxcpm
-# or, for a local source checkout:
-pip install -e /path/to/voxcpm
+python tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
+uv pip install 'voxcpm==2.0.3' \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
+# Alternatively, add an editable VoxCPM checkout with matching 2.0.3 metadata:
+uv pip install 'voxcpm==2.0.3' -e /path/to/voxcpm \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
+uv pip check
 ```
+
+The selected CPU dependency/serialization checks do not establish native
+VoxCPM inference or output acceptance.
 
 ### Quick start
 

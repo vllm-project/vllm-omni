@@ -41,7 +41,7 @@ import time
 import wave
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right, insort
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Container, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
@@ -60,6 +60,12 @@ from vllm_omni.clients.utils import (
     distribution_summary,
     metric_mean,
     summarize_stage_metrics,
+)
+
+#: Errors about one tool call. The session carries on, so a consumer waiting on
+#: the response path must not fail; they stay visible through ``events()``.
+_TOOL_CALL_ERROR_CODES = frozenset(
+    {"tool_result_timeout", "invalid_function_call_output", "invalid_function_call_cancel"}
 )
 
 __all__ = [
@@ -233,7 +239,7 @@ class SessionConfig:
     model-neutral.
     """
 
-    modalities: tuple[str, ...] = ("audio", "text")
+    modalities: tuple[str, ...] | None = ("audio", "text")
     input_audio: AudioFormat = AudioFormat("pcm16", 16_000)
     output_audio: AudioFormat = AudioFormat("pcm16", 24_000)
     instructions: str | None = None
@@ -253,7 +259,6 @@ class SessionConfig:
     def to_session_payload(self, *, model: str) -> dict[str, object]:
         payload: dict[str, object] = {
             "model": model,
-            "modalities": list(self.modalities),
             "input_audio_format": self.input_audio.encoding,
             "output_audio_format": self.output_audio.encoding,
             # The encodings alone do not pin the rates (presets differ from the
@@ -267,6 +272,8 @@ class SessionConfig:
             },
             "turn_detection": self.turn_detection,
         }
+        if self.modalities is not None:
+            payload["modalities"] = list(self.modalities)
         if self.instructions is not None:
             payload["instructions"] = self.instructions
         if self.ref_audio is not None:
@@ -509,6 +516,13 @@ _FATAL_RESUME_CODES = frozenset(
         "session_resume_conflict",
     }
 )
+
+#: Error codes a duplex server uses to refuse a ``response.create``: the
+#: committed turn holds nothing the model can answer, so no response will ever
+#: be produced for that ask. A caller waiting on such a request should treat
+#: these as a definitive answer rather than as a failure -- and, symmetrically,
+#: must not read them as a health signal about the session.
+DEFINITIVE_REFUSAL_CODES = frozenset({"response_create_without_input", "text_only_turn_unsupported"})
 
 
 def wrap_event(raw: dict[str, object]) -> DuplexEvent:
@@ -766,6 +780,16 @@ class DuplexClientBase(ABC):
 
     # -- input ----------------------------------------------------------------
 
+    async def append_text(self, text: str, *, force_listen: bool = False) -> None:
+        """Prefill a text fragment; force listening while more input is arriving.
+
+        Requires ``text`` in the session's input modalities. Like audio units,
+        fragments may elicit a model-native response before the next append.
+        """
+        if not text:
+            raise ValueError("append_text requires non-empty text")
+        await self.send({"type": "input.text.append", "text": text, "force_listen": force_listen})
+
     async def append_audio(
         self,
         pcm: bytes,
@@ -897,6 +921,21 @@ class DuplexClientBase(ABC):
     async def clear_input(self) -> None:
         await self.send({"type": "input_audio_buffer.clear"})
 
+    # -- tool calls -------------------------------------------------------------
+
+    async def send_function_call_output(self, call_id: str, output: str) -> None:
+        """Return one function call's result to the model."""
+        await self.send(
+            {
+                "type": "conversation.item.create",
+                "item": {"type": "function_call_output", "call_id": call_id, "output": output},
+            }
+        )
+
+    async def cancel_function_call(self, call_id: str, reason: str = "cancelled") -> None:
+        """End one pending function call; ``reason="failed"`` reports a failed tool."""
+        await self.send({"type": "function_call.cancel", "call_id": call_id, "reason": reason})
+
     # -- playback contract ------------------------------------------------------
 
     async def ack_playback(
@@ -921,19 +960,30 @@ class DuplexClientBase(ABC):
 
     # -- server-side stats -----------------------------------------------------
 
-    async def get_session_stats(self, *, timeout_s: float = 10.0) -> dict[str, object]:
+    async def get_session_stats(
+        self,
+        *,
+        timeout_s: float = 10.0,
+        event_id: str | None = None,
+    ) -> dict[str, object]:
         """Fetch the server's per-turn stage work and audio (``session.stats``, RFC #8325).
 
         Needs ``capabilities.supports_session_stats`` (``duplex_session.collect_stats``
         on the server). Busy RTF and stall ratio are derived from the returned raw
         document by ``vllm_omni.benchmarks.duplex_session_metrics``.
         """
-        event_id = f"evt_{uuid4().hex}"
+        request_id = event_id or f"evt_{uuid4().hex}"
         # Subscribe before sending: the reply can arrive before send() returns.
         queue = self._add_subscriber()
         try:
-            await self.send({"type": "session.stats.get", "event_id": event_id})
             deadline = time.monotonic() + timeout_s
+            try:
+                await asyncio.wait_for(
+                    self.send({"type": "session.stats.get", "event_id": request_id}),
+                    timeout=timeout_s,
+                )
+            except TimeoutError as exc:
+                raise asyncio.TimeoutError("timed out sending session.stats.get") from exc
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -941,9 +991,9 @@ class DuplexClientBase(ABC):
                 item = await asyncio.wait_for(queue.get(), remaining)
                 if isinstance(item, _ClosedMarker):
                     raise DuplexSessionClosedError(item.reason)
-                if isinstance(item, ErrorEvent) and item.related_event_id == event_id:
+                if isinstance(item, ErrorEvent) and item.related_event_id == request_id:
                     raise item.to_exception()
-                if item.type == "session.stats" and item.raw.get("request_event_id") == event_id:
+                if item.type == "session.stats" and item.raw.get("request_event_id") == request_id:
                     stats = item.raw.get("stats")
                     return stats if isinstance(stats, dict) else {}
         finally:
@@ -1066,7 +1116,7 @@ class DuplexClientBase(ABC):
             item = await asyncio.wait_for(queue.get(), remaining)
             if isinstance(item, _ClosedMarker):
                 raise DuplexSessionClosedError(item.reason)
-            if isinstance(item, ErrorEvent) and item.type not in types:
+            if isinstance(item, ErrorEvent) and item.type not in types and item.code not in _TOOL_CALL_ERROR_CODES:
                 raise item.to_exception()
             if item.type in types:
                 return item
@@ -1145,7 +1195,8 @@ class DuplexClientBase(ABC):
             # A rejected request produces no response; surface the rejection
             # on the response path too so a consumer waiting in responses()
             # is not left waiting forever (see the responses() docstring).
-            _put_drop_oldest(self._response_queue, _ErrorMarker(event))
+            if event.code not in _TOOL_CALL_ERROR_CODES:
+                _put_drop_oldest(self._response_queue, _ErrorMarker(event))
             # Keep the text for the close that usually follows: a client that
             # is streaming input is inside send(), not draining responses(),
             # and would otherwise only ever see "closed".
@@ -1264,7 +1315,14 @@ class DuplexClient(DuplexClientBase):
         except ImportError as exc:  # pragma: no cover - websockets is a pinned dep
             raise DuplexConnectionError("The duplex client requires the 'websockets' package") from exc
         try:
-            return await websockets.connect(url, additional_headers=self._extra_headers, max_size=_MAX_FRAME_BYTES)
+            # Startup warmup can hold the HTTP upgrade before session.created.
+            # Use the caller's handshake budget for this transport phase too.
+            return await websockets.connect(
+                url,
+                additional_headers=self._extra_headers,
+                max_size=_MAX_FRAME_BYTES,
+                open_timeout=self._handshake_timeout_s,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1425,6 +1483,17 @@ class DuplexClient(DuplexClientBase):
 # Test/benchmark collector
 
 
+def _response_created_modalities(event: dict[str, object]) -> frozenset[str] | None:
+    response = event.get("response")
+    if not isinstance(response, dict):
+        return None
+    for key in ("output_modalities", "modalities"):
+        value = response.get(key)
+        if isinstance(value, list) and value:
+            return frozenset(map(str, value))
+    return None
+
+
 def _event_stage_metrics(event: dict[str, object]) -> dict[str, object] | None:
     candidates: list[object] = [event.get("vllm_omni")]
     metadata = event.get("metadata")
@@ -1579,8 +1648,18 @@ class EventCollector:
             chunk for response_id in self.response_ids for chunk in self.response_audio.get(response_id, ())
         )
 
-    def errors(self) -> list[dict[str, object]]:
-        return [event for event in self.events if event.get("type") == "error"]
+    def errors(self, exclude_indexes: Container[int] = frozenset()) -> list[dict[str, object]]:
+        """Collected ``error`` events, optionally skipping forgive-list indexes.
+
+        ``exclude_indexes`` refers to positions in :attr:`events`, so callers
+        that forgive specific errors keep a single definition of what an error
+        is instead of re-filtering ``events`` themselves.
+        """
+        return [
+            event
+            for index, event in enumerate(self.events)
+            if event.get("type") == "error" and index not in exclude_indexes
+        ]
 
     def response_is_done(self, response_id: str) -> bool:
         return any(
@@ -1711,6 +1790,7 @@ class EventCollector:
         first_text_received_at_s: float | None = None
         audio_received_at_s: list[float] = []
         cumulative_audio_ms: list[float] = []
+        created_modalities: frozenset[str] | None = None
         for event, received_at_s in zip(self.events, self.event_received_at_s, strict=True):
             if received_at_s < after_s:
                 continue
@@ -1719,6 +1799,7 @@ class EventCollector:
                 continue
             if event.get("type") == "response.created" and response_created_at_s is None:
                 response_created_at_s = received_at_s
+                created_modalities = _response_created_modalities(event)
             if (
                 event.get("type")
                 in {
@@ -1736,7 +1817,7 @@ class EventCollector:
             if isinstance(stage_metrics, dict):
                 for stage_id, stage_snapshot in stage_metrics.items():
                     if isinstance(stage_snapshot, dict):
-                        observed_stage_metrics[str(stage_id)] = stage_snapshot
+                        observed_stage_metrics[str(stage_id)] = dict(stage_snapshot)
 
             event_request_metrics = _event_response_request_metrics(event)
             if event_request_metrics is not None:
@@ -1754,8 +1835,16 @@ class EventCollector:
                 cumulative_audio_ms.append(max(0.0, float(duration_ms)))
 
         result: dict[str, object] = {}
+        if not audio_received_at_s and (
+            first_text_received_at_s is not None
+            or (created_modalities is not None and "audio" not in created_modalities)
+        ):
+            # Still a text turn if it ended before its first text delta.
+            result["output_modality"] = "text"
         stage0_metrics = observed_stage_metrics.get("0")
         if observed_stage_metrics:
+            # Preserve raw cumulative snapshots for the shared benchmark aggregator.
+            result["stage_metrics"] = observed_stage_metrics
             stages = {
                 stage_id: _stage_engine_metrics_block(stage_snapshot)
                 for stage_id, stage_snapshot in sorted(
@@ -1767,6 +1856,16 @@ class EventCollector:
             if "0" in stages:
                 result["stage0_tokens"] = stages["0"]
 
+        if not audio_received_at_s and first_text_received_at_s is not None:
+            result["request_metrics"] = self._text_only_request_metrics(
+                response_request_metrics,
+                stage0_metrics=stage0_metrics,
+                request_started_at_s=(
+                    input_committed_at_s if input_committed_at_s is not None else response_created_at_s
+                ),
+                committed=input_committed_at_s is not None,
+                first_text_received_at_s=first_text_received_at_s,
+            )
         if audio_received_at_s:
             intervals_ms = [
                 (current - previous) * 1000.0 for previous, current in zip(audio_received_at_s, audio_received_at_s[1:])
@@ -1900,6 +1999,47 @@ class EventCollector:
                         "rtf": _CLIENT_APPEND_RTF_ORIGIN,
                     }
         return result
+
+    @staticmethod
+    def _text_only_request_metrics(
+        response_request_metrics: dict[str, object],
+        *,
+        stage0_metrics: dict[str, object] | None,
+        request_started_at_s: float | None,
+        committed: bool,
+        first_text_received_at_s: float,
+    ) -> dict[str, object]:
+        server_ttft_ms = _finite_number(response_request_metrics.get("ttft_ms"), nonnegative=True)
+        if server_ttft_ms is not None:
+            origin = "native request start to first text output"
+            server_origins = response_request_metrics.get("measurement_origin")
+            if isinstance(server_origins, dict) and isinstance(server_origins.get("ttft"), str):
+                origin = server_origins["ttft"]
+            ttft_ms: float | None = server_ttft_ms
+        else:
+            origin = (
+                "input_audio_buffer.commit client send to first non-empty text delta"
+                if committed
+                else "response.created client receive to first non-empty text delta"
+            )
+            ttft_ms = (
+                _rounded_ms((first_text_received_at_s - request_started_at_s) * 1000.0)
+                if request_started_at_s is not None
+                else None
+            )
+        resolved_origin = {"ttft": origin}
+        metrics: dict[str, object] = {
+            "source": (
+                "server_request_start_and_client_receive" if server_ttft_ms is not None else "client_monotonic_receive"
+            ),
+            "output_modality": "text",
+            "measurement_origin": resolved_origin,
+            "ttft_ms": ttft_ms,
+        }
+        if stage0_metrics is not None:
+            resolved_origin["tpot"] = "Stage-0 engine mean time per output token"
+            metrics["tpot_ms"] = _finite_number(stage0_metrics.get("vllm_tpot_ms"), nonnegative=True)
+        return metrics
 
     def _format_for_bytes(self) -> AudioFormat:
         return AudioFormat("pcm16", self.output_sample_rate_hz)
@@ -2035,13 +2175,16 @@ def summarize_session_request_metrics(
 
     Aggregatable fields are nested as ``{count, mean, p50, p99}``.
     """
+    text_turn_count = sum(1 for metrics in request_metrics if metrics.get("output_modality") == "text")
     summary: dict[str, object] = {
         "session_id": session_id,
-        "audio_turn_count": len(request_metrics),
+        "audio_turn_count": len(request_metrics) - text_turn_count,
         "ttft_ms": distribution_summary(_finite_metric_values(request_metrics, "ttft_ms")),
         "ttfp_ms": distribution_summary(_finite_metric_values(request_metrics, "ttfp_ms")),
         "rtf": distribution_summary(_finite_metric_values(request_metrics, "rtf"), digits=6),
     }
+    if text_turn_count:
+        summary["text_turn_count"] = text_turn_count
     if (client_ttfp := distribution_summary(_finite_metric_values(request_metrics, "client_ttfp_ms"))) is not None:
         summary["client_ttfp_ms"] = client_ttfp
     if (client_rtf := distribution_summary(_finite_metric_values(request_metrics, "client_rtf"), digits=6)) is not None:
@@ -2068,7 +2211,12 @@ async def acknowledge_collected_playback(client: DuplexClientBase, collector: Ev
     A response that has produced no audio yet is still acked (0 ms) unless it
     already finished: the ack checkpoints the response's history position on
     the server, so a user input committed later cannot displace it.
+
+    A deployment with ``supports_playback_ack=False`` rejects ACKs, so none is sent.
     """
+    capabilities = getattr(client, "session_info", {}).get("capabilities")
+    if isinstance(capabilities, dict) and capabilities.get("supports_playback_ack") is False:
+        return
     output_format = AudioFormat("pcm16", collector.output_sample_rate_hz)
     for response_id in collector.response_ids:
         pcm16 = collector.audio_bytes(response_id)
