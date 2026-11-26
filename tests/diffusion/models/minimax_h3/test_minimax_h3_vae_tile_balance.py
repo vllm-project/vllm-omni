@@ -209,6 +209,21 @@ def test_install_is_npu_only_idempotent_and_context_scoped():
         assert torch.equal(model.encode_temporal(unsupported), unsupported + 1)
 
 
+def test_active_context_falls_back_when_parallel_tiling_is_disabled():
+    model = Model()
+    adapter = SimpleNamespace(
+        _device_target=Device("npu"),
+        decode_only=False,
+        model=model,
+        _native_parallel_state=lambda: pytest.fail("parallel state must not be queried"),
+    )
+    assert balance.install_video_tile_balance(adapter, 8) is True
+    x = torch.zeros(1, 1, 8, 4, 4)
+
+    with balance.video_encode_tile_balance_context():
+        assert torch.equal(model.encode_temporal(x), x + 1)
+
+
 def test_opted_in_npu_reports_missing_checkpoint_collective():
     model = Model()
     empty_gather = FunctionType((lambda *_: None).__code__, {})
