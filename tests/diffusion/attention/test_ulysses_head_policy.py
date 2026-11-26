@@ -72,3 +72,50 @@ def test_mismatched_layer_order_skips_collective_preparation(monkeypatch):
     policy.finish_component(None, (), None)
     assert policy.visits["shape"] == {}
     assert not policy.layouts and not policy.pending and not policy.discovered
+
+
+@pytest.mark.parametrize("failure,recoverable", [(MemoryError("allocation"), True), (ValueError("bad layout"), False)])
+def test_prepare_local_votes_before_rendezvous(monkeypatch, failure, recoverable):
+    from vllm_omni.diffusion.attention.parallel import ulysses_ce_overlap as ce
+
+    def prepare():
+        raise failure
+
+    def gather(peers, local, group):
+        peers[:] = [None, local]
+
+    monkeypatch.setattr(ce.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(ce.dist, "all_gather_object", gather)
+    with pytest.raises(RuntimeError, match=str(failure)) as caught:
+        ce.prepare_local(prepare, object())
+    assert isinstance(caught.value, ce.PreparationError) is recoverable
+
+
+@pytest.mark.parametrize("peer_split_us,expected", [(65.0, True), (105.0, False)])
+def test_one_decision_from_slowest_rank(monkeypatch, peer_split_us, expected):
+    from vllm_omni.diffusion.attention.parallel import head_policy as hp
+
+    policy = hp.HeadPolicy(None, 120)
+    key = (2, (((1, 127, 16, 64),),))
+    trial = hp.Trial((3, 5), 0, seen=hp._UNTIMED + hp._SAMPLES)
+    policy.component_layouts["request"] = (key,)
+    policy.layouts[key] = trial
+    policy.pending.add(key)
+    end = SimpleNamespace(query=lambda: True)
+    for i in range(hp._SAMPLES):
+        ms = 0.06 if hp.candidate_index(i) else 0.10
+        trial.observations[i] = SimpleNamespace(elapsed_time=lambda _, ms=ms: ms), end, True
+
+    calls = []
+
+    def gather(peers, local, group):
+        calls.append(1)
+        peer = [(peer_split_us if hp.candidate_index(i) else 100.0, True) for i in range(hp._SAMPLES)]
+        peers[:] = [local, {key: peer}]
+
+    monkeypatch.setattr(hp.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(hp.dist, "all_gather_object", gather)
+    policy.resolve_pending("request")
+    assert trial.selected is expected and not policy.pending and not trial.observations
+    policy.resolve_pending("request")
+    assert len(calls) == 1

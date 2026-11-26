@@ -89,6 +89,8 @@ def clear():
         policy.layouts.clear()
         policy.pending.clear()
         policy.component_layouts.clear()
+        policy.routes.clear()
+        policy.discovered.clear()
         policy.visits.clear()
         policy.slots.clear()
 
@@ -135,6 +137,7 @@ class HeadPolicy:
         self.discovered = {}
         self.enabled_for_call = False
         self.generation = 0
+        self.routes = {}
         self.visits = {}
         self.slots = {}
 
@@ -346,8 +349,8 @@ class HeadPolicy:
                 reports[key] = []  # A discovered layer changed layout or skipped a visit.
             elif len(observations) == _SAMPLES and all(end.query() for _, end, _ in observations.values()):
                 reports[key] = [
-                    (candidate_index(i), start.elapsed_time(end) * 1000, queued)
-                    for i, (start, end, queued) in sorted(observations.items())
+                    (start.elapsed_time(end) * 1000, queued)
+                    for start, end, queued in (observations[i] for i in range(_SAMPLES))
                 ]
             else:
                 reports[key] = None
@@ -355,15 +358,14 @@ class HeadPolicy:
         dist.all_gather_object(peers, reports, group=self.group)
         for key in keys:
             trial = self.layouts[key]
-            if not any(peer[key] == [] for peer in peers) and any(peer[key] is None for peer in peers):
-                continue
+            rows = [peer[key] for peer in peers]
             choices = [[], []]
-            complete = all(peer[key] for peer in peers)
-            for values in zip(*(peer[key] or [] for peer in peers), strict=complete):
-                choice = values[0][0]
-                if any(value[0] != choice for value in values):
-                    raise RuntimeError("Ulysses ranks sampled different head partitions")
-                choices[choice].append([value[1:] for value in values])
+            if not any(row == [] for row in rows):
+                if any(row is None for row in rows):
+                    continue
+                # Every peer reports the same preassigned slot order.
+                for i, values in enumerate(zip(*rows, strict=True)):
+                    choices[candidate_index(i)].append(values)
             samples = qualified_cycles(choices)
             trial.selected = bool(choose(samples))
             self.generation += int(trial.selected)

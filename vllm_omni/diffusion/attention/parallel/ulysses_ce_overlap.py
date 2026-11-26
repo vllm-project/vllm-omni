@@ -62,17 +62,22 @@ class PreparationError(RuntimeError):
 
 
 def prepare_local(fn, control):
-    if control is None:
-        return fn()
-    error = None
+    # Complete all purely local work before any rank can enter rendezvous.
+    # An unexpected local exception must also reach the other ranks. Only
+    # resource exhaustion and unavailable driver libraries are safe to retry
+    # as native attention. A poisoned device must leave the worker instead.
+    failure = None
     try:
         result = fn()
-    except (RuntimeError, OSError, MemoryError) as exc:
-        error = f"{type(exc).__name__}: {exc}"
-    errors = [None] * dist.get_world_size(control)
-    dist.all_gather_object(errors, error, group=control)
-    if any(errors):
-        raise PreparationError(f"Ulysses local preparation failed: {errors}")
+    except Exception as exc:
+        recoverable = isinstance(exc, (torch.OutOfMemoryError, MemoryError, OSError))
+        failure = (recoverable, f"{type(exc).__name__}: {exc}")
+    peers = [None] * dist.get_world_size(control)
+    dist.all_gather_object(peers, failure, group=control)
+    errors = [(rank, item[1]) for rank, item in enumerate(peers) if item is not None]
+    if errors:
+        error_type = PreparationError if all(item[0] for item in peers if item) else RuntimeError
+        raise error_type(f"Ulysses local preparation failed: {errors}")
     return result
 
 
