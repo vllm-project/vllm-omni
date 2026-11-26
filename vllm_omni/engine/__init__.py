@@ -15,6 +15,10 @@ from vllm.v1.engine import (
     EngineCoreRequest,
 )
 
+# Stable stop-reason prefix shared by the scheduler and duplex client errors.
+CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
+
+
 # Where a receiver gets a request's stage payload: the sender's connector address, or the
 # serialized payload itself for a run request.
 PayloadSenderInfo: TypeAlias = dict[str, Any] | bytes
@@ -163,6 +167,10 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     # Duplex session stats (RFC #8325): [epoch, seq, start_ns, duration_ns] step
     # spans of measured duplex chunks, the producing step's chunk last.
     stage_work: list[list[int]] | None = None
+    # Talker/async-chunk segment identity for this poll. Duplex stamp copies it
+    # onto processed outputs so sentence-TTS park can tell leftover 2150 from
+    # the next utterance. Not the chunk-transfer adapter watermark.
+    segment_generation: int | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

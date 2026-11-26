@@ -38,6 +38,7 @@ def _core_with(model) -> StepAudio2Token2WavCore:
     core.device = torch.device("cpu")
     # Graph bookkeeping normally declared in __init__ (skipped above).
     core._s3_graphs = {}
+    core._s3_cuda_graph = None
     core._s3_failed = set()
     core._s3_graph_lock = threading.Lock()
     core._s3_graph_done = None
@@ -119,7 +120,7 @@ class _BrokenGraph:
     """NPUGraph whose first ``replay()`` raises: the failure mode the
     registration-order fix must survive without publishing a bucket."""
 
-    instances = []
+    instances: list["_BrokenGraph"] = []
 
     def __init__(self):
         self.replays = 0

@@ -36,7 +36,7 @@ MULTI_EDIT_PROMPT = (
     "Then juxtapose the two transformed images into a single artwork for visual contrast."
 )
 NEGATIVE_PROMPT = "blurry, low quality, modern, geometrist"
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
 
 
 def _get_diffusion_feature_cases(model: str = MODEL):

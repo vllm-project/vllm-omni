@@ -289,6 +289,93 @@ async def test_generate_rejects_unreadable_cached_mix(tmp_path, monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ([], cli.DEFAULT_JUDGE_FRAME_MAX_SIDE),
+        (["--judge-frame-max-side", "768"], 768),
+        (["--judge-frame-max-side", "0"], None),
+    ],
+)
+def test_cli_evaluate_forwards_judge_frame_max_side(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: list[str], expected: int | None
+):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"id": "s", "split": "PR_correction", "question_text": "q"}]), encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(cli, "DuplexJudge", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli, "evaluate_sample", lambda *args, **kwargs: seen.append(kwargs["judge_frame_max_side"]))
+
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--family", "pr", "--response-root", str(tmp_path / "r")]
+    args += ["--score-root", str(tmp_path / "s"), "--judge-model", "mock-judge", *flag]
+    OmniDuplexEvalSubcommand.cmd(parser.parse_args(args))
+    assert seen == [expected]
+
+
+def test_cli_evaluate_rejects_negative_judge_frame_max_side(tmp_path: Path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"id": "s", "split": "PR_correction", "question_text": "q"}]), encoding="utf-8")
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--family", "pr", "--response-root", str(tmp_path / "r")]
+    args += ["--score-root", str(tmp_path / "s"), "--judge-model", "mock-judge", "--judge-frame-max-side", "-1"]
+    with pytest.raises(ValueError, match="--judge-frame-max-side"):
+        OmniDuplexEvalSubcommand.cmd(parser.parse_args(args))
+
+
+@pytest.mark.parametrize(
+    ("sample_ids", "cached_score"),
+    [(["cached"], {}), (["new", "cached"], {"judge_frame_max_side": 1920})],
+    ids=["fully-cached-legacy", "partial-resume"],
+)
+def test_cli_evaluate_rejects_mismatched_cached_rtd_cap(tmp_path, monkeypatch, sample_ids, cached_score):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"id": sample_id, "split": "RTD_OCR"} for sample_id in sample_ids]))
+    score_root = tmp_path / "scores"
+    cached_path = score_root / "RTD_OCR" / "cached.json"
+    cached_path.parent.mkdir(parents=True)
+    cached_path.write_text(json.dumps(cached_score))
+    seen = []
+    monkeypatch.setattr(cli, "evaluate_sample", lambda sample, *args, **kwargs: seen.append(sample.id))
+
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--response-root", str(tmp_path / "responses")]
+    args += ["--score-root", str(score_root), "--judge-model", "mock-judge", "--judge-frame-max-side", "768"]
+    with pytest.raises(ValueError, match=r"cached\.json.*judge_frame_max_side.*--overwrite.*--score-root"):
+        OmniDuplexEvalSubcommand.cmd(parser.parse_args(args))
+
+    assert seen == []
+    assert list(cached_path.parent.iterdir()) == [cached_path]
+    assert json.loads(cached_path.read_text()) == cached_score
+
+    OmniDuplexEvalSubcommand.cmd(parser.parse_args([*args, "--overwrite"]))
+    assert seen == sample_ids
+
+
+def test_cli_evaluate_reuses_matching_rtd_and_legacy_pr_scores(tmp_path, monkeypatch):
+    samples = [{"id": "rtd", "split": "RTD_OCR"}, {"id": "pr", "split": "PR_correction"}]
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(samples))
+    score_root = tmp_path / "scores"
+    for sample, score in zip(samples, ({"judge_frame_max_side": 768}, {})):
+        path = score_root / sample["split"] / f"{sample['id']}.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(score))
+
+    def unexpected_evaluation(*args, **kwargs):
+        pytest.fail("compatible cached scores should be reused")
+
+    monkeypatch.setattr(cli, "evaluate_sample", unexpected_evaluation)
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--response-root", str(tmp_path / "responses")]
+    args += ["--score-root", str(score_root), "--judge-model", "mock-judge", "--judge-frame-max-side", "768"]
+    assert cli.run(parser.parse_args(args)) == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cached", [False, True])
 async def test_generate_rejects_unpaced_server_vad_before_preparation_or_cache(tmp_path, monkeypatch, cached):
@@ -316,8 +403,9 @@ async def test_generate_rejects_unpaced_server_vad_before_preparation_or_cache(t
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pace", ["realtime", "as-fast-as-possible"])
+@pytest.mark.parametrize("collect_stage_metrics", [False, True])
 async def test_generate_exercises_realtime_socket_and_media_clock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pace: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pace: str, collect_stage_metrics: bool
 ):
     import websockets
 
@@ -349,7 +437,23 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
             elif event["type"] == "input_audio_buffer.commit":
                 # The reply opened during the clip is not the residual decision.
                 await websocket.send(json.dumps({"type": "input_audio_buffer.committed"}))
-                await websocket.send(json.dumps({"type": "response.done", "response": {"id": "r1"}}))
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "response.done",
+                            "response": {"id": "r1"},
+                            "vllm_omni": {
+                                "stage_metrics": {
+                                    "0": {
+                                        "stage_name": "thinker",
+                                        "final_output_type": "text",
+                                        "num_tokens_out": 4,
+                                    }
+                                }
+                            },
+                        }
+                    )
+                )
                 listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
                 await websocket.send(json.dumps(listen))
             elif event["type"] == "session.close":
@@ -367,6 +471,7 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
         path.write_bytes(b"data")
     sample = DuplexSample("sample", "PR_correction", "pr", "correction", video, audio)
 
+    extra_body = {"temperature": 0.2, "return_stage_metrics": False}
     async with websockets.serve(handler, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
         result = await runner.generate_sample(
@@ -375,24 +480,79 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
             model="mock",
             ref_audio=ref,
             output_root=tmp_path / "responses",
+            collect_stage_metrics=collect_stage_metrics,
+            extra_body=extra_body,
             pace=pace,
         )
 
+    # The reply's media timestamp is the local media clock when its delta is
+    # processed. At the realtime pace the delta lands before the drain
+    # padding advances the clock (0.8s, the clip's own duration); as fast as
+    # possible the first padded unit is already on the wire when the delta
+    # is read, so the reply is stamped one unit later (1.8s).
+    sentence_time = 0.8 if pace == "realtime" else 1.8
     assert json.loads(result.output.read_text(encoding="utf-8")) == {
-        "sentences": [{"sentence": "Done.", "start": 0.8, "end": 0.8}],
-        "chunks": [{"text": "Done.", "current_time": 0.8}],
+        "sentences": [{"sentence": "Done.", "start": sentence_time, "end": sentence_time}],
+        "chunks": [{"text": "Done.", "current_time": sentence_time}],
     }
     meta = json.loads(result.output.with_name("sample.meta.json").read_text(encoding="utf-8"))
     assert meta["response_done"] is True
     assert meta["drain_timeout"] is None
     assert meta["unit_ms"] == 1000
     assert meta["clock"] == ("media" if pace == "realtime" else "invalid")
-    assert len([event for event in received if event["type"] == "input_audio_buffer.append"]) == 1
+    # The clip is the wire before the commit; the drain padding that follows
+    # it streams zeroed units by design and is not part of the clip.
+    commit_at = next(
+        (index for index, event in enumerate(received) if event["type"] == "input_audio_buffer.commit"),
+        len(received),
+    )
+    assert len([event for event in received[:commit_at] if event["type"] == "input_audio_buffer.append"]) == 1
     assert "duplex_request_metrics" not in meta
     assert result.request_metrics
     assert result.request_metrics[0]["sample_id"] == "sample"
+    assert result.request_metrics[0]["stage_metrics"] == {
+        "0": {
+            "stage_name": "thinker",
+            "final_output_type": "text",
+            "num_tokens_out": 4,
+        }
+    }
     assert result.session_metrics["stream_ttfp_ms"] is not None
+    session_update = next(event for event in received if event["type"] == "session.update")
+    session_extra = session_update["session"]["extra_body"]
+    assert session_extra["temperature"] == 0.2
+    assert session_extra["return_stage_metrics"] is collect_stage_metrics
+    assert extra_body == {"temperature": 0.2, "return_stage_metrics": False}
     assert any(event["type"] == "playback.ack" for event in received)
+
+
+@pytest.mark.asyncio
+async def test_generate_marks_existing_output_as_skipped(tmp_path: Path):
+    output = tmp_path / "responses" / "PR_correction" / "sample.json"
+    output.parent.mkdir(parents=True)
+    output.write_text(json.dumps({"sentences": [], "chunks": []}), encoding="utf-8")
+    sample = DuplexSample(
+        "sample",
+        "PR_correction",
+        "pr",
+        "correction",
+        tmp_path / "missing-video.mp4",
+        tmp_path / "missing-audio.wav",
+    )
+
+    result = await runner.generate_sample(
+        sample,
+        url="ws://127.0.0.1:1/v1/realtime?duplex=1",
+        model="mock",
+        ref_audio=tmp_path / "missing-ref.wav",
+        output_root=tmp_path / "responses",
+        collect_stage_metrics=True,
+    )
+
+    assert result.output == output
+    assert result.generated is False
+    assert result.request_metrics == []
+    assert result.session_metrics == {}
 
 
 @pytest.mark.asyncio
@@ -415,14 +575,19 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
 async def test_generate_preserves_av_inputs(tmp_path, monkeypatch, turn_detection, duration, audio_duration, fps):
     import websockets
 
+    from tests.benchmarks.duplex.test_omni_duplex_eval_media import _make_synthetic_mp4
     from vllm_omni.protocol.realtime.items import validate_realtime_video_frames
 
     pcm = b"\x01\x00" * round(audio_duration * 16000)
-    # Keep the real frame-time generator; only JPEG decoding is replaced here.
-    monkeypatch.setattr(
-        media, "extract_jpeg", lambda path, *, timestamp, quality: b"\xff\xd8" + str(timestamp).encode()
+    # Keep the real timestamp grid. iter_jpegs opens the container (it no longer
+    # calls extract_jpeg), so the clip must exist. JPEG bytes stay timestamp-tagged
+    # so each sample remains unique on the wire.
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(_make_synthetic_mp4(duration=duration + 1.0))
+    frames = tuple(
+        (timestamp, b"\xff\xd8" + str(timestamp).encode())
+        for timestamp, _ in media.iter_jpegs(clip, fps=fps, duration=duration)
     )
-    frames = tuple(media.iter_jpegs("unused.mp4", fps=fps, duration=duration))
     prepared = runner.PreparedSample(pcm, frames, duration, None, None)
     received = []
     server_turns = turn_detection == "server_vad"
@@ -478,7 +643,14 @@ async def test_generate_preserves_av_inputs(tmp_path, monkeypatch, turn_detectio
             expected_pcm += b"\0\0"
         else:
             expected_pcm = expected_pcm[:-2]
-    appends = [event for event in received if event["type"] == "input_audio_buffer.append"]
+    # The clip is the wire before the commit (server VAD sends no commit and
+    # streams the whole clip): the drain padding after it streams zeroed
+    # units by design and is not part of the clip.
+    commit_at = next(
+        (index for index, event in enumerate(received) if event["type"] == "input_audio_buffer.commit"),
+        len(received),
+    )
+    appends = [event for event in received[:commit_at] if event["type"] == "input_audio_buffer.append"]
     assert b"".join(base64.b64decode(event["audio"]) for event in appends) == expected_pcm
     sent_frames = []
     pending_images = []
@@ -521,16 +693,21 @@ async def test_generate_finishes_a_silent_session_on_the_post_commit_listen(tmp_
     appended = []
 
     async def handler(websocket):
+        committed = False
         async for raw in websocket:
             event = json.loads(raw)
             if event["type"] == "session.update":
                 await websocket.send(json.dumps({"type": "session.created"}))
             elif event["type"] == "input_audio_buffer.append":
-                appended.append(base64.b64decode(event["audio"]))
+                # The clip is the wire before the commit; the zeroed drain
+                # padding that follows it is not part of the clip.
+                if not committed:
+                    appended.append(base64.b64decode(event["audio"]))
                 # A decision for an earlier unit does not end the session.
                 listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
                 await websocket.send(json.dumps(listen))
             elif event["type"] == "input_audio_buffer.commit":
+                committed = True
                 await websocket.send(json.dumps({"type": "input_audio_buffer.committed"}))
                 await websocket.send(json.dumps(listen))
             elif event["type"] == "session.close":
@@ -998,7 +1175,7 @@ def _pr_manifest(tmp_path: Path, sample_ids: tuple[str, ...]) -> Path:
     return manifest
 
 
-def _run_generate_cli(manifest: Path, response_root: Path) -> None:
+def _run_generate_cli(manifest: Path, response_root: Path, *extra: str) -> None:
     parser = argparse.ArgumentParser()
     OmniDuplexEvalSubcommand.add_cli_args(parser)
     OmniDuplexEvalSubcommand.cmd(
@@ -1015,6 +1192,7 @@ def _run_generate_cli(manifest: Path, response_root: Path) -> None:
                 str(manifest),
                 "--response-root",
                 str(response_root),
+                *extra,
             ]
         )
     )
@@ -1049,16 +1227,185 @@ def _fake_generate(results: dict[str, GenerateSampleResult | None]):
         clock: str = "media",
         overwrite: bool = False,
         unit_ms: int = 1000,
+        collect_stage_metrics: bool = False,
         instructions: str | None = None,
         turn_detection: str = "none",
     ) -> GenerateSampleResult:
-        _ = (url, model, ref_audio, fps, mix, pace, clock, overwrite, unit_ms, instructions, turn_detection)
+        _ = (
+            url,
+            model,
+            ref_audio,
+            fps,
+            mix,
+            pace,
+            clock,
+            overwrite,
+            unit_ms,
+            collect_stage_metrics,
+            instructions,
+            turn_detection,
+        )
         result = results[sample.id]
         if result is None:
-            return GenerateSampleResult(output=Path(output_root) / sample.split / f"{sample.id}.json")
+            return GenerateSampleResult(
+                output=Path(output_root) / sample.split / f"{sample.id}.json",
+                generated=False,
+            )
         return result
 
     return generate
+
+
+def test_cli_print_stage_aggregates_generated_responses_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    manifest = _pr_manifest(tmp_path, ("sample-1",))
+    split = "PR_correction"
+    snapshot = {
+        "stage_name": "thinker",
+        "final_output_type": "text",
+        "output_unit_type": "text",
+    }
+    result = GenerateSampleResult(
+        output=tmp_path / "responses" / split / "sample-1.json",
+        metadata={"response_done": True},
+        request_metrics=[
+            {
+                "sample_id": "sample-1",
+                "split": split,
+                "response_id": "response-1",
+                "stage_metrics": {
+                    "0": {
+                        **snapshot,
+                        "num_tokens_out": 20,
+                        "serving_time_to_first_output_ms": 100.0,
+                    }
+                },
+            },
+            {
+                "sample_id": "sample-1",
+                "split": split,
+                "response_id": "response-2",
+                "stage_metrics": {
+                    "0": {
+                        **snapshot,
+                        "num_tokens_out": 30,
+                        "serving_time_to_first_output_ms": 300.0,
+                    }
+                },
+            },
+        ],
+    )
+    monkeypatch.setattr(cli, "generate_sample", _fake_generate({"sample-1": result}))
+
+    _run_generate_cli(manifest, tmp_path / "responses", "--print-stage")
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.count("Stage 0 (thinker)") == 1
+    assert "Stage generated tokens:" in captured.out
+    assert "50" in captured.out
+    assert "Mean Serving TTFT (ms):" in captured.out
+    assert "200.00" in captured.out
+
+
+@pytest.mark.parametrize(
+    ("metadata", "error"),
+    [
+        pytest.param({"response_done": False}, "response.done timed out", id="drain-timeout"),
+        pytest.param({"response_done": True}, "session.close timed out", id="close-timeout"),
+        pytest.param({"response_done": True}, "server error", id="server-error"),
+        pytest.param({"response_done": False}, "", id="incomplete"),
+        pytest.param({}, "", id="missing-completion"),
+    ],
+)
+@pytest.mark.parametrize("include_success", [False, True], ids=["all-failed", "mixed"])
+def test_cli_print_stage_excludes_failed_sessions_with_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    metadata: dict[str, object],
+    error: str,
+    include_success: bool,
+):
+    split = "PR_correction"
+
+    def make_result(
+        sample_id: str, tokens: int, ttft_ms: float, *, metadata: dict[str, object], error: str = ""
+    ) -> GenerateSampleResult:
+        return GenerateSampleResult(
+            output=tmp_path / "responses" / split / f"{sample_id}.json",
+            generated=True,
+            request_metrics=[
+                {
+                    "sample_id": sample_id,
+                    "split": split,
+                    "response_id": f"{sample_id}-response",
+                    "stage_metrics": {
+                        "0": {
+                            "stage_name": "thinker",
+                            "final_output_type": "text",
+                            "output_unit_type": "text",
+                            "num_tokens_out": tokens,
+                            "serving_time_to_first_output_ms": ttft_ms,
+                        }
+                    },
+                }
+            ],
+            metadata=metadata,
+            error=error,
+        )
+
+    results: dict[str, GenerateSampleResult | None] = {
+        "failed": make_result("failed", 999, 9000.0, metadata=metadata, error=error)
+    }
+    if include_success:
+        results["success"] = make_result("success", 20, 100.0, metadata={"response_done": True})
+    # Skipped samples must not be counted as failures or contribute snapshots.
+    results["skipped"] = GenerateSampleResult(output=tmp_path / "responses" / split / "skipped.json", generated=False)
+    manifest = _pr_manifest(tmp_path, tuple(results))
+    monkeypatch.setattr(cli, "generate_sample", _fake_generate(results))
+
+    _run_generate_cli(manifest, tmp_path / "responses", "--print-stage")
+
+    captured = capsys.readouterr()
+    assert "Excluded 1 failed sample(s) from stage metrics." in captured.err
+    assert "1 skipped sample(s)" in captured.err
+    assert "No stage metrics were returned" not in captured.err
+    if include_success:
+        assert captured.out.count("Stage 0 (thinker)") == 1
+        for label, expected in (
+            ("Stage generated tokens:", "20"),
+            ("Mean Serving TTFT (ms):", "100.00"),
+            ("Median Serving TTFT (ms):", "100.00"),
+            ("P99 Serving TTFT (ms):", "100.00"),
+        ):
+            line = next(line for line in captured.out.splitlines() if line.startswith(label))
+            assert line.removeprefix(label).strip() == expected
+    else:
+        assert captured.out == ""
+
+
+def test_cli_print_stage_explains_skipped_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    manifest = _pr_manifest(tmp_path, ("sample-1",))
+    skipped = GenerateSampleResult(
+        output=tmp_path / "responses" / "PR_correction" / "sample-1.json",
+        generated=False,
+    )
+    monkeypatch.setattr(cli, "generate_sample", _fake_generate({"sample-1": skipped}))
+
+    _run_generate_cli(manifest, tmp_path / "responses", "--print-stage")
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "use --overwrite to regenerate" in captured.err
+    assert "No stage metrics were returned" not in captured.err
 
 
 def test_merge_duplex_metrics_report_replaces_only_incoming_sample_keys():
@@ -1303,3 +1650,18 @@ def test_judge_exercises_openai_http_schema():
     assert authorization == "Bearer token"
     assert payload["model"] == "judge"
     assert payload["messages"] == [{"role": "user", "content": "prompt"}]
+
+
+def test_session_metrics_copy_raw_stage_maps(monkeypatch):
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "r1"}}, received_at_s=1.0)
+    snapshots = {"0": {"num_tokens_out": 7, "stage_gen_time_ms": 10.0}}
+    monkeypatch.setattr(collector, "timing_summary", lambda **kwargs: {"stage_metrics": snapshots})
+    monkeypatch.setattr(collector, "global_timing_summary", lambda **kwargs: {})
+
+    bundle = collect_duplex_session_metrics(collector, stream_start=1.0, session_id="sample")
+    retained = bundle.request_metrics[0]["stage_metrics"]
+    assert retained == snapshots
+    retained["0"]["num_tokens_out"] = 99
+    retained["1"] = {"stage_gen_time_ms": 5.0}
+    assert snapshots == {"0": {"num_tokens_out": 7, "stage_gen_time_ms": 10.0}}

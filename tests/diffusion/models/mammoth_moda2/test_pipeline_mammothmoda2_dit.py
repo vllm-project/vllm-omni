@@ -1102,6 +1102,7 @@ def test_pre_process_normalizes_steps_before_scheduler_admission(
     assert parsed.num_inference_steps == expected_steps
     if step_execution:
         scheduler = StepScheduler()
+        scheduler.od_config = SimpleNamespace(diffusion_attention_schedule=None)
         assert scheduler.add_request(request) == request.request_id
         assert scheduler._request_progress[request.request_id].total_steps == expected_steps
     else:
@@ -1162,6 +1163,7 @@ def test_step_batch_handles_cfg_and_non_cfg_requests(
     config.step_execution = True
     pre_process = get_mammoth_moda2_pre_process_func(config)
     scheduler = StepScheduler()
+    scheduler.od_config = SimpleNamespace(diffusion_attention_schedule=None)
     requests = [
         pre_process(
             _batch(

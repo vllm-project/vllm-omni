@@ -11,6 +11,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.diffusion.models.cosmos3.multiview_fixtures import multiview_lidar_contract
 from tests.helpers.mark import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
@@ -371,6 +372,309 @@ def test_timestep_embedder_stores_frequencies_in_fp32() -> None:
     assert embedder.freqs.dtype == torch.float32
 
 
+@pytest.mark.parametrize("masked", [False, True])
+@torch.no_grad()
+def test_multiview_timestep_update_reuses_projection_output(masked: bool) -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MaskItem
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import (
+        Cosmos3MultiviewVFMTransformer,
+    )
+
+    model = object.__new__(Cosmos3MultiviewVFMTransformer)
+    nn.Module.__init__(model)
+    model.latent_patch_size = 1
+    model.rig_view_embed = nn.Embedding(2, 3)
+    model.rig_view_embed.weight.data.zero_()
+    model.rig_lidar_id = 1
+    model.proj_in = nn.Linear(2, 3, bias=False)
+    model.proj_in.weight.copy_(
+        torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, -1.0],
+            ]
+        )
+    )
+    time = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    model._embed_timestep = lambda timestep, dtype: time.to(dtype)
+
+    projected: list[torch.Tensor] = []
+    projected_before: list[torch.Tensor] = []
+    projected_versions: list[int] = []
+
+    def capture_projection(module, args, output) -> None:
+        del module, args
+        projected.append(output)
+        projected_before.append(output.clone())
+        projected_versions.append(output._version)
+
+    model.proj_in.register_forward_hook(capture_projection)
+    camera = torch.arange(2 * 2 * 2 * 1 * 2, dtype=torch.float32).reshape(2, 2, 2, 1, 2)
+    frame_mask = torch.tensor([[[[[0.0]], [[1.0]]]], [[[[1.0]], [[0.0]]]]]) if masked else None
+    item = MaskItem(token_shape=(2, 1, 2), num_views=1)
+
+    actual = model._embed_packed_streams(
+        (item,),
+        [camera],
+        timestep=torch.tensor([0.25, 0.75]),
+        camera=camera,
+        noisy_frame_mask=frame_mask,
+        rig_view_ids=torch.tensor([0]),
+    )
+
+    if frame_mask is None:
+        expected = projected_before[0] + time.unsqueeze(1)
+    else:
+        token_mask = frame_mask[:, 0, :, 0, 0].repeat_interleave(2, dim=1).unsqueeze(-1)
+        expected = projected_before[0] + time.unsqueeze(1) * token_mask
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # The projection hook retains the exact output object, so observing the
+    # updated values here proves the timestep operation reused its storage.
+    assert projected[0]._version > projected_versions[0]
+    torch.testing.assert_close(projected[0], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("patch", [1, 2, (1, 2), (2, 1), (3, 2)])
+def test_multiview_sensor_patchify_round_trips_rectangular_patches(patch) -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_packing import (
+        patch_grid,
+        patchify_sensor,
+        spatial_patch_hw,
+        unpatchify_sensor,
+    )
+
+    latent = torch.randn(2, 3, 4, 5, 7)  # odd H/W exercise the zero padding
+    ph, pw = spatial_patch_hw(patch)
+    hp, wp = patch_grid(5, 7, patch)
+    tokens = patchify_sensor(latent, patch)
+
+    assert (hp, wp) == (-(-5 // ph), -(-7 // pw))
+    assert tokens.shape == (2, 4 * hp * wp, ph * pw * 3)
+    torch.testing.assert_close(unpatchify_sensor(tokens, tuple(latent.shape[1:]), patch), latent, rtol=0, atol=0)
+    # Feature layout is (ph, pw, C), matching the reference "cthpwq->thwpqc".
+    padded = torch.nn.functional.pad(latent, (0, wp * pw - 7, 0, hp * ph - 5))
+    reference = torch.einsum("bcthpwq->bthwpqc", padded.reshape(2, 3, 4, hp, ph, wp, pw)).reshape(2, -1, ph * pw * 3)
+    torch.testing.assert_close(tokens, reference, rtol=0, atol=0)
+
+
+def test_multiview_square_patch_accepts_int_and_pair() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_packing import patchify_sensor, spatial_patch_hw
+
+    latent = torch.randn(1, 2, 3, 4, 6)
+    torch.testing.assert_close(patchify_sensor(latent, 2), patchify_sensor(latent, [2, 2]), rtol=0, atol=0)
+    for bad in (0, (1,), (1, 0), (True, 1), 1.0):
+        with pytest.raises(ValueError, match="patch size"):
+            spatial_patch_hw(bad)
+
+
+def test_multiview_camera_only_checkpoint_requires_rig_weights() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
+
+    model = object.__new__(Cosmos3MultiviewVFMTransformer)
+    nn.Module.__init__(model)
+    model.lidar_config = None
+    with pytest.raises(ValueError, match="rig_view_embed.weight"):
+        model.validate_loaded_weights({"transformer.proj_in.weight"})
+    model.validate_loaded_weights({"transformer.rig_view_embed.weight"})
+
+
+def test_multiview_positions_align_camera_subsets_and_lidar_capture_times() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MaskItem
+    from vllm_omni.diffusion.models.cosmos3.multiview_packing import packed_position_ids
+
+    # Two cameras sampled at 5 Hz share positions. LiDAR at 10 Hz advances
+    # by half the camera stride and uses its own rectangular spatial grid.
+    items = (
+        MaskItem((6, 1, 1), 2, is_control=True, seconds_per_frame=0.2),
+        MaskItem((6, 1, 1), 2, seconds_per_frame=0.2),
+        MaskItem((5, 1, 2), 1, view_offset=2, is_lidar=True, seconds_per_frame=0.1),
+    )
+    positions, _ = packed_position_ids(items, text_origin=7, base_fps=20, camera_compression=4)
+    torch.testing.assert_close(positions[0, :12], torch.tensor([7.0, 8.0, 9.0, 7.0, 8.0, 9.0] * 2))
+    torch.testing.assert_close(positions[0, 12:], torch.tensor([7.0, 7.0, 7.5, 7.5, 8.0, 8.0, 8.5, 8.5, 9.0, 9.0]))
+    single, _ = packed_position_ids(
+        (MaskItem((3, 1, 1), 1, seconds_per_frame=0.2),),
+        text_origin=7,
+        base_fps=20,
+        camera_compression=4,
+    )
+    torch.testing.assert_close(single, positions[:, :3])
+
+
+def test_multiview_lidar_patch1_token_grid() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_packing import patch_grid, patchify_sensor
+
+    # V1.2 LiDAR latent: 128x1808 range image / 16 = 8x113, 128 channels.
+    lidar = torch.zeros(1, 128, 3, 8, 113)
+    assert patch_grid(8, 113, [1, 1]) == (8, 113)
+    assert patch_grid(8, 113, 2) == (4, 57)
+    assert patchify_sensor(lidar, (1, 1)).shape == (1, 3 * 8 * 113, 128)
+    assert patchify_sensor(lidar, 2).shape == (1, 3 * 4 * 57, 512)
+
+
+@pytest.mark.parametrize("physical_ids", [[0, 3], [3, 0]])
+def test_add_rig_view_embedding_uses_physical_ids_per_camera_block(physical_ids: list[int]) -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_packing import add_rig_view_embedding
+
+    embedding = nn.Embedding(5, 4)
+    with torch.no_grad():
+        embedding.weight.copy_(torch.arange(20, dtype=torch.float32).reshape(5, 4))
+    per_view = 2 * 2 * 3  # two latent frames of a 2x3 token grid per camera
+    hidden = torch.zeros(1, 2 * per_view, 4)
+
+    out = add_rig_view_embedding(hidden, embedding(torch.tensor(physical_ids)), num_views=2)
+
+    assert out is hidden
+    for view, row in enumerate(physical_ids):
+        block = hidden[0, view * per_view : (view + 1) * per_view]
+        torch.testing.assert_close(block, embedding.weight[row].expand_as(block), rtol=0, atol=0)
+
+    lidar = torch.zeros(1, 6, 4)
+    add_rig_view_embedding(lidar, embedding.weight[4].unsqueeze(0), num_views=1)
+    torch.testing.assert_close(lidar[0], embedding.weight[4].expand(6, 4), rtol=0, atol=0)
+
+    with pytest.raises(ValueError, match="rows must be"):
+        add_rig_view_embedding(torch.zeros(1, 6, 4), embedding.weight[:3], num_views=2)
+
+
+@torch.no_grad()
+def test_multiview_embed_adds_rig_rows_after_projection_and_before_timestep() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MaskItem
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import (
+        Cosmos3MultiviewVFMTransformer,
+    )
+
+    hidden_size, camera_channels, lidar_channels = 3, 2, 4
+    model = object.__new__(Cosmos3MultiviewVFMTransformer)
+    nn.Module.__init__(model)
+    model.latent_patch_size = 1
+    model.lidar_patch_hw = (1, 1)
+    model.proj_in = nn.Linear(camera_channels, hidden_size, bias=False)
+    model.lidar_proj_in = nn.Linear(lidar_channels, hidden_size, bias=False)
+    model.rig_view_embed = nn.Embedding(12, hidden_size)
+    model.rig_lidar_id = 11
+    model.rig_view_embed.weight.copy_(torch.arange(36, dtype=torch.float32).reshape(12, 3) * 100)
+    time = torch.tensor([[0.5, 0.25, 0.125]])
+    model._embed_timestep = lambda timestep, dtype: time.to(dtype)
+
+    views = 2
+    camera = torch.randn(1, camera_channels, views * 2, 1, 2)  # 2 latent frames per view
+    lidar = torch.randn(1, lidar_channels, 2, 1, 3)
+    camera_shape, lidar_shape = (views * 2, 1, 2), (2, 1, 3)
+    items = (
+        MaskItem(camera_shape, views, is_control=True),
+        MaskItem(camera_shape, views),
+        MaskItem(lidar_shape, 1, view_offset=views, is_control=True, is_lidar=True),
+        MaskItem(lidar_shape, 1, view_offset=views, is_lidar=True),
+    )
+    ids = torch.tensor([6, 0])  # a reordered subset keeps physical IDs
+    streams = [camera, camera, lidar, lidar]
+
+    actual = model._embed_packed_streams(items, streams, torch.tensor([0.5]), camera, None, ids)
+
+    rows = model.rig_view_embed.weight
+    camera_rig = torch.cat([rows[6].expand(4, -1), rows[0].expand(4, -1)])
+    camera_tokens = model.proj_in(camera.permute(0, 2, 3, 4, 1).reshape(1, -1, camera_channels))[0]
+    lidar_tokens = model.lidar_proj_in(lidar.permute(0, 2, 3, 4, 1).reshape(1, -1, lidar_channels))[0]
+    expected = torch.cat(
+        [
+            camera_tokens + camera_rig,
+            camera_tokens + camera_rig + time,
+            lidar_tokens + rows[11],
+            lidar_tokens + rows[11] + time,
+        ]
+    ).unsqueeze(0)
+    torch.testing.assert_close(actual, expected)
+
+    with pytest.raises(ValueError, match="physical camera IDs"):
+        model._embed_packed_streams(items, streams, torch.tensor([0.5]), camera, None, None)
+
+
+@torch.no_grad()
+def test_multiview_embed_skips_timestep_on_lidar_condition_prefix() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MaskItem
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import (
+        Cosmos3MultiviewVFMTransformer,
+    )
+
+    model = object.__new__(Cosmos3MultiviewVFMTransformer)
+    nn.Module.__init__(model)
+    model.latent_patch_size = 1
+    model.lidar_patch_hw = (1, 1)
+    model.rig_view_embed = nn.Embedding(2, 3)
+    model.rig_view_embed.weight.data.zero_()
+    model.rig_lidar_id = 1
+    model.proj_in = nn.Linear(2, 3, bias=False)
+    model.lidar_proj_in = nn.Linear(4, 3, bias=False)
+    time = torch.tensor([[1.0, 2.0, 3.0]])
+    model._embed_timestep = lambda timestep, dtype: time.to(dtype)
+    camera = torch.randn(1, 2, 2, 1, 1)
+    lidar = torch.randn(1, 4, 3, 1, 2)  # three sweeps of two tokens each
+    items = (MaskItem((2, 1, 1), 1), MaskItem((3, 1, 2), 1, view_offset=1, is_lidar=True))
+
+    actual = model._embed_packed_streams(
+        items, [camera, lidar], torch.tensor([0.5]), camera, None, torch.tensor([0]), lidar_condition_frames=1
+    )
+
+    lidar_tokens = model.lidar_proj_in(lidar.permute(0, 2, 3, 4, 1).reshape(1, -1, 4))[0]
+    torch.testing.assert_close(actual[0, 2:4], lidar_tokens[:2])  # measured sweep: no timestep
+    torch.testing.assert_close(actual[0, 4:], lidar_tokens[2:] + time)
+
+
+def _tiny_multiview_deployment(**overrides) -> dict[str, Any]:
+    lidar = multiview_lidar_contract()
+    lidar["latent_channels"] = 4
+    lidar["network_config"]["z_dim"] = 4
+    deployment = {
+        "cameras": ["a", "b"],
+        "cross_view_past_window_seconds": 0.4,
+        "inference_defaults": {
+            "resolution": "480",
+            "fps": 30.0,
+            "num_steps": 35,
+            "guidance": 6.0,
+            "shift": 10.0,
+            "control_guidance": 1.0,
+            "emphasize_control_in_prompt": True,
+            "guidance_interval": None,
+            "control_guidance_interval": None,
+            "normalize_cfg": False,
+        },
+        "lidar": lidar,
+        "lidar_latent_patch_size_hw": [1, 1],
+        "rig_view_embedding": {"num_embeddings": 3, "camera_ids": {"a": 0, "b": 1}, "lidar_id": 2},
+    }
+    deployment.update(overrides)
+    return deployment
+
+
+def test_multiview_transformer_builds_per_stream_lidar_patch_and_rig_table() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import (
+        Cosmos3MultiviewVFMTransformer,
+    )
+
+    config = _tiny_cosmos3_config(
+        latent_patch_size=2, backbone_type="cosmos3_multiview", multiview=_tiny_multiview_deployment()
+    )
+    model = Cosmos3MultiviewVFMTransformer(SimpleNamespace(tf_model_config=config, dtype=torch.float32))
+    assert model.lidar_patch_hw == (1, 1)
+    assert tuple(model.lidar_proj_in.weight.shape) == (8, 4)
+    assert tuple(model.lidar_proj_out.weight.shape) == (4, 8)
+    assert tuple(model.rig_view_embed.weight.shape) == (3, 8)
+    assert model.rig_lidar_id == 2
+
+    loaded = {
+        "transformer.lidar_proj_in.weight",
+        "transformer.lidar_proj_in.bias",
+        "transformer.lidar_proj_out.weight",
+        "transformer.lidar_proj_out.bias",
+    }
+    with pytest.raises(ValueError, match="rig_view_embed.weight"):
+        model.validate_loaded_weights(loaded)
+    model.validate_loaded_weights(loaded | {"transformer.rig_view_embed.weight"})
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [
@@ -602,7 +906,8 @@ def test_edge_weight_validation_skips_pp_missing_layers(monkeypatch: pytest.Monk
 
 @pytest.mark.cpu
 def test_edge_gen_cached_k_is_normalized_but_reasoner_uses_raw_k() -> None:
-    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import RMSNorm
+    from vllm_omni.diffusion.models.cosmos3.norm import QKRMSNorm
+    from vllm_omni.diffusion.models.cosmos3.rope import Cosmos3RotaryEmbedding
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (
         Cosmos3EdgeCausalAttention,
     )
@@ -636,7 +941,8 @@ def test_edge_gen_cached_k_is_normalized_but_reasoner_uses_raw_k() -> None:
     attn.to_k = ScaleProjection(1.0)
     attn.to_v = ScaleProjection(1.0)
     attn.to_out = IdentityOutput()
-    attn.k_norm_und_for_gen = RMSNorm(2, eps=1e-5)
+    attn.k_norm_und_for_gen = QKRMSNorm(2, eps=1e-5)
+    attn.rotary_embedding = Cosmos3RotaryEmbedding()
     attn.attn = RawKAttention()
 
     hidden_states = torch.tensor(
@@ -2076,3 +2382,284 @@ def test_shared_gen_stack_preserves_control_metadata_sharding_and_wrapped_output
     output = model._run_gen_layers(inputs, gather_output=False, **kwargs)
     torch.testing.assert_close(output, torch.full_like(inputs, 4 if already_sharded else 5))
     assert len(gathered) == 1
+
+
+@pytest.mark.parametrize("path", ["und", "gen", "gen_without_qk_norm", "edge"])
+def test_attention_constructs_and_calls_qk_norm(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    """Exercise real constructors and forwards, with only attention math stubbed."""
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3 as model
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3_edge as edge
+    from vllm_omni.diffusion.models.cosmos3.norm import QKRMSNorm
+
+    monkeypatch.setattr(model, "FrameworkAttention", lambda **kwargs: nn.Identity())
+    monkeypatch.setattr(edge, "FrameworkAttention", lambda **kwargs: nn.Identity())
+    monkeypatch.setattr(model, "_is_sp_active", lambda: False)
+    options = dict(hidden_size=8, num_attention_heads=2, num_key_value_heads=1, head_dim=4, rms_norm_eps=1e-5)
+    if path == "und":
+        attn = model.Cosmos3CausalAttention(**options)
+    elif path == "edge":
+        attn = edge.Cosmos3EdgeCausalAttention(**options, use_und_k_norm_for_gen=True)
+    else:
+        attn = model.Cosmos3CrossAttention(**options, qk_norm=path == "gen")
+
+    class QueryAttention(nn.Module):
+        def forward(self, q, k, v):
+            return q
+
+    attn.attn = QueryAttention()
+    for name, size in (("to_q", 8), ("to_k", 4), ("to_v", 4), ("to_out", 8)):
+        projection = nn.Linear(8, size, bias=False)
+        with torch.no_grad():
+            projection.weight.copy_(torch.linspace(-0.2, 0.3, size * 8).reshape(size, 8))
+        setattr(attn, name, projection)
+    if path == "edge":
+        norms = [attn.k_norm_und_for_gen]
+    elif path == "gen_without_qk_norm":
+        assert not hasattr(attn, "norm_q") and not hasattr(attn, "norm_k")
+        norms = []
+    else:
+        norms = [attn.norm_q, attn.norm_k]
+    inputs = []
+    for norm in norms:
+        assert isinstance(norm, QKRMSNorm)
+        norm.register_forward_pre_hook(lambda module, args: inputs.append(args[0].detach().clone()))
+    x = torch.linspace(-1, 2, 24).reshape(1, 3, 8)
+    before = x.clone()
+    cos, sin = torch.ones(1, 3, 1, 4), torch.zeros(1, 3, 1, 4)
+    if path in ("gen", "gen_without_qk_norm"):
+        attn(x, torch.ones(1, 2, 1, 4), torch.ones(1, 2, 1, 4), cos, sin)
+    else:
+        attn(x, cos, sin)
+    expected = (
+        [attn.to_k(x).reshape(1, 3, 1, 4)]
+        if path == "edge"
+        else [attn.to_q(x).reshape(1, 3, 2, 4), attn.to_k(x).reshape(1, 3, 1, 4)]
+    )
+    if path == "gen_without_qk_norm":
+        expected = []
+    assert len(inputs) == len(norms)
+    for actual, reference in zip(inputs, expected, strict=True):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("path", ["und", "gen", "edge"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_decoder_residual_norm_handoff_matches_unfused(path: str, dtype: torch.dtype) -> None:
+    """Assert block wiring, norm tuple order, MLP input and no input mutation."""
+    from vllm_omni.diffusion.models.cosmos3.norm import RMSNorm
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
+        Cosmos3GenDecoderLayer,
+        Cosmos3UndDecoderLayer,
+    )
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import Cosmos3EdgeUndDecoderLayer
+
+    classes = {"und": Cosmos3UndDecoderLayer, "gen": Cosmos3GenDecoderLayer, "edge": Cosmos3EdgeUndDecoderLayer}
+    layer = object.__new__(classes[path])
+    nn.Module.__init__(layer)
+    layer.input_layernorm = RMSNorm(4, eps=1e-5, dtype=dtype)
+    layer.post_attention_layernorm = RMSNorm(4, eps=1e-5, dtype=dtype)
+    with torch.no_grad():
+        layer.post_attention_layernorm.weight.copy_(torch.tensor([0.5, -0.75, 1.25, 2.0], dtype=dtype))
+    k, v = torch.full((1, 2, 1, 4), 3, dtype=dtype), torch.full((1, 2, 1, 4), 5, dtype=dtype)
+
+    class CausalAttention(nn.Module):
+        def forward(self, x, cos, sin):
+            return x * 0.5 + 0.125, k, v
+
+    class CrossAttention(nn.Module):
+        def forward(
+            self, x, *, k_und, v_und, freqs_cos, freqs_sin, control_token_sizes, control_weights, multiview_layout
+        ):
+            assert k_und is k and v_und is v
+            return x * 0.5 + 0.125
+
+    class MLP(nn.Module):
+        def forward(self, x):
+            return x * 0.25 - 0.5
+
+    layer.self_attn = CausalAttention()
+    layer.cross_attention = CrossAttention()
+    layer.mlp = MLP()
+    calls, mlp_inputs = [], []
+    layer.post_attention_layernorm.register_forward_hook(lambda module, args, output: calls.append((args, output)))
+    layer.mlp.register_forward_pre_hook(lambda module, args: mlp_inputs.append(args[0]))
+    x = torch.linspace(-2, 3, 24).reshape(1, 6, 4).to(dtype)
+    before = x.clone()
+    weights = {name: parameter.detach().clone() for name, parameter in layer.named_parameters()}
+    attn_out = layer.input_layernorm.forward_native(x) * 0.5 + 0.125
+    updated = x + attn_out
+    # Old unfused formula: add first in input dtype, then FP32 hidden norm.
+    norm = layer.post_attention_layernorm
+    fp32 = updated.float()
+    normalized = (norm.weight.float() * (fp32 * torch.rsqrt(fp32.square().mean(-1, keepdim=True) + 1e-5))).to(dtype)
+    expected = updated + (normalized * 0.25 - 0.5)
+    cos, sin = torch.ones(1, 6, 1, 4), torch.zeros(1, 6, 1, 4)
+    if path == "gen":
+        actual = layer(x, k_und=k, v_und=v, freqs_cos=cos, freqs_sin=sin)
+    else:
+        actual, actual_k, actual_v = layer(x, (cos, sin))
+        assert actual_k is k and actual_v is v
+    assert len(calls) == 1 and len(mlp_inputs) == 1
+    args, output = calls[0]
+    assert len(args) == 2 and args[1] is x
+    torch.testing.assert_close(args[0], attn_out, rtol=0, atol=0)
+    torch.testing.assert_close(output[0], normalized, rtol=0, atol=0)
+    torch.testing.assert_close(output[1], updated, rtol=0, atol=0)
+    torch.testing.assert_close(mlp_inputs[0], normalized, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+    for name, parameter in layer.named_parameters():
+        torch.testing.assert_close(parameter, weights[name], rtol=0, atol=0)
+
+
+def test_multiview_gen_preserves_chunked_mlp_and_tp_reduction(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3_multiview as multiview
+
+    layer = object.__new__(multiview.Cosmos3MultiviewGenDecoderLayer)
+    nn.Module.__init__(layer)
+    layer._mlp_chunk_size = 2
+    layer.input_layernorm = nn.Identity()
+
+    class CrossAttention(nn.Module):
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states * 2
+
+    layer.cross_attention = CrossAttention()
+    layer.mlp = nn.Identity()
+    layer.mlp.down_proj = nn.Identity()
+    layer.mlp.down_proj.tp_size = 2
+    events = []
+
+    def chunked(hidden_states, chunk_size):
+        events.append(("chunk", chunk_size))
+        return hidden_states * 4
+
+    def reduce(output):
+        events.append(("reduce", None))
+        return output * 2
+
+    monkeypatch.setattr(layer, "_forward_mlp_chunked", chunked)
+    monkeypatch.setattr(multiview, "tensor_model_parallel_all_reduce", reduce)
+    x = torch.ones(1, 3, 4)
+    k = v = torch.zeros(1, 3, 1, 4)
+    cos, sin = torch.ones_like(k), torch.zeros_like(k)
+    actual = layer(x, k_und=k, v_und=v, freqs_cos=cos, freqs_sin=sin)
+    assert events == [("chunk", 2), ("reduce", None)]
+    torch.testing.assert_close(actual, torch.full_like(x, 27))
+    torch.testing.assert_close(x, torch.ones_like(x))
+
+
+@pytest.fixture
+def _cpu_sdpa_attention(monkeypatch: pytest.MonkeyPatch):
+    """Build real GEN/UND attention layers that run on CPU through torch SDPA."""
+    from vllm_omni.diffusion.attention import selector
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    selector._cached_get_backend_cls.cache_clear()
+    monkeypatch.setattr(
+        current_omni_platform,
+        "get_diffusion_attn_backend_cls",
+        lambda **kwargs: DiffusionAttentionBackendEnum.TORCH_SDPA.get_path(),
+    )
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    yield
+    selector._cached_get_backend_cls.cache_clear()
+
+
+@pytest.mark.usefixtures("_cpu_sdpa_attention")
+@pytest.mark.parametrize("batch_size", [2, 3])
+@pytest.mark.parametrize("config_kind", ["base", "edge"])
+def test_gen_layers_broadcast_batch1_und_kv_to_gen_batch(config_kind, batch_size) -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import Cosmos3EdgeVFMTransformer
+
+    torch.manual_seed(0)
+    if config_kind == "edge":
+        model_cls, config = Cosmos3EdgeVFMTransformer, _tiny_cosmos3_edge_config(num_hidden_layers=2)
+        latents, video_shape = torch.randn(batch_size, 48, 1, 4, 4), (1, 4, 4)
+    else:
+        model_cls, config = Cosmos3VFMTransformer, _tiny_cosmos3_config(num_hidden_layers=2)
+        latents, video_shape = torch.randn(batch_size, 2, 1, 2, 2), (1, 2, 2)
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+
+    od_config = OmniDiffusionConfig(
+        model=None, tf_model_config=TransformerConfig.from_dict(config), dtype=torch.float32
+    )
+    model = model_cls(od_config).eval()
+    with torch.no_grad():
+        for param in model.parameters():
+            param.normal_(0, 0.5)
+    kwargs = dict(
+        timestep=torch.tensor([500.0]),
+        text_ids=torch.tensor([[1, 2, 3]]),
+        text_mask=torch.ones(1, 3, dtype=torch.long),
+        video_shape=video_shape,
+        fps=24.0,
+    )
+
+    with torch.inference_mode():
+        serial = []
+        for row in latents.split(1):
+            model.reset_cache()
+            serial.append(model(hidden_states=row, **kwargs))
+        serial = torch.cat(serial)
+
+        model.reset_cache()
+        batched = model(hidden_states=latents, **kwargs)
+        # The cache keeps the batch-1 prompt encoding; only GEN sees the views.
+        assert all(key.shape[0] == 1 and value.shape[0] == 1 for key, value in model.cached_kv)
+        cached = model(hidden_states=latents, **kwargs)
+
+    # Batch size can select a different CPU GEMM kernel (e.g. MKL on AVX-512),
+    # so batched and serial fp32 results may differ in the last bits. Reusing
+    # the batch-1 cache at the same batch size must be exact.
+    torch.testing.assert_close(batched, serial, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(cached, batched, atol=0, rtol=0)
+
+
+def test_broadcast_und_kv_expands_batch1_views_only() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import _broadcast_und_kv
+
+    single = [(torch.randn(1, 3, 2, 4), torch.randn(1, 3, 2, 4)) for _ in range(2)]
+    expanded = _broadcast_und_kv(single, 3)
+    for (key, value), (out_key, out_value) in zip(single, expanded, strict=True):
+        assert out_key.shape == (3, 3, 2, 4) and out_value.shape == (3, 3, 2, 4)
+        assert out_key.data_ptr() == key.data_ptr() and out_value.data_ptr() == value.data_ptr()
+        assert torch.equal(out_key[2], key[0]) and torch.equal(out_value[2], value[0])
+    assert single[0][0].shape[0] == 1
+
+    # Every other cache reaches the layers exactly as before.
+    matching = [(torch.randn(2, 3, 2, 4), torch.randn(2, 3, 2, 4))]
+    assert _broadcast_und_kv(matching, 2) is matching
+    assert _broadcast_und_kv(matching, 3) is matching
+    assert _broadcast_und_kv(single, 1) is single
+
+
+def test_gen_stack_passes_broadcast_und_kv_to_layers() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    model = object.__new__(Cosmos3VFMTransformer)
+    nn.Module.__init__(model)
+    model.cached_kv = [(torch.full((1, 3, 1, 2), float(i)), torch.full((1, 3, 1, 2), i + 10.0)) for i in range(2)]
+    stored = model.cached_kv
+    model.gen_sp_gather = lambda hidden: hidden
+    seen: list[tuple[int, int]] = []
+
+    class Layer(nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.index = index
+
+        def forward(self, hidden, **kwargs):
+            seen.append((kwargs["k_und"].shape[0], kwargs["v_und"].shape[0]))
+            return hidden
+
+    model.gen_layers = nn.ModuleList([Layer(i) for i in range(2)])
+    freqs = (torch.zeros(1, 4, 1, 2), torch.zeros(1, 4, 1, 2))
+    model._run_gen_layers(torch.zeros(2, 4, 8), freqs_gen=freqs)
+
+    assert seen == [(2, 2), (2, 2)]
+    assert model.cached_kv is stored
+    assert all(key.shape[0] == 1 for key, _ in model.cached_kv)

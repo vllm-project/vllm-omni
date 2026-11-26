@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Batch-bucket alignment for the MiniCPM-o 4.5 NPU code2wav graph path.
 
 The NPU capture key is the full tensor shape
@@ -27,9 +27,6 @@ class TestBatchBucket:
     def test_rounds_up_to_next_bucket(self):
         buckets = (1, 2, 4, 8)
         assert [npu_patch._batch_bucket(n, buckets) for n in range(1, 9)] == [1, 2, 4, 4, 8, 8, 8, 8]
-
-    def test_exact_bucket_is_unchanged(self):
-        assert npu_patch._batch_bucket(8, (1, 2, 4, 8)) == 8
 
     def test_batch_beyond_largest_bucket_stays_exact(self):
         # Rounding 12 up to a hypothetical 16 would be correct but 12 is not a
@@ -78,6 +75,14 @@ class TestPadding:
         value = torch.ones((2, 4, 5, 7))
         assert npu_patch._pad_cache_rows(value, 4) is value
 
+    def test_pad_cache_rows_follows_the_split_kv_row_axis(self):
+        # Attention caches split K/V on dim 1: (depth, 2, rows, heads, frames, dim).
+        value = torch.ones((2, 2, 3, 5, 7, 9))
+        padded = npu_patch._pad_cache_rows(value, 4, batch_dim=2)
+        assert padded.shape == (2, 2, 4, 5, 7, 9)
+        torch.testing.assert_close(padded[:, :, :3], value)
+        assert padded[:, :, 3].abs().sum().item() == 0.0
+
 
 def _run_batch_bucket_script(body: str) -> subprocess.CompletedProcess:
     # The interpreter-teardown heap corruption in this image (unrelated to the
@@ -92,7 +97,7 @@ import torch
 from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import (
     _FakeToken2Wav,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 import vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav as npu_patch
 
 
@@ -168,13 +173,6 @@ def _seen_and_out(completed: subprocess.CompletedProcess) -> tuple[set[int], tup
     return set(ast.literal_eval(seen_text)), tuple(ast.literal_eval(out_text))
 
 
-def test_batch_three_is_captured_as_four_and_trimmed_back():
-    seen, out = _seen_and_out(_run_batch_bucket_script(_step_body("(4,)", 3)))
-    assert seen == {4}, seen
-    # The batch axis of the result is trimmed back to the live rows.
-    assert out[0] == 3, out
-
-
 def test_bucket_of_one_never_pads():
     seen, out = _seen_and_out(_run_batch_bucket_script(_step_body("(1,)", 3)))
     assert seen == {3}, seen
@@ -195,7 +193,7 @@ def test_every_batch_rounds_into_the_bucket_set():
 
 
 def test_padded_cache_slots_are_dropped_from_outputs():
-    """Packed caches are padded on dim 1 and trimmed back on the way out."""
+    """Packed caches are padded on their row axis and trimmed back on the way out."""
     body = """
 adapter = BatchedToken2Wav(_FakeToken2Wav())
 adapter._cfm_graph_batch_buckets = (4,)
@@ -206,7 +204,8 @@ estimator = adapter.flow.decoder.estimator
 batch, chunk, dim = 3, 4, 2
 depth = len(estimator.blocks)
 cnn_cache = torch.zeros(depth, batch, 3, 6)
-att_cache = torch.zeros(depth, batch, 2, 0, 4)
+# (depth, K/V, rows, heads, frames, head_dim)
+att_cache = torch.zeros(depth, 2, batch, 2, 0, 2)
 result, new_cnn, new_att = npu_patch._patched_estimator_step(
     adapter,
     estimator,
@@ -225,13 +224,14 @@ assert len(shapes) == 7, shapes
 # Padded to 4 on the way in ...
 for shape in shapes[:5]:
     assert shape[0] == 4, shape
-# ... including the packed caches, whose batch axis is dim 1.
-for shape in shapes[5:]:
-    assert shape[1] == 4, shape
+# ... including the caches: the CNN cache keeps its rows on dim 1, the
+# split K/V attention cache on dim 2.
+assert shapes[5][1] == 4, shapes[5]
+assert shapes[6][2] == 4, shapes[6]
 # ... and trimmed back to the live rows on the way out.
 assert result.shape[0] == batch, result.shape
 assert new_cnn.shape[1] == batch, new_cnn.shape
-assert new_att.shape[1] == batch, new_att.shape
+assert new_att.shape[2] == batch, new_att.shape
 print("SEEN", {4}, "OUT", (batch,))
 """
     seen, out = _seen_and_out(_run_batch_bucket_script(body))

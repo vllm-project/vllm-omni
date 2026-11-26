@@ -339,3 +339,20 @@ def test_real_fa4_dense_hopper_fullgraph(monkeypatch, kv_heads, head_size):
         eager = run(q, k, v)
         torch.testing.assert_close(eager.float(), expected, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(compiled(q, k, v), eager)
+
+
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_real_aiter_custom_op_schema(noncontiguous):
+    if not current_omni_platform.is_rocm() or not fa.IS_AITER:
+        pytest.skip("Requires AITER FlashAttention")
+    query = torch.randn(1, 17, 8, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(1, 25, 8, 128, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn(1, 25, 8, 128, device="cuda", dtype=torch.bfloat16)
+    if noncontiguous:
+        query, key, value = (t.transpose(1, 2).contiguous().transpose(1, 2) for t in (query, key, value))
+        assert not query.is_contiguous()
+    torch.library.opcheck(
+        torch.ops.vllm_omni.aiter_dense_attention.default,
+        (query, key, value, 128**-0.5, False, False),
+    )

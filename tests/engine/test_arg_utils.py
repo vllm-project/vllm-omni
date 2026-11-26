@@ -19,8 +19,9 @@ from unittest.mock import Mock
 import pytest
 from omegaconf import OmegaConf
 from pydantic import ValidationError
-from transformers import PretrainedConfig, Qwen3OmniMoeConfig
+from transformers import AutoConfig, PretrainedConfig, Qwen3OmniMoeConfig
 from vllm.config import VllmConfig
+from vllm.config.utils import hash_config
 from vllm.engine.arg_utils import EngineArgs
 from vllm.exceptions import VLLMValidationError
 from vllm.v1.engine.input_processor import InputProcessor
@@ -33,9 +34,10 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
     load_omni_transfer_config,
     resolve_omni_kv_config_for_stage,
 )
-from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.arg_utils import _ARCH_TO_MODEL_TYPE, OmniEngineArgs
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict, get_stage_connector_spec
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -44,34 +46,40 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 AR_WORKER_CLS = "vllm_omni.worker.gpu_ar_worker.GPUARWorker"
 
 
-@pytest.mark.parametrize("use_v2", [False, True])
-def test_stage_runner_selects_matching_input_processor_validator(monkeypatch, use_v2):
+@pytest.mark.parametrize("logits_processor", [LogitBiasState, None], ids=["logit_bias", "audex_cfg"])
+def test_stage_runner_selects_matching_input_processor_validator(logits_processor):
     from vllm.sampling_params import SamplingParams
 
     from vllm_omni.model_executor.models.audex.cfg import AudexCFGLogitsProcessor
 
-    # Upstream's process-wide preference must not override a stage's deploy choice.
-    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", not use_v2)
+    # v0.34 removed Model Runner V1 together with the VLLM_USE_V2_MODEL_RUNNER
+    # preference; every stage now validates request params through the single
+    # `build_custom_logits_processors_params_validator` path, which calls each
+    # processor class's `validate_params` (the V2 interface). AudexCFGLogitsProcessor
+    # keeps its cfg_role/cfg_scale validation there.
+    if logits_processor is None:
+        logits_processor = AudexCFGLogitsProcessor
     config = VllmConfig()
     model_config = object.__new__(OmniModelConfig)
-    model_config.use_v2_model_runner = use_v2
     model_config.runner_type = "generate"
-    model_config.logits_processors = [LogitBiasState if use_v2 else AudexCFGLogitsProcessor]
+    model_config.logits_processors = [logits_processor]
     config.model_config = model_config
-    assert config.use_v2_model_runner is use_v2
     processor = object.__new__(InputProcessor)
     processor.vllm_config, processor.model_config = config, model_config
     validator = processor._build_logits_processors_params_validator()
     validator(SamplingParams(extra_args={"cfg_role": "cond", "cfg_scale": 1.5}))
-    if not use_v2:
+    if logits_processor is AudexCFGLogitsProcessor:
         with pytest.raises(VLLMValidationError, match="cfg_role"):
             validator(SamplingParams(extra_args={"cfg_role": "invalid"}))
 
 
 @pytest.mark.parametrize("use_v2", [False, True])
 def test_plain_vllm_config_retains_upstream_runner_preference(monkeypatch, use_v2):
-    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", use_v2)
-    assert VllmConfig().use_v2_model_runner is use_v2
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(use_v2)))
+    assert not hasattr(VllmConfig(), "use_v2_model_runner")
+    assert OmniEngineArgs().use_v2_model_runner
+    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+        OmniEngineArgs(use_v2_model_runner=False)
 
 
 def test_sync_config_is_omni():
@@ -273,11 +281,21 @@ def test_compute_hash_is_stable_across_launches(stage_id):
             omni_kv_config={"connector_config": kv_connector_config},
         ).create_engine_config()
         # vLLM keys its torch.compile and AOT caches on this hash.
-        return vllm_config.compute_hash()
+        return hash_config(vllm_config)
 
     first_hash = get_model_config_hash()
     second_hash = get_model_config_hash()
     assert first_hash == second_hash
+
+
+def test_scheduler_window_policy_preserves_the_model_compile_key():
+    config = OmniEngineArgs(worker_cls=AR_WORKER_CLS).create_engine_config()
+    assert "scheduler_window_policy" not in config.model_config.compile_factors()
+    original = hash_config(config)
+    config.model_config.scheduler_window_policy = (
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
+    )
+    assert hash_config(config) == original
 
 
 def test_compute_hash_keeps_stage_connector_settings():
@@ -288,7 +306,7 @@ def test_compute_hash_keeps_stage_connector_settings():
             worker_cls=AR_WORKER_CLS,
             stage_connector_spec={"name": "SharedMemoryConnector", "extra": {"codec_chunk_frames": num_frames}},
         ).create_engine_config()
-        return vllm_config.compute_hash()
+        return hash_config(vllm_config)
 
     first_hash = get_model_config_hash(num_frames=25)
     second_hash = get_model_config_hash(num_frames=50)
@@ -370,9 +388,22 @@ def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
     }
 
 
-def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, monkeypatch, mocker):
+@pytest.mark.parametrize(
+    ("model", "model_arch", "subfolder"),
+    [
+        ("remote/cosyvoice3", "CosyVoice3Model", "CosyVoice-BlankEN"),
+    ],
+)
+def test_remote_tokenizer_subfolder_download_does_not_report_failure(
+    tmp_path,
+    monkeypatch,
+    mocker,
+    model,
+    model_arch,
+    subfolder,
+):
     """A successful remote tokenizer download must not enter the error path."""
-    tokenizer_dir = tmp_path / "CosyVoice-BlankEN"
+    tokenizer_dir = tmp_path / subfolder
     tokenizer_dir.mkdir()
     baseline_config = Mock()
     warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
@@ -386,30 +417,44 @@ def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, m
         classmethod(lambda cls, model_config, **omni_kwargs: model_config),
     )
 
-    args = OmniEngineArgs(model="remote/cosyvoice3", model_arch="CosyVoice3Model")
+    args = OmniEngineArgs(model=model, model_arch=model_arch)
     assert args.create_model_config() is baseline_config
     assert args.tokenizer == str(tokenizer_dir)
     warning.assert_not_called()
 
 
-def test_patch_missing_local_hf_config(tmp_path):
+@pytest.mark.parametrize(
+    ("model_arch", "model_type"),
+    [
+        ("IndexTTS25TalkerForConditionalGeneration", "indextts2_5"),
+        (
+            "Confucius4TTSTalkerForConditionalGeneration",
+            "confucius4_tts",
+        ),
+    ],
+)
+def test_patch_missing_local_hf_config(
+    tmp_path,
+    model_arch,
+    model_type,
+):
     """Native model bundles may only contain a checkpoints/ directory."""
     (tmp_path / "checkpoints").mkdir()
     args = object.__new__(OmniEngineArgs)
     args.model = str(tmp_path)
-    args.model_arch = "IndexTTS25TalkerForConditionalGeneration"
+    args.model_arch = model_arch
     args.hf_config_path = None
 
     try:
-        args._patch_empty_hf_config("indextts2_5")
+        args._patch_empty_hf_config(model_type)
 
         assert args.hf_config_path is not None
         config_path = args.hf_config_path + "/config.json"
         with open(config_path, encoding="utf-8") as config_file:
             config = json.load(config_file)
         assert config == {
-            "model_type": "indextts2_5",
-            "architectures": ["IndexTTS25TalkerForConditionalGeneration"],
+            "model_type": model_type,
+            "architectures": [model_arch],
         }
     finally:
         if hasattr(args, "_temp_config_dir"):
@@ -511,6 +556,8 @@ def test_remote_hf_config_error_reaches_parent_loader(monkeypatch):
     """Remote resolution failures must stay on vLLM's normal error path."""
     loader_error = OSError("remote config resolution failed")
     parent_inputs = {}
+
+    monkeypatch.setattr("vllm.engine.arg_utils.get_model_path", lambda model, _revision=None: model)
 
     def controlled_get_config_dict(cls, model, **kwargs):
         raise loader_error
@@ -663,6 +710,80 @@ def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
     assert parallel_config["text_encoder_tp_size"] == 2
 
 
+# Chatterbox's Hub repository ships no config.json, so a config-less
+# directory or Hub id gets one written; a config.json that exists but fails
+# to load stays on vLLM's error path.
+def chatterbox_args(model: str, model_arch: str = "ChatterboxForConditionalGeneration") -> OmniEngineArgs:
+    return OmniEngineArgs(model=model, model_arch=model_arch, skip_tokenizer_init=True)
+
+
+def _patched_config(args: OmniEngineArgs) -> dict:
+    with open(os.path.join(args.hf_config_path, "config.json"), encoding="utf-8") as config_file:
+        return json.load(config_file)
+
+
+def test_config_less_chatterbox_directory_gets_a_config_written(tmp_path):
+    """The engine writes a config.json naming the model type, loads the directory through it, and removes it."""
+    args = chatterbox_args(str(tmp_path))
+
+    model_config = args.create_model_config()
+
+    config = model_config.hf_config
+    assert isinstance(config, ChatterboxConfig)
+    assert config.architectures == model_config.architectures == ["ChatterboxForConditionalGeneration"]
+    assert not os.path.exists(args.hf_config_path) and not hasattr(args, "_temp_config_dir")
+
+
+# The Hub is a remote service: its answers for the Hub id (no config.json, or
+# one that exists but cannot be fetched) are stood in for here.
+def no_config(cls, model, **kwargs):
+    """The Hub's answer for a repository without a config.json."""
+    raise OSError("no config")
+
+
+def test_config_less_chatterbox_hub_id_gets_a_config_written(monkeypatch):
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(no_config))
+    monkeypatch.setattr("vllm_omni.engine.arg_utils.file_or_path_exists", lambda *a, **k: False)
+    args = chatterbox_args("ResembleAI/chatterbox-turbo")
+    try:
+        # As create_model_config calls it: the model type comes from the architecture.
+        args._patch_empty_hf_config(_ARCH_TO_MODEL_TYPE[args.model_arch])
+        assert _patched_config(args) == {
+            "model_type": "chatterbox",
+            "architectures": ["ChatterboxForConditionalGeneration"],
+        }
+        # The engine then loads the written directory through AutoConfig.
+        monkeypatch.undo()
+        config = AutoConfig.from_pretrained(args.hf_config_path)
+        assert isinstance(config, ChatterboxConfig)
+        assert config.architectures == ["ChatterboxForConditionalGeneration"]
+    finally:
+        if hasattr(args, "_temp_config_dir"):
+            shutil.rmtree(args._temp_config_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("model_arch", ["ChatterboxForConditionalGeneration", "CosyVoice3Model"])
+def test_a_config_that_exists_but_fails_to_load_is_left_alone(tmp_path, model_arch):
+    """The engine writes no config over a broken one; loading the directory fails on the file itself."""
+    (tmp_path / "config.json").write_text("{")
+    args = chatterbox_args(str(tmp_path), model_arch)
+
+    with pytest.raises((OSError, ValueError)):
+        args.create_model_config()
+
+    assert args.hf_config_path is None
+    assert not hasattr(args, "_temp_config_dir")
+
+
+def test_chatterbox_hub_config_that_exists_but_fails_to_load_is_left_alone(monkeypatch):
+    # The file exists but the Hub refuses it, as for a gated repository.
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(no_config))
+    monkeypatch.setattr("vllm_omni.engine.arg_utils.file_or_path_exists", lambda *a, **k: True)
+    hub = chatterbox_args("ResembleAI/chatterbox-turbo")
+    hub._patch_empty_hf_config("chatterbox")
+    assert hub.hf_config_path is None
+
+
 # For https://github.com/vllm-project/vllm-omni/issues/8503
 # The non-parallel diffusion engine args the serve CLI registers on
 # OrchestratorArgs and the stage engine consumes. Values differ from the
@@ -681,9 +802,17 @@ DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
     ("diffusion_attention_backend", "SDPA"),
     ("fastvideo_vsa_topk", 96),
     ("diffusion_attention_config", '{"default": {"backend": "SDPA"}}'),
+    (
+        "diffusion_attention_schedule",
+        {
+            "profiles": {"sparse": {"default": {"backend": "SDPA"}}},
+            "default": [{"start": 2, "end": None, "profile": "sparse"}],
+        },
+    ),
     ("diffusion_compile_granularity", "whole"),
     ("diffusion_compile_dynamic", False),
     ("enable_cuda_graph_decode", False),
+    ("enable_cfg_batching", True),
     ("cache_backend", "tea_cache"),
     ("cache_config", '{"steps": [1, 2]}'),
     ("video_output_transport", {"backend": "zmq"}),
@@ -691,6 +820,7 @@ DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
     ("step_execution", True),
     ("vae_use_slicing", True),
     ("vae_use_tiling", True),
+    ("vae_stack_tiles", False),
     ("vae_fast_path", "channels_last"),
     ("vae_encode_fast_path", "off"),
     ("enable_multithread_weight_load", False),
@@ -748,6 +878,7 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
         "flow_shift": 12.0,
         "num_gpus": 2,
         "enable_cuda_graph_decode": False,
+        "enable_cfg_batching": True,
         "vae_encode_fast_path": "off",
     }
     engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**overrides))
@@ -761,17 +892,18 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
     assert resolved["flow_shift"] == 12.0
     assert resolved["parallel_config"]["data_parallel_size"] == 2
     assert resolved["enable_cuda_graph_decode"] is False
+    assert resolved["enable_cfg_batching"] is True
     assert resolved["vae_encode_fast_path"] == "off"
 
 
-def test_native_mrv2_worker_provides_connector_without_legacy_mixin():
-    from vllm_omni.worker.omni_connector_validation import validate_worker_omni_connector
-    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+@pytest.mark.parametrize(
+    "worker_cls",
+    ["vllm_omni.worker.gpu_ar_worker.GPUARWorker", "vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker"],
+)
+def test_native_mrv2_worker_provides_connector_without_legacy_mixin(worker_cls):
+    args = OmniEngineArgs(worker_cls=worker_cls, requires_full_payload_input=True)
 
-    class Worker:
-        model_runner_cls = OmniARModelRunner
-
-    validate_worker_omni_connector(Worker, required=True)
+    assert args.worker_cls == worker_cls
 
 
 # For https://github.com/vllm-project/vllm-omni/issues/8037
@@ -782,6 +914,7 @@ DIFFUSION_PARALLEL_KNBS = [
     ("ulysses_degree", 4),
     ("ulysses_mode", "advanced_uaa"),
     ("ulysses_a2a_permute", True),
+    ("ulysses_overlap_chunks", 2),
     ("ring_degree", 2),
     ("allgather_degree", 8),
     ("use_hsdp", True),
@@ -816,6 +949,9 @@ def test_from_cli_args_applies_diffusion_parallel_knobs():
             # Standalone HSDP (all other parallelism at 1) cannot
             # auto-calculate its shard size; pass one explicitly.
             factory_kwargs["hsdp_shard_size"] = 2048
+        if knob == "ulysses_overlap_chunks":
+            # The overlap runs on the copy-engine exchange.
+            factory_kwargs["ulysses_a2a_permute"] = True
         stage_cfg = StageConfigFactory.create_default_diffusion(factory_kwargs)[0]
         parallel_config = stage_cfg["engine_args"]["parallel_config"]
         assert parallel_config[knob] == value, f"{knob} did not reach parallel_config"

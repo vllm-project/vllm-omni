@@ -9,6 +9,10 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    "Alpamayo2SuperPolicy": ("alpamayo2_super", "alpamayo2_super", "Alpamayo2SuperPolicyForConditionalGeneration"),
+    "Lfm3OmniForConditionalGeneration": ("lfm3_omni", "model", "Lfm3OmniForConditionalGeneration"),
+    "Lfm3OmniCode2Wav": ("lfm3_omni", "code2wav", "Lfm3OmniCode2Wav"),
+    "Lfm3AudioForConditionalGeneration": ("lfm3_audio", "model", "Lfm3AudioForConditionalGeneration"),
     "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
     "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (
@@ -83,6 +87,12 @@ _OMNI_MODELS = {
         "step_audio2",
         "step_audio2_token2wav",
         "StepAudio2Token2WavForConditionalGeneration",
+    ),
+    ## chatterbox
+    "ChatterboxForConditionalGeneration": (
+        "chatterbox",
+        "chatterbox",
+        "ChatterboxForConditionalGeneration",
     ),
     "CosyVoice3Model": (
         "cosyvoice3",
@@ -159,6 +169,9 @@ _OMNI_MODELS = {
         "qwen3_tts_talker",
         "Qwen3TTSTalkerForConditionalGeneration",
     ),
+    "KimiAudioForConditionalGeneration": ("kimi_audio", "kimi_audio", "KimiAudioForConditionalGeneration"),
+    "KimiAudioARStage": ("kimi_audio", "kimi_audio_ar_stage", "KimiAudioARStage"),
+    "KimiAudioDecoder": ("kimi_audio", "kimi_audio_decoder", "KimiAudioDecoder"),
     "Qwen3TTSTalkerForConditionalGeneration": (
         "qwen3_tts",
         "qwen3_tts_talker",
@@ -168,6 +181,17 @@ _OMNI_MODELS = {
         "qwen3_tts",
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
+    ),
+    ## Confucius4-TTS
+    "Confucius4TTSTalkerForConditionalGeneration": (
+        "confucius4_tts",
+        "confucius4_tts_talker",
+        "Confucius4TTSTalkerForConditionalGeneration",
+    ),
+    "Confucius4TTSS2ADecoder": (
+        "confucius4_tts",
+        "confucius4_tts_decoder",
+        "Confucius4TTSS2ADecoder",
     ),
     ## personaplex (Moshi finetune, full-duplex S2S; 2-stage audio->audio offline pipeline)
     # built by lead: personaplex_talker module + PersonaPlexTalkerForConditionalGeneration.
@@ -345,11 +369,11 @@ _OMNI_MODELS = {
         "gepard_talker",
         "GepardTalkerForConditionalGeneration",
     ),
-    ## Kokoro-82M (hexgrad)
-    "KokoroForConditionalGeneration": (
-        "kokoro",
-        "modeling_kokoro",
-        "KokoroForConditionalGeneration",
+    ## Haru-4B (higurashi-ai) — full-duplex S2S, one AR stage with in-step audio hooks
+    "HaruForConditionalGeneration": (
+        "haru",
+        "haru",
+        "HaruForConditionalGeneration",
     ),
     ## audio8_tts (Audio8 TTS Preview 0.6B)
     "Audio8TTSSlowARForConditionalGeneration": (
@@ -368,6 +392,7 @@ _OMNI_MODELS = {
         "vibevoice",
         "VibeVoiceForConditionalGeneration",
     ),
+    "PhononTalkerForConditionalGeneration": ("phonon", "phonon_talker", "PhononTalkerForConditionalGeneration"),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
         "voxcpm2",
@@ -518,6 +543,17 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
+    ## Response-judge stage models
+    "ResponseJudgeQwen3ForCausalLM": (
+        "response_judge",
+        "qwen3",
+        "ResponseJudgeQwen3ForCausalLM",
+    ),
+    "LayaDecisionModel": (
+        "response_judge",
+        "laya",
+        "LayaDecisionModel",
+    ),
     "MiniMaxH3Encoder": (
         "minimax_h3",
         "encoder",
@@ -537,7 +573,7 @@ _OMNI_MODELS = {
     ## YuE2-3B (text-to-music; single-stage native-AR with terminal NAR/VAE)
     "Yue2ForCausalLM": (
         "yue2",
-        "yue2",
+        "runtime",
         "Yue2ForCausalLM",
     ),
 }

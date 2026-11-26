@@ -69,14 +69,22 @@ class PrefixCacheRewrite:
             for payloads in (output.inter_stage_outputs, output.pooler_output, output.multimodal_outputs)
             if payloads
         }
+        replaced_keys: dict[str, set[str]] = {}
         for row, req_id in self.rows:
             payloads = {id(p[row]): p[row] for p in payload_lists.values() if row < len(p) and p[row]}
             for payload in payloads.values():
                 if outs.hidden_states is not None and "hidden" in payload:
                     payload["hidden"] = outs.hidden_states[req_id]
+                    replaced_keys.setdefault(req_id, set()).add("hidden")
                 for key, per_req in outs.mm_outputs.items():
                     if key in payload:
                         payload[key] = per_req[req_id]
+                        replaced_keys.setdefault(req_id, set()).add(key)
+        if replaced_keys:
+            stamped = dict(getattr(output, "full_payload_prefix_cache_keys", None) or {})
+            for req_id, keys in replaced_keys.items():
+                stamped[req_id] = frozenset(keys) | frozenset(stamped.get(req_id, ()))
+            output.full_payload_prefix_cache_keys = stamped
 
 
 class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
@@ -165,6 +173,8 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
         replay or trim) is discarded at once, so misses keep the plain
         output path.
         """
+        from vllm.distributed.parallel_state import get_tp_group
+
         cache, view = self.omni_prefix_cache, self._prefix_cache_group_view
         if cache is None or view is None:
             return None
@@ -182,12 +192,26 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
             return None
         rewrite_ids = cache.step_rewrite_req_ids(step_id)
         emits_payloads = getattr(self.vllm_config.model_config, "engine_output_type", "text") != "text"
-        if not rewrite_ids or not emits_payloads or self._model_mm_outputs_written_in_sample():
-            cache.discard_step(step_id)
-            return None
-        batch_req_ids = input_batch.req_ids[: input_batch.num_reqs]
-        rows = tuple((row, req_id) for row, req_id in enumerate(batch_req_ids) if req_id in rewrite_ids)
-        return PrefixCacheRewrite(cache, step_id, rows)
+        if rewrite_ids and emits_payloads and not self._model_mm_outputs_written_in_sample():
+            from vllm.v1.executor.abstract import Executor
+            from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+            # MP (including Ray V2) consumes only TP0's async output unless a
+            # KV/EC connector aggregates all ranks. UniProc/external launcher
+            # and the legacy Ray wrapper materialize each worker's output.
+            if (
+                get_tp_group().is_first_rank
+                or getattr(self.vllm_config, "kv_transfer_config", None) is not None
+                or getattr(self.vllm_config, "ec_transfer_config", None) is not None
+                or not issubclass(Executor.get_class(self.vllm_config), MultiprocExecutor)
+            ):
+                batch_req_ids = input_batch.req_ids[: input_batch.num_reqs]
+                rows = tuple((row, req_id) for row, req_id in enumerate(batch_req_ids) if req_id in rewrite_ids)
+                return PrefixCacheRewrite(cache, step_id, rows)
+        # Drop only the read-side context; write-task holders keep the staging
+        # slot alive until the cache writes complete.
+        cache.discard_step(step_id)
+        return None
 
     @staticmethod
     def _prefix_cache_output_finalizer(

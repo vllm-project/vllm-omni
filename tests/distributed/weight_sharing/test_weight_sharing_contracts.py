@@ -149,7 +149,17 @@ from tests.distributed.weight_sharing.helpers import load_weight_sharing
 
 before = set(threading.enumerate())
 package = load_weight_sharing()
-backend = package.TorchCudaIpcBackend()
+from importlib import import_module
+backend_module = import_module(f"{package.__name__}.backend")
+contracts = import_module(f"{package.__name__}.contracts")
+assert package.TorchCudaIpcBackend is package.TorchIpcBackend
+assert backend_module.TorchCudaIpcBackend is package.TorchIpcBackend
+assert contracts.CudaIpcCodec is contracts.IpcCodec
+for backend_class in (package.TorchIpcBackend, package.TorchCudaIpcBackend):
+    backend = backend_class()
+    assert type(backend._codec) is package.TorchCudaIpcCodec
+    npu_codec = package.TorchNpuIpcCodec()
+    assert backend_class(codec=npu_codec)._codec is npu_codec
 assert "torch" not in sys.modules
 assert "vllm_omni" not in sys.modules
 assert set(threading.enumerate()) == before

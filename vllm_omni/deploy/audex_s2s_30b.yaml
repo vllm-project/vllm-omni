@@ -57,3 +57,13 @@ stages:
       temperature: 0.0
       max_tokens: 8192
       seed: 0
+
+platforms:
+  rocm:
+    stages:
+      - stage_id: 1
+        # AudexCode2Wav uses hidden_dim=2048 and heads=32, but its custom
+        # config does not expose the standard head metadata that vLLM's ROCm
+        # backend validates while discovering KV-cache layouts.
+        hf_overrides:
+          head_dim: 64

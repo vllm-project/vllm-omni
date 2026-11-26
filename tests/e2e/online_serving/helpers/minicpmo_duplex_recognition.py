@@ -14,6 +14,8 @@ from pathlib import Path
 
 import regex as re
 
+from vllm_omni.clients.duplex import DEFINITIVE_REFUSAL_CODES, ErrorEvent
+
 ASSETS = Path(__file__).resolve().parents[3] / "assets/minicpmo_4_5/duplex_recognition"
 CHINESE_NUMBERS = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二")
 
@@ -65,15 +67,36 @@ def covered_scenes(transcript: str, scenes: list[dict]) -> list[int]:
     return covered
 
 
-def evaluate_session(transcript: str, events: list[dict], scenes: list[dict]) -> dict:
+def evaluate_session(
+    transcript: str,
+    events: list[dict],
+    scenes: list[dict],
+    *,
+    forced_response_windows: list[tuple[int, int]] | None = None,
+) -> dict:
     covered = covered_scenes(transcript, scenes)
     missing = [scene["scene"] for scene in scenes if scene["scene"] not in covered]
     created: list[str] = []
     done: list[str] = []
     errors = []
-    for event in events:
+    if forced_response_windows is None:
+        last_commit = max(
+            (i for i, event in enumerate(events) if event.get("type") == "input_audio_buffer.committed"),
+            default=-1,
+        )
+        forced_response_windows = [(last_commit, len(events))] if last_commit >= 0 else []
+    for start, end in forced_response_windows:
+        if not (0 <= start < end <= len(events)) or events[start].get("type") != "input_audio_buffer.committed":
+            raise ValueError("Forced-response windows must start at an acknowledged commit")
+    for index, event in enumerate(events):
         kind = event.get("type", "")
         if kind in {"error", "client.timeout", "client.error"}:
+            if (
+                kind == "error"
+                and ErrorEvent(event).code in DEFINITIVE_REFUSAL_CODES
+                and any(start < index < end for start, end in forced_response_windows)
+            ):
+                continue
             errors.append(event)
         if kind in {"response.created", "response.done"}:
             response = event.get("response", {})

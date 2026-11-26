@@ -659,6 +659,12 @@ class FastH3WeightFusion(MiniMaxH3WeightFusion):
                     "FastH3 VSA supports local attention or pure Ulysses sequence parallelism; "
                     "ring/all-gather SP does not give the block-sparse kernel the complete packed sequence."
                 )
+            # Imported here because fasth3_checkpoint imports this module.
+            from .fasth3_checkpoint import check_base_vsa_provider, check_scheduled_vsa_providers
+
+            # The fused gates run on tile64, the H3 default.
+            check_base_vsa_provider(_resolve_dit_attention_spec(od_config), name=self.adapter_name, tile_size=64)
+            check_scheduled_vsa_providers(od_config, name=self.adapter_name, tile_size=64)
         logger.info(
             "FastH3 adapter active: sigma points %s for %d transformer forwards, "
             "flow_shift=%g, audio_flow_shift=%g, tasks=%s",

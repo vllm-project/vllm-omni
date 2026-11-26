@@ -30,7 +30,7 @@ def register_top_k_top_p_warmup(worker: Any) -> bool:
     """Register vLLM's native top-k/top-p kernels with the v2 runner's JIT warmup registry.
 
     Must run before ``compile_or_warm_up_model`` reaches ``kernel_warmup``.
-    Assumes the zero-argument ``register_top_k_top_p_warmups()`` of vLLM 0.32.0.
+    Assumes the zero-argument ``register_top_k_top_p_warmups()`` of vLLM 0.33.0.
     Returns whether the kernels were registered.
     """
     if not getattr(worker, "use_v2_model_runner", False) or not current_platform.is_cuda():

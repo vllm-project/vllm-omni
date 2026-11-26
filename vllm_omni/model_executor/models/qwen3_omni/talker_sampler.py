@@ -20,11 +20,12 @@ import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, register_top_k_top_p_warmups
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
+from vllm_omni.utils.seeded_exponential import categorical_sample as random_sample
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
 logger = init_logger(__name__)
@@ -35,6 +36,9 @@ class Qwen3OmniTalkerSampler(OmniSampler):
 
     def __init__(self, base_sampler: Sampler):
         super().__init__(base_sampler)
+        # Seeded rows use native masking even when upstream selects FlashInfer.
+        # Declare its kernels while the runner collects custom-sampler warmups.
+        register_top_k_top_p_warmups()
         self._generators: dict[int, torch.Generator] = {}
         self._sample_random = base_sampler._sample_random
         base_sampler._sample_random = self._sample_like_v1
@@ -81,6 +85,7 @@ class Qwen3OmniTalkerSampler(OmniSampler):
         pos: torch.Tensor,
         top_k: torch.Tensor | None,
         top_p: torch.Tensor | None,
+        has_topp_only_rows: bool,
         use_fused_sampler: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         original: Callable[..., tuple[torch.Tensor, torch.Tensor]] = self._sample_random
@@ -107,9 +112,16 @@ class Qwen3OmniTalkerSampler(OmniSampler):
                 )
                 self._logged_fallback = True
             return original(
-                processed_logits, expanded_idx_mapping, idx_mapping_np, pos, top_k, top_p, use_fused_sampler
+                processed_logits,
+                expanded_idx_mapping,
+                idx_mapping_np,
+                pos,
+                top_k,
+                top_p,
+                has_topp_only_rows,
+                use_fused_sampler,
             )
-        masked = apply_top_k_top_p(processed_logits, top_k, top_p)
+        masked = apply_top_k_top_p(processed_logits, top_k, top_p, has_topp_only_rows=has_topp_only_rows)
         if len(generators) == n_rows:
             if not self._logged_v1:
                 logger.info("Qwen3-Omni Talker sampled %d rows with the V1 generator", n_rows)
@@ -140,6 +152,7 @@ class Qwen3OmniTalkerSampler(OmniSampler):
             pos[:n_rows].index_select(0, other_idx),
             None,
             None,
+            False,
             False,
         )
         sampled[other_idx] = other_sampled.to(torch.int64)

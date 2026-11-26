@@ -154,7 +154,10 @@ class ImageGenerationRequest(BaseModel):
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
     flow_shift: float | None = Field(
-        default=None, description="Scheduler flow_shift (sigma shift) for flow-matching diffusion models."
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Scheduler flow_shift (sigma shift) for flow-matching diffusion models.",
     )
     extra_params: dict[str, Any] | None = Field(
         default=None,
@@ -168,10 +171,11 @@ class ImageGenerationRequest(BaseModel):
 
     # vllm-omni extension for per-request LoRA.
     # This mirrors the `extra_body.lora` convention in /v1/chat/completions.
-    lora: dict[str, Any] | None = Field(
+    lora: dict[str, Any] | list[dict[str, Any]] | None = Field(
         default=None,
         description=(
-            "Optional LoRA adapter for this request. Expected shape: "
+            "Optional LoRA adapter(s) for this request: a single object or a "
+            "list of objects to stack multiple adapters. Expected shape: "
             "{name/path/scale/int_id}. Field names are flexible "
             "(e.g. name|lora_name|adapter, path|lora_path|local_path, "
             "scale|lora_scale, int_id|lora_int_id)."

@@ -190,7 +190,7 @@ def serialize_obj(obj: Any) -> bytes:
     return OmniSerializer.serialize(obj)
 
 
-def shm_write_bytes(payload: bytes, name: str | None = None) -> dict[str, Any]:
+def shm_write_bytes(payload: bytes | bytearray | memoryview, name: str | None = None) -> dict[str, Any]:
     """Write bytes into SharedMemory and return meta dict {name,size}.
 
     Caller should close the segment; the receiver should unlink.
