@@ -73,7 +73,9 @@ from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4
+from vllm_omni.diffusion.utils.flow_matching import normalize_shift
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -155,7 +157,7 @@ def resolve_wan_sample_solver(req: OmniDiffusionRequest, default: str = "unipc")
     raw = extra_args.get("sample_solver", default)
     sample_solver = str(raw).strip().lower()
     if sample_solver not in WAN_SAMPLE_SOLVER_CHOICES:
-        raise ValueError(f"Invalid sample_solver={raw!r}. Expected one of: {sorted(WAN_SAMPLE_SOLVER_CHOICES)}")
+        raise OmniClientError(f"Invalid sample_solver={raw!r}. Expected one of: {sorted(WAN_SAMPLE_SOLVER_CHOICES)}")
     return sample_solver
 
 
@@ -166,9 +168,9 @@ def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionCo
         raw_flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
 
     try:
-        return float(raw_flow_shift)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
+        return normalize_shift(raw_flow_shift, name="flow_shift")
+    except ValueError as exc:
+        raise OmniClientError(str(exc)) from exc
 
 
 def resolve_wan_boundary_ratio(

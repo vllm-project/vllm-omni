@@ -79,7 +79,7 @@ def qwen_duplex_server(
     deploy.write_text(
         yaml.safe_dump(
             {
-                "base_config": get_deploy_config_path("qwen3_omni_duplex.yaml"),
+                "base_config": get_deploy_config_path("qwen3_omni_duplex_mrv2.yaml"),
                 "duplex_session": duplex_options,
             }
         )
@@ -485,7 +485,7 @@ async def _run_duplex_history(runtime, log_path: Path, *, reject_overflow: bool 
 
 
 @pytest.mark.omni
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 class TestQwen3OmniDuplexPlayback:
     @pytest.mark.advanced_model
     @pytest.mark.parametrize(
@@ -558,7 +558,6 @@ class TestQwen3OmniDuplexPlayback:
         )
 
     @pytest.mark.full_model
-    @hardware_test(res={"rocm": "MI325"}, num_cards=2)
     @pytest.mark.parametrize("generation_finished", [False, True], ids=["generating", "queued-playback"])
     @pytest.mark.parametrize("repetition", range(_DUPLEX_REPEATS_FULL))
     def test_speech_interrupts_playback_full(

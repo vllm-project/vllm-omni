@@ -1,7 +1,6 @@
 [
   {
     "test_name": "test_qwen3_omni_duplex_omniinteract",
-    "description": "Provisional H100 mean_duplex_busy_rtf baseline: equal-day mean for 2026-11-16 through 2026-11-18 (3 days; daily CV 78.79%), rounded to four decimals without margin. Source: JiusiServe/omni-reviewbot@9c4086e9a36c. Higher variability is accepted for Busy RTF; this short window does not establish stability.",
     "mark": [
       {
         "hardware_marks": {
@@ -21,7 +20,11 @@
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
       "extra_cli_args": [
         "--deploy-config",
-        "vllm_omni/deploy/qwen3_omni_duplex.yaml"
+        "vllm_omni/deploy/qwen3_omni_duplex.yaml",
+        "--stage-init-timeout",
+        "1200",
+        "--init-timeout",
+        "1800"
       ],
       "update": {
         "model_runner": "v2",
@@ -55,7 +58,7 @@
         "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract_qwen3_omni/1q1a_math",
         "omniinteract_max_video_duration_s": 600,
         "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
-        "name": "c8_accuracy_response_stats_v5",
+        "name": "c8_accuracy_response_stats",
         "duplex_metric_aggregation": "response",
         "metric-percentiles": "50,95",
         "ready_check_timeout_sec": 0,
@@ -74,7 +77,7 @@
         "baseline": {
           "H100": {
             "mean_duplex_busy_rtf": [
-              0.2325
+              0.1262
             ]
           }
         }

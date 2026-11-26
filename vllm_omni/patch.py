@@ -11,7 +11,6 @@ from functools import cached_property
 import torch
 from aenum import extend_enum
 from vllm.config import ModelConfig as _OriginalModelConfig
-from vllm.config import VllmConfig as _OriginalVllmConfig
 from vllm.inputs import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
@@ -24,10 +23,6 @@ from vllm.v1.request import RequestStatus
 from vllm.v1.request import StreamingUpdate as _OriginalStreamingUpdate
 
 import vllm_omni.logger  # noqa: F401
-from vllm_omni.cudagraph.moe_routing_batch_descriptor import (
-    patch_batch_descriptor_moe_routing_key,
-)
-from vllm_omni.cudagraph.moe_routing_dispatcher import patch_cudagraph_dispatcher_moe_routing
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
 from vllm_omni.inputs.audio import apply_soundfile_first_audio_decode_patch
 from vllm_omni.inputs.data import OmniTokensPrompt
@@ -38,33 +33,11 @@ from vllm_omni.utils.mm_prefix import apply_img2img_mm_prefix_patch
 
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
 
-# #9865: BatchDescriptor.moe_routing_key + CudagraphDispatcher expansion.
-# Must run before runners import BatchDescriptor into local names.
-patch_batch_descriptor_moe_routing_key()
-patch_cudagraph_dispatcher_moe_routing()
-
 # Decoder rounding is visible to audio encoders and can change mixed-media
 # answers. Preserve Omni's existing default while retaining explicit choices.
 apply_soundfile_first_audio_decode_patch()
 apply_opencv_capture_reuse_patch()
 apply_img2img_mm_prefix_patch()
-
-# Omni's deploy config selects a runner per stage. vLLM 0.31's config property
-# otherwise defaults to v2 independently of the runner selected by our workers,
-# making shared consumers such as InputProcessor choose the wrong API.
-_runner_property = _OriginalVllmConfig.use_v2_model_runner
-if not getattr(_runner_property.fget, "_omni_stage_runner", False):
-
-    def _patched_use_v2_model_runner(self, _upstream=_runner_property.fget):
-        # Lazy import keeps the package's patch/config initialization acyclic.
-        from vllm_omni.config.model import OmniModelConfig
-
-        if isinstance(self.model_config, OmniModelConfig):
-            return self.model_config.use_v2_model_runner
-        return _upstream(self)
-
-    setattr(_patched_use_v2_model_runner, "_omni_stage_runner", True)
-    _OriginalVllmConfig.use_v2_model_runner = property(_patched_use_v2_model_runner)
 
 # =============================================================================
 # Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
@@ -655,6 +628,14 @@ def release_cumem_allocations_for_shutdown(allocator) -> int:
     """
     from vllm.device_allocator import cumem as cumem_module
 
+    # Since the v0.34 pin, sleep backups are mmap'd + cudaHostRegister'd by
+    # create_cpu_backup() and must be unregistered (release_cpu_backup, the
+    # pin's own release-then-null order) before the last reference is dropped;
+    # a stale registration poisons later host mappings in this process.
+    release_backup = getattr(cumem_module, "release_cpu_backup", None)
+    if release_backup is None:
+        _PATCH_LOGGER.debug("[cumem-cuda] release_cpu_backup unavailable; backup drop keeps legacy semantics")
+
     swept_handles = allocator.__dict__.setdefault("_omni_swept_handles", {})
     retired_bytes = 0
     for ptr, data in list(allocator.pointer_to_data.items()):
@@ -662,6 +643,8 @@ def release_cumem_allocations_for_shutdown(allocator) -> int:
             # Keep the entry visible until the physical unmap succeeds. If it
             # fails, get_current_usage() must continue to report the leak.
             cumem_module.unmap_and_release(data.handle)
+        if data.cpu_backup_tensor is not None and release_backup is not None:
+            release_backup(data.cpu_backup_tensor)
         data.cpu_backup_tensor = None
         removed = allocator.pointer_to_data.pop(ptr, None)
         if removed is not data:
@@ -687,6 +670,13 @@ def _patch_cumem_free_callback_cuda() -> None:
 
     original_unmap_and_release = cumem_module.unmap_and_release
 
+    # v0.34-pin backups are cudaHostRegister'd; unregister them exactly like
+    # the pin's own _python_free_callback does (release, then null) instead of
+    # dropping the last reference to a still-registered mmap.
+    release_backup = getattr(cumem_module, "release_cpu_backup", None)
+    if release_backup is None:
+        _PATCH_LOGGER.debug("[cumem-cuda] release_cpu_backup unavailable; backup drop keeps legacy semantics")
+
     def _tracking_unmap_and_release(allocation_handle) -> None:
         original_unmap_and_release(allocation_handle)
         allocator = CuMemAllocator.instance
@@ -711,6 +701,8 @@ def _patch_cumem_free_callback_cuda() -> None:
                 raise KeyError(ptr)
             return _releasable_handle(swept)
         if data.cpu_backup_tensor is not None:
+            if release_backup is not None:
+                release_backup(data.cpu_backup_tensor)
             data.cpu_backup_tensor = None
         if data.is_asleep:
             return _releasable_handle(data.handle)
@@ -845,3 +837,53 @@ def _patch_ascend_ngram() -> None:
 
 
 _patch_ascend_ngram()
+
+
+def _patch_weak_ref_tensors_dict_payloads() -> None:
+    """Let cudagraph weak-ref traversal pass through Omni payload dicts.
+
+    vLLM 0.34's ``weak_ref_tensors`` recurses into nested containers and
+    raises ``ValueError`` on plain dicts (and Nones). Omni stage models return
+    ``OmniOutput`` NamedTuples whose ``multimodal_outputs`` field is a dict of
+    tensors; CUDAGraphWrapper weak-references exactly that output at capture
+    and replay (vllm/compilation/cuda_graph.py), so a dict payload would kill
+    every graphed stage step. Baseline applied the storage-alias primitive per
+    tuple element, which passed dicts through untouched. The patch adds a dict
+    branch (recursing over values) — every non-dict input keeps the original
+    code path, and dicts previously raised, so no upstream caller can regress.
+    Bound names are rebound in the two modules that from-import the helper.
+    """
+    from vllm.utils import torch_utils
+
+    original = torch_utils.weak_ref_tensors
+    if getattr(original, "_omni_dict_payloads", False):
+        return
+
+    def weak_ref_tensors_with_dicts(tensors):
+        # Baseline dispatched the storage-alias primitive per tuple element,
+        # so dicts and Nones (OmniOutput's optional fields) passed through
+        # untouched — the primitive returns non-tensors as-is. vLLM 0.34
+        # recurses containers instead and raises on both.
+        if isinstance(tensors, dict):
+            return tensors
+        if tensors is None:
+            return None
+        return original(tensors)
+
+    weak_ref_tensors_with_dicts._omni_dict_payloads = True  # type: ignore[attr-defined]
+    weak_ref_tensors_with_dicts.__wrapped__ = original  # type: ignore[attr-defined]
+    torch_utils.weak_ref_tensors = weak_ref_tensors_with_dicts
+    # Rebind early from-imports so the production cudagraph path sees the patch.
+    for module_name in (
+        "vllm.compilation.cuda_graph",
+        "vllm.compilation.breakable_cudagraph",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if getattr(module, "weak_ref_tensors", None) is original:
+            module.weak_ref_tensors = weak_ref_tensors_with_dicts
+
+
+_patch_weak_ref_tensors_dict_payloads()

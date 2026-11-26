@@ -4,9 +4,11 @@
 import asyncio
 import base64
 import importlib.util
+import math
 import sys
 import wave
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -958,3 +960,138 @@ def test_video_without_soundtrack_uses_video_duration(monkeypatch, tmp_path):
     )
     assert wav is None
     assert len(frames) == 3
+
+
+@pytest.mark.parametrize("replay_timeout", [False, True])
+@pytest.mark.parametrize("clip_seconds,replay_seconds,replay_start", [(18, 3, 15), (18.2, 3.4, 14)])
+def test_replay_uses_original_aligned_media_and_reports_timeout(
+    tmp_path, monkeypatch, replay_timeout, clip_seconds, replay_seconds, replay_start
+):
+    from tests.clients.test_duplex_client import SESSION_CLOSED, SESSION_CREATED, FakeSocket
+
+    demo = _load_demo_module()
+    original_client = demo._TimedInputClient
+    pcm = b"".join(bytes([second, 0]) * 16_000 for second in range(math.ceil(clip_seconds)))
+    pcm = pcm[: round(clip_seconds * 32_000)]
+    wav = tmp_path / "input.wav"
+    demo.write_pcm16_wav(wav, pcm, sample_rate_hz=16_000)
+    frames = [f"frame-{second}" for second in range(math.ceil(clip_seconds))]
+    monkeypatch.setattr(demo, "_resolve_duplex_av_inputs", lambda **kwargs: (str(wav), frames, [None] * len(frames)))
+
+    class ReplaySocket(FakeSocket):
+        commits = 0
+        spoke = False
+
+        async def send(self, raw):
+            await super().send(raw)
+            event = self.sent[-1]
+            if event["type"] == "session.update":
+                self.feed(SESSION_CREATED)
+            elif event["type"] == "input_audio_buffer.append" and not self.spoke:
+                self.spoke = True
+                self.feed({"type": "response.created", "response": {"id": "first"}})
+                self.feed(
+                    {"type": "response.output_audio_transcript.delta", "response_id": "first", "delta": "unfinished"}
+                )
+                self.feed({"type": "response.done", "response": {"id": "first", "status": "completed"}})
+            elif event["type"] == "input_audio_buffer.commit":
+                self.commits += 1
+                if self.commits == 1 or not replay_timeout:
+                    self.feed({"type": "input_audio_buffer.committed"})
+                    self.feed({"type": "response.listen"})
+            elif event["type"] == "session.close":
+                self.feed(SESSION_CLOSED)
+
+    sock = ReplaySocket()
+
+    async def connect(url):
+        return sock
+
+    def client(url, **kwargs):
+        return original_client(url, connect=connect, **kwargs)
+
+    async def silent_drain(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(demo, "_TimedInputClient", client)
+    monkeypatch.setattr(demo, "_drain_forced_post_commit_response", silent_drain)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "demo",
+            "--input-wav",
+            str(wav),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--tail-silence-s",
+            "1.2",
+            "--final-create-response",
+            "--post-commit-replay-seconds",
+            str(replay_seconds),
+            "--no-realtime-pacing",
+            "--timeout-s",
+            "0.2",
+        ],
+    )
+    result = asyncio.run(demo.run_demo(demo.parse_args()))
+    assert result["post_commit"]["replay_triggered"] is True
+    assert result["ok"] is (not replay_timeout)
+    assert any(error["type"] == "client.timeout" for error in result["errors"]) is replay_timeout
+    first_commit = next(i for i, e in enumerate(sock.sent) if e["type"] == "input_audio_buffer.commit")
+    replay = [e for e in sock.sent[first_commit + 1 :] if e["type"] == "input_audio_buffer.append"]
+    assert b"".join(base64.b64decode(cast(str, e["audio"])) for e in replay) == pcm[replay_start * 32_000 :]
+    assert [(e["audio_end_ms"], e["video_frames"]) for e in replay if e.get("video_frames")] == [
+        (round((clip_seconds + 1.2 + offset + 1) * 1000), [f"frame-{replay_start + offset}"])
+        for offset in range(math.floor(clip_seconds - replay_start))
+    ]
+
+
+class _ConfigCapturedError(Exception):
+    pass
+
+
+def _session_config_for(demo, monkeypatch, tmp_path, **extra):
+    """Run run_demo up to the client constructor and return its session config."""
+    captured = {}
+
+    def fake_client(url, *, config, **kwargs):
+        captured["config"] = config
+        raise _ConfigCapturedError
+
+    monkeypatch.setattr(demo, "_resolve_duplex_av_inputs", lambda **kwargs: (None, [], []))
+    monkeypatch.setattr(demo, "_TimedInputClient", fake_client)
+    args = demo.argparse.Namespace(
+        output_dir=str(tmp_path),
+        input_wav=None,
+        input_video=None,
+        video_fps=1,
+        frame_max_side=0,
+        stack_frames=1,
+        url="ws://127.0.0.1:1/v1/realtime",
+        model="minicpmo",
+        ref_audio=None,
+        temperature=0.0,
+        instructions="",
+        sliding_window_mode="off",
+        basic_window_high_tokens=8000,
+        basic_window_low_tokens=6000,
+        context_max_units=24,
+        context_previous_max_tokens=500,
+        timeout_s=1,
+        **extra,
+    )
+    with pytest.raises(_ConfigCapturedError):
+        asyncio.run(demo.run_demo(args))
+    return captured["config"]
+
+
+def test_run_demo_leaves_modalities_to_the_deployment(monkeypatch, tmp_path):
+    config = _session_config_for(_load_demo_module(), monkeypatch, tmp_path)
+    assert config.modalities is None
+    assert "modalities" not in config.to_session_payload(model="minicpmo")
+
+
+def test_run_demo_forwards_text_modalities(monkeypatch, tmp_path):
+    config = _session_config_for(_load_demo_module(), monkeypatch, tmp_path, modalities="text")
+    assert config.modalities == ("text",)

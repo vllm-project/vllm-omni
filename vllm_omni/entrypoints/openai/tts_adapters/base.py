@@ -15,11 +15,12 @@ import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_codec_frame_rate, load_supported_speakers
+from vllm_omni.model_extras import get_extra_body_params
 
 logger = init_logger(__name__)
 
@@ -194,6 +195,46 @@ class PreparedRequest:
     segment_silence_ms: int = 200
 
 
+class IncrementalInputNotReadyError(Exception):
+    """Recoverable initial-input wait, not an invalid request or engine error."""
+
+
+class IncrementalTTSInput(Protocol):
+    """Model-owned input conversion for one ordinary TTS request.
+
+    Each call receives released frontend text, not token IDs or a batch of
+    requests. The handler owns submission, output consumption, cancellation, and
+    EOF. Calls on an instance must be serialized.
+
+    Input conversion must preserve the complete-input model encoding regardless
+    of source chunking or delivery batching. Already submitted input is never
+    revised; EOF flushes the remaining encoding exactly once.
+
+    Before the first successful build, the caller accumulates initial text.
+    ``build`` receives the entire candidate, returning a request or raising
+    ``IncrementalInputNotReadyError`` if more input is required. This signal
+    neither submits a request nor consumes caller-owned input; retry with the
+    complete candidate, not only the newly arrived suffix. Implementations may
+    cache speculative encoding to avoid reprocessing an unchanged prefix.
+
+    EOF cannot require more input: ``build(final=True)`` either returns a
+    complete initial request or raises an actual input/construction error.
+    Catch only ``IncrementalInputNotReadyError`` as a normal wait. Other build
+    failures terminate the utterance; discard the instance rather than retrying.
+    A successful build is performed exactly once per instance.
+
+    After a successful build, ``append`` consumes each text delta exactly once.
+    It may buffer text without submitting an engine update. An empty final
+    append flushes pending text and closes input without ending generation.
+    Append/delivery failures terminate the utterance; do not retry a delta
+    whose engine delivery may already have occurred.
+    """
+
+    async def build(self, text: str, *, final: bool) -> PreparedRequest: ...
+
+    async def append(self, request_id: str, text: str, *, final: bool) -> None: ...
+
+
 @dataclass
 class SpeechServingContext:
     """Shared state and helpers an adapter may use.
@@ -269,8 +310,18 @@ class TTSModelAdapter(ABC):
     backend: ClassVar[str] = "ar"
     #: Whether streaming entrypoints must retain terminal metrics for validation.
     validates_generation: ClassVar[bool] = False
+    #: Whether to report a ``length`` finish of the AR entry stage (stopped at
+    #: ``max_new_tokens`` or the context window before end-of-speech) as
+    #: truncated audio: ``X-Audio-Truncated`` on non-streaming responses and
+    #: ``truncated`` on the SSE ``speech.audio.done`` event. Enable it only
+    #: after checking that this model's entry stage emits the speech itself, so
+    #: that a ``length`` finish means the audio was cut off. A
+    #: ``validate_generation`` error takes precedence: rejected audio is never
+    #: returned with the flag.
+    reports_length_truncation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    supports_incremental_input: ClassVar[bool] = False
     #: None disables commitment. Opt-in adapters describe their complete
     #: commitment contract so the handler can validate every requested feature.
     text_commitment: ClassVar[TextCommitmentCapabilities | None] = None
@@ -353,6 +404,10 @@ class TTSModelAdapter(ABC):
         the ``voice_name`` / ``voice_created_at`` metadata.
         """
 
+    async def create_incremental_input(self, request: "OpenAICreateSpeechRequest") -> IncrementalTTSInput:
+        """Create fresh model input state; ordinary request validation is shared."""
+        raise ValueError(f"Incremental model input is not supported by {self.name}")
+
     def apply_sampling_overrides(
         self,
         sampling_params_list: list,
@@ -388,14 +443,41 @@ class TTSModelAdapter(ABC):
     def collect_response_metadata(self, audio_output: Mapping[str, Any], collect: dict) -> None:
         """Fold engine-side metadata from the mm payload into ``collect``.
 
-        Non-streaming only. The orchestrator surfaces select ``collect``
-        entries as response headers (precedent: ``word_timestamps`` ->
-        ``X-Word-Timestamps``, ``audio_truncated`` -> ``X-Audio-Truncated``);
-        adapters opt in by setting the keys it knows. Default: no-op.
+        Called for the final non-streaming audio output and for each
+        audio-bearing streaming output, including partial or empty audio.
+        When the caller omits its metadata collector, serving supplies a
+        temporary dictionary for each call; adapters must not assume that
+        ``collect`` persists across streaming outputs.
+
+        Set ``audio_synthesis_error=True`` to reject a failed synthesis.
+        Serving also surfaces selected entries as non-streaming response
+        headers, such as ``audio_truncated`` -> ``X-Audio-Truncated``.
+        Default: no-op.
         """
 
     async def warmup(self) -> None:
         return
+
+    def stage_setting(self, section: str, name: str) -> Any:
+        """The serving stage's deploy setting ``name``, or None when it is unset.
+
+        A typed stage config keeps the setting in one of its sections; a
+        legacy one keeps every setting flat under ``engine_args``. A section
+        the typed config lacks is a caller bug and raises ``AttributeError``;
+        only an unset setting returns None.
+
+        Args:
+            section: The typed config's section that holds the setting, such
+                as ``runtime_config`` for ``additional_config`` or
+                ``scheduler_config`` for ``max_num_seqs``.
+            name: The deploy file's key.
+        """
+        stage = self.ctx.server._tts_stage
+        engine_args = getattr(stage, "engine_args", None)
+        return getattr(getattr(stage, section) if engine_args is None else engine_args, name, None)
+
+    def shutdown(self) -> None:
+        """Release model-specific serving work before the executor shuts down."""
 
     def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
         return None
@@ -449,25 +531,21 @@ class DiffusionTTSAdapter(TTSModelAdapter):
 
     backend: ClassVar[str] = "diffusion"
 
-    #: Backing diffusion pipeline class (for EXTRA_BODY_PARAMS lookup).
-    pipeline_cls: ClassVar[type | None] = None
-
     @classmethod
     def extra_body_params(cls) -> frozenset[str]:
-        """Fallback-safe access to the pipeline's declared body params.
-
-        Returns the pipeline's ``EXTRA_BODY_PARAMS`` if the #3572 contract is
-        present, else an empty frozenset (the adapter then uses its own inline
-        parameter logic).
-        """
-        params = getattr(cls.pipeline_cls, "EXTRA_BODY_PARAMS", None)
-        return frozenset(params) if params is not None else frozenset()
+        """Return body parameters declared for this adapter's model arches."""
+        params: set[str] = set()
+        for model_arch in cls.model_archs:
+            params.update(get_extra_body_params(model_arch))
+        return frozenset(params)
 
 
 # Re-exported here to avoid import cycles at call sites.
 __all__ = [
     "ARTTSAdapter",
     "DiffusionTTSAdapter",
+    "IncrementalInputNotReadyError",
+    "IncrementalTTSInput",
     "OutputPolicy",
     "PreparedRequest",
     "SpeechServingContext",

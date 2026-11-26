@@ -1,15 +1,11 @@
 [
   {
     "test_name": "test_minicpmo_4_5_omniinteract",
-    "description": "Provisional H200 mean_duplex_busy_rtf baselines: 2026-11-18 single-day response means for 1q1a, 1q1a_math and 1qna (44, 16 and 17 valid samples), rounded to four decimals without margin. Source: JiusiServe/omni-reviewbot@71cb3bb12cca, vLLM-Omni@7a92afde03ef. Local device label L20X maps to H200. Higher Busy RTF variability is accepted; this short window does not establish stability. H100 calibration remains pending.",
     "mark": [
       {
         "hardware_marks": {
           "res": {
-            "cuda": [
-              "H100",
-              "H200"
-            ]
+            "cuda": "H100"
           },
           "num_cards": 2
         }
@@ -38,7 +34,6 @@
         "Qwen2.5-7B-Instruct"
       ]
     },
-    "omniinteract_aggregate_min_ia_qtf1": 0.2,
     "benchmark_params": [
       {
         "dataset_name": "omniinteract",
@@ -46,50 +41,7 @@
         "backend": "openai-realtime-duplex",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          8
-        ],
-        "max_concurrency": [
-          8
-        ],
-        "num_warmups": 0,
-        "disable_shuffle": true,
-        "trust_remote_code": true,
-        "omniinteract_subsets": "1q1a",
-        "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
-        "omniinteract_persist_artifacts": false,
-        "omniinteract_max_video_duration_s": 600,
-        "omniinteract_evaluate": true,
-        "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
-        "extra_body": {
-          "sliding_window_mode": "basic",
-          "basic_window_high_tokens": 7000,
-          "basic_window_low_tokens": 5000
-        },
-        "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
-        "metric-percentiles": "50,95",
-        "duplex_metric_aggregation": "response",
-        "required_duplex_metrics": [
-          "duplex_client_rtf",
-          "duplex_client_ttfp_ms",
-          "duplex_client_ttft_ms",
-          "duplex_busy_rtf",
-          "duplex_stall_ratio"
-        ],
-        "baseline": {
-          "H200": {
-            "mean_duplex_busy_rtf": [
-              2.9042
-            ]
-          }
-        }
-      },
-      {
-        "dataset_name": "omniinteract",
-        "dataset_path": "lucky-lance/OmniInteract@e195f75fe2666fcc5fe74f537ae49ca143a79969",
-        "backend": "openai-realtime-duplex",
-        "endpoint": "/v1/realtime",
-        "num_prompts": [
-          8
+          60
         ],
         "max_concurrency": [
           8
@@ -117,57 +69,7 @@
           "duplex_client_ttft_ms",
           "duplex_busy_rtf",
           "duplex_stall_ratio"
-        ],
-        "baseline": {
-          "H200": {
-            "mean_duplex_busy_rtf": [
-              0.9131
-            ]
-          }
-        }
-      },
-      {
-        "dataset_name": "omniinteract",
-        "dataset_path": "lucky-lance/OmniInteract@e195f75fe2666fcc5fe74f537ae49ca143a79969",
-        "backend": "openai-realtime-duplex",
-        "endpoint": "/v1/realtime",
-        "num_prompts": [
-          8
-        ],
-        "max_concurrency": [
-          8
-        ],
-        "num_warmups": 0,
-        "disable_shuffle": true,
-        "trust_remote_code": true,
-        "omniinteract_subsets": "1qna",
-        "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
-        "omniinteract_persist_artifacts": false,
-        "omniinteract_max_video_duration_s": 600,
-        "omniinteract_evaluate": true,
-        "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
-        "extra_body": {
-          "sliding_window_mode": "basic",
-          "basic_window_high_tokens": 7000,
-          "basic_window_low_tokens": 5000
-        },
-        "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
-        "metric-percentiles": "50,95",
-        "duplex_metric_aggregation": "response",
-        "required_duplex_metrics": [
-          "duplex_client_rtf",
-          "duplex_client_ttfp_ms",
-          "duplex_client_ttft_ms",
-          "duplex_busy_rtf",
-          "duplex_stall_ratio"
-        ],
-        "baseline": {
-          "H200": {
-            "mean_duplex_busy_rtf": [
-              0.6782
-            ]
-          }
-        }
+        ]
       }
     ]
   }

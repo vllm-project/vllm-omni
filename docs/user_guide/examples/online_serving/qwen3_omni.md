@@ -35,7 +35,8 @@ some GPUs.
 Asynchronous chunk streaming is **enabled by default** within the bundled configuration.
 On CUDA and NPU the same file selects model runner v2 for all three stages. The Thinker prefix cache is enabled on CUDA; NPU keeps it disabled by default (set `enable_prefix_caching: true` on stage 0 to opt in). Talker and Code2Wav keep it disabled.
 The NPU Thinker and Talker use an Ascend model state for attention metadata while retaining Omni request lifecycle and M-RoPE handling. Code2Wav uses Ascend input batches and forward context with the shared V2 chunk lifecycle. It runs without outer graph padding and copies audio to host synchronously before publishing each output. Code2Wav captures up to 32 exact-shape NPU graphs at startup for its streaming decode windows; other shapes run eagerly and nothing is captured while serving. Set `enforce_eager: true` on stage 2 to disable them.
-XPU, ROCm and MUSA stay on model runner v1. Set `model_runner: v1` in an overlay to opt out on CUDA or NPU.
+All AR and generation stages use Model Runner V2. `model_runner: v1` is rejected;
+backend and model-state support must be validated for the selected hardware.
 
 On B200/B300-class GPUs (SM100/SM103) with cuDNN 9.20.0, Qwen3-Omni
 automatically runs Code2Wav in FP32 when its configured precision resolves to
@@ -265,7 +266,7 @@ response=$(curl -s http://localhost:8091/v1/chat/completions \
   }')
 
 echo "$response" | jq -r '.choices[0].message.content'
-echo "$response" | jq -r '.choices[1].message.audio.data' | base64 -d > output.wav
+echo "$response" | jq -r '.choices[0].message.audio.data' | base64 -d > output.wav
 ```
 
 ### Using Python client
@@ -305,9 +306,9 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Describe vLLM in brief."}],
     modalities=["text", "audio"]
 )
-# Response contains two choices: one with text, one with audio
+# Text and audio are merged into a single choice
 print(response.choices[0].message.content)  # Text response
-print(response.choices[1].message.audio)    # Audio response
+print(response.choices[0].message.audio)    # Audio response
 ```
 
 ## Streaming Output
@@ -329,7 +330,7 @@ python openai_chat_completion_client_for_multimodal_generation.py \
     pip install 'vllm-omni[demo]'
     ```
 
-    For this 0.33 source checkout, follow the
+    For this 0.34 source checkout, follow the
     [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
     from the repository root. Build the temporary Gradio wheel and include it
     with `.[demo]` in the same normal install command.
@@ -397,38 +398,41 @@ The gradio script supports the following arguments:
 - `--port`: Port for Gradio server (default: 7861)
 - `--share`: Share the Gradio demo publicly (creates a public link)
 
-## Experimental DFlash Thinker decoding
+## DFlash Thinker decoding
 
-DFlash integration currently covers CUDA model runner v1 (MRv1), with an
-ordinary, non-speculative Talker and Code2Wav. The default deployment above
-uses MRv2 and is not the validated DFlash configuration. When configuring
-DFlash, explicitly select `model_runner: v1`, disable Thinker prefix caching
-(`enable_prefix_caching: false` on stage 0), and use non-resumable requests.
-Set stage 0 `pipeline_parallel_size: 1`: DFlash with pipeline parallelism is
-rejected before loading the Thinker weights because auxiliary captures are
-not configured on every pipeline rank. Tensor parallelism remains supported.
+DFlash runs on the Thinker. Talker and Code2Wav use their ordinary execution
+paths. Native MRv2 resumable speech uses the standard Qwen3-Omni pipeline
+with `async_chunk: true`, `async_scheduling: false` on AR stages, Thinker
+prefix caching disabled, and `pipeline_parallel_size: 1`. The
+`qwen3_omni_moe_resumable` pipeline provides scheduler-managed chunk transfer
+with MRv2. Model Runner V1 has been removed.
 
-For DFlash speech output, set stage 0 `enforce_eager: true` and
-`speculative_config.enforce_eager: true` so both the target Thinker and the
-DFlash drafter run eagerly. **CUDA Graph DFlash speech is outside the
-supported scope**, including with `disable_custom_all_reduce: true`: the
-graph experiment reported an unresolved generated-speech ASR regression.
-Disabling custom all-reduce addresses a startup failure, not speech quality.
+For DFlash speech, set stage 0 `enforce_eager: true` and
+`speculative_config.enforce_eager: true` for eager target and drafter execution.
+CUDA Graph DFlash speech has an unresolved generated-speech ASR regression.
 
-For text-only graph experiments, set stage 0
-`disable_custom_all_reduce: true`. With the pinned vLLM 0.33.0 runtime,
-DFlash with tensor parallelism and default custom all-reduce can fail during
-graph memory profiling before the service becomes ready. Eager execution
-of both target and drafter avoids that graph startup path. These settings
-are deployment requirements; the model does not enforce them at admission.
+The native resumable implementation was validated with vLLM 0.33.0 using
+Thinker TP1 and TP2. The current main uses vLLM 0.34, so those hardware
+results require revalidation on the updated runtime. See the
+[validation report](../../../design/qwen3_omni_dflash_validation.md)
+for the measured configurations and quality limitations.
 
-Eager execution also does not establish strict greedy equivalence:
-baseline/DFlash token differences remain unexplained. Treat this integration
-as experimental, and do not infer speech quality or output equivalence from
-successful requests or throughput alone. See the
-[validation results and limitations](../../../design/qwen3_omni_dflash_validation.md)
-for the tested configuration, accuracy evidence, and separate eager/graph
-performance results.
+For audiovisual speech requests, the Talker context must accommodate the
+user-turn rows transferred from the Thinker. A 60-second Daily-Omni video can
+produce roughly 14,000 prompt tokens. Set stage 1 `max_model_len: 32768`
+when testing the full dataset. The `max_num_batched_tokens` setting controls
+prefill chunk size, while `max_model_len` bounds each request's total context.
+A ready stage input exceeding that stage's context limit ends with a
+request-local error containing the prompt length and configured limit.
+
+## Other Thinker speculation with async_chunk
+
+With `async_chunk: true`, speech supports DFlash and `ngram_gpu` on the
+Thinker. `ngram_gpu` forwards each step's accepted tokens to the Talker through
+the same committed-span path as DFlash, for turn-mode requests only.
+Initialization rejects other methods, and `ngram_gpu` with
+`session_mode=duplex`, before loading Thinker weights. Disable `async_chunk`
+to use other methods.
 
 ## Example materials
 
@@ -452,3 +456,7 @@ performance results.
     ``````sh
     --8<-- "examples/online_serving/qwen3_omni/run_gradio_demo.sh"
     ``````
+
+DFlash currently supports turn-mode requests only. Qwen3-Omni initialization
+rejects `session_mode=duplex` with DFlash before loading Thinker weights; use
+turn mode or disable DFlash for a duplex deployment.

@@ -18,7 +18,10 @@
     "server_params": {
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
       "extra_cli_args": [
-        "--async-chunk"
+        "--async-chunk",
+        "--enable-orch-monitor",
+        "--stage-init-timeout",
+        "900"
       ]
     },
     "benchmark_params": [
@@ -46,6 +49,26 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
+          "MI300": {
+            "mean_audio_rtf": [
+              0.17206051893271568
+            ],
+            "request_throughput": [
+              0.09495439677312192
+            ],
+            "mean_ttft_ms": [
+              477.99807315332146
+            ],
+            "mean_tpot_ms": [
+              4.642169403002363
+            ],
+            "mean_e2el_ms": [
+              5009.269228748599
+            ],
+            "mean_audio_ttfp_ms": [
+              613.0700132547645
+            ]
+          },
           "H100": {
             "mean_audio_rtf": [
               0.1063
@@ -54,10 +77,10 @@
               0.0976
             ],
             "mean_ttft_ms": [
-              300.3004
+              302.6793
             ],
             "mean_tpot_ms": [
-              4.9229
+              4.9271
             ],
             "mean_e2el_ms": [
               2875.1345
@@ -68,19 +91,19 @@
           },
           "A3": {
             "mean_audio_rtf": [
-              0.573
+              0.7014
             ],
             "request_throughput": [
-              0.09
+              0.0758
             ],
             "mean_ttft_ms": [
               529.783
             ],
             "mean_tpot_ms": [
-              23.9466
+              27.2798
             ],
             "mean_e2el_ms": [
-              15733.0868
+              35032.2415
             ],
             "mean_audio_ttfp_ms": [
               1424.6187
@@ -114,6 +137,26 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
+          "MI300": {
+            "mean_audio_rtf": [
+              0.21692139290737722
+            ],
+            "request_throughput": [
+              0.47853915971821315
+            ],
+            "mean_ttft_ms": [
+              321.35434102237923
+            ],
+            "mean_tpot_ms": [
+              5.11727178018788
+            ],
+            "mean_e2el_ms": [
+              5591.195166952093
+            ],
+            "mean_audio_ttfp_ms": [
+              1313.3037257002798
+            ]
+          },
           "H100": {
             "mean_audio_rtf": [
               0.1296
@@ -136,22 +179,22 @@
           },
           "A3": {
             "mean_audio_rtf": [
-              0.7346
+              1.2352
             ],
             "request_throughput": [
-              0.4001
+              0.31
             ],
             "mean_ttft_ms": [
               431.6208
             ],
             "mean_tpot_ms": [
-              26.0156
+              30.9782
             ],
             "mean_e2el_ms": [
-              19482.2672
+              52017.2332
             ],
             "mean_audio_ttfp_ms": [
-              762.3133
+              2331.3428
             ]
           }
         }
@@ -184,6 +227,26 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
+          "MI300": {
+            "mean_audio_rtf": [
+              0.4057888853742787
+            ],
+            "request_throughput": [
+              0.9457588752981771
+            ],
+            "mean_ttft_ms": [
+              541.4254003600217
+            ],
+            "mean_tpot_ms": [
+              7.624797112787039
+            ],
+            "mean_e2el_ms": [
+              11128.196099488705
+            ],
+            "mean_audio_ttfp_ms": [
+              2060.99440202408
+            ]
+          },
           "H100": {
             "mean_audio_rtf": [
               0.1798
@@ -192,7 +255,7 @@
               0.9562
             ],
             "mean_ttft_ms": [
-              431.0742
+              460.0396
             ],
             "mean_tpot_ms": [
               6.5413
@@ -206,7 +269,7 @@
           },
           "A3": {
             "mean_audio_rtf": [
-              1.3666
+              2.5023
             ],
             "request_throughput": [
               0.5098
@@ -218,7 +281,7 @@
               44.8081
             ],
             "mean_e2el_ms": [
-              37961.326
+              87154.8693
             ],
             "mean_audio_ttfp_ms": [
               7125.4738
@@ -255,6 +318,20 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
+          "MI300": {
+            "mean_e2el_ms": [
+              735.6390352986637
+            ],
+            "request_throughput": [
+              0.09925524788997073
+            ],
+            "mean_ttft_ms": [
+              268.9336315175751
+            ],
+            "mean_tpot_ms": [
+              4.6241417757402
+            ]
+          },
           "H100": {
             "mean_e2el_ms": [
               733.5836
@@ -274,13 +351,13 @@
               2436.1048
             ],
             "request_throughput": [
-              0.0973
+              0.0972
             ],
             "mean_ttft_ms": [
               463.8431
             ],
             "mean_tpot_ms": [
-              23.4418
+              24.5161
             ]
           }
         }
@@ -316,6 +393,20 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
+          "MI300": {
+            "mean_e2el_ms": [
+              725.619000075676
+            ],
+            "request_throughput": [
+              0.4965968068643686
+            ],
+            "mean_ttft_ms": [
+              223.58727990213083
+            ],
+            "mean_tpot_ms": [
+              5.11000755366906
+            ]
+          },
           "H100": {
             "mean_e2el_ms": [
               694.9777
@@ -335,13 +426,13 @@
               2534.4575
             ],
             "request_throughput": [
-              0.4847
+              0.484
             ],
             "mean_ttft_ms": [
               347.8392
             ],
             "mean_tpot_ms": [
-              25.4835
+              27.363
             ]
           }
         }
@@ -379,6 +470,20 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
+          "MI300": {
+            "mean_e2el_ms": [
+              975.7155577820959
+            ],
+            "request_throughput": [
+              0.9902421804497239
+            ],
+            "mean_ttft_ms": [
+              359.2466840389534
+            ],
+            "mean_tpot_ms": [
+              6.240374665878445
+            ]
+          },
           "H100": {
             "mean_e2el_ms": [
               992.3741
@@ -390,7 +495,7 @@
               378.4494
             ],
             "mean_tpot_ms": [
-              6.1886
+              6.1976
             ]
           },
           "A3": {

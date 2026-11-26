@@ -7,8 +7,8 @@ import inspect
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import replace
-from typing import Any, TypedDict
+from dataclasses import dataclass, replace
+from typing import Any, TypedDict, cast
 
 import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -26,16 +26,28 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
 from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
-from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.omni_scheduler_mixin import (
+    OmniSchedulerMixin,
+    _request_finishes_on_next_stop,
+)
+from vllm_omni.core.sched.output import OmniCachedRequestData, OmniChunkCommit, OmniNewRequestData
+from vllm_omni.core.sched.seeded_isolation import isolation_plan, request_is_seeded
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
+from vllm_omni.core.sched.utils import (
+    streaming_update_replaces_prompt as _streaming_update_replaces_prompt,
+)
+from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
+from vllm_omni.engine.messages import TextInputUpdate
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import CONTINUE_TOKEN_ID
 from vllm_omni.worker_v2.ngram_adapter import is_thinker_ngram, use_scheduler_ngram
 
 logger = init_logger(__name__)
+
+_TEXT_INPUT_WAIT_TIMEOUT_SECONDS = 10.0
 
 
 class _ChunkSaveKwargs(TypedDict, total=False):
@@ -43,6 +55,51 @@ class _ChunkSaveKwargs(TypedDict, total=False):
     confirmed_num_computed_tokens: int | None
     duplex_perf_chunk: tuple[int, int]
     segment_generation: int | None
+    force_request_finished: bool
+
+
+def _segment_generation_of(request: Request) -> int | None:
+    """Scheduler segment identity for this poll, if the request carries one."""
+    raw = getattr(request, "_omni_segment_generation", None)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return raw
+
+
+def _enqueue_last_sentence_chunk(
+    scheduler: OmniSchedulerMixin,
+    request: Request,
+    inter_stage_output: dict[str, Any] | None,
+    scheduler_output: SchedulerOutput,
+    req_id: str,
+    *,
+    is_segment_finished: bool,
+    new_token_ids: list[int],
+    confirmed_num_computed_tokens: int | None,
+) -> None:
+    """Enqueue the last-sentence vocoder chunk before ``_free_request``.
+
+    Saving after free drops that chunk; Code2Wav then parks on the last
+    segment until the client times out. Immediate ``save_async``, not
+    ``batch_saves``: the batch flush runs after the caller loop.
+    """
+    adapter = scheduler.chunk_transfer_adapter
+    if adapter is None:
+        return
+    save_kwargs: _ChunkSaveKwargs = {
+        "new_token_ids": new_token_ids,
+        "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
+        "force_request_finished": True,
+    }
+    perf_chunk = OmniSchedulerMixin._duplex_step_chunk(scheduler, scheduler_output, req_id)
+    if isinstance(perf_chunk, tuple):
+        save_kwargs["duplex_perf_chunk"] = perf_chunk
+    adapter.save_async(
+        inter_stage_output,
+        request,
+        is_segment_finished,
+        **save_kwargs,
+    )
 
 
 def _should_emit_engine_output(
@@ -57,6 +114,10 @@ def _should_emit_engine_output(
         bool(getattr(model_config, "use_v2_model_runner", False))
         and bool(getattr(model_config, "async_chunk", False))
         and not bool(getattr(model_config, "final_output", False))
+        # Only suppress per-step IPC on stages that stream async outputs over a
+        # connector (e.g. Talker). Orchestrator-fed stages (e.g. Stage-0 ASR)
+        # still need their intermediate tokens to reach OutputProcessor.
+        and stage_sends_async_output(model_config)
     )
 
 
@@ -125,6 +186,18 @@ def _slice_sampled_logprobs(logprobs: Any, req_index: int, sampled_token_ids: li
     return sliced
 
 
+@dataclass
+class _SeededIsolationStep:
+    """Queue surgery applied for one scheduling step of the seeded policy."""
+
+    limit: int | None
+    deferred: bool
+    drain: bool
+    solo: bool
+    saved_queues: tuple | None
+    unit_origins: list
+
+
 class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     """Synchronous AutoRegressive scheduler for vLLM-Omni. This class is also
     used as a base class for the OmniARAsyncScheduler and holds most of the
@@ -132,6 +205,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     """
 
     max_num_active_reqs: int
+    max_num_running_reqs: int
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
@@ -172,9 +246,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._thinker_ngram = is_thinker_ngram(self.vllm_config)
         self._scheduler_ngram: Callable[..., np.ndarray] | None = None
         if use_scheduler_ngram(self.vllm_config):
-            from vllm.v1.spec_decode.ngram_proposer import _find_longest_matched_ngram_and_propose_tokens
+            from vllm_omni.core.sched.ngram_lookup import find_longest_matched_ngram_and_propose_tokens
 
-            self._scheduler_ngram = _find_longest_matched_ngram_and_propose_tokens
+            self._scheduler_ngram = find_longest_matched_ngram_and_propose_tokens
             self._ngram_min = self.vllm_config.speculative_config.prompt_lookup_min
             self._ngram_max = self.vllm_config.speculative_config.prompt_lookup_max
             # Compile the lookup before serving the first request.
@@ -229,6 +303,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # until the engine consumes the owner's abort from its ordered input queue.
         self._overflowed_streaming_requests: set[str] = set()
         self._hold_payloadless_outputs = _holds_payloadless_outputs(self.vllm_config.model_config)
+        self._model_input_streams = {}
         # External finishes release Request before their terminal output is assembled.
         self._held_token_ids: dict[str, list[int]] = {}
         self._init_prefill_admission_policy()
@@ -238,6 +313,31 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
             return
         super().add_request(request)
+
+    def register_input_stream(self, request_id: str, stream: object) -> None:
+        """Register a stream that was validated before scheduler admission."""
+        self._model_input_streams[request_id] = stream
+
+    def append_text(self, update: TextInputUpdate) -> None:
+        """Append only to an active, explicitly opted-in request."""
+        stream = self._model_input_streams.get(update.request_id)
+        request = self.requests.get(update.request_id)
+        if stream is None or request is None or request.is_finished():
+            raise ValueError(f"No active input stream for request {update.request_id}")
+        stream.append(update.token_ids, final=update.final)
+
+    def _fail_input_stream_request(self, request: Request, reason: str) -> None:
+        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        if pending is None:
+            pending = self._pending_input_timeout_outputs = {}
+        request.stop_reason = reason
+        pending[request.request_id] = (
+            request.client_index,
+            OmniEngineCoreOutput(
+                request_id=request.request_id, new_token_ids=[], finish_reason=FinishReason.ERROR, stop_reason=reason
+            ),
+        )
+        self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
 
     def release_overflowed_requests(self, request_ids: Iterable[str]) -> None:
         """Release admission fences after an ordered abort, never an eager one."""
@@ -535,7 +635,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.num_spec_tokens,
         ).tolist()
 
-    def update_draft_token_ids(self, draft_token_ids) -> None:
+    def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         """Align the per-request draft buffers before the next schedule().
 
         Upstream writes each request's drafts independently, so a request
@@ -557,6 +657,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 draft_token_ids.req_ids,
                 [self._propose_scheduler_ngram(req_id) for req_id in draft_token_ids.req_ids],
             )
+        for req_id, drafts in zip(draft_token_ids.req_ids, draft_token_ids.draft_token_ids):
+            request = self.requests.get(req_id)
+            if (
+                drafts
+                and request is not None
+                and request.resumable
+                and (
+                    request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+                    or request.num_computed_tokens < request.num_prompt_tokens
+                )
+            ):
+                # post_step can return drafts after update_from_output already
+                # ended this segment and installed the next prompt. Never
+                # let those drafts become lookahead for the new segment.
+                drafts.clear()
         super().update_draft_token_ids(draft_token_ids)
         if not self._talker_kstep_armed():
             return
@@ -783,6 +898,390 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._enforce_kstep_span_uniformity(scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
+    def _find_text_input_waits(self) -> set[str]:
+        """Expire text waits before isolating queues, then return the blocked IDs."""
+        streams = getattr(self, "_model_input_streams", None)
+        if not streams:
+            return set()
+        blocked_ids = set()
+        now = time.monotonic()
+        for request_id, stream in list(streams.items()):
+            request = self.requests[request_id]
+            if stream.is_ready(request):
+                stream.wait_started_at = None
+            elif stream.wait_started_at is None:
+                stream.wait_started_at = now
+                blocked_ids.add(request_id)
+            elif now - stream.wait_started_at >= _TEXT_INPUT_WAIT_TIMEOUT_SECONDS:
+                self._fail_input_stream_request(
+                    request, f"Timed out waiting for text input after {_TEXT_INPUT_WAIT_TIMEOUT_SECONDS:g}s"
+                )
+            else:
+                blocked_ids.add(request_id)
+        return blocked_ids
+
+    def _prepare_text_input_waits(self, blocked_ids: set[str]):
+        """Park input-starved requests and return this tick's restoration data."""
+        if not blocked_ids:
+            return None
+        original_running = list(self.running)
+        held = {request for request in original_running if request.request_id in blocked_ids}
+        held_waiting = []
+        for waiting_queue in (self.waiting, self.kv_holding_waiting):
+            blocked = [request for request in waiting_queue if request.request_id in blocked_ids]
+            if blocked:
+                waiting_queue.remove_requests(blocked)
+                held_waiting.append((waiting_queue, blocked))
+        original_running_limit = self.max_num_running_reqs
+        original_active_limit = self.max_num_active_reqs
+        if held:
+            self.running[:] = [request for request in self.running if request not in held]
+            self.max_num_running_reqs -= len(held)
+            self.max_num_active_reqs -= len(held)
+        return original_running, held, held_waiting, original_running_limit, original_active_limit
+
+    def _restore_text_input_waits(self, waiting_state) -> None:
+        """Restore parked requests before the outer Omni queue/limit restoration."""
+        if waiting_state is None:
+            return
+        original_running, held, held_waiting, original_running_limit, original_active_limit = waiting_state
+        self.max_num_running_reqs = original_running_limit
+        self.max_num_active_reqs = original_active_limit
+        if held:
+            retained = set(self.running)
+            # Restore the order of running requests as well
+            self.running[:] = [request for request in original_running if request in held or request in retained] + [
+                request for request in self.running if request not in original_running
+            ]
+        for waiting_queue, blocked in held_waiting:
+            waiting_queue.prepend_requests(blocked)
+
+    def _attach_text_input_updates(self, scheduler_output: SchedulerOutput) -> None:
+        streams = getattr(self, "_model_input_streams", None)
+        if not streams:
+            return
+        for new_request in scheduler_output.scheduled_new_reqs:
+            new_request = cast(OmniNewRequestData, new_request)
+            stream = streams.get(new_request.req_id)
+            if stream is not None:
+                new_request.model_intermediate_buffer = {
+                    **(new_request.model_intermediate_buffer or {}),
+                    "input_stream_update": stream.take_update(reset=True),
+                }
+        cached = cast(OmniCachedRequestData, scheduler_output.scheduled_cached_reqs)
+        for request_id in cached.req_ids:
+            stream = streams.get(request_id)
+            update = stream.take_update(reset=False) if stream is not None else None
+            if update is not None:
+                additional = getattr(cached, "additional_information", None)
+                if additional is None:
+                    additional = cached.additional_information = {}
+                previous = additional.get(request_id)
+                additional[request_id] = {
+                    **(deserialize_additional_information(previous) if previous else {}),
+                    "input_stream_update": update,
+                }
+
+    @staticmethod
+    def _request_is_runnable(request: Any) -> bool:
+        """Whether upstream would consider this request runnable now.
+
+        A resumable session parked in ``WAITING_FOR_STREAMING_REQ`` is skipped by
+        upstream until its client sends the next segment, so it must not drive
+        the solo decision: an idle seeded session would otherwise hide every
+        other queue while the engine has free capacity (review P2 on #9937).
+        It is counted again as soon as the update lands and makes it runnable.
+        """
+        return getattr(request, "status", None) != RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    def _parked_running_requests(self) -> tuple[Any, ...]:
+        """Running requests parked in the chunk-transfer layer for this step.
+
+        ``_process_pending_omni_inputs`` runs before the isolation scan and can
+        move a running request into the adapter's (or native coordinator's)
+        chunk-waiting deques until the step ends. Those rows are still running
+        for admission purposes: the engine has no free capacity, and a request
+        admitted now would be co-batched once the step restores them (review
+        P2 on #9937).
+        """
+        parked: tuple[Any, ...] = ()
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is not None:
+            parked += (
+                *getattr(adapter, "waiting_for_chunk_running_requests", ()),
+                *getattr(adapter, "_held_non_active", ()),
+            )
+        coordinator = getattr(self, "input_coordinator", None)
+        if coordinator is not None:
+            # Native-coordinator path: same park/restore contract as the adapter.
+            parked += tuple(getattr(coordinator, "_waiting_for_chunk_running", ()))
+        return parked
+
+    def _seeded_isolation_plan(self) -> tuple[bool, bool]:
+        """Whether to defer admission and/or admit only a waiting seeded request."""
+        parked_running = self._parked_running_requests()
+        return isolation_plan(
+            # Adapter/coordinator-parked runners still occupy the engine this
+            # step; counting only ``self.running`` would solo-admit a seeded
+            # request and then co-batch it on restore (review P2 on #9937).
+            has_running=bool(self.running) or bool(parked_running),
+            seeded_running=any(
+                request_is_seeded(getattr(r, "sampling_params", None)) for r in (*self.running, *parked_running)
+            ),
+            seeded_waiting=any(
+                request_is_seeded(getattr(r, "sampling_params", None)) and self._request_is_runnable(r)
+                for r in (*self.waiting, *self.kv_holding_waiting)
+            ),
+        )
+
+    def _promote_seeded_request(self, queues: tuple[str, ...] = ("kv_holding", "waiting")) -> tuple[str, object] | None:
+        """Move the oldest seeded request of the given queues to the front.
+
+        Returns ``(queue_name, request)`` for the promoted request, or ``None``
+        when none of the requested queues holds a runnable seeded request.
+        """
+        for name in queues:
+            queue = self.kv_holding_waiting if name == "kv_holding" else self.waiting
+            target = next(
+                (
+                    r
+                    for r in queue
+                    if request_is_seeded(getattr(r, "sampling_params", None)) and self._request_is_runnable(r)
+                ),
+                None,
+            )
+            if target is None:
+                continue
+            if queue.peek_request() is not target:
+                queue.remove_request(target)
+                queue.prepend_request(target)
+            return name, target
+        return None
+
+    def _runnable_kv_holders(self, *, seeded: bool) -> list[object]:
+        return [
+            request
+            for request in self.kv_holding_waiting
+            if self._request_is_runnable(request)
+            and request_is_seeded(getattr(request, "sampling_params", None)) == seeded
+        ]
+
+    def _paired_with_seeded(self, request: object) -> bool:
+        """Whether ``request`` is the companion of a seeded CFG request.
+
+        Draining such a companion alone would split the pair: the pairing
+        wrapper deregisters it and the conditioned branch runs unguided
+        (review on #9937). The registries are the common pairing one
+        (``_cfg_req_to_pair`` / ``_cfg_pairs``) and the CFG scheduler's own
+        (``_request_pairs`` / ``_pairs``).
+        """
+        request_id = getattr(request, "request_id", None)
+        for request_registry, pair_registry in (
+            ("_cfg_req_to_pair", "_cfg_pairs"),
+            ("_request_pairs", "_pairs"),
+        ):
+            pair_id = getattr(self, request_registry, {}).get(request_id)
+            if pair_id is None:
+                continue
+            roles = getattr(self, pair_registry, {}).get(pair_id) or {}
+            members = [self.requests.get(rid) for rid in roles.values()]
+            if any(
+                member is not None and request_is_seeded(getattr(member, "sampling_params", None)) for member in members
+            ):
+                return True
+        return False
+
+    def _isolation_unit(self, request: object) -> list[object] | None:
+        """Requests that must be admitted together with the isolated request.
+
+        ``None`` means the request cannot be isolated safely this step (e.g. an
+        incomplete CFG pair); the caller then defers admission instead.
+        """
+        request_id = getattr(request, "request_id", None)
+        pair_id = getattr(self, "_cfg_req_to_pair", {}).get(request_id)
+        if pair_id is None:
+            return [request]
+        # Audex and the other common pairing pipelines register their CFG pair
+        # on the ordinary AR scheduler; restricting admission to the
+        # conditioned branch would make the pairing wrapper drop the pair and
+        # release it unguided (review P1 on #9937).
+        roles = getattr(self, "_cfg_pairs", {}).get(pair_id) or {}
+        if len(roles) != 2:
+            return None
+        members = [self.requests.get(roles[role]) for role in ("cond", "uncond")]
+        return members if all(member is not None for member in members) else None
+
+    def _isolation_group_size(self, request: object) -> int | None:
+        unit = self._isolation_unit(request)
+        return None if unit is None else len(unit)
+
+    def _begin_seeded_isolation(self) -> _SeededIsolationStep:
+        """Apply this step's seeded-isolation queue surgery.
+
+        Kept out of ``schedule()`` so the policy keeps a small, self-contained
+        surface that is easy to rebase (review on #9937).
+        """
+        seeded_defer, seeded_solo = self._seeded_isolation_plan()
+        solo_queue = None
+        solo_group = 1
+        drain_kv = False
+        unit_origins: list[tuple[object, str]] = []
+        if seeded_solo:
+            # Upstream drains KV-holding requests first: their blocks are already
+            # allocated, so they can finish and release memory for the requests
+            # that still need a prefill allocation. A fresh seeded request must
+            # not hide that queue. If only unseeded holders are waiting, drain
+            # them this step (normal limit, ``waiting`` hidden) instead of
+            # solo-admitting a fresh request that may not be able to allocate -
+            # that would repeat the same failing plan and livelock (#9937).
+            # Holders that already own their blocks can finish and release
+            # memory without a new allocation, so let the unseeded ones drain
+            # first - even when a seeded holder is queued. A seeded holder may
+            # still need a block, and solo-admitting it would hide a holder that
+            # could have made progress (P2 on #9937).
+            drain_unit = [
+                holder for holder in self._runnable_kv_holders(seeded=False) if not self._paired_with_seeded(holder)
+            ]
+            # A drain step that scheduled nothing means the selected holders
+            # could not allocate; give the seeded holder the next step instead,
+            # and vice versa (review P2 on #9937).
+            if getattr(self, "_isolation_drain_stalled", False):
+                drain_unit = []
+            promoted = None
+            if drain_unit:
+                drain_kv = True
+            else:
+                promoted = self._promote_seeded_request(queues=("kv_holding",))
+                if promoted is None:
+                    promoted = self._promote_seeded_request(queues=("waiting",))
+            if promoted is not None:
+                solo_queue, solo_request = promoted
+                unit = self._isolation_unit(solo_request)
+                if unit is not None:
+                    # A CFG unit can straddle the two queues: the companion may
+                    # already hold KV blocks while the seeded branch still waits.
+                    # Gather both members so the unit is admitted together.
+                    for member in unit:
+                        origin = next(
+                            (
+                                name
+                                for name, queue in (("waiting", self.waiting), ("kv_holding", self.kv_holding_waiting))
+                                if any(request.request_id == member.request_id for request in queue)
+                            ),
+                            None,
+                        )
+                        if origin is None:
+                            unit = None
+                            break
+                        unit_origins.append((member, origin))
+                if unit is None:
+                    # Cannot isolate this unit safely; admit nothing instead of
+                    # splitting it across a solo step.
+                    seeded_defer, solo_queue, unit = True, None, None
+                    unit_origins.clear()
+                else:
+                    solo_group = len(unit)
+
+        # A solo step admits only the promoted unit (a CFG pair counts as one):
+        # empty the *other* queue for this step so it cannot be admitted
+        # alongside. A drain step keeps ``kv_holding_waiting`` and hides only
+        # the fresh ``waiting`` queue.
+        original_wait_queues = None
+        deferred = seeded_defer or self._should_defer_waiting_admission()
+        if deferred or solo_queue is not None or drain_kv:
+            original_wait_queues = self.waiting, self.kv_holding_waiting
+            if deferred:
+                self.waiting = create_request_queue(self.policy)
+                self.kv_holding_waiting = create_request_queue(self.policy)
+            elif drain_kv:
+                # Keep only the unseeded holders (a seeded holder must not join
+                # their batch) and let them drain at the normal limit.
+                self.kv_holding_waiting.remove_requests(drain_unit)
+                restricted = create_request_queue(self.policy)
+                for request in drain_unit:
+                    restricted.add_request(request)
+                self.kv_holding_waiting = restricted
+                self.waiting = create_request_queue(self.policy)
+            else:
+                # Restrict the promoted queue to the isolation unit, not just
+                # the cap: the queue is pre-built by `OmniCFGARScheduler` and a
+                # cap wide enough for a pair would otherwise admit an unrelated
+                # request that sits between its branches (#9937).
+                for member, origin in unit_origins:
+                    origin_queue = self.waiting if origin == "waiting" else self.kv_holding_waiting
+                    origin_queue.remove_requests([member])
+                restricted = create_request_queue(self.policy)
+                for request in unit:
+                    restricted.add_request(request)
+                if solo_queue == "waiting":
+                    self.waiting = restricted
+                    self.kv_holding_waiting = create_request_queue(self.policy)
+                else:
+                    self.kv_holding_waiting = restricted
+                    self.waiting = create_request_queue(self.policy)
+
+        original_max_num_active_reqs = self.max_num_active_reqs
+        # One limit, computed once: the solo cap must survive the async-chunk
+        # reservation below (review on #9937). Paused streaming sessions are not
+        # in ``running`` but upstream counts them against this limit, so the
+        # solo budget is one executing slot on top of the parked ones -- without
+        # that, an unrelated parked session would consume the slot and the
+        # seeded request would never be admitted (review P2 on #9937).
+        parked_streaming_sessions = int(getattr(self, "num_waiting_for_streaming_input", 0) or 0)
+        limit = (
+            min(original_max_num_active_reqs, solo_group + parked_streaming_sessions)
+            if seeded_solo and not drain_kv and not seeded_defer
+            else original_max_num_active_reqs
+        )
+        async_chunk_transport = self._async_chunk_transport_enabled()
+        reserved_running_slots = (
+            self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
+        )
+        if reserved_running_slots:
+            limit = min(limit, max(0, original_max_num_active_reqs - reserved_running_slots))
+        return _SeededIsolationStep(
+            limit=limit,
+            deferred=deferred,
+            drain=drain_kv,
+            solo=solo_queue is not None,
+            saved_queues=original_wait_queues,
+            unit_origins=unit_origins,
+        )
+
+    def _finish_seeded_isolation(self, step: _SeededIsolationStep, *, scheduled_any: bool) -> None:
+        """Restore the queues and remember whether the step made progress."""
+        saved = step.saved_queues
+        if saved is not None:
+            original_waiting, original_kv_holding = saved
+            if step.unit_origins:
+                # Restore by current KV ownership: upstream can move a waiting
+                # request into `kv_holding_waiting` mid-step when it starts an
+                # async KV load, so the recorded origin can be stale (review P2
+                # on #9937).
+                origins_by_member = {id(member): origin for member, origin in step.unit_origins}
+                holds_kv_blocks = getattr(self, "_holds_kv_blocks", None)
+                for leftover in (*self.waiting, *self.kv_holding_waiting):
+                    if holds_kv_blocks is not None:
+                        target = original_kv_holding if holds_kv_blocks(leftover) else original_waiting
+                    else:
+                        origin = origins_by_member.get(id(leftover))
+                        target = original_kv_holding if origin == "kv_holding" else original_waiting
+                    target.prepend_requests([leftover])
+            else:
+                if self.waiting is not original_waiting:
+                    original_waiting.prepend_requests(self.waiting)
+                if self.kv_holding_waiting is not original_kv_holding:
+                    original_kv_holding.prepend_requests(self.kv_holding_waiting)
+            self.waiting, self.kv_holding_waiting = saved
+        self._restore_omni_wait_queues()
+        if not step.deferred:
+            if step.drain:
+                # Remember a stalled drain so the next step promotes the seeded
+                # holder instead of repeating the failing allocation.
+                self._isolation_drain_stalled = not scheduled_any
+            elif step.solo:
+                self._isolation_drain_stalled = False
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -799,29 +1298,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # refuses the rest.
         self._drop_talker_drafts_if_prefill_pending()
 
-        original_wait_queues = None
-        if self._should_defer_waiting_admission():
-            original_wait_queues = self.waiting, self.kv_holding_waiting
-            self.waiting = create_request_queue(self.policy)
-            self.kv_holding_waiting = create_request_queue(self.policy)
-
+        blocked_text_requests = self._find_text_input_waits()
+        step = self._begin_seeded_isolation()
         original_max_num_active_reqs = self.max_num_active_reqs
-        async_chunk_transport = self._async_chunk_transport_enabled()
-        reserved_running_slots = (
-            self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
-        )
-        if reserved_running_slots:
-            self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
+        self.max_num_active_reqs = step.limit
+        text_input_waits = None
+        scheduled_any = False
         try:
+            text_input_waits = self._prepare_text_input_waits(blocked_text_requests)
             scheduler_output = super().schedule(throttle_prefills)
+            scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", None)
+            if scheduled_tokens is None and isinstance(scheduler_output, dict):
+                scheduled_tokens = scheduler_output.get("num_scheduled_tokens")
+            scheduled_any = bool(scheduled_tokens)
         finally:
+            self._restore_text_input_waits(text_input_waits)
             self.max_num_active_reqs = original_max_num_active_reqs
-            if original_wait_queues is not None:
-                original_waiting, original_kv_holding = original_wait_queues
-                original_waiting.prepend_requests(self.waiting)
-                original_kv_holding.prepend_requests(self.kv_holding_waiting)
-                self.waiting, self.kv_holding_waiting = original_wait_queues
-            self._restore_omni_wait_queues()
+            self._finish_seeded_isolation(step, scheduled_any=scheduled_any)
 
         # Backstop: a step built without ``_update_after_schedule`` (nothing
         # booked, so nothing to reconcile) still leaves here uniform. On the
@@ -832,6 +1325,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             include_cached_payloads=True,
         )
+        self._attach_text_input_updates(scheduler_output)
         finished_reqs = self.get_finished_requests_needing_kv_transfer()
 
         # Wrap in omni scheduler output to carry transfer metadata.
@@ -950,6 +1444,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             or spec_decode_tokens
             or getattr(self, "kv_transfer_criteria", None)
             or self.chunk_transfer_adapter is not None
+            or getattr(self, "_native_resumable", False)
             or getattr(self, "is_mm_encoder_only", False)
             or num_nans_in_logits is not None
             or prompt_logprobs_dict
@@ -968,6 +1463,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             and not requires_token_updates
             else None
         )
+        # The worker's output order follows its batch, not num_scheduled_tokens.
+        # ModelRunnerOutput.req_id_to_index was dropped upstream; derive the
+        # row index from req_ids like the pin's scheduler does.
+        req_indices = {req_id: i for i, req_id in enumerate(model_runner_output.req_ids)}
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             if num_tokens_scheduled <= 0:
                 # A zero-token schedule entry used to die on the bare assert
@@ -1017,7 +1516,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism or async scheduling).
                 continue
-            req_index = model_runner_output.req_id_to_index[req_id]
+            req_index = req_indices[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
             stale_async_tokens = int(getattr(request, "async_tokens_to_discard", 0) or 0)
@@ -1028,7 +1527,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # domains must consume the old frame before new output passes.
                 request.async_tokens_to_discard = max(0, stale_async_tokens - len(generated_token_ids))
 
+            native_resumable_output = getattr(self, "_native_resumable", False) and getattr(
+                request, "_omni_native_resumable_sender", request.resumable
+            )
+            if native_resumable_output:
+                request._omni_native_resumable_sender = True
             if async_output_is_stale or (output_is_stale and request.drop_stale_output):
+                if native_resumable_output:
+                    self._pending_chunk_commits.append(OmniChunkCommit(req_id, [], discard=True))
                 # Output of a step scheduled before the request's in-flight
                 # tokens were discarded (segment stop / session replacement).
                 # num_computed_tokens was rolled back at the discard site, so
@@ -1185,7 +1691,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             stopped = sampling_validation_failed
             is_segment_finished = False
+            output_segment_generation = _segment_generation_of(request)
             finished = False
+            finish_on_next_stop = False
+            enqueued_finish_on_next_stop = False
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
@@ -1273,7 +1782,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 omits_chunk_transfer = self._request_omits_chunk_transfer_to_next_stage(request)
             # Capture before resumable stop handling can clear token history.
             num_generation_tokens = _num_generation_tokens(request)
+            processor_request = request
             if stopped:
+                # Last sentence: this 2150 is the Code2Wav request terminal.
+                # Mixin copies the stamp onto the parked session; also read the
+                # last sentence's additional_information in case that copy
+                # missed the wire shape. Only this stamp may force a request
+                # finish — a bare 2150 is still a segment park for other models.
+                finish_on_next_stop = _request_finishes_on_next_stop(request)
+                if finish_on_next_stop:
+                    request.resumable = False
+                if (
+                    request.resumable
+                    and self.chunk_transfer_adapter is not None
+                    and getattr(self.chunk_transfer_adapter, "uses_dflash", False) is True
+                ):
+                    processor_request = self.chunk_transfer_adapter._snapshot_processor_request(request)
                 if self.chunk_transfer_adapter is not None:
                     confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
                 if (
@@ -1285,11 +1809,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
+                # Capture before ``_handle_stopped_request``: a queued
+                # StreamingUpdate in the same step bumps generation, and this
+                # park's eco must keep the generation that just stopped.
+                output_segment_generation = _segment_generation_of(request)
                 if self.chunk_transfer_adapter is not None:
-                    try:
-                        boundary_generation = int(getattr(request, "_omni_segment_generation", 0) or 0)
-                    except (TypeError, ValueError):
-                        boundary_generation = 0
+                    boundary_generation = 0 if output_segment_generation is None else output_segment_generation
                 finished = self._handle_stopped_request(request)
                 is_segment_finished = not finished
                 if finished:
@@ -1337,6 +1862,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
                 if finished:
+                    # Last-sentence terminal: enqueue the vocoder chunk *before*
+                    # ``_free_request``. Saving after free drops that chunk
+                    # (#6670); Code2Wav then parks on the last segment until the
+                    # client times out. Immediate ``save_async``, not
+                    # ``batch_saves``: the batch flush runs after this loop.
+                    if finish_on_next_stop and self.chunk_transfer_adapter is not None and not omits_chunk_transfer:
+                        _enqueue_last_sentence_chunk(
+                            self,
+                            request,
+                            inter_stage_output,
+                            scheduler_output,
+                            req_id,
+                            is_segment_finished=is_segment_finished,
+                            new_token_ids=new_token_ids,
+                            confirmed_num_computed_tokens=confirmed_num_computed_tokens,
+                        )
+                        enqueued_finish_on_next_stop = True
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1404,6 +1946,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     routed_experts=routed_experts,
                     num_nans_in_logits=request.num_nans_in_logits,
                     is_segment_finished=is_segment_finished,
+                    segment_generation=output_segment_generation,
                     new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id),
                     num_generation_tokens=num_generation_tokens,
                 )
@@ -1411,6 +1954,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
                 assert prompt_token_id_logprobs is None
+
+            if native_resumable_output:
+                self._pending_chunk_commits.append(
+                    OmniChunkCommit(
+                        req_id,
+                        list(new_token_ids),
+                        segment_finished=is_segment_finished,
+                        request_finished=finished,
+                        discard=sampling_validation_failed,
+                    )
+                )
 
             if omits_chunk_transfer and inter_stage_output is not None:
                 logger.warning(
@@ -1421,6 +1975,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if (
                 self.chunk_transfer_adapter is not None
                 and not omits_chunk_transfer
+                and not enqueued_finish_on_next_stop
                 and (
                     inter_stage_output is not None
                     or (new_token_ids and requires_token_updates)
@@ -1449,9 +2004,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         }
                     )
                 else:
+                    if processor_request is not request and finished:
+                        save_kwargs["force_request_finished"] = True
                     self.chunk_transfer_adapter.save_async(
                         inter_stage_output,
-                        request,
+                        processor_request,
                         is_segment_finished,
                         **save_kwargs,
                     )
@@ -1710,13 +2267,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         session.mm_features.extend(update.mm_features)
                 self._finish_streaming_session_update(session, update)
                 return
-        replace_streaming_prompt = any(
-            isinstance(info, dict)
-            and isinstance(info.get("meta"), dict)
-            and info["meta"].get("replace_streaming_prompt") is True
-            for info in update_infos
-        )
-        if replace_streaming_prompt:
+        if _streaming_update_replaces_prompt(update_infos):
             self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return
@@ -2046,6 +2597,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         exists to keep alive. The same holds for a session whose overflow was
         recorded before this call and that upstream still reports as resumed.
         """
+        if self._resume_native_chunk_receiver(request):
+            return False
         finished = super()._handle_stopped_request(request)
         if finished:
             return True
@@ -2106,7 +2659,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
+        self._record_full_payload_discard(request)
 
+        streams = getattr(self, "_model_input_streams", None)
+        if streams is not None:
+            streams.pop(request.request_id, None)
         self._omits_kv_transfer_cache.pop(request.request_id, None)
 
         # [Upstream compat] Discard request from in-flight prefills set added
