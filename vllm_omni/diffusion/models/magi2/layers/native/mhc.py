@@ -26,7 +26,7 @@ def _mhc_mix_fp32(
     residual_matrix: torch.Tensor,
 ) -> torch.Tensor:
     """``MHCMix.forward_native`` with the stream mix as an elementwise contraction in at least FP32."""
-    branch = torch.einsum("tn,tc->tnc", post_coefficients, branch_output)
+    branch = post_coefficients.unsqueeze(-1) * branch_output.unsqueeze(1)
     accumulate = torch.promote_types(streams.dtype, torch.float32)
     mixed = (residual_matrix.to(accumulate).unsqueeze(-1) * streams.to(accumulate).unsqueeze(1)).sum(2)
     return mixed.to(streams.dtype) + branch
@@ -101,6 +101,13 @@ class MHCHandler:
         # Inductor keeps the strides of an as_strided input, so the norm kernel stores stream-major.
         return stream_major.as_strided(stream_major.shape, stream_major.stride()).transpose(0, 1)
 
+    def _use_elementwise_stream_contraction(self, tensor: torch.Tensor) -> bool:
+        return (
+            (self.fp32_stream_contractions or torch.compiler.is_compiling())
+            and tensor.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and not torch.is_autocast_enabled(tensor.device.type)
+        )
+
     def apply_pre(
         self,
         streams: torch.Tensor,
@@ -113,11 +120,9 @@ class MHCHandler:
         coefficients = torch.sigmoid(alpha * self.matmul_scale * logits + bias.unsqueeze(0))
         coefficients = coefficients.to(out_dtype or streams.dtype)
         if (
-            self.fp32_stream_contractions
+            self._use_elementwise_stream_contraction(streams)
             and coefficients.shape == streams.shape[:2]
             and coefficients.dtype == streams.dtype
-            and streams.dtype in (torch.float32, torch.bfloat16, torch.float16)
-            and not torch.is_autocast_enabled(streams.device.type)
         ):
             return (coefficients.float().unsqueeze(-1) * streams.float()).sum(1).to(streams.dtype)
         return torch.einsum("tn,tnc->tc", coefficients, streams)
@@ -157,8 +162,10 @@ class MHCHandler:
             raise ValueError("invalid mHC branch-output shape")
         if not torch.compiler.is_compiling():
             mix = _mhc_mix
+        elif self._use_elementwise_stream_contraction(residual_streams):
+            mix = _mhc_mix_fp32
         else:
-            mix = _mhc_mix_fp32 if self.fp32_stream_contractions else _mhc_mix.forward_native
+            mix = _mhc_mix.forward_native
         return mix(residual_streams, branch_output, post_coefficients, residual_matrix)
 
     def _check_multi(self, tensor: torch.Tensor) -> None:

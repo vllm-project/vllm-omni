@@ -94,7 +94,8 @@ def test_contractions_are_unchanged_off_musa(monkeypatch, dtype):
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("musa", [False, True])
-def test_compiled_mix_selection(monkeypatch, musa):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float64])
+def test_compiled_mix_selection(monkeypatch, musa, dtype):
     handler = _handler(monkeypatch, musa=musa)
     calls = []
 
@@ -108,9 +109,9 @@ def test_compiled_mix_selection(monkeypatch, musa):
     monkeypatch.setattr(mhc_module, "_mhc_mix_fp32", record("fp32", mhc_module._mhc_mix_fp32))
     monkeypatch.setattr(mhc_module._mhc_mix, "forward_native", record("native", MHCMix.forward_native))
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    streams, branch_output, post, residual = _mix_inputs(torch.float32)
+    streams, branch_output, post, residual = _mix_inputs(dtype)
     handler.hyper_connect(streams, branch_output, post, residual)
-    assert calls == ["fp32" if musa else "native"]
+    assert calls == ["fp32" if dtype in DTYPES else "native"]
 
 
 @pytest.mark.cpu
