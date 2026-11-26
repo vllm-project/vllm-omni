@@ -75,10 +75,10 @@ From the repository root, source
 `tests/e2e/accuracy/minimax_h3_image/setup_reference.sh` and run the accuracy
 test with `--run-level full_model`. The first run needs access to the pinned
 Diffusers source and both weight formats. For offline runs, pre-cache `main`
-with the native and converted weights. The Nightly jobs retain images, metrics,
-and standard `result_acc_*.json` accuracy summaries. The test allocates up to
-3 minutes for reference preflight, 20 for reference generation on CUDA (25 on
-NPU), 10 for server startup, and 3 per image request. These limits leave at
+with the native and converted weights. The CUDA Nightly job retains images,
+metrics, and standard `result_acc_*.json` accuracy summaries. The test allocates
+up to 3 minutes for reference preflight, 20 for CUDA reference generation, 10
+for server startup, and 3 per image request. These limits leave at
 least 10 minutes of the 60-minute job for setup, cleanup, and artifacts.
 
 `H3_IMAGE_CALIBRATE` defaults to `1`. Successful calibration reports SKIP
@@ -91,7 +91,9 @@ status to `selected`. The shared accuracy helpers resolve the device profile.
 All floors currently remain `null`; an unselected or invalid gate fails before
 model startup. Both draws for each task must meet both floors.
 
-A3 Nightly runs both implementations on one die. The Diffusers reference uses
-leaf-level offload for the text encoder and one block per group for the DiT.
-For a manual run, initialize the CANN environment, source `setup_reference.sh`,
-and select `full_model and npu and A3 and cards_1`.
+A3 accuracy calibration is paused in Nightly while the Diffusers reference
+failure is investigated. Manual A3 runs use one die for each implementation.
+The Diffusers reference uses leaf-level offload for the text encoder and one
+block per group for the DiT, with a 25-minute generation timeout. For a manual
+run, initialize the CANN environment, source `setup_reference.sh`, and select
+`full_model and npu and A3 and cards_1`.
