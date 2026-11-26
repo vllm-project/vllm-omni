@@ -150,14 +150,18 @@ def test_hunyuan_ar_platform_runner_defaults(platform, deploy_name, pipeline_key
 
 
 def test_higgs_default_profile_enables_mrv2_async_audio_payload() -> None:
+    from vllm_omni.config.stage_config import resolve_stage_model_runner
+    from vllm_omni.transformers_utils.configs import HiggsAudioV3Config
+
     deploy = load_deploy_config(_DEPLOY_DIR / "higgs_multimodal_qwen3.yaml")
     stage = deploy.stages[0]
 
     assert stage.async_scheduling is True
-    assert stage.engine_extras["hf_overrides"] == {
-        "audio_async_prompt_mode": True,
-        "audio_async_payload": True,
-    }
+    options = HiggsAudioV3Config(**stage.engine_extras.get("hf_overrides", {})).resolve_mrv2_defaults(
+        use_v2_model_runner=resolve_stage_model_runner(deploy, stage) == "v2"
+    )
+    assert options.audio_async_prompt_mode is True
+    assert options.audio_async_payload is True
 
 
 @pytest.mark.parametrize("pending", [False, True])

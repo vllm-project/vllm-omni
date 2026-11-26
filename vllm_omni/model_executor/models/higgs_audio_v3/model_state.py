@@ -23,8 +23,9 @@ class HiggsModelState(OmniModelState):
         super().__init__(vllm_config, model, encoder_cache, device)
         # Fix decode-state addresses before any sampling graph can capture them.
         # (The external-decode-graph decision itself lives in the talker's
-        # __init__, keyed off use_v2_model_runner, so eager/v2 combos hit the
-        # MLP-graph disarm and the mutual-exclusion assert there.)
+        # __init__, keyed off enforce_eager and cudagraph_mode: an eager V2
+        # profile keeps the local MLP graph, and selecting the external graph
+        # triggers the MLP-graph disarm and the mutual-exclusion assert there.)
         model._ensure_decode_state_capacity(max(self.max_num_tokens, 128), device)
         logger.info("Higgs MRV2 custom sampler and owned audio snapshots enabled")
         if model.mrv2_options.audio_mrv2_static_inputs:

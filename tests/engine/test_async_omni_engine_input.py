@@ -265,6 +265,7 @@ def test_unsupported_mrv2_sampling_is_rejected_before_queue_and_does_not_poison_
         )
     ]
     engine.request_queue = mocker.Mock()
+    engine.prompt_expand_func = None
 
     with pytest.raises(ValueError, match="repetition_penalty"):
         engine.add_request(

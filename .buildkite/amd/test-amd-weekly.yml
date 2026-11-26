@@ -1965,7 +1965,7 @@ steps:
             env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=210
             bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
             tests/e2e/online_serving/test_higgs_audio_v3.py
-            13 tts rocm-higgs-audio-v3-weekly
+            15 tts rocm-higgs-audio-v3-weekly
 
       # CUDA owns these in one L4 lane. Keep the online sweep separate on AMD
       # so its shared server lifetime cannot hide offline or graph-parity failures.
