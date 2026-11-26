@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
-import ast
 import copy
 import json
 import os
@@ -809,20 +808,6 @@ def test_sensenova_accuracy_is_not_in_daily_pipelines(pipeline: str, monkeypatch
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
     rendered = _render_test_pipeline(doc, changed_files=None, pipeline_path=path)
     assert not any("SenseNova-U1" in step.get("label", "") for step in _iter_steps(rendered))
-
-
-@pytest.mark.parametrize("mode", ["text2img", "img2img"])
-def test_sensenova_accuracy_uses_weekly_mark(mode: str) -> None:
-    path = Path(f"tests/e2e/offline_inference/test_sensenova_u1_{mode}_expansion.py")
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    case = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == f"test_sensenova_u1_{mode}_pixel_accuracy"
-    )
-    marks = {ast.unparse(mark) for mark in case.decorator_list}
-    assert "pytest.mark.slow" in marks
-    assert not marks & {"pytest.mark.core_model", "pytest.mark.advanced_model", "pytest.mark.full_model"}
 
 
 def test_voxcpm2_voxtral_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:

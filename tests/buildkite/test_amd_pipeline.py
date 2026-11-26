@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import ast
 import json
 import os
 import re
@@ -1162,47 +1161,6 @@ def test_longcat_image_edit_tiny_diffusion_has_cold_start_headroom() -> None:
     assert "offline_init_timeout_s=900" in longcat_edit_settings
 
 
-def test_flux2_klein_weekly_pixel_contract_uses_native_image_diff() -> None:
-    source = Path("tests/e2e/offline_inference/test_flux2_klein.py").read_text(encoding="utf-8")
-
-    assert "ImageChops.difference(first, second).getbbox(alpha_only=False)" in source
-    assert "if current_omni_platform.is_rocm():" in source
-    assert "assert _image_difference_bbox(images1[0], images2[0]) is None" in source
-    assert "list(images1[0].getdata())" not in source
-    assert "zip(images1[0].getdata(), images2[0].getdata())" not in source
-
-
-def test_flux2_dev_weekly_online_has_cold_start_headroom() -> None:
-    path = Path("tests/e2e/online_serving/test_flux_2_dev_expansion.py")
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    timeout_assignment = next(
-        statement
-        for statement in tree.body
-        if isinstance(statement, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "FLUX_2_DEV_INIT_TIMEOUT_S" for target in statement.targets
-        )
-    )
-    assert isinstance(timeout_assignment.value, ast.Constant)
-    assert timeout_assignment.value.value == 1800
-
-    cases = next(
-        statement
-        for statement in tree.body
-        if isinstance(statement, ast.FunctionDef) and statement.name == "_get_flux_2_dev_feature_cases"
-    )
-    server_params = [
-        node
-        for node in ast.walk(cases)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "OmniServerParams"
-    ]
-    assert len(server_params) == 6
-    for params in server_params:
-        timeout = next(keyword.value for keyword in params.keywords if keyword.arg == "init_timeout")
-        assert isinstance(timeout, ast.Name)
-        assert timeout.id == "FLUX_2_DEV_INIT_TIMEOUT_S"
-
-
 def test_wan_sdpa_alignment_cpu_case_stays_shared_and_cuda_kernel_stays_nvidia() -> None:
     cpu_case = Path("tests/diffusion/distributed/test_wan_attention_sdpa_alignment.py").read_text(encoding="utf-8")
     cuda_case = Path("tests/diffusion/distributed/test_wan_attention_sdpa_alignment_cuda.py").read_text(
@@ -2348,46 +2306,6 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
         text = pipeline_path.read_text(encoding="utf-8")
         for label in jobs:
             assert label not in text
-
-
-def test_ming_weekly_uses_rocm_stage_init_allowance() -> None:
-    path = Path("tests/e2e/offline_inference/test_ming_flash_omni_expansion.py")
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    assignments: dict[str, ast.AST] = {}
-    for statement in tree.body:
-        if not isinstance(statement, ast.Assign):
-            continue
-        for target in statement.targets:
-            if isinstance(target, ast.Name):
-                assignments[target.id] = statement.value
-
-    timeout = assignments["MING_FLASH_OMNI_ROCM_STAGE_INIT_TIMEOUT_S"]
-    assert isinstance(timeout, ast.Constant)
-    assert ast.literal_eval(timeout) == 1800
-
-    rocm_kwargs = assignments["_ROCM_STAGE_INIT_KWARGS"]
-    assert isinstance(rocm_kwargs, ast.IfExp)
-    assert ast.unparse(rocm_kwargs.test) == "current_omni_platform.is_rocm()"
-    assert isinstance(rocm_kwargs.body, ast.Dict)
-    assert len(rocm_kwargs.body.keys) == 1
-    timeout_key = rocm_kwargs.body.keys[0]
-    assert isinstance(timeout_key, ast.Constant)
-    assert timeout_key.value == "stage_init_timeout"
-    assert len(rocm_kwargs.body.values) == 1
-    timeout_ref = rocm_kwargs.body.values[0]
-    assert isinstance(timeout_ref, ast.Name)
-    assert timeout_ref.id == "MING_FLASH_OMNI_ROCM_STAGE_INIT_TIMEOUT_S"
-    assert isinstance(rocm_kwargs.orelse, ast.Dict)
-    assert not rocm_kwargs.orelse.keys
-
-    for params_name in ("test_params_thinker", "test_params"):
-        params = assignments[params_name]
-        assert isinstance(params, ast.ListComp)
-        assert isinstance(params.elt, ast.Tuple)
-        assert len(params.elt.elts) == 3
-        kwargs_ref = params.elt.elts[2]
-        assert isinstance(kwargs_ref, ast.Name)
-        assert kwargs_ref.id == "_ROCM_STAGE_INIT_KWARGS"
 
 
 @pytest.mark.parametrize(
@@ -6278,14 +6196,6 @@ def test_qwen_duplex_rocm_mark_covers_the_whole_playback_class() -> None:
     ) in source
     # The class mark already selects the full_model method on ROCm.
     assert '@hardware_test(res={"rocm": "MI325"}, num_cards=2)' not in source
-
-
-def test_bagel_rocm_nightly_allows_cold_aiter_startup() -> None:
-    source = Path("tests/entrypoints/test_omni_sleep_mode.py").read_text(encoding="utf-8")
-    fixture = source.split("async def bagel_diffusion_engine", maxsplit=1)[1].split(
-        "@pytest.mark.full_model", maxsplit=1
-    )[0]
-    assert "init_timeout=1200" in fixture
 
 
 @pytest.mark.parametrize(

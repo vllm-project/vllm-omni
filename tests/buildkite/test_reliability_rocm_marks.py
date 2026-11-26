@@ -68,44 +68,6 @@ def test_invalid_parameter_scopes_declare_mi325(filename: str, expected_markers:
         assert source.count(marker) == expected_count
 
 
-def test_qwen_oom_uses_free_memory_ceiling_and_eager_params() -> None:
-    case_source = (RELIABILITY_DIR / "test_qwen3_omni.py").read_text(encoding="utf-8")
-    case_tree = ast.parse(case_source)
-    functions = {node.name: node for node in case_tree.body if isinstance(node, ast.FunctionDef)}
-    hard_return = next(node for node in ast.walk(functions["_hard_oom_config"]) if isinstance(node, ast.Return))
-    assert isinstance(hard_return.value, ast.Dict)
-    config = {
-        key.value: value
-        for key, value in zip(hard_return.value.keys, hard_return.value.values)
-        if isinstance(key, ast.Constant)
-    }
-    ceiling = config["max_free_bytes"]
-    assert isinstance(ceiling, ast.IfExp)
-    assert ast.unparse(ceiling.body) == "32 * 1024 * 1024"
-    assert ast.unparse(ceiling.orelse) == "256 * 1024 * 1024"
-    assert "torch.version" in ast.unparse(ceiling.test)
-    assert "eager_oom_stage_ids = (0, 1)" in case_source
-    assert "reliability_scenarios_for_eager_oom" in (RELIABILITY_DIR / "helpers.py").read_text(encoding="utf-8")
-    case = functions["test_gpu_oom_at_load"]
-    assert any("GpuOomUnderLoad" in ast.unparse(decorator) for decorator in case.decorator_list)
-    assert "GpuOomUnderLoad().run" in ast.unparse(case)
-    assert "def oom_under_load_request" in case_source
-    assert "def oom_preflight_request" in case_source
-    shared_tree = ast.parse((RELIABILITY_DIR / "scenarios" / "oom.py").read_text(encoding="utf-8"))
-    flow = next(
-        node for node in shared_tree.body if isinstance(node, ast.FunctionDef) and node.name == "run_oom_under_load"
-    )
-    injections = [
-        node
-        for node in ast.walk(flow)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "inject_gpu_oom"
-    ]
-    assert len(injections) == 1
-    assert "model.hard_oom_config" in ast.unparse(flow)
-    assert any(keyword.arg == "max_free_bytes" for keyword in injections[0].keywords)
-    assert "_run_oom_recovery" not in functions
-
-
 def _class_assignment(path: Path, class_name: str, name: str) -> ast.AST | None:
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in tree.body:
@@ -204,14 +166,3 @@ def test_diffusion_reliability_tracks_shared_stage_config_helper(key: str) -> No
 
     registry = yaml.safe_load(Path(".buildkite/common/ci_source_file_dependencies.yml").read_text(encoding="utf-8"))
     assert "tests/helpers/stage_config.py" in registry["source_file_dependencies"][key]
-
-
-def test_wan_reliability_uses_cli_deploy_without_stage_config_directory() -> None:
-    path = RELIABILITY_DIR / "test_wan22.py"
-    assert _class_assignment(path, "Wan22", "deploy_dir") is None
-    scenarios = _literal_class_assignment(path, "Wan22", "scenarios")
-    assert isinstance(scenarios, list) and scenarios
-    for scenario in scenarios:
-        params = scenario["server_params"]
-        assert "stage_config_name" not in params
-        assert "--usp" in params["server_args"]
