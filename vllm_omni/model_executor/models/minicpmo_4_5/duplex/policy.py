@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 # Server-owned token IDs appended after the media in one native input unit.
 APPEND_TEXT_TOKEN_IDS_KEY = "duplex_append_text_token_ids"
+REPLAY_CONTEXT_KEY = "duplex_replay_completed_turns"
 
 
 @dataclass(frozen=True, slots=True)

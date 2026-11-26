@@ -218,6 +218,21 @@ hard-capped replies remain in its bounded cache for prefix correction. Every
 completion path preserves that evidence until calibration retires it. Sessions
 without calibration release stopped output immediately.
 
+## MiniCPM-o history after an interruption
+
+Cancellation retires the active stage requests and advances the session epoch.
+The public conversation can still contain the portion of the cancelled answer
+that was emitted or played. For native MiniCPM-o sessions, the model plugin
+retains a bounded window of accepted input units and uses committed assistant
+text from completed responses. A committed user turn remains eligible when its
+answer is cancelled. The cancelled answer is omitted from model replay.
+
+Stage 0 prefills the retained units and text before the new epoch's first live
+unit. The replay does not generate output or write conversation items. The
+same mechanism serves Thinker-only and audio-capable deployments. The plugin
+caps replay material at 8 MiB of encoded input and 2,048 prefix tokens and
+selects only items still available in the prompt history.
+
 ## Experimental Qwen history policy
 
 Qwen defaults to `full_history` when `history_policy` is omitted from server-owned

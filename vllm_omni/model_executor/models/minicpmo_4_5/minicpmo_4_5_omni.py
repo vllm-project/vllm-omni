@@ -38,7 +38,11 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import APPEND_TEXT_TOKEN_IDS_KEY, MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
+    APPEND_TEXT_TOKEN_IDS_KEY,
+    REPLAY_CONTEXT_KEY,
+    MiniCPMO45DuplexPolicy,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMForConditionalGeneration,
@@ -755,6 +759,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 helper.thinker.audio_past_key_values = None
             helper._configure_streaming_processor(state)
             helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
+            replay = duplex.get(REPLAY_CONTEXT_KEY)
+            if replay:
+                helper.restore_completed_turns(state, replay, duplex["duplex_replay_token_budget"])
         return state
 
     @staticmethod

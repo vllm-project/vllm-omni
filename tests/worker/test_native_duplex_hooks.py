@@ -945,6 +945,30 @@ def test_minicpmo_stage0_window_uses_accepted_output_not_async_sampler_history(p
     assert 41 not in result["input_token_ids"]
 
 
+def test_minicpmo_stage0_replays_interrupted_user_as_listening_and_continues_audio(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    runtime._stage_audio_embeddings = lambda *args, **kwargs: torch.zeros((1, 2))
+    monkeypatch.setattr(runtime, "_decode_audio_payload", lambda payload: np.zeros(4, dtype=np.float32))
+    state = _MiniCPMO45Stage0SessionState(session_id="restore", window_enabled=True)
+    runtime.restore_completed_turns(
+        state,
+        [
+            {"epoch": 0, "inputs": [{}], "response_token_ids": [80]},
+            {"epoch": 0, "inputs": [{}, {}], "user_only": True, "resumes_audio_window": True},
+        ],
+        token_budget=15,
+    )
+    prefix = [1, 11, 5, 80, 10, 9, 2, 1, 11, 3, 2, 1, 11, 3, 2]
+    assert state.audio_encoder_chunk_idx == 2
+    assert state.restored_context.token_ids == prefix
+    live = runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), epoch=1, seq=1)
+    assert live["input_token_ids"] == [*prefix, 1, 11]
+    assert state.audio_encoder_chunk_idx == 3
+    assert state.pending_window_unit.token_ids == live["input_token_ids"]
+
+
 @pytest.mark.parametrize("pending_terminator", [None, 3, 99])
 def test_minicpmo_stage0_without_window_reconciles_accepted_terminator(pending_terminator):
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (

@@ -282,3 +282,79 @@ def test_final_exact_chunk_append_reserves_one_unit_not_two(seq):
         return len(prompt["prompt_token_ids"])
 
     assert _budget(seq=seq, final=True) == _budget(seq=seq, final=False)
+
+
+@pytest.mark.asyncio
+async def test_cancel_restore_keeps_committed_user_media_and_excludes_cancelled_answer(monkeypatch):
+    _stub_tokenizer(monkeypatch)
+    plugin = _plugin()
+    state = plugin.create_session_state()
+    runtime = await plugin.prepare_runtime_config(DuplexSessionConfig(modalities=("text",)), model_config=None)
+
+    async def plan(fence, seq, payload, config=None):
+        return await plugin.prepare_append_plan(
+            request_id="request",
+            fence=fence,
+            session_config=config or {},
+            runtime_config=runtime,
+            seq=seq,
+            turn_seq=1,
+            payload=payload,
+            final=False,
+            sampling_params=None,
+        )
+
+    blue = DuplexFence("session", epoch=0, turn_id=1)
+    cancelled = DuplexFence("session", epoch=0, turn_id=2)
+    recovery = DuplexFence("session", epoch=1, turn_id=3)
+    first = {
+        "type": "audio",
+        "audio": base64.b64encode(np.zeros(32000, dtype=np.float32).tobytes()).decode(),
+        "format": "pcm_f32le",
+        "sample_rate_hz": 16000,
+        "video_frames": ["blue-frame"],
+    }
+    old = {"type": "audio", "video_frames": ["old-frame"]}
+    new = {"type": "audio", "video_frames": ["new-frame"]}
+
+    first_plan = await plan(blue, 1, first)
+    plugin.observe_submitted_append(state=state, fence=blue, prompt=first_plan.prompt)
+    plugin.observe_response_end(state=state, fence=blue, response_id="blue", completed=True)
+    old_plan = await plan(cancelled, 2, old)
+    plugin.observe_submitted_append(state=state, fence=cancelled, prompt=old_plan.prompt)
+    plugin.observe_committed_input(state=state, fence=cancelled, item_id="user_old")
+    # Even if a generated reply was archived before playback, cancel excludes
+    # it. An already-visible prefix can still be present in conversation.
+    plugin.observe_response_end(state=state, fence=cancelled, response_id="old", completed=True)
+    plugin.observe_response_end(state=state, fence=cancelled, response_id="old", completed=False)
+    config = plugin.prepare_prompt_config(
+        {
+            "conversation": [
+                {"role": "assistant", "content": "Blue."},
+                {"role": "user", "content": "Please count."},
+                {"role": "assistant", "content": "One"},
+            ],
+            "conversation_item_ids": ("item_blue", "user_old", "item_old"),
+        },
+        state=state,
+        payload=new,
+    )
+    baseline = await plan(recovery, 1, new)
+    recovered = await plan(recovery, 1, new, config)
+    envelope = recovered.prompt["model_intermediate_buffer"]["duplex"]
+    turn, interrupted = envelope[module.REPLAY_CONTEXT_KEY]
+    assert turn["inputs"] == [{key: first[key] for key in ("audio", "format", "sample_rate_hz", "video_frames")}]
+    assert turn["response_token_ids"] == list(map(ord, "Blue."))
+    assert interrupted["user_only"] is True
+    assert interrupted["inputs"] == [{"video_frames": ["old-frame"]}]
+    assert interrupted["response_token_ids"] == []
+    assert envelope["payload"] == new
+    assert len(recovered.prompt["prompt_token_ids"]) == (
+        len(baseline.prompt["prompt_token_ids"]) + turn["token_budget"] + interrupted["token_budget"]
+    )
+    deleted_user = {**config, "conversation": [config["conversation"][0]], "conversation_item_ids": ("item_blue",)}
+    without_deleted = await plan(recovery, 1, new, deleted_user)
+    assert without_deleted.prompt["model_intermediate_buffer"]["duplex"][module.REPLAY_CONTEXT_KEY] == [turn]
+    for fence, seq in ((blue, 1), (recovery, 2)):
+        continued = await plan(fence, seq, new, config)
+        assert module.REPLAY_CONTEXT_KEY not in continued.prompt["model_intermediate_buffer"]["duplex"]
