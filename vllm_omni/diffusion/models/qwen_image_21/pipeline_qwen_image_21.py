@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -21,6 +21,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
+from torch._dynamo.exc import BackendCompilerFailed, InternalTorchDynamoError
 from transformers import AutoConfig, AutoModelForImageTextToText, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -475,7 +476,8 @@ class QwenImage21Pipeline(
         from vllm_omni.platforms import current_omni_platform
 
         self._decoder_compile_allowed = vae_compile_allowed(bool(self.od_config.enforce_eager), current_omni_platform)
-        self._decoder_compiled = False
+        self._decoder_compile_attempted = False
+        self._decoder_eager_forward: Callable[..., torch.Tensor] | None = None
 
         # `latents_mean` / `latents_std` are checkpoint constants, so they are built once
         # per (device, dtype) instead of on every request.
@@ -1131,33 +1133,38 @@ class QwenImage21Pipeline(
         }
 
     def _maybe_compile_decoder(self) -> None:
-        """Compile the decoder's forward once, on first use.
-
-        Deferred rather than done at construction because two things rebind the decode path
-        after ``__init__``: the pipeline profiler wraps ``vae.decode``, and the VAE fast path
-        replaces the decoder's submodule forwards. A callable captured earlier would pin the
-        pre-rebind version and silently bypass both.
-
-        ``self.decoder`` is the target rather than ``vae.decode``, so the profiler's wrapper
-        still runs, the tiled and OOM-recovery paths stay outside the compiled region - they
-        mutate the tile sizes the traced frame reads - and the shapes seen are the fixed-size
-        frame chunks and tiles rather than the per-request output size.
-        """
-        if self._decoder_compiled or not self._decoder_compile_allowed:
+        """Wrap the decoder after the VAE fast paths and profiler are installed."""
+        if self._decoder_compile_attempted or not self._decoder_compile_allowed:
             return
-        self._decoder_compiled = True
-        decoder = getattr(getattr(self, "vae", None), "decoder", None)
-        if decoder is None:
-            return
+        self._decoder_compile_attempted = True
+        decoder = self.vae.decoder
+        eager_forward = decoder.forward
         try:
-            decoder.forward = torch.compile(decoder.forward, mode="default", fullgraph=False, dynamic=False)
+            decoder.forward = torch.compile(eager_forward, mode="default", fullgraph=False, dynamic=False)
         except Exception:
             logger.warning(
                 "Qwen-Image-2.1: compiling the VAE decoder failed; using the reference forward",
                 exc_info=True,
             )
             return
-        logger.info("Qwen-Image-2.1: VAE decoder forward is compiled")
+        self._decoder_eager_forward = eager_forward
+        logger.info("Qwen-Image-2.1: enabled VAE decoder compilation")
+
+    def _decode_vae(self, latents: torch.Tensor) -> torch.Tensor:
+        self._maybe_compile_decoder()
+        try:
+            return self.vae.decode(latents, return_dict=False)[0]
+        except (BackendCompilerFailed, InternalTorchDynamoError):
+            if self._decoder_eager_forward is None:
+                raise
+            self.vae.decoder.forward = self._decoder_eager_forward
+            self._decoder_eager_forward = None
+            logger.warning(
+                "Qwen-Image-2.1: compiling the VAE decoder failed; using the reference forward",
+                exc_info=True,
+            )
+        # Restart the decode so tiling and cache cleanup run from the start.
+        return self.vae.decode(latents, return_dict=False)[0]
 
     def _decode_latents(
         self,
@@ -1185,8 +1192,7 @@ class QwenImage21Pipeline(
             )
         _, latents_mean, latents_std = self._latent_stats
         latents = latents * latents_std + latents_mean
-        self._maybe_compile_decoder()
-        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        image = self._decode_vae(latents)[:, :, 0]
         return DiffusionOutput(
             output=image,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,

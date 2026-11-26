@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from torch._dynamo.exc import BackendCompilerFailed
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
@@ -438,7 +439,7 @@ def _decode_latents_pipeline(decoded: torch.Tensor) -> tuple[QwenImage21Pipeline
 
     def decode(latents: torch.Tensor, return_dict: bool = True):
         seen.append(latents)
-        return (decoded,)
+        return (pipeline.vae.decoder.forward(latents),)
 
     pipeline.vae = SimpleNamespace(
         dtype=torch.float32,
@@ -448,7 +449,8 @@ def _decode_latents_pipeline(decoded: torch.Tensor) -> tuple[QwenImage21Pipeline
     )
     pipeline._latent_stats = None
     pipeline._decoder_compile_allowed = False
-    pipeline._decoder_compiled = False
+    pipeline._decoder_compile_attempted = False
+    pipeline._decoder_eager_forward = None
     pipeline.vae_scale_factor = 16
     pipeline._unpack_latents = lambda latents, *args: latents
     return pipeline, seen
@@ -521,20 +523,39 @@ def test_decoder_compile_happens_once(monkeypatch) -> None:
     assert len(calls) == 1, "torch.compile ran more than once"
 
 
-def test_decoder_compile_failure_falls_back(monkeypatch) -> None:
+@pytest.mark.parametrize("fail_during_decode", [False, True])
+def test_decoder_compile_failure_falls_back(monkeypatch, fail_during_decode) -> None:
     """A compile failure must leave the reference forward rather than break the request."""
     pipeline, seen = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
     pipeline._decoder_compile_allowed = True
     original = pipeline.vae.decoder.forward
 
-    def boom(fn, **kwargs):
-        raise RuntimeError("inductor said no")
+    def fail(*args, **kwargs):
+        raise BackendCompilerFailed(fail, RuntimeError("inductor said no"), None)
 
-    monkeypatch.setattr(torch, "compile", boom)
+    def compile_decoder(fn, **kwargs):
+        if fail_during_decode:
+            return fail
+        raise RuntimeError("could not prepare compilation")
 
-    pipeline._maybe_compile_decoder()
+    monkeypatch.setattr(torch, "compile", compile_decoder)
+    latents = torch.zeros(1, 4, 1, 8, 8)
+    assert pipeline._decode_latents(latents, 128, 128).output.shape == (1, 4, 8, 8)
 
     assert pipeline.vae.decoder.forward is original
-    # and decoding still works
-    pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
+    assert len(seen) == (2 if fail_during_decode else 1)
+    pipeline._decode_latents(latents, 128, 128)
+    assert pipeline.vae.decoder.forward is original
+
+
+def test_decoder_runtime_error_propagates(monkeypatch) -> None:
+    pipeline, seen = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
+    pipeline._decoder_compile_allowed = True
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("decoder execution failed")
+
+    monkeypatch.setattr(torch, "compile", lambda *args, **kwargs: fail)
+    with pytest.raises(RuntimeError, match="decoder execution failed"):
+        pipeline._decode_latents(torch.zeros(1, 4, 1, 8, 8), 128, 128)
     assert len(seen) == 1
