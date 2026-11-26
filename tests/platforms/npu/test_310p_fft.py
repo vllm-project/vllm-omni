@@ -19,7 +19,13 @@ import math
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.platforms.npu._310p import fft_ops
+
+pytestmark = [
+    pytest.mark.core_model,
+    *hardware_marks(res={"npu": "310P"}, num_cards=1),
+]
 
 TOL = 5e-4
 
