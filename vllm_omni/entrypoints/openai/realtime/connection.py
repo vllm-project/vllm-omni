@@ -198,7 +198,9 @@ class OpenAIFullDuplexConnection:
         # ASR runs off the read loop so the connection keeps receiving frames
         # while a turn transcribes; the single worker drains the queue in
         # order, so turns serialize and item order is preserved.
-        self._transcription_queue: asyncio.Queue[types.RealtimeConversationItemUserMessage] = asyncio.Queue()
+        self._transcription_queue: asyncio.Queue[
+            tuple[types.RealtimeConversationItemUserMessage, str | None, str | None]
+        ] = asyncio.Queue()
         self._transcription_task: asyncio.Task | None = None
         self._active_transcription_request_id: str | None = None
         self._response_cancel_event = asyncio.Event()
@@ -781,16 +783,19 @@ class OpenAIFullDuplexConnection:
         The transcription runs off the read loop so the connection keeps
         receiving frames while a turn transcribes; the single worker drains
         the queue in order, so turns serialize and item order is preserved.
+        The effective ASR options are snapshotted with the item: a
+        ``session.update`` accepted after the commit must not change how an
+        already-committed turn transcribes.
         """
-        self._transcription_queue.put_nowait(item)
+        self._transcription_queue.put_nowait((item, self._transcription_language, self._transcription_prompt))
         if self._transcription_task is None or self._transcription_task.done():
             self._transcription_task = asyncio.create_task(self._transcription_worker())
 
     async def _transcription_worker(self) -> None:
         while True:
-            item = await self._transcription_queue.get()
+            item, language, prompt = await self._transcription_queue.get()
             try:
-                await self._run_transcription(item)
+                await self._run_transcription(item, language, prompt)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -798,13 +803,20 @@ class OpenAIFullDuplexConnection:
             finally:
                 self._transcription_queue.task_done()
 
-    async def _run_transcription(self, item: types.RealtimeConversationItemUserMessage) -> None:
+    async def _run_transcription(
+        self,
+        item: types.RealtimeConversationItemUserMessage,
+        language: str | None,
+        prompt: str | None,
+    ) -> None:
         """Transcribe one committed audio turn (#11074).
 
         The committed item's audio is the only model input: no conversation
         history, no audio output. The text streams back as
         ``conversation.item.input_audio_transcription.delta`` chunks and a
-        final ``conversation.item.input_audio_transcription.completed``.
+        final ``conversation.item.input_audio_transcription.completed``. The
+        ``language`` / ``prompt`` options are the ones snapshotted when the
+        turn was committed, not the connection's current values.
         """
         audio_content = next(
             (part for part in item.content if getattr(part, "type", None) == "input_audio"),
@@ -819,12 +831,12 @@ class OpenAIFullDuplexConnection:
         if not audio:
             return
 
-        # Build the transcription system prompt from the session knobs.
+        # Build the transcription system prompt from the snapshotted knobs.
         parts = ["Transcribe the spoken audio exactly."]
-        if self._transcription_language:
-            parts.append(f"The language is {self._transcription_language}.")
-        if self._transcription_prompt:
-            parts.append(f"Context: {self._transcription_prompt}")
+        if language:
+            parts.append(f"The language is {language}.")
+        if prompt:
+            parts.append(f"Context: {prompt}")
         parts.append("Output only the transcript text, with no commentary.")
         instructions = " ".join(parts)
 

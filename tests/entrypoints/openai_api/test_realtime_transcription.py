@@ -112,7 +112,7 @@ class _TranscriptionConnection(OpenAIFullDuplexConnection):
 
     async def _build_full_prompt(self, tools=None, *, instructions=None, items=None, **_kwargs):
         if instructions is not None:
-            self.transcription_instructions = instructions
+            self.transcription_instructions.append(instructions)
         return {"prompt": "transcription-input"}
 
 
@@ -124,7 +124,7 @@ def _make_connection(websocket: _FakeWebSocket, engine) -> _TranscriptionConnect
         model_name="test-model",
         chat_handler=chat_handler,
     )
-    connection.transcription_instructions = ""
+    connection.transcription_instructions = []
     return connection
 
 
@@ -250,10 +250,11 @@ async def test_rejected_update_keeps_live_mode_and_knobs() -> None:
     assert connection._transcription_mode is True
     assert connection._transcription_language == "en"
     assert connection._transcription_prompt == "board meeting"
-    assert "The language is en." in connection.transcription_instructions
-    assert "Context: board meeting" in connection.transcription_instructions
-    assert "fr" not in connection.transcription_instructions
-    assert "stadium" not in connection.transcription_instructions
+    instructions = connection.transcription_instructions[-1]
+    assert "The language is en." in instructions
+    assert "Context: board meeting" in instructions
+    assert "fr" not in instructions
+    assert "stadium" not in instructions
 
 
 @pytest.mark.asyncio
@@ -395,11 +396,89 @@ async def test_transcription_engine_failure_emits_failed() -> None:
         content=[{"type": "input_audio", "audio": audio}],
     )
 
-    await connection._run_transcription(item)
+    await connection._run_transcription(item, "en", "board meeting")
 
     failed = [e for e in _sent_events(websocket) if e["type"] == "conversation.item.input_audio_transcription.failed"]
     assert len(failed) == 1
     assert failed[0]["error"]["code"] == "transcription_error"
+
+
+@pytest.mark.asyncio
+async def test_committed_turns_snapshot_their_asr_options() -> None:
+    """Options are snapshotted at commit time, not dequeue time.
+
+    With the first turn's ASR held, a second turn is committed under the
+    original knobs, then an accepted session.update changes the language
+    before the first turn releases: the queued turn still transcribes with
+    the options it was committed under, while a later turn — committed after
+    the update — uses the new ones.
+    """
+    hold = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class _HoldFirstEngine(SimpleNamespace):
+        def __init__(self) -> None:
+            super().__init__(
+                model_config=SimpleNamespace(max_model_len=100),
+                default_sampling_params_list=[SamplingParams()],
+            )
+            self.calls = 0
+
+        def generate(self, *, prompt, request_id, sampling_params_list, output_modalities):
+            first = self.calls == 0
+            self.calls += 1
+
+            async def _stream():
+                if first:
+                    await release_first.wait()
+                yield SimpleNamespace(outputs=[SimpleNamespace(text="t")])
+
+            return _stream()
+
+    fr_update = json.dumps(
+        {
+            "type": "session.update",
+            "session": {"type": "transcription", "input_audio_transcription": {"language": "fr"}},
+        }
+    )
+    websocket = _InboundFakeWebSocket(
+        [
+            _transcription_update(),
+            _audio_append(b"\x01\x02" * 100),
+            json.dumps({"type": "input_audio_buffer.commit"}),
+            _audio_append(b"\x03\x04" * 100),
+            json.dumps({"type": "input_audio_buffer.commit"}),
+            fr_update,
+            _audio_append(b"\x05\x06" * 100),
+            json.dumps({"type": "input_audio_buffer.commit"}),
+        ],
+        disconnect_event=hold,
+    )
+    connection = _make_connection(websocket, _HoldFirstEngine())
+    conn_task = asyncio.create_task(connection.handle_connection())
+
+    def completed() -> list[dict]:
+        return _events_of_type(websocket, "conversation.item.input_audio_transcription.completed")
+
+    # Let every commit land (the worker stays held on turn A), then release.
+    assert await _wait_for(lambda: connection._transcription_queue.qsize() == 2)
+    release_first.set()
+    assert await _wait_for(lambda: len(completed()) == 3), (
+        f"not all turns completed; got: {[e.get('type') for e in _sent_events(websocket)]}"
+    )
+    hold.set()
+    await asyncio.wait_for(conn_task, timeout=5.0)
+
+    assert len(connection.transcription_instructions) == 3
+    turn_a, turn_b, turn_c = connection.transcription_instructions
+    assert "The language is en." in turn_a
+    # B was committed under the en knobs — the later fr update does not
+    # change how it transcribes.
+    assert "The language is en." in turn_b
+    assert "The language is fr." not in turn_b
+    assert "Context: board meeting" in turn_b
+    # C was committed after the update: it uses the new language.
+    assert "The language is fr." in turn_c
 
 
 def test_absorb_stages_a_candidate_and_normalizes_for_the_adapter() -> None:
