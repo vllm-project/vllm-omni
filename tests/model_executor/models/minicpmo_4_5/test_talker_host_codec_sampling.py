@@ -35,7 +35,7 @@ def _make_talker() -> tts.MiniCPMO45OmniTTSForConditionalGeneration:
     return talker
 
 
-def _sample(talker, *, request_id: str, step: int, state: dict, max_tokens: int = 3):
+def _sample(talker, *, request_id: str, step: int, state: dict, logits: torch.Tensor | None = None):
     return talker._sample_audio_code_host(
         hidden_state=torch.zeros(1, 4),
         history=torch.empty(0, dtype=torch.long),
@@ -43,9 +43,9 @@ def _sample(talker, *, request_id: str, step: int, state: dict, max_tokens: int 
         request_state=state,
         step=step,
         min_tokens=0,
-        max_tokens=max_tokens,
+        max_tokens=3,
         eos_window_masked=False,
-        lg_dev=torch.zeros(_CODEC_VOCAB),
+        lg_dev=logits if logits is not None else torch.zeros(_CODEC_VOCAB),
     )
 
 
@@ -106,29 +106,40 @@ def test_native_codec_sampler_resumes_after_condition_eos(new_turn):
     """A native phrase can use several conditions under the same request ID."""
     from types import SimpleNamespace
 
+    from vllm_omni.engine.duplex.intermediate import set_tts_handoff
+
     talker = _make_talker()
     talker._request_audio_states = {}
     talker._request_condition_states = {}
+    talker._tts_config = SimpleNamespace(attention_type="full_attention")
     talker.emb_text = SimpleNamespace(weight=torch.zeros(1))
     talker._build_condition_embeddings = lambda *a, **k: torch.zeros(3, 4)
-    talker._build_streaming_recompute_embeddings = lambda cond, **k: cond
-    first_state = {"codec_temperature": 0.0}
     rid = "duplex-resumable"
-    assert _sample(talker, request_id=rid, step=0, state=first_state, max_tokens=2)[2]
-    assert _sample(talker, request_id=rid, step=1, state=first_state, max_tokens=2)[1]
+
+    def prefill(seq: int, turn_start: bool) -> dict:
+        info = {
+            "request_id": rid,
+            "native_duplex": True,
+            "meta": {
+                "streaming_condition_seq": seq,
+                "turn_start": turn_start,
+                "turn_end": True,
+                "turn_text_ends_sentence": True,
+            },
+        }
+        set_tts_handoff(info, torch.tensor([3]), torch.zeros(1, 4))
+        _, _, scratch = talker.preprocess(torch.zeros(3, dtype=torch.long), input_embeds=None, **info)
+        return scratch["audio_state"]
+
+    first_state = prefill(0, True)
+    assert _sample(talker, request_id=rid, step=0, state=first_state)[2]
+    stop_logits = torch.zeros(_CODEC_VOCAB)
+    stop_logits[_EOS_ID] = 100.0
+    assert _sample(talker, request_id=rid, step=1, state=first_state, logits=stop_logits)[1:] == (True, False)
     old = talker._request_host_codec_states[rid]
     draw_stream = old["generator"]
     assert old["history"] == [0]
-    from vllm_omni.engine.duplex.intermediate import set_tts_handoff
-
-    info = {
-        "request_id": rid,
-        "native_duplex": True,
-        "meta": {"turn_start": new_turn, "turn_end": True, "turn_text_ends_sentence": True},
-    }
-    set_tts_handoff(info, torch.tensor([3]), torch.zeros(1, 4))
-    _, _, scratch = talker.preprocess(torch.zeros(3, dtype=torch.long), input_embeds=None, **info)
-    _, finished, emit = _sample(talker, request_id=rid, step=0, state=scratch["audio_state"])
+    _, finished, emit = _sample(talker, request_id=rid, step=0, state=prefill(1, new_turn))
     assert emit and not finished
     assert old["generator"] is draw_stream
     assert old["history"] == ([0] if new_turn else [0, 0])
