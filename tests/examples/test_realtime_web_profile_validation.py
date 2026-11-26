@@ -20,6 +20,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
         ("joyai-turn", {"speechInput": True, "turnMode": "manual"}),
         ("joyai-turn", {"speechInput": True, "turnMode": "vad"}),
         ("aura-ptt", {}),
+        ("personaplex-native", {}),
         ("qwen3-turn", {"turnMode": "vad"}),
         ("qwen3-turn", {"turnMode": "semantic_vad"}),
     ],
