@@ -46,7 +46,7 @@ def _padding_matches(module: nn.Conv3d) -> bool:
         with torch.no_grad():
             for frames in (3, 17):
                 probe = torch.arange(1, 20 * frames + 1, device="cpu", dtype=torch.float32).view(1, 1, frames, 4, 5)
-                expected = F.pad(probe, (0, 0, 0, 0, 2, 0))
+                expected = F.pad(probe, (0, 0, 0, 0, 2 * module.padding[0], 0))
                 actual = module._apply_padding(probe)
                 if not (
                     isinstance(actual, torch.Tensor)
@@ -92,7 +92,7 @@ def _apply_padding(self: nn.Conv3d, x: torch.Tensor) -> torch.Tensor:
         return self._omni_noop_spatial_pad(x)
     # The all-zero spatial F.pad is gone. Keep the original left temporal
     # zero pad and let the checkpoint's own forward perform the convolution.
-    return F.pad(x, (0, 0, 0, 0, 2, 0), mode=self.pad_mode_t)
+    return F.pad(x, (0, 0, 0, 0, 2 * self.padding[0], 0), mode=self.pad_mode_t)
 
 
 def install_npu_skip_noop_pad(model: nn.Module, *, device: torch.device) -> int:
