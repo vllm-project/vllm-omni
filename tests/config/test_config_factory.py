@@ -1757,7 +1757,7 @@ stages:
         else:
             stages = merge_pipeline_deploy(pipeline, deploy)
             assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
-            assert stages[0].yaml_engine_args["enable_prefix_caching"] is (platform == "cuda")
+            assert stages[0].yaml_engine_args["enable_prefix_caching"] is (platform in {"cuda", "npu"})
         assert deploy.model_runner == ("v2" if expect_v2 else "v1")
 
         duplex = _apply_platform_overrides(
@@ -2181,7 +2181,8 @@ stages:
         ("yaml_name", "platform", "enabled"),
         [
             ("qwen3_omni_moe.yaml", "cuda", True),
-            *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
+            ("qwen3_omni_moe.yaml", "npu", True),
+            *(("qwen3_omni_moe.yaml", platform, False) for platform in ("rocm", "xpu", "musa")),
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", False),
             ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
@@ -2192,7 +2193,7 @@ stages:
         ],
     )
     def test_thinker_prefix_cache_defaults(self, monkeypatch, yaml_name: str, platform: str, enabled: bool):
-        """Stage-0 prefix caching ships on only for the validated CUDA turn profiles.
+        """Stage-0 prefix caching follows each platform and deployment profile.
 
         Checked on the final engine args: the stage value rides in
         ``engine_extras`` and must keep winning over the pipeline-wide flag.
@@ -3405,6 +3406,21 @@ class TestPlatformOverrides:
 
         structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=npu)
         assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [True, True, True]
+        thinker = structured.stage_by_id(0)
+        assert thinker.cache_config.enable_prefix_caching is True
+        assert thinker.scheduler_config.async_scheduling is True
+        graphs = thinker.compilation_config
+        assert graphs.cudagraph_mode.name == "FULL_AND_PIECEWISE"
+        legacy_graphs = legacy[0].yaml_engine_args["compilation_config"]
+        assert graphs.decode_cudagraph_capture_request_sizes == legacy_graphs["decode_cudagraph_capture_request_sizes"]
+        assert graphs.prefill_cudagraph_capture_token_sizes == legacy_graphs["prefill_cudagraph_capture_token_sizes"]
+        assert max(graphs.decode_cudagraph_capture_request_sizes) == thinker.scheduler_config.max_num_seqs == 64
+        assert {128, 144, 160}.issubset(graphs.prefill_cudagraph_capture_token_sizes)
+        assert max(graphs.prefill_cudagraph_capture_token_sizes) == 4608
+        for stage_id in (1, 2):
+            stage = structured.stage_by_id(stage_id)
+            assert stage.cache_config.enable_prefix_caching is False
+            assert stage.compilation_config.cudagraph_mode.name == "PIECEWISE"
 
     @pytest.mark.parametrize("platform", ["cuda", "npu"])
     def test_minicpmo_4_5_caps_talker_kv_cache(self, platform):

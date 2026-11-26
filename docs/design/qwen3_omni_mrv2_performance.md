@@ -78,14 +78,25 @@ streaming graph plan. Talker and Code2Wav share a device in the default NPU
 deployment, so graph-count limits alone do not provide a memory budget for
 these longer non-streaming windows (#10090).
 
-## Ascend prefix cache
+## Ascend Thinker graphs and prefix cache
 
-The default Thinker prefix cache is enabled on CUDA for V1 and V2. NPU keeps
-it disabled by default until cold/hit Thinker token parity is established;
-set `enable_prefix_caching: true` on stage 0 to opt in. Talker and Code2Wav
-retain disabled prefix caching. When enabled, the NPU V2 AR runner
-initializes the Omni stage-output cache after native Ascend KV setup; KV
-reuse alone would omit the cached Thinker rows needed by the Talker. The
-shared cache manager restores hidden and multimodal output rows on hits
-using its synchronous non-CUDA copy path. Duplex and the separate
-experimental profiles retain their explicit settings.
+The default `qwen3_omni_moe.yaml` enables Thinker prefix caching on CUDA and
+NPU. Talker and Code2Wav retain disabled prefix caching. The NPU Thinker
+uses `FULL_AND_PIECEWISE`: 11 decode capture sizes through 64 requests and
+36 prefill capture sizes through 4608 tokens, including short-prompt
+128/144/160-token buckets. It inherits default async scheduling. Larger
+capture sets add startup work and persistent graph-buffer memory; deployments
+can override the NPU stage-0 sizes.
+
+The NPU V2 AR runner initializes the Omni stage-output cache after native
+Ascend KV setup; KV reuse alone would omit the cached Thinker rows needed by
+the Talker. Its runner-owned manager selects native NPU streams/events for
+asynchronous device-to-host snapshots into pinned staging buffers. Source
+lifetime and snapshot completion are preserved before cached hidden and
+multimodal rows are restored for the Talker.
+
+The defaults were exercised with BF16 Instruct on three 910B1 cards. Directed
+V2 duplex tests also cover committed audio turns and interruption, with one
+API worker; they do not establish full audio-quality equivalence. The bundled
+duplex profiles retain their historical NPU V1 overrides and remain rejected
+by vLLM 0.34 until their runner migration is addressed separately.

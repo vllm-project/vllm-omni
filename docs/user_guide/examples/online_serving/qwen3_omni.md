@@ -33,7 +33,7 @@ The bundled Qwen3-Omni setup explicitly sets `moe_backend: triton` for the Think
 both stages on vLLM's Triton unquantized MoE path and avoids the unstable FlashInfer CUTLASS unquantized MoE path on
 some GPUs.
 Asynchronous chunk streaming is **enabled by default** within the bundled configuration.
-On CUDA and NPU the same file selects model runner v2 for all three stages. The Thinker prefix cache is enabled on CUDA; NPU keeps it disabled by default (set `enable_prefix_caching: true` on stage 0 to opt in). Talker and Code2Wav keep it disabled.
+On CUDA and NPU the same file selects model runner v2 for all three stages. The Thinker prefix cache is enabled by default on CUDA and NPU. Talker and Code2Wav keep it disabled.
 The NPU Thinker and Talker use an Ascend model state for attention metadata while retaining Omni request lifecycle and M-RoPE handling. Code2Wav uses Ascend input batches and forward context with the shared V2 chunk lifecycle. It runs without outer graph padding and copies audio to host synchronously before publishing each output. Code2Wav captures up to 32 exact-shape NPU graphs at startup for its streaming decode windows; other shapes run eagerly and nothing is captured while serving. Set `enforce_eager: true` on stage 2 to disable them.
 All AR and generation stages use Model Runner V2. `model_runner: v1` is rejected;
 backend and model-state support must be validated for the selected hardware.
@@ -109,35 +109,38 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 Captioner / Thinking checkpoints (`enable_audio_output=false`) still auto-select
 the same single-stage pipeline without `--deploy-config`.
 
-### Ascend TTFT profile
+### Ascend defaults
 
-The optional `qwen3_omni_moe_ascend_ttft.yaml` profile enables full Thinker
-decode graphs and expands the piecewise prefill capture sizes through 4608
-tokens, including 128/144/160-token buckets for short prompts. It enables
-the Thinker prefix cache and inherits default Thinker scheduling, with
-asynchronous chunk streaming and complete text/audio output.
-Talker and Code2Wav retain their existing graph settings.
+The default `qwen3_omni_moe.yaml` enables full Thinker decode graphs,
+expands piecewise prefill capture through 4608 tokens, and enables the
+Thinker prefix cache. Short prompts have 128/144/160-token capture buckets;
+decode capture covers up to 64 requests. Default Thinker async scheduling
+and asynchronous chunk streaming remain enabled. Talker and Code2Wav retain
+their existing graph settings.
 
-From a source checkout, launch the optional profile with:
+Standard turn serving selects these defaults automatically. To use two API
+workers, which share the stage engines and weights:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-    --deploy-config vllm_omni/deploy/qwen3_omni_moe_ascend_ttft.yaml \
     --api-server-count 2
 ```
 
-This profile inherits the default three-card Ascend placement: Thinker TP2
-on devices 0 and 1, with Talker and Code2Wav sharing device 2. Graph sizes were explored
-with BF16 Instruct weights on 3× Ascend 910B1 (64 GiB), CANN 9.2.1 and
-torch_npu 2.10.0.post7, using non-duplex SeedTTS English workloads at
-concurrency 1/16/32. The two API workers share the stage engines and weights.
-The historical combined performance results also disabled Thinker async
-scheduling. They describe that earlier variant; this profile inherits the
-default scheduler. Individual optimization gains remain unisolated.
+The default Ascend placement uses three cards: Thinker TP2 on devices 0 and
+1, with Talker and Code2Wav sharing device 2. The graph/cache settings were
+exercised with BF16 Instruct weights on 3× Ascend 910B1 (64 GiB), CANN 9.2.1
+and torch_npu 2.10.0.post7, including non-duplex SeedTTS English at C1/C16/C32
+and directed two-turn duplex audio sessions at C1/C4/C8 with an explicit V2
+override. The historical duplex YAMLs still select V1 on NPU, which vLLM
+0.34 rejects; this default-setting change does not migrate their runners.
+Qwen duplex sessions require one API worker because session resume routing
+across API workers is unsupported.
 
-Capture sizes should match the deployment workload. Larger capture sets
-increase startup work and persistent graph-buffer memory. Shapes beyond
-capture coverage use the runner's normal fallback.
+Larger capture sets increase startup work and persistent graph-buffer memory.
+The measured Thinker graph-memory estimate increased from about 0.12 to
+1.13 GiB per TP card. Adjust the NPU stage-0 capture sizes for deployments
+with tighter memory or startup budgets; shapes outside capture coverage use
+the runner's normal fallback.
 
 ### Thinking checkpoint chat template
 
