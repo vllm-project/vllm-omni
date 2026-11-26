@@ -62,6 +62,15 @@ def supports_ark_sparse() -> bool:
     return importlib.util.find_spec("auto_round_kernel") is not None
 
 
+def _require_ark_k_block_valid() -> None:
+    """Fail when the installed ARK cannot mask the tail of a partial K block."""
+    if "k_block_valid" not in _ark_block_sparse_parameters() or not supports_ark_k_block_valid():
+        raise RuntimeError(
+            "The installed auto-round-lib cannot mask zero-padded K-block tails; the XPU block-sparse "
+            "provider requires block_sparse_sdpa(k_block_valid=...). Install auto-round-lib>=0.17.0."
+        )
+
+
 def require_ark_sparse(
     device: torch.device,
     dtype: torch.dtype,
@@ -77,6 +86,9 @@ def require_ark_sparse(
     if block_size not in (64, 128):
         raise ValueError(f"ARK block-sparse attention requires block_size 64 or 128, got {block_size}")
     _load_ark_block_sparse()
+    # Provider resolution runs before the first forward, so an ARK build without
+    # tail masking fails at startup instead of on the first H3 request.
+    _require_ark_k_block_valid()
 
 
 def block_map_to_lut(block_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -126,11 +138,9 @@ if not hasattr(torch.ops.vllm_omni, "ark_block_sparse_attn_bshd"):
             # FastH3 tiles H3's padded latent grid, so partial edge blocks are the
             # norm. Without per-K-block valid lengths those zero-padded keys enter
             # the softmax denominator and silently shift the attention weights.
-            if "k_block_valid" not in _ark_block_sparse_parameters() or not supports_ark_k_block_valid():
-                raise RuntimeError(
-                    "The installed auto-round-lib cannot mask zero-padded K-block tails; FastH3 on XPU "
-                    "requires block_sparse_sdpa(k_block_valid=...). Install auto-round-lib>=0.17.0."
-                )
+            # Provider resolution already enforces this; keep the guard so direct
+            # callers of the custom op fail the same way.
+            _require_ark_k_block_valid()
             kwargs["k_block_valid"] = block_sizes
         return kernel(query, key, value, lut, valid_block_num, **kwargs)
 

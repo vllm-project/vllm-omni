@@ -100,6 +100,16 @@ def test_ark_provider_dispatches_lut_and_tile64_multirrow(monkeypatch):
     assert kwargs["tensor_layout"] == "NHD"
 
 
+def test_ark_provider_resolution_rejects_old_build(monkeypatch):
+    calls: list[Any] = []
+    _install_fake_ark(monkeypatch, calls, with_k_block_valid=False)
+    resolve_block_sparse_provider.cache_clear()
+
+    with pytest.raises(RuntimeError, match="auto-round-lib>=0.17.0"):
+        resolve_block_sparse_provider("xpu", "bf16", torch.device("xpu"), torch.bfloat16, 128, 64)
+    assert calls == []
+
+
 def test_ark_provider_requires_k_block_valid_when_blocks_are_partial(monkeypatch):
     calls: list[Any] = []
     _install_fake_ark(monkeypatch, calls, with_k_block_valid=False)
