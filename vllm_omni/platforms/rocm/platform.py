@@ -83,6 +83,17 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         apply_aiter_groupnorm(model, od_config.model_class_name)
 
     @classmethod
+    def init_diffusion_worker_vllm_config(cls, vllm_config: VllmConfig) -> None:
+        import os
+
+        # MIOpen's ConvAsmImplicitGemmGTCDynamicFwdXdlopsNHWC solver returns
+        # different bf16 conv outputs for identical inputs, so the same seeded
+        # SDXL request produces different images on MI300. Disable only this
+        # solver before the worker runs its first conv; an explicit user
+        # setting wins.
+        os.environ.setdefault("MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_FWD_GTC_XDLOPS_NHWC", "0")
+
+    @classmethod
     def get_diffusion_attn_backend_cls(
         cls,
         selected_backend: str | None,

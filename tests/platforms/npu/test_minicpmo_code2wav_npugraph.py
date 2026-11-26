@@ -15,6 +15,7 @@ pytest.importorskip("vllm_ascend")
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
     BatchedToken2Wav,
+    BatchedToken2WavState,
 )
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
@@ -511,12 +512,9 @@ def test_fused_body_npugraph_matches_its_eager_path_with_inference_weights():
                 torch.testing.assert_close(value, unfused, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("rows", [1, 4])
-@torch.inference_mode()
-def test_encoder_tail_and_prompt_replay_after_shared_precapture(rows):
+def _encoder_backend() -> BatchedToken2Wav:
     from cosyvoice2.transformer.upsample_encoder_v2 import UpsampleConformerEncoderV2
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.flow_encoder_graph import FlowEncoderGraphs
     from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import _undecorate_dynamo
 
     prepare_code2wav_graph_runtime()
@@ -538,6 +536,15 @@ def test_encoder_tail_and_prompt_replay_after_shared_precapture(rows):
     backend.flow.encoder_proj = nn.Linear(32, 16).npu()
     backend.flow.eval()
     _undecorate_dynamo(backend.flow.encoder, "forward_chunk")
+    return backend
+
+
+@pytest.mark.parametrize("rows", [1, 4])
+@torch.inference_mode()
+def test_encoder_tail_and_prompt_replay_after_shared_precapture(rows):
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.flow_encoder_graph import FlowEncoderGraphs
+
+    backend = _encoder_backend()
     graph = FlowEncoderGraphs(
         partial(backend._encode_chunk_eager, last_chunk=False),
         chunk_forward=backend._encode_chunk_eager,
@@ -597,3 +604,50 @@ def test_encoder_tail_and_prompt_replay_after_shared_precapture(rows):
     for actual, saved in retained:
         for a, b in zip(actual, saved, strict=True):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_padded_flow_graph_matches_eager_across_continuations_and_tails():
+    torch.manual_seed(307)
+    backend = _encoder_backend()
+    backend._chunk_encoder_steady_width = 35
+    backend._padded_flow_history = 416
+    backend._padded_flow_encoder = None
+    width = backend._chunk_encoder_steady_width
+
+    def tokens(count):
+        return torch.randint(0, 64, (count,), device="npu")
+
+    def eager(codes, last, cnn_cache=None, att_cache=None):
+        batch = codes.unsqueeze(0)
+        backend._ensure_relpos_pe(batch, att_cache)
+        return backend._encode_chunk_eager(batch, last_chunk=last, cnn_cache=cnn_cache, att_cache=att_cache)
+
+    with npu_token2wav_sdpa_context(require_math=True):
+        initial = [eager(tokens(history // 2 + 3), False) for history in (16, 44, 96, 224, 416)]
+        assert [entry[2].shape[3] for entry in initial] == [16, 44, 96, 224, 416]
+        assert backend._precapture_padded_flow_encoder(*initial[0][1:]) == 1
+
+        def compare_chunks(actual, expected, widths, last):
+            graph = backend._padded_flow_encoder
+            hits = graph.stats["hits"]
+            states = [
+                BatchedToken2WavState({"conformer_cnn_cache": cnn, "conformer_att_cache": att}, {})
+                for _, cnn, att in actual
+            ]
+            codes = [tokens(count) for count in widths]
+            actual = backend._encode_padded_flow_chunks(codes, states, [last] * len(codes))
+            assert graph.stats["hits"] == hits + 1
+            expected = [eager(ids, last, cnn, att) for ids, (_, cnn, att) in zip(codes, expected, strict=True)]
+            for result, reference in zip(actual, expected, strict=True):
+                for value, wanted in zip(result, reference, strict=True):
+                    torch.testing.assert_close(value, wanted, rtol=1e-4, atol=1e-4)
+            return actual, expected
+
+        actual = expected = initial[:4]
+        for _ in range(3):
+            actual, expected = compare_chunks(actual, expected, [width] * 4, False)
+        assert [entry[2].shape[3] for entry in actual] == [208, 236, 288, 416]
+        compare_chunks(actual, expected, [2, 3, 13, width], True)
+        for rows in (1, 2, 3):
+            compare_chunks(initial[-rows:], initial[-rows:], [2, 7, 19][:rows], True)

@@ -11,6 +11,7 @@ from tests.model_executor.models.minicpmo_4_5.helpers import stage0_vision_runti
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext, DuplexRuntimeConfigError
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex import plugin as minicpm_plugin
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
 from vllm_omni.model_executor.models.realtime_venus.duplex import RealtimeVenusDuplexPlugin, VenusDataPlane
@@ -165,11 +166,24 @@ def test_result_limit_is_retryable_without_mutation(plugin):
 
 @pytest.mark.parametrize(
     "key",
-    ["venus_function_results", "venus_function_generation", "venus_tokenizer_ref", "duplex_append_text_token_ids"],
+    ["venus_function_results", "venus_function_generation", "duplex_tokenizer_key", "duplex_append_text_token_ids"],
 )
 def test_client_cannot_inject_server_owned_tool_state(plugin, key):
     with pytest.raises(DuplexRuntimeConfigError):
         plugin.validate_client_extra_body({key: []})
+
+
+@pytest.mark.asyncio
+async def test_delegate_result_finds_the_tokenizer_cached_by_real_preparation(monkeypatch):
+    """The tokenizer key is the parent's; Venus must not cache under a path of its own."""
+    tokenizer = SimpleNamespace(encode=lambda text, **kwargs: list(text.encode()))
+    monkeypatch.setattr(minicpm_plugin, "_load_tokenizer", lambda model_config: tokenizer)
+    plugin = RealtimeVenusDuplexPlugin(lambda *args, **kwargs: "")
+    model_config = SimpleNamespace(model="model-path", tokenizer="tokenizer-path", tokenizer_revision="revision-a")
+    current = await plugin.prepare_runtime_config(
+        DuplexSessionConfig(model="venus", modalities=["text"]), model_config=model_config
+    )
+    assert result(plugin, current)["venus_function_results"]
 
 
 def test_stage0_places_result_after_media_and_caches_one_prefill():

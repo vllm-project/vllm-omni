@@ -18,6 +18,7 @@ from tests.engine.duplex.test_session_runner import (
 from tests.engine.duplex.test_session_runner_nemotron_voicechat import answer, error_codes
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallState
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import _tokenizer_key
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import TEXT_WITHOUT_AUDIO_KEY
 from vllm_omni.model_executor.models.realtime_venus.duplex import RealtimeVenusDuplexPlugin
 
@@ -28,7 +29,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 async def venus_session(**kwargs):
     plugin = RealtimeVenusDuplexPlugin(lambda *args: "")
     h = await open_harness(plugin=plugin, **kwargs)
-    plugin._tokenizers[""] = SimpleNamespace(encode=lambda text, **kw: list(text.encode()))
+    plugin._tokenizers[_tokenizer_key(None)] = SimpleNamespace(encode=lambda text, **kw: list(text.encode()))
     try:
         yield h
     finally:

@@ -2880,6 +2880,24 @@ class OrchestratorBase:
     ) -> Any:
         """Process a bypassing request's raw prompt with the input processor that also prepares the
         prompts forwarded to this stage, so the stage keeps a single multimodal cache sender."""
+        startup_marker = os.getenv("MINICPMO_NPU_TALKER_PREFILL_STARTUP")
+        if (
+            stage_id == 1
+            and startup_marker
+            and req_id.startswith("minicpmo-talker-startup-")
+            and os.path.isfile(startup_marker)
+            and self._next_stage_input_is_tokens(prompt)
+        ):
+            # A synthetic Talker handoff is already tokenized. Use the same
+            # constructor as a normal Thinker-to-Talker transfer.
+            request = await self._build_next_stage_request(
+                req_id,
+                stage_id,
+                prompt,
+                req_state.sampling_params_list[stage_id],
+                replica_id=replica_id,
+            )
+            return apply_omni_final_stage_metadata(request, req_state.final_stage_id)
         if replica_id is not None:
             prompt = await asyncio.to_thread(self._scope_stage_mm_cache_to_replica, stage_id, prompt, replica_id)
         request = await self._process_stage_inputs(
@@ -3792,6 +3810,8 @@ class OrchestratorBase:
                 except StageUnavailableError:
                     await self._fail_request_dead_stage(request_id, route_stage_id)
                     return False
+            if next_stage_id == 2 and pinned_replica_id is None and not req_state.session_owned:
+                pinned_replica_id = next_pool.select_code2wav_replica(request_id)
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
             stamp_downstream_stage_submit(
                 req_state,
