@@ -42,7 +42,21 @@ Attention/RoPE contracts, and mixed parameter residency. Combined NPU operator
 accuracy, video quality, memory, and latency gains still require A2/A3
 validation; CPU test results do not establish those gains.
 
-When the separate online VAE INT8 feature is also installed, both can be enabled:
+### W8A8 expansion and SwiGLU
+
+On Ascend, opt in for the native video decoder using the server startup JSON:
+
+```bash
+--additional-config '{"video_vae_w8a8_swiglu": true}'
+```
+
+This requires a MindIE-SD build that provides
+`mindiesd::eagle_quant_batch_matmul_swiglu_vae`. Only the biased `w1` in gated
+SiLU FFNs is quantized and fused. The operator adds FP32 bias and rounds to FP16
+before SwiGLU. It does not change the encoder, the `w2` projection, or the
+quantization of other components. The default is `false`.
+
+The separate RMSNorm/RoPE adapters and online VAE INT8 feature can be enabled as follows:
 
 ```bash
 MINIMAX_H3_VAE_USE_OMNI_OPS=1 \

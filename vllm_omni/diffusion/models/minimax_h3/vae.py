@@ -371,6 +371,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         lightvae_decoder_path: str | None = None,
         allow_decoder_compile: bool = False,
         stack_decode_tiles: bool = True,
+        use_w8a8_swiglu: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -456,6 +457,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 decoder,
                 device=device,
             )
+        if (
+            use_w8a8_swiglu
+            and device.type == "npu"
+            and decoder is not None
+            and decoder_path is None
+            and lightvae_decoder_path is None
+        ):
+            from .vae_w8a8_swiglu import install_video_vae_w8a8_swiglu
+
+            install_video_vae_w8a8_swiglu(decoder)
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
         # The three decoder fast paths below are XPU-only: they were written
         # against the XPU kernels/compile stack and validated there. CUDA keeps
