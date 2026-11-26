@@ -10,10 +10,7 @@ import torch
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.control_contract import (
     Cosmos3NanoSimBimanualControlVideoConditioning,
 )
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
-    Cosmos3NanoSimBimanualGeometry,
-    Cosmos3NanoSimBimanualResolutionPolicy,
-)
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import Cosmos3NanoSimBimanualGeometry
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_sim_bimanual import (
     ARDiffusionRequestRejectedError,
 )
@@ -21,7 +18,6 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_
     Cosmos3NanoSimTransferPipeline,
     _TransferConditioning,
     format_cosmos3_nano_sim_transfer_prompt,
-    resolve_cosmos3_nano_sim_transfer_geometry,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualSessionState,
@@ -34,7 +30,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _sampling_params(
     *,
-    resolution: str = "480",
     height: int | None = None,
     width: int | None = None,
     **extra,
@@ -42,58 +37,94 @@ def _sampling_params(
     return SimpleNamespace(
         height=height,
         width=width,
-        extra_args={"resolution": resolution, **extra},
+        extra_args=extra,
     )
 
 
 def test_transfer_input_video_drives_bucket_before_hint_control() -> None:
     params = _sampling_params(edge={"control": {"height": 480, "width": 480}})
     prompt = {
-        "multi_modal_data": {"video": {"height": 480, "width": 832}},
+        "multi_modal_data": {"video": {"height": 720, "width": 1280}},
     }
 
-    geometry = resolve_cosmos3_nano_sim_transfer_geometry(
-        params,
-        prompt,
-        Cosmos3NanoSimBimanualResolutionPolicy(),
-    )
+    geometry = pipeline()._resolve_request_geometry(params, prompt)
 
     assert (geometry.height, geometry.width) == (480, 832)
 
 
-@pytest.mark.parametrize("source", ["prompt", "additional_information"])
-def test_named_prompt_hint_preprocesses_source_video(monkeypatch, source):
-    from PIL import Image
-
+@pytest.fixture
+def transfer_preprocess(monkeypatch):
     from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
     from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_sim_transfer import (
         get_cosmos3_nano_sim_transfer_pre_process_func,
     )
+
+    manifest = pipeline().manifest
+    monkeypatch.setattr(Cosmos3NanoSimBimanualManifest, "from_od_config", lambda _: manifest)
+    return get_cosmos3_nano_sim_transfer_pre_process_func(SimpleNamespace(model_config={"guardrails": False}))
+
+
+@pytest.mark.parametrize("source", ["prompt", "additional_information"])
+def test_named_prompt_hint_preprocesses_source_video(transfer_preprocess, source):
+    from PIL import Image
+
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    manifest = pipeline().manifest
-    manifest.vae_spatial_compression_factor = 16
-    manifest.latent_patch_size = 2
-    monkeypatch.setattr(Cosmos3NanoSimBimanualManifest, "from_od_config", lambda _: manifest)
-    preprocess = get_cosmos3_nano_sim_transfer_pre_process_func(SimpleNamespace(model_config={"guardrails": False}))
     prompt = {"prompt": "test", "multi_modal_data": {"video": [Image.new("RGB", (32, 32))]}}
     (prompt if source == "prompt" else prompt.setdefault(source, {}))["edge"] = True
-    sp = OmniDiffusionSamplingParams(height=None, width=None, num_frames=1, extra_args={"resolution": "256"})
+    sp = OmniDiffusionSamplingParams(height=None, width=None, num_frames=1)
     request = OmniDiffusionRequest(request_id="edge", prompt=prompt, sampling_params=sp)
-    additional = preprocess(request).prompt["additional_information"]
-    assert additional["preprocessed_transfer_video"].shape == (1, 3, 1, 256, 256)
+    processed = transfer_preprocess(request)
+    assert (processed.sampling_params.height, processed.sampling_params.width) == (640, 640)
+    additional = processed.prompt["additional_information"]
+    assert additional["preprocessed_transfer_video"].shape == (1, 3, 1, 640, 640)
     assert "edge" not in sp.extra_args
+
+
+@pytest.mark.parametrize(
+    "sp,message",
+    [
+        (_sampling_params(resolution="720"), "supports only resolution"),
+        (_sampling_params(height=720, width=1280), "serialized dimensions do not match"),
+    ],
+)
+def test_transfer_preprocessor_rejects_720p_output(transfer_preprocess, sp, message):
+    request = SimpleNamespace(sampling_params=sp, prompt={"prompt": "test"})
+    with pytest.raises(ARDiffusionRequestRejectedError, match=message):
+        transfer_preprocess(request)
+
+
+@pytest.mark.parametrize("key", ["resolution", "image_size"])
+@pytest.mark.parametrize("resolution", ["256", "704", "720"])
+def test_transfer_rejects_other_output_families(key, resolution):
+    with pytest.raises(ValueError, match="supports only resolution '480'"):
+        pipeline()._resolve_request_geometry(_sampling_params(**{key: resolution}), {})
+
+
+@pytest.mark.parametrize(
+    "model_config,expected",
+    [({}, (480, 832)), ({"default_resolution": [640, 640]}, (640, 640))],
+)
+def test_transfer_default_canvas_without_media(model_config, expected):
+    p = pipeline()
+    p.resolution_policy = p._build_resolution_policy(SimpleNamespace(model_config=model_config), p.manifest)
+    geometry = p._resolve_request_geometry(_sampling_params(), {})
+    assert (geometry.height, geometry.width) == expected
+
+
+@pytest.mark.parametrize("default_resolution", [[256, 256], [480, 800], [720, 1280]])
+def test_transfer_deployment_default_must_be_canonical_480p(default_resolution):
+    p = pipeline()
+    config = SimpleNamespace(model_config={"default_resolution": default_resolution, "max_pixels": 921_600})
+    with pytest.raises(ValueError, match="default_resolution must be a canonical 480p bucket"):
+        p._build_resolution_policy(config, p.manifest)
 
 
 def test_transfer_hint_control_drives_bucket_without_input_video() -> None:
     params = _sampling_params(depth={"control": {"height": 832, "width": 480}})
 
-    geometry = resolve_cosmos3_nano_sim_transfer_geometry(
-        params,
-        {"prompt": "test"},
-        Cosmos3NanoSimBimanualResolutionPolicy(),
-    )
+    geometry = pipeline()._resolve_request_geometry(params, {"prompt": "test"})
 
     assert (geometry.height, geometry.width) == (832, 480)
 
@@ -106,22 +137,16 @@ def test_transfer_serialized_dimensions_must_match_generated_bucket() -> None:
     )
 
     with pytest.raises(ValueError, match="serialized dimensions do not match"):
-        resolve_cosmos3_nano_sim_transfer_geometry(
-            params,
-            {"prompt": "test"},
-            Cosmos3NanoSimBimanualResolutionPolicy(),
-        )
+        pipeline()._resolve_request_geometry(params, {"prompt": "test"})
 
 
-def test_transfer_generated_bucket_must_pass_bimanual_policy() -> None:
-    params = _sampling_params(resolution="720", edge={"control": {"height": 480, "width": 832}})
-    policy = Cosmos3NanoSimBimanualResolutionPolicy(
-        default_resolution=(480, 832),
-        max_pixels=480 * 832,
-    )
+def test_transfer_generated_bucket_must_pass_deployment_pixel_cap() -> None:
+    p = pipeline()
+    config = SimpleNamespace(model_config={"max_pixels": 480 * 832})
+    p.resolution_policy = p._build_resolution_policy(config, p.manifest)
 
     with pytest.raises(ValueError, match="max_pixels"):
-        resolve_cosmos3_nano_sim_transfer_geometry(params, {"prompt": "test"}, policy)
+        p._resolve_request_geometry(_sampling_params(aspect_ratio="1,1"), {})
 
 
 def pipeline(chunk_size: int = 1) -> Cosmos3NanoSimTransferPipeline:
@@ -141,8 +166,11 @@ def pipeline(chunk_size: int = 1) -> Cosmos3NanoSimTransferPipeline:
         window_frames=51 if chunk_size == 1 else 96,
         sink_frames=1 if chunk_size == 1 else 0,
         temporal_compression_factor=4,
+        vae_spatial_compression_factor=16,
+        latent_patch_size=2,
         require_control_video_conditioning=lambda: contract,
     )
+    instance.resolution_policy = instance._build_resolution_policy(SimpleNamespace(), instance.manifest)
     instance.dtype = torch.float32
     instance.device = torch.device("cpu")
     return instance
@@ -395,7 +423,7 @@ def test_online_declared_fields_reach_admission_and_geometry() -> None:
     assert sp.extra_args == body
     request = pipeline()._validate_conditioning_request(sp, None, prompt_data=None)
     assert (request.hint, request.window_frames, request.sink_frames) == ("depth", 30, 3)
-    geometry = resolve_cosmos3_nano_sim_transfer_geometry(sp, {}, Cosmos3NanoSimBimanualResolutionPolicy())
+    geometry = pipeline()._resolve_request_geometry(sp, {})
     assert (geometry.height, geometry.width) == (480, 832)
 
 
@@ -407,9 +435,9 @@ def test_emphasis_and_explicit_geometry() -> None:
     assert emphasized.startswith(plain)
     assert "Follow the depth control video precisely" in emphasized
     sp = SimpleNamespace(
-        extra_args={"resolution": "480", "aspect_ratio": "16,9", "depth": {"control": {"height": 832, "width": 480}}}
+        extra_args={"image_size": 480, "aspect_ratio": "16,9", "depth": {"control": {"height": 832, "width": 480}}}
     )
-    geometry = resolve_cosmos3_nano_sim_transfer_geometry(sp, {}, Cosmos3NanoSimBimanualResolutionPolicy())
+    geometry = pipeline()._resolve_request_geometry(sp, {})
     assert (geometry.height, geometry.width) == (480, 832)
 
 

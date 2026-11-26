@@ -160,10 +160,13 @@ class _ActionConditioning:
 def _resolution_policy(
     od_config: OmniDiffusionConfig,
     manifest: Cosmos3NanoSimBimanualManifest,
+    *,
+    default_resolution: tuple[int, int] = (720, 1280),
+    max_pixels: int = 921_600,
 ) -> Cosmos3NanoSimBimanualResolutionPolicy:
     return Cosmos3NanoSimBimanualResolutionPolicy(
-        default_resolution=deploy_option(od_config, "default_resolution", (720, 1280)),
-        max_pixels=deploy_option(od_config, "max_pixels", 921_600),
+        default_resolution=deploy_option(od_config, "default_resolution", default_resolution),
+        max_pixels=deploy_option(od_config, "max_pixels", max_pixels),
         vae_spatial_compression_factor=manifest.vae_spatial_compression_factor,
         latent_patch_size=manifest.latent_patch_size,
     )
@@ -225,6 +228,12 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     _vae_decode_stream: torch.cuda.Stream | None = None
     _streaming_decoder: WanStreamingDecoder | None = None
 
+    @staticmethod
+    def _build_resolution_policy(
+        od_config: OmniDiffusionConfig, manifest: Cosmos3NanoSimBimanualManifest
+    ) -> Cosmos3NanoSimBimanualResolutionPolicy:
+        return _resolution_policy(od_config, manifest)
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         self._ar_compile_mode = resolve_ar_compile_mode(od_config)
         validate_sim_parallel_config(od_config)
@@ -234,7 +243,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         self.overlap_vae_decode = bool(deploy_option(od_config, "overlap_vae_decode", True))
         if self.clean_commit_mode not in {"framewise", "batched"}:
             raise ValueError("clean_commit_mode must be 'framewise' or 'batched'")
-        self.resolution_policy = _resolution_policy(od_config, self.manifest)
+        self.resolution_policy = self._build_resolution_policy(od_config, self.manifest)
         self.manifest.require_exported_artifact()
         if not isinstance(self.transformer, Cosmos3NanoSimBimanualTransformer):
             raise TypeError(

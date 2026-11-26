@@ -68,6 +68,8 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_na
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import iter_clean_commit_frames, prompt_token_hash
 
+_TRANSFER_RESOLUTION = "480"
+
 
 @dataclass(frozen=True, slots=True)
 class _TransferRequestContract:
@@ -178,14 +180,17 @@ def _transfer_media_hw(value: Any) -> tuple[int, int] | None:
     return media_hw(value)
 
 
-def _default_transfer_resolution(policy: Cosmos3NanoSimBimanualResolutionPolicy) -> str:
+def _transfer_resolution_policy(
+    od_config: OmniDiffusionConfig,
+    manifest: Cosmos3NanoSimBimanualManifest,
+) -> Cosmos3NanoSimBimanualResolutionPolicy:
+    policy = _resolution_policy(od_config, manifest, default_resolution=(480, 832), max_pixels=409_600)
     height, width = policy.default_resolution
-    matching = [key for key, sizes in VIDEO_RES_SIZE_INFO.items() if (width, height) in sizes.values()]
-    if not matching:
+    if (width, height) not in VIDEO_RES_SIZE_INFO[_TRANSFER_RESOLUTION].values():
         raise ValueError(
-            f"Cosmos3-Nano-Sim-Transfer default_resolution must be a canonical Cosmos3 bucket, got {height}x{width}."
+            f"Cosmos3-Nano-Sim-Transfer default_resolution must be a canonical 480p bucket, got {height}x{width}."
         )
-    return max(matching, key=int)
+    return policy
 
 
 def resolve_cosmos3_nano_sim_transfer_geometry(
@@ -193,28 +198,26 @@ def resolve_cosmos3_nano_sim_transfer_geometry(
     prompt_data: Any,
     policy: Cosmos3NanoSimBimanualResolutionPolicy,
 ) -> Cosmos3NanoSimBimanualGeometry:
-    """Snap the prioritized Transfer source to a policy-valid Cosmos3 bucket."""
+    """Snap the prioritized Transfer source to a policy-valid 480p bucket."""
 
     resolution = _request_value(
         sampling_params,
         prompt_data,
         "resolution",
-        _request_value(
-            sampling_params,
-            prompt_data,
-            "image_size",
-            _default_transfer_resolution(policy),
-        ),
+        _request_value(sampling_params, prompt_data, "image_size", _TRANSFER_RESOLUTION),
     )
+    if str(resolution) != _TRANSFER_RESOLUTION:
+        raise ValueError(f"Cosmos3-Nano-Sim-Transfer supports only resolution '480', got {resolution!r}.")
+
+    aspect_ratio = _request_value(sampling_params, prompt_data, "aspect_ratio")
     try:
-        aspect_ratio = _request_value(sampling_params, prompt_data, "aspect_ratio")
         if aspect_ratio is not None:
-            target_width, target_height = VIDEO_RES_SIZE_INFO[str(resolution)][str(aspect_ratio)]
+            target_width, target_height = VIDEO_RES_SIZE_INFO[_TRANSFER_RESOLUTION][str(aspect_ratio)]
         else:
             source_hw = _transfer_media_hw(_transfer_media_source(sampling_params, prompt_data))
             if source_hw is None:
                 source_hw = policy.default_resolution
-            target_width, target_height = find_closest_target_size(*source_hw, resolution)
+            target_width, target_height = find_closest_target_size(*source_hw, _TRANSFER_RESOLUTION)
     except (KeyError, ValueError) as exc:
         raise ValueError(
             f"Cosmos3-Nano-Sim-Transfer invalid resolution/aspect_ratio: {resolution!r}/{aspect_ratio!r}."
@@ -333,14 +336,13 @@ def get_cosmos3_nano_sim_transfer_pre_process_func(od_config: OmniDiffusionConfi
 
     manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
     manifest.require_control_video_conditioning()
-    policy = _resolution_policy(od_config, manifest)
+    policy = _transfer_resolution_policy(od_config, manifest)
 
     def transfer_target_size(request) -> tuple[int, int]:
-        geometry = resolve_cosmos3_nano_sim_transfer_geometry(
-            request.sampling_params,
-            request.prompt,
-            policy,
-        )
+        try:
+            geometry = resolve_cosmos3_nano_sim_transfer_geometry(request.sampling_params, request.prompt, policy)
+        except (TypeError, ValueError) as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
         return geometry.height, geometry.width
 
     cosmos3_pre_process = get_cosmos3_pre_process_func(
@@ -358,8 +360,7 @@ def get_cosmos3_nano_sim_transfer_pre_process_func(od_config: OmniDiffusionConfi
         if not isinstance(extra, dict):
             raise ValueError("Cosmos3-Nano-Sim-Transfer extra_args must be a mutable mapping during preprocessing.")
         prompt_data = request.prompt
-        geometry = resolve_cosmos3_nano_sim_transfer_geometry(sp, prompt_data, policy)
-        sp.height, sp.width = geometry.height, geometry.width
+        sp.height, sp.width = transfer_target_size(request)
 
         generic_hint = _request_value(sp, prompt_data, "control_hint")
         named = [key for key in (*TRANSFER_HINTS, "wsm") if _request_value(sp, prompt_data, key) is not None]
@@ -386,8 +387,7 @@ def get_cosmos3_nano_sim_transfer_pre_process_func(od_config: OmniDiffusionConfi
         else:
             processed = cosmos3_pre_process(request)
         final_sp = processed.sampling_params
-        final_geometry = resolve_cosmos3_nano_sim_transfer_geometry(final_sp, processed.prompt, policy)
-        final_sp.height, final_sp.width = final_geometry.height, final_geometry.width
+        final_sp.height, final_sp.width = transfer_target_size(processed)
         return processed
 
     return pre_process_func
@@ -397,6 +397,7 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
     """Offline full-clip Transfer inference with dense full or paired sliding history."""
 
     _transformer_cls_override: ClassVar[type[Cosmos3NanoSimTransferTransformer]] = Cosmos3NanoSimTransferTransformer
+    _build_resolution_policy = staticmethod(_transfer_resolution_policy)
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)

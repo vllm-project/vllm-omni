@@ -46,11 +46,13 @@ seed images, or `initial_latent` are rejected. The control weight,
 | --- | --- |
 | Video | One clip with exactly `num_frames` frames. Generation pads to the VAE's `4k+1` grid and trims the result. |
 | Frame rate | The decoded source video's FPS when it carries one; otherwise the request `frame_rate` or `fps`, then the deployment `default_fps` (15). |
-| Geometry | `resolution` selects the 256, 480, 704, or 720 bucket; the deployment defaults to 720 (`default_resolution: [720, 1280]`). Without `aspect_ratio`, the source video, else the hint's control clip, selects the nearest aspect. Inputs are resized directly to the bucket without center cropping. |
+| Geometry | Generation supports only the Cosmos3 480p bucket family. Omit `resolution` or set it to `"480"`. Without `aspect_ratio`, the source video or, if absent, the hint's control clip selects the nearest aspect. Inputs are resized directly to the bucket without center cropping. |
 | Latent | Set `output_type="latent"` to return the pre-VAE latent tensor. |
 
-The deployment's `max_pixels: 921600` (720×1280) bounds every bucket, and the
-shared Cosmos3-Nano-Sim-Bimanual resolution policy validates the result.
+The deployment's `default_resolution: [480, 832]` sets the fallback aspect when
+media dimensions are unavailable. Its `max_pixels: 409600` fits every 480p
+bucket, including the 640×640 square bucket. Explicit `height` and `width`
+must match the selected bucket.
 
 ### History window
 
@@ -111,7 +113,6 @@ if __name__ == "__main__":
         output_type="np",
         extra_args={
             "depth": {"control_path": "/data/depth.mp4"},
-            "resolution": "480",
             "kv_cache_inference_size": 30,
             "attention_sink_size": 3,
             "emphasize_control_in_prompt": False,
@@ -129,8 +130,8 @@ if __name__ == "__main__":
     export_to_video(outputs[0].images[0], "cosmos3_nano_sim_transfer.mp4", fps=fps)
 ```
 
-Omit `resolution` to use the deployment's 720 bucket. Omitted window and sink
-settings use the deployment configuration, then the checkpoint.
+Omitted window and sink settings use the deployment configuration, then the
+checkpoint.
 
 ## Verification
 
