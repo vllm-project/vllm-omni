@@ -64,7 +64,7 @@ def test_duplex_mrv2_rocm_profile_preserves_shared_contract(monkeypatch) -> None
     assert structured.stage_by_id(2).model_config.enforce_eager is True
 
 
-@pytest.mark.parametrize("platform", ["xpu", "musa"])
+@pytest.mark.parametrize("platform", ["musa"])
 def test_duplex_mrv2_profile_keeps_deferred_platforms_on_v1(monkeypatch, platform) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
@@ -158,6 +158,14 @@ def test_two_card_deploy_accepts_single_vocoder_stage_override(monkeypatch) -> N
         ("1,0", 2),
         ("0", 1),
     ]
+
+
+def test_duplex_mrv2_profile_xpu_full_mrv2(monkeypatch) -> None:
+    monkeypatch.setattr(current_omni_platform, "device_name", "xpu")
+    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform="xpu")
+    assert config.model_runner == "v2"
+    stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
 
 
 @pytest.mark.parametrize("deploy_name", [_DEPLOY, "minicpmo_4_5_turn.yaml"])

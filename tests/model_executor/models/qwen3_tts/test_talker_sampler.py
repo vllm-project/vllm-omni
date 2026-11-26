@@ -167,3 +167,25 @@ def test_fp64_gumbel_sampler_stays_upstream():
     out = fused(logits.clone(), batch)
     ref = base(logits.clone(), batch)
     torch.testing.assert_close(out.sampled_token_ids, ref.sampled_token_ids, rtol=0, atol=0)
+
+
+def test_fused_talker_sampler_compiles_once_for_every_batch_size(monkeypatch):
+    # num_rejected is the second row of one (2, n) buffer, so its alignment
+    # changes with n. A new kernel compiled mid-serving stalls every stream.
+    from triton import knobs
+
+    from vllm_omni.model_executor.models.qwen3_tts.talker_sampler import _talker_sample_kernel
+
+    base, fused, talker, _, slots, device = _setup([_talker_params()] * 5)
+    # Earlier tests may have compiled kernels for other batch sizes already.
+    _talker_sample_kernel.device_caches.clear()
+
+    def sample(n):
+        fused(torch.randn(n, VOCAB, device=device), _batch(slots[:n], [5] * n, [6] * n, device))
+
+    sample(1)
+    compiles = []
+    monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", lambda **kw: compiles.append(kw["fn"].name))
+    for n in (2, 3, 4, 5):
+        sample(n)
+    assert compiles == []

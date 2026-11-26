@@ -599,6 +599,42 @@ class TestStageResolutionHelpers:
 class TestPipelineDiscovery:
     """Tests for the central pipeline registry (``OMNI_PIPELINES``)."""
 
+    def test_pipeline_discovery_keeps_revision_configs_separate(self, mocker):
+        model = "revision-test/omni"
+        get_config = mocker.patch(
+            "vllm_omni.config.config_factory.get_config",
+            side_effect=[Q3_OMNI_THINKER_HF_CONFIG, Q3_OMNI_ALL_STAGES_HF_CONFIG],
+        )
+        thinker = StageConfigFactory.get_pipeline_config(model, trust_remote_code=False, revision="text")
+        full = StageConfigFactory.get_pipeline_config(model, trust_remote_code=False, revision="audio")
+        assert StageConfigFactory.get_pipeline_config(model, trust_remote_code=False, revision="text") == thinker
+
+        assert thinker is not None and len(thinker.stages) == 1
+        assert full is not None and len(full.stages) == 3
+        assert [call.kwargs["revision"] for call in get_config.call_args_list] == ["text", "audio"]
+
+    @pytest.mark.parametrize(
+        "filename,metadata,expected",
+        [
+            ("config.json", {"model_type": "qwen3_tts"}, "qwen3_tts"),
+            ("model_index.json", {"_class_name": "GlmImagePipeline"}, "glm_image"),
+        ],
+    )
+    def test_pipeline_discovery_reads_pinned_fallback_metadata(self, mocker, filename, metadata, expected):
+        pinned_revision = "release"
+
+        def read_config_file(name, _model, *, revision):
+            return metadata if name == filename and revision == pinned_revision else None
+
+        mocker.patch.object(config_factory_module, "get_config", return_value=None)
+        read_metadata = mocker.patch.object(config_factory_module, "get_hf_file_to_dict", side_effect=read_config_file)
+
+        model = "revision-test/checkpoint"
+        pipeline = StageConfigFactory.get_pipeline_config(model, trust_remote_code=False, revision=pinned_revision)
+
+        assert pipeline is not None and pipeline.model_type == expected
+        read_metadata.assert_any_call(filename, model, revision=pinned_revision)
+
     def test_registry_has_known_models(self):
         """Check that specific models are in OMNI_PIPELINES."""
         assert "qwen2_5_omni" in OMNI_PIPELINES
@@ -1345,7 +1381,7 @@ class TestPipelineRegistration:
                 "trust_remote_code": True,
                 "model": "fake/model",
             }
-            mock_get_config.assert_called_once_with("fake/model", trust_remote_code=True)
+            mock_get_config.assert_called_once_with("fake/model", trust_remote_code=True, revision=None)
 
         with patch.object(StageConfigFactory, "_create_legacy_from_registry", return_value=([], None)) as mock_legacy:
             StageConfigFactory.create_legacy_stage_configs_from_model(
@@ -3479,6 +3515,7 @@ class TestPlatformOverrides:
             "moss_tts_nano.yaml",
             "chatterbox_turbo.yaml",
             "chatterbox.yaml",
+            "minicpmo_4_5.yaml",
         )
         rocm_full_mrv2 = platform == "rocm" and filename in (
             "qwen3_tts.yaml",
