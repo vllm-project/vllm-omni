@@ -201,7 +201,7 @@ class MiniMaxH3DenoiseBranch:
         local_span = getattr(model, "_rope_local_span", None)
         if not callable(local_span):
             return
-        _, local_len = local_span(self.seq_len)
+        local_start, local_len = local_span(self.seq_len)
         if local_len == self.seq_len:
             return
         if local_len <= 0 or self.seq_len % local_len:
@@ -213,6 +213,7 @@ class MiniMaxH3DenoiseBranch:
             return
 
         # Keep both the existing 64-row packing buckets and SP alignment.
+        # MINIMAX_H3_MAX_PAD_SEQ_LEN caps request pins, not internal SP padding.
         alignment = math.lcm(MINIMAX_H3_SEQ_ALIGN, sp_size)
         old_len = self.seq_len
         self.seq_len = ((self.used_len + trim + alignment - 1) // alignment) * alignment
@@ -242,14 +243,15 @@ class MiniMaxH3DenoiseBranch:
         packed_params["cu_seqlens_q"] = cu
         self.static_kwargs["packed_seq_params"] = packed_params
         self.static_kwargs.pop("rope_table", None)
-        _LOG.info(
-            "MiniMax H3 reference-KV SP padding: original=%d padded=%d used=%d reference=%d sp=%d",
-            old_len,
-            self.seq_len,
-            self.used_len,
-            reference_rows,
-            sp_size,
-        )
+        if local_start == 0:
+            _LOG.info(
+                "MiniMax H3 reference-KV SP padding: original=%d padded=%d used=%d reference=%d sp=%d",
+                old_len,
+                self.seq_len,
+                self.used_len,
+                reference_rows,
+                sp_size,
+            )
 
     def prepare_rope_table(self, model: Any) -> None:
         """Materialize the branch-local DiT RoPE table once per denoise run.

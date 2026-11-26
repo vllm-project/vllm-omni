@@ -1544,7 +1544,11 @@ class MiniMaxH3DiTModel(nn.Module):
                 if compact_local_positions is None:
                     raise ValueError("MiniMax H3 reference-KV target rows cannot form an equal SP shard")
                 trimmed_padding = seq_len - reference_rows - int(active_positions.numel())
-                if trimmed_padding and not getattr(reference_kv_state, "_sp_alignment_logged", False):
+                if (
+                    local_start == 0
+                    and trimmed_padding
+                    and not getattr(reference_kv_state, "_sp_alignment_logged", False)
+                ):
                     logger.info(
                         "MiniMax H3 reference-KV SP alignment: original=%d used=%d reference=%d "
                         "compact=%d sp=%d dropped_padding=%d",
@@ -1628,7 +1632,7 @@ class MiniMaxH3DiTModel(nn.Module):
             block_packed_total = int(active_positions.numel())
             block_max_seqlen = max_seqlen - reference_rows
             cu_seqlens = cu_seqlens.clone()
-            cu_seqlens[1:] -= reference_rows
+            cu_seqlens[1] = block_max_seqlen
             cu_seqlens[-1] = block_packed_total
             if local_len == seq_len:
                 hidden = hidden.index_select(0, active_positions)
