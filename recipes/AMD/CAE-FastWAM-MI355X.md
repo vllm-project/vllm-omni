@@ -106,6 +106,41 @@ Every transformer layer of both experts is compiled; the umT5 and VAE encoders
 stay eager. With `warmup: true` the engine's warm-up request runs a real forward
 pass, so compilation happens at startup.
 
+### Optional: AMD kernels from the Hugging Face Kernel Hub
+
+An optional backend serves the action inference with AMD's CAE-FastWAM kernel
+package (`amd/cae-fastwam-kernels`, pinned to version 1) instead of the stock
+PyTorch path. It is **off by default** and enabled by one environment variable:
+
+```bash
+VLLM_OMNI_FASTWAM_KERNELS=hub vllm serve amd/CAE-FastWAM --omni --host 0.0.0.0 --port 8091 \
+  --deploy-config vllm_omni/deploy/cae_fastwam_libero.yaml
+```
+
+- Keep the eager deploy config (`enforce_eager: true`). The package runs inside
+  CAE-FastWAM's own compiled regions, so the runner does not add its own
+  `torch.compile` on top of it.
+- Requirements: an AMD Instinct MI355X (gfx950, the package's only validated
+  architecture); the `kernels` library (already a vLLM-Omni dependency); access
+  to the package on the Hub; and the reference implementation the package plugs
+  into, AMD-AGI/faster-action-models `FastWAM/src` at commit `a5fa731`,
+  importable as `fastwam` (for example `pip install --no-deps -e FastWAM` from a
+  checkout of that commit). The package checks the reference files against its
+  own sha256 pins and the checkpoint layout of `amd/CAE-FastWAM`.
+- The backend builds the reference CAE-FastWAM model from the same assets as
+  the stock path (`policy.pt` and `action_vae.pt`, plus the VAE and umT5 tensors
+  of the Diffusers base repository, renamed to the reference layout). Observation
+  parsing, normalisation and the LIBERO gripper post-processing are shared with
+  the stock path.
+- If anything is missing (another GPU architecture, no `kernels`, no Hub access,
+  the reference package not installed), the server logs one warning naming the
+  reason, for example `FastWAM kernel backend 'hub' requested
+  (VLLM_OMNI_FASTWAM_KERNELS=hub) but not used: ... Serving with the stock
+  PyTorch path.`, and serves the stock path. When the backend is active the log
+  says `FastWAM kernel backend 'hub' active: amd/cae-fastwam-kernels version 1 ...`.
+- Outputs are not bitwise equal to the stock path (fused kernels change the
+  rounding); see Qualification evidence.
+
 ## Verification
 
 ```python
@@ -148,9 +183,9 @@ values in `{-1.0, 1.0}`.
 
 ## Notes
 
-- No custom kernels, fp8 or tuning tables: this is the plain PyTorch path. The
-  published 12.82 ms (10 steps) latency used AMD's optimised kernel package
-  from the reference repository and is not comparable.
+- The default path has no custom kernels, fp8 or tuning tables: it is the plain
+  PyTorch path. AMD's optimised kernels are available through the optional
+  Kernel Hub backend above (`VLLM_OMNI_FASTWAM_KERNELS=hub`).
 - Two ERROR blocks at server start are expected. `amd/CAE-FastWAM` has a root
   `config.json` with `model_type: fastwam` (it names the FastWAM preset and the
   checkpoint layout). vLLM's generic Hugging Face config probe (`repo_utils`)
