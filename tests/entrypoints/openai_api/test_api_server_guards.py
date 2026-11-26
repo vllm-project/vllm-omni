@@ -202,8 +202,19 @@ def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
     ],
 )
 @pytest.mark.parametrize("tracing_mode", ["enabled", "disabled", "no-engine", "no-provider"])
+@pytest.mark.parametrize(
+    "robot_enabled,configured_size,expected_size",
+    [(False, None, None), (True, None, 64 * 1024 * 1024), (True, 4096, 4096)],
+)
 async def test_omni_run_server_worker_forwards_client_config(
-    monkeypatch, tracing_mode, disable_compression, uvicorn_kwargs, expected_kwargs
+    monkeypatch,
+    tracing_mode,
+    disable_compression,
+    uvicorn_kwargs,
+    expected_kwargs,
+    robot_enabled,
+    configured_size,
+    expected_size,
 ):
     import httpx
     from opentelemetry.sdk.trace import TracerProvider
@@ -219,6 +230,7 @@ async def test_omni_run_server_worker_forwards_client_config(
     exporter = InMemorySpanExporter()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     app = FastAPI()
+    app.state.openai_serving_realtime_robot = object() if robot_enabled else None
     app.add_middleware(CORSMiddleware, allow_origins=["http://client"])
 
     @app.get("/trace")
@@ -253,6 +265,7 @@ async def test_omni_run_server_worker_forwards_client_config(
 
     async def fake_serve_http(app, **kwargs):
         assert app.state.api_server_count == 2
+        assert kwargs.get("ws_max_size") == expected_size
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
             for sampled in ("01", "00"):
                 parent = f"00-12345678901234567890123456789012-1234567890123456-{sampled}"
@@ -280,7 +293,8 @@ async def test_omni_run_server_worker_forwards_client_config(
     args = _minimal_args(model="dummy", disable_websocket_compression=disable_compression)
     config = {"client_count": 2, "client_index": 1, "stage_addresses": {}}
 
-    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config, **uvicorn_kwargs)
+    options = dict(uvicorn_kwargs) if configured_size is None else {**uvicorn_kwargs, "ws_max_size": configured_size}
+    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config, **options)
     assert captured["client_config"] is config
     spans = exporter.get_finished_spans()
     assert len(spans) == int(tracing_enabled)
@@ -406,6 +420,9 @@ def test_profiler_endpoints_detect_typed_stage_config():
 
 # Exact Omni router census on main. Update intentionally when routes change.
 _EXPECTED_ROUTER_ROUTES = {
+    ("GET", "/api/v1/models"),
+    ("WEBSOCKET", "/api/v1/session"),
+    ("WEBSOCKET", "/api/v1/session/{model_id:path}"),
     ("POST", "/v1/chat/completions"),
     ("POST", "/v1/chat/completions/batch"),
     ("POST", "/v1/audio/speech"),
