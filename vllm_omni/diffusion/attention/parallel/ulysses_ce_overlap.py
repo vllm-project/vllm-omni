@@ -70,7 +70,7 @@ def prepare_local(fn, control):
     try:
         result = fn()
     except Exception as exc:
-        recoverable = isinstance(exc, (torch.OutOfMemoryError, MemoryError, OSError))
+        recoverable = isinstance(exc, (PreparationError, torch.OutOfMemoryError, MemoryError, OSError))
         failure = (recoverable, f"{type(exc).__name__}: {exc}")
     peers = [None] * dist.get_world_size(control)
     dist.all_gather_object(peers, failure, group=control)
@@ -169,6 +169,7 @@ class CEOverlapUlysses:
             .view(dtype)
             .view(1, seq_local, heads, head_dim)
         )
+        self.staging = ()
         self.self_inputs = []
         if not prefix and not tail and len(set(widths)) == 1:
             # Uniform groups can stage all chunks in one strided copy per field.
@@ -278,11 +279,15 @@ class CEOverlapUlysses:
             hc = self.widths[0]
             for dst, x in zip(self.self_inputs, (query, key, value)):
                 dst.copy_(x[0, :, local_head : local_head + hpr].view(s, self.k, hc, d).permute(1, 0, 2, 3))
+        if self.staging:
+            pointers = tuple(ptr for ptr, _ in sources) + tuple(x.data_ptr() for x in joint_kv)
+            for stage in self.staging:
+                stage(pointers)
         pending = []
         for c, hc in enumerate(self.widths):
             head = local_head + self.offsets[c]
             columns = slice(head, head + hc)
-            if not self.self_inputs:
+            if not self.self_inputs and not self.staging:
                 for dst, x in zip(self.local_inputs[c], (query, key, value)):
                     dst.copy_(x[:, :, columns])
                 for dst, x in zip(self.prefix_inputs[c], joint_kv, strict=True):

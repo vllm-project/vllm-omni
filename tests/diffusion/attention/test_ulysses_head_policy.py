@@ -93,7 +93,7 @@ def test_prepare_local_votes_before_rendezvous(monkeypatch, failure, recoverable
 
 @pytest.mark.parametrize("peer_split_us,expected", [(65.0, True), (105.0, False)])
 def test_one_decision_from_slowest_rank(monkeypatch, peer_split_us, expected):
-    from vllm_omni.diffusion.attention.parallel import head_policy as hp
+    from vllm_omni.diffusion.attention.parallel.head_overlap import head_policy as hp
 
     policy = hp.HeadPolicy(None, 120)
     key = (2, (((1, 127, 16, 64),),))

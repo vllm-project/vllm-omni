@@ -329,6 +329,20 @@ class HeadPolicy:
             tail=trial.tail_rows,
             defer_rendezvous=True,
         )
+        if not plan.self_inputs:
+            from .staging import prepare_staging
+
+            pitches = tuple(spec[1][1] for spec in (*qkv, *(joint[1:] if plan.prefix else ())))
+            try:
+                plan.staging = tuple(
+                    prepare_staging((*parts, *prefix), pitches, (plan.rank * sum(trial.widths) + offset) * dim)
+                    for parts, prefix, offset in zip(plan.local_inputs, plan.prefix_inputs, plan.offsets, strict=True)
+                )
+            except torch.AcceleratorError:
+                raise
+            except Exception as exc:
+                # The optional staging compiler has not issued peer work yet.
+                raise PreparationError(f"Could not compile local Ulysses staging: {exc}") from exc
         timers = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(_SAMPLES)]
         for event in (*plan.ev_attn, *plan.ev_in_done.values(), *plan.ev_out_done.values(), plan.ev_inputs):
             event.record()

@@ -92,7 +92,16 @@ def _check_uneven(group, device, rank):
         kv = [torch.cat((p, x) if front else (x, p), dim=1) for p, x in zip(prefix, (k, v))]
         expected = _attention(q, *kv)[:, rank * s : (rank + 1) * s]
         for tail in (0, s // 2, s):
-            plan._configure(s, h, d, (3, 5), q.dtype, prefix=19, front=front, tail=tail)
+            if tail == s:
+                # Use production staging prep on the same strided QKV and both prefix placements.
+                qkv_spec = tuple(head_policy.tensor_spec(x) for x in inputs)
+                joint_spec = tuple(head_policy.tensor_spec(x) for x in (q[:, :0], *prefix))
+                key = (2, qkv_spec, joint_spec, "front" if front else "rear")
+                plan, _ = policy._prepare(key, head_policy.Trial((3, 5), tail), device, group.ulysses_group)
+                plan.connect()
+                assert len(plan.staging) == 2
+            else:
+                plan._configure(s, h, d, (3, 5), q.dtype, prefix=19, front=front, tail=tail)
             actual = plan.run(*inputs, _attention, joint_kv=prefix)
             torch.testing.assert_close(actual, expected, rtol=1e-2, atol=5e-3)
 
