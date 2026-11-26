@@ -39,6 +39,7 @@ _SUPPORTED_MODEL_OPT_CONFIGS = frozenset(
         "modelopt_mixed",
     }
 )
+_SUPPORTED_CONFIGS = _SUPPORTED_MODEL_OPT_CONFIGS | {"int8"}
 
 
 def resolve_mixed_precision_config(
@@ -163,8 +164,16 @@ def _validate_checkpoint_quantization(od_config: object) -> None:
 def _validate_modelopt_config(quant_config: object | None) -> None:
     get_name = getattr(quant_config, "get_name", None)
     name = get_name() if callable(get_name) else None
-    if name not in _SUPPORTED_MODEL_OPT_CONFIGS:
-        raise ValueError(f"diffusion_step_policy requires a serialized ModelOpt FP8 or NVFP4 checkpoint, got {name!r}")
+    if name not in _SUPPORTED_CONFIGS:
+        raise ValueError(
+            "diffusion_step_policy requires a serialized ModelOpt FP8 or NVFP4 checkpoint "
+            f"or a serialized INT8 checkpoint, got {name!r}"
+        )
+
+    if name == "int8":
+        if not bool(getattr(quant_config, "is_checkpoint_int8_serialized", False)):
+            raise ValueError("diffusion_step_policy requires serialized INT8 weights")
+        return
 
     if name == "modelopt":
         _require_serialized(quant_config, "is_checkpoint_fp8_serialized", "FP8")
