@@ -14,14 +14,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import math
 from base64 import b64decode
 from binascii import Error as BinasciiError
 from collections.abc import Mapping
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, cast
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
+from vllm.multimodal.image import open_image
 from vllm.multimodal.media import MediaConnector
 from vllm.sampling_params import SamplingParams
 
@@ -32,28 +36,53 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputAction,
     DuplexOutputDecision,
 )
+from vllm_omni.engine.duplex.intermediate import build_duplex_append_prompt
 from vllm_omni.engine.duplex.plugin import (
+    DefaultDuplexModelSessionState,
     DuplexModelPlugin,
     DuplexRuntimeConfigError,
+    DuplexUnitOutputs,
     EncodeAudio,
     reject_changed_runtime_value,
+    reject_private_runtime_keys,
 )
+from vllm_omni.model_executor.common.duplex.payload import payload_audio
+from vllm_omni.model_executor.common.duplex.payload import payload_sample_count as _duplex_pcm_sample_count
+from vllm_omni.model_executor.common.request_outputs import coerce_int as _coerce_int
+from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
+from vllm_omni.model_executor.common.request_outputs import first_completion as _first_completion
+from vllm_omni.model_executor.common.request_outputs import multimodal_output as _multimodal_output
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import (
     minicpmo45_native_capabilities,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
-    MiniCPMO45DataPlaneContext,
     MiniCPMO45DataPlaneSession,
+    is_last_tts_chunk,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.session import (
-    MiniCPMO45ServingSessionState,
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import MiniCPMO45PcmAppendBuffer
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
+    MiniCPMO45DuplexPolicy,
+    MiniCPMO45DuplexWindowConfig,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
+    load_default_prompt_audio,
 )
 
 if TYPE_CHECKING:
-    import torch
     from transformers import PreTrainedTokenizerBase
     from vllm.config import ModelConfig
+
+
+@dataclass(slots=True)
+class MiniCPMO45ServingSessionState(DefaultDuplexModelSessionState):
+    """Mutable model-owned state of one MiniCPM duplex session (owned by the session runner).
+
+    The runner-facing flag contract lives on ``DefaultDuplexModelSessionState``;
+    MiniCPM-o only binds its ~1 s PCM unit buffer.
+    """
+
+    audio_buffer: MiniCPMO45PcmAppendBuffer = field(default_factory=MiniCPMO45PcmAppendBuffer)
+
 
 _DUPLEX_CHUNK_SAMPLES = 16000
 _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
@@ -79,12 +108,19 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "duplex_stage_max_tokens",
         "duplex_stage0_max_tokens",
         "duplex_scheduler_token_id",
+        "duplex_listen_prob_scale",
+        "duplex_listen_top_k",
         "duplex_vision_tile_pixels",
         "duplex_first_append_context_tokens",
         "ref_audio_data",
         "ref_audio_format",
         "ref_audio_sample_rate_hz",
         "initial_user_text",
+        "duplex_window_config",
+        "duplex_window_prefix_tokens",
+        "duplex_window_suffix_token_ids",
+        "duplex_window_previous_marker_token_ids",
+        "duplex_window_special_token_ids",
     }
 )
 
@@ -126,7 +162,7 @@ def _duplex_base_frame_blocks(frame: str, tile_pixels: int | None) -> int:
 
     try:
         raw = b64decode(frame, validate=True)
-        with Image.open(BytesIO(raw)) as image:
+        with open_image(BytesIO(raw)) as image:
             width, height = image.size
     except (BinasciiError, ValueError, OSError, Image.DecompressionBombError):
         return _DUPLEX_HD_SLICES_PER_BASE_FRAME
@@ -160,22 +196,13 @@ def _duplex_vision_tokens(payload: object, *, tile_pixels: int | None = None) ->
     return blocks * _DUPLEX_VISION_TOKENS_PER_FRAME
 
 
-def _duplex_pcm_sample_count(payload: object) -> int | None:
-    if not isinstance(payload, dict):
-        return None
-    audio = payload.get("audio") or payload.get("data")
-    if payload.get("format") != "pcm_f32le" or not isinstance(audio, str):
-        return None
-    try:
-        raw = b64decode(audio, validate=True)
-    except (BinasciiError, ValueError):
-        return None
-    return len(raw) // 4
-
-
 def duplex_payload_is_exact_chunks(payload: object) -> bool:
     sample_count = _duplex_pcm_sample_count(payload)
     return sample_count is not None and sample_count != 0 and sample_count % _DUPLEX_CHUNK_SAMPLES == 0
+
+
+def _duplex_payload_is_vision_only(payload: object) -> bool:
+    return bool(_duplex_frames(payload)) and payload_audio(payload) is None
 
 
 def duplex_first_append_unit_count(payload: object) -> int | None:
@@ -185,16 +212,21 @@ def duplex_first_append_unit_count(payload: object) -> int | None:
     return max(1, sample_count // _DUPLEX_CHUNK_SAMPLES - 1)
 
 
-def duplex_scheduler_token_budget(payload: object, *, default: int = 64, tile_pixels: int | None = None) -> int:
-    vision_tokens = _duplex_vision_tokens(payload, tile_pixels=tile_pixels)
+def _duplex_audio_token_budget(payload: object, *, default: int = 64) -> int:
     sample_count = _duplex_pcm_sample_count(payload)
     if sample_count is None:
-        return max(1, int(default)) + vision_tokens
+        return max(1, int(default))
     sample_count = max(1, sample_count)
     if sample_count % _DUPLEX_CHUNK_SAMPLES == 0:
         units = sample_count // _DUPLEX_CHUNK_SAMPLES
-        return units * (2 + _DUPLEX_CHUNK_SAMPLES // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN) + vision_tokens
-    return max(16, min(768, sample_count // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8)) + vision_tokens
+        return units * (2 + _DUPLEX_CHUNK_SAMPLES // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN)
+    return max(16, min(768, sample_count // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8))
+
+
+def duplex_scheduler_token_budget(payload: object, *, default: int = 64, tile_pixels: int | None = None) -> int:
+    return _duplex_audio_token_budget(payload, default=default) + _duplex_vision_tokens(
+        payload, tile_pixels=tile_pixels
+    )
 
 
 def duplex_first_append_context_reserve(runtime_config: object) -> int:
@@ -223,6 +255,41 @@ def _duplex_force_listen_count(extra_body: object) -> int:
         return 0
 
 
+def _duplex_listen_knobs(extra_body: object) -> tuple[float, int | None]:
+    """``listen_prob_scale`` / ``listen_top_k`` from the session's ``extra_body``.
+
+    The released ``streaming_generate`` takes both per call; serving keeps
+    them constant per session, and the neutral defaults (``1.0`` / ``None``)
+    leave the listen decision exactly as it stands. Invalid values fail at
+    session creation instead of silently neutralizing the request.
+    """
+    if not isinstance(extra_body, dict):
+        return 1.0, None
+    scale_raw = extra_body.get("listen_prob_scale")
+    scale = 1.0
+    if scale_raw is not None:
+        if isinstance(scale_raw, bool) or not isinstance(scale_raw, (int, float)):
+            raise MiniCPMO45ClientRuntimeConfigError(
+                "listen_prob_scale must be a number", code="invalid_listen_prob_scale"
+            )
+        scale = float(scale_raw)
+        if not math.isfinite(scale) or scale <= 0:
+            raise MiniCPMO45ClientRuntimeConfigError(
+                "listen_prob_scale must be a finite positive number", code="invalid_listen_prob_scale"
+            )
+    top_k_raw = extra_body.get("listen_top_k")
+    top_k = None
+    if top_k_raw is not None:
+        if isinstance(top_k_raw, bool) or not isinstance(top_k_raw, int):
+            raise MiniCPMO45ClientRuntimeConfigError("listen_top_k must be an integer", code="invalid_listen_top_k")
+        if top_k_raw <= 0:
+            raise MiniCPMO45ClientRuntimeConfigError(
+                "listen_top_k must be greater than zero", code="invalid_listen_top_k"
+            )
+        top_k = int(top_k_raw)
+    return scale, top_k
+
+
 def build_duplex_data_plane_prompt(
     *,
     request_id: str,
@@ -234,19 +301,36 @@ def build_duplex_data_plane_prompt(
     payload: object,
     final: bool,
 ) -> dict[str, object]:
-    tile_pixels = _duplex_vision_tile_pixels(runtime_config)
-    token_budget = duplex_scheduler_token_budget(payload, tile_pixels=tile_pixels)
-    if seq <= 1:
-        context_reserve = duplex_first_append_context_reserve(runtime_config)
-        token_budget += context_reserve
+    # Computed once: with a known tile this decodes the stacked pair's first frame.
+    # The buffer marks the first payload that actually carries PCM. A VISION
+    # unit advances the append sequence without opening the mel window, so
+    # ``seq`` alone cannot tell that the following speech is still the first
+    # audio window.
+    first_audio_window = isinstance(payload, dict) and payload.get("first_audio_window") is True
+    if first_audio_window:
+        payload = {key: value for key, value in payload.items() if key != "first_audio_window"}
+    vision_tokens = _duplex_vision_tokens(payload, tile_pixels=_duplex_vision_tile_pixels(runtime_config))
+    token_budget = _duplex_audio_token_budget(payload) + vision_tokens
+    if _duplex_payload_is_vision_only(payload):
+        # Surplus slots are filled with </unit> pad embeddings that stay in the KV.
+        # A VISION unit is <unit> + frame blocks; later units first close the
+        # previous one with its sampled terminator + </unit>.
+        lead_tokens = duplex_first_append_context_reserve(runtime_config) if seq <= 1 else 2
+        token_budget = lead_tokens + 1 + vision_tokens
+    elif seq <= 1 or first_audio_window:
+        # After a VISION unit the session context is already in the KV. The
+        # first audio window still closes that unit (terminator + </unit>)
+        # and then builds fewer units than one per buffered second.
+        lead_tokens = 2 if seq > 1 else duplex_first_append_context_reserve(runtime_config)
         first_units = duplex_first_append_unit_count(payload)
         if first_units is not None:
-            vision_tokens = _duplex_vision_tokens(payload, tile_pixels=tile_pixels)
-            token_budget = context_reserve + first_units * 12 - 1 + vision_tokens
-    if seq > 1 and duplex_payload_is_exact_chunks(payload):
+            token_budget = lead_tokens + first_units * 12 - 1 + vision_tokens
+        else:
+            token_budget += lead_tokens
+    if seq > 1 and not first_audio_window and duplex_payload_is_exact_chunks(payload):
         token_budget += 1
-    if final and duplex_payload_is_exact_chunks(payload):
-        token_budget += 12
+        # Serving already pads the final residual audio. Stage0 does not
+        # append another silent unit, so final must not reserve extra slots.
     extra_body = session_config.get("extra_body")
     raw_token_id = runtime_config.get("duplex_scheduler_token_id")
     try:
@@ -261,74 +345,36 @@ def build_duplex_data_plane_prompt(
         and payload.get("force_listen") is not True
     ):
         payload = {**payload, "force_listen": True}
-    return {
-        "prompt_token_ids": [token_id] * token_budget,
-        "model_intermediate_buffer": {
-            "request_id": request_id,
-            "global_request_id": [fence.session_id],
-            "duplex": {
-                "fence": fence,
-                "session_id": fence.session_id,
-                "epoch": fence.epoch,
-                "seq": seq,
-                "turn_id": fence.turn_id,
-                "turn_seq": turn_seq,
-                "mode": "append_audio_chunk",
-                "payload": payload,
-                "final": final,
-                "data_plane": True,
-                "session_config": dict(session_config),
-                "runtime_config": dict(runtime_config),
-                "scheduler_token_budget": token_budget,
-                "scheduler_token_id": token_id,
-            },
-        },
-    }
+    raw_listen_scale = runtime_config.get("duplex_listen_prob_scale")
+    try:
+        listen_scale = 1.0 if raw_listen_scale is None else float(raw_listen_scale)
+    except (TypeError, ValueError):
+        listen_scale = 1.0
+    raw_listen_top_k = runtime_config.get("duplex_listen_top_k")
+    try:
+        listen_top_k = max(0, int(raw_listen_top_k)) if raw_listen_top_k is not None else 0
+    except (TypeError, ValueError):
+        listen_top_k = 0
+    if isinstance(payload, dict) and (listen_scale != 1.0 or listen_top_k > 0):
+        # The released decoder's listen knobs, carried on the payload like
+        # force_listen. A session that did not ask for them samples exactly
+        # as before: neutral values never touch the payload.
+        payload = {**payload, "listen_prob_scale": listen_scale, "listen_top_k": listen_top_k}
+    return build_duplex_append_prompt(
+        request_id=request_id,
+        fence=fence,
+        session_config=session_config,
+        runtime_config=runtime_config,
+        seq=seq,
+        turn_seq=turn_seq,
+        payload=payload,
+        final=final,
+        prompt_token_ids=[token_id] * token_budget,
+        model_fields={"scheduler_token_id": token_id},
+    )
 
 
 # ---- engine policy helpers: listen decision ----
-
-
-def _coerce_int(value: object) -> int | None:
-    detach = getattr(value, "detach", None)
-    if callable(detach):
-        try:
-            flat: torch.Tensor = detach().cpu().reshape(-1)
-            if flat.numel() == 0:
-                return None
-            value = flat[0].item()
-        except Exception:
-            return None
-    try:
-        return int(cast(Any, value))  # Any: duck-typed scalar (int/float/str/tensor item)
-    except (TypeError, ValueError):
-        return None
-
-
-def _coerce_int_list(value: object) -> list[int]:
-    if value is None:
-        return []
-    if hasattr(value, "detach"):
-        try:
-            value = value.detach().cpu().reshape(-1).tolist()
-        except Exception:
-            return []
-    if not isinstance(value, (list, tuple)):
-        return []
-    return [token_id for item in value if (token_id := _coerce_int(item)) is not None]
-
-
-def _first_completion(output: object) -> object | None:
-    outputs = getattr(output, "outputs", None)
-    return outputs[0] if isinstance(outputs, list) and outputs else None
-
-
-def _multimodal_output(output: object, completion: object | None) -> dict[str, object]:
-    metadata = getattr(output, "multimodal_output", None)
-    if isinstance(metadata, dict):
-        return metadata
-    metadata = getattr(completion, "multimodal_output", None) if completion is not None else None
-    return metadata if isinstance(metadata, dict) else {}
 
 
 def _special_token_ids(metadata: dict[str, object]) -> dict[str, int]:
@@ -427,14 +473,17 @@ def _stage0_stop_token_ids(tokenizer: PreTrainedTokenizerBase | None) -> list[in
     if tokenizer is None:
         return []
     out: list[int] = []
+    # ``turn_eos`` is deliberately not a stop token: the official Talker
+    # conditions on the hidden state produced *after* ``<|turn_eos|>`` is fed,
+    # so Stage 0 must forward it once and stop on the unit terminator that the
+    # policy forces on the following step.
     stop_token_fields = (
         "chunk_eos_token_id",
         "chunk_tts_eos_token_id",
         "listen_token_id",
-        "turn_eos_token_id",
     )
-    for field in stop_token_fields:
-        token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field]
+    for field_name in stop_token_fields:
+        token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field_name]
         token_id = _convert_token_to_id(tokenizer, token)
         if token_id is not None and token_id not in out:
             out.append(token_id)
@@ -468,6 +517,45 @@ async def resolve_ref_audio(ref_audio: str, *, model_config: ModelConfig | None)
     )
     wav_np, sr = await connector.fetch_audio_async(ref_audio)
     return np.asarray(wav_np, dtype=np.float32), int(sr)
+
+
+class _DefaultRefAudioMissingError(Exception):
+    """Signal an absent bundle asset without caching the miss."""
+
+
+@lru_cache(maxsize=8)
+def _load_default_ref_audio(model_ref: str, revision: str | None = None) -> tuple[NDArray[np.float32], int]:
+    """Load the prompt WAV shipped in the MiniCPM-o model snapshot.
+
+    Code2Wav already resolves the model reference and uses the same bundled
+    ``assets/HT_ref_audio.wav`` as its fallback prompt. Reuse those helpers so
+    native duplex and Code2Wav condition on the same model-owned asset. Cache
+    successful loads for each model revision so sessions reuse the same prompt
+    audio. Raise on a missing asset because lru_cache also stores ``None``.
+    """
+    loaded = load_default_prompt_audio(model_ref, revision=revision)
+    if loaded is None:
+        raise _DefaultRefAudioMissingError
+    waveform, sample_rate = loaded
+    wav_np = np.asarray(waveform, dtype=np.float32)
+    if wav_np.ndim > 1:
+        # Code2Wav's WAV reader returns (channels, samples); native duplex
+        # normalizes request references as samples-first audio.
+        wav_np = wav_np.mean(axis=0)
+    return wav_np, int(sample_rate)
+
+
+async def resolve_default_ref_audio(model_config: ModelConfig | None) -> tuple[NDArray[np.float32], int] | None:
+    """Resolve the model-bundled prompt without blocking the session loop."""
+    model_ref = getattr(model_config, "model", None)
+    if not isinstance(model_ref, str) or not model_ref:
+        return None
+    raw_revision = getattr(model_config, "revision", None)
+    revision = raw_revision if isinstance(raw_revision, str) else None
+    try:
+        return await asyncio.to_thread(_load_default_ref_audio, model_ref, revision)
+    except (_DefaultRefAudioMissingError, OSError):
+        return None
 
 
 def normalize_ref_audio(wav_np: NDArray[np.float32], sample_rate: int, *, target_sr: int) -> NDArray[np.float32]:
@@ -515,26 +603,44 @@ def _apply_first_append_context_tokens(
         return
     ref_tokens = MiniCPMO45DuplexPolicy.audio_token_count(ref_sample_count or 0)
     runtime_config["duplex_first_append_context_tokens"] = len(prefix_ids) + ref_tokens + len(suffix_ids)
+    runtime_config["duplex_window_prefix_tokens"] = len(prefix_ids) + ref_tokens
+    runtime_config["duplex_window_suffix_token_ids"] = [int(token_id) for token_id in suffix_ids]
+    marker_ids = tokenizer.encode("\n\nprevious: ", add_special_tokens=False)
+    runtime_config["duplex_window_previous_marker_token_ids"] = [int(token_id) for token_id in marker_ids]
+    runtime_config["duplex_window_special_token_ids"] = sorted(
+        MiniCPMO45DuplexPolicy.native_special_token_ids(
+            MiniCPMO45DuplexPolicy.token_ids_from_tokenizer(tokenizer),
+            tokenizer_special_ids=list(getattr(tokenizer, "all_special_ids", ()) or ()),
+        )
+    )
 
 
 def _model_vision_tile_pixels(model_config: ModelConfig | None) -> int | None:
-    """Area of one normalization tile, from the checkpoint that will do the slicing.
+    """Area of one normalization tile, as the processor that does the slicing sees it.
 
-    ``MiniCPMVImageProcessor`` is built with ``scale_resolution=config.image_size``
-    and Stage0 loads the checkpoint's own processor, so this is per-checkpoint
-    configuration. ``None`` when it cannot be read, which keeps the reservation
-    at the sliced count.
+    Stage0 slices with the checkpoint's own processor
+    (``MiniCPMO45Stage0DuplexRuntime._load_processor_from_path``), whose
+    ``MiniCPMVImageProcessor`` takes ``scale_resolution`` from the checkpoint's
+    image-processor config: a nested ``image_processor`` entry in
+    ``processor_config.json`` if there is one, else ``preprocessor_config.json``.
+    ``get_image_processor_dict`` is that lookup. ``hf_config`` has its own
+    ``slice_config.scale_resolution`` and ``image_size``; they agree on the
+    released checkpoint, but reading them here would under-reserve as soon as
+    one side changes alone (``--hf-overrides`` reaches only ``hf_config``).
+    Local files only, like ``_load_tokenizer``. ``None`` when it cannot be
+    read, which keeps the reservation at the sliced count.
     """
-    hf_config = getattr(model_config, "hf_config", None)
-    if hf_config is None:
+    model_path = getattr(model_config, "model", None)
+    if not isinstance(model_path, str) or not model_path:
         return None
-    slice_config = getattr(hf_config, "slice_config", None)
-    side = getattr(slice_config, "scale_resolution", None)
-    if not isinstance(side, int):
-        side = slice_config.get("scale_resolution") if isinstance(slice_config, dict) else None
-    if not isinstance(side, int):
-        side = getattr(hf_config, "image_size", None)
-    if not isinstance(side, int) or side <= 0:
+    try:
+        from transformers.image_processing_base import ImageProcessingMixin
+
+        processor_dict, _ = ImageProcessingMixin.get_image_processor_dict(model_path, local_files_only=True)
+        side = processor_dict.get("scale_resolution")
+    except Exception:
+        return None
+    if not isinstance(side, int) or isinstance(side, bool) or side <= 0:
         return None
     return side * side
 
@@ -570,11 +676,25 @@ def _apply_default_scheduler_policy(
         runtime_config["duplex_vision_tile_pixels"] = tile_pixels
 
 
+def _count(state: dict[str, object], key: str) -> int:
+    """A counter kept in the input clock's per-session plugin ``state`` (fresh after every cancel)."""
+    value = state.get(key, 0)
+    return value if isinstance(value, int) else 0
+
+
 class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     """MiniCPM-owned sampling policy, append planning, session state and output projection."""
 
     plugin_id = "minicpmo45"
     private_runtime_config_keys = PRIVATE_RUNTIME_CONFIG_KEYS
+    #: Input-clocked sessions: a unit is one 1 s chunk Stage 0 decides;
+    #: ``unit_output_complete`` below finds where Code2Wav's audio for a
+    #: speaking unit ends. Audio only: a committed turn with video frames is
+    #: split into separate VISION units (``prepare_commit_prefix``), which
+    #: the clock does not account for when the commit is deferred behind a
+    #: response.
+    supports_input_clock = True
+    input_clock_input_modalities = frozenset({"audio"})
     silence_continuation_samples = 16000
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
@@ -653,6 +773,52 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             )
         )
 
+    def unit_output_complete(
+        self,
+        *,
+        unit: DuplexUnitOutputs | None,
+        final_stage_id: int,
+        new_output: object | None,
+        new_context: object | None,
+        state: dict[str, object],
+        runtime_config: Mapping[str, object],
+    ) -> bool:
+        """Code2Wav streams across unit boundaries without marking a segment end per unit.
+
+        The Talker->Code2Wav connector forwards whole codec windows as they
+        fill and, at every Talker segment end (one per unit), flushes the rest
+        as one chunk flagged ``tts_is_last_chunk`` (an empty marker when
+        nothing is left). Code2Wav echoes the flag on its output. A speaking
+        unit is therefore complete once its Talker segment has ended and a
+        flagged Code2Wav output was credited to it. The orchestrator reads
+        each stage's stream independently, so the two may arrive in either
+        order, and the flushes of several queued units may all arrive before
+        the first Talker segment end; the engine hands every final-stage
+        output to the oldest speaking unit. The flags are therefore counted in
+        ``state`` and consumed in unit order, one per completed unit: the
+        n-th flagged output belongs to the n-th speaking unit of the epoch.
+        (Output that overtakes the unit's Stage-0 segment end is held by the
+        engine and handed over once the unit speaks.) A Code2Wav segment end
+        alone does not complete a unit: the flag is per unit, while a segment
+        end can also be a trailing control-only snapshot of the previous unit
+        (a repeated turn end), which the engine would otherwise credit to the
+        next unit.
+        """
+        del final_stage_id, new_context, runtime_config
+        if unit is None:
+            return False
+        flushes = _count(state, "code2wav_flushes")
+        if new_output is not None and is_last_tts_chunk(_multimodal_output(new_output, _first_completion(new_output))):
+            flushes += 1
+            state["code2wav_flushes"] = flushes
+        if not unit.upstream_segment_finished:
+            return False
+        completed = _count(state, "completed_units")
+        if flushes <= completed:
+            return False
+        state["completed_units"] = completed + 1
+        return True
+
     def decide_output(
         self,
         *,
@@ -677,6 +843,14 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         stop_reason = getattr(completion, "stop_reason", None) if completion is not None else None
         token_ids = _completion_token_ids(completion) or list(segment_token_ids)
         if _coerce_int(stop_reason) != listen_id and (not token_ids or token_ids[-1] != listen_id):
+            return None
+        unit_ids = max(
+            (token_ids, _coerce_int_list(getattr(completion, "cumulative_token_ids", None)), list(segment_token_ids)),
+            key=len,
+        )
+        if MiniCPMO45DuplexPolicy.speech_unit_closed_by_listen(unit_ids, special_token_ids):
+            # The unit's final speech and <|turn_eos|> must reach the Talker,
+            # or the response never ends.
             return None
 
         metadata = dict(output_metadata)
@@ -704,13 +878,12 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         return minicpmo45_native_capabilities(max_sessions=max_sessions)
 
     def validate_client_extra_body(self, extra_body: object) -> None:
-        if not isinstance(extra_body, dict):
-            return
-        private_keys = sorted(PRIVATE_RUNTIME_CONFIG_KEYS.intersection(extra_body))
-        if private_keys:
-            raise MiniCPMO45ClientRuntimeConfigError(
-                "duplex runtime configuration is server-owned: " + ", ".join(private_keys)
-            )
+        reject_private_runtime_keys(
+            extra_body,
+            self.private_runtime_config_keys,
+            message="duplex runtime configuration is server-owned: ",
+            error_cls=MiniCPMO45ClientRuntimeConfigError,
+        )
 
     async def prepare_runtime_config(
         self, config: DuplexSessionConfig, *, model_config: ModelConfig | None
@@ -722,6 +895,8 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
                 code="unsupported_ref_audio_path",
             )
         runtime_config: dict[str, object] = {"instructions": config.instructions}
+        window_config = self._pop_window_config(extra_body) or MiniCPMO45DuplexWindowConfig()
+        runtime_config["duplex_window_config"] = window_config.as_dict()
         # ``duplex_initial_user_text`` is the older extra_body spelling and
         # still works; the session field is the framework-level one.
         initial_user_text = extra_body.pop("duplex_initial_user_text", None)
@@ -731,6 +906,11 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             runtime_config["initial_user_text"] = initial_user_text
         tokenizer = await self._tokenizer_for(model_config)
         _apply_default_scheduler_policy(runtime_config, config=config, tokenizer=tokenizer, model_config=model_config)
+        listen_scale, listen_top_k = _duplex_listen_knobs(extra_body)
+        runtime_config["duplex_listen_prob_scale"] = listen_scale
+        # 0 spells "absent" so the prompt builder's tolerant read maps it back
+        # to the disabled knob.
+        runtime_config["duplex_listen_top_k"] = listen_top_k if listen_top_k is not None else 0
 
         ref_audio = config.ref_audio
         extra_ref_audio = extra_body.get("ref_audio")
@@ -742,10 +922,15 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             extra_body.pop("tts_ref_audio")
             ref_audio = extra_tts_ref_audio
 
-        if ref_audio is None:
-            if any(str(modality).lower() == "audio" for modality in config.modalities):
+        requests_audio = any(str(modality).lower() == "audio" for modality in config.modalities)
+        default_ref_audio = None
+        if ref_audio is None and requests_audio:
+            default_ref_audio = await resolve_default_ref_audio(model_config)
+
+        if ref_audio is None and default_ref_audio is None:
+            if requests_audio:
                 raise MiniCPMO45ClientRuntimeConfigError(
-                    "MiniCPM-o duplex audio output requires ref_audio",
+                    "MiniCPM-o duplex audio output requires ref_audio or the model-bundled assets/HT_ref_audio.wav",
                     code="ref_audio_required",
                 )
             _apply_first_append_context_tokens(
@@ -758,15 +943,15 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             config.extra_body = extra_body
             return runtime_config
 
-        wav_np, sr = await resolve_ref_audio(ref_audio, model_config=model_config)
+        if default_ref_audio is None:
+            wav_np, sr = await resolve_ref_audio(ref_audio, model_config=model_config)
+        else:
+            wav_np, sr = default_ref_audio
         # torchaudio resampling is CPU work: keep it off the orchestrator loop.
         wav_np = await asyncio.to_thread(normalize_ref_audio, wav_np, int(sr), target_sr=16000)
-        # Trim to a whole number of pooled audio embeddings (100 ms frames) so
-        # the first-append scheduler reserve can count them exactly.
-        usable = (len(wav_np) // MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN) * (
-            MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN
-        )
-        wav_np = wav_np[:usable]
+        # Preserve the reference waveform used by the checkpoint's prepare().
+        # Its final samples still condition the encoder even when pooling does
+        # not produce another token. Budget the actual encoder output below.
         ref_audio_bytes = np.ascontiguousarray(wav_np, dtype=np.float32).tobytes()
         runtime_config["ref_audio_data"] = base64.b64encode(ref_audio_bytes).decode("ascii")
         runtime_config["ref_audio_format"] = "pcm_f32le"
@@ -788,11 +973,37 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         current: Mapping[str, object],
     ) -> dict[str, object]:
         runtime_config = deepcopy(dict(current))
+        extra_body = dict(config.extra_body)
+        requested_window = self._pop_window_config(extra_body)
+        if requested_window is not None:
+            reject_changed_runtime_value(
+                requested_window.as_dict(),
+                runtime_config.get("duplex_window_config"),
+                message="sliding-window configuration cannot be changed after the session is created",
+                code="sliding_window_update_unsupported",
+                error_cls=MiniCPMO45ClientRuntimeConfigError,
+            )
+        config.extra_body = extra_body
         reject_changed_runtime_value(
             config.instructions,
             runtime_config.get("instructions"),
             message="instructions cannot be changed after the session is created",
             code="instructions_update_unsupported",
+            error_cls=MiniCPMO45ClientRuntimeConfigError,
+        )
+        listen_scale, listen_top_k = _duplex_listen_knobs(extra_body)
+        reject_changed_runtime_value(
+            listen_scale,
+            runtime_config.get("duplex_listen_prob_scale"),
+            message="listen decision knobs cannot be changed after the session is created",
+            code="listen_knobs_update_unsupported",
+            error_cls=MiniCPMO45ClientRuntimeConfigError,
+        )
+        reject_changed_runtime_value(
+            listen_top_k if listen_top_k is not None else 0,
+            runtime_config.get("duplex_listen_top_k"),
+            message="listen decision knobs cannot be changed after the session is created",
+            code="listen_knobs_update_unsupported",
             error_cls=MiniCPMO45ClientRuntimeConfigError,
         )
         stage_max_tokens = runtime_config.get("duplex_stage_max_tokens")
@@ -812,28 +1023,22 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         runtime_config["duplex_stage_sampling_params"] = stage_sampling
         return runtime_config
 
-    def data_plane_context(
-        self,
-        *,
-        epoch: int,
-        turn_id: int,
-        active_response_turn_id: int | None,
-        active_response_id: str | None,
-        auto_responds: bool,
-        response_format: str,
-        speed: float | None,
-        modalities: tuple[str, ...],
-    ) -> MiniCPMO45DataPlaneContext:
-        return MiniCPMO45DataPlaneContext(
-            epoch=epoch,
-            turn_id=turn_id,
-            active_response_turn_id=active_response_turn_id,
-            active_response_id=active_response_id,
-            auto_responds=auto_responds,
-            response_format=response_format,
-            speed=speed,
-            modalities=modalities,
+    @staticmethod
+    def _pop_window_config(extra_body: dict[str, object]) -> MiniCPMO45DuplexWindowConfig | None:
+        names = (
+            "sliding_window_mode",
+            "basic_window_high_tokens",
+            "basic_window_low_tokens",
+            "context_previous_max_tokens",
+            "context_max_units",
         )
+        provided = {name: extra_body.pop(name) for name in names if name in extra_body}
+        if not provided:
+            return None
+        try:
+            return MiniCPMO45DuplexWindowConfig.from_mapping(provided)
+        except ValueError as exc:
+            raise MiniCPMO45ClientRuntimeConfigError(str(exc), code="invalid_sliding_window_config") from exc
 
 
 __all__ = [

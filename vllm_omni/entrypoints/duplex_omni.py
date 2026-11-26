@@ -26,29 +26,59 @@ Example::
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import suppress
+import weakref
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, suppress
 from typing import Any
 from uuid import uuid4
 
 from vllm.logger import init_logger
 
+from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands as duplex_commands
 from vllm_omni.engine.duplex.commands import DuplexCommand
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig, ResponseCreateOptions
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import DuplexEvent, SessionClosed
 from vllm_omni.engine.duplex.messages import (
     DuplexControlResultMessage,
     DuplexSessionError,
     DuplexSessionEventMessage,
 )
+from vllm_omni.engine.duplex.process_engine import ProcessDuplexEngineClient
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
 _DEFAULT_CONTROL_TIMEOUT_S = 10.0
+# A cold engine can spend tens of seconds initializing per-session state before
+# the first open lands; control ops on a live session keep the short budget.
+_DEFAULT_OPEN_TIMEOUT_S = 60.0
+
+
+class _ProcessWorkerRuntime:
+    """Entrypoint-owned factory adapter; no frontend object is sent over IPC."""
+
+    def __init__(self, model: str, options: dict[str, Any]) -> None:
+        from vllm.plugins import load_general_plugins
+
+        from vllm_omni.entrypoints.duplex.warmup import warmup_silence_unit
+
+        load_general_plugins()
+        self.runtime = DuplexOmni(model=model, **options)
+        self.model = self.runtime.model
+        self.engine = self.runtime.engine
+        assert isinstance(self.engine, DuplexOmniEngine)
+        self.process_warmup_audio = warmup_silence_unit(self.engine.plugin)
+
+    async def check_health(self) -> None:
+        await self.runtime.check_health()
+
+    def shutdown(self) -> None:
+        self.runtime.shutdown()
 
 
 class DuplexSessionHandle:
@@ -66,7 +96,11 @@ class DuplexSessionHandle:
         self.capabilities: DuplexCapabilities = DuplexCapabilities()
         self.public_session: dict[str, object] = {}
         self.lease_generation: int = 0
-        self._outbox: asyncio.Queue[DuplexEvent | None] = asyncio.Queue()
+        limits = omni.duplex_session_config
+        self._outbox = DuplexOutputBuffer(
+            max_bytes=limits.max_pending_output_bytes_per_session,
+            max_events=limits.max_pending_output_events_per_session,
+        )
         self._closed = False
         self._close_reason: str | None = None
         self._closed_event = asyncio.Event()
@@ -219,12 +253,10 @@ class DuplexSessionHandle:
         self._consumer_active = True
         try:
             while True:
-                if self._closed and self._outbox.empty():
-                    return
                 event = await self._outbox.get()
                 if event is None:
-                    if self._closed and self._outbox.empty():
-                        return
+                    return
+                if not self._outbox.is_valid(event):
                     continue
                 yield event
                 if event.is_terminal:
@@ -235,6 +267,37 @@ class DuplexSessionHandle:
     async def wait_closed(self) -> str:
         await self._closed_event.wait()
         return self._close_reason or "closed"
+
+    def output_guard(self, event: DuplexEvent) -> AbstractContextManager[bool]:
+        """Recheck held audio while committing its delivery; never await inside this guard."""
+        return self._outbox.guard(event)
+
+    def _latest_accepted_session(self) -> tuple[int, dict[str, object] | None]:
+        """Newest accepted ``session.updated`` payload for wire-default apply.
+
+        Serving-only. Not part of the public handle (``submit`` / ``events``).
+        """
+        return self._outbox.latest_accepted_session()
+
+    def _observation_seq(self) -> int:
+        """How many ``session.updated`` / ``error`` events this session has enqueued."""
+        return self._outbox.observation_seq()
+
+    async def _wait_for_observation(self, seen: int) -> bool:
+        """Wait for a control event newer than ``seen``. False if the outbox is closed."""
+        return await self._outbox.wait_for_observation(seen)
+
+    def _arm_observation_retention(self, after_seq: int, event_id: str) -> None:
+        """Keep one update's outcome until the serving reader consumes it."""
+        self._outbox.arm_observation_retention(after_seq, event_id)
+
+    def _disarm_observation_retention(self) -> None:
+        """Drop the retained update outcome."""
+        self._outbox.disarm_observation_retention()
+
+    def _retained_observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
+        """Control events kept for the outstanding update."""
+        return self._outbox.retained_observations_after(seq)
 
     async def __aenter__(self) -> DuplexSessionHandle:
         return self
@@ -256,7 +319,7 @@ class DuplexSessionHandle:
             self.lease_generation = int(result.lease_generation)
 
     def _deliver(self, event: DuplexEvent) -> None:
-        self._outbox.put_nowait(event)
+        self._outbox.put(event)
         if isinstance(event, SessionClosed):  # SessionExpired is a SessionClosed
             self._mark_closed(event.reason or event.type)
 
@@ -266,7 +329,7 @@ class DuplexSessionHandle:
         self._closed = True
         self._close_reason = reason
         self._closed_event.set()
-        self._outbox.put_nowait(None)
+        self._outbox.close()
 
 
 class DuplexOmni(AsyncOmni):
@@ -274,20 +337,65 @@ class DuplexOmni(AsyncOmni):
 
     Construct it like ``AsyncOmni``. The pipeline must declare
     ``duplex_plugin`` and the deploy config ``session_mode: duplex``; the
-    engine raises at startup otherwise. There is no ``generate()``: duplex
-    serving is session-only.
+    engine raises at startup otherwise. ``duplex_engine_backend_as_process=True``
+    isolates the runtime from the frontend GIL and restricts this deployment
+    to sessions. The default ``False`` also permits model-supported chat.
     """
 
-    engine: DuplexOmniEngine
+    session_only: bool = False
+    final_output_task: asyncio.Task[None] | None
+    engine: DuplexOmniEngine | ProcessDuplexEngineClient  # type: ignore[assignment]
 
     def _create_engine(self, **engine_kwargs: Any) -> DuplexOmniEngine:
         from vllm_omni.entrypoints.duplex.audio_encoding import encode_audio
 
         return DuplexOmniEngine(duplex_audio_encoder=encode_audio, **engine_kwargs)
 
-    def __init__(self, model: str = "", *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, model=model, **kwargs)
+    def __init__(
+        self,
+        model: str = "",
+        *args: Any,
+        duplex_engine_backend_as_process: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        self.session_only = duplex_engine_backend_as_process
+        if self.session_only:
+            if args:
+                raise TypeError("The process duplex backend accepts keyword engine options only")
+            self.engine = ProcessDuplexEngineClient(model, kwargs, factory=_ProcessWorkerRuntime)
+            self.model = self.engine.metadata.model
+            self._initialize_output_state()
+            self._initialize_async_frontend()
+            self.endpoint_restrictions += tuple(
+                EndpointRestriction(capability, "The process duplex backend serves sessions only")
+                for capability in OmniServingCapability
+            )
+            self._weak_finalizer = weakref.finalize(self, self.engine.shutdown)
+        else:
+            super().__init__(model, *args, **kwargs)
         self._handles: dict[str, DuplexSessionHandle] = {}
+        #: Rollbacks of resumes whose caller was cancelled mid-RPC (see ``resume_session``).
+        self._resume_compensations: set[asyncio.Task[None]] = set()
+        #: Initial and maximum delay between replays of an abandoned resume
+        #: whose answers keep timing out.
+        self._resume_replay_backoff_s: tuple[float, float] = (0.5, 5.0)
+
+    async def generate(self, *args: Any, **kwargs: Any) -> AsyncGenerator[OmniRequestOutput, None]:
+        if self.session_only:
+            raise NotImplementedError("The process duplex backend serves sessions only; use open_session()")
+        async for output in super().generate(*args, **kwargs):
+            yield output
+
+    async def aclose(self) -> None:
+        """Release sessions and flush the process shutdown before joining it."""
+        try:
+            await self.close_all_sessions()
+        finally:
+            try:
+                if isinstance(self.engine, ProcessDuplexEngineClient):
+                    await self.engine.aclose()
+            finally:
+                self.shutdown()
 
     # ---- deployment facts ----
 
@@ -336,7 +444,7 @@ class DuplexOmni(AsyncOmni):
         self,
         config: DuplexSessionConfig | Mapping[str, object] | None = None,
         *,
-        timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
+        timeout: float | None = _DEFAULT_OPEN_TIMEOUT_S,
     ) -> DuplexSessionHandle:
         """Open an engine-resident session and return its handle.
 
@@ -348,11 +456,14 @@ class DuplexOmni(AsyncOmni):
         session_id = f"duplex-{uuid4().hex}"
         session_config = self._resolve_session_config(config, model=self.model)
         handle = DuplexSessionHandle(self, session_id)
-        self._handles[session_id] = handle
         self._final_output_handler()
+        self._handles[session_id] = handle
         try:
-            result = await self.engine.open_session_async(session_id, session_config, timeout=timeout)
+            result = await self.engine.open_session_async(
+                session_id, session_config, output_buffer=handle._outbox, timeout=timeout
+            )
         except BaseException:
+            handle._mark_closed("open_failed")
             if self._handles.get(session_id) is handle:
                 self._handles.pop(session_id, None)
             # Dropping the handle only forgets the id here. The engine may still
@@ -377,32 +488,166 @@ class DuplexOmni(AsyncOmni):
         *,
         expected_lease_generation: int,
         timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
+        on_abandoned: Callable[[int], Awaitable[None]] | None = None,
     ) -> DuplexSessionHandle:
-        """Engine lease resume (CAS on the lease generation); returns the existing handle."""
+        """Engine lease resume (CAS on the lease generation); returns the existing handle.
+
+        The RPC runs to completion in an executor thread whatever happens to
+        this waiter, so a caller cancelled while it is in flight does not stop
+        the engine from applying the resume (lease generation bumped,
+        disconnect grace cleared) for a connection that will never serve it.
+        The outcome is then observed off the cancelled task. If the RPC times
+        out before answering, the outcome is unknown, so the same resume is
+        replayed under its control id: the engine answers a replay with the
+        generation the resume produced instead of resuming again. A resume
+        that landed is adopted into the handle (a later reconnect resumes
+        against the real generation) and settled through ``on_abandoned`` with
+        that generation; without a callback it is detached again, fenced on
+        the generation, so a resume that came after it is never touched.
+
+        ``on_abandoned`` is for callers that own an attachment concept: they
+        decide whether the generation now belongs to a connection that is
+        still serving (a takeover that never activated leaves the previous
+        socket attached) or whether the lease goes back into disconnect grace.
+        """
         handle = self._require_handle(session_id)
-        result = await self.engine.resume_session_async(
-            session_id,
-            expected_lease_generation=expected_lease_generation,
-            timeout=timeout,
+        control_id = uuid4().hex
+        rpc = asyncio.ensure_future(
+            self.engine.resume_session_async(
+                session_id,
+                expected_lease_generation=expected_lease_generation,
+                control_id=control_id,
+                timeout=timeout,
+            )
         )
+        try:
+            result = await asyncio.shield(rpc)
+        except asyncio.CancelledError:
+            self._compensate_abandoned_resume(
+                handle,
+                rpc,
+                control_id=control_id,
+                expected_lease_generation=expected_lease_generation,
+                timeout=timeout,
+                on_abandoned=on_abandoned,
+            )
+            raise
         # The result carries the engine's current public session (state,
         # epoch, turn ...), which a resumed client must see, not the open-time snapshot.
         handle._adopt(result)
         return handle
+
+    def _compensate_abandoned_resume(
+        self,
+        handle: DuplexSessionHandle,
+        rpc: asyncio.Future[DuplexControlResultMessage],
+        *,
+        control_id: str,
+        expected_lease_generation: int,
+        timeout: float | None,
+        on_abandoned: Callable[[int], Awaitable[None]] | None,
+    ) -> None:
+        session_id = handle.session_id
+
+        async def observe() -> DuplexControlResultMessage | None:
+            # The first attempt is the RPC the caller abandoned. A timeout
+            # means its answer was dropped and the outcome is unknown: the
+            # engine may have applied the resume after the waiter gave up.
+            # Replaying under the same control id makes the engine answer with
+            # the generation that resume produced, whether it lands now or
+            # already did, and refuse if a newer resume won. A replay can time
+            # out too, so this keeps replaying, with backoff, until the engine
+            # answers one way or the other or the session is gone: giving up
+            # on a timeout would be exactly the lost-answer window again.
+            attempt: Awaitable[DuplexControlResultMessage] = rpc
+            delay, ceiling = self._resume_replay_backoff_s
+            while True:
+                try:
+                    return await attempt
+                except DuplexSessionError as exc:
+                    if exc.code != "timeout":
+                        # Refused (conflict, unknown session, engine gone):
+                        # the resume did not land, nothing to give back.
+                        logger.debug("abandoned duplex resume of %s did not land: %s", session_id, exc)
+                        return None
+                except Exception as exc:
+                    logger.debug("abandoned duplex resume of %s did not land: %s", session_id, exc)
+                    return None
+                if handle.closed:
+                    return None
+                logger.warning(
+                    "abandoned duplex resume of %s lost its answer to a timeout; replaying in %.1fs", session_id, delay
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, ceiling)
+                attempt = self.engine.resume_session_async(
+                    session_id,
+                    expected_lease_generation=expected_lease_generation,
+                    control_id=control_id,
+                    timeout=timeout,
+                )
+
+        async def compensate() -> None:
+            result = await observe()
+            if result is None:
+                return
+            handle._adopt(result)
+            lease_generation = result.lease_generation
+            if lease_generation is None:
+                return
+            try:
+                if on_abandoned is not None:
+                    await on_abandoned(lease_generation)
+                else:
+                    await self.engine.touch_session_async(
+                        session_id,
+                        activity="detach",
+                        expected_lease_generation=lease_generation,
+                        timeout=timeout,
+                    )
+            except Exception as exc:
+                logger.warning("abandoned duplex resume of %s could not be settled: %s", session_id, exc)
+
+        task = asyncio.create_task(compensate(), name=f"duplex-resume-compensation-{session_id}")
+        self._resume_compensations.add(task)
+        task.add_done_callback(self._resume_compensations.discard)
 
     async def touch_session(
         self,
         session_id: str,
         *,
         activity: str = "heartbeat",
+        expected_lease_generation: int | None = None,
         timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
     ) -> None:
         self._require_handle(session_id)
-        await self.engine.touch_session_async(session_id, activity=activity, timeout=timeout)
+        await self.engine.touch_session_async(
+            session_id,
+            activity=activity,
+            expected_lease_generation=expected_lease_generation,
+            timeout=timeout,
+        )
 
-    async def detach_session(self, session_id: str, *, timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S) -> None:
-        """Start the engine-owned disconnect grace; expiry arrives as ``session.expired``."""
-        await self.touch_session(session_id, activity="detach", timeout=timeout)
+    async def detach_session(
+        self,
+        session_id: str,
+        *,
+        expected_lease_generation: int | None = None,
+        timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
+    ) -> None:
+        """Start the engine-owned disconnect grace; expiry arrives as ``session.expired``.
+
+        ``expected_lease_generation`` names the lease the caller opened or
+        resumed against; the engine refuses to detach a newer one, so a
+        connection giving up its lease cannot start the grace for the lease a
+        later resume owns.
+        """
+        await self.touch_session(
+            session_id,
+            activity="detach",
+            expected_lease_generation=expected_lease_generation,
+            timeout=timeout,
+        )
 
     async def close_session(
         self,
@@ -466,11 +711,22 @@ class DuplexOmni(AsyncOmni):
             handle._mark_closed(f"engine_dead: {error}")
         self._handles.clear()
 
-    def shutdown(self, timeout: float | None = None) -> None:
+    def _on_frontend_shutdown(self) -> None:
+        if not self.session_only:
+            super()._on_frontend_shutdown()
         for handle in list(self._handles.values()):
             handle._mark_closed("shutdown")
         self._handles.clear()
-        super().shutdown(timeout)
+        for compensation in list(self._resume_compensations):
+            compensation.cancel()
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        if isinstance(self.engine, ProcessDuplexEngineClient):
+            self._close_async_frontend()
+            self.engine.shutdown(timeout)
+            self._weak_finalizer.detach()
+        else:
+            super().shutdown(timeout)
 
 
 __all__ = ["DuplexOmni", "DuplexSessionHandle"]

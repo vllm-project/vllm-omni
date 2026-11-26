@@ -18,6 +18,8 @@ def startup_server(request, tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "cleanup_test_environment", lambda: None)
     proc = MagicMock(spec=runtime.subprocess.Popen)
     proc.poll.return_value = None
+    # Clock tests do not exercise stderr capture; omit the pipe.
+    proc.stderr = None
     monkeypatch.setattr(runtime.subprocess, "Popen", lambda *args, **kwargs: proc)
     if request.param == "server":
         # Exercise the wait-loop clock without reserving or inspecting real ports.
@@ -29,8 +31,8 @@ def startup_server(request, tmp_path, monkeypatch):
     config.write_text("stages:\n  - stage_id: 0\n  - stage_id: 1\n")
     server = runtime.OmniServerStageCli("fake-model", str(config), [])
 
-    def launch(stage_id, *, headless, replica_id=0):
-        server.stage_procs[(stage_id, replica_id)] = proc
+    def launch(stage_id, *, headless):
+        server.stage_procs[stage_id] = proc
 
     monkeypatch.setattr(server, "_launch_stage", launch)
     return server
@@ -38,7 +40,11 @@ def startup_server(request, tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("wall_clock_jump", [3600, -3600])
 @pytest.mark.parametrize("becomes_ready", [True, False], ids=["ready", "timeout"])
-def test_startup_deadline_ignores_wall_clock_changes(startup_server, monkeypatch, wall_clock_jump, becomes_ready):
+@pytest.mark.parametrize("startup_timeout", [runtime.SERVER_STARTUP_TIMEOUT_S, 2100])
+def test_startup_deadline_ignores_wall_clock_changes(
+    startup_server, monkeypatch, wall_clock_jump, becomes_ready, startup_timeout
+):
+    startup_server.startup_timeout = startup_timeout
     elapsed = 0.0
     wall_offset = 0.0
     first_probe_at = None
@@ -66,7 +72,7 @@ def test_startup_deadline_ignores_wall_clock_changes(startup_server, monkeypatch
         if first_probe_at is None:
             first_probe_at = elapsed
         # Even a backwards clock correction must not extend the deadline.
-        assert elapsed - first_probe_at < runtime.SERVER_STARTUP_TIMEOUT_S, "startup exceeded its elapsed-time budget"
+        assert elapsed - first_probe_at < startup_timeout, "startup exceeded its elapsed-time budget"
         probes += 1
         if probes == 1:
             wall_offset += wall_clock_jump
@@ -84,7 +90,7 @@ def test_startup_deadline_ignores_wall_clock_changes(startup_server, monkeypatch
         assert first_probe_at is not None
         assert elapsed - first_probe_at == 2
     else:
-        with pytest.raises(RuntimeError, match=f"failed to start within {runtime.SERVER_STARTUP_TIMEOUT_S} seconds"):
+        with pytest.raises(RuntimeError, match=f"failed to start within {startup_timeout} seconds"):
             startup_server._start_server()
         assert first_probe_at is not None
-        assert elapsed - first_probe_at == runtime.SERVER_STARTUP_TIMEOUT_S
+        assert elapsed - first_probe_at == startup_timeout

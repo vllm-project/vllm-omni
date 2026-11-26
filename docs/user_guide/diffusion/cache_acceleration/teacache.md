@@ -15,7 +15,7 @@
 
 ## Overview
 
-TeaCache accelerates diffusion model inference by caching transformer computations when consecutive timesteps are similar, providing **1.5x-2.0x speedup** with minimal quality loss. It dynamically decides whether to reuse cached outputs based on input similarity, making it ideal for production deployments where inference speed matters without sacrificing generation quality.
+TeaCache accelerates diffusion model inference by caching transformer computations when consecutive timesteps are similar, providing up to **1.5x-2.0x speedup** with minimal quality loss on models with calibrated coefficients and enough steps to skip (few-step distilled models gain less; see the Summary). It dynamically decides whether to reuse cached outputs based on input similarity, making it ideal for production deployments where inference speed matters without sacrificing generation quality.
 
 See supported models list in [Supported Models](../../diffusion_features.md#supported-models).
 
@@ -119,7 +119,7 @@ In `OmniDiffusionConfig`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `rel_l1_thresh` | float | `0.2` | Similarity threshold for cache reuse. Lower values prioritize quality (less caching), higher values prioritize speed (more caching). Suggested range: 0.1-0.8 |
+| `rel_l1_thresh` | float | `0.2` | Similarity threshold for cache reuse. Lower values prioritize quality (less caching), higher values prioritize speed (more caching). Suggested range: 0.1-0.3; higher values mostly cost quality on calibrated models |
 | `coefficients` | list[float] \| None | `None` | Polynomial coefficients for rescaling L1 distance. Must contain exactly 5 elements if provided. If `None`, uses model-specific defaults based on transformer type. |
 
 Users can find the default model coefficients in [`vllm_omni/diffusion/cache/teacache/config.py`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/diffusion/cache/teacache/config.py), for example:
@@ -149,7 +149,7 @@ _MODEL_COEFFICIENTS = {
 **Good for:**
 
 - Production deployments requiring faster inference, tolerant of minimal quality loss
-- Scenarios where 1.5-2x speedup is valuable
+- Scenarios where a model-dependent 1.2-2x speedup is valuable
 - Useful for single-card acceleration
 
 **Not for:**
@@ -178,11 +178,11 @@ cache_config={"rel_l1_thresh": 0.1}
 **Symptoms**: Actual speedup is less than expected (< 1.3x)
 
 **Solutions**:
-1. Increase the threshold to enable more aggressive caching:
+1. Increase the threshold to enable more aggressive caching (non-distilled models only; on few-step distilled models such as Z-Image-Turbo a higher threshold mostly costs quality, see the Summary):
    ```python
-   cache_config={"rel_l1_thresh": 0.8}
+   cache_config={"rel_l1_thresh": 0.3}
    ```
-2. Ensure you're using sufficient inference steps (35+ recommended)
+2. Ensure you're using sufficient inference steps (35+ recommended for non-distilled models; few-step distilled models cannot add steps)
 3. Check that your model architecture is supported (see Supported Models section)
 
 ---
@@ -190,5 +190,5 @@ cache_config={"rel_l1_thresh": 0.1}
 
 ## Summary
 
-1. ✅ **Enable TeaCache** - Set `cache_backend="tea_cache"` to get 1.5x-2.0x speedup with optimized defaults
+1. ✅ **Enable TeaCache** - Set `cache_backend="tea_cache"` to get up to 1.5x-2.0x speedup with optimized defaults on 50-step runs; few-step distilled models (e.g. Z-Image-Turbo at 25 steps) change too much per step to skip many, so expect ~1.1x there
 2. ✅ **(Optional) Customize** - Adjust thresholds and polynomial coefficients for specific speed/quality trade-offs

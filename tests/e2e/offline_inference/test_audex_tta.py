@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Offline E2E smoke test for Audex text-to-audio (TTA).
 
 Caption → RVQ-phase-masked <audiocodec_*> tokens → XCodec1 waveform through
@@ -66,13 +66,11 @@ pytestmark = [
 
 @pytest.fixture(scope="module")
 def tta_tokenizer_bits():
-    from transformers import AutoTokenizer
-
-    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot, load_audex_tokenizer
     from vllm_omni.model_executor.models.audex.tta import build_tta_phase_token_ids
 
     root = ensure_audex_snapshot(_audex_model, profile="tta")
-    tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, "checkpoint_folder_audiogen"), trust_remote_code=True)
+    tokenizer = load_audex_tokenizer(os.path.join(root, "checkpoint_folder_audiogen"))
     phase_token_ids, start_tid, end_tid = build_tta_phase_token_ids(tokenizer)
     return tokenizer, phase_token_ids, start_tid, end_tid
 
@@ -105,7 +103,7 @@ def _tta_sampling_params(runner: OmniRunner, cond_prompt: str, tokenizer_bits, c
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_audex_offline_tta_eight_captions(omni_runner: OmniRunner, run_level: str, tta_tokenizer_bits) -> None:
     """All eight captions decode through XCodec1 to non-silent, finite audio.
 

@@ -1107,6 +1107,11 @@ def calculate_metrics(
     error_outputs = [o for o in outputs if not o.success]
 
     num_success = len(success_outputs)
+    error_log_path = os.environ.get("BENCH_ERROR_LOG")
+    if error_outputs and error_log_path:
+        with open(error_log_path, "a") as f:
+            for output in error_outputs:
+                f.write(f"ERROR latency={output.latency:.3f} detail={output.error!r}\n")
     latencies = [o.latency for o in success_outputs]
     peak_memories = [o.peak_memory_mb for o in success_outputs if o.peak_memory_mb > 0]
 
@@ -1275,6 +1280,8 @@ def _default_endpoint_for_task(task: str) -> str:
 async def benchmark(args):
     if not math.isfinite(args.video_job_timeout) or args.video_job_timeout <= 0:
         raise ValueError("--video-job-timeout must be a positive finite number of seconds.")
+    if not math.isfinite(args.video_poll_interval) or args.video_poll_interval <= 0:
+        raise ValueError("--video-poll-interval must be a positive finite number of seconds.")
 
     # Construct base_url if not provided
     if args.base_url is None:
@@ -1329,6 +1336,7 @@ async def benchmark(args):
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
     for req in requests_list:
         req.video_job_timeout = args.video_job_timeout
+        req.video_poll_interval = args.video_poll_interval
 
     if args.return_stage_metrics and args.endpoint in _STAGE_METRICS_ENDPOINTS:
         for req in requests_list:
@@ -1395,6 +1403,7 @@ async def benchmark(args):
     metrics["task"] = args.task
     if args.endpoint == "/v1/videos":
         metrics["video_job_timeout"] = args.video_job_timeout
+        metrics["video_poll_interval"] = args.video_poll_interval
     if args.endpoint == "/v1/images/edits":
         metrics["bot_task"] = args.bot_task
 
@@ -1511,6 +1520,12 @@ def build_parser():
         default=900.0,
         help="Maximum polling time in seconds per video job, including server queue time (default: 900). "
         "Increase this for long-running video generation or high concurrency.",
+    )
+    parser.add_argument(
+        "--video-poll-interval",
+        type=float,
+        default=2.0,
+        help="Interval in seconds between video job status checks (default: 2).",
     )
     parser.add_argument(
         "--max-concurrency",

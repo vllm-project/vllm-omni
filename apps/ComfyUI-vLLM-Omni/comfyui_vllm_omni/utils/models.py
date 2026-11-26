@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from .logger import get_logger
-from .types import Modality, ModelMode, Spec
+from .types import Modality, ModelMode, ParamsBuilder, Spec
 
 logger = get_logger(__name__)
 
@@ -68,9 +68,20 @@ def _minimaxh3_params_builder(
 
     if "flow_shift" in params:
         form_fields["flow_shift"] = params.pop("flow_shift")
-    for key in ("audio_flow_shift",):
+    for key in (
+        "audio_flow_shift",
+        "long_video",
+        "long_video_mode",
+        "continuation_window_frames",
+        "continuation_overlap_frames",
+        "latent_upscale",
+    ):
         if key in params:
             merged_extra_params[key] = params.pop(key)
+    # "native" is the server default; omit it so ordinary requests are unchanged.
+    audio_mode = params.pop("audio_mode", "native")
+    if audio_mode != "native":
+        merged_extra_params["audio_mode"] = audio_mode
     if params:
         logger.warning("Unused MiniMax-H3 model params ignored: %s", sorted(params))
 
@@ -127,7 +138,7 @@ _MODEL_PIPELINE_SPECS: dict[str, Spec] = {
             }
         ],
     },
-    r"MiniMax-H3(/FL2VA|/Ref2VA)?": {
+    r"MiniMax-H3(/FL2VA|/Ref2VA)?|FastVideo-FastH3-Omni-8-Step-V1": {
         "stages": ["diffusion"],
         "modes": [
             {
@@ -157,6 +168,14 @@ def lookup_model_spec(model: str) -> tuple[Spec | None, str | None]:
         if pattern.search(lookup_key):
             return spec, pattern.pattern
     return None, None
+
+
+def lookup_params_builder(model: str, model_params_type: str | None = None) -> ParamsBuilder | None:
+    """Resolve request serialization independently from the served model name."""
+    if model_params_type == "minimax_h3":
+        return _minimaxh3_params_builder
+    spec, _ = lookup_model_spec(model)
+    return spec.get("params_builder") if spec else None
 
 
 # ============== DEMONSTRATION ==============

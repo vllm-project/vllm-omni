@@ -101,6 +101,10 @@ When the pipeline includes an LLM stage, the upstream vLLM engine exposes its fu
 
 vLLM-Omni wraps the upstream `vllm.v1.metrics.loggers.PrometheusStatLogger` with `OmniPrometheusStatLogger` so that the original `engine` single label is reshaped into `stage` + `replica`. Every `vllm:*` family — TTFT, ITL, TPOT, e2e latency, KV cache usage, scheduler running/waiting, request success counts, etc. — therefore gains per-`(stage, replica)` visibility automatically. No omni-side duplicate is needed for the text path.
 
+Final AR audio stages can coalesce token-only decode steps into the next audio output. Their coalesced intervals are excluded from both upstream ITL histograms and Omni `vllm_itls_ms`; ordinary step samples, completed-request token counts, TTFT, TPOT and completion statistics remain available. ITL coverage therefore excludes coalesced steps. An empty ITL list means no individual-step samples were available; the corresponding zero average does not mean zero decode latency.
+
+`vllm:generation_tokens_total` counts tokens delivered to the output processor. Cancelling a request removes its processor state, so tokens still held by the scheduler at cancellation are not counted. Token-only step coalescing can therefore lower this counter for aborted audio streams compared with per-step delivery; it is not an exact measure of engine work for cancelled requests. Requests that complete normally flush their held tokens and retain their full generation counts.
+
 ```text
 # Before wrap:
 vllm:num_requests_running{model_name="...", engine="1"}              3.0
@@ -129,3 +133,33 @@ For the full list of upstream metrics, see [the vLLM docs](https://github.com/vl
 - Sizes use the `_bytes` suffix.
 - All omni-specific families are prefixed `vllm_omni:`. The upstream `unregister_vllm_metrics()` function is monkey-patched (see `vllm_omni/patch.py`) to a scoped version that still strips upstream `vllm:*` collectors so multi-engine init within one process does not crash on duplicate registration, but preserves anything prefixed `vllm_omni:`.
 - Text and audio first-output use distinct families (`vllm:time_to_first_token_seconds` reused from upstream for text; `vllm_omni:audio_ttfp_s` for audio) rather than a single metric with a `modality` label.
+
+## Distributed tracing
+
+Install the `tracing` extra and pass `--otlp-traces-endpoint` to enable tracing:
+
+```bash
+pip install 'vllm-omni[tracing]'
+vllm-omni serve <model> --otlp-traces-endpoint http://localhost:4317
+```
+
+The default transport is gRPC. For HTTP, set
+`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf` and pass an endpoint ending
+in `/v1/traces`. Standard OTel service, resource and sampler environment variables
+apply. Tracing is disabled when the flag is absent.
+
+HTTP requests accept W3C `traceparent`, `tracestate` and `baggage`. Python callers
+can use an active OTel span or pass `trace_headers` to `AsyncOmni.generate`.
+A server span covers the HTTP response, including streaming; `omni.pipeline`
+covers the admitted request in the orchestrator, with one `omni.stage` span per
+submitted stage. These are orchestration lifetimes, including waits and transfers,
+not GPU kernel timings. Stage spans are model independent and are ended on
+completion, cancellation, failure or shutdown. `omni.stage.first_output` records
+the first nonempty output observed by the orchestrator, not client receipt.
+
+Realtime and duplex connections add `omni.session` and `omni.turn` spans, recording
+response completion, failure, or cancellation. Realtime inference requests inherit
+the active turn context.
+
+No per-token or per-chunk spans, prompts, generated content or media are recorded
+by the pipeline instrumentation.

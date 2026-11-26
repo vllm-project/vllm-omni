@@ -56,6 +56,13 @@ def test_build_app_serves_health_and_injected_client_config():
     assert "__FULL_DUPLEX_CONFIG__" not in index.text
 
 
+def test_qwen_semantic_vad_mode_is_injected_and_restricted_to_qwen():
+    client = TestClient(build_app(profile="qwen3-turn", turn_mode="semantic_vad"))
+    assert '"turnMode": "semantic_vad"' in client.get("/").text
+    with pytest.raises(ValueError, match="requires --profile qwen3-turn"):
+        build_app(profile="minicpm-native", turn_mode="semantic_vad")
+
+
 def test_build_app_injects_public_realtime_url():
     public_realtime_url = "wss://proxy.example.test/backend/v1/realtime"
     app = build_app(
@@ -108,21 +115,48 @@ def test_build_app_exposes_realtime_websocket_and_static_assets():
 
 
 def test_qwen_config_does_not_inject_reference_voice():
-    client = TestClient(build_app(profile="qwen3-turn", adapter="vad", model="Qwen/Qwen3-Omni-30B-A3B-Instruct"))
+    client = TestClient(build_app(profile="qwen3-turn", turn_mode="vad", model="Qwen/Qwen3-Omni-30B-A3B-Instruct"))
     page = client.get("/").text
     assert '"profile": "qwen3-turn"' in page
-    assert '"adapter": "vad"' in page
+    assert '"turnMode": "vad"' in page
     assert '"refAudio": null' in page
-    for name in ("common", "minicpm_native", "qwen3_turn"):
+    assert '"speechInput": false' in page
+    for name in ("common", "minicpm_native", "qwen3_turn", "aura_ptt"):
         assert client.get(f"/static/profiles/{name}.js").status_code == 200
     with pytest.raises(ValueError, match="ref-audio"):
         build_app(profile="qwen3-turn", ref_audio="unused.wav")
+
+
+def test_aura_ptt_config_defaults_and_rejects_ref_audio():
+    client = TestClient(build_app(profile="aura-ptt", model="aurateam/AURA"))
+    page = client.get("/").text
+    assert '"profile": "aura-ptt"' in page
+    assert '"refAudio": null' in page
+    assert "aura_ptt.js" in page
+    assert 'id="pttButton"' in page
+    with pytest.raises(ValueError, match="ref-audio"):
+        build_app(profile="aura-ptt", ref_audio="unused.wav")
 
 
 def test_config_cannot_close_its_script_element():
     page = TestClient(build_app(model="</script><script>alert(1)</script>")).get("/").text
     assert "</script><script>alert(1)" not in page
     assert "\\u003c/script>" in page
+
+
+def test_joyai_profile_defaults_and_static_asset():
+    client = TestClient(build_app(profile="joyai-turn"))
+    page = client.get("/").text
+    assert '"profile": "joyai-turn"' in page
+    assert '"model": "jdopensource/JoyAI-VL-Interaction-Preview"' in page
+    assert '"refAudio": null' in page
+    assert "joyai_turn.js" in page
+    assert client.get("/static/profiles/joyai_turn.js").status_code == 200
+    with pytest.raises(ValueError, match="ref-audio"):
+        build_app(profile="joyai-turn", ref_audio="unused.wav")
+    speech = TestClient(build_app(profile="joyai-turn", speech_input=True, turn_mode="vad"))
+    assert '"speechInput": true' in speech.get("/").text
+    assert '"turnMode": "vad"' in speech.get("/").text
 
 
 def test_proxy_reports_unreachable_backend(monkeypatch):

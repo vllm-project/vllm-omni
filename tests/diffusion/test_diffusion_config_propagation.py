@@ -5,6 +5,7 @@
 Regression tests for https://github.com/vllm-project/vllm-omni/issues/1862
 """
 
+import json
 from collections.abc import Mapping
 
 import pytest
@@ -45,6 +46,21 @@ def _roundtrip_diffusion_config(**kwargs) -> OmniDiffusionConfig:
     return OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
 
 
+def test_direct_config_extras_are_independent_dicts():
+    first = OmniDiffusionConfig(model="test-model")
+    second = OmniDiffusionConfig(model="test-model")
+
+    assert first.extras.get("prefix_kv_cache_dtype") is None
+    first.extras["prefix_kv_cache_dtype"] = "fp8"
+    assert second.extras == {}
+
+
+def test_direct_config_preserves_explicit_extras():
+    config = OmniDiffusionConfig(model="test-model", extras={"prefix_kv_cache_dtype": "fp8"})
+
+    assert config.extras["prefix_kv_cache_dtype"] == "fp8"
+
+
 class TestParallelConfigPropagation:
     """Core regression tests: parallel_config must survive serialization."""
 
@@ -68,10 +84,12 @@ class TestParallelConfigPropagation:
             tensor_parallel_size=2,
             ulysses_degree=2,
             ring_degree=1,
+            ulysses_a2a_permute=True,
         )
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.parallel_config.ulysses_degree == 2
         assert od.parallel_config.ring_degree == 1
+        assert od.parallel_config.ulysses_a2a_permute is True
 
     def test_mask_sp_padding_roundtrip(self):
         pc = DiffusionParallelConfig(ulysses_degree=2, mask_sp_padding=True)
@@ -122,6 +140,55 @@ class TestParallelConfigPropagation:
         od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
         assert od.parallel_config.data_parallel_size == 1
         assert od.parallel_config.world_size == 4
+
+    def test_hsdp_data_parallel_exposes_world_as_request_lanes(self):
+        pc = DiffusionParallelConfig(
+            use_hsdp=True,
+            hsdp_data_parallel=True,
+            hsdp_shard_size=4,
+        )
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+
+        assert od.parallel_config.data_parallel_size == 4
+        assert od.parallel_config.world_size == 4
+
+    @pytest.mark.parametrize("cache_backend", ["tea_cache", "cache_dit", "mag_cache", "step_cache"])
+    def test_hsdp_data_parallel_rejects_rank_local_cache_backends(self, cache_backend):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_data_parallel=True, hsdp_shard_size=4)
+
+        with pytest.raises(ValueError, match="cannot be combined with hsdp_data_parallel"):
+            OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4, cache_backend=cache_backend)
+
+    @pytest.mark.parametrize("cache_backend", ["none", "sea_cache"])
+    def test_hsdp_data_parallel_allows_synchronized_cache_backends(self, cache_backend):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_data_parallel=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4, cache_backend=cache_backend)
+
+        assert od.cache_backend == cache_backend
+
+    def test_hsdp_data_parallel_defaults_request_batch_wait(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_data_parallel=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+
+        assert od.request_batch_max_wait_ms == 500.0
+
+    def test_hsdp_data_parallel_keeps_explicit_zero_request_batch_wait(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_data_parallel=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4, request_batch_max_wait_ms=0)
+
+        assert od.request_batch_max_wait_ms == 0.0
+
+    def test_hsdp_without_data_parallel_disables_request_batch_wait_by_default(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+
+        assert od.request_batch_max_wait_ms == 0.0
+
+    def test_hsdp_without_data_parallel_keeps_cache_backends(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4, cache_backend="tea_cache")
+
+        assert od.cache_backend == "tea_cache"
 
 
 class TestCreateDefaultDiffusion:
@@ -214,6 +281,29 @@ def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
     assert od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
 
 
+def test_vae_fast_path_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").vae_fast_path == "lossless"
+    od = _roundtrip_diffusion_config(model="x", vae_fast_path="channels_last")
+    assert od.vae_fast_path == "channels_last"
+
+
+def test_invalid_vae_fast_path_is_rejected():
+    with pytest.raises(ValueError, match="vae_fast_path"):
+        OmniDiffusionConfig(model="x", vae_fast_path="fast")
+
+
+def test_vae_encode_fast_path_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").vae_encode_fast_path == "lossless"
+    od = _roundtrip_diffusion_config(model="x", vae_fast_path="off", vae_encode_fast_path="channels_last")
+    assert od.vae_fast_path == "off"
+    assert od.vae_encode_fast_path == "channels_last"
+
+
+def test_invalid_vae_encode_fast_path_is_rejected():
+    with pytest.raises(ValueError, match="vae_encode_fast_path"):
+        OmniDiffusionConfig(model="x", vae_encode_fast_path="fast")
+
+
 def test_flux2_klein_sets_generic_multimodal_limit():
     od_config = OmniDiffusionConfig(
         model="black-forest-labs/FLUX.2-klein-9B",
@@ -253,6 +343,21 @@ def test_architecture_name_resolves_via_pipeline_class_fallback():
 
     assert hunyuan_od_config.supports_multimodal_inputs is True
     assert hunyuan_od_config.max_multimodal_image_inputs == HUNYUAN_IMAGE3_MAX_INPUT_IMAGES
+
+
+def test_architecture_only_checkpoint_propagates_multimodal_limit(tmp_path):
+    """A config.json-only checkpoint must expose its image-input capability."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": ["HunyuanImage3ForCausalMM"]}),
+        encoding="utf-8",
+    )
+
+    od_config = OmniDiffusionConfig(model=str(tmp_path))
+    od_config.enrich_config()
+
+    assert od_config.model_class_name == "HunyuanImage3ForCausalMM"
+    assert od_config.supports_multimodal_inputs is True
+    assert od_config.max_multimodal_image_inputs == HUNYUAN_IMAGE3_MAX_INPUT_IMAGES
 
 
 def test_additional_config_roundtrip():

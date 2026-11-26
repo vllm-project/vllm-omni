@@ -42,7 +42,6 @@ ALLOWED_FILES = {
     "tests/e2e/accuracy/wan22_i2v/run_wan22_i2v_diffusers_cp.py",
     "tests/e2e/features/custom_pipeline/test_async_omni_collective_rpc.py",
     "tests/e2e/features/fullduplex/test_personaplex_elastic.py",
-    "tests/entrypoints/test_omni_sleep_mode.py",
     "tools/configure_stage_memory.py",
     "vllm_omni/diffusion/models/bagel/pipeline_bagel.py",
     "vllm_omni/diffusion/models/lance/pipeline_lance.py",
@@ -54,7 +53,6 @@ ALLOWED_FILES = {
     "vllm_omni/model_executor/models/moss_tts/cuda_graph_streaming_decoder_wrapper.py",
     "vllm_omni/model_executor/models/moss_tts_nano/modeling_moss_tts_nano.py",
     "vllm_omni/model_executor/models/qwen3_tts/cuda_graph_decoder_wrapper.py",
-    "vllm_omni/worker/gpu_ar_model_runner.py",
 }
 
 _GENERIC_TIP = (

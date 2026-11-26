@@ -30,3 +30,13 @@ stages:
       step_cache_dit_enabled: true
       velocity_sim_thresholds: [0.95, 0.93]
       velocity_skip_countdowns: [4, 2]
+
+platforms:
+  xpu:
+    stages:
+      - stage_id: 0
+        # Weights do not fit one 32 GiB card.
+        devices: "0,1,2,3"
+        parallel_config:
+          tensor_parallel_size: 4
+          cfg_parallel_size: 1

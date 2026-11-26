@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression coverage for MiniCPM-o 4.5 SigLIP FlashAttention."""
 
 from __future__ import annotations
@@ -127,22 +127,7 @@ def test_qkv_bshd_layout_reuses_projection_storage(mocker: MockerFixture) -> Non
         assert flash_tensor.untyped_storage().data_ptr() == projected_tensor.untyped_storage().data_ptr()
 
 
-@pytest.mark.core_model
-@pytest.mark.cpu
-@pytest.mark.parametrize(
-    ("attention_mask", "expected_calls"),
-    [
-        pytest.param(torch.tensor([[True, True, False], [True, False, False]]), 1, id="padded"),
-        pytest.param(None, 0, id="dense"),
-    ],
-)
-def test_encoder_computes_unpadding_metadata_once_per_forward(
-    mocker: MockerFixture,
-    attention_mask: torch.Tensor | None,
-    expected_calls: int,
-) -> None:
-    encoder = SiglipEncoder(_encoder_config()).eval()
-    metadata_spy = mocker.spy(minicpmo_model, "_get_unpad_data")
+def _record_unpadding_metadata(mocker: MockerFixture, encoder: SiglipEncoder):
     received_metadata: list[minicpmo_model.FlashAttentionUnpaddingMetadata | None] = []
 
     def fake_flash_attention(
@@ -162,6 +147,26 @@ def test_encoder_computes_unpadding_metadata_once_per_forward(
 
     for layer in encoder.layers:
         mocker.patch.object(layer.self_attn, "_flash_attention_forward", side_effect=fake_flash_attention)
+    return received_metadata
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("attention_mask", "expected_calls"),
+    [
+        pytest.param(torch.tensor([[True, True, False], [True, False, False]]), 1, id="padded"),
+        pytest.param(None, 0, id="dense"),
+    ],
+)
+def test_encoder_computes_unpadding_metadata_once_per_forward(
+    mocker: MockerFixture,
+    attention_mask: torch.Tensor | None,
+    expected_calls: int,
+) -> None:
+    encoder = SiglipEncoder(_encoder_config()).eval()
+    metadata_spy = mocker.spy(minicpmo_model, "_get_unpad_data")
+    received_metadata = _record_unpadding_metadata(mocker, encoder)
 
     hidden_states = torch.randn(2, 3, 32)
     with torch.inference_mode():
@@ -187,28 +192,7 @@ def test_encoder_computes_unpadding_metadata_once_per_forward(
 def test_encoder_recomputes_unpadding_metadata_for_new_mask(mocker: MockerFixture) -> None:
     encoder = SiglipEncoder(_encoder_config(num_layers=1)).eval()
     metadata_spy = mocker.spy(minicpmo_model, "_get_unpad_data")
-    received_metadata: list[minicpmo_model.FlashAttentionUnpaddingMetadata | None] = []
-
-    def fake_flash_attention(
-        query_states: torch.Tensor,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        _attention_mask: torch.Tensor | None,
-        _query_length: int,
-        *,
-        dropout: float = 0.0,
-        softmax_scale: float | None = None,
-        unpadding_metadata: minicpmo_model.FlashAttentionUnpaddingMetadata | None = None,
-    ) -> torch.Tensor:
-        del key_states, value_states, _attention_mask, _query_length, dropout, softmax_scale
-        received_metadata.append(unpadding_metadata)
-        return query_states
-
-    mocker.patch.object(
-        encoder.layers[0].self_attn,
-        "_flash_attention_forward",
-        side_effect=fake_flash_attention,
-    )
+    received_metadata = _record_unpadding_metadata(mocker, encoder)
     hidden_states = torch.randn(2, 4, 32)
     masks = (
         torch.tensor([[True, True, True, False], [True, True, False, False]]),
@@ -253,7 +237,7 @@ def _make_cuda_attention_pair() -> tuple[SiglipAttention, SiglipFlashAttention2]
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_encoder_metadata_reuse_matches_per_layer_recomputation() -> None:
     _require_flash_attention()
     encoder = SiglipEncoder(_encoder_config()).eval().to(device="cuda", dtype=_DTYPE)
@@ -285,7 +269,7 @@ def test_encoder_metadata_reuse_matches_per_layer_recomputation() -> None:
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_flash_attention_unpadded_matches_eager_reference() -> None:
     _require_flash_attention()
     eager_attention, flash_attention = _make_cuda_attention_pair()
@@ -306,7 +290,7 @@ def test_flash_attention_unpadded_matches_eager_reference() -> None:
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize(
     "valid_lengths",
     [

@@ -1,20 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import math
-from typing import Annotated, Any, Literal
+from dataclasses import dataclass
+from typing import Annotated, Any, Literal, cast
 
 import numpy as np
-from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 # Bound int request fields to avoid overflow issues.
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 
 _MAX_EMBEDDING_DIM = 8192
+# Structural bounds for pre-computed reference codes ([codebooks, frames]);
+# the adapter checks the deployed model's exact codebook count and lengths.
+_MAX_REF_AUDIO_CODEBOOKS = 64
+_MAX_REF_AUDIO_CODE_FRAMES = 1 << 16
 
 SUPPORTED_AUDIO_FORMATS: frozenset[str] = frozenset({"wav", "pcm", "flac", "mp3", "opus"})
 SUPPORTED_CHAT_AUDIO_FORMATS: frozenset[str] = SUPPORTED_AUDIO_FORMATS | {"pcm16"}
-DEFAULT_AUDIO_FORMAT: str = "wav"
+DEFAULT_AUDIO_FORMAT: Literal["wav", "pcm", "flac", "mp3", "opus"] = "wav"
 SpeechSampleRate = Annotated[int, Field(gt=0)]
 
 
@@ -55,7 +70,19 @@ def _normalize_speaker_embedding_value(value):
     return [float(x) for x in value]
 
 
+@dataclass(frozen=True)
+class RegisteredVoiceReference:
+    """Server-only snapshot of an uploaded audio generation."""
+
+    name: str
+    created_at: int
+    file_path: str
+    ref_text: str | None
+
+
 class OpenAICreateSpeechRequest(BaseModel):
+    _registered_voice_reference: RegisteredVoiceReference | None = PrivateAttr(default=None)
+
     input: str
     model: str | None = None
     # Accept both "voice" (OpenAI convention) and "speaker" (model/internal
@@ -140,16 +167,48 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0.0,
         description="Target audio duration in seconds (MOSS-SoundEffect). Converted to ~12.5 frames/s internally.",
     )
+    token_count: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        le=_INT64_MAX,
+        description="Optional target for new audio, in codec frames (12.5/s), for MOSS-TTS Local. "
+        "Does not change max_new_tokens. Resolve automatic estimates on the client before sending.",
+    )
     x_vector_only_mode: bool | None = Field(
         default=None,
         description="Use speaker embedding only without in-context learning (Base task)",
     )
+    cache_salt: str | None = Field(
+        default=None,
+        description="Caller-supplied prefix-cache salt namespace. Composed "
+        "with the server-derived conditioning identity (adapter-computed or "
+        "the derived default), so callers narrow sharing (tenants, sessions) "
+        "without dropping voice/input isolation.",
+    )
+
+    @field_validator("cache_salt", mode="before")
+    @classmethod
+    def _validate_cache_salt(cls, cache_salt):
+        from vllm.entrypoints.generate.base.protocol import validate_cache_salt
+
+        validate_cache_salt(cache_salt)
+        return cache_salt
+
     speaker_embedding: list[float] | list[list[float]] | None = Field(
         default=None,
         max_length=_MAX_EMBEDDING_DIM,
         description="Pre-computed speaker embedding vector (1024-dim for 0.6B, "
         "2048-dim for 1.7B). Skips speaker encoder extraction from ref_audio. "
         "Implies x_vector_only_mode=True. Mutually exclusive with ref_audio.",
+    )
+    ref_audio_codes: list[list[StrictInt]] | None = Field(
+        default=None,
+        description=(
+            "Pre-computed codec codes of the reference audio, shaped [codebooks, frames]: the raw "
+            "codebook indices from the deployed model's own codec. Skips reference encoding. "
+            "Requires ref_text; mutually exclusive with ref_audio, speaker_embedding and an "
+            "uploaded voice. Supported by Fish Audio Drama 3."
+        ),
     )
     max_new_tokens: int | None = Field(
         default=None,
@@ -161,8 +220,10 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         ge=_INT64_MIN,
         le=_INT64_MAX,
-        description="Random seed for reproducible generation. When set, ensures "
-        "deterministic output for the same input text and seed value.",
+        description="Random seed for reproducible generation. An explicitly set seed isolates the "
+        "request from other batched work: it waits for the engine to drain and runs alone, which makes "
+        "its output byte-reproducible but lowers throughput while it runs. A seed copied from a stage's "
+        "default_sampling_params does not trigger this.",
     )
     initial_codec_chunk_frames: int | None = Field(
         default=None,
@@ -180,8 +241,50 @@ class OpenAICreateSpeechRequest(BaseModel):
     )
     extra_params: dict[str, Any] | None = Field(
         default=None,
-        description=("Optional model-specific parameters passed directly to the model's extra_args."),
+        description=("Optional model-specific parameters and first-stage sampling overrides."),
     )
+    temperature: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+        strict=True,
+        description="First-stage temperature override; takes precedence over extra_params.temperature.",
+    )
+    repetition_penalty: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        strict=True,
+        description="First-stage repetition penalty override; takes precedence over extra_params.repetition_penalty.",
+    )
+
+    @model_validator(mode="after")
+    def _merge_sampling_overrides(self) -> "OpenAICreateSpeechRequest":
+        # Resolve precedence before validating so shadowed nested values do
+        # not reject an otherwise valid top-level override.
+        overrides = {
+            name: value for name in ("temperature", "repetition_penalty") if (value := getattr(self, name)) is not None
+        }
+        values = {**(self.extra_params or {}), **overrides}
+        # The serving layer assigns these overrides to a request-local
+        # sampling configuration. Reject non-numeric overrides at admission.
+        for name in ("temperature", "repetition_penalty"):
+            value = values.get(name)
+            if value is None:
+                continue
+            bound = "> 0" if name == "repetition_penalty" else ">= 0"
+            message = f"extra_params.{name} must be a finite number {bound}"
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(message)
+            number = float(value)
+            if not math.isfinite(number) or number < 0 or (name == "repetition_penalty" and number == 0):
+                raise ValueError(message)
+        # Canonicalize both public spellings before adapter validation so a
+        # model that rejects sampling overrides sees top-level fields too.
+        if overrides:
+            self.extra_params = values
+        return self
+
     word_timestamps: bool = Field(
         default=False,
         description=(
@@ -193,16 +296,36 @@ class OpenAICreateSpeechRequest(BaseModel):
             "/v1/audio/speech/stream path."
         ),
     )
-
-    @field_validator("stream_format")
-    @classmethod
-    def validate_stream_format(cls, v: str) -> str:
-        return v
+    watermarking: bool = Field(
+        default=True,
+        description="Whether the server's configured watermarking applies to this request.",
+    )
 
     @field_validator("ref_audio", mode="before")
     @classmethod
     def normalize_ref_audio(cls, v):
         return _normalize_ref_audio_value(v)
+
+    @field_validator("ref_audio_codes")
+    @classmethod
+    def validate_ref_audio_codes(cls, v: list[list[int]] | None) -> list[list[int]] | None:
+        """A non-empty rectangular grid; the adapter checks its values against the model's
+        codec (each codebook's size) before anything converts them."""
+        if v is None:
+            return None
+        if not v or not v[0]:
+            raise ValueError("'ref_audio_codes' must be a non-empty [codebooks, frames] array")
+        if len(v) > _MAX_REF_AUDIO_CODEBOOKS:
+            raise ValueError(
+                f"'ref_audio_codes' has {len(v)} rows; it is shaped [codebooks, frames] "
+                f"(at most {_MAX_REF_AUDIO_CODEBOOKS} codebooks)"
+            )
+        frames = len(v[0])
+        if any(len(row) != frames for row in v):
+            raise ValueError("'ref_audio_codes' rows (codebooks) must all have the same number of frames")
+        if frames > _MAX_REF_AUDIO_CODE_FRAMES:
+            raise ValueError(f"'ref_audio_codes' has {frames} frames; at most {_MAX_REF_AUDIO_CODE_FRAMES}")
+        return v
 
     @field_validator("speaker_embedding")
     @classmethod
@@ -215,15 +338,17 @@ class OpenAICreateSpeechRequest(BaseModel):
         if not v:
             return []
         if isinstance(v[0], list):
-            for item in v:
+            nested = cast(list[list[float]], v)
+            for item in nested:
                 if not item:
                     raise ValueError("'speaker_embedding' nested vectors must be non-empty")
                 if not all(math.isfinite(x) for x in item):
                     raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
-            return v
-        if not all(math.isfinite(x) for x in v):
+            return nested
+        flat = cast(list[float], v)
+        if not all(math.isfinite(x) for x in flat):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
-        return v
+        return flat
 
     @model_validator(mode="before")
     @classmethod
@@ -322,6 +447,13 @@ class OpenAICreateSpeechRequest(BaseModel):
         if self.speaker_embedding is not None:
             if self.ref_audio is not None and not isinstance(self.ref_audio, list):
                 raise ValueError("'speaker_embedding' and 'ref_audio' are mutually exclusive")
+        if self.ref_audio_codes is not None:
+            if self.ref_audio is not None:
+                raise ValueError("'ref_audio_codes' and 'ref_audio' are mutually exclusive")
+            if self.speaker_embedding is not None:
+                raise ValueError("'ref_audio_codes' and 'speaker_embedding' are mutually exclusive")
+            if not self.ref_text or not self.ref_text.strip():
+                raise ValueError("'ref_audio_codes' requires 'ref_text' (transcript of the reference audio)")
         return self
 
     def is_raw_audio_stream(self) -> bool:
@@ -378,6 +510,16 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         default=0.0,
         description="Audio start time in seconds",
     )
+    num_frames: int | None = Field(
+        default=None,
+        ge=1,
+        description="Exact generation frame count for pipelines that support frame-based duration",
+    )
+    frame_rate: float | None = Field(
+        default=None,
+        gt=0,
+        description="Frame rate used with num_frames by pipelines that support frame-based duration",
+    )
     negative_prompt: str | None = Field(
         default=None,
         description="Negative prompt for classifier-free guidance",
@@ -394,11 +536,19 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         le=1000,
         description="Number of inference steps",
     )
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional model-specific generation parameters",
+    )
     seed: int | None = Field(
         default=None,
         ge=_INT64_MIN,
         le=_INT64_MAX,
         description="Random seed for reproducibility",
+    )
+    watermarking: bool = Field(
+        default=True,
+        description="Whether the server's configured watermarking applies to this request.",
     )
 
     @field_validator("stream_format")
@@ -410,15 +560,14 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
 
 
 class CreateAudio(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     audio_tensor: np.ndarray
     sample_rate: int = 24000
     output_sample_rate: int | None = None
     response_format: str = "wav"
     speed: float = 1.0
     base64_encode: bool = True
-
-    class Config:
-        arbitrary_types_allowed = True
 
 
 class AudioChunkMetadata(BaseModel):
@@ -461,6 +610,7 @@ class SpeechBatchItem(BaseModel):
     max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
+    watermarking: bool | None = None
 
 
 class BatchSpeechRequest(BaseModel):
@@ -482,6 +632,7 @@ class BatchSpeechRequest(BaseModel):
     max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
+    watermarking: bool = True
 
 
 class SpeechInputTokenDetails(BaseModel):
@@ -557,11 +708,16 @@ class StreamingSpeechSessionConfig(BaseModel):
     """Configuration sent as the first WebSocket message for streaming TTS."""
 
     model: str | None = None
+    text_input_mode: Literal["buffered", "commitment"] = "buffered"
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
+    sample_rate: SpeechSampleRate | None = Field(
+        default=None,
+        description="Target sample rate of the returned audio. If omitted, use the model's native sample rate.",
+    )
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
     max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(
@@ -586,11 +742,22 @@ class StreamingSpeechSessionConfig(BaseModel):
         max_length=_MAX_EMBEDDING_DIM,
         description="Pre-computed speaker embedding vector. Mutually exclusive with ref_audio.",
     )
+    # The fields below mean the same as on OpenAICreateSpeechRequest; the
+    # handler validates them by building that request at session.config time.
+    ref_audio_codes: list[list[StrictInt]] | None = None
+    ref_audio_2: str | None = None
+    ambient_sound: str | None = None
+    duration_seconds: float | None = Field(default=None, ge=0.0)
+    token_count: StrictInt | None = Field(default=None, gt=0, le=_INT64_MAX)
+    cache_salt: str | None = None
+    temperature: float | None = Field(default=None, ge=0, allow_inf_nan=False, strict=True)
+    repetition_penalty: float | None = Field(default=None, gt=0, allow_inf_nan=False, strict=True)
+    extra_params: dict[str, Any] | None = None
     stream_audio: bool = Field(
         default=False,
         description=(
-            "If true, send raw PCM audio chunks progressively over WebSocket. "
-            "Requires response_format='pcm'. WebSocket streaming currently requires "
+            "If true, send PCM or WAV audio chunks progressively over WebSocket. "
+            "Requires response_format='pcm' or 'wav'. WebSocket streaming currently requires "
             "speed=1.0, including for models with native speed control."
         ),
     )
@@ -609,6 +776,10 @@ class StreamingSpeechSessionConfig(BaseModel):
         le=_INT64_MAX,
         description="Random seed forwarded to /v1/audio/speech for this session.",
     )
+    watermarking: bool = Field(
+        default=True,
+        description="Whether the server's configured watermarking applies to this session's audio.",
+    )
     split_granularity: Literal["none", "sentence", "clause"] = Field(
         default="none",
         description=(
@@ -623,9 +794,9 @@ class StreamingSpeechSessionConfig(BaseModel):
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
         if self.stream_audio:
-            if self.response_format != "pcm":
+            if self.response_format not in ("pcm", "wav"):
                 raise ValueError(
-                    "WebSocket streaming audio (stream_audio=true) requires response_format='pcm'. "
+                    "WebSocket streaming audio (stream_audio=true) requires response_format='pcm' or 'wav'. "
                     f"Got response_format='{self.response_format}'."
                 )
             if self.speed is None:
@@ -635,4 +806,11 @@ class StreamingSpeechSessionConfig(BaseModel):
                     "WebSocket stream_audio=true currently requires speed=1.0; "
                     "native speed control is only available through HTTP streaming."
                 )
+        if (self.duration_seconds is not None or self.token_count is not None) and (
+            self.split_granularity != "none" or self.text_input_mode != "buffered"
+        ):
+            raise ValueError(
+                "duration_seconds and token_count set the length of a whole request, so they require "
+                "split_granularity='none' and text_input_mode='buffered'."
+            )
         return self

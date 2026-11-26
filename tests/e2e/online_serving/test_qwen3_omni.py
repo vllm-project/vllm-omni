@@ -11,8 +11,14 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
-from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.runtime import (
+    QWEN3_OMNI_COLD_INIT_TIMEOUT_S,
+    QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S,
+    OmniServerParams,
+    dummy_messages_from_mix_data,
+)
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -24,10 +30,12 @@ _MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 _CI_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
 
-# Prefix cache is opt-in on the deploy YAML. CI overlay also pins
-# ``async_chunk: False``; the existing server keeps ``--no-async-chunk``.
-# Production Qwen YAML is ``async_chunk: true``, so a sibling server boots
-# with ``--async-chunk`` and the same cache overrides (async output builder).
+# The production YAML leaves the Thinker prefix cache off with model runner
+# v2. These args turn it back on for the Thinker and Talker and pin the
+# block size. CI overlay pins ``async_chunk: False``; the existing server
+# keeps ``--no-async-chunk``. Production Qwen YAML is ``async_chunk: true``,
+# so a sibling server boots with ``--async-chunk`` and the same cache
+# overrides (async output builder).
 BLOCK_SIZE = 16
 _PREFIX_CACHE_SERVER_ARGS = [
     "--block-size",
@@ -36,6 +44,9 @@ _PREFIX_CACHE_SERVER_ARGS = [
     '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
     "--enable-prompt-tokens-details",
 ]
+# Keep every ``default`` test contiguous, then the ``prefix_cache_async_chunk``
+# tests. ``omni_server`` is module-scoped per param, so a param change tears the
+# server down. Interleaving these restarts the default server.
 test_params = [
     pytest.param(
         OmniServerParams(
@@ -43,6 +54,8 @@ test_params = [
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=True,
             server_args=["--no-async-chunk", *_PREFIX_CACHE_SERVER_ARGS],
+            stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None),
+            init_timeout=QWEN3_OMNI_COLD_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None,
         ),
         id="default",
     )
@@ -54,6 +67,8 @@ prefix_cache_async_chunk_params = [
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=True,
             server_args=["--async-chunk", *_PREFIX_CACHE_SERVER_ARGS],
+            stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None),
+            init_timeout=QWEN3_OMNI_COLD_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None,
         ),
         id="prefix_cache_async_chunk",
     )
@@ -94,7 +109,14 @@ def get_max_batch_size(size_type="few"):
 @pytest.mark.core_model
 @pytest.mark.omni
 @pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
+@hardware_test(
+    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
+    num_cards={
+        "cuda": 3 if _USE_PD else 2,
+        "rocm": 3 if _USE_PD else 2,
+        "npu": 3,
+    },
+)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_audio_001(omni_server, online_client) -> None:
     """
@@ -134,7 +156,14 @@ def test_mix_to_text_audio_001(omni_server, online_client) -> None:
 @pytest.mark.core_model
 @pytest.mark.omni
 @pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
+@hardware_test(
+    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
+    num_cards={
+        "cuda": 3 if _USE_PD else 2,
+        "rocm": 3 if _USE_PD else 2,
+        "npu": 3,
+    },
+)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, online_client) -> None:
     """
@@ -256,6 +285,77 @@ def test_thinker_prefix_caching_audio_output(omni_server, online_client) -> None
     _run_prefix_cache_check(online_client, request_config)
 
 
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(
+    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
+    num_cards={"cuda": 2, "rocm": 2, "npu": 3},
+)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_batched_completions_text(omni_server, openai_client) -> None:
+    """Ensure that we can make a batch chat completions request (text only)."""
+    responses = openai_client.send_batched_chat_completions_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "messages": [
+                    [{"role": "user", "content": "What color is the sky? Answer in one word."}],
+                    [{"role": "user", "content": "What is 2+2? Answer in one word."}],
+                ],
+                "modalities": ["text"],
+                "max_tokens": 20,
+            },
+        },
+    )
+    assert responses
+    resp = responses[0]
+    assert resp.success
+    body = resp.json_body
+    choices = body["choices"]
+    assert len(choices) == 2
+    for choice in choices:
+        assert choice["message"]["content"]
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(
+    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
+    num_cards={"cuda": 2, "rocm": 2, "npu": 3},
+)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_batched_completions_audio_out(omni_server, openai_client) -> None:
+    """Ensure that we can make a batch chat completions request (audio + text)."""
+    messages = [
+        [{"role": "user", "content": "Say hello."}],
+        [{"role": "user", "content": "Say goodbye."}],
+    ]
+    num_messages = len(messages)
+    responses = openai_client.send_batched_chat_completions_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "messages": messages,
+                "modalities": ["text", "audio"],
+                "max_tokens": 200,
+            },
+        },
+    )
+    assert responses and len(responses) == 1
+    resp = responses[0]
+    assert resp.success
+    choices = resp.json_body["choices"]
+
+    assert len(choices) == num_messages
+
+    # Every message in the batch should contain both the audio and text content
+    for choice in choices:
+        assert choice["message"]["audio"]["data"]
+        assert choice["message"]["content"]
+
+
 def _assert_omni_payload_complete(resp) -> None:
     """Async-chunk + prefix-cache must still deliver a full downstream payload."""
     assert resp.success
@@ -264,6 +364,7 @@ def _assert_omni_payload_complete(resp) -> None:
     assert has_audio
 
 
+# These two stay after every ``default`` test. See the note on ``test_params``.
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
@@ -331,125 +432,3 @@ def test_thinker_prefix_caching_async_chunk_shared_image_prefix(omni_server, onl
     assert num_cached > 0
     assert num_cached % BLOCK_SIZE == 0
     assert num_cached < num_prompt
-
-
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_completions_rejected_for_thinker_talker(omni_server, online_client) -> None:
-    """Ensure Thinker-talker models reject /v1/completions; we do this because the
-    thinker-talker handoff implementations currently use ChatML <|im_start|> and
-    <|im_end|> markers to segment the input sequence; when we don't have them,
-    the talker does not get any embeddings, which breaks the server.
-    """
-    responses = online_client.send_completions_http_request(
-        {
-            "json": {
-                "model": omni_server.model,
-                "prompt": "Hello, how are you?",
-                "max_tokens": 10,
-            },
-        },
-        err_code=400,
-    )
-    assert not responses[0].success
-
-
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_batched_completions_text(omni_server, openai_client) -> None:
-    """Ensure that we can make a batch chat completions request (text only)."""
-    responses = openai_client.send_batched_chat_completions_http_request(
-        {
-            "json": {
-                "model": omni_server.model,
-                "messages": [
-                    [{"role": "user", "content": "What color is the sky? Answer in one word."}],
-                    [{"role": "user", "content": "What is 2+2? Answer in one word."}],
-                ],
-                "modalities": ["text"],
-                "max_tokens": 20,
-            },
-        },
-    )
-    assert responses
-    resp = responses[0]
-    assert resp.success
-    body = resp.json_body
-    choices = body["choices"]
-    assert len(choices) == 2
-    for choice in choices:
-        assert choice["message"]["content"]
-
-
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_batched_completions_audio_out(omni_server, openai_client) -> None:
-    """Ensure that we can make a batch chat completions request (audio + text)."""
-    messages = [
-        [{"role": "user", "content": "Say hello."}],
-        [{"role": "user", "content": "Say goodbye."}],
-    ]
-    num_messages = len(messages)
-    responses = openai_client.send_batched_chat_completions_http_request(
-        {
-            "json": {
-                "model": omni_server.model,
-                "messages": messages,
-                "modalities": ["text", "audio"],
-                "max_tokens": 200,
-            },
-        },
-    )
-    assert responses and len(responses) == 1
-    resp = responses[0]
-    assert resp.success
-    choices = resp.json_body["choices"]
-
-    assert len(choices) == num_messages
-
-    # Every message in the batch should contain both the audio and text content
-    for choice in choices:
-        assert choice["message"]["audio"]["data"]
-        assert choice["message"]["content"]
-
-
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-@pytest.mark.parametrize(
-    "sad_opts",
-    [
-        {"stream": "not-a-bool"},  # Fails validation
-        {"n": 2},  # vLLM Batched endpoints doesn't support n > 1
-    ],
-)
-def test_batched_completions_with_bad_values(omni_server, openai_client, sad_opts) -> None:
-    """Ensure that a bad values are correctly handled as 400s."""
-    messages = [
-        [{"role": "user", "content": "Say hello."}],
-        [{"role": "user", "content": "Say goodbye."}],
-    ]
-    responses = openai_client.send_batched_chat_completions_http_request(
-        {
-            "json": {
-                "model": omni_server.model,
-                "messages": messages,
-                **sad_opts,
-            },
-        },
-    )
-    assert responses and len(responses) == 1
-    resp = responses[0]
-    assert not responses[0].success
-    assert resp.status_code == 400

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 End-to-end tests for Bagel text2text and img2text (understanding) tasks.
@@ -43,7 +43,14 @@ REFERENCE_TEXT_IMG2TEXT = (
 
 
 # (model, stage_config_path, extra_omni_kwargs) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
-_OMNI_RUNNER_PARAM = (MODEL_NAME, STAGE_CONFIG)
+# Cold ROCm AITER MHA builds have taken nearly 1,690 seconds under CI load.
+# Keep the offline weekly owner bounded while leaving headroom for import and
+# the stage-ready handshake after compilation completes.
+_OMNI_RUNNER_PARAM = (
+    MODEL_NAME,
+    STAGE_CONFIG,
+    {"stage_init_timeout": 2400, "init_timeout": 2700},
+)
 
 pytestmark = [
     pytest.mark.slow,

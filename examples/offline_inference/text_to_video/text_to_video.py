@@ -235,7 +235,7 @@ def parse_extra_body(value: str) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a video from a text prompt. "
-        "Supports Wan2.2, HunyuanVideo-1.5, Helios, LingBot-Video, MAGI-2, "
+        "Supports Wan2.2, HunyuanVideo-1.5, Helios, LingBot-Video, MAGI-2, Kandinsky 6, "
         "and other text-to-video models."
     )
     parser.add_argument(
@@ -315,6 +315,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
+    parser.add_argument(
+        "--diffusion-attention-config",
+        type=json.loads,
+        default=None,
+        help="Per-role diffusion attention backend configuration as a JSON object.",
+    )
     # Inter-request cache parameters [inter_request only]
     parser.add_argument(
         "--persistent-cache-dir",
@@ -352,6 +358,18 @@ def parse_args() -> argparse.Namespace:
         "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
+    )
+    parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=600,
+        help="Total timeout for orchestrator startup in seconds (default: 600s).",
+    )
+    parser.add_argument(
+        "--stage-init-timeout",
+        type=int,
+        default=300,
+        help="Timeout for initializing a single stage in seconds (default: 300s).",
     )
     parser.add_argument(
         "--enable-cpu-offload",
@@ -622,6 +640,8 @@ def main():
         enable_distributed_layerwise_offload=args.enable_distributed_layerwise_offload,
         dlo_use_allgather=args.dlo_use_allgather,
         dlo_resident_layers=args.dlo_resident_layers,
+        init_timeout=args.init_timeout,
+        stage_init_timeout=args.stage_init_timeout,
     )
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
@@ -633,6 +653,8 @@ def main():
         omni_kwargs["quantization"] = args.quantization
     if args.quantization_config is not None:
         omni_kwargs["quantization_config"] = args.quantization_config
+    if args.diffusion_attention_config is not None:
+        omni_kwargs["diffusion_attention_config"] = args.diffusion_attention_config
     if args.cache_backend is not None:
         omni_kwargs["cache_backend"] = args.cache_backend
         omni_kwargs["cache_config"] = cache_config
@@ -653,7 +675,7 @@ def main():
     if args.extra_body and "guardrails" in args.extra_body:
         omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
 
-    omni = Omni(init_timeout=1800, stage_init_timeout=1800, **omni_kwargs)
+    omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni) or model_class_name
     declared_extra_body_params = get_extra_body_params(model_class_name)
     output_tensor_range = get_output_tensor_range(model_class_name)

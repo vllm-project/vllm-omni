@@ -28,7 +28,9 @@ def _load_hub_module(repo_id: str):
 
     logger.info("Loading %s kernel from HuggingFace Hub...", repo_id)
     last_error = None
-    for version in (1, 2):
+    # FA2 v3 provides Torch stable-ABI builds for the vLLM 0.33 runtime.
+    versions = (1, 2, 3) if repo_id == "kernels-community/flash-attn2" else (1, 2)
+    for version in versions:
         try:
             return get_kernel(repo_id, version=version)
         except Exception as exc:

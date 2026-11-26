@@ -1,16 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -87,6 +92,18 @@ class CacheEntry:
     clip_embedding: torch.Tensor | None = None
     cache_key: CacheKey | None = None
     image_embedding: torch.Tensor | None = None
+    tier_ready: bool = False
+    step_storage_key: str | None = None
+
+
+def _atomic_tensor_save(value: Any, path: Path) -> None:
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as tmp:
+        temp_path = Path(tmp.name)
+    try:
+        torch.save(value, temp_path)
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 class DiTCacheStore:
@@ -118,19 +135,13 @@ class DiTCacheStore:
         # (which manages CPU→Disk tiering + LRU internally). On CPU eviction the
         # entry's latents are set to None (lightweight shell kept for
         # semantic_search); a subsequent get() recovers them via engine.get().
-        self._lmcache = lmcache_engine
-
-        # Final latent (185MB) uses direct torch.save to disk (async thread)
-        # instead of LMCache. This avoids LMCache CPU pool pressure and
-        # LRU-eviction-before-disk-write data loss.
-        self._final_disk_dir = Path(final_disk_dir) if final_disk_dir else None
-        if self._final_disk_dir:
-            self._final_disk_dir.mkdir(parents=True, exist_ok=True)
-        self._final_write_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="final-disk")
-
-        # Bound LMCache's allocator wait: put() must degrade to a no-store
-        # under sustained pool pressure instead of blocking the request path.
-        self._patch_lmcache_busy_loop(self._lmcache)
+        self.configure_tier(lmcache_engine, final_disk_dir)
+        # Serialize tier writes in put order, including successive writes for the
+        # same key. Bound the number of CPU tensor snapshots held by the worker.
+        self._tier_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cache-tier")
+        self._tier_slots = threading.BoundedSemaphore(2)
+        self._closed = False
+        self._embedding_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cache-embedding")
 
         # Max number of step latents to store (0 = all steps).
         # Limits per-entry size; semantic-hit resume beyond this is clamped.
@@ -139,16 +150,23 @@ class DiTCacheStore:
         # ---- Pre-stacked embedding matrices for fast vectorized retrieval ----
         # Instead of torch.stack()-ing all embeddings on every semantic_search()
         # call (O(N) copy each time), we maintain two growable matrices that are
-        # updated incrementally on put()/update/evict.  Rows are lazily freed:
-        # evicted rows are marked invalid and skipped during search, avoiding
-        # costly matrix rebuilds on every eviction.
+        # updated incrementally on put()/update/evict. Eviction makes a row
+        # available to the next insertion, so churn does not grow the matrices.
         self._emb_dim: int | None = None  # embedding dim (set on first put)
         self._txt_matrix: torch.Tensor | None = None  # [rows, dim] text embeddings
         self._img_matrix: torch.Tensor | None = None  # [rows, dim] image embeddings (None row = absent)
         self._row_keys: list[str | None] = []  # row_idx -> key_hash (None = freed row)
         self._key_rows: dict[str, int] = {}  # key_hash -> row_idx
+        self._free_rows: list[int] = []
         self._next_row: int = 0  # next free row to append to
         self._capacity: int = 0  # allocated row capacity (grows in chunks)
+
+    def configure_tier(self, engine: Any | None, final_disk_dir: str | Path | None) -> None:
+        self._lmcache = engine
+        self._final_disk_dir = Path(final_disk_dir) if final_disk_dir else None
+        if self._final_disk_dir is not None:
+            self._final_disk_dir.mkdir(parents=True, exist_ok=True)
+        self._patch_lmcache_busy_loop(engine)
 
     def set_t2i_penalty(self, enabled: bool) -> None:
         """Enable or disable t2i sigmoid penalty in hybrid matching."""
@@ -179,8 +197,8 @@ class DiTCacheStore:
 
     def _matrix_add(self, key_hash: str, clip_embedding: torch.Tensor | None) -> None:
         """Add/overwrite a row in the text embedding matrix for key_hash."""
+        self._matrix_free(key_hash)
         if clip_embedding is None:
-            self._key_rows.pop(key_hash, None)
             return
         emb = clip_embedding.detach().cpu()
         if emb.dim() == 2:
@@ -190,8 +208,13 @@ class DiTCacheStore:
         elif emb.shape[0] != self._emb_dim:
             logger.warning("Embedding dim mismatch: got %d, expected %d, skipping", emb.shape[0], self._emb_dim)
             return
-        self._ensure_capacity(1)
-        row = self._next_row
+        if self._free_rows:
+            row = self._free_rows.pop()
+            self._img_matrix[row].zero_()
+        else:
+            self._ensure_capacity(1)
+            row = self._next_row
+            self._next_row += 1
         self._txt_matrix[row] = emb
         # Assign by matrix row (append would desync after capacity growth:
         # _ensure_capacity pads _row_keys to matrix length, so appending
@@ -199,7 +222,6 @@ class DiTCacheStore:
         # lands at `row`).
         self._row_keys[row] = key_hash
         self._key_rows[key_hash] = row
-        self._next_row += 1
 
     def _matrix_update_image(self, key_hash: str, image_embedding: torch.Tensor) -> bool:
         """Set the image embedding for an existing row. Returns False if key absent."""
@@ -217,6 +239,7 @@ class DiTCacheStore:
         row = self._key_rows.pop(key_hash, None)
         if row is not None:
             self._row_keys[row] = None  # mark as freed
+            self._free_rows.append(row)
 
     def _estimate_tensor_bytes(self, tensor: torch.Tensor) -> int:
         return tensor.nelement() * tensor.element_size()
@@ -316,127 +339,77 @@ class DiTCacheStore:
         clip_embedding: torch.Tensor | None = None,
     ):
         key_hash = key.to_hash()
-        # Compute bytes from the ACTUAL latents passed in (before truncation)
-        # — this overestimates slightly when max_stored_steps truncates, but
-        # _estimate_entry_bytes on the stored entry will be accurate.
-        tensor_bytes = self._estimate_tensor_bytes(latents)
-        if step_latents is not None:
-            stored_steps = step_latents
-            if max_stored_steps := getattr(self, "_max_stored_steps", 0):
-                stored_steps = step_latents[:max_stored_steps]
-            tensor_bytes += self._estimate_step_latents_bytes(stored_steps)
-        if clip_embedding is not None:
-            tensor_bytes += self._estimate_tensor_bytes(clip_embedding)
+        stored_steps = step_latents
+        if step_latents is not None and self._max_stored_steps > 0:
+            stored_steps = step_latents[: self._max_stored_steps]
+        final = latents.detach().to(device="cpu", copy=True)
+        steps = (
+            [
+                StepLatentData(s.step_index, s.timestep, s.latent.detach().to(device="cpu", copy=True))
+                for s in stored_steps
+            ]
+            if stored_steps is not None
+            else None
+        )
+        clip = clip_embedding.detach().to(device="cpu", copy=True) if clip_embedding is not None else None
+        entry = CacheEntry(final, key_hash, steps, metadata, clip, key)
+        tensor_bytes = self._estimate_entry_bytes(entry)
 
         with self._lock:
-            if key_hash in self._store:
-                old_entry = self._store[key_hash]
+            if self._closed:
+                return
+            old_entry = self._store.pop(key_hash, None)
+            if old_entry is not None:
                 self._current_memory_bytes -= self._estimate_entry_bytes(old_entry)
                 self._matrix_free(key_hash)
-                del self._store[key_hash]
-
-            cached_latents = latents.detach().clone().cpu()
-            cached_step_latents = None
-            if step_latents is not None:
-                # Limit number of step latents stored (0 = all).
-                steps_to_store = step_latents
-                if self._max_stored_steps > 0:
-                    steps_to_store = step_latents[: self._max_stored_steps]
-                cached_step_latents = [
-                    StepLatentData(
-                        step_index=s.step_index,
-                        timestep=s.timestep,
-                        latent=s.latent.detach().clone().cpu(),
-                    )
-                    for s in steps_to_store
-                ]
-            cached_clip = clip_embedding.detach().clone().cpu() if clip_embedding is not None else None
-
-            # Persist latents BEFORE inserting into OrderedDict.
-            # Final latent (185MB): direct torch.save to disk (async thread),
-            #   bypasses LMCache to avoid pool pressure + LRU data loss.
-            # Step latents (8MB each): LMCache (small data, fast async write).
-            if self._final_disk_dir is not None:
-                # Async write final latent to disk
-                self._final_write_executor.submit(self._save_final_to_disk, key_hash, cached_latents)
-            if self._lmcache is not None:
-                import torch.distributed as dist
-
-                if dist.is_initialized():
-                    time.sleep(dist.get_rank() * 0.5)
-                meta_pairs = None
-                if cached_step_latents:
-                    meta_pairs = torch.tensor(
-                        [[s.step_index, s.timestep] for s in cached_step_latents],
-                        dtype=torch.float32,
-                    )
-                self._put_steps_to_lmcache(key_hash, cached_step_latents, meta_pairs)
 
             self._evict_if_needed(tensor_bytes)
-
-            entry = CacheEntry(
-                latents=cached_latents,
-                cache_key_hash=key_hash,
-                step_latents=cached_step_latents,
-                metadata=metadata,
-                clip_embedding=cached_clip,
-                cache_key=key,
-            )
             self._store[key_hash] = entry
-            self._matrix_add(key_hash, cached_clip)
+            self._matrix_add(key_hash, clip)
             self._current_memory_bytes += tensor_bytes
-
-            # If CPU budget is 0, evict this entry's heavy data immediately
-            # (data is already safe in LMCache from the put above).
+            needs_write = self._final_disk_dir is not None or (self._lmcache is not None and bool(steps))
+            if needs_write and self._tier_slots.acquire(blocking=False):
+                # Submit under the index lock to preserve publication order.
+                # The job owns the snapshots even if the entry is evicted now.
+                self._tier_writer.submit(self._persist_tier, entry, final, steps)
             if self._lmcache is not None:
                 self._evict_if_needed(0)
 
-            # Cached DiT state for key
-            num_steps = len(cached_step_latents) if cached_step_latents is not None else 0
-            logger.debug(
-                "Cached DiT state for key %s, size %.2f MB (final + %d steps), total cache %.2f MB / %d entries",
-                key_hash[:8],
-                tensor_bytes / _MB,
-                num_steps,
-                self._current_memory_bytes / _MB,
-                len(self._store),
-            )
+    def _persist_tier(self, entry: CacheEntry, final: torch.Tensor, steps: list[StepLatentData] | None) -> None:
+        key_hash = entry.cache_key_hash
+        try:
+            with self._lock:
+                if self._store.get(key_hash) is not entry:
+                    return
+            if self._final_disk_dir is not None:
+                _atomic_tensor_save(final, self._final_disk_dir / f"{key_hash}.pt")
+            step_storage_key = None
+            if self._lmcache is not None and steps:
+                # ECCache can retain an earlier write to an existing key. Each
+                # complete step trajectory gets a single immutable generation.
+                step_storage_key = f"{key_hash}:{uuid4().hex}"
+                for step in steps:
+                    if not self._lmcache.put(f"{step_storage_key}:step_{step.step_index:04d}", step.latent):
+                        return
+                meta = torch.tensor([[s.step_index, s.timestep] for s in steps], dtype=torch.float32)
+                if not self._lmcache.put(f"{step_storage_key}:steps_meta", meta):
+                    return
 
-    def _put_steps_to_lmcache(
-        self,
-        key_hash: str,
-        step_latents: list[StepLatentData] | None,
-        meta_pairs: torch.Tensor | None,
-    ) -> None:
-        """Write step latents + meta to LMCache with bounded retry on failure.
+            with self._lock:
+                if self._store.get(key_hash) is entry:
+                    entry.tier_ready = True
+                    entry.step_storage_key = step_storage_key
+        except Exception:
+            logger.warning("Failed to persist cache entry %s", key_hash[:8], exc_info=True)
+        finally:
+            self._tier_slots.release()
 
-        The final latent is NOT stored via LMCache (it goes to torch.save);
-        only steps_meta and the per-step latents are written here.
-        """
-        max_retries = 5
-
-        def _put_with_retry(key: str, tensor: torch.Tensor) -> bool:
-            backoff = 1.0
-            for attempt in range(max_retries):
-                if self._lmcache.put(key, tensor):
-                    return True
-                logger.info(
-                    "LMCache put retry %d/%d for %s (waiting %.1fs)",
-                    attempt + 1,
-                    max_retries,
-                    key[:24],
-                    backoff,
-                )
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
-            logger.warning("LMCache put failed after %d retries for %s", max_retries, key[:24])
-            return False
-
-        if meta_pairs is not None:
-            _put_with_retry(f"{key_hash}:steps_meta", meta_pairs)
-        if step_latents:
-            for s in step_latents:
-                _put_with_retry(f"{key_hash}:step_{s.step_index:04d}", s.latent)
+    def close(self) -> None:
+        """Stop accepting puts and drain work before the LMCache engine closes."""
+        with self._lock:
+            self._closed = True
+        self._embedding_executor.shutdown(wait=True)
+        self._tier_writer.shutdown(wait=True)
 
     def _recover_latents_from_lmcache(self, entry: CacheEntry, key_hash: str) -> bool:
         """Recover entry.latents if it was evicted to None.
@@ -445,15 +418,19 @@ class DiTCacheStore:
             return True
         # Final latents are only persisted via torch.save (never written to
         # the LMCache steps engine), so recovery is disk-only.
-        if self._final_disk_dir is not None:
-            path = self._final_disk_dir / f"{key_hash}.pt"
-            if path.exists():
-                recovered = torch.load(path, map_location="cpu", weights_only=True)
-                entry.latents = recovered
-                self._current_memory_bytes += self._estimate_tensor_bytes(recovered)
-                logger.debug("Recovered %s final latent from disk", key_hash[:8])
-                return True
-        return False
+        if not entry.tier_ready or self._final_disk_dir is None:
+            return False
+        path = self._final_disk_dir / f"{key_hash}.pt"
+        try:
+            recovered = torch.load(path, map_location="cpu", weights_only=True)
+            if not isinstance(recovered, torch.Tensor):
+                return False
+        except Exception as exc:
+            logger.warning("Cannot read cached latent %s: %s", key_hash[:8], exc)
+            return False
+        entry.latents = recovered
+        self._current_memory_bytes += self._estimate_tensor_bytes(recovered)
+        return True
 
     def get(self, key: CacheKey, target_device: torch.device | str | None = None) -> torch.Tensor | None:
         key_hash = key.to_hash()
@@ -498,6 +475,9 @@ class DiTCacheStore:
             )
             return latents
 
+    # The runner allocates embedding matrices inside inference mode. The CLIP
+    # callback runs on a different thread, where that mode is not inherited.
+    @torch.inference_mode()
     def update_image_embedding(self, key_hash: str, image_embedding: torch.Tensor) -> bool:
         with self._lock:
             entry = self._store.get(key_hash)
@@ -520,6 +500,8 @@ class DiTCacheStore:
         required_num_frames: int | None = None,
         required_sigmas: tuple[float, ...] | None = None,
         required_lora_digest: str | None = None,
+        *,
+        return_key_hash: bool = False,
     ) -> tuple[torch.Tensor | None, list[StepLatentData] | None, float, str | None, str | None]:
         if query_embedding.dim() == 1:
             query_embedding = query_embedding.unsqueeze(0)
@@ -693,41 +675,22 @@ class DiTCacheStore:
                 self._current_memory_bytes -= self._estimate_tensor_bytes(entry.latents)
                 entry.latents = None
 
+            # Recover the trajectory for the winning entry, whose key can
+            # differ from the query even when the prompt strings coincide.
+            stored_steps = self._read_step_latents(entry)
             step_latents = None
-            if entry.step_latents is not None and target_device is not None:
+            if stored_steps is not None:
                 step_latents = [
                     StepLatentData(
                         step_index=s.step_index,
                         timestep=s.timestep,
-                        latent=s.latent.to(device=target_device),
+                        latent=s.latent.to(target_device) if target_device is not None else s.latent.clone(),
                     )
-                    for s in entry.step_latents
-                ]
-            elif entry.step_latents is not None:
-                step_latents = [
-                    StepLatentData(
-                        step_index=s.step_index,
-                        timestep=s.timestep,
-                        latent=s.latent.clone(),
-                    )
-                    for s in entry.step_latents
+                    for s in stored_steps
                 ]
 
-                logger.debug(
-                    "CLIP semantic HIT [%s]: key=%s "
-                    "t2t=%.4f t2i=%.4f penalty=%.4f final=%.4f "
-                    "(threshold=%.2f, hits=%d, misses=%d)",
-                    match_type,
-                    best_key_hash[:8],
-                    best_t2t,
-                    best_t2i,
-                    best_penalty,
-                    best_sim,
-                    threshold,
-                    self._hits,
-                    self._misses,
-                )
-            return latents, step_latents, best_sim, cached_prompt, match_type
+            logger.debug("CLIP semantic HIT [%s]: key=%s similarity=%.4f", match_type, best_key_hash[:8], best_sim)
+            return latents, step_latents, best_sim, best_key_hash if return_key_hash else cached_prompt, match_type
 
     def get_step_latents(
         self, key: CacheKey, target_device: torch.device | str | None = None
@@ -739,60 +702,59 @@ class DiTCacheStore:
             if entry is None:
                 return None
 
-            # LMCache recovery: if step_latents were evicted from CPU, recover.
-            recovered_now = False
-            if entry.step_latents is None:
-                if self._lmcache is None:
-                    return None
-                recovered_now = True
-                # Recover final latent first (to ensure entry is warm).
-                self._recover_latents_from_lmcache(entry, key_hash)
-                # Recover step latents from LMCache using the meta tensor.
-                meta = self._lmcache.get(f"{key_hash}:steps_meta", device="cpu")
-                if meta is None:
-                    return None
-                recovered_steps = []
-                for row in meta:
-                    si = int(row[0].item())
-                    ts = float(row[1].item())
-                    latent = self._lmcache.get(f"{key_hash}:step_{si:04d}", device="cpu")
-                    if latent is None:
-                        break
-                    recovered_steps.append(StepLatentData(step_index=si, timestep=ts, latent=latent))
-                if recovered_steps:
-                    entry.step_latents = recovered_steps
-                else:
-                    return None
-
-            if entry.step_latents is None:
+            steps = self._read_step_latents(entry)
+            if not steps:
                 return None
-
             self._store.move_to_end(key_hash)
+            return [
+                StepLatentData(
+                    s.step_index,
+                    s.timestep,
+                    s.latent.to(device=target_device) if target_device is not None else s.latent.clone(),
+                )
+                for s in steps
+            ]
 
-            if target_device is not None:
-                result = [
-                    StepLatentData(
-                        step_index=s.step_index,
-                        timestep=s.timestep,
-                        latent=s.latent.to(device=target_device),
-                    )
-                    for s in entry.step_latents
-                ]
-            else:
-                result = [
-                    StepLatentData(
-                        step_index=s.step_index,
-                        timestep=s.timestep,
-                        latent=s.latent.clone(),
-                    )
-                    for s in entry.step_latents
-                ]
+    def _read_tier_tensor(self, key: str) -> torch.Tensor | None:
+        tensor = self._lmcache.get(key, device="cpu")
+        if tensor is not None:
+            return tensor
+        # LMCache 0.5.1's ECCacheEngine.get uses batched_get([key]). A CPU
+        # miss can return [None], ending that search before its disk tier.
+        # The pinned engine's single-key read can target the disk backend.
+        manager = getattr(self._lmcache, "_storage_manager", None)
+        if manager is None:
+            return None
+        memory = manager.get(self._lmcache._make_cache_key(key), location="LocalDiskBackend")
+        if memory is None:
+            return None
+        try:
+            value = memory.tensor
+            return value.clone() if value is not None else None
+        finally:
+            memory.ref_count_down()
 
-            # Tiered mode: a recovered step trajectory must not stay resident
-            # (same read-path accumulation rationale as get()).
-            if recovered_now and self._lmcache is not None:
-                entry.step_latents = None
-            return result
+    def _read_step_latents(self, entry: CacheEntry) -> list[StepLatentData] | None:
+        if entry.step_latents is not None:
+            return entry.step_latents
+        if not entry.tier_ready or entry.step_storage_key is None:
+            return None
+        key_hash = entry.cache_key_hash
+        try:
+            meta = self._read_tier_tensor(f"{entry.step_storage_key}:steps_meta")
+            if meta is None:
+                return None
+            steps = []
+            for row in meta:
+                index = int(row[0].item())
+                latent = self._read_tier_tensor(f"{entry.step_storage_key}:step_{index:04d}")
+                if not isinstance(latent, torch.Tensor):
+                    return None
+                steps.append(StepLatentData(index, float(row[1].item()), latent))
+            return steps
+        except Exception as exc:
+            logger.warning("Cannot recover step latents for %s: %s", key_hash[:8], exc)
+            return None
 
     @property
     def hit_rate(self) -> float:
@@ -874,6 +836,7 @@ class DiTCacheStore:
             self._img_matrix = None
             self._row_keys = []
             self._key_rows = {}
+            self._free_rows.clear()
             self._next_row = 0
             self._capacity = 0
             logger.info("DiT cache store cleared")
@@ -911,77 +874,19 @@ class DiTCacheStore:
                 # would raise AttributeError on None and be silently swallowed.
                 if entry.latents is None:
                     continue
-                entry_dir = cache_dir / key_hash
                 try:
-                    entry_dir.mkdir(parents=True, exist_ok=True)
-
-                    torch.save(
-                        entry.latents.cpu(),
-                        entry_dir / "final_latent.pt",
-                    )
-
-                    meta = {
-                        "cache_key_hash": entry.cache_key_hash,
+                    snapshot = {
+                        "cache_key": asdict(entry.cache_key),
+                        "latents": entry.latents,
                         "metadata": entry.metadata,
+                        "clip_embedding": entry.clip_embedding,
+                        "image_embedding": entry.image_embedding,
+                        "step_latents": [
+                            {"step_index": s.step_index, "timestep": s.timestep, "latent": s.latent}
+                            for s in entry.step_latents or []
+                        ],
                     }
-
-                    # Persist cache_key so that semantic_search dimension filters
-                    # (height/width/steps/frames) survive a restart.
-                    if entry.cache_key is not None:
-                        ck = entry.cache_key
-                        meta["cache_key"] = {
-                            "prompt": ck.prompt,
-                            "negative_prompt": ck.negative_prompt,
-                            "height": ck.height,
-                            "width": ck.width,
-                            "num_inference_steps": ck.num_inference_steps,
-                            "guidance_scale": ck.guidance_scale,
-                            "true_cfg_scale": ck.true_cfg_scale,
-                            "seed": ck.seed,
-                            "sigmas": list(ck.sigmas) if ck.sigmas is not None else None,
-                            "max_sequence_length": ck.max_sequence_length,
-                            "num_images_per_prompt": ck.num_images_per_prompt,
-                            "num_frames": ck.num_frames,
-                        }
-
-                    # Persist text/image embeddings so loaded entries remain
-                    # searchable by semantic_search without re-encoding.
-                    if entry.clip_embedding is not None:
-                        torch.save(
-                            entry.clip_embedding.cpu(),
-                            entry_dir / "clip_embedding.pt",
-                        )
-                    if entry.image_embedding is not None:
-                        torch.save(
-                            entry.image_embedding.cpu(),
-                            entry_dir / "image_embedding.pt",
-                        )
-
-                    if entry.step_latents is not None:
-                        step_data = []
-                        for s in entry.step_latents:
-                            step_file = entry_dir / f"step_{s.step_index:04d}.pt"
-                            torch.save(
-                                {
-                                    "step_index": s.step_index,
-                                    "timestep": s.timestep,
-                                    "latent": s.latent.cpu(),
-                                },
-                                step_file,
-                            )
-                            step_data.append(
-                                {
-                                    "step_index": s.step_index,
-                                    "timestep": s.timestep,
-                                    "file": step_file.name,
-                                }
-                            )
-                        meta["step_latents"] = step_data
-                        meta["num_steps"] = len(step_data)
-
-                    with open(entry_dir / "meta.json", "w") as f:
-                        json.dump(meta, f, indent=2)
-
+                    _atomic_tensor_save(snapshot, cache_dir / f"{key_hash}.pt")
                     saved_count += 1
                 except Exception as e:
                     logger.warning(
@@ -1006,97 +911,37 @@ class DiTCacheStore:
 
         loaded_count = 0
         with self._lock:
-            for entry_dir in sorted(cache_dir.iterdir()):
-                if not entry_dir.is_dir():
-                    continue
-                meta_file = entry_dir / "meta.json"
-                latent_file = entry_dir / "final_latent.pt"
-                if not meta_file.exists() or not latent_file.exists():
-                    continue
-
+            for path in sorted(cache_dir.glob("*.pt")):
                 try:
-                    key_hash = entry_dir.name
-
-                    with open(meta_file) as f:
-                        meta = json.load(f)
-
-                    latents = torch.load(latent_file, map_location="cpu", weights_only=True)
-
-                    step_latents = None
-                    if "step_latents" in meta and meta["step_latents"]:
-                        step_latents = []
-                        for step_info in meta["step_latents"]:
-                            step_file = entry_dir / step_info["file"]
-                            if step_file.exists():
-                                step_data = torch.load(step_file, map_location="cpu", weights_only=True)
-                                step_latents.append(
-                                    StepLatentData(
-                                        step_index=step_data["step_index"],
-                                        timestep=step_data["timestep"],
-                                        latent=step_data["latent"],
-                                    )
-                                )
-
-                    if key_hash in self._store:
-                        old_entry = self._store[key_hash]
-                        self._current_memory_bytes -= self._estimate_entry_bytes(old_entry)
-
-                    # Restore CacheKey so semantic_search dimension filters work.
-                    cache_key = None
-                    ck_meta = meta.get("cache_key")
-                    if ck_meta is not None:
-                        try:
-                            cache_key = CacheKey(
-                                prompt=ck_meta["prompt"],
-                                negative_prompt=ck_meta.get("negative_prompt", ""),
-                                height=ck_meta["height"],
-                                width=ck_meta["width"],
-                                num_inference_steps=ck_meta["num_inference_steps"],
-                                guidance_scale=ck_meta["guidance_scale"],
-                                true_cfg_scale=ck_meta["true_cfg_scale"],
-                                seed=ck_meta["seed"],
-                                sigmas=tuple(ck_meta["sigmas"]) if ck_meta.get("sigmas") is not None else None,
-                                max_sequence_length=ck_meta.get("max_sequence_length"),
-                                num_images_per_prompt=ck_meta["num_images_per_prompt"],
-                                num_frames=ck_meta.get("num_frames", 1),
-                            )
-                        except (KeyError, TypeError) as e:
-                            logger.debug("Could not restore CacheKey for %s: %s", key_hash[:8], e)
-
-                    # Restore embeddings so loaded entries stay semantically searchable.
-                    clip_embedding = None
-                    image_embedding = None
-                    clip_file = entry_dir / "clip_embedding.pt"
-                    img_file = entry_dir / "image_embedding.pt"
-                    if clip_file.exists():
-                        clip_embedding = torch.load(clip_file, map_location="cpu", weights_only=True)
-                    if img_file.exists():
-                        image_embedding = torch.load(img_file, map_location="cpu", weights_only=True)
-
+                    snapshot = torch.load(path, map_location="cpu", weights_only=True)
+                    key = CacheKey(**snapshot["cache_key"])
+                    key_hash = key.to_hash()
+                    if key_hash != path.stem:
+                        logger.warning("Skipping cache snapshot with mismatched key: %s", path)
+                        continue
                     entry = CacheEntry(
-                        latents=latents,
-                        cache_key_hash=meta.get("cache_key_hash", key_hash),
-                        step_latents=step_latents,
-                        metadata=meta.get("metadata"),
-                        clip_embedding=clip_embedding,
-                        cache_key=cache_key,
-                        image_embedding=image_embedding,
+                        latents=snapshot["latents"],
+                        cache_key_hash=key_hash,
+                        step_latents=[StepLatentData(**s) for s in snapshot["step_latents"]] or None,
+                        metadata=snapshot["metadata"],
+                        clip_embedding=snapshot["clip_embedding"],
+                        cache_key=key,
+                        image_embedding=snapshot["image_embedding"],
                     )
+                    size = self._estimate_entry_bytes(entry)
+                    old = self._store.pop(key_hash, None)
+                    if old is not None:
+                        self._current_memory_bytes -= self._estimate_entry_bytes(old)
+                        self._matrix_free(key_hash)
+                    self._evict_if_needed(size)
                     self._store[key_hash] = entry
-                    # Register in the semantic-search matrices so loaded entries
-                    # are visible to vectorized semantic_search.
-                    self._matrix_add(key_hash, clip_embedding)
-                    if image_embedding is not None:
-                        self._matrix_update_image(key_hash, image_embedding)
-                    self._current_memory_bytes += self._estimate_entry_bytes(entry)
+                    self._matrix_add(key_hash, entry.clip_embedding)
+                    if entry.image_embedding is not None:
+                        self._matrix_update_image(key_hash, entry.image_embedding)
+                    self._current_memory_bytes += size
                     loaded_count += 1
-
-                except Exception as e:
-                    logger.warning(
-                        "Failed to load cache entry from %s: %s",
-                        entry_dir,
-                        e,
-                    )
+                except Exception as exc:
+                    logger.warning("Failed to restore cache snapshot %s: %s", path, exc)
 
         logger.info(
             "Loaded %d cache entries from %s (%.2f MB)",
@@ -1105,16 +950,6 @@ class DiTCacheStore:
             self._current_memory_bytes / _MB,
         )
         return loaded_count
-
-    def _save_final_to_disk(self, key_hash: str, latent: torch.Tensor) -> None:
-        """Background thread: save final latent to disk via torch.save."""
-        try:
-            path = self._final_disk_dir / f"{key_hash}.pt"
-            torch.save(latent.cpu(), path)
-            size_mb = latent.nelement() * latent.element_size() / _MB
-            logger.debug("Saved final latent %s to disk (%.1f MB)", key_hash[:8], size_mb)
-        except Exception as e:
-            logger.warning("Failed to save final latent %s: %s", key_hash[:8], e)
 
     # Bounded wait for LMCache allocation under pool pressure. A put() that
     # cannot get memory within this budget degrades to a no-store instead of
@@ -1202,9 +1037,8 @@ def build_cache_key_from_request(
         if isinstance(prompt_item, str):
             prompt_text = prompt_item
         elif isinstance(prompt_item, dict):
-            if prompt_item.get("multi_modal_data"):
-                # Image-conditioned generation: the conditioning image is not
-                # part of the key, so reuse would conflate different sources.
+            if prompt_item.get("multi_modal_data") or prompt_item.get("additional_information"):
+                # External conditioning is not part of the text identity.
                 return None
             if prompt_item.get("prompt_embeds") is not None:
                 # Embedding prompts have no stable text identity.

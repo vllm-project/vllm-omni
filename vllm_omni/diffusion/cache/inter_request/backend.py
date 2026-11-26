@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
+import json
 import logging
-import os
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -17,6 +21,51 @@ from vllm_omni.diffusion.cache.inter_request.step_recorder import StepLatentsRec
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 logger = logging.getLogger(__name__)
+
+
+class _CacheHit(NamedTuple):
+    key_hash: str
+    # Zero denotes a complete cached output; positive values resume denoising.
+    resume_step: int
+    tensor: torch.Tensor
+
+
+def _agreed_hits(hits: list[_CacheHit | None]) -> list[bool]:
+    """Agree before any rank changes its batch or skips denoising steps."""
+    dist = torch.distributed
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return [hit is not None for hit in hits]
+
+    from vllm_omni.diffusion.distributed.parallel_state import get_data_parallel_rank, get_world_group
+
+    # The multiproc executor issues the wave to the whole diffusion world.
+    # DLO may give different requests to different DP replicas, but weight
+    # collectives still require every replica to execute the same step pattern.
+    signatures = [None if hit is None else (hit.key_hash, hit.resume_step) for hit in hits]
+    group = get_world_group().cpu_group
+    votes: list[Any] = [None] * dist.get_world_size(group)
+    # Gloo updates receive tensors on its worker threads outside inference mode.
+    with torch.inference_mode(False):
+        dist.all_gather_object(votes, (get_data_parallel_rank(), signatures), group=group)
+    if any(len(batch) != len(hits) for _, batch in votes):
+        raise RuntimeError("Inter-request cache received inconsistent distributed batch sizes")
+
+    agreed = []
+    for i in range(len(hits)):
+        sources_by_replica = {}
+        steps = set()
+        for replica, batch in votes:
+            if batch[i] is None:
+                break
+            source, step = batch[i]
+            if source != sources_by_replica.setdefault(replica, source):
+                break
+            steps.add(step)
+        else:
+            agreed.append(len(steps) == 1)
+            continue
+        agreed.append(False)
+    return agreed
 
 
 class InterRequestCacheBackend(CacheBackend):
@@ -58,71 +107,18 @@ class InterRequestCacheBackend(CacheBackend):
         max_entries = getattr(config, "inter_request_max_entries", 100)
         max_memory_gb = getattr(config, "inter_request_max_memory_gb", 0.0)
 
-        # Initialize LMCache ECCacheEngine for CPU→Disk tiered storage.
-        # ECCacheEngine stores arbitrary tensors by string key with built-in
-        # CPU→Disk layering, LRU eviction, and async persistence.
-        lmcache_disk_dir = getattr(config, "inter_request_lmcache_disk_dir", None)
-        if lmcache_disk_dir:
-            import torch as _torch
-            from lmcache.v1.cache_engine import LMCacheMetadata
-            from lmcache.v1.config import LMCacheEngineConfig
-            from lmcache.v1.ec_engine import ECCacheEngine
-
-            cpu_gb = getattr(config, "inter_request_lmcache_max_cpu_gb", 5.0)
-            disk_gb = getattr(config, "inter_request_lmcache_max_disk_gb", 100.0)
-
-            lc_metadata = LMCacheMetadata(
-                model_name="vllm_omni_diffusion",
-                world_size=1,
-                local_world_size=1,
-                worker_id=0,
-                local_worker_id=0,
-                kv_dtype=_torch.float32,
-                kv_shape=(1, 1, 1, 1, 1),
-            )
-
-            # Single LMCache engine for step latents only (8MB each).
-            # Final latent (185MB) is stored via direct torch.save to avoid
-            # LMCache CPU pool pressure and LRU-eviction-before-write data loss.
-            steps_dir = os.path.join(lmcache_disk_dir, "steps")
-            os.makedirs(steps_dir, exist_ok=True)
-
-            self._lmcache_engine = ECCacheEngine(
-                config=LMCacheEngineConfig.from_defaults(
-                    local_cpu=True,
-                    max_local_cpu_size=cpu_gb,
-                    local_disk=steps_dir,
-                    max_local_disk_size=disk_gb,
-                    save_decode_cache=True,
-                ),
-                metadata=lc_metadata,
-                encoder_dtype=_torch.float32,
-            )
-            logger.info(
-                "LMCache ECCacheEngine initialized for step latents: steps_dir=%s, cpu_gb=%.1f",
-                steps_dir,
-                cpu_gb,
-            )
-        else:
-            self._lmcache_engine = None
-
-        # Final latent directory (torch.save direct to disk, bypasses LMCache)
-        final_disk_dir = None
-        if lmcache_disk_dir:
-            final_disk_dir = os.path.join(lmcache_disk_dir, "final_direct")
-            os.makedirs(final_disk_dir, exist_ok=True)
-
+        self._lmcache_engine = None
+        self._closed = False
         self._cache_store = DiTCacheStore(
             max_entries=max_entries,
             max_memory_gb=max_memory_gb,
-            lmcache_engine=self._lmcache_engine,
             max_stored_steps=getattr(config, "inter_request_max_stored_steps", 0),
-            final_disk_dir=final_disk_dir,
         )
         # Fingerprint of model checkpoint + TP world size; included in every
         # cache key so persisted caches are namespaced per model/topology.
         self._model_digest = ""
         self._pipeline = None
+        self._recorder: StepLatentsRecorder | None = None
 
         self._persistent_cache_dir = getattr(config, "inter_request_persistent_cache_dir", None)
 
@@ -158,17 +154,62 @@ class InterRequestCacheBackend(CacheBackend):
             self._clip_max_skip_ratio,
         )
 
+    def _configure_disk_storage(self) -> None:
+        import torch.distributed as dist
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        namespace = Path(self._model_digest) / f"rank-{rank}"
+        snapshot_root = getattr(self.config, "inter_request_persistent_cache_dir", None)
+        if snapshot_root is not None:
+            self._persistent_cache_dir = Path(snapshot_root) / namespace
+        tier_root = getattr(self.config, "inter_request_lmcache_disk_dir", None)
+        if not tier_root:
+            return
+
+        from lmcache.v1.config import LMCacheEngineConfig
+        from lmcache.v1.ec_engine import ECCacheEngine
+        from lmcache.v1.metadata import LMCacheMetadata
+
+        tier_dir = Path(tier_root) / namespace
+        steps_dir = tier_dir / "steps"
+        steps_dir.mkdir(parents=True, exist_ok=True)
+        # Each rank owns its own single-worker engine, directory and key space.
+        self._lmcache_engine = ECCacheEngine(
+            config=LMCacheEngineConfig.from_defaults(
+                local_cpu=True,
+                max_local_cpu_size=getattr(self.config, "inter_request_lmcache_max_cpu_gb", 5.0),
+                local_disk=str(steps_dir),
+                max_local_disk_size=getattr(self.config, "inter_request_lmcache_max_disk_gb", 100.0),
+                save_decode_cache=True,
+            ),
+            metadata=LMCacheMetadata(
+                model_name=f"vllm_omni_diffusion_{self._model_digest}_rank{rank}",
+                world_size=1,
+                local_world_size=1,
+                worker_id=0,
+                local_worker_id=0,
+                kv_dtype=torch.float32,
+                kv_shape=(1, 1, 1, 1, 1),
+            ),
+            encoder_dtype=torch.float32,
+        )
+        self._cache_store.configure_tier(self._lmcache_engine, tier_dir / "final_direct")
+
     def enable(self, pipeline: Any) -> None:
-        self._pipeline = pipeline
-        self._model_digest = self._compute_model_digest(pipeline)
+        register_step_hook = getattr(pipeline, "register_diffuse_step_hook", None)
+        if not callable(register_step_hook):
+            logger.warning("Inter-request cache disabled for %s: no denoising step hook", type(pipeline).__name__)
+            self.enabled = False
+            return
 
         # Tiled/sharded VAE decode (vae_patch_parallel_size > 1) returns the
         # real output only on the owning rank; other ranks get placeholders.
         # Rank-divergent cache-hit decisions would desynchronize the
         # collectives inside pipeline.forward (owner short-circuits, peers
         # block) — refuse inter-request reuse in that topology.
-        vae_patch_parallel_size = getattr(getattr(pipeline, "od_config", None), "vae_patch_parallel_size", 1)
-        if vae_patch_parallel_size and vae_patch_parallel_size > 1:
+        parallel_config = getattr(getattr(pipeline, "od_config", None), "parallel_config", None)
+        vae_patch_parallel_size = getattr(parallel_config, "vae_patch_parallel_size", 1)
+        if vae_patch_parallel_size > 1:
             logger.warning(
                 "InterRequestCacheBackend disabled: vae_patch_parallel_size=%d "
                 "shards outputs across ranks; cross-request reuse would "
@@ -178,22 +219,21 @@ class InterRequestCacheBackend(CacheBackend):
             self.enabled = False
             return
 
-        self.enabled = True
+        self._pipeline = pipeline
+        self._model_digest = self._compute_model_digest(pipeline)
+        self._configure_disk_storage()
         self._recorder = StepLatentsRecorder()
         # Register as a general-purpose denoising-step hook (see
         # ProgressBarMixin). Kept also as an attribute for backwards compat.
-        pipeline.register_diffuse_step_hook(self._recorder)
+        register_step_hook(self._recorder)
         pipeline._step_latents_recorder = self._recorder
+        self.enabled = True
 
         if self._clip_model_path is not None:
             self._init_clip_encoder()
 
-        # Restore persisted cache on startup.
-        # When LMCache is enabled, latents are already on disk (managed by
-        # LMCache) and will be recovered on first get(). We only need to
-        # restore the embedding shells for semantic_search.
-        # When persistent_cache_dir is set (without LMCache), do a full load.
-        if self._persistent_cache_dir is not None and self._lmcache_engine is None:
+        # Snapshot files contain complete hot entries saved at a clean shutdown.
+        if self._persistent_cache_dir is not None:
             loaded = self._cache_store.load_from_disk(self._persistent_cache_dir)
             if loaded > 0:
                 logger.info(
@@ -229,13 +269,12 @@ class InterRequestCacheBackend(CacheBackend):
         od_model = getattr(getattr(pipeline, "od_config", None), "model", None)
         if isinstance(od_model, str) and od_model:
             parts.append(od_model)
-        try:
-            import torch.distributed as dist
-
-            if dist.is_initialized():
-                parts.append(f"tp{dist.get_world_size()}")
-        except Exception:
-            pass
+        parallel = getattr(getattr(pipeline, "od_config", None), "parallel_config", None)
+        if parallel is not None:
+            topology = asdict(parallel) if is_dataclass(parallel) else vars(parallel)
+            parts.append(json.dumps(topology, sort_keys=True, default=str))
+        if torch.distributed.is_initialized():
+            parts.append(f"world{torch.distributed.get_world_size()}")
         return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
     def _init_clip_encoder(self) -> None:
@@ -409,10 +448,10 @@ class InterRequestCacheBackend(CacheBackend):
                 self._cache_store.update_image_embedding(cache_key_hash, image_emb)
                 logger.debug("stored image embedding for %s", cache_key_hash[:8])
 
-        self._cache_store._final_write_executor.submit(_encode_and_store)
+        self._cache_store._embedding_executor.submit(_encode_and_store)
 
     def semantic_lookup(
-        self, req: Any, target_device: torch.device | str | None = None
+        self, req: Any, target_device: torch.device | str | None = None, *, return_key_hash: bool = False
     ) -> tuple[torch.Tensor | None, list[StepLatentData] | None, float, str | None, str | None]:
         if not self.enabled or self._clip_model is None:
             return None, None, 0.0, None, None
@@ -425,7 +464,7 @@ class InterRequestCacheBackend(CacheBackend):
         if query_emb is None:
             return None, None, 0.0, None, None
 
-        latents, step_latents, sim, cached_prompt, match_type = self._cache_store.semantic_search(
+        return self._cache_store.semantic_search(
             query_emb,
             threshold=self._clip_threshold,
             target_device=target_device,
@@ -435,64 +474,41 @@ class InterRequestCacheBackend(CacheBackend):
             required_num_frames=cache_key.num_frames,
             required_sigmas=cache_key.sigmas,
             required_lora_digest=cache_key.lora_digest,
+            return_key_hash=return_key_hash,
         )
-        return latents, step_latents, sim, cached_prompt, match_type
 
     def compute_skip_steps(
         self,
         similarity: float,
         total_steps: int,
     ) -> int:
-        if similarity < self._clip_threshold:
+        if total_steps <= 1 or similarity < self._clip_threshold:
             return 0
-        max_skip = int(total_steps * self._clip_max_skip_ratio)
-        if max_skip <= self._clip_min_skip:
-            return self._clip_min_skip
-
-        ratio = (similarity - self._clip_threshold) / (1.0 - self._clip_threshold)
-        ratio = min(max(ratio, 0.0), 1.0)
-
-        skip = self._clip_min_skip + int(ratio * (max_skip - self._clip_min_skip))
-
-        # Clamp to max_stored_steps: if we only stored the first N step latents,
-        # resume beyond step N is impossible. Clamp to N so the runner can find
-        # the step latent at index N-1.
+        # Semantic matches must leave at least one denoising step for this prompt.
+        max_skip = max(0, min(total_steps - 1, int(total_steps * self._clip_max_skip_ratio)))
+        min_skip = min(max(0, self._clip_min_skip), max_skip)
+        ratio = 1.0
+        if self._clip_threshold < 1.0:
+            ratio = min(1.0, (similarity - self._clip_threshold) / (1.0 - self._clip_threshold))
+        skip = min_skip + int(ratio * (max_skip - min_skip))
         max_stored = self._cache_store._max_stored_steps
-        if max_stored > 0 and skip > max_stored:
-            skip = max_stored
-
-        return skip
+        return min(skip, max_stored) if max_stored > 0 else skip
 
     @property
     def clip_enabled(self) -> bool:
         return self._clip_model is not None
 
     def shutdown(self) -> None:
-        logger.info(
-            "InterRequestCacheBackend shutdown: persistent_cache_dir=%s, lmcache_enabled=%s, cache_size=%d",
-            self._persistent_cache_dir,
-            self._lmcache_engine is not None,
-            self._cache_store.size,
-        )
-
-        # Close LMCache engine (flushes async writes + stops background workers).
-        if self._lmcache_engine is not None:
-            self._lmcache_engine.close()
-            logger.info("LMCache ECCacheEngine closed")
-        # Flush pending final latent disk writes
-        if hasattr(self._cache_store, "_final_write_executor"):
-            self._cache_store._final_write_executor.shutdown(wait=True)
-            logger.info("LMCache ECCacheEngine closed")
-
-        # Persist hot (in-CPU) entries to persistent_cache_dir for cross-process
-        # reuse (original behaviour, independent of LMCache).
-        if self._persistent_cache_dir is not None and self._cache_store.size > 0:
-            saved = self._cache_store.save_to_disk(self._persistent_cache_dir)
-            logger.info(
-                "Persisted %d cache entries to %s",
-                saved,
-                self._persistent_cache_dir,
-            )
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._cache_store.close()
+            if self._persistent_cache_dir is not None and self._cache_store.size:
+                self._cache_store.save_to_disk(self._persistent_cache_dir)
+        finally:
+            if self._lmcache_engine is not None:
+                self._lmcache_engine.close()
 
     def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         pass
@@ -578,64 +594,66 @@ class InterRequestCacheBackend(CacheBackend):
     # These encapsulate the runner logic so the runner can call every
     # backend uniformly without isinstance() checks.
     # ------------------------------------------------------------------
-    def short_circuit_requests(self, reqs: list, target_device: Any) -> tuple[list, list]:
-        """Inspect requests before forward.
+    def _local_hit(self, req: Any, target_device: Any) -> _CacheHit | None:
+        key = build_cache_key_from_request(req, self._pipeline, model_digest=self._model_digest)
+        if key is None:
+            return None
 
-        Returns (hit_outputs, remaining_reqs) where hit_outputs is a list of
-        (original_index, DiffusionOutput). Exact hits are short-circuited;
-        semantic hits set ``resume_from_step`` on the request for the pipeline.
-        """
+        step = getattr(req.sampling_params, "resume_from_step", 0) or 0
+        if step > 0:
+            steps = self._cache_store.get_step_latents(key, target_device)
+            source = key.to_hash()
+        else:
+            output = self._cache_store.get(key, target_device)
+            if output is not None:
+                return _CacheHit(key.to_hash(), 0, output)
+            if not self.clip_enabled:
+                return None
+            _, steps, similarity, source, _ = self.semantic_lookup(req, target_device, return_key_hash=True)
+            if not steps or source is None:
+                return None
+            total = req.sampling_params.num_inference_steps or len(steps)
+            step = min(len(steps), self.compute_skip_steps(similarity, total))
+
+        if not steps or not (0 < step <= len(steps)) or steps[step - 1].step_index != step - 1:
+            return None
+        latent = steps[step - 1].latent
+        if latent.ndim == 0 or latent.shape[0] != key.num_images_per_prompt:
+            return None
+        return _CacheHit(source, step, latent)
+
+    def short_circuit_requests(self, reqs: list, target_device: Any) -> tuple[list, list]:
+        """Apply a cache hit only after every participating rank can use it."""
         if not self.enabled or self._pipeline is None:
             return [], reqs
 
         from vllm_omni.diffusion.data import DiffusionOutput
 
-        hit_outputs: list[tuple[int, Any]] = []
-        remaining_reqs: list = []
-        for idx, req in enumerate(reqs):
-            # Path A: resume from a cached step (set by a prior semantic hit).
-            resume_from_step = getattr(req.sampling_params, "resume_from_step", 0) or 0
-            if resume_from_step > 0:
-                step_latents_list = self.lookup_step_latents(req, target_device=target_device)
-                if step_latents_list is not None and len(step_latents_list) >= resume_from_step:
-                    resume_data = step_latents_list[resume_from_step - 1]
-                    req.sampling_params.resume_latents = resume_data.latent
-                    logger.info("Inter-request cache: resuming from step %d", resume_from_step)
-                else:
-                    req.sampling_params.resume_from_step = 0
-                remaining_reqs.append(req)
-                continue
-
-            # Path B: exact hit -> skip forward entirely.
-            cached_output = self.lookup(req, target_device=target_device)
-            if cached_output is not None:
-                logger.info("Inter-request cache HIT: skipping DiT computation entirely")
-                hit_outputs.append((idx, DiffusionOutput(output=cached_output)))
-                continue
-
-            # Path C: semantic hit -> set resume_from_step for partial skip.
-            if self.clip_enabled:
-                clip_result = self.semantic_lookup(req, target_device=target_device)
-                clip_latents, clip_step_latents, clip_sim, _, _ = clip_result
-                if clip_latents is not None and clip_step_latents is None:
-                    # The matched entry was evicted to a shell (heavy tensors
-                    # dropped, embeddings kept). semantic_lookup cannot return
-                    # step latents for shells — recover them from LMCache the
-                    # same way the exact-hit path does.
-                    clip_step_latents = self.lookup_step_latents(req, target_device=target_device)
-                if clip_latents is not None and clip_step_latents is not None:
-                    total_steps = req.sampling_params.num_inference_steps or len(clip_step_latents)
-                    clip_resume_step = self.compute_skip_steps(clip_sim, total_steps)
-                    if clip_resume_step > 0 and len(clip_step_latents) >= clip_resume_step:
-                        resume_data = clip_step_latents[clip_resume_step - 1]
-                        req.sampling_params.resume_latents = resume_data.latent
-                        req.sampling_params.resume_from_step = clip_resume_step
-                        logger.info(
-                            "CLIP semantic match: similarity=%.4f, resuming from step %d/%d",
-                            clip_sim,
-                            clip_resume_step,
-                            total_steps,
-                        )
+        candidates = []
+        for req in reqs:
+            try:
+                is_dummy = getattr(req, "is_dummy_run", None)
+                hit = None if callable(is_dummy) and is_dummy() else self._local_hit(req, target_device)
+            except Exception:
+                # Local disk, transfer or encoder failure must still enter the
+                # vote: a peer may otherwise skip its next forward collective.
+                logger.warning("Inter-request cache lookup failed; running full denoising", exc_info=True)
+                hit = None
+            candidates.append(hit)
+        hit_outputs = []
+        remaining_reqs = []
+        for idx, (req, hit, agreed) in enumerate(zip(reqs, candidates, _agreed_hits(candidates))):
+            if agreed and hit is not None:
+                if hit.resume_step == 0:
+                    logger.info("Inter-request cache HIT: skipping DiT computation entirely")
+                    hit_outputs.append((idx, DiffusionOutput(output=hit.tensor)))
+                    continue
+                logger.info("Inter-request cache: resuming from step %d", hit.resume_step)
+                req.sampling_params.resume_from_step = hit.resume_step
+                req.sampling_params.resume_latents = hit.tensor
+            else:
+                req.sampling_params.resume_from_step = 0
+                req.sampling_params.resume_latents = None
             remaining_reqs.append(req)
         return hit_outputs, remaining_reqs
 
@@ -653,18 +671,27 @@ class InterRequestCacheBackend(CacheBackend):
         latent is complete and worth caching, but the step latents are partial
         (only the post-resume steps were recorded) so they are skipped.
         """
-        if not self.enabled or self._pipeline is None:
+        if not self.enabled or self._pipeline is None or is_dummy:
             return outputs
         # The recorder's resume_from_step survives across forward(); use it to
         # detect whether this batch was a resume. req.sampling_params may have
         # been reset by the pipeline between short_circuit and here.
-        recorder_resumed = self._recorder is not None and self._recorder.resume_from_step > 0
-        for req, output in zip(reqs, outputs):
+        recorder = self._recorder
+        recorder_resumed = recorder is not None and recorder.resume_from_step > 0
+        output_counts = [max(1, req.sampling_params.num_outputs_per_prompt) for req in reqs]
+        batch_size = sum(output_counts)
+        records = recorder.records if recorder is not None and not recorder_resumed else []
+        # A pipeline records one latent tensor for the batch. Each cache
+        # entry must store only the slice belonging to its own request.
+        if any(record.latent.ndim == 0 or record.latent.shape[0] != batch_size for record in records):
+            records = []
+        offset = 0
+        for req, output, count in zip(reqs, outputs, output_counts, strict=True):
+            start = offset
+            offset += count
             if output.output is None:
                 # Media-typed outputs (decoded video on DiffusionOutput.media)
                 # have no cacheable tensor representation; bypass silently.
-                continue
-            if is_dummy:
                 continue
             if not hasattr(output.output, "numel") or output.output.numel() == 0:
                 # Placeholder tensors (e.g. non-owner ranks under sharded
@@ -672,14 +699,14 @@ class InterRequestCacheBackend(CacheBackend):
                 continue
             # Skip step latents when this was a resume (incomplete step history).
             step_latents_data = None
-            if not recorder_resumed and self._recorder is not None and self._recorder.num_steps > 0:
+            if records:
                 step_latents_data = [
                     StepLatentData(
                         step_index=r.step_index,
                         timestep=r.timestep,
-                        latent=r.latent,
+                        latent=r.latent[start:offset],
                     )
-                    for r in self._recorder.records
+                    for r in records
                 ]
             cache_key_hash = self.store(req, output.output, step_latents=step_latents_data)
             if recorder_resumed:

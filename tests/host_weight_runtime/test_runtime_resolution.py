@@ -56,6 +56,14 @@ from vllm_omni.host_weight_runtime.filesystem.locks import FileLock, lock_is_act
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+# Match the filesystem-store multiprocessing tests. Process exit is
+# separate from the 0.1-second coordination deadline checked below.
+_PROCESS_COMPLETION_TIMEOUT_SECONDS = 60.0
+_PROCESS_CLEANUP_TIMEOUT_SECONDS = 5.0
+# Exceed the former five-second completion wait while staying well below the
+# normal completion bound, so both parametrized cases exercise the regression.
+_CONTROLLED_FINALIZATION_DELAY_SECONDS = 8.0
+
 
 def _identity() -> WeightArtifactIdentity:
     return WeightArtifactIdentity(
@@ -525,7 +533,11 @@ def test_retryable_store_initialization_failure_obeys_runtime_mode(
     assert resolution.report.attempts[0].failure.retryable
 
 
-def _initialize_contended_runtime(config: HostWeightRuntimeConfig, output: Connection) -> None:
+def _initialize_contended_runtime(
+    config: HostWeightRuntimeConfig,
+    output: Connection,
+    finalization_delay_seconds: float,
+) -> None:
     try:
         output.send("starting")
         started = time.monotonic()
@@ -536,6 +548,8 @@ def _initialize_contended_runtime(config: HostWeightRuntimeConfig, output: Conne
         finally:
             if resolution.lease is not None:
                 resolution.lease.close()
+        output.send("finalizing")
+        time.sleep(finalization_delay_seconds)
     finally:
         output.close()
 
@@ -559,7 +573,10 @@ def test_domain_lock_timeout_and_fresh_runtime_recovery(
     lock_path = tmp_path / "locks" / "domain-init.lock"
     ctx = mp.get_context("spawn")
     reader, writer = ctx.Pipe(duplex=False)
-    process = ctx.Process(target=_initialize_contended_runtime, args=(config, writer))
+    process = ctx.Process(
+        target=_initialize_contended_runtime,
+        args=(config, writer, _CONTROLLED_FINALIZATION_DELAY_SECONDS),
+    )
 
     with FileLock(lock_path, exclusive=True, deadline=None):
         process.start()
@@ -580,12 +597,18 @@ def test_domain_lock_timeout_and_fresh_runtime_recovery(
             assert "timed out waiting for" in failure.message
             assert "domain-init.lock" in failure.message
             assert lock_is_active(lock_path), "waiter must not unlock the owner"
-            process.join(5)
-            assert process.exitcode == 0
+            assert reader.poll(5), "waiter did not begin controlled finalization"
+            assert reader.recv() == "finalizing"
+            process.join(_PROCESS_COMPLETION_TIMEOUT_SECONDS)
+            assert process.exitcode == 0, (
+                f"runtime waiter pid={process.pid} did not exit successfully within "
+                f"{_PROCESS_COMPLETION_TIMEOUT_SECONDS:g}s: exitcode={process.exitcode}"
+            )
         finally:
             if process.is_alive():
                 process.kill()
-            process.join(5)
+            process.join(_PROCESS_CLEANUP_TIMEOUT_SECONDS)
+            assert not process.is_alive(), f"runtime waiter pid={process.pid} survived cleanup"
             process.close()
             reader.close()
 

@@ -26,7 +26,7 @@ redundant computation and providing significant end-to-end speedup.
 
 | Tier | Match Condition | Speedup | Quality |
 |------|----------------|---------|---------|
-| **Exact hit** | Identical prompt + seed + params | Skip all DiT steps (measured 11–142× latency on committed benchmarks; see `benchmarks/inter_request_cache/`) | Identical |
+| **Exact hit** | Identical prompt + seed + params | Skip all DiT steps | Replay the cached output |
 | **Semantic hit** | CLIP text similarity > threshold | Partial (skip first N steps) | Near-identical |
 | **Miss** | No match | No speedup (compute & cache) | Normal |
 
@@ -34,6 +34,12 @@ Only **text-prompt** requests with an **explicit seed** (or a resolvable
 generator seed) are cached. Image-conditioned requests (edit / i2v), embedding
 or token prompts, and seedless requests bypass the cache — see *Cache Safety*
 below.
+
+Cross-request reuse currently applies to full, non-streaming pipeline requests.
+Waves with cross-stage payloads, scheduler-managed KV metadata or an attention
+schedule follow their normal forward path. Pipelines without a denoising-step
+hook also follow their normal forward path. Workload-specific throughput and
+request latency are reported in `benchmarks/inter_request_cache/`.
 
 ---
 
@@ -192,28 +198,27 @@ cache-dit acceleration (DBCache + TaylorSeer + SCM) for the remaining denoising 
 
 ## Persistent Cache
 
-When `inter_request_persistent_cache_dir` is set, the cache is automatically:
-
-1. **Loaded** on engine startup — all entries (latents, step latents, embeddings, cache keys)
-   are restored and become immediately searchable.
-2. **Saved** periodically and on shutdown — new entries are persisted to disk.
-
-Cache keys embed a digest of the model checkpoint and TP world size, so a
-persistent dir written by a different model or topology is never served.
+At clean shutdown, `inter_request_persistent_cache_dir` saves resident entries
+as atomic snapshots containing the final output, available step latents,
+embeddings and cache key. Startup loads complete snapshots under
+`<dir>/<model-and-topology-digest>/rank-<rank>/`. Older unscoped cache files
+lack the identity required for this layout and are skipped on startup.
 
 ## LMCache CPU→Disk Tiering (optional)
 
-For caches larger than host memory, set `inter_request_lmcache_disk_dir` to
-enable tiered storage via LMCache (`pip install 'vllm-omni[inter_request]'`):
+Set `inter_request_lmcache_disk_dir` to enable a process-local spill tier
+(`pip install 'vllm-omni[inter_request]'`). Each rank owns a separate engine
+and directory under `<dir>/<model-and-topology-digest>/rank-<rank>/`.
 
-- Final latents are persisted with `torch.save` into
-  `<dir>/final_direct/` (async, off the request path).
-- Step latents go through LMCache's `ECCacheEngine` into `<dir>/steps/`,
-  which manages the CPU pool (`inter_request_lmcache_max_cpu_gb`) and spills
-  to disk (`inter_request_lmcache_max_disk_gb`) with LRU eviction.
-- Under sustained pool pressure, LMCache allocation waits at most 30s and
-  then degrades to a no-store (the request is unaffected; the entry simply
-  is not cached).
+- Final latents are written to a temporary file in `final_direct/` and
+  atomically published once the tensor has been serialized.
+- A background worker writes step latents to LMCache under `steps/`. The
+  in-memory index marks an entry recoverable after its writes complete.
+- Under load, each rank can hold up to two in-flight writes. A full queue or
+  failed write leaves the entry usable while its tensors remain in memory;
+  after eviction it becomes a cache miss.
+- Spill metadata lives in the running process. Clean shutdown drains writes;
+  only entries retained in the snapshot directory can be loaded on restart.
 
 ## Cache Safety
 

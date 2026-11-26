@@ -12,7 +12,7 @@ For the internal architecture and backend extension points, see the
 
 | Mode | Guide | Description | Methods |
 | ------ | ------- | ------------- | --------- |
-| Online quantization | [Online Quantization](online.md) | vLLM-Omni computes quantized weights and scales while loading the model. | FP8 W8A8, Int8 W8A8, BitsAndBytes W4, MXFP8 W8A8, MXFP4 W4A4 |
+| Online quantization | [Online Quantization](online.md) | vLLM-Omni computes quantized weights and scales while loading the model. | FP8 W8A8, Int8 W8A8, ConvRot W8A8/W4A4, BitsAndBytes W4, MXFP8 W8A8, MXFP4 W4A4 |
 | Runtime attention quantization | [Quantized KV Cache](quantized_kvcache.md) | vLLM-Omni dynamically quantizes eligible diffusion attention tensors during inference. | FP8, MXFP8, MXFP4 |
 | Pre-quantized checkpoints | Method-specific guides | The checkpoint or an offline quantizer provides quantized weights and scales before serving. | ModelOpt, AutoRound, TorchAO, msModelSlim, serialized Int8, offline MXFP8, offline MXFP4 DualScale |
 
@@ -20,10 +20,10 @@ For the internal architecture and backend extension points, see the
 
 | Device | FP8 W8A8 | Int8 W8A8 | BitsAndBytes W4 | ModelOpt | MXFP8 W8A8 | MXFP4 W4A4 | AutoRound | msModelSlim | TorchAO FP8 weight-only |
 | -------- | ---------- | ----------- | ------------------ | ---------- | ------------ | ------------ | ----------- | ------------- | --------- |
-| NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ | ⭕ |
+| NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ | ✅ | ✅ | ✅ (online SM100/103/107) | ⭕ | ✅ | ❌ | ⭕ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ | ✅ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ | ✅ | ✅ | ⭕ | ⭕ | ⭕ | ✅ | ❌ | ⭕ |
-| AMD ROCm | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ✅ | ⭕ | ❌ | ⭕ |
+| AMD ROCm | ✅ ([online block options](rocm_online_fp8.md)) | ⭕ | ❌ | ⭕ | ⭕ | ✅ | ⭕ | ❌ | ⭕ |
 | Intel XPU | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ⭕ | ✅ | ❌ | ⭕ |
 | Ascend NPU | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | ⭕ |
 
@@ -43,9 +43,10 @@ otherwise.
 | -------- | ------- | ------ | ---------------- | -------- |
 | FP8 W8A8 | [FP8](fp8.md) | Online W8A8 or checkpoint FP8 | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image family and other DiT models |
 | Int8 W8A8 | [Int8](int8.md) | Online or serialized W8A8 | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image and Z-Image |
+| ConvRot W8A8 / W4A4 | [ConvRot](convrot.md) | Online rotated W8A8 or W4A4 (+ INT8 layers) | MiniMax-H3 | Validated on MiniMax-H3 Ref2VA (H200) |
 | BitsAndBytes W4 | [BitsAndBytes](bitsandbytes.md) | Online W4 weight-only | Z-Image-Turbo; Qwen-Image/Wan2.2 not validated | Validated for Z-Image-Turbo |
 | ModelOpt | [ModelOpt](modelopt.md) | Pre-quantized FP8 checkpoints | Qwen-Image, Z-Image, FLUX.2, HunyuanImage-3.0 | Validated for ModelOpt FP8 diffusion checkpoints |
-| MXFP8 W8A8 | [MXFP8](mxfp8.md) | Online W8A8 or offline pre-quantized | Wan2.2-T2V-A14B, I2V-A14B, TI2V-5B | Ascend NPU only; validated for Wan2.2 |
+| MXFP8 W8A8 | [MXFP8](mxfp8.md) | Online W8A8; platform-specific offline support | Wan2.2-T2V-A14B, I2V-A14B, TI2V-5B; MiniMax-H3-Image | Wan2.2 on Ascend NPU; H3-Image online on Rubin; see the method guide for CUDA/XPU limits |
 | MXFP4 W4A4 | [MXFP4](mxfp4.md) | `mxfp4`: online single-scale only; `mxfp4_dualscale`: online or offline dual-scale (offline recommended) | Wan2.2-T2V-A14B, I2V-A14B | Ascend NPU only; validated for Wan2.2 A14B cascade models; TI2V-5B not supported; offline `mxfp4_dualscale` uses calibrated `mul_scale` for best accuracy |
 | AutoRound | [AutoRound](autoround.md) | Pre-quantized W4A16 checkpoints | FLUX.1-dev; Qwen-Image/Wan2.2 not validated | Checkpoint-driven |
 | msModelSlim | [msModelSlim](msmodelslim.md) | Pre-quantized Ascend checkpoints | Wan2.2 recipe; HunyuanImage-3.0 inference target | Ascend/NPU path |

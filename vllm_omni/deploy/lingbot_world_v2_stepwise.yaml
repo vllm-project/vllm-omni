@@ -34,8 +34,14 @@ stages:
       extra_args:
         flow_shift: 5.0
     model_config:
+      # Multi-rank width sharding changes floating-point numerics at shard borders.
+      # Set false for full-frame VAE decode while keeping DiT sequence parallelism.
+      lingbot_vae_spatial_sharding: true
       ar_diffusion_height: 480
       ar_diffusion_width: 832
       ar_diffusion_kv_config:
         gpu_memory_fraction: 0.6
         warmup_cudagraph: true
+        # Superpage KV: set to the FlashAttention key tile, 160 on H100/H200
+        # (FA3) or 128 on B200 (FA4). Output is not bitwise identical to off.
+        # superpage_tokens: 160

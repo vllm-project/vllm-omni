@@ -89,6 +89,23 @@ def test_launch_failure_disables_runtime_key(monkeypatch):
     assert len(fused_rope._FAILED_KEYS) == 1
 
 
+def test_non_cuda_platform_does_not_launch_fused_kernel(monkeypatch):
+    from vllm_omni.diffusion.models.ernie_image import fused_rope
+
+    monkeypatch.setattr(fused_rope, "HAS_TRITON", True)
+    monkeypatch.setattr(fused_rope.current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+
+    def unexpected_launch(*args):
+        raise AssertionError("non-CUDA platforms must remain on the native path")
+
+    monkeypatch.setattr(fused_rope, "_launch_fused_qk_rotary_emb", unexpected_launch)
+    query = torch.zeros((1, 1, 1, 128), dtype=torch.bfloat16)
+    freqs = torch.zeros((1, 1, 64), dtype=torch.float32)
+    assert fused_rope.try_fused_qk_rotary_emb(query, query, freqs, freqs) is None
+    assert not fused_rope._FAILED_KEYS
+
+
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_failed_runtime_key_cache_is_bounded():
     from vllm_omni.diffusion.models.ernie_image import fused_rope

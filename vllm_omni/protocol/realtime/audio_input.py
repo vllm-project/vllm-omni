@@ -34,7 +34,7 @@ from typing import cast
 
 import numpy as np
 
-from vllm_omni.protocol.realtime.audio import convert_input_audio_with_rate
+from vllm_omni.protocol.realtime.audio import convert_input_audio_to_pcm_f32
 from vllm_omni.protocol.realtime.errors import RealtimeProtocolError
 from vllm_omni.protocol.realtime.formats import (
     is_supported_realtime_input_format,
@@ -175,7 +175,10 @@ def decode_audio_append(
     defaults: RealtimeInputDefaults,
     hints_source: Mapping[str, object] | None = None,
 ) -> RealtimeAudioAppend:
-    """Validate, convert (to 16 kHz ``pcm_f32le``) and pack one audio append.
+    """Validate and pack one input append (audio and/or video frames).
+
+    Capability checks (required/optional modalities) run later on the session.
+    Audio path converts to 16 kHz ``pcm_f32le``.
 
     ``hints_source`` is the enclosing payload when the audio arrives inside
     something larger than a bare append --- a ``conversation.item.create``
@@ -186,6 +189,39 @@ def decode_audio_append(
     """
     event_id = cast("str", event.get("event_id")) if isinstance(event.get("event_id"), str) else None
     audio = event.get("audio") or event.get("delta")
+    video_frames: tuple[str, ...] = ()
+    raw_frames = event.get("video_frames")
+    if raw_frames is not None:
+        frames_error = validate_realtime_video_frames(raw_frames, event.get("max_slice_nums"))
+        if frames_error is not None:
+            raise RealtimeProtocolError(frames_error, code="invalid_video_frames", event_id=event_id)
+        if isinstance(raw_frames, list):
+            video_frames = tuple(frame for frame in raw_frames if isinstance(frame, str) and frame)
+    has_audio_field = isinstance(audio, str) and bool(audio)
+    if not has_audio_field:
+        if not video_frames:
+            raise RealtimeProtocolError(
+                "input_audio_buffer.append requires audio and/or video_frames",
+                code="bad_event",
+                event_id=event_id,
+            )
+        hints: dict[str, object] = {}
+        if hints_source is not None:
+            copy_realtime_input_hints(hints_source, hints)
+        copy_realtime_input_hints(event, hints)
+        duration_ms = hints.get("duration_ms", hints.get("audio_duration_ms"))
+        audio_end_ms = hints.get("audio_end_ms")
+        return RealtimeAudioAppend(
+            event_id=event_id,
+            audio=b"",
+            format="pcm_f32le",
+            sample_rate_hz=defaults.input_sample_rate_hz,
+            is_speech=False,
+            video_frames=video_frames,
+            duration_ms=int(duration_ms) if isinstance(duration_ms, int | float) else None,
+            audio_end_ms=int(audio_end_ms) if isinstance(audio_end_ms, int | float) else None,
+            hints=hints,
+        )
     fmt, format_rate = parse_realtime_audio_format(
         event.get("format") or event.get("input_audio_format") or defaults.input_audio_format
     )
@@ -199,37 +235,31 @@ def decode_audio_append(
             event_id=event_id,
         )
     try:
-        audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
+        # Decoded once here: the speech check and the command both take these bytes.
+        audio_bytes, fmt, sample_rate_hz = convert_input_audio_to_pcm_f32(
             audio,
             fmt,
             sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int | float) else None,
         )
     except ValueError as exc:
         raise RealtimeProtocolError(str(exc), code="bad_event", event_id=event_id) from exc
+    if audio_bytes is None:  # not converted (already pcm_f32le, or undecodable): take the wire bytes as they are
+        try:
+            audio_bytes = base64.b64decode(cast("str", audio), validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise RealtimeProtocolError("input audio is not valid base64", code="bad_audio", event_id=event_id) from exc
     hints: dict[str, object] = {}
     if hints_source is not None:
         copy_realtime_input_hints(hints_source, hints)
     copy_realtime_input_hints(event, hints)
     looks_like_speech = input_looks_like_speech(
         {**(hints_source or {}), **event},
-        audio=audio,
+        audio=audio_bytes,
         fmt=fmt,
         overlap_silence_rms=defaults.overlap_silence_rms,
     )
-    video_frames: tuple[str, ...] = ()
-    raw_frames = event.get("video_frames")
-    if raw_frames is not None:
-        frames_error = validate_realtime_video_frames(raw_frames, event.get("max_slice_nums"))
-        if frames_error is not None:
-            raise RealtimeProtocolError(frames_error, code="invalid_video_frames", event_id=event_id)
-        if isinstance(raw_frames, list):
-            video_frames = tuple(frame for frame in raw_frames if isinstance(frame, str) and frame)
     duration_ms = hints.get("duration_ms", hints.get("audio_duration_ms"))
     audio_end_ms = hints.get("audio_end_ms")
-    try:
-        audio_bytes = base64.b64decode(audio, validate=True) if isinstance(audio, str) and audio else b""
-    except (binascii.Error, ValueError) as exc:
-        raise RealtimeProtocolError("input audio is not valid base64", code="bad_audio", event_id=event_id) from exc
     return RealtimeAudioAppend(
         event_id=event_id,
         audio=audio_bytes,

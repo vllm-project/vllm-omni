@@ -14,15 +14,13 @@ Functions, not a component, because there is nothing here to own.
 from __future__ import annotations
 
 import asyncio
-import binascii
 from typing import TYPE_CHECKING
-
-import pybase64 as base64
 
 from vllm_omni.engine.duplex.config import DuplexPlaybackCommitPolicy
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import ErrorEvent, OverlapDecision, error_event
 from vllm_omni.engine.duplex.plugin import payload_turn_id
+from vllm_omni.protocol.duplex import base64_decoded_size
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -58,11 +56,15 @@ def append_fence(session: DuplexEngineSession, payload: object, *, epoch: int | 
         turn_id = session.active_response_turn_id
     if turn_id is None:
         turn_id = session.turn_id
-    return DuplexFence(
-        session.session_id,
-        epoch=session.epoch if epoch is None else epoch,
-        turn_id=turn_id,
-    )
+    epoch = session.epoch if epoch is None else epoch
+    # The reply to an earlier turn can still own the response slot after the
+    # user has opened a newer one (they talked over it). New input belongs to
+    # the newer turn: an append fenced at the older turn would be rejected as
+    # stale, and every later append with it.
+    accepted = session.accepted_fence
+    if accepted.session_id == session.session_id and accepted.epoch == epoch:
+        turn_id = max(turn_id, accepted.turn_id)
+    return DuplexFence(session.session_id, epoch=epoch, turn_id=turn_id)
 
 
 def response_in_progress(session: DuplexEngineSession, tasks: DuplexSessionTasks) -> bool:
@@ -81,6 +83,24 @@ def response_in_progress(session: DuplexEngineSession, tasks: DuplexSessionTasks
     return tasks.has_response_bound_append_tasks()
 
 
+def next_commit_allowed(
+    session: DuplexEngineSession,
+    tasks: DuplexSessionTasks,
+    *,
+    concurrent_turn_requests_released: bool,
+) -> bool:
+    """Whether a new commit may flush/submit now.
+
+    Idle sessions always allow it. When ``supports_concurrent_turn_requests`` is on and
+    the plugin has released the commit gate, a commit is allowed even though
+    prior assistant TTS/playback still counts as ``response_in_progress``.
+    Barge-in remains the abort path; this gate does not cancel anything.
+    """
+    if not response_in_progress(session, tasks):
+        return True
+    return session.capabilities.supports_concurrent_turn_requests and concurrent_turn_requests_released
+
+
 def assistant_playback_active(session: DuplexEngineSession) -> bool:
     """Whether the client is still playing audio the session has sent."""
     return (
@@ -93,10 +113,31 @@ def audio_payload_size_bytes(payload: Mapping[str, object]) -> int:
     audio = payload.get("audio") or payload.get("data")
     if not isinstance(audio, str):
         return 0
-    try:
-        return len(base64.b64decode(audio, validate=True))
-    except (ValueError, binascii.Error):
-        return 0
+    # Measured, not decoded: by here the audio is base64 this process encoded.
+    return base64_decoded_size(audio) or 0
+
+
+def pcm_bytes_per_sample(fmt: object) -> int:
+    """Bytes per mono sample of an engine-side PCM payload format."""
+    if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
+        return 2
+    return 4  # pcm_f32le, the engine's decoded format
+
+
+def pcm_sample_count(audio: object, fmt: object) -> int:
+    """Mono samples in an engine-side PCM payload: the decoded bytes of a client append, or base64 text.
+
+    The input clock counts the client's audio from this. A client append
+    arrives as decoded bytes (``payload(encode_audio=False)``); what the
+    converter hands back for pcm16 / G.711 is base64 text. Anything else
+    would count nothing, so that is an error here rather than a silently
+    stalled ``audio_end_ms``.
+    """
+    if isinstance(audio, bytes):
+        return len(audio) // pcm_bytes_per_sample(fmt)
+    if not isinstance(audio, str):
+        raise TypeError(f"engine-side PCM payload must be bytes or base64 text, got {type(audio).__name__}")
+    return audio_payload_size_bytes({"audio": audio}) // pcm_bytes_per_sample(fmt)
 
 
 # --------------------------------------------------------------------------- #
@@ -169,25 +210,6 @@ def overlap_decision_event(session: DuplexEngineSession, decision: dict[str, obj
         reason=reason if isinstance(reason, str) else None,
         details=details,
     )
-
-
-def input_committed_payload(
-    session: DuplexEngineSession,
-    committed: DuplexCommittedInput,
-    *,
-    realtime_item_id: object | None = None,
-) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "type": "input.committed",
-        "session_id": session.session_id,
-        "turn_id": committed.turn_id,
-        "epoch": committed.epoch,
-        "history_len": len(session.history),
-        "message": committed.message,
-    }
-    if isinstance(realtime_item_id, str) and realtime_item_id:
-        payload["realtime_item_id"] = realtime_item_id
-    return payload
 
 
 def audio_committed_payload(

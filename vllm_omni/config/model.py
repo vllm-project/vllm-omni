@@ -1,9 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import copy
 from dataclasses import MISSING, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ConfigDict, TypeAdapter
+from transformers import PretrainedConfig
 from vllm.config import ModelConfig
-from vllm.config.utils import config
+from vllm.config.utils import CompileFactors, config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     get_hf_text_config,
@@ -101,7 +106,7 @@ class OmniModelConfig(ModelConfig):
          worker_type: Model Type, e.g., "ar" or "generation"
          engine_output_type: Optional output type specification for the engine.
              Used to route outputs to appropriate processors (e.g., "image",
-             "audio", "latents"). If None, output type is inferred.
+             "audio", "latent", "token_ids"). If None, output type is inferred.
          stage_connector_config: Stage connector configuration dictionary.
              Contains "name" (connector name), "extra" (extra connector config).
          task_type: Model-defined startup task type. Each model validates its
@@ -121,9 +126,16 @@ class OmniModelConfig(ModelConfig):
     """
 
     stage_id: int = 0
+    # Match the upstream derived field while its value is replaced per stage.
+    hf_text_config: PretrainedConfig = field(init=False)
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    supports_pending_generation: bool = False
+    supports_running_prefix_cache_reset: bool = True
+    recompute_preemption: Literal["allow", "fail"] = "allow"
+    use_v2_model_runner: bool = True
+    supports_native_mrv2_data_plane: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
     duplex_max_sessions: int = 1
@@ -134,6 +146,7 @@ class OmniModelConfig(ModelConfig):
     # Optional dotted path of a per-stage pooling-output decoder applied
     # worker-side before IPC. Read by the AR scheduler.
     pooling_output_decoder: str | None = None
+    final_output: bool = False
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_config: dict[str, Any] = field(
@@ -155,6 +168,31 @@ class OmniModelConfig(ModelConfig):
     # ``cfg_role`` for classifier-free-guidance request pairs).
     sampling_extra_args_keys: tuple[str, ...] = ()
     requires_full_payload_input: bool = False
+    scheduling_metadata_adapter: str | None = None
+
+    def compile_factors(self) -> CompileFactors:
+        """Compile factors for the Omni Model config, used for the compile cache.
+
+        v0.34 replaced ``ModelConfig.compute_hash``/``VllmConfig.compute_hash``
+        with ``compile_factors()`` + ``vllm.config.utils.hash_config``; this
+        ports the connector normalization that used to live in the removed
+        ``compute_hash`` override.
+        """
+        from vllm_omni.distributed.omni_connectors.utils.config import connector_hash_factors
+
+        # Remove hash factors on a copy of the object, then use the mutated copy to get the factors.
+        # This is a workaround to vLLM's ModelConfig not having a clean way of changing its config
+        # factors.
+        hashed = copy.copy(self)
+
+        # connector config are handled here to ensure UUIDs don't cause compile cache misses
+        hashed.stage_connector_config = connector_hash_factors(self.stage_connector_config)
+        if self.omni_kv_config and self.omni_kv_config.get("connector_config"):
+            # Create a copy of the omni kv config dict, since the hashed object is a shallow copy
+            hashed.omni_kv_config = dict(self.omni_kv_config)
+            hashed.omni_kv_config["connector_config"] = connector_hash_factors(self.omni_kv_config["connector_config"])
+
+        return super(OmniModelConfig, hashed).compile_factors()
 
     @property
     def registry(self):
@@ -212,7 +250,7 @@ class OmniModelConfig(ModelConfig):
             return convertor.convert()
         return super().get_model_arch_config()
 
-    def draw_hf_text_config(self):
+    def draw_hf_text_config(self) -> PretrainedConfig:
         # transformers' get_text_config method is used to get the text config from thinker_config.
         # to handle the case that each model stage has their own text config,
         # we need to draw the text config from the corresponding model stage.

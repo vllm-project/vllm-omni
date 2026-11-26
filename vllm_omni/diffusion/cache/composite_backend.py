@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Composite cache backend combining inter_request and cache_dit.
 
@@ -69,6 +69,9 @@ class CompositeCacheBackend(InterRequestCacheBackend):
 
         # Then enable inter_request (attaches StepLatentsRecorder)
         super().enable(pipeline)
+
+    def is_enabled(self) -> bool:
+        return super().is_enabled() or self._cache_dit_backend.is_enabled()
 
     def refresh(
         self,

@@ -43,5 +43,6 @@
     }
   },
   "hit_rate": 1.0,
-  "throughput_speedup": 126.27
+  "throughput_speedup": 74.44,
+  "mean_request_latency_speedup": 126.27
 }

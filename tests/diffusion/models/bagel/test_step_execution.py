@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Focused CPU tests for BAGEL step execution and packed batching."""
 
 from __future__ import annotations
@@ -14,16 +14,19 @@ from PIL import Image
 from safetensors.torch import save_file
 from torch import nn
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.bagel.bagel_transformer import Bagel, NaiveCache
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import (
     BagelGenParams,
     BagelPipeline,
+    _bagel_canvas_requested,
     get_bagel_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import StepScheduler
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -118,7 +121,7 @@ def test_bagel_step_preprocessor_separates_incompatible_cfg_settings(first_extra
     assert first.batch_compatibility_key != second.batch_compatibility_key
 
 
-def test_bagel_step_preprocessor_buckets_effective_img2img_sizes(tmp_path):
+def _pre_process_with_stub_checkpoint(tmp_path):
     (tmp_path / "config.json").write_text(
         '{"vae_config":{"downsample":8},"latent_patch_size":2,"max_latent_size":32}',
         encoding="utf-8",
@@ -131,9 +134,22 @@ def test_bagel_step_preprocessor_buckets_effective_img2img_sizes(tmp_path):
         '{"weight_map":{"latent_pos_embed.pos_embed":"ema.safetensors"}}',
         encoding="utf-8",
     )
-    pre_process = get_bagel_pre_process_func(
-        types.SimpleNamespace(model=str(tmp_path), revision=None, step_execution=True)
+    return get_bagel_pre_process_func(types.SimpleNamespace(model=str(tmp_path), revision=None, step_execution=True))
+
+
+def _edit_request(source_size, sampling_params, request_id="req"):
+    return OmniDiffusionRequest(
+        prompt={
+            "prompt": "edit this image",
+            "multi_modal_data": {"image": [Image.new("RGB", source_size)]},
+        },
+        sampling_params=sampling_params,
+        request_id=request_id,
     )
+
+
+def test_bagel_step_preprocessor_buckets_effective_img2img_sizes(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
     requests = [
         OmniDiffusionRequest(
             prompt={
@@ -144,15 +160,15 @@ def test_bagel_step_preprocessor_buckets_effective_img2img_sizes(tmp_path):
             sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
             request_id=request_id,
         )
-        for request_id, size in (("a", (800, 400)), ("b", (1024, 512)))
+        for request_id, size in (("a", (800, 600)), ("b", (1024, 512)))
     ]
     first, second = (pre_process(request) for request in requests)
 
-    assert (first.sampling_params.height, first.sampling_params.width) == (400, 800)
+    assert (first.sampling_params.height, first.sampling_params.width) == (608, 800)
     assert (second.sampling_params.height, second.sampling_params.width) == (512, 1024)
 
     scheduler = StepScheduler()
-    scheduler.initialize(types.SimpleNamespace(max_num_seqs=2))
+    scheduler.initialize(OmniDiffusionConfig(max_num_seqs=2, diffusion_attention_schedule=None))
     scheduler.add_request(first)
     scheduler.add_request(second)
 
@@ -161,6 +177,172 @@ def test_bagel_step_preprocessor_buckets_effective_img2img_sizes(tmp_path):
     assert schedule.scheduled_request_ids == ["a"]
     assert schedule.num_running_reqs == 1
     assert schedule.num_waiting_reqs == 1
+
+
+def test_bagel_pre_process_keeps_explicitly_requested_canvas(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = _edit_request((512, 1024), OmniDiffusionSamplingParams(num_inference_steps=2, height=1024, width=1024))
+
+    pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (1024, 1024)
+    assert _bagel_canvas_requested(request.sampling_params)
+
+
+def test_bagel_pre_process_aligns_source_derived_canvas_for_size_auto(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = _edit_request(
+        (500, 700),
+        OmniDiffusionSamplingParams(
+            num_inference_steps=2,
+            height=700,
+            width=500,
+            height_not_provided=True,
+            width_not_provided=True,
+        ),
+    )
+
+    pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (720, 512)
+    assert not _bagel_canvas_requested(request.sampling_params)
+
+
+def test_bagel_pre_process_derives_canvas_when_caller_asked_for_none(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = _edit_request((800, 400), OmniDiffusionSamplingParams(num_inference_steps=2))
+
+    pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (512, 1024)
+    assert (request.sampling_params.height_not_provided, request.sampling_params.width_not_provided) == (True, True)
+    assert not _bagel_canvas_requested(request.sampling_params)
+
+
+def test_bagel_pre_process_marks_kv_metadata_canvas_as_requested(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = _edit_request(
+        (500, 700),
+        OmniDiffusionSamplingParams(
+            num_inference_steps=2,
+            height=700,
+            width=500,
+            height_not_provided=True,
+            width_not_provided=True,
+            kv_metadata={"image_shape": (1024, 1024)},
+        ),
+    )
+
+    pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (1024, 1024)
+    assert (request.sampling_params.height_not_provided, request.sampling_params.width_not_provided) == (False, False)
+    assert _bagel_canvas_requested(request.sampling_params)
+
+
+def test_bagel_pre_process_prefers_explicit_canvas_over_kv_metadata(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = _edit_request(
+        (1280, 720),
+        OmniDiffusionSamplingParams(
+            num_inference_steps=2,
+            height=1024,
+            width=1024,
+            kv_metadata={"image_shape": (576, 1024)},
+        ),
+    )
+
+    pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (1024, 1024)
+    assert _bagel_canvas_requested(request.sampling_params)
+
+
+def test_bagel_pre_process_floors_unaligned_explicit_canvas_with_warning(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = _edit_request(
+        (1280, 720),
+        OmniDiffusionSamplingParams(num_inference_steps=2, height=700, width=1000),
+    )
+
+    with patch("vllm_omni.diffusion.models.bagel.pipeline_bagel.logger.warning") as warning:
+        pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (688, 992)
+    assert _bagel_canvas_requested(request.sampling_params)
+    warning.assert_called_once()
+    assert "width 1000->992, height 700->688" in warning.call_args.args[-1]
+
+
+def test_bagel_pre_process_keeps_aligned_explicit_canvas_silent(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = _edit_request(
+        (1280, 720),
+        OmniDiffusionSamplingParams(num_inference_steps=2, height=512, width=1024),
+    )
+
+    with patch("vllm_omni.diffusion.models.bagel.pipeline_bagel.logger.warning") as warning:
+        pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (512, 1024)
+    warning.assert_not_called()
+
+
+def test_bagel_pre_process_rejects_explicit_canvas_over_checkpoint_limit(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = _edit_request(
+        (1280, 720),
+        OmniDiffusionSamplingParams(num_inference_steps=2, height=512, width=2048),
+    )
+
+    with pytest.raises(OmniClientError, match="width=2048 exceeds the BAGEL checkpoint limit of 1024") as excinfo:
+        pre_process(request)
+
+    assert excinfo.value.status_code == 400
+
+
+def test_bagel_pre_process_aligns_text2img_canvas_too(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = OmniDiffusionRequest(
+        prompt="a cat",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, height=700, width=1000),
+        request_id="req",
+    )
+
+    pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (688, 992)
+
+
+def test_bagel_pre_process_skips_canvas_alignment_for_text_output(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = OmniDiffusionRequest(
+        prompt={
+            "prompt": "describe this image",
+            "modalities": ["text"],
+            "multi_modal_data": {"image": [Image.new("RGB", (1280, 720))]},
+        },
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, height=700, width=1000),
+        request_id="req",
+    )
+
+    pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (700, 1000)
+    assert request.use_step_execution is False
+
+
+@pytest.mark.parametrize(
+    ("sampling_kwargs", "requested"),
+    [
+        ({"height": 1024, "width": 1024}, True),
+        ({"height": 1024, "width": 512, "height_not_provided": True, "width_not_provided": True}, False),
+        ({}, False),
+    ],
+    ids=["explicit_size", "size_auto", "unset"],
+)
+def test_bagel_canvas_requested_separates_asked_for_from_derived(sampling_kwargs, requested):
+    assert _bagel_canvas_requested(OmniDiffusionSamplingParams(**sampling_kwargs)) is requested
 
 
 def _cache(length: int, value: float, num_layers: int = 1) -> NaiveCache:

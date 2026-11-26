@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Copyright 2025 Black Forest Labs and The HuggingFace Team. All rights reserved.
 #
@@ -36,17 +36,20 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_flux2 import DistributedAutoencoderKLFlux2
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
+    _use_local_single_stream_tp,
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = init_logger(__name__)
@@ -190,6 +193,9 @@ class Flux2KleinPipeline(
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
+    # Both CFG branches share latents and timestep; prompts are padded to a
+    # fixed length and the position ids are batched like the latents.
+    supports_cfg_batching = True
     support_image_input = True
 
     def __init__(
@@ -247,8 +253,13 @@ class Flux2KleinPipeline(
             subfolder="tokenizer",
             local_files_only=local_files_only,
         )
+        vae_class = (
+            DistributedAutoencoderKLFlux2
+            if od_config.parallel_config.vae_parallel_mode == "batch"
+            else AutoencoderKLFlux2
+        )
         self.vae = from_pretrained_with_prefetch(
-            AutoencoderKLFlux2.from_pretrained,
+            vae_class.from_pretrained,
             model,
             subfolder="vae",
             prefetch_list=flux2_subfolders,
@@ -256,7 +267,11 @@ class Flux2KleinPipeline(
         ).to(self._execution_device)
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
-        self.transformer = Flux2Transformer2DModel(quant_config=od_config.quantization_config, **transformer_kwargs)
+        self.transformer = Flux2Transformer2DModel(
+            quant_config=od_config.quantization_config,
+            local_tp=_use_local_single_stream_tp(od_config),
+            **transformer_kwargs,
+        )
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.latent_channels = self.vae.config.latent_channels if hasattr(self.vae, "config") else 16
@@ -696,16 +711,18 @@ class Flux2KleinPipeline(
         if num_inference_steps is not None and num_inference_steps <= 0:
             raise ValueError(f"num_inference_steps must be positive, got {num_inference_steps}")
 
-        if (
-            height is not None
-            and height % (self.vae_scale_factor * 2) != 0
-            or width is not None
-            and width % (self.vae_scale_factor * 2) != 0
-        ):
+        multiple_of = self.vae_scale_factor * 2
+        for name, size in (("height", height), ("width", width)):
+            if size is not None and size < multiple_of:
+                raise OmniClientError(
+                    f"`{name}` must be at least {multiple_of} to produce a non-empty latent grid, got {size}."
+                )
+
+        if any(size is not None and size % multiple_of for size in (height, width)):
             logger.warning(
                 "`height` and `width` have to be divisible by %s but are %s and %s. "
                 "Dimensions will be resized accordingly",
-                self.vae_scale_factor * 2,
+                multiple_of,
                 height,
                 width,
             )

@@ -66,3 +66,16 @@ stages:
       temperature: 0.0
       max_tokens: 8192
       seed: 0
+
+platforms:
+  rocm:
+    stages:
+      - stage_id: 1
+        # AudexXCodec1 has no vLLM attention layers, but vLLM still validates
+        # the root XCodec config while discovering KV-cache layouts. XCodec's
+        # root config has no head metadata (the nested HuBERT encoder uses 64),
+        # so Omni's ROCm TRITON_ATTN default otherwise rejects head_size=0.
+        # This metadata-only override does not change the codec model, which
+        # loads its own unmodified config in AudexXCodec1.
+        hf_overrides:
+          head_dim: 64

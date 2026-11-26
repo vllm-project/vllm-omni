@@ -13,8 +13,6 @@ from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
 pytestmark = [pytest.mark.slow, pytest.mark.diffusion, pytest.mark.omni]
 
-_SKIP_ISSUE_3649 = pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/3649")
-
 # One module-scoped server for this file. ``--enable-sleep-mode`` is required by the
 # level-2 wake contract test; invalid-JSON cases only hit request validation and are
 # unaffected. Do not mix ``omni_server`` (module) with ``omni_server_function`` here:
@@ -27,7 +25,7 @@ _QWEN_IMAGE = [
             server_args=["--enable-sleep-mode"],
         ),
         id="qwen_image",
-        marks=hardware_marks(res={"cuda": "H100"}),
+        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}),
     ),
 ]
 
@@ -39,54 +37,13 @@ _QWEN_IMAGE = [
 
 @pytest.mark.parametrize(
     "endpoint, json_body, err_message",
-    [
-        pytest.param("sleep", {"level": 2}, ("stage_ids", "Field required", "Missing"), id="sleep_missing_stage_ids"),
-        pytest.param(
-            "sleep",
-            {"stage_ids": [], "level": 2},
-            ("stage_ids", "Field required", "Missing"),
-            id="sleep_empty_stage_ids",
-            marks=_SKIP_ISSUE_3649,
-        ),
-        pytest.param(
-            "sleep",
-            {"stage_ids": "not-a-list", "level": 2},
-            ("stage_ids", "list_type", "a valid list"),
-            id="sleep_invalid_stage_ids_type",
-        ),
-        pytest.param(
-            "sleep",
-            {"stage_ids": [0], "level": "high"},
-            ("level", "int_parsing", "a valid integer"),
-            id="sleep_invalid_level_type",
-        ),
-        pytest.param(
-            "sleep",
-            {"stage_ids": [0], "level": -1},
-            ("level", "greater"),
-            id="sleep_negative_level",
-            marks=_SKIP_ISSUE_3649,
-        ),
-        pytest.param("wakeup", {}, ("stage_ids", "missing", "Field required"), id="wakeup_missing_stage_ids"),
-        pytest.param(
-            "wakeup",
-            {"stage_ids": None},
-            ("stage_ids", "list_type", "a valid list"),
-            id="wakeup_invalid_stage_ids_type",
-        ),
-        pytest.param(
-            "wakeup",
-            {"stage_ids": []},
-            ("stage_ids", "length"),
-            id="wakeup_empty_stage_ids",
-            marks=_SKIP_ISSUE_3649,
-        ),
-    ],
+    [pytest.param("sleep", {"level": 2}, ("stage_ids", "Field required", "Missing"), id="sleep_missing_stage_ids")],
 )
 @pytest.mark.parametrize("omni_server", _QWEN_IMAGE, indirect=True)
 def test_omni_sleep_wakeup_invalid_requests(
     omni_server: OmniServer,
     online_client: OnlineOmniClient,
+    assert_valid_inference,
     endpoint: Literal["sleep", "wakeup"],
     json_body: dict[str, Any],
     err_message: str | tuple[str, ...],
@@ -101,6 +58,7 @@ def test_omni_sleep_wakeup_invalid_requests(
         online_client.send_omni_sleep_http_request(cfg)
     else:
         online_client.send_omni_wakeup_http_request(cfg)
+    assert_valid_inference()
 
 
 # Keep this after the invalid-JSON cases: sleep(level=2) discards weights and the

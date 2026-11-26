@@ -27,6 +27,8 @@ from vllm_omni.diffusion.cache.cachedit import (
 from vllm_omni.diffusion.cache.magcache import MagCacheBackend
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.cache.teacache import TeaCacheBackend
+from vllm_omni.diffusion.cache.teacache.backend import enable_ming_image_teacache
+from vllm_omni.diffusion.cache.teacache.config import _MODEL_COEFFICIENTS
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -481,6 +483,35 @@ class TestTeaCacheBackend:
         TeaCacheBackend(DiffusionCacheConfig()).enable(pipeline)
         assert mock_apply_hook.call_args.args[1].rel_l1_thresh == 0.2
 
+    @pytest.mark.parametrize(
+        "is_layer_decomposition, default_threshold, coefficient_key",
+        [
+            (False, 0.3, "MingImageTransformer2DModel"),
+            (True, 0.13, "MingImageTransformer2DModel:Design-Layer"),
+        ],
+        ids=["design", "design_layer"],
+    )
+    @pytest.mark.parametrize("threshold", [None, 0.25], ids=["default_threshold", "explicit_threshold"])
+    @pytest.mark.parametrize(
+        "coefficients",
+        [None, [1.0, 2.0, 3.0, 4.0, 5.0]],
+        ids=["default_coefficients", "custom_coefficients"],
+    )
+    def test_ming_image_enabler_resolves_variant_config(
+        self, mocker, is_layer_decomposition, default_threshold, coefficient_key, threshold, coefficients
+    ):
+        pipeline = SimpleNamespace(transformer=object(), is_layer_decomposition=is_layer_decomposition)
+        apply_hook = mocker.patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+        config = DiffusionCacheConfig(rel_l1_thresh=threshold, coefficients=coefficients)
+
+        enable_ming_image_teacache(pipeline, config)
+
+        resolved_config = apply_hook.call_args.args[1]
+        assert resolved_config.rel_l1_thresh == (default_threshold if threshold is None else threshold)
+        assert resolved_config.coefficients == (
+            _MODEL_COEFFICIENTS[coefficient_key] if coefficients is None else coefficients
+        )
+
     @pytest.mark.parametrize("partition", ["fl2va", "combined"])
     @pytest.mark.parametrize(
         ("configured_threshold", "expected_threshold"),
@@ -570,6 +601,57 @@ class TestTeaCacheBackend:
         # Test refresh
         backend.refresh(mock_pipeline, num_inference_steps=50)
         mock_registry.reset_hook.assert_called_once()
+
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_enable_mammoth_moda2_uses_gen_transformer(self, mock_apply_hook):
+        """MammothModa2 exposes its DiT as gen_transformer, not transformer."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "MammothModa2DiTPipeline"
+        mock_pipeline.gen_transformer = Mock()
+        del mock_pipeline.transformer
+
+        backend = TeaCacheBackend(DiffusionCacheConfig())
+        backend.enable(mock_pipeline)
+
+        assert backend.enabled is True
+        mock_apply_hook.assert_called_once()
+        transformer_arg, config_arg = mock_apply_hook.call_args.args
+        assert transformer_arg is mock_pipeline.gen_transformer
+        assert config_arg.transformer_type == "MammothModa2Transformer2DModel"
+        assert config_arg.rel_l1_thresh == 0.075
+        assert mock_pipeline.transformer is mock_pipeline.gen_transformer
+
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_enable_mammoth_moda2_preserves_explicit_threshold(self, mock_apply_hook):
+        pipeline = Mock()
+        pipeline.__class__.__name__ = "MammothModa2DiTPipeline"
+        pipeline.gen_transformer = Mock()
+        del pipeline.transformer
+
+        TeaCacheBackend(DiffusionCacheConfig(rel_l1_thresh=0.05)).enable(pipeline)
+
+        assert mock_apply_hook.call_args.args[1].rel_l1_thresh == 0.05
+
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_refresh_mammoth_moda2_resets_gen_transformer_hook(self, mock_apply_hook):
+        """Refresh should find the hook through the transformer alias set by the enabler."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "MammothModa2DiTPipeline"
+        mock_pipeline.gen_transformer = Mock()
+        del mock_pipeline.transformer
+
+        backend = TeaCacheBackend(DiffusionCacheConfig())
+        backend.enable(mock_pipeline)
+
+        mock_hook = Mock()
+        mock_registry = Mock()
+        mock_registry.get_hook = Mock(return_value=mock_hook)
+        mock_registry.reset_hook = Mock()
+        mock_pipeline.gen_transformer._hook_registry = mock_registry
+
+        backend.refresh(mock_pipeline, num_inference_steps=12)
+
+        mock_registry.reset_hook.assert_called_once_with("teacache")
 
 
 class TestCacheSelector:

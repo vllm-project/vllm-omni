@@ -190,10 +190,47 @@ def test_ltx25_missing_gemma4_recommends_supported_transformers_range(monkeypatc
     )
 
 
+def test_ltx_vocoder_loader_uses_profile_fallback(monkeypatch):
+    class PrimaryVocoder:
+        pass
+
+    class FallbackVocoder:
+        pass
+
+    profile = replace(
+        LTX25_FULL_COMPONENT_PROFILE,
+        vocoder_cls=PrimaryVocoder,
+        vocoder_fallback_cls=FallbackVocoder,
+    )
+    calls: list[tuple[object, str, str, dict[str, Any]]] = []
+
+    def fake_load_component(component_cls, model, subfolder, **kwargs):
+        calls.append((component_cls, model, subfolder, kwargs))
+        if component_cls is PrimaryVocoder:
+            raise OSError("BWE vocoder config is unavailable")
+        return "fallback-vocoder"
+
+    monkeypatch.setattr(ltx2_components, "_load_component", fake_load_component)
+
+    result = ltx2_components._load_ltx_vocoder(
+        profile,
+        "org/ltx",
+        local_files_only=True,
+        dtype=torch.bfloat16,
+        revision="pinned",
+        prefetch_list=("audio_vae", "vocoder"),
+    )
+
+    assert result == "fallback-vocoder"
+    assert [call[0] for call in calls] == [PrimaryVocoder, FallbackVocoder]
+    assert all(call[1:3] == ("org/ltx", "vocoder") for call in calls)
+    assert all(call[3]["prefetch_list"] == ("audio_vae", "vocoder") for call in calls)
+
+
 def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     revision = "pinned-revision"
     calls: dict[str, Any] = {"components": []}
-    natten_processor = object()
+    neighborhood_processor = object()
 
     class FakeDiffusionDecoder:
         def set_attn_processor(self, processor):
@@ -266,8 +303,8 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     monkeypatch.setattr(ltx2_components, "load_transformer_config", fake_transformer_config)
     monkeypatch.setattr(
         ltx2_components,
-        "LTX2VideoVaeNeighborhoodNattenProcessor",
-        lambda: natten_processor,
+        "_create_ltx25_neighborhood_processor",
+        lambda: neighborhood_processor,
     )
     monkeypatch.setattr(
         ltx2_components,
@@ -300,7 +337,7 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         od_config.model,
         {"local_files_only": False, "dtype": torch.bfloat16, "revision": revision},
     )
-    assert calls["diffusion_decoder_processor"] is natten_processor
+    assert calls["diffusion_decoder_processor"] is neighborhood_processor
     assert calls["diffusion_decoder_tiling"] is True
     assert calls["diffusion_decoder_parallel"] == (2, "tile")
     assert calls["transformer_config"] == (
@@ -376,11 +413,46 @@ def test_ltx25_native_diffusion_decoder_uses_diffusers_config_and_canonical_arti
     assert calls["init_distributed"] is True
 
 
+def test_ltx25_neighborhood_processor_uses_triton_on_rocm(monkeypatch):
+    expected = object()
+
+    monkeypatch.setattr(ltx2_components.current_omni_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(
+        ltx2_components,
+        "LTX2VideoVaeNeighborhoodTritonProcessor",
+        lambda: expected,
+    )
+    monkeypatch.setattr(
+        ltx2_components,
+        "LTX2VideoVaeNeighborhoodNattenProcessor",
+        lambda: (_ for _ in ()).throw(AssertionError("ROCm must not initialize NATTEN")),
+    )
+
+    assert ltx2_components._create_ltx25_neighborhood_processor() is expected
+
+
+def test_ltx25_triton_failure_has_actionable_rocm_remedy(monkeypatch):
+    class MissingTritonProcessor:
+        def __init__(self):
+            raise RuntimeError("Triton is unavailable")
+
+    monkeypatch.setattr(ltx2_components.current_omni_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(
+        ltx2_components,
+        "LTX2VideoVaeNeighborhoodTritonProcessor",
+        MissingTritonProcessor,
+    )
+
+    with pytest.raises(RuntimeError, match=r"ROCm requires the bundled Triton.*working ROCm PyTorch and Triton"):
+        ltx2_components._create_ltx25_neighborhood_processor()
+
+
 def test_ltx25_natten_failure_has_actionable_omni_remedy(monkeypatch):
     class MissingNattenProcessor:
         def __init__(self):
             raise ImportError("kernels is unavailable")
 
+    monkeypatch.setattr(ltx2_components.current_omni_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(
         ltx2_components,
         "LTX2VideoVaeNeighborhoodNattenProcessor",
@@ -388,7 +460,7 @@ def test_ltx25_natten_failure_has_actionable_omni_remedy(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match=r"kernels==0\.16\.1.*supported GPU.*allow Hub access"):
-        ltx2_components._create_ltx25_natten_processor()
+        ltx2_components._create_ltx25_neighborhood_processor()
 
 
 def test_ltx_checkpoint_explicit_version_precedes_structural_heuristics(tmp_path):
@@ -715,6 +787,53 @@ def test_ltx_velocity_from_x0_materializes_official_scalar_sigma():
     velocity_from_x0(sample, x0, TrackingTensor())
 
     assert item_calls == [True]
+
+
+def test_ltx_velocity_from_x0_explicit_scalar_skips_item_and_is_bit_exact():
+    item_calls = []
+
+    class TrackingTensor(torch.Tensor):
+        @staticmethod
+        def __new__(cls):
+            return torch.Tensor._make_subclass(cls, torch.tensor(0.725, dtype=torch.float32), False)
+
+        def item(self):
+            item_calls.append(True)
+            return super().item()
+
+    sample = torch.tensor([[1.0, -0.25, 0.0078125]], dtype=torch.bfloat16)
+    x0 = torch.tensor([[0.5, -0.5, -0.0078125]], dtype=torch.bfloat16)
+    sigma = torch.tensor(0.725, dtype=torch.float32)
+    expected = velocity_from_x0(sample, x0, sigma)
+    actual = velocity_from_x0(sample, x0, TrackingTensor(), sigma_scalar=sigma.item())
+
+    assert item_calls == []
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("guidance", "split_names"),
+    [
+        (LTXModalityGuidance(), ("cond",)),
+        (LTXModalityGuidance(cfg_scale=4.0), ("cond", "uncond")),
+        (LTXModalityGuidance(stg_scale=1.0, stg_blocks=(28,)), ("cond", "ptb")),
+    ],
+)
+def test_ltx_guidance_explicit_sigma_scalar_matches_fallback(guidance, split_names):
+    sample = torch.tensor([[[1.0, -0.5], [0.25, 2.0]]], dtype=torch.bfloat16)
+    velocities = {name: torch.full_like(sample, 0.125 * (index + 1)) for index, name in enumerate(split_names)}
+    sigma = torch.tensor(0.725, dtype=torch.float32)
+
+    expected = LTX_GUIDANCE_EXECUTOR._guide_modality(sample, velocities, sigma, guidance)
+    actual = LTX_GUIDANCE_EXECUTOR._guide_modality(
+        sample,
+        velocities,
+        sigma,
+        guidance,
+        sigma_scalar=sigma.item(),
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
 
 def test_ltx_ancestral_positive_only_guidance_preserves_raw_velocity():

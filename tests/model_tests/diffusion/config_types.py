@@ -27,6 +27,7 @@ class DiffusionAccs(str, Enum):
     SEQUENCE_PARALLEL = "sequence_parallel"
     CFG_PARALLEL = "cfg_parallel"
     TENSOR_PARALLEL = "tensor_parallel"
+    PIPELINE_PARALLEL = "pipeline_parallel"
     CPU_OFFLOAD = "cpu_offload"
     LAYERWISE_OFFLOAD = "layerwise_offload"
     VAE_PATCH_PARALLEL = "vae_patch_parallel"
@@ -39,7 +40,15 @@ class DiffusionTasks(str, Enum):
     IMAGE_TO_IMAGE = "image_to_image"
     TEXT_TO_VIDEO = "text_to_video"
     IMAGE_TO_VIDEO = "image_to_video"
-    # Text to audio, etc should be added here as needed
+    TEXT_TO_AUDIO = "text_to_audio"
+
+
+class ModelTypeMarker(str, Enum):
+    """Model type markers for pytest parametrization."""
+
+    DIFFUSION = "diffusion"
+    OMNI = "omni"
+    TTS = "tts"
 
 
 class DiffusionModelTestOpts(NamedTuple):
@@ -59,6 +68,10 @@ class DiffusionModelTestOpts(NamedTuple):
     # Actual tasks which controls the tests actually run
     supported_tasks: list[DiffusionTasks]
 
+    # Function module marker applied per-test-case via parametrization.
+    # Set to ModelTypeMarker.OMNI or ModelTypeMarker.TTS for non-diffusion models.
+    model_type_marker: ModelTypeMarker
+
     # Additional acceleration groups to run beyond the base case (no acceleration).
     # The base case is always run for every model in the test settings. None means
     # we only run the base case.
@@ -69,6 +82,14 @@ class DiffusionModelTestOpts(NamedTuple):
     # as core models to always run in the CI.
     # Example: https://github.com/vllm-project/vllm/blob/v0.23.0/tests/models/multimodal/generation/test_common.py#L131
     marks: list[MarkDecorator] | None = None
+
+    # Whether multi-device groups should receive native ROCm hardware marks.
+    # Keep this False for models whose runtime path is not yet qualified on ROCm.
+    rocm_multigpu: bool = True
+
+    # Whether one-card groups should receive native ROCm hardware marks.
+    # Keep this False when the one-card path is unqualified on MI325.
+    rocm_base: bool = True
 
     # When True (default), online tests only run the base case (no accelerations).
     # When False, online tests run all test_groups, same as offline. This should be
@@ -89,6 +110,10 @@ class DiffusionModelTestOpts(NamedTuple):
     # Native single-file models: builders/resolvers return the containing directory.
     checkpoint_filename: str | None = None
 
+    # Optional engine startup deadline for offline tests whose cold initialization
+    # is known to exceed the default on supported hardware.
+    offline_init_timeout_s: int | None = None
+
 
 ### Mappings & utils for building offline Omni() instances given a list of enabled accelerations
 ACC_OMNI_KWARGS: dict[DiffusionAccs, dict[str, Any]] = {
@@ -102,6 +127,7 @@ ACC_OMNI_KWARGS: dict[DiffusionAccs, dict[str, Any]] = {
 ACC_PARALLEL_KWARGS = {
     DiffusionAccs.HSDP: {"use_hsdp": True, "hsdp_shard_size": 2},
     DiffusionAccs.TENSOR_PARALLEL: {"tensor_parallel_size": 2},
+    DiffusionAccs.PIPELINE_PARALLEL: {"pipeline_parallel_size": 2},
     DiffusionAccs.CFG_PARALLEL: {"cfg_parallel_size": 2},
     DiffusionAccs.VAE_PATCH_PARALLEL: {"vae_patch_parallel_size": 2},
     # For SP, we don't run ring here to conserve devices, since it is easy
@@ -112,6 +138,7 @@ ACC_PARALLEL_KWARGS = {
 
 ACC_DEVICE_COUNT_KEYS = {
     DiffusionAccs.TENSOR_PARALLEL: "tensor_parallel_size",
+    DiffusionAccs.PIPELINE_PARALLEL: "pipeline_parallel_size",
     DiffusionAccs.CFG_PARALLEL: "cfg_parallel_size",
     DiffusionAccs.SEQUENCE_PARALLEL: "ulysses_degree",
     DiffusionAccs.VAE_PATCH_PARALLEL: "vae_patch_parallel_size",
@@ -128,6 +155,7 @@ ACC_SERVER_ARGS: dict[DiffusionAccs, list[str]] = {
     DiffusionAccs.SEQUENCE_PARALLEL: ["--usp", "2"],
     DiffusionAccs.CFG_PARALLEL: ["--cfg-parallel-size", "2"],
     DiffusionAccs.TENSOR_PARALLEL: ["--tensor-parallel-size", "2"],
+    DiffusionAccs.PIPELINE_PARALLEL: ["--pipeline-parallel-size", "2"],
     DiffusionAccs.CPU_OFFLOAD: ["--enable-cpu-offload"],
     DiffusionAccs.LAYERWISE_OFFLOAD: ["--enable-layerwise-offload"],
     DiffusionAccs.VAE_PATCH_PARALLEL: ["--vae-use-tiling", "--vae-patch-parallel-size", "2"],

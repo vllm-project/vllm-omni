@@ -16,13 +16,9 @@ See `vllm_omni/diffusion/cache/inter_request/` for the implementation.
 | warmup (build cache)  | 66525.06 | 0.1199 | 8.34 | 8.40 | 26.35 |
 | cache hit (reuse)     | 26347.26 | 0.3027 | 3.30 | 0.77 | 26.22 |
 
-Overall hit rate was 44.7% (exact + semantic).
-
-The p50 drops to 0.77s because most hits are exact and return instantly. The
-mean stays at 3.3s since the 55% that miss still pay the full ~8.7s. CLIP score
-drops 1.7 points (27.90 -> 26.22), all of it from semantic hits that skip steps;
-exact hits are lossless. Turning off the t2i image-similarity penalty makes it
-worse (27.6 -> 25.0), so it stays on by default.
+Overall hit rate was 44.7% across exact and semantic matches. The reuse pass
+measured 2.64× end-to-end throughput, 0.77 s median latency, and a mean CLIP
+score of 26.22. The baseline mean CLIP score was 27.90.
 
 Raw metrics in `t2i_qwen_image_7975/summary.json`.
 
@@ -39,13 +35,12 @@ itself.
 | warmup (build cache)  | 24277.3 | 0.0082 | 120.71 | 123.8 | 0.2328 |
 | cache hit (reuse)     | 335.1   | 0.5968 | 0.99   | 0.86  | 0.2328 |
 
-All 200 cache-hit requests were served from cache (hit rate 100%, 126x
-throughput). During warmup, 89 of 199 requests matched a cached neighbour
-semantically and skipped on average 8.1 of 40 denoising steps; 42% of those
-hits were clamped at the 10-step storage cap. Warmup ends 3.2% faster than
-baseline — the skipped steps roughly cancel the cache-write overhead. ViCLIP
-on cache hit is identical to warmup (0.2328): exact reuse is lossless. The
-baseline-vs-warmup ViCLIP gap (0.2437 vs 0.2328) is generation variance, not
-cache degradation.
+All 200 reuse-pass requests hit the cache on this prompt cluster. Using the
+recorded wallclock duration for the same number of requests, the reuse pass
+achieved 74.44× end-to-end throughput and a 126.27× reduction in mean request
+latency. During warmup, 89 of the 199 requests after the first matched a
+cached neighbour semantically and skipped an average of 8.1 of 40 steps.
+Warmup wallclock duration was 2.68% lower than the baseline. Mean ViCLIP was
+0.2437 at baseline and 0.2328 in both the warmup and reuse passes.
 
 Raw metrics in `t2v_wan22_200/summary.json`.

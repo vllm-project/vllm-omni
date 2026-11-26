@@ -29,8 +29,6 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
-
-from vllm_omni.diffusion.models.pi05 import modeling_pi05
 from vllm_omni.diffusion.models.pi05.config import (
     Pi05Config,
     UnsupportedCheckpointCapabilityError,
@@ -56,7 +54,11 @@ from vllm_omni.diffusion.models.pi05.processor_pi05 import (
     build_pi05_prompt,
     discretize_state,
     resize_with_pad,
+    tokenize_prompt,
 )
+
+from vllm_omni.diffusion.models.pi.common import backbone
+from vllm_omni.diffusion.models.pi05 import modeling_pi05
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -654,6 +656,28 @@ class _FakeTokenizer:
         return {"input_ids": [0] * length, "attention_mask": [1] * length}
 
 
+def test_tokenize_prompt_preserves_pi05_prompt_verbatim():
+    class RecordingTokenizer(_FakeTokenizer):
+        def __call__(self, text, **kwargs):
+            self.text = text
+            self.kwargs = kwargs
+            return super().__call__(text, **kwargs)
+
+    prompt = "Task: move block, State: 1 2 3;\nAction: "
+    tokenizer = RecordingTokenizer()
+    ids, attn = tokenize_prompt(tokenizer, prompt, 16)
+
+    assert tokenizer.text == prompt
+    assert tokenizer.kwargs == {
+        "padding": "max_length",
+        "max_length": 16,
+        "truncation": True,
+        "add_special_tokens": True,
+        "return_tensors": None,
+    }
+    assert len(ids) == len(attn) == 16
+
+
 @pytest.mark.parametrize("explicit_none", [False, True])
 def test_build_model_inputs_preserves_missing_middle_camera_slot(explicit_none):
     config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER, max_cameras=3)
@@ -729,7 +753,9 @@ def _shrink_gemma_backbones():
 
 
 def _tiny_pi05_model():
-    """A fresh model. Use for tests that load weights or otherwise mutate it."""
+    """A fresh model. Use for tests that need a pristine model; the two
+    load_weights tests share one via ``remap_model`` instead — they write
+    distinct parameters, so they don't need pristine state."""
     return Pi05ForActionPrediction(Pi05Config(max_action_dim=8, max_state_dim=8, chunk_size=4, n_action_steps=4))
 
 
@@ -737,6 +763,14 @@ def _tiny_pi05_model():
 def tiny_model():
     """Shared read-only model, so the tests that only inspect it pay for one
     construction between them rather than one each."""
+    return _tiny_pi05_model()
+
+
+@pytest.fixture(scope="module")
+def remap_model():
+    """Shared model for the two load_weights remap tests: one fills
+    ``embed_tokens``, the other feeds a π0-shaped key that must raise before
+    anything is written, so a single construction serves both."""
     return _tiny_pi05_model()
 
 
@@ -768,8 +802,8 @@ def test_adarms_norm_returns_gate_only_when_conditioned():
 
 
 @pytest.mark.slow
-def test_lm_head_remap_to_embed_tokens():
-    model = _tiny_pi05_model()
+def test_lm_head_remap_to_embed_tokens(remap_model):
+    model = remap_model
     target = "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
     payload = torch.full(dict(model.named_parameters())[target].shape, 0.5)
     model.load_weights([("model.paligemma_with_expert.paligemma.lm_head.weight", payload)], strict=False)
@@ -777,10 +811,10 @@ def test_lm_head_remap_to_embed_tokens():
 
 
 @pytest.mark.slow
-def test_pi0_shaped_keys_are_not_silently_loaded():
+def test_pi0_shaped_keys_are_not_silently_loaded(remap_model):
     """A π0 checkpoint pointed at the π0.5 class would leave the AdaRMS expert
     randomly initialized. ``state_proj`` is the tell."""
-    model = _tiny_pi05_model()
+    model = remap_model
     with pytest.raises(RuntimeError, match="π0-shaped"):
         model.load_weights([("model.state_proj.weight", torch.zeros(1024, 8))])
 
@@ -796,7 +830,14 @@ def test_prefix_length_is_fixed_and_valid_len_tracks_masks(num_real_views, tiny_
     lang_mask = torch.zeros(1, 200, dtype=torch.bool)
     lang_mask[:, :live_text] = True
 
-    embs, pad_masks, _ = tiny_model.embed_prefix(images, masks, lang, lang_mask)
+    embs, pad_masks, _ = backbone.embed_multimodal_prefix(
+        images,
+        masks,
+        lang,
+        lang_mask,
+        paligemma=tiny_model.paligemma_with_expert.paligemma,
+        expected_num_views=int(tiny_model.config.max_cameras),
+    )
     assert embs.shape[1] == 256 * 3 + 200
     assert int(pad_masks.sum()) == 256 * num_real_views + live_text
 
@@ -866,8 +907,9 @@ def test_sample_actions_uses_request_generator(tiny_model):
     ],
 )
 def test_resolve_dtype_accepts_supported_serving_dtypes(declared, expected):
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
     assert Pi05Pipeline._resolve_dtype(OmniDiffusionConfig(dtype=declared)) is expected
 
@@ -881,8 +923,9 @@ def test_resolve_dtype_rejects_unvalidated_dtypes(declared):
     asserting on: it maps a string it does not recognize onto bfloat16 with a
     warning, so e.g. ``"float64"`` never reaches this guard as float64.
     """
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
     with pytest.raises(ValueError, match="Unsupported π0.5 dtype"):
         Pi05Pipeline._resolve_dtype(OmniDiffusionConfig(dtype=declared))
@@ -977,10 +1020,10 @@ def test_bfloat16_runs_and_tracks_float32(tiny_model):
             ).float()
 
     reference = run(tiny_model.eval(), torch.float32)
-    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import _set_inference_dtype
+    from vllm_omni.diffusion.models.pi.common import inference_dtype
 
     bf16_model = copy.deepcopy(tiny_model).eval()
-    _set_inference_dtype(bf16_model, torch.bfloat16)
+    inference_dtype.apply_pi_inference_dtype(bf16_model, torch.bfloat16)
 
     # The cast actually happened — otherwise everything below passes trivially.
     assert any(param.dtype is torch.bfloat16 for param in bf16_model.parameters())
@@ -1070,7 +1113,10 @@ def _spy_request(num_inference_steps, generator=None):
         "robot_obs": {
             "state": np.zeros(32, dtype=np.float32),
             "images": {key: np.zeros((4, 4, 3), dtype=np.uint8) for key in _EXPECTED_CAMERA_ORDER},
-        }
+        },
+        # Legacy Pi0 location: intentionally conflicts with the top-level field
+        # so this test proves both pipelines use the same source of truth.
+        "num_inference_steps": 999,
     }
     params.num_inference_steps = num_inference_steps
     params.generator = generator

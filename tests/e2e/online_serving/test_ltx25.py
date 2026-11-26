@@ -6,8 +6,8 @@
 import os
 
 import pytest
+import torch
 
-from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
@@ -21,17 +21,8 @@ MODEL_REVISION = os.getenv("VLLM_TEST_LTX25_MODEL_REVISION", DEFAULT_REVISION if
 PROMPT = "A red fox walks through a snowy forest while the camera remains fixed."
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
-SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
-
-
-@pytest.fixture(scope="module", autouse=True)
-def require_ltx25_model_access() -> None:
-    if not os.path.isdir(MODEL):
-        skip_if_gated_repo_inaccessible(
-            MODEL,
-            revision=MODEL_REVISION or None,
-            filename="model_index.json",
-        )
+SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
+ATTENTION_BACKEND = "TORCH_SDPA" if torch.version.hip is not None else "CUDNN_ATTN"
 
 
 def _server(model_class_name: str) -> OmniServerParams:
@@ -44,7 +35,7 @@ def _server(model_class_name: str) -> OmniServerParams:
             "--enforce-eager",
             "--enable-layerwise-offload",
             "--diffusion-attention-backend",
-            "CUDNN_ATTN",
+            ATTENTION_BACKEND,
         ],
     )
 

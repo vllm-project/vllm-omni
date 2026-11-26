@@ -44,7 +44,7 @@ Pick exactly one per-step semantics for `forward()` and document it in the docst
 If you choose **delta**, verify the full emit→consolidate→consume chain:
 
 1. `forward()` returns `{"model_outputs": <new_chunk_only>, ...}`
-2. `_consolidate_multimodal_tensors()` in `vllm_omni/engine/output_processor.py` concatenates the audio key into one tensor at finish. If it skips the key (`continue`), offline consumers receive only the final chunk. See `output_processor.py` for the concrete list of handled modality keys.
+2. `_consolidate_multimodal_tensors()` in `vllm_omni/outputs/output_processor.py` concatenates the audio key into one tensor at finish. If it skips the key (`continue`), offline consumers receive only the final chunk. See `output_processor.py` for the concrete list of handled modality keys.
 3. Streaming consumers (SSE, Gradio) receive per-step deltas; offline consumers (`engine.generate()`) receive a single concatenated tensor.
 
 Cumulative-vs-delta mismatch is the most common silent bug — offline RTF benchmarks pass, but users hear replays or truncation.

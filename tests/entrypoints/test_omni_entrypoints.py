@@ -6,12 +6,16 @@ from __future__ import annotations
 import asyncio
 import gc
 import queue
-from collections.abc import Callable
+import threading
+from collections.abc import AsyncGenerator, Callable
+from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
+import janus
 import pytest
+from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -19,19 +23,21 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
-from vllm_omni.config.stage_config import StageConfig
-from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
-from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.config.stage_config import StageConfig, StageType
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.messages import ErrorMessage, NextStageInputMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.omni_base import OmniBase, OmniEngineDeadError
+from vllm_omni.entrypoints.openai.speech_usage import SpeechOutputTokenCounter
 from vllm_omni.errors import (
     OmniClientError,
     client_error_from_metadata,
     client_error_metadata,
     is_client_error_status,
 )
+from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -107,7 +113,13 @@ class FakeAsyncOmniEngine:
         self.stage_metadata = stage_metadata or [THREE_STAGE_META[-1]]
         self.num_stages = len(self.stage_metadata)
         self.stage_configs = [
-            StageConfig(stage_id=i, model_stage="dummy-model").to_omegaconf() for i in range(self.num_stages)
+            StageConfig(
+                stage_id=i,
+                model_stage="dummy-model",
+                stage_type=StageType(metadata.stage_type),
+                is_comprehension=getattr(metadata, "is_comprehension", False),
+            ).to_omegaconf()
+            for i, metadata in enumerate(self.stage_metadata)
         ]
         self.default_sampling_params_list = default_sampling_params_list or [
             SamplingParams(max_tokens=8) for _ in range(self.num_stages)
@@ -159,8 +171,13 @@ class FakeAsyncOmniEngine:
         except queue.Empty:
             return None
 
-    async def try_get_output_async(self) -> Any | None:
-        return self.try_get_output()
+    async def get_outputs_async(self, timeout: float = 1.0, max_messages: int = 256) -> list[Any]:
+        msgs: list[Any] = []
+        while len(msgs) < max_messages and (msg := self.try_get_output()) is not None:
+            msgs.append(msg)
+        if not msgs:
+            await asyncio.sleep(0.001)
+        return msgs
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         return self.stage_metadata[stage_id]
@@ -202,6 +219,103 @@ def _make_base():
     obj.engine = MagicMock()
     obj.request_states = {}
     return obj
+
+
+def test_disabled_stage_metrics_preserve_speech_completion_without_full_merge(monkeypatch):
+    base = _make_base()
+    base.collect_stage_metrics = False
+    base._enable_ar_profiler = False
+    base.engine.get_stage_metadata.return_value = StageRuntimeInfo(
+        stage_type="llm", final_output=True, final_output_type="audio", model_stage="code2wav"
+    )
+    base._publish_request_gauges = MagicMock()
+    metrics = OrchestratorAggregator(2, False, 0.0, 1)
+    diagnostic_latencies = MagicMock()
+    diagnostic_latencies.__iter__.side_effect = AssertionError("diagnostic arrays merged")
+    for count, reason in [(100, None), (91, "length")]:
+        metrics.on_stage_metrics(
+            0,
+            "req-no-metrics",
+            StageRequestStats(
+                batch_id=0,
+                batch_size=1,
+                num_tokens_in=0,
+                num_tokens_out=count,
+                finish_reason=reason,
+                stage_gen_time_ms=0.0,
+                rx_transfer_bytes=0,
+                rx_decode_time_ms=0.0,
+                rx_in_flight_time_ms=0.0,
+                stage_stats=StageStats(),
+                inter_output_latencies_ms=diagnostic_latencies,
+                vllm_itls_ms=diagnostic_latencies,
+            ),
+            "text",
+        )
+    merge = MagicMock(wraps=OrchestratorAggregator._merge_stage_metric_event)
+    monkeypatch.setattr(OrchestratorAggregator, "_merge_stage_metric_event", merge)
+    result = OutputMessage(
+        request_id="req-no-metrics",
+        stage_id=1,
+        engine_outputs=OmniRequestOutput(request_id="req-no-metrics", finished=False, final_output_type="audio"),
+        finished=False,
+    )
+
+    output = base._process_single_result(result, 1, metrics, {}, 0.0, 1)
+
+    assert output is not None
+    counter = SpeechOutputTokenCounter()
+    counter.observe(output)
+    assert counter.stage0_finish_reason == "length"
+    assert counter.total() == 191
+    assert "inter_output_latencies_ms" not in output.metrics["stage_metrics"]["0"]
+    assert merge.call_count == 2
+    assert all(call.kwargs == {"collect_stage_metrics": False} for call in merge.call_args_list)
+
+
+def test_process_single_result_accepts_scalar_pooling_output(mocker):
+    base = _make_base()
+    base.collect_stage_metrics = False
+    base._enable_ar_profiler = False
+    base.engine.get_stage_metadata.return_value = StageRuntimeInfo(
+        stage_type="llm",
+        final_output=True,
+        final_output_type="latent",
+        model_stage="pooler",
+    )
+    base.prom_metrics = mocker.Mock()
+    base.mod_metrics = mocker.Mock()
+    base._publish_request_gauges = mocker.Mock()
+    mocker.patch("vllm_omni.entrypoints.omni_base.observe_modality_at_finalize")
+
+    metrics = mocker.Mock()
+    metrics.stage_events = {}
+    metrics.stage_first_ts = [None]
+    metrics.stage_last_ts = [None]
+    metrics.e2e_done = set()
+    pooling_output = SimpleNamespace(data=object())
+    result = SimpleNamespace(
+        request_id="req-pooling",
+        stage_id=0,
+        replica_id=0,
+        stage_submit_ts=1.0,
+        metrics=None,
+        engine_outputs=SimpleNamespace(
+            request_id="req-pooling",
+            outputs=pooling_output,
+            finished=True,
+            final_output_type="latent",
+            stage_durations={},
+            peak_memory_mb=0.0,
+        ),
+    )
+
+    output = base._process_single_result(result, 0, metrics, {}, 0.0, 0)
+
+    base.prom_metrics.request_succeeded.assert_called_once()
+    assert base.prom_metrics.request_succeeded.call_args.kwargs["finished_reason"] == "stop"
+    assert output is not None
+    assert output.outputs == [pooling_output]
 
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
@@ -481,7 +595,7 @@ def test_model_config_and_vllm_config_forward_from_comprehension_stage():
     io_processor = SimpleNamespace(name="io-processor")
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
-        stage_clients=[SimpleNamespace(is_comprehension=False), SimpleNamespace(is_comprehension=True)],
+        stage_configs=[SimpleNamespace(is_comprehension=False), SimpleNamespace(is_comprehension=True)],
         stage_vllm_configs=[None, vllm_config],
     )
     omni.input_processor = input_processor
@@ -502,7 +616,7 @@ def test_openai_serving_models_can_consume_async_omni_compat_attrs():
     io_processor = SimpleNamespace(name="io-processor")
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
-        stage_clients=[SimpleNamespace(is_comprehension=True)],
+        stage_configs=[SimpleNamespace(is_comprehension=True)],
         stage_vllm_configs=[vllm_config],
     )
     omni.input_processor = input_processor
@@ -524,10 +638,11 @@ def test_get_diffusion_od_config_returns_diffusion_stage_config():
     diffusion_od_config = object()
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="llm"), SimpleNamespace(stage_type="diffusion")],
         stage_clients=[
             SimpleNamespace(stage_type="llm"),
             SimpleNamespace(stage_type="diffusion", od_config=diffusion_od_config),
-        ]
+        ],
     )
 
     assert omni.get_diffusion_od_config() is diffusion_od_config
@@ -537,13 +652,31 @@ def test_get_diffusion_od_config_falls_back_to_inner_engine():
     diffusion_od_config = object()
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="llm"), SimpleNamespace(stage_type="diffusion")],
         stage_clients=[
             SimpleNamespace(stage_type="llm"),
             SimpleNamespace(stage_type="diffusion", _engine=SimpleNamespace(od_config=diffusion_od_config)),
-        ]
+        ],
     )
 
     assert omni.get_diffusion_od_config() is diffusion_od_config
+
+
+@pytest.mark.asyncio
+async def test_async_omni_rejects_diffusion_list_prompt_without_stage_clients(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    engine = FakeAsyncOmniEngine(stage_metadata=DIFFUSION_ONLY_META)
+    engine.stage_clients = []
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        with pytest.raises(ValueError, match="single prompt per request"):
+            async for _ in app.generate(prompt=["prompt-1", "prompt-2"], request_id="req-1"):
+                pass
+    finally:
+        app.shutdown()
 
 
 @pytest.mark.asyncio
@@ -969,12 +1102,23 @@ def test_omni_forces_final_only_on_llm_stages(monkeypatch: pytest.MonkeyPatch):
     assert len(outputs) == 2
 
 
-def test_fatal_error_raises_engine_dead():
+@pytest.mark.parametrize("request_id", [None, "removed"])
+def test_fatal_error_raises_engine_dead(request_id: str | None):
     base = _make_base()
-    msg = ErrorMessage(error="orchestrator crashed", fatal=True)
+    msg = ErrorMessage(error="orchestrator crashed", fatal=True, request_id=request_id)
 
     with pytest.raises(EngineDeadError, match="orchestrator crashed"):
         base._handle_output_message(msg)
+
+
+def test_non_fatal_error_for_unknown_request_is_ignored():
+    base = _make_base()
+    active_state = ClientRequestState("active")
+    base.request_states["active"] = active_state
+    msg = ErrorMessage(error="cancelled request failed", request_id="removed")
+
+    assert base._handle_output_message(msg) == (True, None, None, None)
+    assert base.request_states == {"active": active_state}
 
 
 def test_non_fatal_error_raises_runtime():
@@ -1133,6 +1277,7 @@ def test_async_omni_errored_property_alive():
     )
 
     assert omni.errored is False
+    assert omni.is_stopped is False
 
 
 def test_async_omni_errored_property_dead_engine():
@@ -1143,6 +1288,7 @@ def test_async_omni_errored_property_dead_engine():
     )
 
     assert omni.errored is True
+    assert omni.is_stopped is True
 
 
 def test_async_omni_errored_false_when_stage_dead():
@@ -1455,3 +1601,547 @@ def test_del_shutsdown_engine(monkeypatch: pytest.MonkeyPatch):
     del app
     gc.collect()
     assert engine.shutdown_called
+
+
+def _client_error_then_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    """First request is rejected with a 4xx client error; later ones complete normally."""
+    if len(engine.submitted) == 1:
+        _enqueue_client_error_message(engine, msg)
+    else:
+        _enqueue_omni_final_only_outputs(engine, msg)
+
+
+def test_omni_generate_client_error_keeps_engine_usable(monkeypatch: pytest.MonkeyPatch):
+    """Issue #8449: a non-fatal client error must fail only that generate() call.
+
+    The rejected request is aborted and the error propagates with its status
+    metadata, but the engine stays up so the next generate() succeeds, matching
+    AsyncOmni. Before the fix list-mode generate() closed the engine and the
+    second call died with janus.ShutDown.
+    """
+    sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        default_sampling_params_list=sampling_params,
+        on_add_request=_client_error_then_outputs,
+    )
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    try:
+        with pytest.raises(OmniClientError) as exc_info:
+            app.generate(["blocked"], use_tqdm=False)
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.error_type == "BadRequestError"
+        rejected_id = engine.submitted[0]["request_id"]
+        assert engine.aborted == [[rejected_id]]
+        assert rejected_id not in app.request_states
+        assert not engine.shutdown_called
+
+        outputs = app.generate(["p2"], use_tqdm=False)
+    finally:
+        app.shutdown()
+
+    assert [output.stage_id for output in outputs] == [0, 2]
+    assert len(engine.submitted) == 2
+
+
+@pytest.mark.parametrize("py_generator", [False, True], ids=["list", "generator"])
+@pytest.mark.parametrize(
+    ("enqueue_error", "exception_type"),
+    [
+        pytest.param(_enqueue_client_error_message, OmniClientError, id="client-error"),
+        pytest.param(_enqueue_error_message, RuntimeError, id="server-error"),
+    ],
+)
+def test_omni_generate_discards_errors_from_aborted_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    py_generator: bool,
+    enqueue_error: Callable[[FakeAsyncOmniEngine, dict[str, Any]], None],
+    exception_type: type[Exception],
+):
+    def enqueue_batch_errors_then_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+        if msg["prompt"] == "valid":
+            _enqueue_omni_final_only_outputs(engine, msg)
+        else:
+            enqueue_error(engine, msg)
+
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=enqueue_batch_errors_then_outputs,
+    )
+    _patch_engine(monkeypatch, engine)
+    app = Omni("dummy-model")
+    try:
+        with pytest.raises(exception_type) as exc_info:
+            list(app.generate(["bad-1", "bad-2"], py_generator=py_generator, use_tqdm=False))
+
+        assert type(exc_info.value) is exception_type
+        assert len(engine.submitted) == 2
+        assert len(engine.aborted) == 1
+        assert set(engine.aborted[0]) == {msg["request_id"] for msg in engine.submitted}
+        assert not app.request_states
+        assert engine.output_q.qsize() == 1
+        assert not engine.shutdown_called
+
+        outputs = list(app.generate(["valid"], py_generator=py_generator, use_tqdm=False))
+
+        assert [output.stage_id for output in outputs] == [0, 2]
+        assert len(engine.submitted) == 3
+        assert len(engine.aborted) == 1
+        assert engine.output_q.empty()
+        assert not app.request_states
+        assert not engine.shutdown_called
+    finally:
+        app.shutdown()
+
+
+def test_omni_generate_server_error_keeps_engine_usable(monkeypatch: pytest.MonkeyPatch):
+    """A non-fatal server-side error (RuntimeError, no 4xx status) also leaves the engine up."""
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_enqueue_error_message,
+    )
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    try:
+        with pytest.raises(RuntimeError, match="engine boom") as exc_info:
+            app.generate(["boom"], use_tqdm=False)
+        assert not isinstance(exc_info.value, OmniClientError)
+        assert not engine.shutdown_called
+        assert engine.aborted == [[engine.submitted[0]["request_id"]]]
+    finally:
+        app.shutdown()
+
+
+def test_omni_generate_fatal_error_still_closes_engine(monkeypatch: pytest.MonkeyPatch):
+    """A fatal ErrorMessage means the engine is unusable: generate() keeps closing it."""
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_enqueue_fatal_error_message,
+    )
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    with pytest.raises(EngineDeadError, match="engine dead") as exc_info:
+        app.generate(["dead"], use_tqdm=False)
+
+    assert isinstance(exc_info.value, OmniEngineDeadError)
+    assert engine.shutdown_called
+
+
+@pytest.mark.parametrize("py_generator", [False, True])
+def test_omni_submit_error_aborts_partial_batch(monkeypatch: pytest.MonkeyPatch, py_generator: bool):
+    def reject_bad_prompt(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+        if msg["prompt"] == "bad":
+            raise ValueError("invalid prompt")
+        if msg["prompt"] == "retry":
+            _enqueue_omni_final_only_outputs(engine, msg)
+
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=reject_bad_prompt)
+    _patch_engine(monkeypatch, engine)
+    app = Omni("dummy-model")
+    try:
+        with pytest.raises(ValueError, match="invalid prompt"):
+            list(app.generate(["ok", "bad", "not submitted"], py_generator=py_generator, use_tqdm=False))
+
+        assert [msg["prompt"] for msg in engine.submitted] == ["ok", "bad"]
+        assert len(engine.aborted) == 1
+        assert set(engine.aborted[0]) == {msg["request_id"] for msg in engine.submitted}
+        assert not app.request_states
+        assert not engine.shutdown_called
+        outputs = list(app.generate(["retry"], py_generator=py_generator, use_tqdm=False))
+        assert [output.stage_id for output in outputs] == [0, 2]
+    finally:
+        app.shutdown()
+
+
+def test_omni_generate_dead_orchestrator_closes_engine(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META)
+    _patch_engine(monkeypatch, engine)
+    app = Omni("dummy-model")
+
+    def dead_orchestrator() -> None:
+        engine._alive = False
+        raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
+
+    monkeypatch.setattr(engine, "try_get_output", dead_orchestrator)
+    try:
+        with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
+            app.generate(["hello"], use_tqdm=False)
+        assert engine.shutdown_called
+        assert engine.aborted == [[engine.submitted[0]["request_id"]]]
+        assert not app.request_states
+    finally:
+        app.shutdown()
+
+
+# ───────── AsyncOmni.shutdown() fails in-flight requests ─────────
+
+
+@pytest.mark.asyncio
+async def test_async_omni_shutdown_ends_in_flight_streams(monkeypatch: pytest.MonkeyPatch):
+    """A shutdown after partial output must terminate every active stream."""
+    engine = FakeAsyncOmniEngine(
+        on_add_request=lambda eng, msg: eng.output_q.put_nowait(
+            make_output_msg(
+                msg["request_id"],
+                0,
+                payload="partial",
+                output_finished=False,
+            )
+        )
+    )
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    streaming = {request_id: asyncio.Event() for request_id in ("req-1", "req-2")}
+
+    async def drain(request_id: str) -> None:
+        async for _ in app.generate(prompt="hello", request_id=request_id):
+            streaming[request_id].set()
+
+    streams = [asyncio.create_task(drain(request_id)) for request_id in streaming]
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(event.wait() for event in streaming.values())),
+            timeout=5,
+        )
+
+        app.shutdown()
+        results = await asyncio.wait_for(
+            asyncio.gather(*streams, return_exceptions=True),
+            timeout=5,
+        )
+        assert all(isinstance(result, OmniEngineDeadError) for result in results)
+        assert engine.shutdown_called
+        assert app.request_states == {}
+    finally:
+        app.shutdown()
+        for stream in streams:
+            stream.cancel()
+        await asyncio.gather(*streams, return_exceptions=True)
+
+
+async def _consume_async(gen) -> None:
+    """Drain an async generator so the test only observes the exception."""
+    async for _ in gen:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_async_omni_shutdown_rejects_request_racing_the_snapshot(monkeypatch: pytest.MonkeyPatch):
+    loop = asyncio.get_running_loop()
+    serving_thread = threading.current_thread()
+    first_streaming = asyncio.Event()
+    snapshot_taken = asyncio.Event()
+    late_submitted = threading.Event()
+    snapshot_threads: list[threading.Thread] = []
+
+    def on_add_request(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+        if msg["request_id"] == "req-late":
+            late_submitted.set()
+        else:
+            engine.output_q.put_nowait(make_output_msg("req-first", 0, payload="partial", output_finished=False))
+
+    engine = FakeAsyncOmniEngine(on_add_request=on_add_request)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+
+    class RequestStates(dict[str, ClientRequestState]):
+        armed = True
+
+        def values(self):
+            snapshot = self.copy().values()
+            if not self.armed:
+                return snapshot
+            self.armed = False
+            snapshot_threads.append(threading.current_thread())
+            # Schedule the late request as soon as the first snapshot is taken.
+            # A worker-thread snapshot can overlap that request's registration.
+            if threading.current_thread() is serving_thread:
+                snapshot_taken.set()
+            else:
+                loop.call_soon_threadsafe(snapshot_taken.set)
+                assert late_submitted.wait(timeout=5)
+            return snapshot
+
+    async def drain_first() -> None:
+        async for _ in app.generate(prompt="hello", request_id="req-first"):
+            first_streaming.set()
+
+    async def drain_late() -> None:
+        await snapshot_taken.wait()
+        await _consume_async(app.generate(prompt="hello", request_id="req-late"))
+
+    streams = [asyncio.create_task(drain_first()), asyncio.create_task(drain_late())]
+    try:
+        await asyncio.wait_for(first_streaming.wait(), timeout=5)
+        pump = app.final_output_task
+        assert pump is not None and not pump.done()
+        app.request_states = RequestStates(app.request_states)
+
+        await asyncio.wait_for(asyncio.to_thread(app.shutdown), timeout=6)
+        result = await asyncio.wait_for(asyncio.gather(*streams, return_exceptions=True), timeout=2)
+        assert all(isinstance(exc, OmniEngineDeadError) and "shutting down" in str(exc) for exc in result), result
+        assert snapshot_threads == [serving_thread]
+        assert not late_submitted.is_set()
+        assert not app.request_states
+        assert engine.shutdown_called
+        assert app.final_output_task is None and pump.cancelled()
+    finally:
+        for stream in streams:
+            stream.cancel()
+        await asyncio.gather(*streams, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("paused", [True, False], ids=["paused", "sleeping"])
+async def test_async_omni_shutdown_releases_admission_waiters(monkeypatch: pytest.MonkeyPatch, paused: bool):
+    engine = FakeAsyncOmniEngine()
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    app._paused = paused
+    if not paused:
+        app._sleeping_tags.add("kv_cache")
+
+    parked = asyncio.Event()
+    original_wait = app._pause_cond.wait
+
+    async def observe_wait() -> bool:
+        parked.set()
+        return await original_wait()
+
+    monkeypatch.setattr(app._pause_cond, "wait", observe_wait)
+    waiting = asyncio.create_task(_consume_async(app.generate(prompt="hello", request_id="req-parked")))
+    try:
+        await asyncio.wait_for(parked.wait(), timeout=5)
+        assert not app.request_states
+        assert app.final_output_task is None
+
+        await asyncio.wait_for(asyncio.to_thread(app.shutdown), timeout=5)
+
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(waiting, timeout=1)
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(_consume_async(app.generate(prompt="hello", request_id="req-later")), timeout=1)
+        assert not engine.submitted
+        assert not app.request_states
+        assert app.final_output_task is None
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_input_pump", [True, False], ids=["waiting-for-input", "before-pump-start"])
+async def test_async_omni_shutdown_releases_first_streaming_input(
+    monkeypatch: pytest.MonkeyPatch, start_input_pump: bool
+):
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META[:1])
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    input_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    input_closed = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    allow_input = asyncio.Event()
+
+    async def inputs() -> AsyncGenerator[StreamingInput, None]:
+        input_started.set()
+        try:
+            await allow_input.wait()
+            yield StreamingInput(prompt={"prompt_token_ids": [1]})
+        finally:
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            input_closed.set()
+
+    if start_input_pump:
+        # An abort ACK may arrive while the input iterator is releasing its resources.
+        abort = engine.abort_async
+
+        async def acknowledge_abort(request_ids, timeout=None):
+            await cleanup_started.wait()
+            return await abort(request_ids, timeout)
+
+        monkeypatch.setattr(engine, "abort_async", acknowledge_abort)
+
+    original_add_streaming = app._add_streaming_input_request
+    pumps: list[asyncio.Task] = []
+
+    async def capture_input_pump(**kwargs) -> asyncio.Task:
+        pump = await original_add_streaming(**kwargs)
+        pumps.append(pump)
+        if not start_input_pump:
+            # The pump is queued on this loop and has yet to execute its try/finally.
+            app.shutdown()
+        return pump
+
+    monkeypatch.setattr(app, "_add_streaming_input_request", capture_input_pump)
+    waiting = asyncio.create_task(_consume_async(app.generate(prompt=inputs(), request_id="req-input")))
+    try:
+        if start_input_pump:
+            await asyncio.wait_for(input_started.wait(), timeout=5)
+            assert app.request_states["req-input"].input_stream_task is pumps[0]
+            await asyncio.wait_for(asyncio.to_thread(app.shutdown), timeout=5)
+
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(waiting, timeout=1)
+        allow_cleanup.set()
+        assert len(pumps) == 1
+        await asyncio.wait_for(asyncio.gather(*pumps, return_exceptions=True), timeout=1)
+        assert input_started.is_set() is start_input_pump
+        assert input_closed.is_set() is start_input_pump
+        assert not allow_input.is_set()
+        assert not engine.submitted
+        assert not app.request_states
+        assert app.final_output_task is None
+    finally:
+        allow_cleanup.set()
+        waiting.cancel()
+        await asyncio.gather(waiting, *pumps, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_async_omni_executor_shutdown_delivers_terminal_errors_before_engine_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    engine = FakeAsyncOmniEngine(
+        on_add_request=lambda eng, msg: eng.output_q.put_nowait(
+            make_output_msg(msg["request_id"], 0, payload="partial", output_finished=False)
+        )
+    )
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    streaming = {request_id: asyncio.Event() for request_id in ("req-1", "req-2")}
+
+    async def drain(request_id: str) -> None:
+        async for _ in app.generate(prompt="hello", request_id=request_id):
+            streaming[request_id].set()
+
+    loop = asyncio.get_running_loop()
+    real_schedule = loop.call_soon_threadsafe
+    frontend_scheduled = asyncio.Event()
+    engine_started = asyncio.Event()
+    release_frontend = asyncio.Event()
+    pending_frontend: list[asyncio.Task] = []
+    fatal_enqueued: set[str] = set()
+    fatal_at_teardown: list[set[str]] = []
+    worker: threading.Thread | None = None
+    frontend_intercepted = False
+
+    async def delay_frontend(callback, args, context) -> None:
+        frontend_scheduled.set()
+        await release_frontend.wait()
+        loop.call_soon(callback, *args, context=context)
+
+    def schedule(callback, *args, context=None):
+        nonlocal frontend_intercepted
+        if threading.current_thread() is worker and not frontend_intercepted:
+            frontend_intercepted = True
+
+            def defer() -> None:
+                pending_frontend.append(loop.create_task(delay_frontend(callback, args, context)))
+
+            return real_schedule(defer)
+        return real_schedule(callback, *args, context=context)
+
+    def observe_queue(queue) -> None:
+        put = queue.put_nowait
+
+        def record(message) -> None:
+            if isinstance(message, ErrorMessage) and message.fatal:
+                assert asyncio.get_running_loop() is loop
+                assert message.request_id is not None
+                fatal_enqueued.add(message.request_id)
+            put(message)
+
+        monkeypatch.setattr(queue, "put_nowait", record)
+
+    engine_shutdown = engine.shutdown
+
+    def teardown() -> None:
+        fatal_at_teardown.append(fatal_enqueued.copy())
+        real_schedule(engine_started.set)
+        engine_shutdown()
+
+    def launcher_shutdown() -> None:
+        nonlocal worker
+        worker = threading.current_thread()
+        app.shutdown()
+
+    streams = [asyncio.create_task(drain(request_id)) for request_id in streaming]
+    shutdown = None
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in streaming.values())), timeout=5)
+        for state in app.request_states.values():
+            observe_queue(state.queue)
+        monkeypatch.setattr(loop, "call_soon_threadsafe", schedule)
+        monkeypatch.setattr(engine, "shutdown", teardown)
+
+        shutdown = loop.run_in_executor(None, launcher_shutdown)
+        await asyncio.wait_for(frontend_scheduled.wait(), timeout=5)
+        # Give the executor time to reach teardown while the frontend callback
+        # is held. An implementation that waits for the callback cannot enter.
+        with suppress(TimeoutError):
+            await asyncio.wait_for(engine_started.wait(), timeout=0.25)
+        release_frontend.set()
+
+        await asyncio.wait_for(shutdown, timeout=5)
+        results = await asyncio.wait_for(asyncio.gather(*streams, return_exceptions=True), timeout=5)
+        assert all(isinstance(result, OmniEngineDeadError) for result in results)
+        assert fatal_at_teardown == [set(streaming)]
+        assert not app.request_states
+    finally:
+        release_frontend.set()
+        if shutdown is not None:
+            await asyncio.wait_for(asyncio.gather(shutdown, return_exceptions=True), timeout=5)
+        for stream in streams:
+            stream.cancel()
+        await asyncio.gather(*streams, *pending_frontend, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_executor_shutdown_with_full_downstream_stage_queue(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine()
+    stage_engine = object.__new__(AsyncOmniEngine)
+    requests = janus.Queue(maxsize=1)
+    stage_engine.request_queue = requests
+    monkeypatch.setattr(engine, "add_next_stage_input_async", stage_engine.add_next_stage_input_async, raising=False)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    stage_input = NextStageInputMessage(
+        request_id="original",
+        source_stage_id=0,
+        receiver_stage_id=1,
+        requests=[],
+        submit_kwargs=None,
+        stage_output=None,
+        prompt="hello",
+        sampling_params_list=[],
+    )
+    requests.sync_q.put_nowait(stage_input)
+    # Bound the test even if a synchronous put blocks the entire serving loop.
+    watchdog = threading.Timer(5, requests.close)
+    watchdog.start()
+    stage = asyncio.create_task(app.run_downstream_stage(stage_input, request_id="downstream"))
+    try:
+        await asyncio.sleep(0)
+        assert app.request_states and not stage.done()
+        await asyncio.wait_for(asyncio.to_thread(app.shutdown), timeout=2)
+        assert engine.shutdown_called
+        assert requests.sync_q.get_nowait() is stage_input
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(stage, timeout=2)
+        assert not app.request_states
+    finally:
+        watchdog.cancel()
+        await requests.aclose()
+        await asyncio.gather(stage, return_exceptions=True)
+        app.shutdown()

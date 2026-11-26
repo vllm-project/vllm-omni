@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from NextStep-1.1 (https://huggingface.co/stepfun-ai/NextStep-1.1)
 
 import os
@@ -704,7 +704,7 @@ class NextStep11Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelin
         )
 
         # Unpatchify
-        latents = self.model.unpatchify(tokens)
+        latents = self.model.unpatchify(tokens, h=height // self.down_factor, w=width // self.down_factor)
         latents = (latents / self.scaling_factor) + self.shift_factor
 
         # Decode latents

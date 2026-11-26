@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import contextlib
+
 import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
-from vllm_omni.model_executor.models.common.ming.audio_dsp import ISTFT
+from tests.helpers.mark import hardware_marks, hardware_test
+from vllm_omni.model_executor.models.common.ming.audio_dsp import ISTFT, ISTFTEnvelopeError
+from vllm_omni.model_executor.models.common.ming.fused_istft import deferred_envelope_checks
 
 pytestmark = [pytest.mark.core_model, pytest.mark.tts]
 cuda = pytest.mark.skipif(
@@ -24,7 +28,7 @@ def _assert_outputs_close(actual, expected):
 
 
 @cuda
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("hop", [4, 320, 882])
 @pytest.mark.parametrize("window_dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("batch,frames", [(1, 2), (1, 25), (3, 7), (2, 100)])
@@ -53,7 +57,7 @@ def test_fused_istft_matches_native(hop, window_dtype, batch, frames, mode, monk
 
 
 @cuda
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("hop", [320, 882])
 @pytest.mark.parametrize("window_dtype", [torch.float32, torch.bfloat16, torch.float16])
 @torch.inference_mode()
@@ -82,7 +86,7 @@ def test_fused_istft_streaming_state(hop, window_dtype):
 
 
 @cuda
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("invalid", [False, True])
 @torch.inference_mode()
 def test_fused_istft_silence_and_invalid_envelope(invalid):
@@ -98,9 +102,59 @@ def test_fused_istft_silence_and_invalid_envelope(invalid):
         assert torch.count_nonzero(module(spec)[0]) == 0
 
 
+@cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("invalid", [False, True])
+@torch.inference_mode()
+def test_fused_istft_deferred_envelope_check(invalid):
+    module = ISTFT(1280, 320, 1280).cuda()
+    spec = torch.randn(1, 641, 25, device="cuda", dtype=torch.complex64)
+    expected = module(spec)
+    if invalid:
+        module.window.zero_()
+    with contextlib.ExitStack() as stack:
+        if invalid:
+            stack.enter_context(pytest.raises(RuntimeError, match="window envelope underflowed"))
+        with deferred_envelope_checks():
+            # Reported once at the end of the block, not by each call.
+            outputs = [module(spec) for _ in range(3)]
+    if not invalid:
+        for output in outputs:
+            _assert_outputs_close(output, expected)
+
+
+@cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.inference_mode()
+def test_deferred_envelope_check_identifies_failures_and_preserves_fatal_errors():
+    good = ISTFT(1280, 320, 1280).cuda()
+    bad = ISTFT(1280, 320, 1280).cuda()
+    bad.window.zero_()
+    spec = torch.randn(1, 641, 25, device="cuda", dtype=torch.complex64)
+    with pytest.raises(ISTFTEnvelopeError) as error:
+        with deferred_envelope_checks():
+            for module in (good, bad, good, bad):
+                module(spec)
+    assert error.value.indices == [1, 3]
+    # Exiting the deferred scope must restore immediate validation.
+    with pytest.raises(ISTFTEnvelopeError) as error:
+        bad(spec)
+    assert error.value.indices is None
+    fatal = RuntimeError("device failure")
+    with pytest.raises(RuntimeError) as error:
+        with deferred_envelope_checks():
+            bad(spec)
+            raise fatal
+    assert error.value is fatal
+    _assert_outputs_close(good(spec), good.forward_native(spec))
+
+
 @pytest.mark.parametrize(
     "device",
-    [pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=[pytest.mark.cuda, cuda])],
+    [
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=[*hardware_marks(res={"cuda": "L4"}, num_cards=1), cuda]),
+    ],
 )
 @pytest.mark.parametrize("padding", ["same", "center"])
 def test_istft_autograd_fallback(padding, device, monkeypatch):
@@ -127,7 +181,7 @@ def test_istft_autograd_fallback(padding, device, monkeypatch):
 
 
 @cuda
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize(
     "n_fft,hop,frames,dtype", [(32, 8, 1, torch.complex64), (30, 10, 7, torch.complex64), (32, 8, 7, torch.complex128)]
 )

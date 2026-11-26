@@ -179,9 +179,10 @@ class TestLMCacheStepRecovery:
         steps = [StepLatentData(step_index=i, timestep=float(40 - i), latent=torch.full((2, 2), i)) for i in range(3)]
         key = make_key(prompt="vid")
         store.put(key, torch.zeros(2, 2), step_latents=steps)
-        # steps went through the fake engine
-        assert f"{key.to_hash()}:steps_meta" in engine.data
-        assert f"{key.to_hash()}:step_0000" in engine.data
+        store.close()
+        generation = store._store[key.to_hash()].step_storage_key
+        assert f"{generation}:steps_meta" in engine.data
+        assert f"{generation}:step_0000" in engine.data
 
         # Simulate eviction to shell
         entry = store._store[key.to_hash()]
@@ -278,6 +279,25 @@ class TestPersistenceRoundTrip:
 
 
 class TestMatrixGrowthAlignment:
+    def test_churn_reuses_rows(self):
+        store = DiTCacheStore(max_entries=1, max_memory_gb=1.0)
+        store._ROW_CHUNK = 2
+        text = torch.tensor([1.0, 0.0])
+        latent = torch.zeros(2)
+        for i in range(16):
+            # Alternate overwriting the same key and evicting it for a new key.
+            key = make_key(prompt=f"p{i // 2}")
+            store.put(key, latent, clip_embedding=text)
+            assert store._next_row == 1
+            assert store._capacity == 2
+            assert store._key_rows == {key.to_hash(): 0}
+            assert store._img_matrix[0].count_nonzero().item() == 0
+            assert store.semantic_search(text, threshold=0.9)[3] == key.prompt
+            assert store.update_image_embedding(key.to_hash(), text)
+        store.clear()
+        store.put(make_key(prompt="fresh"), latent, clip_embedding=text)
+        assert store.semantic_search(text, threshold=0.9)[3] == "fresh"
+
     def test_row_keys_aligned_past_chunk_growth(self):
         """Rows must stay aligned with _row_keys after capacity growth (P1).
 
@@ -410,7 +430,7 @@ class TestTieredReadNonRetention:
         )
         key = make_key(prompt="x")
         store.put(key, torch.full((2, 2), 7.0))
-        store._final_write_executor.shutdown(wait=True)  # flush torch.save
+        store.close()  # Drain tier writes before simulating eviction.
 
         entry = store._store[key.to_hash()]
         entry.latents = None  # simulate eviction to shell
@@ -426,6 +446,7 @@ class TestTieredReadNonRetention:
         steps = [StepLatentData(step_index=0, timestep=40.0, latent=torch.ones(2, 2))]
         key = make_key(prompt="vid")
         store.put(key, torch.zeros(2, 2), step_latents=steps)
+        store.close()
         entry = store._store[key.to_hash()]
         entry.step_latents = None
 
@@ -443,3 +464,144 @@ class TestBoundedSimilarityStats:
         assert len(store._all_sims) == _SIM_STATS_MAX_SAMPLES
         stats = store.get_similarity_stats()
         assert stats["final_sim"]["total_comparisons"] == _SIM_STATS_MAX_SAMPLES
+
+
+class TestTierWriteConcurrency:
+    def test_blocked_write_allows_reads_and_skips_saturated_queue(self, tmp_path):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        started, resume = Event(), Event()
+
+        class SlowCache(FakeLMCache):
+            def put(self, key, tensor):
+                started.set()
+                assert resume.wait(10), "tier writer was never released"
+                return super().put(key, tensor)
+
+        store = DiTCacheStore(max_memory_gb=0, lmcache_engine=SlowCache(), final_disk_dir=str(tmp_path))
+        keys = [make_key(prompt=f"generation-{i}") for i in range(3)]
+        steps = [StepLatentData(0, 1.0, torch.ones(1))]
+        try:
+            store.put(keys[0], torch.zeros(1), steps)
+            assert started.wait(3)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                try:
+                    assert pool.submit(store.get, keys[0]).result(timeout=2) is None
+                    for key in keys[1:]:
+                        pool.submit(store.put, key, torch.ones(1), steps).result(timeout=2)
+                finally:
+                    resume.set()
+        finally:
+            resume.set()
+            store.close()
+        assert store.get(keys[0]).item() == 0
+        assert store.get(keys[1]).item() == 1
+        assert store.get(keys[2]) is None
+
+    def test_failed_overwrite_does_not_expose_old_or_partial_tier(self, tmp_path):
+        class RejectNewMeta(FakeLMCache):
+            fail = False
+
+            def put(self, key, tensor):
+                if self.fail and key.endswith(":steps_meta"):
+                    return False
+                return super().put(key, tensor)
+
+        engine = RejectNewMeta()
+        store = DiTCacheStore(max_memory_gb=0, lmcache_engine=engine, final_disk_dir=str(tmp_path))
+        key = make_key()
+        store.put(key, torch.ones(1), [StepLatentData(0, 1, torch.ones(1))])
+        store._tier_writer.submit(lambda: None).result(timeout=3)
+        assert store.get(key).item() == 1
+        engine.fail = True
+        store.put(key, torch.zeros(1), [StepLatentData(0, 1, torch.zeros(1))])
+        store.close()
+        assert store.get(key) is None
+        assert store.get_step_latents(key) is None
+
+    def test_clear_during_write_and_replace_same_key(self, tmp_path, monkeypatch):
+        import threading
+
+        from vllm_omni.diffusion.cache.inter_request import cache_store
+
+        entered, resume = threading.Event(), threading.Event()
+        save = cache_store._atomic_tensor_save
+
+        def slow_save(tensor, path):
+            entered.set()
+            assert resume.wait(5)
+            save(tensor, path)
+
+        monkeypatch.setattr(cache_store, "_atomic_tensor_save", slow_save)
+        store = DiTCacheStore(max_memory_gb=0, lmcache_engine=FakeLMCache(), final_disk_dir=str(tmp_path))
+        key = make_key()
+        try:
+            store.put(key, torch.ones(1))
+            assert entered.wait(3)
+            store.clear()
+            store.put(key, torch.full((1,), 2))
+            assert store.get(key) is None
+        finally:
+            resume.set()
+            store.close()
+        assert store.get(key).item() == 2
+
+    def test_corrupt_disk_file_is_a_miss(self, tmp_path):
+        store = DiTCacheStore(max_memory_gb=0, lmcache_engine=FakeLMCache(), final_disk_dir=str(tmp_path))
+        key = make_key()
+        store.put(key, torch.ones(1))
+        store.close()
+        (tmp_path / f"{key.to_hash()}.pt").write_bytes(b"truncated tensor")
+        assert store.get(key) is None
+
+    def test_interrupted_save_preserves_complete_snapshot(self, tmp_path, monkeypatch):
+        store = DiTCacheStore()
+        key = make_key()
+        store.put(key, torch.ones(1))
+        assert store.save_to_disk(tmp_path) == 1
+        store.put(key, torch.zeros(1))
+
+        def broken_save(value, path):
+            path.write_bytes(b"partial")
+            raise OSError("simulated write interruption")
+
+        monkeypatch.setattr(torch, "save", broken_save)
+        assert store.save_to_disk(tmp_path) == 0
+        reopened = DiTCacheStore()
+        assert reopened.load_from_disk(tmp_path) == 1
+        assert reopened.get(key).item() == 1
+        assert len(list(tmp_path.iterdir())) == 1
+
+    def test_disk_only_step_recovery_releases_borrowed_buffers(self):
+        from unittest.mock import Mock
+
+        class DiskOnly(FakeLMCache):
+            def __init__(self):
+                super().__init__()
+                self._storage_manager = SimpleNamespace(get=self.read_disk)
+                self.releases = []
+
+            def _make_cache_key(self, key):
+                return key
+
+            def get(self, key, device="cpu"):
+                return None
+
+            def read_disk(self, key, location):
+                assert location == "LocalDiskBackend"
+                buffer = self.data[key].clone()
+                release = Mock(side_effect=buffer.zero_)
+                self.releases.append(release)
+                return SimpleNamespace(tensor=buffer, ref_count_down=release)
+
+        engine = DiskOnly()
+        store = DiTCacheStore(max_memory_gb=0, lmcache_engine=engine)
+        key = make_key()
+        store.put(key, torch.ones(1), [StepLatentData(0, 9.0, torch.full((1,), 7))])
+        store.close()
+        steps = store.get_step_latents(key)
+        assert steps and steps[0].timestep == 9.0 and steps[0].latent.item() == 7
+        assert len(engine.releases) == 2
+        for release in engine.releases:
+            release.assert_called_once_with()

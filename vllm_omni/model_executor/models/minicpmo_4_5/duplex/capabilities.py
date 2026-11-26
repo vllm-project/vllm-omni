@@ -28,6 +28,9 @@ def minicpmo45_native_capabilities(*, max_sessions: int = 1) -> DuplexCapabiliti
         supports_scheduler_native_append=False,
         supports_core_resumable_request=True,
         supports_stage_connector_handoff=True,
+        # Official duplex accepts AUDIO, VISION, and OMNI units.
+        required_input_modalities=frozenset(),
+        optional_input_modalities=frozenset({"audio", "video"}),
         supports_independent_io_streams=True,
         supports_realtime_endpoint=True,
         supports_multi_session=supports_multi_session,
