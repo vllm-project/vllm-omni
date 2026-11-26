@@ -34,6 +34,36 @@ kept separate so the evidence remains clear.
 
 ## Extending platform support
 
+### Experimental NPU video encoder empty spatial padding
+
+`VLLM_OMNI_H3_VAE_SKIP_NOOP_PAD=1` opts into removal of the encoder's
+all-zero spatial `F.pad` for convolutions whose padding is `(1, 0, 0)`.
+The temporal pad is still required: the convolution's complete padding
+configuration is not zero. Downsampling's outer nonzero right/bottom spatial
+pad and the original Conv3D forward also remain in place.
+
+The switch is disabled by default and read at NPU video VAE construction;
+`true`/`on` also enable it, `0`/`false`/`off` or an empty value disable it,
+and any other value raises `ValueError`. Restart workers when changing it.
+It is classified as deprecate/remove: remove the temporary switch or move
+validated behavior into normal dispatch after public device qualification.
+
+Installation binds only the loaded `EncoderFCN3D`'s concrete
+`SpatialParallelConv3d`, after checking its padding on CPU. Eager,
+contiguous NCDHW FP32 NPU video tensors use the path. T=1 images retain the
+checkpoint path, avoiding overlap with the separate NPU image convolution
+optimization. Other devices, nonzero spatial padding, changed checkpoint
+contracts, spatial parallelism, strided tensors, training, gradients,
+autocast, hooks, and compilation retain the original method. Decoder and
+quant_conv modules are untouched.
+
+CPU tests cover actual padding/convolution results, the removal of the empty
+pad call, the retained outer spatial and temporal pads, and fallbacks. Public
+NPU bitwise accuracy, complete encoding latency, and end-to-end media checks
+have not been run, so the default remains disabled.
+
+### Platform qualification
+
 Validation and improvements for other platforms are welcome. A contribution
 should keep the model-facing installation path unchanged and add a complete
 operator-set entry with conservative fallback behavior. Please include:
