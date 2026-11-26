@@ -13,6 +13,8 @@ from types import ModuleType
 import pytest
 import torch
 
+from vllm_omni.diffusion.distributed.autoencoders.wan_streaming_decode import WanStreamingDecoder
+
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
@@ -35,14 +37,25 @@ def pixel_modules():
             return module
 
         pixels = load(f"{package_name}.pixel_output", source / "diffusion/models/lingbot_world/pixel_output.py")
-        decoder = load("sp8_streaming_cpu", source / "experimental/ar_diffusion/streaming_decode.py")
         try:
-            yield pixels, decoder.WanStreamingDecoder
+            yield pixels, WanStreamingDecoder
         finally:
             # Relative imports performed by the subject must not leak into other tests.
             for name in set(sys.modules) - original_modules:
                 if name.startswith(package_name + "."):
                     sys.modules.pop(name, None)
+
+
+def test_legacy_streaming_imports_resolve_to_codec_types():
+    from vllm_omni.diffusion.distributed.autoencoders.streaming_decode import (
+        StreamingDecodeState,
+        SupportsStreamingDecode,
+    )
+    from vllm_omni.experimental.ar_diffusion import streaming_decode as legacy
+
+    assert legacy.StreamingDecodeState is StreamingDecodeState
+    assert legacy.SupportsStreamingDecode is SupportsStreamingDecode
+    assert legacy.WanStreamingDecoder is WanStreamingDecoder
 
 
 @dataclass

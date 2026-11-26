@@ -27,8 +27,10 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
+from vllm_omni.diffusion.distributed.autoencoders.streaming_decode import StreamingDecodeState
 from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_fast_path import install_wan_decoder_fast_path
 from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import install_wan_spatial_shard_decode
+from vllm_omni.diffusion.distributed.autoencoders.wan_streaming_decode import WanStreamingDecoder
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession
@@ -86,10 +88,6 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.conditioning import (
     ConditioningKVIdentity,
     ConditioningKVRepresentation,
-)
-from vllm_omni.experimental.ar_diffusion.streaming_decode import (
-    StreamingDecodeState,
-    WanStreamingDecoder,
 )
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,

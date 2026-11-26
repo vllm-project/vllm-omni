@@ -25,6 +25,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.wan_streaming_decode import WanStreamingDecoder
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
     ARDiffusionCellContext,
     CellRunSpec,
@@ -66,7 +67,6 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     clean_history_cells,
 )
 from vllm_omni.experimental.ar_diffusion.request_binding import kv_request_binding
-from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 
 logger = init_logger(__name__)
 

@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 
 import torch
 
+from vllm_omni.diffusion.distributed.autoencoders.streaming_decode import StreamingDecodeState
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.dense_attention import CosmosSimDenseAttentionCache
-from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState
 
 
 def append_dense_kv_history(

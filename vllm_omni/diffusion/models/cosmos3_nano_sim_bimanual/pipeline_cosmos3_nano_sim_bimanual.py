@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.wan_streaming_decode import WanStreamingDecoder
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
     VideoMediaOutput,
@@ -72,7 +73,6 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import (
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
-from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
