@@ -130,9 +130,9 @@ class OvisImageAttention(nn.Module):
 
         # Fused RMSNorm (+ text/image cat) + RoPE in one launch when the
         # forward supplied the packed table and the CUDA kernel accepts the
-        # geometry; otherwise the original eager chain. With vllm_c RMSNorm,
-        # outputs are bit-identical in eager; torch.compile can introduce
-        # last-bit differences in the unfused RoPE arithmetic.
+        # geometry; otherwise the original chain. The tested eager paths
+        # with vllm_c RMSNorm are bit-identical. Compiling the surrounding
+        # block can change its numerical results.
         qk_norm_rope_table = kwargs.get(QK_NORM_ROPE_TABLE_KEY)
         use_fused_qk_norm_rope = (
             qk_norm_rope_table is not None

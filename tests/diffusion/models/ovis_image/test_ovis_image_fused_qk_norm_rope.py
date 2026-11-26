@@ -155,6 +155,8 @@ def test_ovis_forward_fusion_gate(_torch_sdpa_env, monkeypatch, head_dim, thresh
             .to(torch.bfloat16)
             .eval()
         )
+    assert model.transformer_blocks[0].attn.attn.attn_backend.get_name() == "SDPA"
+    assert model.single_transformer_blocks[0].attn.attn.attn_backend.get_name() == "SDPA"
     with torch.no_grad():
         # vLLM parallel linear layers allocate uninitialized parameters.
         for name, p in model.named_parameters():
