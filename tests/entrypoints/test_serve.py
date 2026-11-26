@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from dataclasses import dataclass
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
@@ -415,7 +416,7 @@ def test_serve_native_checkpoint_validation(model_class, exists, native, tmp_pat
     checkpoint = tmp_path / "anima.safetensors"
     if exists:
         checkpoint.touch()
-    argv = ["serve", str(checkpoint), "--omni"]
+    argv = ["serve", str(checkpoint), "--omni", "--revision", "pinned"]
     if model_class is not None:
         argv.extend(["--model-class-name", model_class])
     args = _parse_serve_args(argv)
@@ -428,7 +429,7 @@ def test_serve_native_checkpoint_validation(model_class, exists, native, tmp_pat
         detect_model.assert_not_called()
         validate_llm.assert_not_called()
     else:
-        detect_model.assert_called_once_with(str(checkpoint))
+        detect_model.assert_called_once_with(str(checkpoint), revision="pinned")
         validate_llm.assert_called_once_with(args)
 
 
@@ -630,12 +631,18 @@ def test_build_multi_api_stage_runtime_rejects_sleep_enabled_in_stage_config(
         serve_module._build_multi_api_stage_runtime(args, 2)
 
 
-def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(mocker: MockerFixture) -> None:
+def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from vllm_omni.entrypoints.cli import serve as serve_module
 
+    marker_keys = ("MINICPMO_NPU_THINKER_PREFILL_STARTUP", "MINICPMO_NPU_TALKER_PREFILL_STARTUP")
+    for key in marker_keys:
+        monkeypatch.delenv(key, raising=False)
+    mocker.patch.object(platforms, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
     args = TrackingNamespace(
-        argparse.Namespace(api_server_count=2, shutdown_timeout=1),
-        frozenset({"api_server_count", "shutdown_timeout"}),
+        argparse.Namespace(api_server_count=2, shutdown_timeout=1, deploy_config="minicpmo_4_5_2gpu.yaml"),
+        frozenset({"api_server_count", "shutdown_timeout", "deploy_config"}),
     )
     socket = mocker.Mock()
     primary_addresses = EngineZmqAddresses(
@@ -647,6 +654,13 @@ def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(moc
         resources=[StageReplicaResources(addresses=primary_addresses)],
     )
     runtime = mocker.MagicMock()
+    inherited_markers: dict[str, str] = {}
+
+    def launch_engines(_count):
+        inherited_markers.update((key, os.environ[key]) for key in marker_keys)
+        return runtime.launch_stage_engines.return_value
+
+    runtime.launch_stage_engines.side_effect = launch_engines
     runtime.launch_stage_engines.return_value.__enter__.return_value = engine_launch
     runtime.launch_stage_engines.return_value.__exit__.return_value = False
 
@@ -658,7 +672,12 @@ def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(moc
     mocker.patch("signal.signal")
     mocker.patch("vllm.entrypoints.launchers.launcher.setup_server", return_value=("127.0.0.1:8000", socket))
     mocker.patch("vllm.v1.metrics.prometheus.setup_multiprocess_prometheus")
-    start_manager = mocker.patch.object(serve_module, "_start_api_server_process_manager", return_value=manager)
+
+    def start_frontends(**_kwargs):
+        assert inherited_markers == {key: os.environ[key] for key in marker_keys}
+        return manager
+
+    start_manager = mocker.patch.object(serve_module, "_start_api_server_process_manager", side_effect=start_frontends)
 
     serve_module.run_multi_api_server_omni(args)
 
@@ -672,6 +691,7 @@ def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(moc
     assert engine_launch.watched_frontend_processes == manager.processes
     runtime.shutdown.assert_called_once_with()
     socket.close.assert_called_once_with()
+    assert not any(key in os.environ for key in marker_keys)
 
 
 def test_start_api_server_process_manager_cleans_up_partial_start(mocker: MockerFixture) -> None:

@@ -885,7 +885,7 @@ def resolve_model_class_name(
 
     if model_type == "praxis":
         return "Praxis1Pipeline"
-    if _looks_like_hidream_o1(model, cfg):
+    if _looks_like_hidream_o1(model, cfg, revision=revision):
         return "HiDreamO1ImagePipeline"
     if _looks_like_flux3(model, cfg):
         return "Flux3Pipeline"
@@ -920,7 +920,7 @@ def resolve_model_class_name(
     if model_type == "vla":
         from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
-        return "DreamZeroPipeline" if _looks_like_dreamzero(model) else None
+        return "DreamZeroPipeline" if _looks_like_dreamzero(model, revision=revision) else None
     if len(architectures) == 1:
         return architectures[0]
     return None
@@ -1871,7 +1871,11 @@ class OmniDiffusionConfig:
             )
             # Mixed Flux3 packages also ship a Diffusers index. Native loading
             # must resolve variant quantization from the package config below.
-            if config_dict is not None and self.diffusion_load_format != "diffusers" and _looks_like_flux3(self.model):
+            if (
+                config_dict is not None
+                and self.diffusion_load_format != "diffusers"
+                and _looks_like_flux3(self.model, revision=self.revision)
+            ):
                 config_dict = None
             if config_dict is not None:
                 if self.model_class_name is None:
@@ -1977,7 +1981,7 @@ class OmniDiffusionConfig:
                 from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
 
                 assert self.model is not None
-                is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg)
+                is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg, revision=self.revision)
                 is_flux3 = _looks_like_flux3(self.model, cfg)
                 if self.model_class_name == "HiDreamO1ImagePipeline" and not is_hidream_o1:
                     raise ValueError(f"Checkpoint {self.model} does not have the HiDream-O1 signature")
@@ -2057,7 +2061,7 @@ class OmniDiffusionConfig:
                     from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
                     assert self.model is not None
-                    if _looks_like_dreamzero(self.model):
+                    if _looks_like_dreamzero(self.model, revision=self.revision):
                         self.model_class_name = "DreamZeroPipeline"
                         self.set_tf_model_config(TransformerConfig())
                         self.update_multimodal_support()
