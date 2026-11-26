@@ -3,6 +3,7 @@
 
 import functools
 import itertools
+import os
 import time
 import weakref
 from collections import Counter
@@ -737,6 +738,44 @@ def _copy_frame_segments(dst: torch.Tensor, src: torch.Tensor, segments: list[tu
         position += length
 
 
+def _split_segments_before_tail(
+    segments: list[tuple[int, int]],
+    tail_len: int,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Split logical frame ``segments`` into prefix segments and trailing ``tail_len`` segments."""
+    total = sum(length for _, length in segments)
+    if tail_len <= 0:
+        return list(segments), []
+    if tail_len >= total:
+        return [], list(segments)
+    split_at = total - tail_len
+    prefix_segments: list[tuple[int, int]] = []
+    tail_segments: list[tuple[int, int]] = []
+    cursor = 0
+    for start, length in segments:
+        end = cursor + length
+        if end <= split_at:
+            prefix_segments.append((start, length))
+        elif cursor >= split_at:
+            tail_segments.append((start, length))
+        else:
+            left_len = split_at - cursor
+            prefix_segments.append((start, left_len))
+            tail_segments.append((start + left_len, length - left_len))
+        cursor = end
+    return prefix_segments, tail_segments
+
+
+def _matches_frame_segments(src: torch.Tensor, segments: list[tuple[int, int]], expected: torch.Tensor) -> bool:
+    """Compare ``segments`` of ``src`` against contiguous ``expected`` without allocating."""
+    pos = 0
+    for start, length in segments:
+        if not torch.equal(src[..., start : start + length, :], expected[..., pos : pos + length, :]):
+            return False
+        pos += length
+    return pos == int(expected.shape[-2])
+
+
 def _tensors_from_key(key: tuple) -> tuple[torch.Tensor, ...]:
     """Rebuild zero tensors from a cache key (shape, dtype, device tuples).
 
@@ -1241,8 +1280,94 @@ class ResidentAttCache:
         return self.pool.storage[:, :, :, 2 * self.slot : 2 * self.slot + 2].index_select(5, index)
 
 
+class SharedPromptAttCache:
+    """A request attention cache split into a request-owned prefix and an immutable prompt suffix.
+
+    Holds ``(prefix, prompt)`` without joining them into a full tensor.
+    Logical shape is ``(n_t, depth, 2, 2, heads, prefix_frames + prompt_frames, head_dim)``
+    matching the per-request split K/V estimator cache layout (frame axis ``5``).
+    """
+
+    __slots__ = ("prefix", "prompt")
+
+    def __init__(self, prefix: torch.Tensor, prompt: torch.Tensor) -> None:
+        if prefix.ndim != 7 or prompt.ndim != 7:
+            raise ValueError(
+                f"SharedPromptAttCache expects 7-D (n_t, depth, 2, 2, heads, frames, head_dim) tensors, "
+                f"got {tuple(prefix.shape)} and {tuple(prompt.shape)}"
+            )
+        if prefix.shape[:5] != prompt.shape[:5] or prefix.shape[6] != prompt.shape[6]:
+            raise ValueError(
+                f"SharedPromptAttCache shape mismatch between prefix {tuple(prefix.shape)} "
+                f"and prompt {tuple(prompt.shape)}"
+            )
+        self.prefix = prefix
+        self.prompt = prompt
+
+    @property
+    def ndim(self) -> int:
+        return 7
+
+    @property
+    def shape(self) -> torch.Size:
+        return torch.Size(
+            (
+                self.prefix.shape[0],
+                self.prefix.shape[1],
+                self.prefix.shape[2],
+                self.prefix.shape[3],
+                self.prefix.shape[4],
+                self.prefix.shape[5] + self.prompt.shape[5],
+                self.prefix.shape[6],
+            )
+        )
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.prompt.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.prompt.device
+
+    def data_ptr(self) -> int:
+        """Expose a stable pointer for cache-owner accounting without a full materialization."""
+        return self.prefix.data_ptr() if self.prefix.numel() > 0 else id(self)
+
+    def copy_range_to(self, dst: torch.Tensor, start: int, length: int) -> None:
+        """Copy a logical frame range into ``dst`` without joining prefix and prompt."""
+        start, length = int(start), int(length)
+        if start < 0 or length < 0 or start + length > int(self.shape[5]):
+            raise ValueError(f"attention-cache range ({start}, {length}) is outside {tuple(self.shape)}")
+        prefix_len = int(self.prefix.shape[5])
+        position = 0
+        if start < prefix_len:
+            count = min(length, prefix_len - start)
+            dst[..., position : position + count, :].copy_(self.prefix[..., start : start + count, :])
+            position += count
+            start += count
+            length -= count
+        if length:
+            prompt_start = start - prefix_len
+            dst[..., position : position + length, :].copy_(self.prompt[..., prompt_start : prompt_start + length, :])
+
+    def materialize(self) -> torch.Tensor:
+        """Materialize the logical cache for eager or unsupported graph paths."""
+        return torch.cat((self.prefix, self.prompt), dim=5)
+
+
+def _copy_att_cache_range(dst: torch.Tensor, src, start: int, length: int) -> None:
+    if isinstance(src, SharedPromptAttCache):
+        src.copy_range_to(dst, start, length)
+    elif isinstance(src, ResidentAttCache):
+        materialized = src.materialize()
+        dst.copy_(materialized[..., int(start) : int(start) + int(length), :])
+    else:
+        dst.copy_(src[..., int(start) : int(start) + int(length), :])
+
+
 def _materialize_att_rows(rows: list) -> list[torch.Tensor]:
-    return [row.materialize() if isinstance(row, ResidentAttCache) else row for row in rows]
+    return [row.materialize() if isinstance(row, (ResidentAttCache, SharedPromptAttCache)) else row for row in rows]
 
 
 def _pack_att_cache(att: object) -> object:
@@ -1345,6 +1470,7 @@ class WholeEulerCFMGraphWrapper:
         modulation_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
         att_slots: int = 0,
         row_offsets: bool = False,
+        arena_rows_from_graph_grid: bool = False,
     ) -> None:
         """``ragged_body(estimator, input, t_emb, mask, cnn, att, cnn_out, att_out, lengths)``
         replaces ``estimator.blocks_forward_chunk`` in the captured solve when
@@ -1389,6 +1515,31 @@ class WholeEulerCFMGraphWrapper:
         if pad_max_rows is None:
             pad_max_rows = self.micro_batch_size // 4
         self.pad_max_rows = max(0, int(pad_max_rows))
+        self.arena_rows_from_graph_grid = bool(arena_rows_from_graph_grid)
+        # Parse VLLM_OMNI_CFM_GRAPH_GRID once at initialization
+        grid_raw = os.environ.get("VLLM_OMNI_CFM_GRAPH_GRID")
+        if grid_raw:
+            try:
+                parsed_grid = sorted({int(x) for x in grid_raw.split(",") if x.strip()})
+                filtered_batches = [b for b in parsed_grid if 0 < b <= self.micro_batch_size]
+                self._configured_graph_batches: list[int] = filtered_batches or [self.micro_batch_size]
+            except Exception:
+                logger.warning("Failed to parse VLLM_OMNI_CFM_GRAPH_GRID=%r; using powers of two", grid_raw)
+                self._configured_graph_batches = self._default_graph_batches()
+        else:
+            self._configured_graph_batches = self._default_graph_batches()
+
+        if self.arena_rows_from_graph_grid:
+            self._arena_rows = max(self._configured_graph_batches)
+            if self._arena_rows >= self.micro_batch_size:
+                logger.warning(
+                    "cfm_arena_rows_from_graph_grid is enabled, but the effective graph grid max (%d) "
+                    "is not smaller than micro_batch_size (%d); no arena memory will be saved",
+                    self._arena_rows,
+                    self.micro_batch_size,
+                )
+        else:
+            self._arena_rows = self.micro_batch_size
         # Largest steady cache length a caller announced; sizes the arena storage.
         self._att_capacity = 0
         parameter = next(estimator.parameters(), None)
@@ -1526,8 +1677,7 @@ class WholeEulerCFMGraphWrapper:
 
         return cur_x
 
-    def _graph_batches(self) -> list[int]:
-        """Native graph batch sizes: the powers of two below ``micro_batch_size``, and it."""
+    def _default_graph_batches(self) -> list[int]:
         sizes = []
         size = 1
         while size < self.micro_batch_size:
@@ -1535,6 +1685,14 @@ class WholeEulerCFMGraphWrapper:
             size *= 2
         sizes.append(self.micro_batch_size)
         return sizes
+
+    def _graph_batches(self) -> list[int]:
+        """Native graph batch sizes: the powers of two below ``micro_batch_size``, and it.
+
+        ``VLLM_OMNI_CFM_GRAPH_GRID`` (comma-separated sizes) pins them instead;
+        sizes above ``micro_batch_size`` are dropped.
+        """
+        return self._configured_graph_batches
 
     def _plan_groups(self, batch_size: int) -> list[tuple[int, int]]:
         """``(graph_batch, rows)`` replays that cover ``batch_size`` requests.
@@ -1546,7 +1704,7 @@ class WholeEulerCFMGraphWrapper:
         graph's replay costs well over its share of a larger one, so a padded
         row is cheaper than a further replay.
         """
-        sizes = self._graph_batches()
+        sizes = sorted(self._graph_batches())
         largest = max(sizes)
         groups: list[tuple[int, int]] = []
         remainder = batch_size
@@ -1558,7 +1716,13 @@ class WholeEulerCFMGraphWrapper:
             if up - remainder <= self.pad_max_rows:
                 groups.append((up, remainder))
                 break
-            down = max(size for size in sizes if size <= remainder)
+            down_candidates = [size for size in sizes if size <= remainder]
+            if not down_candidates:
+                # Configured grids without a singleton tier (e.g. VLLM_OMNI_CFM_GRAPH_GRID=16)
+                # must still handle batches smaller than the minimum tier (such as setup_batch).
+                groups.append((up, remainder))
+                break
+            down = max(down_candidates)
             groups.append((down, down))
             remainder -= down
         return groups
@@ -1626,11 +1790,11 @@ class WholeEulerCFMGraphWrapper:
             assert att_cache is not None
             static_att_rows[:, :, :, :, :rows].copy_(att_cache.unflatten(3, (2, batch_size))[:, :, :, :, start:stop])
         else:
-            for row, source in enumerate(_materialize_att_rows(att_rows[start:stop])):
+            for row, source in enumerate(att_rows[start:stop]):
                 # A mixed-reference batch right-pads shorter histories. Their
                 # remaining arena columns are excluded by the per-row mask.
                 row_offset = int(source.shape[5])
-                static_att_rows[:, :, :, :, row, :, :row_offset].copy_(source)
+                _copy_att_cache_range(static_att_rows[:, :, :, :, row, :, :row_offset], source, 0, row_offset)
 
     def _group_fills(self, groups: list[tuple[int, int]], after=None, **inputs) -> list[Callable]:
         """Per replay group, a ``fill(statics)`` that copies the group's requests in, then runs ``after``."""
@@ -1693,7 +1857,7 @@ class WholeEulerCFMGraphWrapper:
         # adding its width on top of the steady offset would hold ~300 frames
         # per row that nothing uses.
         capacity = max(offset + query_cap, max(offset, self._att_capacity) + 2 * self.query_bucket_frames)
-        rows = self.micro_batch_size
+        rows = self._arena_rows
         if self.att_slots:
             # Streaming chunks run from the slot pool; the arena only holds
             # what reaches it (the prompt solve or fallback), not a steady batch.
@@ -1963,7 +2127,11 @@ class WholeEulerCFMGraphWrapper:
             return None
         handles: list[ResidentAttCache] = []
         for row, needs in zip(att_rows, adopt, strict=True):
-            handle = pool.adopt(row.materialize() if isinstance(row, ResidentAttCache) else row) if needs else row
+            handle = (
+                pool.adopt(row.materialize() if isinstance(row, (ResidentAttCache, SharedPromptAttCache)) else row)
+                if needs
+                else row
+            )
             assert handle is not None
             handles.append(handle)
 
@@ -2162,7 +2330,9 @@ class WholeEulerCFMGraphWrapper:
         valid_lengths: list[int] | None = None,
         att_keep: tuple[int, int] | None = None,
         prompt_lengths: list[int] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | list[torch.Tensor]] | None:
+        prompt_att_segments: list[torch.Tensor | None] | None = None,
+        prompt_att_verified: list[bool] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | list[torch.Tensor | SharedPromptAttCache]] | None:
         """Solve the chunk through captured graphs; ``None`` sends it to the step/eager path.
 
         ``att_cache`` is the stacked ``(n_t, depth, 2, 2B, heads, L, head_dim)``
@@ -2282,8 +2452,9 @@ class WholeEulerCFMGraphWrapper:
         if mixed_offsets and x.device.type != "cuda" and not (x.device.type == "npu" and self.npu_mixed_history):
             return None
         if att_rows is not None:
-            # A refused slot replay can leave resident rows; the arena path reads tensors.
-            att_rows = _materialize_att_rows(att_rows)
+            # A refused slot replay can leave resident rows; the arena path reads
+            # tensors or copies SharedPromptAttCache piecewise via copy_range_to.
+            att_rows = [row.materialize() if isinstance(row, ResidentAttCache) else row for row in att_rows]
         offset_cap = _capture_offset(offset, self.offset_bucket_frames, sum(att_keep) if att_keep is not None else 0)
         mask_cap = _build_capture_mask(
             attn_mask=attn_mask,
@@ -2319,7 +2490,7 @@ class WholeEulerCFMGraphWrapper:
         out_cnn_rows = out_cnn.unflatten(2, (2, batch_size))
         out_att: torch.Tensor | None = None
         out_att_rows = None
-        request_att: list[torch.Tensor] = []
+        request_att: list[torch.Tensor | SharedPromptAttCache] = []
         if not att_rows_out:
             out_att = torch.empty(
                 (self.n_timesteps, arena.depth, 2, 2 * batch_size, arena.heads, keep_len, arena.head_dim),
@@ -2378,21 +2549,72 @@ class WholeEulerCFMGraphWrapper:
                 _copy_frame_segments(out_att_rows[:, :, :, :, start:stop], att_src, segments)
             else:
                 for row in range(rows):
-                    keep = row_keeps[start + row]
-                    row_segments = segments_by_shape[row_lengths[start + row], row_offsets[start + row], keep]
+                    global_row = start + row
+                    keep = row_keeps[global_row]
+                    row_segments = segments_by_shape[row_lengths[global_row], row_offsets[global_row], keep]
+                    total_frames = sum(length for _, length in row_segments)
                     shape = (
                         self.n_timesteps,
                         arena.depth,
                         2,
                         2,
                         arena.heads,
-                        sum(length for _, length in row_segments),
+                        total_frames,
                         arena.head_dim,
                     )
+                    row_src = att_src[:, :, :, :, row]
                     # The row's old cache was copied into the arena by ``fill``.
-                    old = att_rows[start + row] if att_rows is not None else None
+                    old = att_rows[global_row] if att_rows is not None else None
+                    prompt_segment = (
+                        prompt_att_segments[global_row]
+                        if prompt_att_segments is not None and global_row < len(prompt_att_segments)
+                        else None
+                    )
+                    if (
+                        prompt_segment is not None
+                        and prompt_segment.ndim == 7
+                        and int(prompt_segment.shape[5]) > 0
+                        and total_frames >= int(prompt_segment.shape[5])
+                        and prompt_segment.dtype == self.att_cache_dtype
+                        and prompt_segment.device == x.device
+                        and tuple(prompt_segment.shape[:5]) == shape[:5]
+                        and prompt_segment.shape[6] == shape[6]
+                    ):
+                        shared_len = int(prompt_segment.shape[5])
+                        prefix_segments, tail_segments = _split_segments_before_tail(row_segments, shared_len)
+                        already_verified = bool(
+                            prompt_att_verified is not None
+                            and global_row < len(prompt_att_verified)
+                            and prompt_att_verified[global_row]
+                            and (not isinstance(old, SharedPromptAttCache) or old.prompt is prompt_segment)
+                        )
+                        if already_verified or _matches_frame_segments(row_src, tail_segments, prompt_segment):
+                            prefix_len = total_frames - shared_len
+                            prefix = None
+                            if (
+                                isinstance(old, SharedPromptAttCache)
+                                and old.prefix.dtype == self.att_cache_dtype
+                                and owners[old.data_ptr()] == 1
+                            ):
+                                prefix = _resized_frame_view(old.prefix, prefix_len)
+                            if prefix is None:
+                                keep_frames = (sum(keep) if keep is not None else total_frames) - shared_len
+                                prefix_room = max(prefix_len, keep_frames)
+                                prefix = torch.empty(
+                                    (*shape[:5], prefix_room, shape[6]),
+                                    device=x.device,
+                                    dtype=self.att_cache_dtype,
+                                )[..., :prefix_len, :]
+                            _copy_frame_segments(prefix, row_src, prefix_segments)
+                            request_att.append(SharedPromptAttCache(prefix, prompt_segment))
+                            continue
+
                     request = None
-                    if old is not None and old.dtype == self.att_cache_dtype and owners[old.data_ptr()] == 1:
+                    if (
+                        isinstance(old, torch.Tensor)
+                        and old.dtype == self.att_cache_dtype
+                        and owners[old.data_ptr()] == 1
+                    ):
                         request = _resized_frame_view(old, shape[5])
                     if request is None:
                         # Room for the steady length, so the cache grows into it in place.
@@ -2400,7 +2622,7 @@ class WholeEulerCFMGraphWrapper:
                         request = torch.empty(
                             (*shape[:5], room, shape[6]), device=x.device, dtype=self.att_cache_dtype
                         )[..., : shape[5], :]
-                    _copy_frame_segments(request, att_src[:, :, :, :, row], row_segments)
+                    _copy_frame_segments(request, row_src, row_segments)
                     request_att.append(request)
             start = stop
 
