@@ -69,7 +69,14 @@
           "duplex_client_ttft_ms",
           "duplex_busy_rtf",
           "duplex_stall_ratio"
-        ]
+        ],
+        "baseline": {
+          "H100": {
+            "mean_duplex_busy_rtf": [
+              0.1701
+            ]
+          }
+        }
       }
     ],
     "judge_server_params": {
@@ -80,6 +87,7 @@
         "--served-model-name",
         "Qwen2.5-7B-Instruct"
       ]
-    }
+    },
+    "description": "H100 Busy RTF uses equal daily means from the seven comparable run dates 2026-11-16 through 2026-11-24. Higher variability is permitted, including the slower 11-16 run. All selected sources use full-history duplex behavior; earlier recent-history runs are excluded. Source: JiusiServe/omni-reviewbot@2b499afbfc2719740a1869ac20b5c5b9afafde10."
   }
 ]
