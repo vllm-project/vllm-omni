@@ -1385,6 +1385,10 @@ def extract_flux_context(
     # DEFINE TRANSFORMER EXECUTION (Flux1-specific)
     # ============================================================================
     def run_transformer_blocks() -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm_omni.diffusion.models.flux.flux_transformer import _with_qk_norm_rope_table
+
+        # Cache hits skip this closure, so only pack on steps that run blocks.
+        block_attention_kwargs = _with_qk_norm_rope_table(joint_attention_kwargs, image_rotary_emb, hidden_states)
         h = hidden_states
         e = encoder_hidden_states
 
@@ -1394,7 +1398,7 @@ def extract_flux_context(
                 encoder_hidden_states=e,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
+                joint_attention_kwargs=block_attention_kwargs,
             )
 
         for block in module.single_transformer_blocks:
@@ -1403,7 +1407,7 @@ def extract_flux_context(
                 encoder_hidden_states=e,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
+                joint_attention_kwargs=block_attention_kwargs,
             )
 
         return (h, e)
