@@ -1800,24 +1800,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # The repetition-penalty window is carried through the state
                 # and ``codes`` above, so only the counters and the cached
                 # input tensors reset.
+                if isinstance(condition_seq, int) and not isinstance(condition_seq, bool):
+                    self._reset_host_codec_segment(request_id, condition_seq, new_turn=bool(meta.get("turn_start")))
                 codec_states = getattr(self, "_request_codec_device_states", None)
                 if isinstance(codec_states, dict):
                     codec_states.pop(request_id, None)
                 codec_inputs = getattr(self, "_request_codec_device_inputs", None)
                 if isinstance(codec_inputs, dict):
                     codec_inputs.pop(request_id, None)
-                host_states = getattr(self, "_request_host_codec_states", None)
-                host_state = host_states.get(request_id) if isinstance(host_states, dict) else None
-                if (
-                    host_state is not None
-                    and isinstance(condition_seq, int)
-                    and not isinstance(condition_seq, bool)
-                    and host_state.get("condition_seq") != condition_seq
-                ):
-                    # Finishing one segment must not stop the next; retries of
-                    # the same segment must preserve its finished state.
-                    host_state["finished"] = False
-                    host_state["condition_seq"] = condition_seq
             empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
             return (
                 input_ids,
@@ -1851,6 +1841,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if isinstance(device_last, torch.Tensor):
             code = device_last.to(device=self.emb_code[0].weight.device, dtype=torch.long).reshape(1)
             return input_ids, self.emb_code[0](code), {}
+        if self._k_step_frames and input_ids.device.type == "npu" and isinstance(state, dict):
+            # Host codec feedback can use a row of the embedding without a gather.
+            last_code = state.get("last_code")
+            weight = self.emb_code[0].weight
+            if isinstance(last_code, int) and 0 <= last_code < weight.shape[0]:
+                return input_ids, weight.narrow(0, last_code, 1), {}
         k_last = state.get("last_code") if isinstance(state, dict) else None
         if isinstance(k_last, int) and k_last >= 0:
             code = torch.tensor(
@@ -1949,6 +1945,36 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             )
         embeds = self.emb_code[0](codes)
         return input_ids, embeds, empty, empty, updates
+
+    def write_kstep_frame_embeddings(
+        self,
+        inputs_embeds: torch.Tensor,
+        spans: list[tuple[int, int]],
+        infos: list[dict[str, Any]],
+        frame: int,
+    ) -> bool:
+        if inputs_embeds.device.type != "npu" or len(spans) < 2 or len(spans) != len(infos):
+            return False
+        width = int(spans[0][1]) - int(spans[0][0])
+        first = int(spans[0][0]) + frame
+        if width <= frame or first < 0 or first + (len(spans) - 1) * width >= inputs_embeds.shape[0]:
+            return False
+        sampled_ids = []
+        for row, ((start, end), info) in enumerate(zip(spans, infos)):
+            if int(start) + frame != first + row * width or int(end) - int(start) != width:
+                return False
+            if not isinstance(info, dict) or info.get("_omni_is_prefill", False):
+                return False
+            state = self._request_audio_states.get(_request_key(info, row))
+            if not isinstance(state, dict) or state.get("finished") or "_gpu_slot" in state:
+                return False
+            code = state.get("_kstep_last_code")
+            if not isinstance(code, torch.Tensor) or code.device != inputs_embeds.device or code.numel() != 1:
+                return False
+            sampled_ids.append(code.reshape(1))
+        last = first + (len(spans) - 1) * width
+        inputs_embeds[first : last + 1 : width].copy_(self.emb_code[0](torch.cat(sampled_ids)))
+        return True
 
     def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, Any]:
         talker_sampler = _install_mrv2_talker_sampler(sampler, self)
@@ -2887,15 +2913,33 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 continue
             projection_indices[index] = len(projection_rows)
             projection_rows.append(end - 1)
+        host_sampling = current_omni_platform.is_npu()
+        if host_sampling:
+            empty_delta = self._host_sample_empty_delta
         head_logits_all = None
         if projection_rows:
+            first_row = projection_rows[0]
+            last_row = projection_rows[-1]
+            row_stride = projection_rows[1] - first_row if len(projection_rows) > 1 else 1
             if len(projection_rows) == 1:
-                # A slice avoids the H2D copy and stream sync for an index tensor on NPU.
-                row = projection_rows[0]
-                head_logits_all = self.head_code[0](hidden[row : row + 1]).float()
+                projected_hidden = hidden[first_row : first_row + 1]
+            elif (
+                hidden.device.type == "npu"
+                and 0 <= first_row <= last_row < hidden.shape[0]
+                and row_stride > 0
+                and all(row == first_row + index * row_stride for index, row in enumerate(projection_rows))
+            ):
+                # Uniform K-step spans give a regularly spaced row per request.
+                # A view avoids uploading a host-built index tensor every frame.
+                projected_hidden = hidden[first_row : last_row + 1 : row_stride]
             else:
                 frame_rows = torch.tensor(projection_rows, device=hidden.device, dtype=torch.long)
-                head_logits_all = self.head_code[0](hidden.index_select(0, frame_rows)).float()
+                projected_hidden = hidden.index_select(0, frame_rows)
+            head_logits_all = self.head_code[0](projected_hidden).float()
+            if host_sampling:
+                # Each NumPy sampler consumes a distinct row of this host buffer.
+                # Copy all logits at once so the frame waits for the device once.
+                head_logits_all = head_logits_all.detach().cpu()
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
             if emit_duplex_metadata:
@@ -2960,10 +3004,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             codes = state.get("codes")
             if not isinstance(codes, torch.Tensor):
                 codes = (info.get("audio_codes", {}) or {}).get("accumulated")
+            history_device = torch.device("cpu") if host_sampling else hidden.device
             if not isinstance(codes, torch.Tensor):
-                codes = torch.empty(0, dtype=torch.long, device=hidden.device)
+                codes = torch.empty(0, dtype=torch.long, device=history_device)
             else:
-                codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
+                codes = codes.to(device=history_device, dtype=torch.long).reshape(-1)
             step = _codec_int_param(state, "step", 0)
             # Note: a turn-end chunk drains the way state["turn_end_drain"]
             # says (see _DRAIN_*), with the same criteria the single-frame
@@ -3002,7 +3047,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             assert head_logits_all is not None
             projection_index = projection_indices[index]
             frame_logits = head_logits_all[projection_index : projection_index + 1]
-            if current_omni_platform.is_npu():
+            if host_sampling:
                 # NPU: host-side codec sampling (PR #9990's path). The host
                 # sampler owns the eos/stop/limit transition, so no pending
                 # row is queued; the delta and state commit immediately.
@@ -3017,7 +3062,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     eos_window_masked=eos_window_masked,
                     lg_dev=frame_logits.reshape(-1),
                 )
-                sampled = torch.tensor(host_id, dtype=torch.long, device=hidden.device).reshape(())
+                # The host already knows the token index. Take a view into
+                # persistent device IDs instead of uploading a scalar per row.
+                ids = getattr(self, "_host_sample_device_ids", None)
+                if ids is None or ids.device != hidden.device or ids.numel() != head_logits_all.shape[-1]:
+                    ids = torch.arange(head_logits_all.shape[-1], dtype=torch.long, device=hidden.device)
+                    self._host_sample_device_ids = ids
+                sampled = ids.narrow(0, host_id, 1).reshape(())
                 sampled_id = int(host_id)
                 full_ids = state.get("codec_full_ids")
                 if isinstance(full_ids, list):
@@ -3028,9 +3079,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 emit_frame = bool(host_emit)
                 state["finished"] = finished
                 if emit_frame:
-                    codes = torch.cat([codes[-(HISTORY_WINDOW - 1) :], sampled.reshape(1)])
-                    delta = sampled.reshape(1, 1)
+                    # The host sampler and connector both consume CPU
+                    # history. Keep the device shadow for batched feedback.
+                    delta = torch.tensor([[sampled_id]], dtype=torch.long)
+                    codes = torch.cat([codes[-(HISTORY_WINDOW - 1) :], delta.reshape(1)])
                     state["last_code"] = sampled_id
+                    state["_kstep_last_code"] = sampled.reshape(1)
                     histories = getattr(self, "_request_codec_history", None)
                     if not isinstance(histories, dict):
                         histories = {}
@@ -3180,6 +3234,32 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     # This model always emits exactly one codec frame per query position, which
     # is what makes a multi-frame step decomposable into per-frame calls.
     supports_multi_frame_decode = True
+
+    def terminal_kstep_tail(
+        self, hidden: torch.Tensor, infos: list[dict[str, Any]]
+    ) -> tuple[OmniOutput, torch.Tensor] | None:
+        """Return the stop rows for an HTTP batch with no live codec request."""
+        states = self._request_audio_states
+        if not infos or any(
+            not isinstance(info, dict)
+            or info.get("native_duplex")
+            or not states.get(_request_key(info, row), {}).get("finished")
+            for row, info in enumerate(infos)
+        ):
+            return None
+        _, stop, _, finished, _ = self._step_constants(hidden)
+        empty_delta = self._host_sample_empty_delta
+        empty_valid = empty_delta.reshape(-1).bool()
+        return (
+            OmniOutput(
+                text_hidden_states=hidden,
+                multimodal_outputs={
+                    "codes": {"audio": [empty_delta] * len(infos)},
+                    "meta": {"finished": [finished] * len(infos), "codec_frame_valid": [empty_valid] * len(infos)},
+                },
+            ),
+            stop.expand(len(infos), -1),
+        )
 
     def take_batch_stop_logits(self) -> torch.Tensor | None:
         """Hand over this frame's stop rows and clear them.
@@ -3567,8 +3647,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         host scalars, replacing the per-frame eager micro-kernel chain (and
         its packed.cpu() sync) that the device samplers drive.
 
-        ``lg_dev`` optionally carries the next-row head result queued by the
-        caller after the previous row's D2H. Otherwise submit the head here.
+        ``lg_dev`` optionally carries the row projected by the caller, on
+        either the host or the device. Otherwise submit the head here.
 
         The draw uses a per-request python random.Random seeded from the
         same codec_seed the device path derives its NPU generator from: the
@@ -3660,8 +3740,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # The frame loop advances state["step"] (and passes it here) in
         # lockstep with the device state's own counter, so trust the caller.
         hstate["step"] = int(step)
-        # Device: project + one D2H of the raw logits row; the numpy chain (~0.9 ms/frame
-        # cheaper than CPU torch ops) then overlaps the pre-submitted next head.
+        # A CPU row was already transferred with the rest of the batch.
+        # Standalone callers still project or transfer one row here.
         lg = (
             (lg_dev if lg_dev is not None else self.head_code[0](hidden_state).float().reshape(-1).detach())
             .cpu()
@@ -3746,6 +3826,22 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 bins[sampled_id] = bins.get(sampled_id, 0) + 1
         return sampled_id, finished, emit
 
+    def _reset_host_codec_segment(self, request_id: str, condition_seq: int, *, new_turn: bool) -> None:
+        host_states = getattr(self, "_request_host_codec_states", None)
+        state = host_states.get(request_id) if host_states is not None else None
+        if state is None or state["condition_seq"] == condition_seq:
+            return
+        # K-step keeps host sampling state for the request, across native
+        # duplex conditions. Codec EOS stops the current condition only.
+        # Keep the seeded draw stream and within-turn repetition history.
+        state["finished"] = False
+        state["step"] = 0
+        state["condition_seq"] = condition_seq
+        state.pop("params", None)
+        if new_turn:
+            state["history"].clear()
+            state["bins"].clear()
+
     def _step_constants(self, hidden: torch.Tensor):
         """Constant per-step tensors, cached per (device, dtype).
 
@@ -3767,6 +3863,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 ),
             )
             self._step_constants_cache = cache
+            self._host_sample_empty_delta = torch.empty((0, 1), dtype=torch.long)
         return cache[1]
 
     def set_batch_stop_logits(self, logits: torch.Tensor | None) -> None:

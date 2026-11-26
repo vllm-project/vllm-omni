@@ -29,6 +29,16 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 HIDDEN = 8
 
 
+class _RecordingDecoderLayer(torch.nn.Module):
+    def __init__(self, *, config, cache_config, quant_config, prefix):
+        super().__init__()
+        self.received_hidden_states = []
+
+    def forward(self, positions, hidden_states, residual):
+        self.received_hidden_states.append(hidden_states.detach().clone())
+        return hidden_states, torch.zeros_like(hidden_states)  # a real layer returns a residual tensor
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _single_rank_vllm_dist():
     with socket.socket() as s:
@@ -48,7 +58,7 @@ def _backbone(embedding_size: int) -> Qwen2Model:
         vocab_size=32,
         hidden_size=HIDDEN,
         intermediate_size=16,
-        num_hidden_layers=0,
+        num_hidden_layers=1,
         num_attention_heads=2,
         num_key_value_heads=2,
     )
@@ -56,7 +66,7 @@ def _backbone(embedding_size: int) -> Qwen2Model:
     vllm_config = VllmConfig(compilation_config=CompilationConfig(mode=0), cache_config=CacheConfig())
     vllm_config.model_config = SimpleNamespace(hf_config=hf_config, dtype=torch.float32, is_multimodal_model=False)
     with set_current_vllm_config(vllm_config):
-        return Qwen2Model(vllm_config=vllm_config, prefix="model")
+        return Qwen2Model(vllm_config=vllm_config, prefix="model", decoder_layer_type=_RecordingDecoderLayer)
 
 
 @pytest.mark.parametrize("embedding_size", [HIDDEN, 2 * HIDDEN], ids=["equal_width", "wider_thinker"])
@@ -82,5 +92,7 @@ def test_projection_is_loaded_from_the_checkpoint_path_and_applied(embedding_siz
     params["thinker_to_talker_proj.bias"].data.copy_(bias)
 
     x = torch.randn(3, embedding_size)
-    expected = x @ weight.T + bias
-    assert torch.allclose(proj(x), expected, atol=1e-5)
+    first_layer = model.layers[0]
+    model(input_ids=torch.zeros(3, dtype=torch.long), positions=torch.arange(3), inputs_embeds=x)
+    assert len(first_layer.received_hidden_states) == 1
+    torch.testing.assert_close(first_layer.received_hidden_states[0], x @ weight.T + bias, rtol=1e-5, atol=1e-5)
