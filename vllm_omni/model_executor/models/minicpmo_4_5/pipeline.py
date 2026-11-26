@@ -56,7 +56,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
     # checkpoint would also intersect ``["MiniCPMO"]`` here and get routed
     # into the 4.5 pipeline, which would then fail at load time.
     hf_architectures=("MiniCPMO", "MiniCPMO45OmniForConditionalGeneration"),
-    hf_config_predicate=lambda c: str(getattr(c, "version", "")) == "4.5",
+    hf_config_predicate=lambda c: str(getattr(c, "version", "")) == "4.5" and getattr(c, "vocab_size", None) != 151749,
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -107,6 +107,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="MiniCPMO45Code2Wav",
+            retains_state_across_chunks=True,
             supports_native_mrv2_data_plane=True,
             supports_duplex_mrv2=True,
             sync_process_input_func=f"{_PROC}.tts2code2wav_token_only",

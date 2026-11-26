@@ -1,0 +1,4 @@
+# InternLM Sage-Interaction turn-based three-stage deploy (non-duplex).
+base_config: minicpmo_4_5_turn.yaml
+pipeline: sage_interaction
+session_mode: turn
