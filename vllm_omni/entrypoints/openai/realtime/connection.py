@@ -192,6 +192,15 @@ class OpenAIFullDuplexConnection:
         self._transcription_mode = False
         self._transcription_language: str | None = None
         self._transcription_prompt: str | None = None
+        # Staged by the raw absorber, committed only when the update is
+        # accepted: a rejected session.update must not change the live mode.
+        self._pending_transcription_session: dict[str, object] | None = None
+        # ASR runs off the read loop so the connection keeps receiving frames
+        # while a turn transcribes; the single worker drains the queue in
+        # order, so turns serialize and item order is preserved.
+        self._transcription_queue: asyncio.Queue[types.RealtimeConversationItemUserMessage] = asyncio.Queue()
+        self._transcription_task: asyncio.Task | None = None
+        self._active_transcription_request_id: str | None = None
         self._response_cancel_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
         self._session_trace: SessionTrace | None = None
@@ -254,6 +263,7 @@ class OpenAIFullDuplexConnection:
     async def _cleanup(self):
         self._connected = False
         await self._cancel_active_response()
+        await self._cancel_active_transcription()
         logger.info("[realtime] connection closed, session_id=%s", self.session.session_id)
 
     # ------------------------------------------------------------------ #
@@ -360,6 +370,7 @@ class OpenAIFullDuplexConnection:
 
         s.config = candidate_config
         self._turn_detector = turn_detector
+        self._commit_transcription_session()
         await self._send_session_updated()
 
     def _sanitize_session_config(
@@ -618,7 +629,7 @@ class OpenAIFullDuplexConnection:
             return
         if result.create_response:
             if self._transcription_mode:
-                await self._run_transcription(item)
+                self._enqueue_transcription(item)
                 return
             if self.session.active_response is not None and not detector.config.interrupt_response:
                 await self._send_error(
@@ -712,7 +723,7 @@ class OpenAIFullDuplexConnection:
 
         item = await self._commit_audio_buffer(event.event_id, item_id=self._speech_item_id)
         if item is not None and self._transcription_mode:
-            await self._run_transcription(item)
+            self._enqueue_transcription(item)
 
     def _absorb_transcription_session(self, text: str) -> str:
         """Absorb the #11074 transcription-session fields, then re-validate.
@@ -725,6 +736,9 @@ class OpenAIFullDuplexConnection:
         read from the raw JSON here (``extra="ignore"`` strips unknown
         session fields otherwise); the session type is then normalized so the
         adapter validates the remaining fields of the update unchanged.
+        The parsed mode and knobs are staged as a candidate and committed
+        only when the update is accepted, so a rejected update — at the
+        adapter or at session-level validation — never changes the live mode.
         """
         try:
             raw = json.loads(text)
@@ -735,16 +749,54 @@ class OpenAIFullDuplexConnection:
         session = raw.get("session")
         if not isinstance(session, dict):
             return text
+        candidate: dict[str, object] = {}
         if isinstance(session.get("type"), str):
-            self._transcription_mode = session["type"] == "transcription"
+            candidate["mode"] = session["type"] == "transcription"
         transcription_cfg = session.get("input_audio_transcription")
         if isinstance(transcription_cfg, dict):
-            self._transcription_language = transcription_cfg.get("language") or None
-            self._transcription_prompt = transcription_cfg.get("prompt") or None
+            candidate["language"] = transcription_cfg.get("language") or None
+            candidate["prompt"] = transcription_cfg.get("prompt") or None
+        self._pending_transcription_session = candidate or None
         if session.get("type") == "transcription":
             session["type"] = "realtime"
             return json.dumps(raw)
         return text
+
+    def _commit_transcription_session(self) -> None:
+        """Apply the staged transcription candidate of an accepted update."""
+        candidate = self._pending_transcription_session
+        self._pending_transcription_session = None
+        if candidate is None:
+            return
+        if "mode" in candidate:
+            self._transcription_mode = bool(candidate["mode"])
+        if "language" in candidate:
+            self._transcription_language = candidate["language"]  # type: ignore[assignment]
+        if "prompt" in candidate:
+            self._transcription_prompt = candidate["prompt"]  # type: ignore[assignment]
+
+    def _enqueue_transcription(self, item: types.RealtimeConversationItemUserMessage) -> None:
+        """Queue one committed turn for ASR and make sure the worker runs.
+
+        The transcription runs off the read loop so the connection keeps
+        receiving frames while a turn transcribes; the single worker drains
+        the queue in order, so turns serialize and item order is preserved.
+        """
+        self._transcription_queue.put_nowait(item)
+        if self._transcription_task is None or self._transcription_task.done():
+            self._transcription_task = asyncio.create_task(self._transcription_worker())
+
+    async def _transcription_worker(self) -> None:
+        while True:
+            item = await self._transcription_queue.get()
+            try:
+                await self._run_transcription(item)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[realtime] transcription worker failed")
+            finally:
+                self._transcription_queue.task_done()
 
     async def _run_transcription(self, item: types.RealtimeConversationItemUserMessage) -> None:
         """Transcribe one committed audio turn (#11074).
@@ -788,6 +840,7 @@ class OpenAIFullDuplexConnection:
 
         item_id = item.id or _gen_id("item")
         request_id = _gen_id("transcription")
+        self._active_transcription_request_id = request_id
         full_transcript = ""
         # Same parameter plumbing as a plain response: one entry per stage
         # from the engine defaults, delta outputs, and greedy decoding on the
@@ -835,6 +888,9 @@ class OpenAIFullDuplexConnection:
                 }
             )
             return
+        finally:
+            if self._active_transcription_request_id == request_id:
+                self._active_transcription_request_id = None
 
         await self._send_event(
             {
@@ -1856,6 +1912,29 @@ class OpenAIFullDuplexConnection:
                 await self._response_task
             except asyncio.CancelledError:
                 pass
+
+    async def _cancel_active_transcription(self) -> None:
+        """Abort the in-flight ASR request and stop the transcription worker.
+
+        Same contract as ``_cancel_active_response``: ``engine.abort()``
+        tears down the request's bookkeeping, and cancelling the worker is
+        what unblocks its ``async for`` output stream. The queue is dropped
+        with it — a disconnecting client will not read the transcripts.
+        """
+        request_id = self._active_transcription_request_id
+        if request_id is not None:
+            try:
+                await self.engine.abort(request_id)
+            except Exception:
+                logger.exception("Failed to abort transcription request %s", request_id)
+        if self._transcription_task is not None:
+            task, self._transcription_task = self._transcription_task, None
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     # ------------------------------------------------------------------ #
     #  conversation.item.create                                           #
