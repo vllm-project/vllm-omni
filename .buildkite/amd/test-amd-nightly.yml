@@ -143,8 +143,8 @@ steps:
             tests/e2e/online_serving/test_joyai_vl_interaction.py
 
   # MI300 owners for CUDA NIGHTLY "Diffusion · Quantization Test with H100 ·
-  # Single-GPU" and "with L4" (one selector minus the NVIDIA-only FlashInfer /
-  # CuTe DSL backends, LTX-2 split out), and for "Diffusion X2V · Wan2.2
+  # Single-GPU" and "with L4" (same selectors minus the NVIDIA-only FlashInfer /
+  # CuTe DSL backends; GGUF and LTX-2 run separately), and for "Diffusion X2V · Wan2.2
   # Autoround Function Test". Non-blocking until burn-in.
   - group: ":full_moon: Diffusion Quantization MI300 Nightly"
     steps:
@@ -158,13 +158,40 @@ steps:
         artifact_paths:
           - artifacts/rocm-diffusion-quantization/**/*
         commands:
+          # BAGEL's causal attention needs the dense masked AITER MHA module.
+          # A cold build (~250 s on this pod) inside stage init exceeds its
+          # 300 s timeout; build it here first.
+          - >-
+            python -c 'import torch; from aiter import flash_attn_func;
+            q = torch.randn(1, 32, 8, 128, device="cuda", dtype=torch.bfloat16);
+            flash_attn_func(q, q, q, causal=True)'
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 18 165m rocm-diffusion-quantization
+            tests/diffusion/quantization
+            --ignore=tests/diffusion/quantization/test_gguf_diffusion.py
+            --deselect tests/diffusion/quantization/test_quantization_fp8.py::test_single_stage_ltx2_fp8_uses_less_memory
+            --deselect "tests/diffusion/quantization/test_quantization_quality.py::test_quantization_quality[fp8_ltx2]"
+            -m 'full_model and diffusion and rocm and MI325 and cards_1 and not nvidia_only'
+
+      # vllm-gguf-plugin replaces DiffusersPipelineLoader.load_weights with a
+      # narrower signature, breaking online-quant CPU streaming; CUDA likewise
+      # installs it only in its L4 job.
+      - label: "Diffusion · Quantization · GGUF · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        source_file_dependencies: [diffusion_quantization, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-diffusion-quantization-gguf/**/*
+        commands:
           - pip install "vllm-gguf-plugin==0.0.4"
           - >-
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
-            1 20 165m rocm-diffusion-quantization
-            tests/diffusion/quantization
-            --deselect tests/diffusion/quantization/test_quantization_fp8.py::test_single_stage_ltx2_fp8_uses_less_memory
-            --deselect "tests/diffusion/quantization/test_quantization_quality.py::test_quantization_quality[fp8_ltx2]"
+            1 2 75m rocm-diffusion-quantization-gguf
+            tests/diffusion/quantization/test_gguf_diffusion.py
             -m 'full_model and diffusion and rocm and MI325 and cards_1 and not nvidia_only'
 
       # LTX-2 (19B) loads BF16 and FP8 copies; keep it in a fresh process so a
