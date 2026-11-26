@@ -765,10 +765,14 @@ def _attention_local_queries(
 def _patch_attention_block(module: nn.Module, group: dist.ProcessGroup, split_dim: str) -> None:
     if getattr(module, "_vllm_omni_spatial_shard_attention", False):
         return
+    from .wan_sdpa_alignment import aligned_wan_attention_forward
+
     orig_forward = module.forward
+    # The SDPA alignment forward has the same arithmetic as the diffusers one,
+    # so either may come first without disabling local queries.
     local_queries_supported = (
         isinstance(orig_forward, MethodType)
-        and orig_forward.__func__ is type(module).forward
+        and orig_forward.__func__ in (type(module).forward, aligned_wan_attention_forward)
         and type(getattr(module, "to_qkv", None)) is nn.Conv2d
         and type(getattr(module, "proj", None)) is nn.Conv2d
         and all(
