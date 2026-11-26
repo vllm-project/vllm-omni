@@ -59,7 +59,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
     # checkpoint would also intersect ``["MiniCPMO"]`` here and get routed
     # into the 4.5 pipeline, which would then fail at load time.
     hf_architectures=("MiniCPMO", "MiniCPMO45OmniForConditionalGeneration"),
-    hf_config_predicate=lambda c: str(getattr(c, "version", "")) == "4.5",
+    hf_config_predicate=lambda c: str(getattr(c, "version", "")) == "4.5" and getattr(c, "vocab_size", None) != 151749,
     stages=(
         StagePipelineConfig(
             stage_id=0,

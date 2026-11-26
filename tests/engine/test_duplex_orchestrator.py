@@ -1711,6 +1711,24 @@ def _enable_managed_windows(orchestrator, mocker):
 
 
 @pytest.mark.asyncio
+async def test_sage_uses_its_stage0_route_without_a_window_replay_lease(mocker):
+    from vllm_omni.model_executor.models.sage_interaction.duplex.plugin import SageInteractionDuplexPlugin
+
+    orchestrator, _, rpc_q, _ = _build(stages=3, replicas=2, plugin=SageInteractionDuplexPlugin(_encode_audio))
+    pool = _enable_managed_windows(orchestrator, mocker)
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        await _submit(orchestrator, _append_audio())
+        (submitted,) = [args[0] for client in pool.clients for args in client.add_request_calls]
+        duplex = submitted.model_intermediate_buffer["duplex"]
+        assert duplex["session_window_replay"] is False
+        assert "session_window_owned" not in duplex
+        assert SESSION_ID not in orchestrator._window_replicas
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_managed_window_follows_cancelled_epoch_and_releases_both_copies(mocker):
     orchestrator, _, rpc_q, _ = _build(stages=2, replicas=2)
     pool = _enable_managed_windows(orchestrator, mocker)

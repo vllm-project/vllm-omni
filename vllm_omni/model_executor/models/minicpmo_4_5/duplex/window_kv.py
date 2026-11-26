@@ -110,7 +110,7 @@ import torch
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec
 from vllm.v1.kv_cache_spec_registry import register_kv_cache_spec
 
-from vllm_omni.core.sched.window_policy import WindowCut, WindowOperation
+from vllm_omni.core.sched.window_policy import WindowCut, WindowOperation, duplex_window_replay_enabled
 from vllm_omni.engine.duplex.contracts import parse_duplex_resource_request_id
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowManager,
@@ -845,6 +845,8 @@ class MiniCPMO45SchedulerWindowPolicy:
     @staticmethod
     def observe_progress(request: Request) -> None:
         info = getattr(request, "model_intermediate_buffer", None)
+        if not duplex_window_replay_enabled(info):
+            return
         duplex = info.get("duplex") if isinstance(info, dict) else None
         if not isinstance(duplex, dict) or not duplex.get("data_plane"):
             return
@@ -922,7 +924,7 @@ class MiniCPMO45SchedulerWindowPolicy:
 
     def superseded_by(self, request: Request, live: Mapping[str, Request]) -> list[str]:
         sid = duplex_stage0_session_id(request.request_id)
-        if sid is None:
+        if sid is None or not duplex_window_replay_enabled(getattr(request, "model_intermediate_buffer", None)):
             return []
         _, epoch, _ = _stage0_order(request.request_id)
         return [
@@ -933,7 +935,8 @@ class MiniCPMO45SchedulerWindowPolicy:
 
     def prepare_admission(self, request: Request, max_prompt_len: int) -> int | None:
         sid = duplex_stage0_session_id(request.request_id)
-        if sid is None:
+        info = getattr(request, "model_intermediate_buffer", None)
+        if sid is None or not duplex_window_replay_enabled(info):
             return None
         if self.carry is None:
             self.carry = MiniCPMO45CarriedWindows()
@@ -944,7 +947,6 @@ class MiniCPMO45SchedulerWindowPolicy:
             if duplex_stage0_session_id(old_id) == sid:
                 window = pending
                 break
-        info = getattr(request, "model_intermediate_buffer", None)
         duplex = info.get("duplex") if isinstance(info, dict) else None
         if not isinstance(duplex, dict) or duplex.get("seq") != 1:
             return None
@@ -1037,7 +1039,10 @@ class MiniCPMO45SchedulerWindowPolicy:
         segment_output_ids: list[int],
         completed_terminator: int | None,
     ) -> int | None:
-        self.snapshot_window(request)
+        info = getattr(update, "model_intermediate_buffer", None)
+        replay_enabled = duplex_window_replay_enabled(info)
+        if replay_enabled:
+            self.snapshot_window(request)
         # A carried window must be placed by replacing the prompt, never by an in-place trim.
         reanchored = None
         if (
@@ -1051,7 +1056,6 @@ class MiniCPMO45SchedulerWindowPolicy:
                 segment_output_ids=segment_output_ids,
                 completed_terminator=completed_terminator,
             )
-        info = getattr(update, "model_intermediate_buffer", None)
         duplex = info.get("duplex") if isinstance(info, dict) else None
         if isinstance(duplex, dict) and isinstance(duplex.get("stage0_window"), dict):
             request._minicpmo45_window_planned = True
@@ -1061,7 +1065,11 @@ class MiniCPMO45SchedulerWindowPolicy:
             segment_output_ids=segment_output_ids,
             completed_terminator=completed_terminator,
         )
-        if isinstance(duplex, dict) and (start := getattr(request, "_minicpmo45_window_open_start", None)) is not None:
+        if (
+            replay_enabled
+            and isinstance(duplex, dict)
+            and (start := getattr(request, "_minicpmo45_window_open_start", None)) is not None
+        ):
             duplex["open_input_start"] = start
         if replaced:
             return len(update.prompt_token_ids)
@@ -1123,7 +1131,11 @@ class MiniCPMO45SchedulerWindowPolicy:
             request = requests.get(request_id)
             # A request that already finished (freed later) never reaches the worker's finished set again.
             live = request is not None and not request.is_finished()
-            if live and duplex_stage0_session_id(request_id) is not None:
+            if (
+                live
+                and duplex_stage0_session_id(request_id) is not None
+                and duplex_window_replay_enabled(getattr(request, "model_intermediate_buffer", None))
+            ):
                 if not getattr(request, "_minicpmo45_started", False):
                     # Never scheduled: it neither holds nor replaces the session's kept window.
                     carry.unstarted.add(request_id)

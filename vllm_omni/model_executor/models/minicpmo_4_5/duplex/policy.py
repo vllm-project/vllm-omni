@@ -37,7 +37,9 @@ def record_turn_sample(
 ) -> None:
     if terminator:
         opening = getattr(state, "explicit_response_awaiting_content", False)
-        if sampled == token_ids.get("listen_token_id") and (payload.get("force_listen") is True or opening):
+        if sampled == token_ids.get("listen_token_id") and (
+            payload.get("force_listen") is True or opening or getattr(state, "allow_speech_interruption", False)
+        ):
             state.current_turn_ended = True
             state.explicit_response_awaiting_content = False
             state.pending_speech_response_open = False
@@ -242,6 +244,9 @@ class MiniCPMO45DuplexPolicy:
         "delegate_open_token_id": "<delegate>",
         "delegate_close_token_id": "</delegate>",
         "audio_placeholder_token_id": "<|audio|>",
+        "audio_start_token_id": "<|audio_start|>",
+        "audio_end_token_id": "<|audio_end|>",
+        "delegate_token_id": "<|delegate|>",
         "image_start_token_id": "<image>",
         "image_end_token_id": "</image>",
         "slice_start_token_id": "<slice>",

@@ -15,6 +15,12 @@ if TYPE_CHECKING:
     from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 
 
+def duplex_window_replay_enabled(intermediate_buffer: object) -> bool:
+    """Respect a model's server-owned opt-out without disabling in-request trimming."""
+    duplex = intermediate_buffer.get("duplex") if isinstance(intermediate_buffer, dict) else None
+    return not isinstance(duplex, dict) or duplex.get("session_window_replay") is not False
+
+
 class WindowCut(NamedTuple):
     """A settled input range and the generated/closing tokens to replay after it."""
 

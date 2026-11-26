@@ -28,6 +28,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.core.sched.duplex_stage_work import stage_work_rows
+from vllm_omni.core.sched.window_policy import duplex_window_replay_enabled
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreRequest
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
@@ -828,6 +829,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 context.stage_id == 0
                 and submission.resumable
                 and isinstance(getattr(model_config, "scheduler_window_policy", None), str)
+                and duplex_window_replay_enabled(submission.prompt.get("model_intermediate_buffer"))
             )
             if keeps_window:
                 owner = self._window_replicas.get(context.session_id)

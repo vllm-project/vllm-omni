@@ -295,7 +295,11 @@ def prepare_stage0_window(
     # the scheduler accepted the segment stop. Window retention is optional.
     if not isinstance(window, dict) or (
         mode not in {"basic", "context"}
-        and (not runtime_config.get("duplex_boundary_token_ids") or duplex.get("session_window_owned") is False)
+        and (
+            not runtime_config.get("duplex_boundary_token_ids")
+            or duplex.get("session_window_owned") is False
+            or duplex.get("session_window_replay") is False
+        )
     ):
         return False
     base_len = int(getattr(session, "num_prompt_tokens", 0) or 0) + len(generated_ids)
