@@ -2016,7 +2016,6 @@ source_file_dependencies:
     - tests/e2e/accuracy/minimax_h3_image/
     - tests/e2e/accuracy/helpers.py
     - tests/e2e/accuracy/conftest.py
-    - tests/assets/qwen_image_edit/
     - tests/helpers/
     - tests/conftest.py
 

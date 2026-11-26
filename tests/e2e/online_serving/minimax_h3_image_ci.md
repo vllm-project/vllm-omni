@@ -68,15 +68,19 @@ with component-level CPU offload. The vLLM-Omni server uses single-GPU
 layerwise offload. The test resolves the model's `main` once and passes the
 same local snapshot to both implementations. It records the resolved commit in
 the accuracy results. Both implementations use the same text encoder and fixed
-2048² generation and editing requests. The test retains two draws per
-implementation and task, plus cross-implementation and repeatability SSIM/PSNR.
+requests from the NPU recipe: 1024² text-to-image with seed 42 and 2048²
+single-reference editing with seed 1234. Both use the CPU generator and the
+checkpoint's six-step schedule. The 1024² output is generated on the default
+2048² canvas and resized. The test keeps one PNG from each implementation per
+case and records cross-implementation SSIM and PSNR.
 
 From the repository root, source
 `tests/e2e/accuracy/minimax_h3_image/setup_reference.sh` and run the accuracy
 test with `--run-level full_model`. The first run needs access to the pinned
-Diffusers source and both weight formats. For offline runs, pre-cache `main`
-with the native and converted weights. The CUDA Nightly job retains images,
-metrics, and standard `result_acc_*.json` accuracy summaries. The test allocates
+Diffusers source and the model's `main` snapshot. For offline runs, cache both
+weight formats and `examples/reference1.png` and `examples/prompt.edit.txt` in
+that snapshot. The CUDA Nightly job retains images, metrics, and standard
+`result_acc_*.json` accuracy summaries. The test allocates
 up to 3 minutes for reference preflight, 20 for CUDA reference generation, 10
 for server startup, and 3 per image request. These limits leave at
 least 10 minutes of the 60-minute job for setup, cleanup, and artifacts.
@@ -88,8 +92,8 @@ Runtime errors still fail the test. To enforce thresholds, set `H3_IMAGE_CALIBRA
 after selecting device-specific `ssim` and `psnr` floors for both `t2i` and
 `edit` in `tests/e2e/accuracy/minimax_h3_image/thresholds.json` and changing its
 status to `selected`. The shared accuracy helpers resolve the device profile.
-All floors currently remain `null`; an unselected or invalid gate fails before
-model startup. Both draws for each task must meet both floors.
+All floors currently remain `null`. Gate mode requires each case to meet both
+floors and fails before model startup when the floors are unselected or invalid.
 
 A3 accuracy calibration is paused in Nightly while the Diffusers reference
 failure is investigated. Manual A3 runs use one die for each implementation.

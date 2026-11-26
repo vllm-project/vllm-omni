@@ -49,29 +49,28 @@ def main():
             return
         pipe.load_components(dtype=torch.bfloat16, local_files_only=True)
         if device_type == "npu":
-            # Either component can exceed a single die's memory when moved whole.
+            # ComponentsManager leaves group-offloaded modules in charge of their own placement.
             apply_group_offloading(pipe.text_encoder, onload_device=device, offload_type="leaf_level")
             apply_group_offloading(
                 pipe.transformer, onload_device=device, offload_type="block_level", num_blocks_per_group=1
             )
-        width, height = map(int, request["size"].split("x"))
         with Image.open(output / "edit-input.png") as source_image:
             reference = source_image.convert("RGB")
-        for task, prompt in request["prompts"].items():
+        for task, case in request["cases"].items():
+            width, height = map(int, case["size"].split("x"))
             kwargs = {"image": reference} if task == "edit" else {}
-            for draw in range(2):
-                image = pipe(
-                    prompt=prompt,
-                    height=height,
-                    width=width,
-                    generator=torch.Generator(device="cpu").manual_seed(request["seed"]),
-                    output="images",
-                    **kwargs,
-                )[0]
-                assert image.size == (width, height)
-                rgb = image.convert("RGB")
-                assert any(low != high for low, high in rgb.getextrema())
-                rgb.save(output / f"diffusers-{task}-{draw}.png")
+            image = pipe(
+                prompt=case["prompt"],
+                height=height,
+                width=width,
+                generator=torch.Generator(device="cpu").manual_seed(case["seed"]),
+                output="images",
+                **kwargs,
+            )[0]
+            assert image.size == (width, height)
+            rgb = image.convert("RGB")
+            assert any(low != high for low, high in rgb.getextrema())
+            rgb.save(output / f"diffusers-{task}.png")
 
 
 if __name__ == "__main__":

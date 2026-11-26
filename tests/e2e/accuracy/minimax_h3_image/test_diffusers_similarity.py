@@ -26,7 +26,6 @@ from tests.e2e.accuracy.helpers import (
     write_json_artifact,
 )
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServer
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.repo_utils import hf_api
@@ -34,11 +33,15 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 MODEL_ID = "MiniMaxAI/MiniMax-H3-Image"
-PROMPTS = {
-    "t2i": "A red bicycle leaning against a pale stone wall in warm afternoon sunlight.",
-    "edit": "Restyle <Picture 1> into a warm oil painting while preserving the subject and composition.",
+CASES = {
+    "t2i": {
+        "size": "1024x1024",
+        "seed": 42,
+        "prompt": "Documentary photograph of a lighthouse keeper on a cliff at dawn, Kodak Portra 400",
+    },
+    "edit": {"size": "2048x2048", "seed": 1234},
 }
-# The configured timeouts budget 45 minutes on CUDA and 50 on NPU, leaving time
+# The configured timeouts budget 39 minutes on CUDA and 44 on NPU, leaving time
 # for environment setup, snapshot resolution, and artifact handling.
 REFERENCE_PREFLIGHT_TIMEOUT_S = 180
 REFERENCE_GENERATION_TIMEOUT_S = 1200
@@ -59,7 +62,7 @@ def test_diffusers_similarity(accuracy_artifact_root):
         assert policy["status"] == "selected", (
             "Select device-specific bounds in thresholds.json after calibration before setting H3_IMAGE_CALIBRATE=0"
         )
-        for task in PROMPTS:
+        for task in CASES:
             tables[task] = {profile: SimilarityThresholds(**row) for profile, row in policy[task].items()}
             floors = resolve_similarity_thresholds(tables[task])
             assert type(floors.ssim) in (float, int) and -1 <= floors.ssim <= 1, f"Invalid SSIM floor for {task}"
@@ -83,6 +86,8 @@ def test_diffusers_similarity(accuracy_artifact_root):
             "text_encoder/*",
             "tokenizer/*",
             "processor/*",
+            "examples/reference1.png",
+            "examples/prompt.edit.txt",
         ],
         local_files_only=constants.HF_HUB_OFFLINE,
     )
@@ -90,20 +95,22 @@ def test_diffusers_similarity(accuracy_artifact_root):
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = (accuracy_artifact_root / "minimax_h3_image" / run_id).resolve()
     output.mkdir(parents=True)
-    source = get_asset_path("qwen_image_edit/qwen_image_edit_2511_test1.png")
-    reference_bytes = source.read_bytes()
+    examples = Path(model) / "examples"
+    reference_bytes = (examples / "reference1.png").read_bytes()
     (output / "edit-input.png").write_bytes(reference_bytes)
+    cases = {
+        **CASES,
+        "edit": {**CASES["edit"], "prompt": (examples / "prompt.edit.txt").read_text(encoding="utf-8").strip()},
+    }
     common = {
         "model": model,
-        "size": "2048x2048",
-        "seed": 42,
         "generator_device": "cpu",
         "num_inference_steps": 6,
         "response_format": "b64_json",
         "output_format": "png",
     }
     request_file = output / "request.json"
-    write_json_artifact(request_file, {**common, "prompts": PROMPTS, "revision": revision, "device_type": device_type})
+    write_json_artifact(request_file, {**common, "cases": cases, "revision": revision, "device_type": device_type})
     command = [python, str(Path(__file__).with_name("run_reference.py")), str(request_file)]
     env = dict(os.environ)
     pythonpath = env.pop("PYTHONPATH", "")
@@ -141,71 +148,61 @@ def test_diffusers_similarity(accuracy_artifact_root):
         args.append("--enforce-eager")
     with OmniServer(model, args, startup_timeout=OMNI_STARTUP_TIMEOUT_S) as server:
         url = f"http://{server.host}:{server.port}/v1/images/"
-        for task, prompt in PROMPTS.items():
-            request = {**common, "prompt": prompt}
-            for draw in range(2):
-                if task == "edit":
-                    response = requests.post(
-                        url + "edits",
-                        data=request,
-                        files=[("image", ("reference.png", reference_bytes, "image/png"))],
-                        timeout=IMAGE_REQUEST_TIMEOUT_S,
-                    )
-                else:
-                    response = requests.post(url + "generations", json=request, timeout=IMAGE_REQUEST_TIMEOUT_S)
-                response.raise_for_status()
-                images = response.json()["data"]
-                assert len(images) == 1
-                with Image.open(io.BytesIO(base64.b64decode(images[0]["b64_json"], validate=True))) as image:
-                    assert image.format == "PNG" and image.size == (2048, 2048)
-                    rgb = image.convert("RGB")
-                    assert any(low != high for low, high in rgb.getextrema())
-                    rgb.save(output / f"native-{task}-{draw}.png")
+        for task, case in cases.items():
+            request = {**common, **case}
+            if task == "edit":
+                response = requests.post(
+                    url + "edits",
+                    data=request,
+                    files=[("image", ("reference1.png", reference_bytes, "image/png"))],
+                    timeout=IMAGE_REQUEST_TIMEOUT_S,
+                )
+            else:
+                response = requests.post(url + "generations", json=request, timeout=IMAGE_REQUEST_TIMEOUT_S)
+            response.raise_for_status()
+            images = response.json()["data"]
+            assert len(images) == 1
+            with Image.open(io.BytesIO(base64.b64decode(images[0]["b64_json"], validate=True))) as image:
+                assert image.format == "PNG" and f"{image.width}x{image.height}" == case["size"]
+                rgb = image.convert("RGB")
+                assert any(low != high for low, high in rgb.getextrema())
+                rgb.save(output / f"native-{task}.png")
 
-    metrics: dict[str, dict[str, dict[str, float | str]]] = {}
-    for task in PROMPTS:
-        comparisons = {
-            "native_vs_diffusers_first": ("native", 0, "diffusers", 0),
-            "native_vs_diffusers_second": ("native", 1, "diffusers", 1),
-            "diffusers_repeatability": ("diffusers", 1, "diffusers", 0),
-            "native_repeatability": ("native", 1, "native", 0),
-        }
-        metrics[task] = {}
-        for name, (candidate, candidate_draw, reference, reference_draw) in comparisons.items():
-            with (
-                Image.open(output / f"{candidate}-{task}-{candidate_draw}.png") as prediction,
-                Image.open(output / f"{reference}-{task}-{reference_draw}.png") as baseline,
-            ):
-                ssim, psnr = compute_image_ssim_psnr(prediction=prediction, reference=baseline)
-            metrics[task][name] = {"ssim": ssim, "psnr_db": "inf" if psnr == math.inf else psnr}
+    metrics: dict[str, dict[str, float | str]] = {}
+    for task in cases:
+        with (
+            Image.open(output / f"native-{task}.png") as prediction,
+            Image.open(output / f"diffusers-{task}.png") as baseline,
+        ):
+            ssim, psnr = compute_image_ssim_psnr(prediction=prediction, reference=baseline)
+        metrics[task] = {"ssim": ssim, "psnr_db": "inf" if psnr == math.inf else psnr}
     write_json_artifact(output / "metrics.json", metrics)
-    for task in PROMPTS:
-        scores = metrics[task]["native_vs_diffusers_first"]
+    for task, scores in metrics.items():
         write_accuracy_result(
             model_id=MODEL_ID,
             dataset=f"image_similarity_{task}",
-            metrics={"ssim": scores["ssim"], "psnr": float(scores["psnr_db"])},
+            metrics={"ssim": float(scores["ssim"]), "psnr": float(scores["psnr_db"])},
             baseline=baseline_from_similarity_thresholds(tables[task]) if task in tables else None,
             result_dir=output,
             extra={
                 "case": task,
+                "size": cases[task]["size"],
+                "seed": cases[task]["seed"],
                 "revision": revision,
                 "device_type": device_type,
                 "calibration_only": calibration == "1",
                 "threshold_status": policy["status"],
-                "comparisons": metrics[task],
             },
         )
     if calibration == "1":
         pytest.skip(f"Diffusers calibration collected at {output}; accuracy thresholds were not enforced.")
 
     for task, floors in thresholds.items():
-        for draw_name in ("first", "second"):
-            scores = metrics[task][f"native_vs_diffusers_{draw_name}"]
-            assert_similarity_metrics(
-                model_name=f"MiniMax-H3-Image {task} ({draw_name} draw)",
-                ssim_score=float(scores["ssim"]),
-                psnr_score=float(scores["psnr_db"]),
-                ssim_threshold=floors.ssim,
-                psnr_threshold=floors.psnr,
-            )
+        scores = metrics[task]
+        assert_similarity_metrics(
+            model_name=f"MiniMax-H3-Image {task}",
+            ssim_score=float(scores["ssim"]),
+            psnr_score=float(scores["psnr_db"]),
+            ssim_threshold=floors.ssim,
+            psnr_threshold=floors.psnr,
+        )
