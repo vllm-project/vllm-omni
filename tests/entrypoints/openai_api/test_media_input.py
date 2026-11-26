@@ -4,7 +4,6 @@
 import asyncio
 import socket
 from functools import partial
-from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -31,9 +30,12 @@ def _address_info(address: str, port: int):
 
 
 @pytest.mark.asyncio
-async def test_media_request_uses_checked_ip_with_original_host(monkeypatch, install_transport):
-    resolve = AsyncMock(return_value=[_address_info("93.184.216.34", 8443), _address_info("1.1.1.1", 8443)])
-    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
+async def test_media_request_uses_checked_ip_with_original_host(mocker, install_transport):
+    resolve = mocker.patch.object(
+        asyncio.get_running_loop(),
+        "getaddrinfo",
+        return_value=[_address_info("93.184.216.34", 8443), _address_info("1.1.1.1", 8443)],
+    )
     attempted_hosts = []
 
     def handle(request):
@@ -60,9 +62,8 @@ async def test_media_request_uses_checked_ip_with_original_host(monkeypatch, ins
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("address", ["127.0.0.1", "10.0.0.1", "::1", "::ffff:10.0.0.1", "ff02::1"])
-async def test_media_request_rejects_non_public_ip(monkeypatch, install_transport, address):
-    resolve = AsyncMock(return_value=[_address_info(address, 443)])
-    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
+async def test_media_request_rejects_non_public_ip(mocker, install_transport, address):
+    mocker.patch.object(asyncio.get_running_loop(), "getaddrinfo", return_value=[_address_info(address, 443)])
     install_transport(lambda request: pytest.fail("Non-public media addresses must not be contacted"))
 
     with pytest.raises(InvalidInputReferenceError, match="public IP address"):
@@ -70,9 +71,12 @@ async def test_media_request_rejects_non_public_ip(monkeypatch, install_transpor
 
 
 @pytest.mark.asyncio
-async def test_redirect_media_request_checks_new_destination(monkeypatch, install_transport):
-    resolve = AsyncMock(side_effect=[[_address_info("93.184.216.34", 443)], [_address_info("10.0.0.1", 443)]])
-    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
+async def test_redirect_media_request_checks_new_destination(mocker, install_transport):
+    resolve = mocker.patch.object(
+        asyncio.get_running_loop(),
+        "getaddrinfo",
+        side_effect=[[_address_info("93.184.216.34", 443)], [_address_info("10.0.0.1", 443)]],
+    )
     contacted = []
 
     def handle(request):
@@ -102,10 +106,9 @@ async def test_redirect_media_request_checks_new_destination(monkeypatch, instal
     ],
 )
 async def test_redirect_media_cookies_follow_the_logical_origin_and_path(
-    monkeypatch, install_transport, location, expect_cookies
+    mocker, install_transport, location, expect_cookies
 ):
-    resolve = AsyncMock(return_value=[_address_info("93.184.216.34", 443)])
-    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
+    mocker.patch.object(asyncio.get_running_loop(), "getaddrinfo", return_value=[_address_info("93.184.216.34", 443)])
 
     def handle(request):
         assert request.url.host == "93.184.216.34"
@@ -147,3 +150,27 @@ async def test_media_download_timeout_includes_address_resolution(monkeypatch, i
         await media_input.download_media_bytes(
             "https://media.example.com/asset", max_bytes=5, source="reference", timeout_s=0.05
         )
+
+
+@pytest.mark.asyncio
+async def test_media_download_timeout_closes_a_stalled_body(mocker, install_transport):
+    class StalledBody(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            yield b"partial media"
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            self.closed = True
+
+    body = StalledBody()
+    mocker.patch.object(asyncio.get_running_loop(), "getaddrinfo", return_value=[_address_info("93.184.216.34", 443)])
+    install_transport(lambda request: httpx.Response(200, stream=body))
+
+    with pytest.raises(media_input.MediaInputTimeoutError):
+        await media_input.download_media_bytes(
+            "https://media.example.com/asset", max_bytes=None, source="reference", timeout_s=0.05
+        )
+
+    assert body.closed

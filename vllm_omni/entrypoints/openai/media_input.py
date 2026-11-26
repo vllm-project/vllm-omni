@@ -149,6 +149,64 @@ async def _stream_media_response(
     raise InvalidInputReferenceError(f"Invalid {source}: media URL must resolve to a public IP address.")
 
 
+async def _download_media_bytes(
+    url: str, *, max_bytes: int | None, source: str, follow_redirects: bool, timeout_s: float
+) -> bytes:
+    async with httpx.AsyncClient(
+        timeout=timeout_s,
+        follow_redirects=False,
+        trust_env=False,
+        verify=httpx.create_ssl_context(),
+        # Different hostnames can resolve to the same address and need distinct TLS connections.
+        limits=httpx.Limits(max_keepalive_connections=0),
+    ) as client:
+        current_url = httpx.URL(url)
+        redirect_count = 0
+        cookies_by_origin: defaultdict[tuple[str, bytes], httpx.Cookies] = defaultdict(httpx.Cookies)
+        while True:
+            origin = (current_url.scheme, current_url.netloc)
+            async with _stream_media_response(
+                client, current_url, source=source, cookies=cookies_by_origin[origin]
+            ) as response:
+                if response.has_redirect_location:
+                    if not follow_redirects:
+                        response.raise_for_status()
+                    if redirect_count >= _MAX_REDIRECTS:
+                        raise httpx.TooManyRedirects(
+                            f"Exceeded {_MAX_REDIRECTS} redirects.",
+                            request=response.request,
+                        )
+                    current_url = current_url.join(response.headers["location"])
+                    redirect_count += 1
+                    continue
+
+                response.raise_for_status()
+                content_encoding = response.headers.get("content-encoding", "").strip().lower()
+                if content_encoding and content_encoding != "identity":
+                    raise InvalidInputReferenceError(f"Invalid {source}: compressed responses are not supported.")
+
+                content_length = response.headers.get("content-length")
+                declared_length = None
+                if content_length is not None:
+                    try:
+                        declared_length = int(content_length)
+                    except ValueError:
+                        declared_length = None
+                if max_bytes is not None and declared_length is not None and declared_length > max_bytes:
+                    raise MediaInputTooLargeError(
+                        f"Invalid {source}: response exceeds the {max_bytes // _MIB} MiB size limit."
+                    )
+
+                payload = bytearray()
+                async for chunk in response.aiter_bytes(chunk_size=_READ_CHUNK_SIZE):
+                    if max_bytes is not None and len(payload) + len(chunk) > max_bytes:
+                        raise MediaInputTooLargeError(
+                            f"Invalid {source}: response exceeds the {max_bytes // _MIB} MiB size limit."
+                        )
+                    payload.extend(chunk)
+                return bytes(payload)
+
+
 async def download_media_bytes(
     url: str,
     *,
@@ -190,62 +248,16 @@ async def download_media_bytes(
         raise ValueError("timeout_s must be positive")
 
     try:
-        async with asyncio.timeout(timeout_s):
-            async with httpx.AsyncClient(
-                timeout=timeout_s,
-                follow_redirects=False,
-                trust_env=False,
-                verify=httpx.create_ssl_context(),
-                # Different hostnames can resolve to the same address and need distinct TLS connections.
-                limits=httpx.Limits(max_keepalive_connections=0),
-            ) as client:
-                current_url = httpx.URL(url)
-                redirect_count = 0
-                cookies_by_origin: defaultdict[tuple[str, bytes], httpx.Cookies] = defaultdict(httpx.Cookies)
-                while True:
-                    origin = (current_url.scheme, current_url.netloc)
-                    async with _stream_media_response(
-                        client, current_url, source=source, cookies=cookies_by_origin[origin]
-                    ) as response:
-                        if response.has_redirect_location:
-                            if not follow_redirects:
-                                response.raise_for_status()
-                            if redirect_count >= _MAX_REDIRECTS:
-                                raise httpx.TooManyRedirects(
-                                    f"Exceeded {_MAX_REDIRECTS} redirects.",
-                                    request=response.request,
-                                )
-                            current_url = current_url.join(response.headers["location"])
-                            redirect_count += 1
-                            continue
-
-                        response.raise_for_status()
-                        content_encoding = response.headers.get("content-encoding", "").strip().lower()
-                        if content_encoding and content_encoding != "identity":
-                            raise InvalidInputReferenceError(
-                                f"Invalid {source}: compressed responses are not supported."
-                            )
-
-                        content_length = response.headers.get("content-length")
-                        declared_length = None
-                        if content_length is not None:
-                            try:
-                                declared_length = int(content_length)
-                            except ValueError:
-                                declared_length = None
-                        if max_bytes is not None and declared_length is not None and declared_length > max_bytes:
-                            raise MediaInputTooLargeError(
-                                f"Invalid {source}: response exceeds the {max_bytes // _MIB} MiB size limit."
-                            )
-
-                        payload = bytearray()
-                        async for chunk in response.aiter_bytes(chunk_size=_READ_CHUNK_SIZE):
-                            if max_bytes is not None and len(payload) + len(chunk) > max_bytes:
-                                raise MediaInputTooLargeError(
-                                    f"Invalid {source}: response exceeds the {max_bytes // _MIB} MiB size limit."
-                                )
-                            payload.extend(chunk)
-                        return bytes(payload)
+        return await asyncio.wait_for(
+            _download_media_bytes(
+                url,
+                max_bytes=max_bytes,
+                source=source,
+                follow_redirects=follow_redirects,
+                timeout_s=timeout_s,
+            ),
+            timeout=timeout_s,
+        )
     except httpx.InvalidURL as exc:
         raise InvalidInputReferenceError(f"Invalid {source}: invalid media URL.") from exc
     except TimeoutError as exc:

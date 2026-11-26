@@ -102,7 +102,9 @@ async def test_decode_image_url_follows_redirects_when_allowed(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_decode_image_url_does_not_read_redirect_response_body(monkeypatch):
+@pytest.mark.parametrize("limit_enabled", [True, False], ids=["bounded", "unbounded"])
+async def test_decode_image_url_does_not_read_redirect_response_body(monkeypatch, limit_enabled):
+    image_bytes = _png_bytes()
     redirect_stream = _ChunkedStream([b"not-a-gzip-body"])
 
     def _handler(request):
@@ -112,13 +114,14 @@ async def test_decode_image_url_does_not_read_redirect_response_body(monkeypatch
                 headers={
                     "location": "/image.png",
                     "content-encoding": "gzip",
-                    "content-length": str(video_api_utils.MAX_IMAGE_INPUT_BYTES + 1),
+                    "content-length": str(len(image_bytes) + 1),
                 },
                 stream=redirect_stream,
             )
-        return httpx.Response(200, content=_png_bytes(), headers={"content-type": "image/png"})
+        return httpx.Response(200, content=image_bytes, headers={"content-type": "image/png"})
 
     monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
+    monkeypatch.setattr(video_api_utils, "MAX_IMAGE_INPUT_BYTES", len(image_bytes) if limit_enabled else None)
     _install_http_transport(monkeypatch, _handler, [])
 
     image = await video_api_utils.decode_image_url("https://93.184.216.34/redirect.png")
