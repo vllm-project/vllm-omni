@@ -25,7 +25,7 @@ from vllm_omni.diffusion.models.hy_nomas.interaction import (
     HyNomasCameraInteractionHandler,
     HyNomasPromptInteractionHandler,
 )
-from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import HyNomasPipeline
+from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import HyNomasPipeline, validate_config
 from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import normalize_request, plan_chunks
 from vllm_omni.diffusion.models.interface import supports_interaction_apply, supports_step_execution
 from vllm_omni.diffusion.output_formatter import format_diffusion_outputs, normalize_diffusion_postprocess_output
@@ -35,6 +35,7 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.ar_diffusion.capability import SupportsARDiffusionPipeline
+from vllm_omni.experimental.ar_diffusion.engine import AR_DIFFUSION_MODEL_RUNNER_CLS
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionControlInput, ARDiffusionTickRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -540,6 +541,21 @@ def test_empty_decoder_chunk_preserves_tick_metadata(runner):
     assert len(execute(runner, batch(index=1, close=True)).output["payload"]["video"]) == 18
 
 
+def test_hy_nomas_validates_the_effective_runner_for_step_execution():
+    config = OmniDiffusionConfig(
+        distributed_executor_backend="mp",
+        step_execution=True,
+        streaming_output=True,
+        dtype=torch.bfloat16,
+        diffusion_model_runner_cls=AR_DIFFUSION_MODEL_RUNNER_CLS,
+    )
+    validate_config(config)
+    config.engine_backend = "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
+    config.diffusion_model_runner_cls = "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
+    with pytest.raises(ValueError, match="requires ARDiffusionModelRunner"):
+        validate_config(config)
+
+
 @pytest.mark.parametrize(
     ("decoder_mode", "sp_size"), [(None, 2), ("window", 2), ("window", 4), ("window", 8), ("window", 16)]
 )
@@ -566,7 +582,8 @@ def test_public_deploy_resolution_preserves_ar_configuration(tmp_path, decoder_m
         strategy_config_path=None,
     )
     [stage] = resolution.stage_configs
-    assert stage.diffusion_config.engine_backend == "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
+    assert stage.diffusion_config.engine_backend == "default"
+    assert stage.diffusion_config.diffusion_model_runner_cls == AR_DIFFUSION_MODEL_RUNNER_CLS
     assert stage.diffusion_config.step_execution and stage.diffusion_config.streaming_output
     assert stage.parallel_config.ulysses_degree == sp_size
     assert stage.parallel_config.sequence_parallel_size == sp_size

@@ -26,7 +26,7 @@ stages:
           - "*adaln_proj*"
       text_encoder: null
     model_class_name: TaoMateH3Pipeline
-    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    diffusion_model_runner_cls: vllm_omni.experimental.ar_diffusion.runner.ARDiffusionModelRunner
     step_execution: true
     streaming_output: true
     parallel_config:

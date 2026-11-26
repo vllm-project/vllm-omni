@@ -18,8 +18,8 @@ stages:
     max_num_seqs: 1
     enforce_eager: true
     model_class_name: LingBotWorldCausalDMDPipeline
-    # LingBot runs on the AR-Diffusion engine (engine-level paged KV cache).
-    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    # LingBot uses the AR-Diffusion runner for paged KV cache.
+    diffusion_model_runner_cls: vllm_omni.experimental.ar_diffusion.runner.ARDiffusionModelRunner
     # One request, many streamed chunks. streaming_output implies step_execution,
     # but both are stated here so the topology is readable on its own.
     step_execution: true

@@ -475,8 +475,12 @@ streams with an error, closes scheduler state, and shuts down the executor.
 
 ## Extension boundaries
 
-- A custom engine may set `default_diffusion_model_runner_cls`; an explicit
-  `diffusion_model_runner_cls` configuration still wins.
+- Set `diffusion_model_runner_cls` to a runner's qualified import path to use
+  it with the default engine. Shipped AR diffusion deploys explicitly select
+  `ARDiffusionModelRunner`.
+- When the runner is omitted, the selected engine's
+  `default_diffusion_model_runner_cls` takes precedence over the platform
+  default. This keeps existing `ARDiffusionEngine` deploys compatible.
 - Tests and custom engine integrations may inject a `BaseScheduler` subclass.
   `SchedulerInterface` remains only as a deprecated compatibility name.
 - `distributed_executor_backend` may be `"uni"`, `"mp"`, `"ray"`, a custom `DiffusionExecutor`

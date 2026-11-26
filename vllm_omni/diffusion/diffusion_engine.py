@@ -95,6 +95,7 @@ from vllm_omni.metrics.utils import (
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
     from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -1547,6 +1548,27 @@ class DiffusionEngine:
                 raise TypeError(f"engine_backend must resolve to a DiffusionEngine subclass. Got {engine_class}.")
             return engine_class
         raise ValueError(f"Unknown engine_backend: {backend!r}")
+
+    @staticmethod
+    def resolve_model_runner_class(config: OmniDiffusionConfig) -> type[DiffusionModelRunner]:
+        """Select the runner from the explicit override, engine default, or platform."""
+        from vllm_omni.platforms import current_omni_platform
+
+        # Guard against non-string values such as unconfigured test mocks.
+        override = getattr(config, "diffusion_model_runner_cls", None)
+        if isinstance(override, str) and override:
+            return resolve_obj_by_qualname(override)
+
+        try:
+            engine_class = DiffusionEngine.resolve_engine_class(config)
+        except (ImportError, AttributeError, TypeError, ValueError):
+            logger.warning("engine_backend resolution failed; using platform diffusion runner", exc_info=True)
+        else:
+            engine_runner = engine_class.default_diffusion_model_runner_cls
+            if isinstance(engine_runner, str) and engine_runner:
+                return resolve_obj_by_qualname(engine_runner)
+
+        return resolve_obj_by_qualname(current_omni_platform.get_diffusion_model_runner_cls())
 
     @staticmethod
     def make_engine(

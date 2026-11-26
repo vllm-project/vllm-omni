@@ -1,23 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Every shipped DreamZero deploy config must select the AR-Diffusion engine.
-
-``DreamZeroPipeline.__init__`` rejects any other engine, so a config missing
-``engine_backend`` fails at worker startup rather than at request time. That
-only surfaces in slow multi-GPU e2e serving tests (see issue #5046), so assert
-it here on CPU instead.
-"""
+"""Keep shipped DreamZero deploys on the default engine and AR runner."""
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from tests.helpers.stage_config import get_deploy_config_path
-from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
-from vllm_omni.experimental.ar_diffusion.engine import ARDiffusionEngine
+from vllm_omni.experimental.ar_diffusion.engine import AR_DIFFUSION_MODEL_RUNNER_CLS
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -44,14 +36,6 @@ def test_dreamzero_deploy_configs_exist() -> None:
     _dreamzero_stages(),
     ids=lambda value: value if isinstance(value, str) else None,
 )
-def test_dreamzero_stage_selects_ar_diffusion_engine(config_name: str, stage_index: int, stage: dict) -> None:
-    backend = stage.get("engine_backend")
-    assert backend, (
-        f"{config_name} stage {stage_index} does not set engine_backend; "
-        "DreamZeroPipeline requires the AR-Diffusion engine"
-    )
-    # Resolving also proves the import path is real, not just a lookalike string.
-    engine_class = DiffusionEngine.resolve_engine_class(SimpleNamespace(engine_backend=backend))
-    assert issubclass(engine_class, ARDiffusionEngine), (
-        f"{config_name} stage {stage_index} resolves to {engine_class.__name__}, not an AR-Diffusion engine"
-    )
+def test_dreamzero_stage_selects_ar_diffusion_runner(config_name: str, stage_index: int, stage: dict) -> None:
+    assert stage.get("engine_backend", "default") == "default", (config_name, stage_index)
+    assert stage.get("diffusion_model_runner_cls") == AR_DIFFUSION_MODEL_RUNNER_CLS, (config_name, stage_index)

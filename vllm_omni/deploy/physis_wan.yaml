@@ -10,7 +10,7 @@ stages:
     video_output_transport:
       enable_device_postprocess: true
     model_class_name: PhysisWanPipeline
-    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    diffusion_model_runner_cls: vllm_omni.experimental.ar_diffusion.runner.ARDiffusionModelRunner
     default_sampling_params:
       # Resolve the frame count from the selected profile and chunk count.
       num_frames: null
