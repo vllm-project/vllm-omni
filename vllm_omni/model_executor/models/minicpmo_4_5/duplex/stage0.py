@@ -96,6 +96,9 @@ class _MiniCPMO45Stage0SessionState:
     pending_terminator_token: int | None = None
     last_terminator_token: int | None = None
     pending_speech_context: bool = False
+    quiet_audio_units: int = 0
+    speech_after_idle: bool = False
+    idle_reply_due: bool = False
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
     generated_tokens: list[int] = field(default_factory=list)
@@ -643,11 +646,21 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.pending_speech_context = True
             state.pending_speech_append_identity = append_identity
             if has_text and not force_listen and state.current_turn_ended:
-                # Like the initial text prompt, an unforced fragment opens an
-                # assistant turn. Apply this once at prefill, never on each
-                # decode step: turn_eos must keep the turn closed afterward.
+                # Reopen once for an unforced text append.
                 state.current_turn_ended = False
                 state.pending_speech_response_open = True
+        if is_speech:
+            # The audio front end bounds its streaming history at 30 seconds.
+            # Allow one reply at the end of the first voiced turn after that gap.
+            state.speech_after_idle |= state.quiet_audio_units >= 30 and state.current_turn_ended
+            state.quiet_audio_units = 0
+            state.idle_reply_due = False
+        elif not (num_frames or has_text):
+            state.quiet_audio_units += units_built
+            state.idle_reply_due |= state.speech_after_idle
+            state.speech_after_idle = False
+        else:
+            state.quiet_audio_units = 0
         if append_identity is not None:
             state.prepared_append_identity = append_identity
             state.prepared_inputs_embeds = inputs_embeds

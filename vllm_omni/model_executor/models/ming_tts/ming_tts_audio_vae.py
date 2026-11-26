@@ -7,7 +7,7 @@ import time
 import warnings
 from collections import OrderedDict
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -16,15 +16,23 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.device_copy import to_device_nonblocking
 
 from .config_ming_tts import KEY_CHUNK_ID, KEY_REQUEST_ID, MingTTSConfig
 
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.ming3_tts.batched_vae_decoder import BatchedStreamingVAEDecoder
+
 _STREAM_STATE_TTL_SECONDS = 15 * 60
 _MAX_STREAM_STATES = 1024
+DENSE_PACKED_GRAPH_TOKENS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
 
 class MingAudioVAEModel(nn.Module):
     input_modalities = "audio"
+    _batched_vae_enabled = False
+    _max_stream_states = _MAX_STREAM_STATES
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -36,6 +44,11 @@ class MingAudioVAEModel(nn.Module):
         self.ming_config.validate()
 
         self.audio = AudioVAE(self.ming_config.audio_tokenizer_config, build_encoder=False)
+        self._batched_vae_decoder: BatchedStreamingVAEDecoder | None = None
+        self._batched_vae_enabled = self.ming_config.model_variant == "dense" and current_omni_platform.is_cuda()
+        if self._batched_vae_enabled:
+            assert self.audio.decoder is not None
+            self.audio.decoder.upsampling.frame_holdback = True
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
@@ -114,6 +127,10 @@ class MingAudioVAEModel(nn.Module):
 
         outputs: list[torch.Tensor] = []
         srs: list[torch.Tensor] = []
+        pending: list[tuple[int, str, torch.Tensor | None, bool]] = []
+        batch_vae = self._batched_vae_enabled
+        device = self.vllm_config.device_config.device
+        dtype = next(self.audio.parameters()).dtype
 
         for idx in range(num_reqs):
             info = info_list[idx] if idx < len(info_list) and isinstance(info_list[idx], dict) else {}
@@ -169,15 +186,26 @@ class MingAudioVAEModel(nn.Module):
                         f"request_id={request_id} chunk_id={chunk_id} keys={sorted(info.keys())}"
                     )
                 if finished:
-                    self._clear_request_state(request_id)
+                    if batch_vae:
+                        pending.append((idx, request_id, None, True))
+                    else:
+                        self._clear_request_state(request_id)
                 outputs.append(empty)
                 srs.append(sr_tensor)
                 continue
 
             latent_tensor = _coerce_latent_chunk(
                 latent,
-                device=self.vllm_config.device_config.device,
-                dtype=next(self.audio.parameters()).dtype,
+                device=(
+                    latent.device
+                    if batch_vae and isinstance(latent, torch.Tensor)
+                    else (torch.device("cpu") if batch_vae else device)
+                ),
+                dtype=(
+                    latent.dtype
+                    if batch_vae and isinstance(latent, torch.Tensor)
+                    else (torch.float32 if batch_vae else dtype)
+                ),
                 latent_dim=self.ming_config.latent_dim,
                 patch_size=self.ming_config.patch_size,
             )
@@ -188,7 +216,16 @@ class MingAudioVAEModel(nn.Module):
                         f"request_id={request_id} chunk_id={chunk_id} latent_shape={_shape_of(latent_tensor)}"
                     )
                 if finished:
-                    self._clear_request_state(request_id)
+                    if batch_vae:
+                        pending.append((idx, request_id, None, True))
+                    else:
+                        self._clear_request_state(request_id)
+                outputs.append(empty)
+                srs.append(sr_tensor)
+                continue
+
+            if batch_vae:
+                pending.append((idx, request_id, latent_tensor, finished))
                 outputs.append(empty)
                 srs.append(sr_tensor)
                 continue
@@ -216,6 +253,42 @@ class MingAudioVAEModel(nn.Module):
             outputs.append(waveform_flat)
             srs.append(sr_tensor)
 
+        if pending and getattr(self, "_batched_vae_decoder", None) is None and all(item[2] is None for item in pending):
+            for _, rid, _, done in pending:
+                if done:
+                    self._clear_request_state(rid)
+            pending.clear()
+
+        if pending:
+            non_empty = [(i, item[2]) for i, item in enumerate(pending) if item[2] is not None]
+            if non_empty:
+                chunks = [chunk for _, chunk in non_empty]
+                if all(chunk.device.type == "cpu" for chunk in chunks):
+                    host = torch.cat([chunk.to(torch.float32) for chunk in chunks])
+                    moved = list(
+                        to_device_nonblocking(host, device).to(dtype).split([chunk.shape[0] for chunk in chunks])
+                    )
+                else:
+                    moved = [chunk.to(device=device, dtype=dtype) for chunk in chunks]
+                for (pos, _), chunk in zip(non_empty, moved, strict=True):
+                    idx, rid, _, done = pending[pos]
+                    pending[pos] = (idx, rid, chunk, done)
+
+            decoder = self._get_batched_decoder()
+            while pending:
+                batch: list[tuple[int, str, torch.Tensor | None, bool]] = []
+                remaining: list[tuple[int, str, torch.Tensor | None, bool]] = []
+                seen: set[str] = set()
+                for item in pending:
+                    (remaining if item[1] in seen else batch).append(item)
+                    seen.add(item[1])
+                pending = remaining
+                waveforms = decoder.decode([(rid, chunk, done) for _, rid, chunk, done in batch])
+                for (idx, rid, _, done), waveform in zip(batch, waveforms, strict=True):
+                    outputs[idx] = waveform
+                    if done:
+                        self._clear_request_state(rid)
+
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={
@@ -223,6 +296,22 @@ class MingAudioVAEModel(nn.Module):
                 "sr": srs,
             },
         )
+
+    def _get_batched_decoder(self) -> BatchedStreamingVAEDecoder:
+        if self._batched_vae_decoder is None:
+            from vllm_omni.model_executor.models.ming3_tts.batched_vae_decoder import BatchedStreamingVAEDecoder
+
+            assert self.audio.decoder is not None
+            scheduler_cfg = getattr(self.vllm_config, "scheduler_config", None)
+            max_seqs = int(getattr(scheduler_cfg, "max_num_seqs", 64))
+            max_streams = max(64, 4 * max_seqs)
+            self._max_stream_states = max_streams
+            self._batched_vae_decoder = BatchedStreamingVAEDecoder(
+                self.audio.decoder,
+                max_streams=max_streams,
+                packed_graph_tokens=DENSE_PACKED_GRAPH_TOKENS,
+            )
+        return self._batched_vae_decoder
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = list(weights)
@@ -250,6 +339,8 @@ class MingAudioVAEModel(nn.Module):
                 f"MingAudioVAEModel: skipped {len(skipped)} checkpoint keys during load. First few: {skipped[:8]}",
                 stacklevel=2,
             )
+        if self._batched_vae_enabled and next(self.audio.parameters()).is_cuda:
+            self._get_batched_decoder().capture_graphs()
         return loaded
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
@@ -257,6 +348,9 @@ class MingAudioVAEModel(nn.Module):
             self._clear_request_state(request_id)
 
     def _clear_request_state(self, request_id: str) -> None:
+        decoder = getattr(self, "_batched_vae_decoder", None)
+        if decoder is not None:
+            decoder.release(request_id)
         self._past_key_values.pop(request_id, None)
         self._stream_state.pop(request_id, None)
         self._state_access_times.pop(request_id, None)
@@ -266,7 +360,7 @@ class MingAudioVAEModel(nn.Module):
         self._evict_expired_request_states(now)
         self._state_access_times[request_id] = now
         self._state_access_times.move_to_end(request_id)
-        while len(self._state_access_times) > _MAX_STREAM_STATES:
+        while len(self._state_access_times) > self._max_stream_states:
             evicted_request_id, _ = self._state_access_times.popitem(last=False)
             self._clear_request_state(evicted_request_id)
 

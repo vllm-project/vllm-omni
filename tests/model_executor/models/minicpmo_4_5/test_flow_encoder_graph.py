@@ -214,6 +214,7 @@ def test_startup_precapture_admission_policy(fake_capture, mock_nvidia_platform,
     backend = SimpleNamespace(
         _chunk_encoder_graph=graphs,
         _chunk_encoder_token_widths=(6,),
+        _chunk_encoder_steady_width=6,
         _flow_supports_graphs=lambda: True,
         _pre_lookahead_len=lambda: _LOOKAHEAD,
         _upsample_stride=lambda: 2,
