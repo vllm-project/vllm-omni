@@ -110,7 +110,10 @@ Callers resolve again when execution metadata changes.
 The same `FLASH_ATTN` backend resolves MindIE paths on NPU and AITER paths on
 ROCm. Both examples report `UNMIGRATED`: their route is inspected, while hardware
 correctness and compilation remain unvalidated. `EAGER_ONLY` is an advisory
-default, not a measured compiler limitation. Existing execution is unchanged.
+default, not a measured compiler limitation. AITER dense execution calls the
+opaque `vllm_omni::aiter_dense_attention` op, with the same fake output as FA4,
+because Dynamo cannot trace AITER's Python dispatch; `rocm_dense` still reports
+`UNMIGRATED` until the hardware checks below are recorded.
 
 | Input | NPU / MindIE | ROCm / AITER |
 | --- | --- | --- |
