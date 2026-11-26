@@ -48,8 +48,31 @@ def test_identity_mapping_reuses_cached_device_and_host_mappings(mocker):
     assert arange.call_count == 1
     assert refreshed.idx_mapping is cached_idx_mapping
     assert refreshed.idx_mapping_np is cached_idx_mapping_np
+    with pytest.raises(ValueError, match="read-only"):
+        refreshed.idx_mapping_np[0] = 1
     assert refreshed.states[0] is states[0]
     assert refreshed.states[1] is states[1]
+
+
+@pytest.mark.parametrize(
+    ("dtype", "device"),
+    [(torch.int64, "cpu"), (torch.int32, "meta")],
+    ids=["dtype-mismatch", "device-mismatch"],
+)
+def test_identity_mapping_rebuilds_when_cached_dtype_or_device_changes(dtype, device):
+    states = [_make_state("first", 1.0), _make_state("second", 2.0)]
+    batch = InputBatch.make_batch(states)
+    mismatched_mapping = batch.idx_mapping.to(dtype=dtype, device=device)
+    cached_host_mapping = batch.idx_mapping_np
+    batch.idx_mapping = mismatched_mapping
+
+    refreshed = InputBatch.make_batch(states, cached_batch=batch)
+
+    assert refreshed is batch
+    assert refreshed.idx_mapping is not mismatched_mapping
+    assert refreshed.idx_mapping_np is not cached_host_mapping
+    torch.testing.assert_close(refreshed.idx_mapping, torch.tensor([0, 1], dtype=torch.int32))
+    np.testing.assert_array_equal(refreshed.idx_mapping_np, [0, 1])
 
 
 @pytest.mark.parametrize("initial_mode", [False, True])

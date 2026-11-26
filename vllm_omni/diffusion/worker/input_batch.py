@@ -86,6 +86,7 @@ def _select_states(
 
         idx_mapping = torch.arange(len(states), dtype=torch.int32, device=device)
         idx_mapping_np = np.arange(len(states), dtype=np.int32)
+        idx_mapping_np.setflags(write=False)
         return identity_states, idx_mapping, idx_mapping_np
 
     if idx_mapping.ndim != 1:
@@ -620,6 +621,10 @@ class InputBatch:
     source of truth. ``InputBatch`` only assembles a contiguous view for the
     current step and refreshes dynamic fields in-place when composition is
     unchanged.
+
+    Internally generated identity mappings can be shared across steps and
+    must be treated as read-only. ``idx_mapping`` retains the device tensor
+    field contract, while ``idx_mapping_np`` is used for host-side indexing.
 
     ``states`` is a narrow escape hatch for Hunyuan-style state-driven
     pipelines that need request-private KV/cache metadata during denoise.
