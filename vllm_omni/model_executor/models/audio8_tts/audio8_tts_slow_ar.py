@@ -18,7 +18,8 @@ Streaming contract is delta: each decode step appends one frame of
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -35,9 +36,13 @@ from vllm.model_executor.models.qwen2 import Qwen2Model
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
+from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsContext
+from vllm.v1.worker.gpu.sample.sampler import Sampler as MRv2Sampler
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
+from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 from .audio8_tts_fast_ar import Audio8TTSFastAR
 from .codec_utils import encode_reference_audio_codes
@@ -47,7 +52,7 @@ from .configuration_audio8_tts import (
     Audio8TTSSlowARConfig,
 )
 from .prompt_utils import build_voice_clone_prompt_ids
-from .sampling import SAMPLING_EPS, ras_sample_batch
+from .sampling import SAMPLING_EPS, filter_top_k_top_p, ras_sample_batch
 
 logger = init_logger(__name__)
 
@@ -164,11 +169,8 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
 
         self.have_multimodal_outputs = True
         self.has_preprocess = True
-        self.has_postprocess = True
-        self.mtp_hidden_size = int(self.text_config.hidden_size)
-        self.talker_mtp_output_key = ("codes", "audio")
-        self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("hidden_states", "last")}
-        self.talker_mtp_graph_safe = True
+        self.has_talker_mtp = True
+        self.mtp_output_key = ("codes", "audio")
 
         self.model = Qwen2Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         self._fix_rope_style()
@@ -366,33 +368,124 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
         token_ids = self._local_to_token_id(local_ids).to(dtype=torch.int32)
         return SamplerOutput(sampled_token_ids=token_ids.unsqueeze(-1), logprobs_tensors=None)
 
+    def mrv2_custom_sampler(self, sampler: MRv2Sampler) -> tuple[MRv2Sampler, None] | None:
+        if type(sampler) is not MRv2Sampler or self.vllm_config.speculative_config is not None:
+            return None
+        # As in GLM-TTS, replace the draw and retain MRv2's request state,
+        # prefill accounting, and output handling in Sampler.__call__.
+        sampler.sample = partial(self._mrv2_sample, sampler=sampler, fallback_sample=sampler.sample)
+        return sampler, None
+
+    def _mrv2_sample(
+        self,
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        pos: torch.Tensor,
+        input_ids: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        seq_lens_upper_bound_np: np.ndarray,
+        return_logprobs: bool = False,
+        *,
+        sampler: MRv2Sampler,
+        fallback_sample: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+        states = sampler.sampling_states
+        if (
+            return_logprobs
+            or sampler.return_sampling_mask
+            or logits.shape[0] != len(idx_mapping_np)
+            or not np.any(states.temperature.np[idx_mapping_np] >= SAMPLING_EPS)
+            or np.any(states.min_p.np[idx_mapping_np])
+            or np.any(sampler.penalties_state.use_penalty[idx_mapping_np])
+            or any(
+                isinstance(proc, BadWordsState) and np.any(proc.num_bad_words.np[idx_mapping_np])
+                for proc in sampler.logits_processors
+            )
+        ):
+            return fallback_sample(
+                logits,
+                expanded_idx_mapping,
+                idx_mapping,
+                idx_mapping_np,
+                pos,
+                input_ids,
+                expanded_local_pos,
+                seq_lens_upper_bound_np,
+                return_logprobs=return_logprobs,
+            )
+
+        # Preserve upstream request constraints without applying temperature
+        # before filtering. Audio8's top-k/top-p operate on the raw scores.
+        processed = logits.to(dtype=torch.float32, copy=True)
+        ctx = LogitsContext(
+            expanded_idx_mapping=expanded_idx_mapping,
+            idx_mapping=idx_mapping,
+            idx_mapping_np=idx_mapping_np,
+            expanded_local_pos=expanded_local_pos,
+            input_ids=input_ids,
+            pos=pos,
+            seq_lens_upper_bound_np=seq_lens_upper_bound_np,
+        )
+        for processor in sampler.logits_processors:
+            processed = processor.apply(processed, ctx)
+        sampler.thinking_budget_state.apply(processed, ctx)
+
+        compact = self._compact_semantic_logits(processed)
+        rows = expanded_idx_mapping.long()
+        top_k, top_p, _ = states.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np, compact.shape[-1])
+        top_k = -1 if top_k is None else top_k
+        top_p = 1.0 if top_p is None else top_p
+        temperatures = states.temperature.gpu
+        row_temperature = temperatures[rows]
+        normal_scores = filter_top_k_top_p(compact, top_k, top_p)
+        normal_scores = normal_scores / row_temperature.clamp_min(SAMPLING_EPS).unsqueeze(1)
+        sampled = gumbel_sample(
+            normal_scores, expanded_idx_mapping, temperatures, states.seeds.gpu, pos,
+            apply_temperature=False, is_drafting=False, use_fp64=sampler.use_fp64_gumbel,
+        )  # fmt: skip
+        if self._ras_window_size <= 0:
+            return self._local_to_token_id(sampled), processed
+
+        req_states = sampler.req_states
+        history = req_states.all_token_ids.gpu
+        last_generated = torch.minimum(req_states.total_len.gpu[rows].long() - 1, pos.long())
+        offsets = last_generated.unsqueeze(1) - torch.arange(self._ras_window_size, device=logits.device)
+        output_mask = offsets >= req_states.prompt_len.gpu[rows].unsqueeze(1)
+        recent = history[rows.unsqueeze(1), offsets.clamp(0, history.shape[1] - 1)]
+        token_ids = self._local_to_token_id(sampled)
+        repeated = ((recent == token_ids.unsqueeze(1)) & output_mask).any(dim=1)
+        resample = repeated & (sampled < self._num_semantic_ids) & (row_temperature >= SAMPLING_EPS)
+
+        # The second draw uses the same request seed but a separate salt.
+        # Both distributions retain the original request's token constraints.
+        ras_scores = filter_top_k_top_p(compact, top_k, self._ras_top_p) / self._ras_temperature
+        redraw = gumbel_sample(
+            ras_scores, expanded_idx_mapping, temperatures, states.seeds.gpu, pos,
+            apply_temperature=False, is_drafting=True, use_fp64=sampler.use_fp64_gumbel,
+        )  # fmt: skip
+        return self._local_to_token_id(torch.where(resample, redraw, sampled)), processed
+
     # -------------------- Omni multimodal plumbing --------------------
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
 
-        hidden = model_outputs
-        info_dicts = kwargs.get("model_intermediate_buffer")
-        if info_dicts is None:
-            info_dicts = kwargs.get("runtime_additional_information") or []
+        spans = kwargs.get("request_token_spans")
+        num_tokens = (spans[-1][1] if spans else 0) if spans is not None else model_outputs.shape[0]
+        return OmniOutput(
+            text_hidden_states=model_outputs,
+            multimodal_outputs={
+                "codes": {"audio": model_outputs.new_zeros((num_tokens, self._num_codebooks), dtype=torch.long)},
+                "meta": {"codec_frame_valid": model_outputs.new_zeros(num_tokens, dtype=torch.bool)},
+            },
+        )
 
-        audio_codes_list: list[torch.Tensor] = []
-        for info in info_dicts:
-            if not isinstance(info, dict):
-                continue
-            codes = info.get("codes", {}).get("audio")
-            if isinstance(codes, torch.Tensor):
-                audio_codes_list.append(codes)
-
-        if not audio_codes_list:
-            return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
-
-        audio_codes = torch.cat(audio_codes_list, dim=0)
-        hidden = hidden[: int(audio_codes.shape[0])]
-        return OmniOutput(text_hidden_states=hidden, multimodal_outputs={"audio_codes": audio_codes})
-
-    # -------------------- preprocess / postprocess --------------------
+    # -------------------- preprocess --------------------
 
     def preprocess(
         self,
@@ -412,9 +505,13 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
             embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
             return input_ids, embeds, {}
 
-        if span_len > 1:
+        if info_dict.get("_omni_is_prefill", span_len > 1):
             return self._preprocess_prefill(input_ids, info_dict, span_len)
-        return self._preprocess_decode(input_ids, info_dict)
+
+        embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
+        # MRv2 consumes the full embedding cached by post_sample. Audio8 has
+        # no separate text contribution to add on the next decode step.
+        return input_ids, embeds, {"mtp_inputs": (None, torch.zeros_like(embeds))}
 
     def _prefill_chunk(
         self,
@@ -464,45 +561,11 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
         chunk = self._prefill_chunk(prompt_embeds_buf, offset, span_len, device)
         next_offset = min(offset + span_len, total_prompt_len)
 
-        # No codes are emitted during prefill; a zero frame per position keeps
-        # the codes buffer aligned with the hidden-state span.
-        zeros = torch.zeros((chunk.shape[0], self._num_codebooks), device=device, dtype=torch.long)
         info_update = {
             "embed": {"prefill": prompt_embeds_buf if next_offset < total_prompt_len else None},
             "meta": {"prefill_offset": next_offset},
-            "codes": {"audio": zeros},
         }
         return torch.full_like(input_ids, self._pad_token_id), chunk, info_update
-
-    def _preprocess_decode(
-        self,
-        input_ids: torch.Tensor,
-        info_dict: dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        device = input_ids.device
-        token_embed = self.embed_input_ids(input_ids.reshape(1, 1).to(torch.long)).to(
-            device=device, dtype=torch.bfloat16
-        )
-        last_hidden = info_dict.get("hidden_states", {}).get("last")
-        if not isinstance(last_hidden, torch.Tensor):
-            # First decode step right after prefill: no Fast AR input yet.
-            logger.warning("Audio8 TTS preprocess: hidden_states.last missing; emitting text-only embedding")
-            return input_ids, token_embed.reshape(1, -1), {}
-
-        # Codebook embeddings are added in talker_mtp, using this step's Fast AR
-        # output; adding them here would use the previous step's codes.
-        info_update = {
-            "mtp_inputs": (
-                last_hidden.to(device=device, dtype=torch.bfloat16).reshape(1, -1),
-                torch.zeros(1, self.text_config.hidden_size, device=device, dtype=torch.bfloat16),
-            ),
-        }
-        return input_ids, token_embed.reshape(1, -1), info_update
-
-    def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
-        if hidden_states.numel() == 0:
-            return {}
-        return {"hidden_states": {"last": hidden_states[-1, :].detach().contiguous()}}
 
     # -------------------- voice cloning --------------------
 
@@ -598,17 +661,21 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
 
     # -------------------- GPU-side Fast AR fast path --------------------
 
+    get_mtp_seed = staticmethod(get_tts_local_seed)
+
+    def mtp_frame_valid(self, semantic_ids: torch.Tensor) -> torch.Tensor:
+        return (semantic_ids >= self._semantic_begin_id) & (semantic_ids <= self._semantic_end_id)
+
     @torch.inference_mode()
-    def talker_mtp(
+    def mtp(
         self,
         input_ids: torch.Tensor,
         input_embeds: torch.Tensor,
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
-        seed: int | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the Fast AR and fold its codes into this step's input embedding.
+        """Complete the sampled frame and prepare the next Slow AR input.
 
         Returns:
             ``(inputs_embeds, audio_codes)`` where ``audio_codes`` is
@@ -625,9 +692,6 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
         temperature = DEFAULT_TEMPERATURE if temperature is None else float(temperature)
         do_sample = kwargs.get("do_sample")
         generator = kwargs.get("generator")
-        if generator is None and seed is not None:
-            generator = torch.Generator(device=device)
-            generator.manual_seed(int(seed))
 
         _top_k = kwargs.get("top_k")
         _top_p = kwargs.get("top_p")
@@ -646,7 +710,7 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
             0
         )
         codebook_sum = self.codebook_embeddings(audio_codes + offsets).sum(dim=1).to(dtype=embeds.dtype)
-        is_semantic = (token_ids >= self._semantic_begin_id) & (token_ids <= self._semantic_end_id)
+        is_semantic = self.mtp_frame_valid(token_ids)
         embeds = torch.where(is_semantic.unsqueeze(-1), embeds + codebook_sum, embeds)
         return embeds, audio_codes.to(dtype=torch.long)
 
