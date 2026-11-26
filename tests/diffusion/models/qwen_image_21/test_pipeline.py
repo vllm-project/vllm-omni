@@ -451,6 +451,7 @@ def _decode_latents_pipeline(decoded: torch.Tensor) -> tuple[QwenImage21Pipeline
     pipeline._decoder_compile_allowed = False
     pipeline._decoder_compile_attempted = False
     pipeline._decoder_eager_forward = None
+    pipeline.parallel_config = SimpleNamespace(vae_patch_parallel_size=1)
     pipeline.vae_scale_factor = 16
     pipeline._unpack_latents = lambda latents, *args: latents
     return pipeline, seen
@@ -495,13 +496,17 @@ def test_decode_latents_rebuilds_the_statistics_for_a_new_dtype() -> None:
     assert pipeline._latent_stats[1].dtype == torch.float64
 
 
-def test_decoder_compile_is_skipped_when_not_allowed() -> None:
-    """`--enforce-eager`, or a platform without inductor, must leave the reference forward."""
+@pytest.mark.parametrize(("compile_allowed", "patch_parallel_size"), [(False, 1), (True, 2)])
+def test_decoder_compile_is_skipped_when_not_allowed(compile_allowed, patch_parallel_size) -> None:
+    """Keep the reference forward for eager or distributed VAE decoding."""
     pipeline, _ = _decode_latents_pipeline(torch.zeros(1, 4, 1, 8, 8))
+    pipeline._decoder_compile_allowed = compile_allowed
+    pipeline.parallel_config.vae_patch_parallel_size = patch_parallel_size
     original = pipeline.vae.decoder.forward
 
     pipeline._maybe_compile_decoder()
 
+    assert not pipeline._decoder_compile_attempted
     assert pipeline.vae.decoder.forward is original
 
 

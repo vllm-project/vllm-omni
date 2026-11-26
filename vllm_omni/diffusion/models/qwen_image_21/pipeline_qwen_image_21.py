@@ -1136,6 +1136,9 @@ class QwenImage21Pipeline(
         """Wrap the decoder after the VAE fast paths and profiler are installed."""
         if self._decoder_compile_attempted or not self._decoder_compile_allowed:
             return
+        # Distributed VAE execution rethrows rank-local failures as a group error.
+        if self.parallel_config.vae_patch_parallel_size > 1:
+            return
         self._decoder_compile_attempted = True
         decoder = self.vae.decoder
         eager_forward = decoder.forward
