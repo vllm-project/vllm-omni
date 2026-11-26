@@ -159,17 +159,17 @@ def test_the_fake_client_mirrors_the_real_client_surface() -> None:
 async def test_padding_works_against_the_real_client() -> None:
     """The padding must send real append events, not just fake-client calls.
 
-    Regression for the swallowed ``AttributeError``: only ``send`` is
-    stubbed, everything else — the event the padding builds included — is
-    the real client's code.
+    Regression for the swallowed ``AttributeError``: replace the socket and
+    exercise the real client's padding, serialization, and send code.
     """
     client = RealtimeDuplexClient("ws://localhost:8000/v1/realtime")
     sent: list[dict] = []
 
-    async def record_send(event: dict) -> None:
-        sent.append(event)
+    class RecordingSocket:
+        async def send(self, raw: str) -> None:
+            sent.append(json.loads(raw))
 
-    client.send = record_send
+    client._ws = RecordingSocket()
     stop = asyncio.Event()
     task = asyncio.create_task(runner._pad_silence_until_stopped(client, 20, stop))
     try:
