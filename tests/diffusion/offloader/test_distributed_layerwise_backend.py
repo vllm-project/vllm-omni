@@ -1818,6 +1818,66 @@ class TestCrossGroupSharedBuffer:
         hook_a.pre_forward(block_a)
         assert not sync_called[0], "Should skip sync-prefetch when slot_group matches (non-contaminated)"
 
+    def test_group_first_rematerializes_after_whole_group_offload(self, patched_offload_runtime):
+        """A whole-group offload must not leave the next pass on empty weights.
+
+        The tail hook prefetches block 0 for the next pass and stamps the
+        shared slot with this group. Releasing every hook afterwards, as
+        MiniMax-H3's encoder offload_to_cpu() does, drops that prefetch but
+        leaves the stamp. The following group-first pre_forward has to load
+        block 0 again.
+        """
+        blocks = nn.ModuleList([nn.Linear(2, 2, bias=False) for _ in range(2)])
+        with torch.no_grad():
+            blocks[0].weight.copy_(torch.arange(4, dtype=torch.float32).reshape(2, 2))
+            blocks[1].weight.copy_(torch.arange(10, 14, dtype=torch.float32).reshape(2, 2))
+        expected_first = blocks[0].weight.detach().clone()
+
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dlo_use_allgather=False,
+            ),
+            torch.device("cpu"),
+        )
+        hooks = backend._install_hook_group(blocks, "dit")
+        shared_buffers = backend._allocate_shared_buffers(hooks)
+        shared_slot_group = [-1, -1]
+        shared_slot_owner = [-1, -1]
+        for hook in hooks:
+            hook.gpu_buffers = shared_buffers
+            hook._group_id = 0
+            hook._shared_slot_group = shared_slot_group
+            hook._shared_slot_owner = shared_slot_owner
+
+        def hook_for(block: nn.Module) -> DistributedLayerwiseOffloadHook:
+            registry = block._hook_registry
+            found = registry.get_hook(DistributedLayerwiseOffloadHook._HOOK_NAME)
+            assert isinstance(found, DistributedLayerwiseOffloadHook)
+            return found
+
+        def run_pass() -> None:
+            for block in blocks:
+                hook = hook_for(block)
+                hook.pre_forward(block)
+                hook.post_forward(block, None)
+
+        run_pass()
+        first_hook = hook_for(blocks[0])
+        assert first_hook.is_materialized
+        torch.testing.assert_close(blocks[0].weight, expected_first)
+
+        for block in blocks:
+            hook_for(block).offload_layer()
+
+        assert not first_hook.is_materialized
+        assert blocks[0].weight.is_meta or blocks[0].weight.numel() == 0
+
+        first_hook.pre_forward(blocks[0])
+        assert first_hook.is_materialized
+        torch.testing.assert_close(blocks[0].weight, expected_first)
+
 
 class TestAllGatherOutputSlicing:
     """Regression test: with heterogeneous block sizes (e.g. MiniMax H3's
