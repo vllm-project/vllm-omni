@@ -779,6 +779,7 @@ class TestQwen3OmniDuplexPlayback:
         asyncio.run(_run_duplex_history(qwen_duplex_server, tmp_path / "events.json", reject_overflow=True))
 
     @pytest.mark.advanced_model
+    @pytest.mark.nvidia_only
     def test_live_tool_runner_completes_a_tool_round_trip(self, qwen_duplex_server):
         """Smoke-test real model/tool integration without prescribing the answer."""
 
