@@ -145,7 +145,8 @@ def test_config(values, backend):
 
 
 def test_removed_permute_field_is_rejected():
-    with pytest.raises(TypeError):
+    # A plain dataclass raises TypeError; vLLM's pydantic-wrapped config raises a ValidationError (a ValueError).
+    with pytest.raises((TypeError, ValueError)):
         DiffusionParallelConfig(ulysses_degree=2, ulysses_a2a_permute=True)
 
 
