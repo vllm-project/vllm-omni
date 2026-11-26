@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 from vllm.sampling_params import SamplingParams
 
@@ -17,15 +15,10 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageSubmission,
     duplex_ephemeral_stage_request_id,
 )
-from vllm_omni.engine.duplex.plugin import DuplexModelPlugin
 from vllm_omni.engine.duplex.session.context import DuplexRunState
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-class _PluginStub(SimpleNamespace):
-    observe_response_end = DuplexModelPlugin.observe_response_end
 
 
 def test_submission_resumable_default_preserves_minicpm() -> None:
@@ -374,7 +367,7 @@ def test_draining_empty_eos_completes_owning_response_before_shortcut() -> None:
     channel = ModelChannel(
         SimpleNamespace(
             session=session,
-            plugin=_PluginStub(data_plane=_Plane()),
+            plugin=SimpleNamespace(data_plane=_Plane()),
             stage_port=port,
             history_calibration=None,
             model_state=SimpleNamespace(clear_continuation=lambda: None),
@@ -467,7 +460,7 @@ def test_draining_completion_drops_finished_response_books_only() -> None:
     channel = ModelChannel(
         SimpleNamespace(
             session=session,
-            plugin=_PluginStub(data_plane=_Plane()),
+            plugin=SimpleNamespace(data_plane=_Plane()),
             stage_port=_Port(),
             history_calibration=None,
             model_state=SimpleNamespace(clear_continuation=lambda: None),
@@ -539,7 +532,7 @@ def test_stale_continue_does_not_close_the_new_response() -> None:
         SimpleNamespace(
             session=session,
             history_calibration=None,
-            plugin=_PluginStub(data_plane=SimpleNamespace()),
+            plugin=SimpleNamespace(data_plane=SimpleNamespace()),
             stage_port=SimpleNamespace(),
             model_state=SimpleNamespace(clear_continuation=lambda: cleared.append(True)),
             services=SimpleNamespace(spawn=lambda *_a, **_k: None),
@@ -629,7 +622,7 @@ def test_silent_listen_with_continuation_releases_ephemeral_request() -> None:
         SimpleNamespace(
             session=session,
             history_calibration=None,
-            plugin=_PluginStub(data_plane=_Plane()),
+            plugin=SimpleNamespace(data_plane=_Plane()),
             stage_port=port,
             model_state=SimpleNamespace(
                 continuation_owner_id=None, continuation_units=0, clear_continuation=lambda: None
@@ -710,7 +703,7 @@ def test_silent_listen_aborts_data_plane_request_with_full_id() -> None:
     channel = ModelChannel(
         SimpleNamespace(
             session=session,
-            plugin=_PluginStub(data_plane=_Plane()),
+            plugin=SimpleNamespace(data_plane=_Plane()),
             stage_port=_Port(),
             model_state=SimpleNamespace(
                 continuation_owner_id=None, continuation_units=0, clear_continuation=lambda: None
@@ -780,7 +773,7 @@ def test_fast_tool_result_does_not_end_a_live_non_resumable_request() -> None:
     channel = ModelChannel(
         SimpleNamespace(
             session=session,
-            plugin=_PluginStub(data_plane=_Plane()),
+            plugin=SimpleNamespace(data_plane=_Plane()),
             stage_port=SimpleNamespace(),
             history_calibration=None,
             model_state=SimpleNamespace(clear_continuation=lambda: cleared.append(True)),

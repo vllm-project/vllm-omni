@@ -658,6 +658,23 @@ The `"context"` mode instead retains `context_max_units` (24) recent units
 plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
 The window configuration is fixed when the session is created.
 
+On a locally managed Stage-0 replica, a barge-in or `response.cancel` ends the
+old output. Its replacement re-prefills the accepted Thinker context before
+processing its first input, including the processed rows of an unfinished
+unit. If the first new input is unforced text or carries a delegated tool
+result, it can open a reply on that same unit. In `"off"` mode, if the
+full prefix and new input leave insufficient
+room to sample within the model context limit, the session ends with
+`context_length_exceeded`. The session keeps the snapshot
+on its Stage-0 replica until replacement or session cleanup. Model text can
+include speech the client has not played yet, and a new response can return to
+the interrupted topic. A replica failure still ends the session.
+
+An independently hosted Stage-0 replica uses the bounded handoff in `"basic"`
+and `"context"`: the same replica can offer completed units for 10 seconds
+from the abort, subject to a limit of 32 waiting windows. In `"off"` mode this
+deployment starts the replacement from the system turn and reference audio.
+
 Constructor options: `reconnect` (a `ReconnectPolicy`, default five
 attempts with 0.25–4 s jittered backoff; `None` disables auto-resume),
 `heartbeat_interval_s` (default 30 s; `None` disables the lease heartbeat),

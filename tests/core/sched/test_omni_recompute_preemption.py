@@ -138,18 +138,6 @@ def test_capacity_preemption_emits_one_error_and_frees_state(requires_kv_deliver
     assert scheduler.update_from_output(next_step, _output()) == {}
 
 
-def test_preemption_does_not_recompute_a_native_checkpoint_from_placeholders():
-    scheduler = _scheduler("allow")
-    request = _prefill(scheduler)
-    request._omni_has_native_checkpoint = True
-    assert request.request_id in scheduler.requests
-    outputs = scheduler.update_from_output(scheduler.schedule(), _output())
-    assert request.status == RequestStatus.FINISHED_ERROR
-    assert request.request_id not in scheduler.requests
-    [terminal] = outputs[3].outputs
-    assert terminal.finish_reason == FinishReason.ERROR
-
-
 @pytest.mark.parametrize("requires_kv_delivery", [False, True])
 def test_allow_mode_capacity_preemption_requeues(requires_kv_delivery):
     scheduler = _scheduler("allow", requires_kv_delivery)

@@ -38,10 +38,7 @@ _SERVER = OmniServerParams(
     use_stage_cli=False,
     server_args=["--trust-remote-code"],
 )
-_BARGE_IN_SERVER = _SERVER._replace(env_dict={"VLLM_LOGGING_STREAM": "ext://sys.stderr"})
-_THINKER_ONLY = _BARGE_IN_SERVER._replace(
-    stage_config_path=get_deploy_config_path("minicpmo_4_5_duplex_thinker_only.yaml")
-)
+_THINKER_ONLY = _SERVER._replace(stage_config_path=get_deploy_config_path("minicpmo_4_5_duplex_thinker_only.yaml"))
 
 
 def _color_frame(color: str, turn: int, unit: int) -> str:
@@ -59,7 +56,7 @@ def _color_frame(color: str, turn: int, unit: int) -> str:
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize(
     ("omni_server", "expect_audio"),
-    [pytest.param(_BARGE_IN_SERVER, True, id="three-stage"), pytest.param(_THINKER_ONLY, False, id="thinker-only")],
+    [pytest.param(_SERVER, True, id="three-stage"), pytest.param(_THINKER_ONLY, False, id="thinker-only")],
     indirect=["omni_server"],
     scope="module",
 )
@@ -210,10 +207,7 @@ def test_mrv2_duplex_barge_in_preserves_history(omni_server, expect_audio: bool)
                 with suppress(asyncio.CancelledError):
                     await reader
 
-    checkpoint_marker = "MiniCPM-o duplex re-used "
-    with omni_server.capture_stderr_evidence([checkpoint_marker]) as evidence:
-        asyncio.run(run())
-        assert checkpoint_marker in evidence.wait()
+    asyncio.run(run())
 
 
 # ``minicpmo_4_5.yaml`` resolves all three stages to MRv2 on CUDA and ROCm.

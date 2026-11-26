@@ -1277,33 +1277,8 @@ async def test_cleared_in_flight_append_cannot_release_later_audio(monkeypatch) 
         await h.settle()
         assert h.session.pending_input_bytes == 32_000
         assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
-        assert not h.runner.model_state.replay_pending
     finally:
         release.set()
-        await close_harness(h)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("committed", [False, True], ids=["uncommitted", "committed"])
-async def test_clear_keeps_only_committed_replay_history(committed: bool) -> None:
-    h = await open_harness()
-    try:
-        request_id = await _open_active_response(h)
-        if committed:
-            await h.run(commands.Commit(create_response=False))
-        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="original", turn_end=True))
-        state = h.runner.model_state
-        [old_turn] = state.replay_completed
-        assert (old_turn.source is not None) == committed
-
-        await h.run(commands.ClearInput())
-        await h.run(append_audio(value=0.12))
-        events = await h.run(commands.Commit(create_response=False))
-
-        assert "input_audio_buffer.committed" in types(events)
-        assert state.replay_completed == ([old_turn] if committed else [])
-        assert not state.replay_history_eligible
-    finally:
         await close_harness(h)
 
 
@@ -3324,20 +3299,27 @@ async def test_a_dropped_continuation_is_not_re_aimed_across_a_barge_in() -> Non
 
 
 @pytest.mark.asyncio
-async def test_stage_failure_fails_the_active_response() -> None:
+@pytest.mark.parametrize(
+    ("reason", "code"),
+    [
+        ("boom", "runtime_data_plane_stream_failed"),
+        ("context_length_exceeded: prompt too long", "context_length_exceeded"),
+    ],
+)
+async def test_stage_failure_fails_the_active_response(reason, code) -> None:
     h = await open_harness()
     try:
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
 
-        h.runner.on_stage_failure(1, RuntimeError("boom"))
+        h.runner.on_stage_failure(1, RuntimeError(reason))
         events = await h.settle()
         assert types(events)[0] == "error"
-        assert events[0].code == "runtime_data_plane_stream_failed"
+        assert events[0].code == code
         done = find(events, "response.done")
         assert done.status == "failed"
-        assert done.response["status_details"]["reason"] == "runtime_data_plane_stream_failed"
+        assert done.response["status_details"]["reason"] == code
         assert h.session.active_response_id is None
     finally:
         await close_harness(h)

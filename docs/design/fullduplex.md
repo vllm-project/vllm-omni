@@ -218,43 +218,6 @@ hard-capped replies remain in its bounded cache for prefix correction. Every
 completion path preserves that evidence until calibration retires it. Sessions
 without calibration release stopped output immediately.
 
-## MiniCPM-o history after an interruption
-
-Cancellation advances the epoch and retires the active stage requests. The
-public conversation can still contain the portion of the cancelled answer that
-was played. The new Thinker request restores completed turns and the committed
-user input for the interrupted turn before consuming the first live append.
-The cancelled answer is excluded from that context. Talker and Code2Wav start
-with the new epoch's request IDs.
-
-The MiniCPM-o plugin binds retained audio and video to the input commit sequence
-and the server-owned source ID. The sequence also covers a user commit received
-after generation ended. Deleting an item invalidates its retained media even
-when a client later reuses its public item ID. The plugin keeps at most 8 MiB
-of encoded input and reserves up to 2,048 tokens for replay from current
-conversation sources.
-
-At the transition from a completed turn to the next user turn, Stage 0 can
-record the last confirmed token position. On abort it retains only the cache
-pages up to that point. On the first append in the next epoch, the scheduler
-can transfer those pages to the new request on the same replica. It verifies
-the session, the interrupted turn, the completed-history identity and the
-prompt layout. It requires old writes to have drained at admission time
-because future positions can share the last retained page. The next
-prefill closes the preceding unit, rebuilds the interrupted turn's user
-input and streaming audio state, and consumes the new live input.
-
-Checkpoint reuse requires an unchanged prefix in basic-window or unbounded
-mode. Saved pages expire after 15 seconds
-and compete for at most one thirty-second of the scheduler's KV pages.
-A missing checkpoint, edited history, a rebased window, unsupported layout,
-unsettled old writes or cache pressure falls back to the same bounded silent
-prefill. Both paths run inside Stage 0 for Thinker-only and three-stage
-deployments and leave the public conversation unchanged.
-After adoption, generic scheduler recomputation cannot recover native media
-from placeholder IDs. The scheduler reports a request error if it preempts
-an adopted request, so a corrupted prefix cannot produce a reply.
-
 ## Experimental Qwen history policy
 
 Qwen defaults to `full_history` when `history_policy` is omitted from server-owned

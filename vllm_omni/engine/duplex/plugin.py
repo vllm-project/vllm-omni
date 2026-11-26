@@ -763,30 +763,6 @@ class DuplexModelPlugin(ABC):
     def commit_append_plan(self, request_id: str) -> None:
         """Commit model-owned context after the stage accepts a fenced append."""
 
-    def observe_submitted_append(
-        self, *, state: DuplexModelSessionState, fence: DuplexFence, prompt: Mapping[str, object], input_commit_seq: int
-    ) -> None:
-        """Observe an accepted model input on the session owner."""
-
-    def observe_committed_input(
-        self, *, state: DuplexModelSessionState, fence: DuplexFence, item_id: str, source_id: int, input_commit_seq: int
-    ) -> None:
-        """Bind model-owned history material to a committed user input."""
-
-    def observe_input_clear(self, *, state: DuplexModelSessionState) -> None:
-        """Discard uncommitted material retained for history."""
-
-    def observe_response_end(
-        self,
-        *,
-        state: DuplexModelSessionState,
-        fence: DuplexFence,
-        response_id: str,
-        completed: bool,
-        assistant_text: str = "",
-    ) -> None:
-        """Observe cancellation or a normal response end eligible for history."""
-
     @abstractmethod
     def plan_append(
         self,

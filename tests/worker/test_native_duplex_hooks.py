@@ -797,8 +797,8 @@ def test_minicpmo_stage0_history_collection_starts_with_session_config(mode):
 @pytest.mark.parametrize("mode", ["basic", "context"])
 @pytest.mark.parametrize("buffered", [False, True])
 def test_minicpmo_stage0_multi_chunk_append_matches_scheduler_window(mode, buffered):
-    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import prepare_stage0_window
 
     runtime = _stage0_vision_runtime()
     state = _MiniCPMO45Stage0SessionState(session_id="multi-chunk-window", window_enabled=True)
@@ -830,9 +830,7 @@ def test_minicpmo_stage0_multi_chunk_append_matches_scheduler_window(mode, buffe
             }
         }
         update = SimpleNamespace(prompt_token_ids=[3, 2, 1, 11], model_intermediate_buffer=info)
-        planned = OmniARScheduler._prepare_minicpmo45_stage0_window(
-            session, update, segment_output_ids=[44], completed_terminator=3
-        )
+        planned = prepare_stage0_window(session, update, segment_output_ids=[44], completed_terminator=3)
         result = runtime._stage_prefill_embeddings_only(
             state, np.zeros(4, dtype=np.float32), seq=seq, stage0_window=info["duplex"]["stage0_window"]
         )
@@ -943,30 +941,6 @@ def test_minicpmo_stage0_window_uses_accepted_output_not_async_sampler_history(p
     assert len(state.pending_window_unit.token_ids) == 11
     assert 40 not in result["input_token_ids"]
     assert 41 not in result["input_token_ids"]
-
-
-def test_minicpmo_stage0_replays_interrupted_user_as_listening_and_continues_audio(monkeypatch):
-    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
-
-    runtime = _stage0_vision_runtime()
-    runtime._stage_audio_embeddings = lambda *args, **kwargs: torch.zeros((1, 2))
-    monkeypatch.setattr(runtime, "_decode_audio_payload", lambda payload: np.zeros(4, dtype=np.float32))
-    state = _MiniCPMO45Stage0SessionState(session_id="restore", window_enabled=True)
-    runtime.restore_completed_turns(
-        state,
-        [
-            {"epoch": 0, "inputs": [{}], "response_token_ids": [80]},
-            {"epoch": 0, "inputs": [{}, {}], "user_only": True, "resumes_audio_window": True},
-        ],
-        token_budget=15,
-    )
-    prefix = [1, 11, 5, 80, 10, 9, 2, 1, 11, 3, 2, 1, 11, 3, 2]
-    assert state.audio_encoder_chunk_idx == 2
-    assert state.restored_context.token_ids == prefix
-    live = runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), epoch=1, seq=1)
-    assert live["input_token_ids"] == [*prefix, 1, 11]
-    assert state.audio_encoder_chunk_idx == 3
-    assert state.pending_window_unit.token_ids == live["input_token_ids"]
 
 
 @pytest.mark.parametrize("pending_terminator", [None, 3, 99])
