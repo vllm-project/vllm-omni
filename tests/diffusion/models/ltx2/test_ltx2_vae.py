@@ -17,7 +17,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("initial_deterministic", [False, True])
 @pytest.mark.parametrize("fail", [False, True])
 def test_ltx_vocoder_deterministic_context(monkeypatch, initial_deterministic, fail):
-    from vllm_omni.diffusion.models.ltx2.ltx2_runtime import _deterministic_ltx_vocoder
+    import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx2_runtime
 
     monkeypatch.setattr(torch.backends.cudnn, "deterministic", initial_deterministic)
     if torch.backends.cudnn.is_available():
@@ -26,8 +26,8 @@ def test_ltx_vocoder_deterministic_context(monkeypatch, initial_deterministic, f
         name: getattr(torch.backends.cudnn, name) for name in ("enabled", "benchmark", "benchmark_limit", "allow_tf32")
     }
     try:
-        with _deterministic_ltx_vocoder():
-            assert torch.backends.cudnn.deterministic
+        with ltx2_runtime._deterministic_ltx_vocoder():
+            assert torch.backends.cudnn.deterministic == (not ltx2_runtime.current_omni_platform.is_rocm())
             assert {name: getattr(torch.backends.cudnn, name) for name in settings} == settings
             if fail:
                 raise RuntimeError("injected failure")

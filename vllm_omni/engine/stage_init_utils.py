@@ -22,7 +22,7 @@ import time
 import warnings
 from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -1655,7 +1655,9 @@ def build_vllm_config(
     # Upgrade vanilla INCConfig to OmniINCConfig for multi-stage models.
     upgraded = OmniINCConfig.maybe_upgrade(vllm_config.quant_config)
     if upgraded is not vllm_config.quant_config:
-        vllm_config = replace(vllm_config, quant_config=upgraded)
+        # VllmConfig is mutable. Reconstructing it replays runtime-added fields
+        # through Pydantic validation, which can reject otherwise valid configs.
+        vllm_config.quant_config = upgraded
 
     custom_voice_dir = engine_args_dict.get("custom_voice_dir")
     if custom_voice_dir:

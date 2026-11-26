@@ -6,7 +6,7 @@ Two-stage pipeline: **thinker** (multimodal understanding) → **talker + Token2
 
 ## Setup
 
-- Install talker deps: `pip install stepaudio2-minicpmo`
+- Install Code2Wav deps: `pip install step-audio2==1.0.0` (provides `cosyvoice2`; do not co-install `stepaudio2-minicpmo`)
 - `--trust-remote-code` is always passed by `end2end.py` (required for MiniCPMO)
 - See [pipeline and deploy configuration docs](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) for memory tuning
 
@@ -60,7 +60,7 @@ python end2end.py --query-type use_mixed_modalities \
 Supported `--query-type` values:
 
 | Query type | Inputs |
-|---|---|
+| --- | --- |
 | `text` | Text only |
 | `use_image` | Image + text |
 | `use_audio` | Audio + text |

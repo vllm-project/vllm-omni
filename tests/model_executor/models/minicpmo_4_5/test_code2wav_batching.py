@@ -1664,7 +1664,8 @@ def test_model_preserves_output_slots_and_prefers_runtime_codes():
     assert token2wav.flow.encoder.calls[-1] == 2
 
 
-def test_code2wav_projects_duplex_metadata_to_final_audio_output():
+@pytest.mark.parametrize("text_without_audio", [False, True])
+def test_code2wav_projects_duplex_metadata_to_final_audio_output(text_without_audio):
     model, token2wav = _model()
     segment = _info("duplex", 0, [10, 11])
     segment_text_utf8 = torch.tensor(list(b"hello"), dtype=torch.uint8)
@@ -1675,12 +1676,14 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
             "llm_output_text_utf8": segment_text_utf8,
             "tts_is_last_chunk": True,
             "turn_end": False,
+            "text_without_audio": text_without_audio,
         }
     )
 
     segment_output = _forward(model, [segment])
 
     assert segment_output.multimodal_outputs["meta.turn_end"][0].item() is False
+    assert segment_output.multimodal_outputs["meta.text_without_audio"][0].item() is text_without_audio
     # A Talker unit boundary only drains pending codec tokens. The official
     # streaming path keeps Token2wav open until the assistant turn ends.
     assert token2wav.flow.encoder.last_chunk_calls[-1] is False
@@ -1705,6 +1708,7 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     assert payload["meta.duplex_audio_cache_epoch"][0].item() == final["meta"]["cache_epoch"]
     assert payload["meta.duplex_audio_chunk_seq"][0].item() == 1
     assert payload["meta.turn_end"][0].item() is True
+    assert payload["meta.text_without_audio"][0].item() is text_without_audio
     assert token2wav.flow.encoder.last_chunk_calls[-1] is True
     assert "duplex" not in model._states
 

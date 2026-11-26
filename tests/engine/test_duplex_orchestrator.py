@@ -740,6 +740,32 @@ async def test_session_owned_outputs_reach_the_runner_and_never_the_client_queue
 
 
 @pytest.mark.asyncio
+async def test_text_continuation_uses_model_turn_snapshot_before_handoff() -> None:
+    orchestrator, _, rpc_q, output_q = _build(stages=2)
+    await _open(orchestrator, rpc_q)
+    try:
+        await _submit(orchestrator, _append_audio())
+        request_id = _stage0_request_id()
+        request_state = orchestrator.request_states[request_id]
+        bridge = request_state.streaming.bridge_states["duplex"]
+        bridge["model_turn_id"] = 1
+        output = _tts_output(request_id)
+        output.finished = False
+        output.multimodal_output = {"duplex_text_input": True}
+        assert not await orchestrator._intercept_stage_output(0, 0, output, request_state, None, None)
+        # The bridge can advance immediately, before the runner mailbox drains.
+        bridge["model_turn_id"] = 2
+        await _settle(orchestrator)
+        runner = orchestrator.session_manager.runner_for_request_id(request_id)
+        assert runner is not None
+        assert runner.run.partial_input_continuation_turn == (0, 1)
+        assert runner.session.active_response_id is None
+        assert output_q.empty()
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_streaming_segment_stop_keeps_response_open_until_real_terminal(mocker) -> None:
     """Codec segment EOS must not close the duplex response before the real stop."""
     orchestrator, _, rpc_q, output_q = _build(stages=2)
@@ -1414,7 +1440,7 @@ async def test_least_sessions_skips_replica_that_exited_before_ready(groups) -> 
 @pytest.mark.parametrize("groups", [None, [{0: 0, 1: 0}, {0: 1, 1: 1}]], ids=["implicit", "explicit"])
 async def test_crossed_startup_failures_respect_session_groups(groups) -> None:
     pools = [StagePool(0, [None, FakeStageClient()]), StagePool(1, [FakeStageClient(final_output=True), None])]
-    rpc = asyncio.Queue()
+    rpc: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
     orchestrator = DuplexOrchestrator(
         request_async_queue=asyncio.Queue(),
         output_async_queue=asyncio.Queue(),

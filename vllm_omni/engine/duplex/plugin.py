@@ -16,7 +16,7 @@ import asyncio
 import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Hashable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from importlib import import_module
 from typing import TYPE_CHECKING
@@ -159,6 +159,14 @@ class PcmAppendBuffer(ABC):
     @abstractmethod
     def has_pending(self) -> bool: ...
 
+    def has_ready_unit(self, *, chunk_period_ms: int) -> bool:
+        """Whether buffered input can precede a text response's continuation.
+
+        Buffers that distinguish incomplete media from ready units may override
+        this; otherwise every pending input keeps priority over generated silence.
+        """
+        return self.has_pending()
+
     @abstractmethod
     def has_reserved(self) -> bool: ...
 
@@ -201,11 +209,12 @@ class PcmAppendBuffer(ABC):
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None: ...
 
     def prepare_backlog(self, *, operation_id: str, chunk_period_ms: int) -> PcmAppendReservation | None:
-        """Reserve one more whole unit from audio already buffered, if there is one (input-clocked sessions).
+        """Reserve one more complete buffered media unit, leaving partial PCM.
 
         After an append emitted its unit, an input-clocked session calls this
         until it returns ``None``, so an append longer than one unit submits
         every whole unit it completed and is acknowledged after all of them.
+        Text appends also drain these units first, preserving media/text order.
         Default: ``None`` (one unit per append; the rest waits for later
         appends).
         """
@@ -368,6 +377,8 @@ class DuplexDataPlaneContext:
     response_format: str = "wav"
     speed: float | None = None
     modalities: tuple[str, ...] = ()
+    # Producer turn captured at interception, when available (Stage0).
+    model_turn_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -580,6 +591,7 @@ class DuplexModelPlugin(ABC):
     #: exactly like client audio, so it must be a unit the model accepts.
     silence_continuation_sample_rate_hz: int = 16000
     data_plane: DuplexDataPlane
+    _pipeline_config: PipelineConfig | None = None
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         # Constructor-only: concrete plugins hand the encoder to their data plane.
@@ -587,6 +599,31 @@ class DuplexModelPlugin(ABC):
 
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
         """Bind model policy to the resolved deployment topology before admission."""
+        self._pipeline_config = pipeline_config
+
+    def deployment_capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
+        """Resolve model capabilities against the topology bound at startup.
+
+        A single final text stage has no audio output or downstream transport.
+        Other topologies retain their plugin's contract, including transcripts
+        emitted alongside audio by a final speech stage.
+        """
+        capabilities = self.capabilities(max_sessions=max_sessions)
+        pipeline = self._pipeline_config
+        if pipeline is None or len(pipeline.stages) != 1:
+            return capabilities
+        stage = pipeline.stages[0]
+        if stage.final_output and stage.final_output_type == "text":
+            return replace(
+                capabilities,
+                supported_output_modalities=frozenset({"text"}) & capabilities.supported_output_modalities,
+                default_output_modalities=("text",),
+                supports_playback_ack=False,
+                supports_audio_truncate=False,
+                supports_stage_connector_handoff=False,
+                stage_handoff_transport=None,
+            )
+        return capabilities
 
     def configure_async_chunk(self, *, enabled: bool) -> None:
         """Receive the deploy-resolved ``async_chunk`` flag before admission.
@@ -751,6 +788,7 @@ class DuplexModelPlugin(ABC):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None: ...
 
     def project_intermediate_output(
@@ -827,6 +865,7 @@ class DuplexModelPlugin(ABC):
         segment_finished: bool,
         output: object,
         context: object,
+        streaming_context: object | None = None,
     ) -> bool:
         """Return True when the next user commit may start while prior TTS drains.
 
