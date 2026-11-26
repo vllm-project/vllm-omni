@@ -8,6 +8,10 @@ per-request ``modalities`` and full chat messages, so all three task types
 go through ``/v1/chat/completions`` (``--backend openai-chat-omni``) in a
 single benchmark run. This enables DTPS mixed-task scheduling evaluation
 within the unified ``vllm bench serve --omni`` framework.
+
+Set ``real_images_dir`` in the mixed-omni config (or point
+``MIXED_OMNI_REAL_IMAGES_DIR`` at a directory) to use real image files for
+the i2t/it2i input images instead of solid-color placeholders.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import os
 import random
 from dataclasses import dataclass
 from typing import Any
@@ -26,7 +31,11 @@ logger = logging.getLogger(__name__)
 
 # Default prompts per task type
 _DEFAULT_PROMPTS = {
-    "i2t": "Describe this image in detail.",
+    "i2t": (
+        "Analyze every visual element in this image: subjects, their positions, colors, "
+        "textures, materials, lighting direction, shadows, background details, "
+        "composition, mood, and atmosphere. Write a thorough professional analysis."
+    ),
     "t2i": "A serene mountain lake at dawn with mist rising over still waters.",
     "it2i": "Make the background a starry night sky.",
 }
@@ -36,6 +45,45 @@ _DEFAULT_BOT_TASKS = ("recaption", "think", "think_recaption")
 
 # Resolution distribution: 512x512 : 1024x1024 : 1280x720 = 1:1:1
 _RESOLUTIONS = [(512, 512), (1024, 1024), (1280, 720)]
+
+# Real-image sources, in priority order: config key -> env var -> repo assets.
+_REPO_IMAGES_DIR = os.path.join("tests", "assets", "hunyuan")
+_DEFAULT_IMAGES = ("hunyuan_baseline.png", "hunyuan_baseline_npu.png")
+_REAL_IMAGES_ENV = "MIXED_OMNI_REAL_IMAGES_DIR"
+
+
+def _discover_real_images(config: dict[str, Any]) -> list[str]:
+    """Return real image paths for i2t/it2i inputs, or [] to use placeholders."""
+    directory = config.get("real_images_dir") or os.environ.get(_REAL_IMAGES_ENV, "")
+    if directory and not os.path.isdir(directory):
+        logger.warning("[MIXED-OMNI] real_images_dir %s not found; using placeholders", directory)
+        return []
+    if not directory:
+        # Repo checkout: the two dog photos in tests/assets/hunyuan/.
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        candidate = os.path.join(repo_root, _REPO_IMAGES_DIR)
+        if not os.path.isdir(candidate):
+            return []
+        paths = [os.path.join(candidate, f) for f in _DEFAULT_IMAGES if os.path.isfile(os.path.join(candidate, f))]
+        if not paths:
+            logger.warning(
+                "[MIXED-OMNI] default images %s not found in %s; using placeholders", _DEFAULT_IMAGES, candidate
+            )
+        return paths
+    exts = (".png", ".jpg", ".jpeg", ".webp")
+    paths = sorted(os.path.join(directory, f) for f in os.listdir(directory) if f.lower().endswith(exts))
+    return paths
+
+
+def _load_real_image_b64(paths: list[str], index: int, size: tuple[int, int] | None = None) -> str:
+    """Load a real image (cycling), optionally resize, and return base64 PNG."""
+    path = paths[index % len(paths)]
+    img = Image.open(path).convert("RGB")
+    if size is not None and img.size != size:
+        img = img.resize(size, resample=Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 @dataclass
@@ -150,6 +198,15 @@ def generate_mixed_omni_samples(
 
     prompts_cfg = config.get("prompts", {})
     bot_tasks_cfg = config.get("bot_tasks", list(_DEFAULT_BOT_TASKS))
+    real_images = _discover_real_images(config)
+    if real_images:
+        logger.info(
+            "[MIXED-OMNI] Using %d real image(s) from %s for i2t/it2i inputs",
+            len(real_images),
+            os.path.dirname(real_images[0]),
+        )
+    else:
+        logger.info("[MIXED-OMNI] No real images found; using generated placeholders")
 
     samples: list[MixedOmniSampleRequest] = []
 
@@ -158,8 +215,11 @@ def generate_mixed_omni_samples(
         prompt = prompts_cfg.get("i2t", _DEFAULT_PROMPTS["i2t"])
         img_seed = seed * 1000 + i
         w, h = _pick_resolution(img_seed)
-        img_bytes = _generate_placeholder_image(seed=img_seed, size=(w, h))
-        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+        if real_images:
+            img_b64 = _load_real_image_b64(real_images, i, size=(w, h))
+        else:
+            img_bytes = _generate_placeholder_image(seed=img_seed, size=(w, h))
+            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
         messages = _build_i2t_messages(prompt, img_b64)
         extra_body = {"modalities": ["text"], "temperature": 0}
         samples.append(
@@ -204,8 +264,11 @@ def generate_mixed_omni_samples(
         img_seed = seed * 1000 + num_i2t + num_t2i + i
         w_in, h_in = _pick_resolution(img_seed)
         w_out, h_out = _pick_resolution(img_seed + 500)
-        img_bytes = _generate_placeholder_image(seed=img_seed, size=(w_in, h_in))
-        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+        if real_images:
+            img_b64 = _load_real_image_b64(real_images, num_i2t + i, size=(w_in, h_in))
+        else:
+            img_bytes = _generate_placeholder_image(seed=img_seed, size=(w_in, h_in))
+            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
         messages = _build_it2i_messages(prompt, img_b64)
         bot_task = bot_tasks_cfg[i % len(bot_tasks_cfg)] if bot_tasks_cfg else None
         extra_body = {
