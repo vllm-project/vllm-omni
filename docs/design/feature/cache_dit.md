@@ -263,11 +263,6 @@ calibrators are initialized after incompatible layout/version history is reset.
 The hard age limit takes precedence over hits. Pending copy-stream reads
 complete before the old Host reference data is overwritten.
 
-The default `refresh` policy is unchanged. Unsupported wrapper layouts or
-separate-CFG caching use the original fixed schedule. This policy does not
-isolate reference tokens or change the Host layout or sparse attention kernel.
-See the [configuration and tradeoffs](../../user_guide/diffusion_features.md#minimax-h3-reference-refresh-with-cache-dit).
-
 ## Testing
 
 After adding cache-dit support, test with:
