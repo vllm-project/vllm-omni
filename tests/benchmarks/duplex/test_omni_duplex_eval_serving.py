@@ -277,6 +277,7 @@ def test_evaluation_requires_a_judge_model(tmp_path):
     [
         ("--duplex-eval-judge-timeout-s", "nan"),
         ("--duplex-eval-judge-fps", "0"),
+        ("--duplex-eval-judge-frame-max-side", "-1"),
         ("--duplex-eval-window-size", "-1"),
         ("--duplex-eval-eval-workers", "0"),
     ],
@@ -286,7 +287,10 @@ def test_evaluation_rejects_invalid_options(tmp_path, option, value):
         _args(tmp_path, option, value)
 
 
-def test_evaluation_reuses_selected_samples_and_existing_scores(tmp_path, prepared, monkeypatch):
+@pytest.mark.parametrize("frame_limit,expected_max_side", [(None, 1920), ("768", 768), ("0", None)])
+def test_evaluation_reuses_selected_samples_and_existing_scores(
+    tmp_path, prepared, monkeypatch, frame_limit, expected_max_side
+):
     args = _args(
         tmp_path,
         "--duplex-eval-evaluate",
@@ -304,6 +308,7 @@ def test_evaluation_reuses_selected_samples_and_existing_scores(tmp_path, prepar
         "0.5",
         "--duplex-eval-eval-workers",
         "2",
+        *([] if frame_limit is None else ["--duplex-eval-judge-frame-max-side", frame_limit]),
     )
     preprocess_serve_args(args)
     samples = patch.get_samples(args, None)
@@ -321,7 +326,18 @@ def test_evaluation_reuses_selected_samples_and_existing_scores(tmp_path, prepar
     output.duplex_eval_result = _result(samples[0])
     summary = adapter.finalize_duplex_eval(samples, [output])
     accuracy = summary["accuracy"]
-    assert observed == [("1", 0.5, {"judge_fps": 3, "judge_video_mode": "frame-sample", "window_size": 12.0})]
+    assert observed == [
+        (
+            "1",
+            0.5,
+            {
+                "judge_fps": 3,
+                "judge_video_mode": "frame-sample",
+                "judge_frame_max_side": expected_max_side,
+                "window_size": 12.0,
+            },
+        )
+    ]
     assert accuracy["status"] == "completed" and accuracy["evaluated"] == accuracy["total"] == 1
     score_root = Path(accuracy["score_root"])
     assert not (score_root / "PR_correction/0.json").exists()

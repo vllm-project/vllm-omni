@@ -213,6 +213,11 @@ class DuplexModelSessionState(ABC):
     committed_audio_consume_started: bool
     deferred_response_create: bool
     deferred_precreate_response: bool
+    # Response id of a response precreated by an explicit response.create
+    # (vs engine-owned auto responses). The model channel uses it to tag the
+    # response's first silence unit so the model can open the assistant turn
+    # even when the previous turn's turn-ended latch is still set.
+    explicit_response_create_id: str | None
     continuation_owner_id: str | None
     continuation_units: int
     pending_silence_task: asyncio.Task[bool] | None
@@ -270,6 +275,8 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
     committed_audio_consume_started: bool = False
     deferred_response_create: bool = False
     deferred_precreate_response: bool = False
+    # See the field comment on DuplexModelSessionState above.
+    explicit_response_create_id: str | None = None
     continuation_owner_id: str | None = None
     continuation_units: int = 0
     pending_silence_task: asyncio.Task[bool] | None = None

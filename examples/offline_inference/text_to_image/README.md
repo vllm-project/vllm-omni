@@ -130,6 +130,17 @@ python text_to_image.py \
 
 ## More CLI Examples
 
+### Qwen-Image 2.1
+
+```bash
+python text_to_image.py \
+  --model Qwen/Qwen-Image-2.1 \
+  --prompt "A red apple on a wooden table" \
+  --height 512 --width 512 \
+  --num-inference-steps 4 \
+  --output qwen_image_21.png
+```
+
 ### Tongyi Models
 
 ```bash

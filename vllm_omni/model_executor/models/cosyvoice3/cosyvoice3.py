@@ -135,7 +135,7 @@ def _normalize_request_conditioning(payload: dict) -> dict:
     # Keep it in the source buffer (including the sampler's SamplingParams),
     # but validate only conditioning against the strict model payload schema.
     payload = payload.copy()
-    for key in ("sampling_params", "req_id", "mm_features", "prompt_embeds_cpu"):
+    for key in ("sampling_params", "req_id", "global_request_id", "mm_features", "prompt_embeds_cpu"):
         payload.pop(key, None)
     embed = payload.get("embed")
     if not isinstance(embed, Mapping):

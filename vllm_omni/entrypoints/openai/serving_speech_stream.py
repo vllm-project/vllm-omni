@@ -68,6 +68,7 @@ from typing import cast
 
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
 
@@ -733,14 +734,23 @@ class OmniStreamingSpeechHandler:
         """Validate a session.config message and its model."""
         try:
             config = StreamingSpeechSessionConfig(**{k: v for k, v in msg.items() if k != "type"})
-        except ValidationError as e:
+            # Apply the /v1/audio/speech request rules (e.g. cache_salt format,
+            # mutually exclusive references) before any text arrives.
+            probe = self._speech_request(config, "ping")
+        except (ValidationError, VLLMValidationError) as e:
             await self._send_error(websocket, f"Invalid session config: {e}")
             return None
 
         if config.model and hasattr(self._speech_service, "_check_model"):
-            error = await self._speech_service._check_model(OpenAICreateSpeechRequest(input="ping", model=config.model))
+            error = await self._speech_service._check_model(probe)
             if error is not None:
                 await self._send_error(websocket, str(error))
+                return None
+
+        if config.sample_rate is not None:
+            error = self._speech_service._validate_speech_sample_rate(probe)
+            if error is not None:
+                await self._send_error(websocket, error)
                 return None
 
         if config.text_input_mode == "commitment":
@@ -782,6 +792,39 @@ class OmniStreamingSpeechHandler:
                 return None
 
         return config
+
+    @staticmethod
+    def _speech_request(config: StreamingSpeechSessionConfig, text: str) -> OpenAICreateSpeechRequest:
+        """Build the /v1/audio/speech request that synthesizes ``text`` with this session's options."""
+        return OpenAICreateSpeechRequest(
+            input=text,
+            model=config.model,
+            voice=config.voice,
+            task_type=config.task_type,
+            language=config.language,
+            instructions=config.instructions,
+            response_format=config.response_format or "wav",
+            sample_rate=config.sample_rate,
+            speed=config.speed,
+            max_new_tokens=config.max_new_tokens,
+            initial_codec_chunk_frames=config.initial_codec_chunk_frames,
+            non_streaming_mode=config.non_streaming_mode,
+            ref_audio=config.ref_audio,
+            ref_text=config.ref_text,
+            ref_audio_2=config.ref_audio_2,
+            ref_audio_codes=config.ref_audio_codes,
+            ambient_sound=config.ambient_sound,
+            duration_seconds=config.duration_seconds,
+            token_count=config.token_count,
+            x_vector_only_mode=config.x_vector_only_mode,
+            speaker_embedding=config.speaker_embedding,
+            cache_salt=config.cache_salt,
+            extra_params=config.extra_params,
+            stream=config.stream_audio,
+            word_timestamps=config.word_timestamps,
+            seed=config.seed,
+            watermarking=config.watermarking,
+        )
 
     def _generation_precondition_error(self, config: StreamingSpeechSessionConfig) -> str | None:
         if not config.word_timestamps:
@@ -829,27 +872,7 @@ class OmniStreamingSpeechHandler:
             await self._send_error(websocket, precondition_error)
             return False
 
-        request = OpenAICreateSpeechRequest(
-            input=sentence_text,
-            model=config.model,
-            voice=config.voice,
-            task_type=config.task_type,
-            language=config.language,
-            instructions=config.instructions,
-            response_format=response_format,
-            speed=config.speed,
-            max_new_tokens=config.max_new_tokens,
-            initial_codec_chunk_frames=config.initial_codec_chunk_frames,
-            non_streaming_mode=config.non_streaming_mode,
-            ref_audio=config.ref_audio,
-            ref_text=config.ref_text,
-            x_vector_only_mode=config.x_vector_only_mode,
-            speaker_embedding=config.speaker_embedding,
-            stream=config.stream_audio,
-            word_timestamps=config.word_timestamps,
-            seed=config.seed,
-            watermarking=config.watermarking,
-        )
+        request = self._speech_request(config, sentence_text)
 
         start_payload = {
             "type": "audio.start",
@@ -860,10 +883,9 @@ class OmniStreamingSpeechHandler:
         }
         if config.word_timestamps:
             start_payload["word_timestamps"] = True
-        # Streamed pcm is model-native s16le. Its rate and channel count are
-        # known once the first chunk is encoded, so for pcm audio.start is
-        # deferred to that point and states them; it is sent bare if no audio
-        # arrives. Non-streamed responses still send it before generation.
+        # Streamed PCM uses the requested sample rate or the model-native rate.
+        # Send audio.start when the first encoded chunk provides the rate and
+        # channel count, or without those fields if no audio arrives.
         describe_pcm = config.stream_audio and response_format == "pcm"
         audio_format: dict[str, int] = {}
         start_sent = False
@@ -911,6 +933,7 @@ class OmniStreamingSpeechHandler:
                         request_start_s=request_start_s,
                         request_arrival_ts=request_arrival_ts,
                         tts_params=tts_params,
+                        target_sample_rate=config.sample_rate,
                         audio_format=audio_format,
                         send_start=send_start,
                     )
@@ -922,6 +945,7 @@ class OmniStreamingSpeechHandler:
                             request_start_s=request_start_s,
                             request_arrival_ts=request_arrival_ts,
                             tts_params=tts_params,
+                            target_sample_rate=config.sample_rate,
                             audio_format=audio_format,
                         )
                     ) as stream:
@@ -1005,6 +1029,7 @@ class OmniStreamingSpeechHandler:
         request_arrival_ts: float,
         language: str | None = None,
         tts_params: dict | None = None,
+        target_sample_rate: int | None = None,
         audio_format: dict[str, int] | None = None,
         send_start: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
@@ -1064,6 +1089,7 @@ class OmniStreamingSpeechHandler:
                 include_sample_rate=True,
                 tts_params=tts_params,
                 collect=collect,
+                target_sample_rate=target_sample_rate,
                 cumulative_audio=True,
                 audio_format=audio_format,
             )

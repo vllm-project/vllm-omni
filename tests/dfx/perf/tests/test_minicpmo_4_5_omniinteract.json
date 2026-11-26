@@ -1,15 +1,11 @@
 [
   {
     "test_name": "test_minicpmo_4_5_omniinteract",
-    "description": "Provisional H200 mean_duplex_busy_rtf baselines: 2026-11-18 single-day response means for 1q1a, 1q1a_math and 1qna (44, 16 and 17 valid samples), rounded to four decimals without margin. Source: JiusiServe/omni-reviewbot@71cb3bb12cca, vLLM-Omni@7a92afde03ef. Local device label L20X maps to H200. Higher Busy RTF variability is accepted; this short window does not establish stability. H100 calibration remains pending.",
     "mark": [
       {
         "hardware_marks": {
           "res": {
-            "cuda": [
-              "H100",
-              "H200"
-            ]
+            "cuda": ["H100", "L20X"]
           },
           "num_cards": 2
         }
@@ -76,9 +72,9 @@
           "duplex_stall_ratio"
         ],
         "baseline": {
-          "H200": {
+          "L20X": {
             "mean_duplex_busy_rtf": [
-              2.9042
+              2.9727
             ]
           }
         }
@@ -119,9 +115,9 @@
           "duplex_stall_ratio"
         ],
         "baseline": {
-          "H200": {
+          "L20X": {
             "mean_duplex_busy_rtf": [
-              0.9131
+              0.9506
             ]
           }
         }
@@ -162,13 +158,14 @@
           "duplex_stall_ratio"
         ],
         "baseline": {
-          "H200": {
+          "L20X": {
             "mean_duplex_busy_rtf": [
-              0.6782
+              0.7246
             ]
           }
         }
       }
-    ]
+    ],
+    "description": "L20X Busy RTF references use equal daily means from 2026-11-18 and 2026-11-23 at C8/N8, separately for 1q1a, 1q1a_math and 1qna. This is a provisional two-day calibration with higher variability permitted. L20X is a distinct device and these values do not calibrate H200 or the newer N60 workload. The pooled IA-QTF1 floor passed on both dates; the weak 1qna subset scores remain a quality limitation. Source: JiusiServe/omni-reviewbot@2b499afbfc2719740a1869ac20b5c5b9afafde10."
   }
 ]

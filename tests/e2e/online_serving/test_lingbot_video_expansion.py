@@ -4,10 +4,7 @@
 """
 L4 expansion coverage for ``robbyant/lingbot-video-dense-1.3b``.
 
-This file remains dense-only. Baseline T2I/T2V/TI2V for the dense checkpoint
-lives in ``test_lingbot_video.py`` (L2/L3). MoE smoke stays in
-``test_lingbot_video_moe.py`` (L4). Distributed feature rows belong in follow-up
-PRs.
+MoE smoke coverage lives in ``test_lingbot_video_moe.py`` (L4).
 """
 
 import json

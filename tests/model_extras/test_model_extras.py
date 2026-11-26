@@ -46,7 +46,7 @@ def test_x_to_text_model_family(monkeypatch: pytest.MonkeyPatch, config: dict[st
 def test_bagel_x_to_text_prompt_builder() -> None:
     prompt, stop_token_ids = build_x_to_text_prompt("bagel", "unused", "Describe it.", has_image=True)
     assert prompt == {
-        "prompt": "<|im_start|>user\n<|image_pad|>\nDescribe it.<|im_end|>\n<|im_start|>assistant\n",
+        "prompt": "<|image_pad|><|im_start|>Describe it.<|im_end|><|im_start|>",
         "modalities": ["text"],
     }
     assert stop_token_ids is None

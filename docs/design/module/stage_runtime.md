@@ -123,6 +123,11 @@ stage override, a positive upstream shutdown timeout is honored, otherwise the
 upstream process manager retains its default grace period. The timeout bounds
 process cleanup; it does not change request draining or admission policy.
 
+Once a local stage process enters final cleanup, repeated `SIGTERM` and
+`SIGINT` signals are ignored until its resource owners finish closing. Default
+signal handling is restored afterwards. The process manager can still enforce
+its shutdown deadline with `SIGKILL`.
+
 ## Invariant namespace
 
 `STAGE-INV` reserves `001-099` for placement and ownership, `100-199` for

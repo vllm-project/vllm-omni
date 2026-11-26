@@ -236,17 +236,6 @@ steps:
             -m "full_model and diffusion and npu and A3 and cards_1"
             --run-level full_model
             --junitxml=tests/e2e/accuracy/artifacts/qwen_image_21/pytest.xml'
-      - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
-        source_file_dependencies: diffusion_hunyuan_image3_accuracy
-        timeout_in_minutes: 180
-        mirror_hardwares: a3_npu_4
-        env:
-          VLLM_WORKER_MULTIPROC_METHOD: spawn
-          HUNYUAN_IMAGE3_MODEL: "tencent/HunyuanImage-3.0-Instruct"
-          HUNYUAN_IMAGE3_DEVICES: "0,1,2,3"
-          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
-        commands:
-          - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py -m "full_model and A3" --run-level full_model
       - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=2 CFGP=2"
         source_file_dependencies: diffusion_hunyuan_image3_perf
         timeout_in_minutes: 180
@@ -298,6 +287,23 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$EXIT
+      - label: ":full_moon: HunyuanImage3 Accuracy (4 NPU)"
+        key: nightly-hunyuan-image3-accuracy-npu
+        source_file_dependencies: diffusion_hunyuan_image3_accuracy
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - tests/e2e/accuracy/results/result_acc_*.json
+        commands:
+          - >-
+            pytest -sv tests/e2e/accuracy/test_hunyuan_image3.py
+            -m "full_model and diffusion and npu and A3 and cards_4"
+            --run-level full_model
+
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-2.1 · Single-NPU"
         source_file_dependencies: diffusion_qwen_image_21_perf
         key: nightly-diffusion-x2iat-performance-qwen-image-21-single-npu

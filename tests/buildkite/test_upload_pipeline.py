@@ -1040,6 +1040,24 @@ def test_gepard_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch)
     )
 
 
+def test_yue2_offline_nightly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    pipeline_path = Path(".buildkite/cuda/test-nightly.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    label = ":full_moon: TTS · Function Test with L4"
+    for changed_file in (
+        "tests/e2e/offline_inference/test_yue2.py",
+        "examples/offline_inference/yue2/end2end.py",
+        "vllm_omni/model_executor/models/yue2/runtime.py",
+        "vllm_omni/deploy/yue2.yaml",
+        "vllm_omni/worker_v2/omni_ar_model_runner.py",
+        "vllm_omni/worker_v2/omni_model_runner.py",
+        "vllm_omni/worker_v2/model_states/omni_model_state.py",
+    ):
+        assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
+    assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
+
+
 def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MIRROR_HW", raising=False)
     pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
@@ -1054,6 +1072,7 @@ def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatc
         "tts_step_audio2_weekly",
         "tts_moss_v15_weekly",
         "tts_minimax_music3_weekly",
+        "tts_yue2_weekly",
     ]
     assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
     command = "\n".join(step["commands"])
@@ -1070,8 +1089,7 @@ def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatc
     for path in explicit_files:
         assert command.count(path) == 2
         assert f"--ignore={path}" in command
-    assert command.count("tests/e2e/online_serving/test_yue2.py") == 1
-    assert "--ignore=tests/e2e/online_serving/test_yue2.py" in command
+    assert "--ignore=tests/e2e/online_serving/test_yue2.py" not in command
     assert "failed=0" in command
     assert "exit $$failed" in command
 
@@ -1081,9 +1099,12 @@ def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatc
     for changed_file in (
         "tests/e2e/offline_inference/test_moss_tts_v1_5_expansion.py",
         "tests/e2e/online_serving/test_minimax_music3.py",
+        "tests/e2e/online_serving/test_yue2.py",
+        "vllm_omni/worker_v2/omni_ar_model_runner.py",
+        "vllm_omni/worker_v2/omni_model_runner.py",
+        "vllm_omni/worker_v2/model_states/omni_model_state.py",
     ):
         assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
-    assert label not in _surviving_labels(doc, ["tests/e2e/online_serving/test_yue2.py"], pipeline_path=pipeline_path)
     assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
 
 
@@ -1508,6 +1529,25 @@ def test_qwen_image_21_accuracy_model_dependencies(
     assert any("test_qwen_image_21.py" in command for command in step["commands"])
     assert any(selector in command for command in step["commands"])
     assert "tests/e2e/accuracy/artifacts/qwen_image_21/**/*" in step["artifact_paths"]
+
+
+@pytest.mark.parametrize(
+    "path,run_level",
+    [(CUDA_READY_YAML, "core_model"), (Path(".buildkite/cuda/test-merge.yml"), "advanced_model")],
+)
+def test_lingbot_world_replaces_cuda_ready_and_merge_video_gate(monkeypatch, path, run_level):
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    rendered = _render_test_pipeline(yaml.safe_load(path.read_text()), changed_files=None, pipeline_path=path)
+    steps = [step for step in _iter_steps(rendered) if "LingBot" in step.get("label", "")]
+
+    assert [step["label"] for step in steps] == ["Diffusion · LingBot-World Test"]
+    assert steps[0]["agents"]["queue"] == "mithril-h100-pool"
+    assert any(
+        "tests/e2e/offline_inference/test_lingbot_world_v2.py" in command
+        and f"{run_level} and cuda and diffusion" in command
+        and f"--run-level '{run_level}'" in command
+        for command in steps[0]["commands"]
+    )
 
 
 @pytest.mark.parametrize("platform", ["cuda", "npu"])

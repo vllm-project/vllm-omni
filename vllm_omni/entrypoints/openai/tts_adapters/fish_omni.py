@@ -112,6 +112,11 @@ class FishOmniAdapter(ARTTSAdapter):
         return prompt
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
+        if request.extra_params is not None and "fish_omni_reference_top_p" in request.extra_params:
+            from vllm_omni.model_executor.models.fish_omni.sampling import parse_reference_top_p
+
+            if parse_reference_top_p(request.extra_params["fish_omni_reference_top_p"]) is None:
+                return "fish_omni_reference_top_p must be a number in (0, 1]"
         server = self.ctx.server
         if request.ref_audio_codes is not None:
             if request.voice:

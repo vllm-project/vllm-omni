@@ -112,7 +112,10 @@ class _FixedAudioCodes(nn.Module):
         super().__init__()
         self.register_buffer("codes", codes)
 
-    def forward(self, llm_hidden: torch.Tensor, cfg_alpha: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, llm_hidden: torch.Tensor, cfg_alpha: torch.Tensor, noise: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        assert noise is None
         return self.codes
 
 

@@ -29,7 +29,7 @@ PREDICTOR_OPTIONS = tuple(PREDICTOR_DEFAULTS)
 def test_resolved_optimization_defaults_are_npu_only(monkeypatch, platform):
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: platform == "npu")
     deploy = _apply_platform_overrides(load_deploy_config(get_deploy_config_path("qwen3_tts.yaml")), platform=platform)
-    assert deploy.model_runner == ("v2" if platform in ("cuda", "npu", "xpu") else "v1")
+    assert deploy.model_runner == ("v2" if platform in ("cuda", "rocm", "npu", "xpu") else "v1")
     if platform == "npu":
         for stage in deploy.stages:
             assert stage.compilation_config is not None
@@ -45,16 +45,19 @@ def test_resolved_optimization_defaults_are_npu_only(monkeypatch, platform):
     assert all(
         options.get(key, False) is (enabled and platform == "npu") for key, enabled in PREDICTOR_DEFAULTS.items()
     )
-    # Defaults belong to the model/loader. A YAML copy could mask a change
-    # to those defaults and give custom deployments different behavior.
-    npu_options = {
-        *PREDICTOR_OPTIONS,
-        "npu_incremental_codec",
-        "code_predictor_kv_cache",
-    }
-    assert npu_options.isdisjoint(connector.get("extra", {}))
+    codec = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    assert codec.async_scheduling is (platform != "npu")
+
+    connector_extra = connector.get("extra", {})
+    assert set(PREDICTOR_OPTIONS).isdisjoint(connector_extra)
+    assert "npu_incremental_codec" not in connector_extra
     for stage in deploy.stages:
-        assert npu_options.isdisjoint(stage.engine_extras.get("additional_config", {}))
+        additional = stage.engine_extras.get("additional_config", {})
+        assert set(PREDICTOR_OPTIONS).isdisjoint(additional)
+        if platform == "npu" and stage.stage_id == 1:
+            assert additional["npu_incremental_codec"] is False
+        else:
+            assert "npu_incremental_codec" not in additional
 
 
 @pytest.mark.parametrize("source", ["implicit", "additional", "connector", "connector_opt_in"])

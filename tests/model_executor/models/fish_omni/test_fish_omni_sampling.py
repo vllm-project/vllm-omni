@@ -16,7 +16,12 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_marks
-from vllm_omni.model_executor.models.fish_omni.sampling import EMPTY_RAS_SLOT, RAS_WINDOW_FRAMES, FusedFrameSampler
+from vllm_omni.model_executor.models.fish_omni.sampling import (
+    EMPTY_RAS_SLOT,
+    RAS_TOP_K,
+    RAS_WINDOW_FRAMES,
+    FusedFrameSampler,
+)
 
 pytestmark = [
     pytest.mark.core_model,
@@ -31,7 +36,7 @@ ROWS = 2000
 MAX_TOP_K = 32
 CANDIDATES = torch.tensor([EOS, *range(SEMANTIC_BEGIN, SEMANTIC_BEGIN + CODEBOOK_SIZE)])
 # Near-tied candidates: the arg-max semantic token, end of speech, and two more
-# semantic tokens; top_p 0.95 drops the last of them.
+# semantic tokens.
 ARGMAX, OTHER_A, OTHER_B = SEMANTIC_BEGIN + 1, SEMANTIC_BEGIN + 2, SEMANTIC_BEGIN + 3
 
 
@@ -130,7 +135,7 @@ def _graph_main_inputs(rows, dtype=torch.float32):
     temperature = torch.ones(rows, dtype=torch.float32, device="cuda")
     top_k = torch.ones(rows, dtype=torch.long, device="cuda")
     top_p = torch.ones(rows, dtype=torch.float32, device="cuda")
-    noise = torch.full((rows, sampler.num_draws, MAX_TOP_K), 0.5, dtype=torch.float32, device="cuda")
+    noise = sampler.noise(rows, torch.device("cuda")).fill_(0.5)
     return sampler, (logits, candidate_ids, ras_window, temperature, top_k, top_p, noise)
 
 
@@ -179,10 +184,9 @@ def test_code_cuda_graph_matches_eager():
     temperature = torch.ones(rows, dtype=torch.float32, device="cuda")
     top_k = torch.full((rows,), 2, dtype=torch.long, device="cuda")
     top_p = torch.ones(rows, dtype=torch.float32, device="cuda")
-    noise = torch.full((rows, sampler.num_draws, MAX_TOP_K), 0.5, dtype=torch.float32, device="cuda")
+    noise = sampler.noise(rows, torch.device("cuda")).fill_(0.5)
     inputs = (logits, temperature, top_k, top_p, noise, 0)
-    assert not noise[:, FusedFrameSampler.NUM_DRAWS_EXTRA].is_contiguous()
-    assert noise[:, FusedFrameSampler.NUM_DRAWS_EXTRA].stride(0) == sampler.num_draws * MAX_TOP_K
+    assert not noise[:, MAX_TOP_K + RAS_TOP_K :].is_contiguous()
 
     eager = sampler.code(*inputs).clone()
     graph, graph_outputs = _capture_graph(lambda: sampler.code(*inputs))
@@ -200,14 +204,14 @@ def test_code_cuda_graph_observes_input_updates():
     temperature = torch.ones(rows, dtype=torch.float32, device="cuda")
     top_k = torch.ones(rows, dtype=torch.long, device="cuda")
     top_p = torch.ones(rows, dtype=torch.float32, device="cuda")
-    noise = torch.full((rows, sampler.num_draws, MAX_TOP_K), 0.5, dtype=torch.float32, device="cuda")
+    noise = sampler.noise(rows, torch.device("cuda")).fill_(0.5)
     inputs = (logits, temperature, top_k, top_p, noise, 0)
     graph, graph_outputs = _capture_graph(lambda: sampler.code(*inputs))
     before = _replay_snapshot(graph, graph_outputs)
     assert bool((before == 0).all())
 
     top_k.copy_(torch.full_like(top_k, 2))
-    noise[:, FusedFrameSampler.NUM_DRAWS_EXTRA, :2].copy_(
+    noise[:, MAX_TOP_K + RAS_TOP_K : MAX_TOP_K + RAS_TOP_K + 2].copy_(
         torch.tensor([0.01, 0.99], dtype=noise.dtype, device=noise.device)
     )
     expected = sampler.code(*inputs).clone()
@@ -221,8 +225,8 @@ def test_code_cuda_graph_observes_input_updates():
 def test_main_tokens_cuda_graph_observes_ras_updates():
     sampler, inputs = _graph_main_inputs(rows=4)
     logits, candidate_ids, ras_window, temperature, top_k, top_p, noise = inputs
-    noise[:, 1, 0] = 0.01
-    noise[:, 1, 1] = 0.99
+    noise[:, MAX_TOP_K] = 0.01
+    noise[:, MAX_TOP_K + 1] = 0.99
     graph, graph_outputs = _capture_graph(lambda: sampler.main_tokens(*inputs, SEMANTIC_BEGIN, CODEBOOK_SIZE))
     before = _replay_snapshot(graph, graph_outputs)
     assert bool((before[0] == ARGMAX).all())
@@ -245,7 +249,7 @@ def test_non_repeated_token_keeps_first_draw():
 def test_repeated_semantic_token_is_redrawn():
     tokens, _ = _sample(_logits(ARGMAX, OTHER_A), history=[OTHER_B, ARGMAX])
     kept = (tokens == ARGMAX).float().mean().item()
-    assert 0.3 < kept < 0.7
+    assert abs(kept - 1 / 3) < 0.05
     assert set(tokens.tolist()) <= {ARGMAX, OTHER_A, OTHER_B}
 
 

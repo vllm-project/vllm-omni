@@ -93,6 +93,7 @@ steps:
             tests/diffusion/layers/test_fused_qk_norm_rope_npu.py
             tests/diffusion/models/minimax_h3/test_minimax_h3_qwen3vl_swiglu.py
             tests/diffusion/models/minimax_h3/test_minimax_h3_modulation.py
+            tests/diffusion/models/qwen_image_21/test_rope_device_qualification.py
             -m 'core_model and npu and A3'
             --run-level 'core_model'
 
@@ -206,6 +207,32 @@ steps:
                 pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'core_model and npu' --run-level 'core_model'
                 "
         timeout_in_minutes: 60
+
+      - label: "Diffusion · LingBot-World Test (A2)"
+        key: ready-diffusion-lingbot-world-a2
+        source_file_dependencies: diffusion_lingbot_world_npu_function
+        timeout_in_minutes: 90
+        mirror_hardwares: a2b3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_HUB_OFFLINE: "1"
+          VLLM_OMNI_LINGBOT_WORLD_V2_IMAGE_PATH: tests/assets/qwen_image_edit/qwen_image_edit_2511_test2.png
+          VLLM_OMNI_AR_DIFFUSION_KV_GATHER: "0"
+          AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH: "0"
+          OMP_NUM_THREADS: "1"
+        commands:
+          # The advanced run level keeps real weights in the explicit deploy config.
+          - |
+            set -e
+            hub_cache=$$(python -c 'from huggingface_hub.constants import HF_HUB_CACHE; print(HF_HUB_CACHE)')
+            snapshot="$$hub_cache/models--robbyant--lingbot-world-v2-14b-causal-fast-diffusers/snapshots/59cccf49f2d2dd27418ae7a04b82b10868d455c2"
+            export VLLM_OMNI_LINGBOT_WORLD_V2_CHECKPOINT_PATH="$${VLLM_OMNI_LINGBOT_WORLD_V2_CHECKPOINT_PATH:-$$snapshot}"
+            if [ ! -r "$$VLLM_OMNI_LINGBOT_WORLD_V2_CHECKPOINT_PATH/model_index.json" ]; then
+              echo "Missing pre-staged LingBot World checkpoint at $$VLLM_OMNI_LINGBOT_WORLD_V2_CHECKPOINT_PATH" >&2
+              exit 1
+            fi
+            MODEL_PREFIX="" pytest -s -v tests/e2e/offline_inference/test_lingbot_world_v2.py \
+              -m "core_model and diffusion and npu and A2 and cards_4" --run-level advanced_model
 
       - label: "Diffusion · Hunyuan Image Test"
         mirror_hardwares: a3_npu_4

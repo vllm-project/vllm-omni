@@ -56,7 +56,7 @@
           "H100": {
             "request_throughput": 0.0414,
             "mean_e2el_ms": 24166.28,
-            "mean_peak_memory_mb": 73579.5714
+            "mean_peak_memory_mb": 73198.2
           }
         }
       }
@@ -125,13 +125,13 @@
         "baseline": {
           "H100": {
             "request_throughput": 0.0597,
-            "mean_e2el_ms": 16750.8681,
+            "mean_e2el_ms": 16767.9317,
             "mean_peak_memory_mb": 47041.8
           },
           "A3": {
-            "request_throughput": 0.0163,
-            "mean_e2el_ms": 61202.1459,
-            "mean_peak_memory_mb": 47511.9429
+            "request_throughput": 0.0165,
+            "mean_e2el_ms": 60676.6706,
+            "mean_peak_memory_mb": 47511.2857
           }
         }
       },
@@ -166,13 +166,13 @@
         "baseline": {
           "H100": {
             "request_throughput": 0.0107,
-            "mean_e2el_ms": 93110.7919,
+            "mean_e2el_ms": 93497.9734,
             "mean_peak_memory_mb": 53625.1143
           },
           "A3": {
             "request_throughput": 0.0022,
-            "mean_e2el_ms": 458592.7033,
-            "mean_peak_memory_mb": 53625.0286
+            "mean_e2el_ms": 463441.4275,
+            "mean_peak_memory_mb": 53658.7429
           }
         }
       }

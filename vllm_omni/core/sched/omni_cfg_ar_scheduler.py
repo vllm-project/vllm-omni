@@ -42,6 +42,23 @@ class OmniCFGARScheduler(OmniARScheduler):
         if self._prefill_min_output_tokens < 0:
             raise ValueError("cfg_prefill_delay_tokens cannot be negative")
 
+    def _isolation_unit(self, request: Request) -> list[Request] | None:
+        """A CFG pair is the isolation unit: both branches must run together."""
+        request_id = getattr(request, "request_id", None)
+        pair_id = self._request_pairs.get(request_id) if request_id is not None else None
+        if pair_id is None:
+            return [request]
+        pair = self._pairs.get(pair_id) or {}
+        if len(pair) != 2:
+            # The companion is not queued: admitting one branch alone would
+            # break the atomic-admission invariant.
+            return None
+        conditioned = self.requests.get(pair["cond"])
+        unconditioned = self.requests.get(pair["uncond"])
+        if conditioned is None or unconditioned is None:
+            return None
+        return [conditioned, unconditioned]
+
     def _should_defer_waiting_admission(self) -> bool:
         # Let fresh streaming requests accumulate playback audio before
         # another request's text/reference encoding occupies the same device.

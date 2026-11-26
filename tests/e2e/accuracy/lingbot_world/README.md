@@ -73,8 +73,8 @@ videos from the semantic
 tests. Server/cleanup failures remain failures. Generation hardware, source,
 model and workload are separate from the CUDA evaluator hardware.
 
-CUDA capture requires released vLLM 0.34.0 and Torch 2.14.0. NPU capture keeps
-its existing vLLM-Ascend 0.33.0 image and is not qualified for vLLM 0.34.0.
+Capture records the installed vLLM and PyTorch versions in `model.json` and
+`generation.json`. NPU capture also records `torch-npu` and `vllm-ascend`.
 
 CUDA generation uses two H100 GPUs with Ulysses/SP=2. NPU uses the existing
 four-device A2 configuration, followed by the same scorers on a CUDA worker.
@@ -164,7 +164,9 @@ CUDA accuracy 60 min (21.7-25.2 min, builds 19532-19586), NPU Data 90 min
 Outputs 45 min (12.3-15.0 min). Perf jobs: CUDA 45 min (6.9-8.1 min), A2
 60 min (15.9-19.2 min; server init is bounded at 900 s).
 
-For a CPU-only check of capture and scoring contracts:
+Nightly runs `test_numeric_precision` against real model outputs, including
+saved NPU captures. Ready runs the CPU component tests for capture and scoring
+with the same selectors used here.
 
 ```bash
 python -m pytest -q tests/benchmarks/test_lingbot_world_cases.py \
@@ -178,7 +180,7 @@ Existing DFX stability cases keep
 `benchmarks/lingbot_world/benchmark_lingbot_world_realtime.py` and their deploy
 config paths. This compatibility entry delegates to the shared serving benchmark.
 
-For PR builds the NPU LingBot lanes require both `nightly-test` and `npu-test`;
+For PR builds the NPU LingBot Nightly lanes require both `nightly-test` and `npu-test`;
 the latter is a separate opt-in for the four-A2 capture and CUDA scoring cost.
 The deprecated nightly email distribution is not extended by this PR; the
 performance JSON remains available through the existing artifacts/dashboard.

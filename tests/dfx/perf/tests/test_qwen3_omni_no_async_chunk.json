@@ -1,7 +1,7 @@
 [
   {
     "test_name": "test_qwen3_omni",
-    "description": "random row: fixed workload (Thinker 900 / Talker 1536 tokens, min_tokens == max_tokens) for comparable audio RTF, see #8100. Selected non-regressing H100 values use equal-weight daily means from 2026-11-10 through 2026-11-16 (7 comparable days), with recorded stage token counts verified, sample daily CV <=5%, and every day within 10% of the window median; rounded to 4 decimals with no added margin. Regressing or unstable values retain their prior references. A3 values are retained because the window has only 4 comparable days; the random row retains its 2026-10-08 through 2026-10-14 reference. These archived measurements do not validate the current revision.",
+    "description": "random row: fixed workload (Thinker 900 / Talker 1536 tokens, min_tokens == max_tokens) for comparable audio RTF, see #8100. Selected A3 and H100 references were refreshed on 2026-11-26 using equal-weight daily means of comparable November runs, after verifying per-request stage token counts. Ordinary updates require at least five valid days, sample CV <= 5%, maximum daily deviation from the median <= 10%, and no regression; no margin is added. Unchanged values retain their previous calibrations. Source: JiusiServe/omni-reviewbot@2b499afbfc2719740a1869ac20b5c5b9afafde10.",
     "mark": [
       {
         "hardware_marks": {
@@ -113,44 +113,44 @@
           },
           "A3": {
             "request_throughput": [
-              0.0078,
-              0.0274,
-              0.0491,
+              0.0119,
+              0.0423,
+              0.0756,
               0.0795,
               0.0994
             ],
             "mean_ttft_ms": [
-              209.3508,
+              187.9923,
               364.3165,
               458.4411,
               723.1123,
               1171.6259
             ],
             "mean_tpot_ms": [
-              28.0779,
-              33.0101,
+              23.6552,
+              25.1081,
               38.8505,
               50.6796,
               120.7271
             ],
             "mean_e2el_ms": [
-              140296.3104,
-              156889.7434,
-              171817.2825,
+              84398.8178,
+              94357.0924,
+              105036.6516,
               207225.9885,
               319344.5635
             ],
             "mean_audio_ttfp_ms": [
-              140275.5251,
-              156867.7576,
-              171714.097,
+              84378.8595,
+              94336.7741,
+              104944.535,
               206912.0565,
               318934.5767
             ],
             "mean_audio_rtf": [
-              1.1436,
-              1.2789,
-              1.4004,
+              0.6875,
+              0.7686,
+              0.8555,
               1.6888,
               2.6025
             ]
@@ -168,14 +168,14 @@
               215.2391,
               296.4664,
               430.4905,
-              568.2295
+              812.2658
             ],
             "mean_tpot_ms": [
-              5.022,
-              8.2965,
-              10.2715,
-              13.172,
-              16.8911
+              4.9877,
+              8.2998,
+              10.3249,
+              13.0621,
+              16.3596
             ],
             "mean_e2el_ms": [
               18752.4068,
@@ -256,7 +256,7 @@
               316.1369
             ],
             "mean_tpot_ms": [
-              4.6932
+              4.6364
             ],
             "mean_e2el_ms": [
               3757.4875
@@ -270,19 +270,19 @@
               0.6604
             ],
             "request_throughput": [
-              0.0769
+              0.0868
             ],
             "mean_ttft_ms": [
-              452.723
+              434.5344
             ],
             "mean_tpot_ms": [
-              26.7059
+              22.9251
             ],
             "mean_e2el_ms": [
-              31418.3177
+              18572.9323
             ],
             "mean_audio_ttfp_ms": [
-              31414.5578
+              18569.6119
             ]
           }
         }
@@ -341,10 +341,10 @@
               0.4781
             ],
             "mean_ttft_ms": [
-              272.1915
+              258.0755
             ],
             "mean_tpot_ms": [
-              5.2147
+              5.1686
             ],
             "mean_e2el_ms": [
               4085.4559
@@ -355,10 +355,10 @@
           },
           "A3": {
             "mean_audio_rtf": [
-              1.0521
+              0.8853
             ],
             "request_throughput": [
-              0.3298
+              0.386
             ],
             "mean_ttft_ms": [
               455.5273
@@ -367,10 +367,10 @@
               30.9399
             ],
             "mean_e2el_ms": [
-              42200.2865
+              23706.2063
             ],
             "mean_audio_ttfp_ms": [
-              42196.627
+              23702.5259
             ]
           }
         }
@@ -434,7 +434,7 @@
               464.283
             ],
             "mean_tpot_ms": [
-              6.1598
+              6.0927
             ],
             "mean_e2el_ms": [
               5246.8779
@@ -448,7 +448,7 @@
               1.9804
             ],
             "request_throughput": [
-              0.5375
+              0.6592
             ],
             "mean_ttft_ms": [
               1236.0965
