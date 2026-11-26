@@ -868,6 +868,7 @@ def test_multistage_images_async_omni_construction(async_omni_test_client):
     assert captured_prompt["mm_processor_kwargs"] == {
         "target_h": 256,
         "target_w": 128,
+        "modalities": ["image"],
     }
 
     captured = engine.captured_sampling_params_list
