@@ -204,9 +204,14 @@ class AppendAttempt:
                 mark()
             else:
                 model_state.committed_audio_consume_started = True
+        payload = self.payload
+        if self.retained_committed_payload is not None:
+            # The flush resubmits audio already counted as a client chunk.
+            payload = dict(self.payload)
+            payload["retained_committed_unit"] = True
         try:
             append_ok, emitted_response = await self.model.append_runtime_input(
-                self.payload,
+                payload,
                 operation_id=(
                     self.pcm_reservation.operation_id if self.pcm_reservation is not None else self.operation_id
                 ),

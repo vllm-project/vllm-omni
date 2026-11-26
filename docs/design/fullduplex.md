@@ -1664,7 +1664,9 @@ what forcing* — the two surfaces this contract adds.
   rides `sampled_token` in the namespaced `model` extension. A unit marked
   `is_speech` keeps a sampled listen and ends the turn.
   Records also carry the forcing taxonomy (`sampled` / `forced` with reason /
-  `reemit`), input origins (`client` / engine-injected silence), effective
+  `reemit`), input origins (one `client` per fed chunk, in submit order;
+  engine-injected silence, a commit flush of audio already consumed, and a
+  model-minted continuation are `engine`), effective
   sampling parameters, and the derived seed
   `f(session_seed, epoch, response_index)`. Validation failure is
   session-fatal (`action_capture_invalid`). The ledger retains

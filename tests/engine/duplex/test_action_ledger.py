@@ -138,6 +138,31 @@ def test_ingest_orders_units_and_derives_records() -> None:
     assert records[0].model == {"rep_penalty": 1.05}
 
 
+def test_input_origin_follows_submit_order_not_the_capture_seq() -> None:
+    """A unit's capture seq is the model's counter, not the append reservation."""
+    ledger = SessionActionLedger(session_id="s1")
+    ledger.bind_listening(epoch=0, turn_id=1)
+    ledger.note_input_unit(0, 1, modality="audio", origin="client", commit_ns=1)
+    ledger.note_input_unit(0, 2, modality="audio", origin="client", commit_ns=2)
+    # Several decode steps share a unit and must not consume the next append.
+    ledger.ingest(_payload(seq=7, unit_index=0), epoch=0, turn_id=1, response_id=None, stage_id=0, input_modality="")
+    ledger.ingest(
+        _payload(seq=8, unit_index=0, token_ids=(12,)),
+        epoch=0,
+        turn_id=1,
+        response_id=None,
+        stage_id=0,
+        input_modality="",
+    )
+    ledger.ingest(_payload(seq=9, unit_index=1), epoch=0, turn_id=1, response_id=None, stage_id=0, input_modality="")
+    # A continuation the model minted has no append behind it.
+    ledger.ingest(_payload(seq=10, unit_index=2), epoch=0, turn_id=1, response_id=None, stage_id=0, input_modality="")
+    ledger.bind_response("r1", epoch=0, turn_id=2)
+    [set_] = ledger.take_terminal_sets()
+    assert set_.input_origins == ("client", "client", "engine")
+    assert set_.input_commit_ns == (1, 2, None)
+
+
 def test_reordering_and_stale_seq_are_session_fatal() -> None:
     ledger = SessionActionLedger(session_id="s1")
     ledger.bind_listening(epoch=0, turn_id=1)

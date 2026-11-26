@@ -12,7 +12,7 @@ cancel seal partial sets. Mutated only on the orchestrator loop — no locking.
 from __future__ import annotations
 
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -97,8 +97,10 @@ class SessionActionLedger:
         self._open: _OpenScope | None = None
         # scope key -> sealed set; at most RETAINED_SEALED_SETS entries.
         self._sealed: OrderedDict[str, DuplexActionRecordSet] = OrderedDict()
-        # Appended-unit input annotations (modality, origin, commit time) per epoch.
-        self._input_units: dict[int, dict[int, tuple[str, str, int | None]]] = {}
+        # Submit-order input annotations (modality, origin, commit time) per epoch.
+        # Claimed one per new unit_index. The capture seq is not the key: one
+        # unit emits several payloads, so that counter runs ahead of append seqs.
+        self._input_annotations: dict[int, deque[tuple[str, str, int | None]]] = {}
         # Scope keys already sealed once (ingest accounting that outlives
         # collection): a payload for one of these is invalid, never a gap.
         self._sealed_keys: set[str] = set()
@@ -116,18 +118,26 @@ class SessionActionLedger:
     def note_input_unit(
         self, epoch: int, seq: int, *, modality: str, origin: str, commit_ns: int | None = None
     ) -> None:
-        """Annotate one appended unit's input side; unknown origins are rejected."""
+        """Queue one append's input annotation, in submit order.
+
+        ``seq`` is the append reservation. It is not the lookup key: a unit's
+        capture seq is the model's own counter and runs ahead of these
+        reservations. Unknown origins are rejected.
+        """
         if origin not in INPUT_ORIGINS:
             raise ActionLedgerError(f"unknown capture input origin: {origin!r}")
-        self._input_units.setdefault(epoch, {})[seq] = (str(modality), str(origin), commit_ns)
+        self._input_annotations.setdefault(epoch, deque()).append((str(modality), str(origin), commit_ns))
 
-    def input_unit(self, epoch: int, seq: int) -> tuple[str, str, int | None]:
-        """The annotation ``note_input_unit`` reserved for this seq.
+    def claim_input_unit(self, epoch: int) -> tuple[str, str, int | None]:
+        """The next submit-order annotation, or engine-origin when none is waiting.
 
-        A seq the model minted for a later unit of the same append was never
-        reserved: that unit consumed no new client chunk, so it is engine-origin.
+        One claim per new ``unit_index``. A model-minted continuation has no
+        append behind it, so the empty queue is engine-origin.
         """
-        return self._input_units.get(epoch, {}).get(seq, ("audio", ORIGIN_ENGINE, None))
+        queue = self._input_annotations.get(epoch)
+        if not queue:
+            return ("audio", ORIGIN_ENGINE, None)
+        return queue.popleft()
 
     # ---- scope lifecycle ----
 
@@ -218,7 +228,6 @@ class SessionActionLedger:
                 f"capture payload unit_index {unit_index} is behind the scope's unit {last.unit_index}"
             )
         scope.last_seq = seq
-        modality, origin, commit_ns_from_input = self.input_unit(epoch, seq)
         offset = len(scope.token_ids)
         count = len(record["token_ids"])
         scope.token_ids.extend(int(value) for value in record["token_ids"])
@@ -246,6 +255,7 @@ class SessionActionLedger:
         if last is not None and unit_index == last.unit_index:
             last.terminators += tuple(dict(term) for term in record.get("terminators") or ())
             return len(scope.units) - 1
+        modality, origin, commit_ns_from_input = self.claim_input_unit(epoch)
         scope.units.append(
             _UnitRow(
                 stage_id=int(stage_id),
@@ -356,7 +366,7 @@ class SessionActionLedger:
                 streams=stream_values,
                 model=model,
             )
-        modality, origin, commit_ns = self.input_unit(epoch, seq)
+        modality, origin, commit_ns = self.claim_input_unit(epoch)
         return replace(
             sealed,
             token_ids=token_ids,

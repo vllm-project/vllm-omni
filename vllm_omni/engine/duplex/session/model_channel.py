@@ -377,8 +377,11 @@ class ModelChannel:
         # read and drop the engine-injected marker before the
         # plugin plans the append; it is ledger bookkeeping, not a model hint.
         engine_unit = isinstance(payload, Mapping) and bool(payload.get("engine_injected_unit"))
-        if engine_unit and isinstance(payload, dict):
+        # A commit flush resubmits audio the client already fed. It is not another chunk.
+        retained_unit = isinstance(payload, Mapping) and bool(payload.get("retained_committed_unit"))
+        if isinstance(payload, dict):
             payload.pop("engine_injected_unit", None)
+            payload.pop("retained_committed_unit", None)
         # Session stats: the chunk's in-engine interval starts when its append is taken up.
         accepted_ns = session.perf.now_ns() if session.perf is not None else 0
         if self._ctx.stage_port.stage_count == 0:
@@ -539,7 +542,7 @@ class ModelChannel:
                     fence.epoch,
                     reservation.update.seq,
                     modality=("silence" if engine_unit else _capture_input_modality(payload)),
-                    origin=(ORIGIN_ENGINE if engine_unit else ORIGIN_CLIENT),
+                    origin=(ORIGIN_ENGINE if engine_unit or retained_unit else ORIGIN_CLIENT),
                 )
                 prompt = _with_action_capture_envelope(
                     prompt,
