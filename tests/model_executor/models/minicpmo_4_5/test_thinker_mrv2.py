@@ -63,6 +63,7 @@ def _model(mocker, *, session="turn", async_chunk=False, speculative_config=None
             session_mode=session,
             async_chunk=async_chunk,
         ),
+        additional_config={},
         speculative_config=speculative_config,
     )
     if session is None:
@@ -284,6 +285,7 @@ def test_mrv2_thinker_duplex_output_and_prompt_rows(mocker):
         {
             "duplex": {
                 "duplex_prompt_token_ids": [1, 2, 3],
+                "duplex_explicit_reply": True,
                 "text_input": True,
                 "special_token_ids": {"tts_bos_token_id": 151703, "turn_start_token_id": 151644},
             }
@@ -300,6 +302,7 @@ def test_mrv2_thinker_duplex_output_and_prompt_rows(mocker):
     assert out.multimodal_outputs["latent"] is hidden
     assert out.multimodal_outputs["duplex_prompt_token_ids"] == [[1, 2, 3], None]
     assert out.multimodal_outputs["duplex_text_input"] == [True, False]
+    assert out.multimodal_outputs["duplex_explicit_reply"] == [True, False]
     assert "tts_bos_token_id" in out.multimodal_outputs["meta"]
     assert out.multimodal_outputs["meta"]["tts_bos_token_id"][0].item() == 151703
     # Tokenizer constants fill rows that carry none (e.g. an append that built
@@ -380,6 +383,31 @@ def test_mrv2_cancel_before_first_prefill_completes_frees_session(mocker):
 
     model.on_requests_finished({"req-1"})
     assert helper.sessions == {}
+
+
+@pytest.mark.parametrize(("final", "explicit"), [(False, False), (True, False), (True, True)])
+def test_mrv2_staged_duplex_prefill_preserves_explicit_reply(mocker, final, explicit):
+    model = _model(mocker, session="duplex")
+    embeds = torch.randn(1, 4)
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(
+        sessions={"s1": object()},
+        take_staged_prefill=lambda *_: {"success": True, "inputs_embeds": embeds, "input_token_ids": [1]},
+        stage_padding_token_id=lambda: 0,
+    )
+    _, output, update = model.preprocess(
+        torch.tensor([1]),
+        embeds,
+        req_id="req-1",
+        duplex={
+            "data_plane": True,
+            "session_id": "s1",
+            "seq": 1,
+            "final": final,
+            "payload": {"_native_explicit_reply": explicit} if explicit else {},
+        },
+    )
+    torch.testing.assert_close(output, embeds)
+    assert update["duplex"]["duplex_explicit_reply"] is explicit
 
 
 def test_mrv2_duplex_thinker_batches_prefill_appends(mocker):
