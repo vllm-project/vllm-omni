@@ -599,6 +599,42 @@ class TestStageResolutionHelpers:
 class TestPipelineDiscovery:
     """Tests for the central pipeline registry (``OMNI_PIPELINES``)."""
 
+    def test_pipeline_discovery_keeps_revision_configs_separate(self, mocker):
+        model = "revision-test/omni"
+        get_config = mocker.patch(
+            "vllm_omni.config.config_factory.get_config",
+            side_effect=[Q3_OMNI_THINKER_HF_CONFIG, Q3_OMNI_ALL_STAGES_HF_CONFIG],
+        )
+        thinker = StageConfigFactory.get_pipeline_config(model, trust_remote_code=False, revision="text")
+        full = StageConfigFactory.get_pipeline_config(model, trust_remote_code=False, revision="audio")
+        assert StageConfigFactory.get_pipeline_config(model, trust_remote_code=False, revision="text") == thinker
+
+        assert thinker is not None and len(thinker.stages) == 1
+        assert full is not None and len(full.stages) == 3
+        assert [call.kwargs["revision"] for call in get_config.call_args_list] == ["text", "audio"]
+
+    @pytest.mark.parametrize(
+        "filename,metadata,expected",
+        [
+            ("config.json", {"model_type": "qwen3_tts"}, "qwen3_tts"),
+            ("model_index.json", {"_class_name": "GlmImagePipeline"}, "glm_image"),
+        ],
+    )
+    def test_pipeline_discovery_reads_pinned_fallback_metadata(self, mocker, filename, metadata, expected):
+        pinned_revision = "release"
+
+        def read_config_file(name, _model, *, revision):
+            return metadata if name == filename and revision == pinned_revision else None
+
+        mocker.patch.object(config_factory_module, "get_config", return_value=None)
+        read_metadata = mocker.patch.object(config_factory_module, "get_hf_file_to_dict", side_effect=read_config_file)
+
+        model = "revision-test/checkpoint"
+        pipeline = StageConfigFactory.get_pipeline_config(model, trust_remote_code=False, revision=pinned_revision)
+
+        assert pipeline is not None and pipeline.model_type == expected
+        read_metadata.assert_any_call(filename, model, revision=pinned_revision)
+
     def test_registry_has_known_models(self):
         """Check that specific models are in OMNI_PIPELINES."""
         assert "qwen2_5_omni" in OMNI_PIPELINES
@@ -1345,7 +1381,7 @@ class TestPipelineRegistration:
                 "trust_remote_code": True,
                 "model": "fake/model",
             }
-            mock_get_config.assert_called_once_with("fake/model", trust_remote_code=True)
+            mock_get_config.assert_called_once_with("fake/model", trust_remote_code=True, revision=None)
 
         with patch.object(StageConfigFactory, "_create_legacy_from_registry", return_value=([], None)) as mock_legacy:
             StageConfigFactory.create_legacy_stage_configs_from_model(
@@ -1550,8 +1586,8 @@ class TestDeployConfigLoading:
         ("filename", "max_sessions"),
         [
             ("minicpmo_4_5.yaml", 16),
-            ("minicpmo_4_5_2gpu.yaml", 4),
-            ("minicpmo_4_5_3gpu.yaml", 4),
+            ("minicpmo_4_5_2gpu.yaml", 16),
+            ("minicpmo_4_5_3gpu.yaml", 16),
             ("minicpmo_4_5_8x4090.yaml", 1),
             ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 16),
             ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 16),
@@ -1629,42 +1665,18 @@ class TestDeployConfigLoading:
         deploy_stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
         stages = merge_pipeline_deploy(resolve_pipeline_config("minicpmo_4_5"), deploy)
 
-        if platform == "npu":
-            assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
-            # The armed head ends on 1; the union keeps the codec EOS inert
-            # (the collapsed head cannot sample it).
-            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
-            # The duplex KV-window contract requires prefix caching off, and the
-            # NPU overlay states that explicitly so a stage-level value can
-            # never turn it back on for this stage.
-            assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
-            assert stages[1].yaml_engine_args["speculative_config"] == {
-                "method": "ngram",
-                "num_speculative_tokens": 7,
-                "prompt_lookup_min": 1,
-                "prompt_lookup_max": 1,
-            }
-            assert stages[1].yaml_engine_args["async_scheduling"] is False
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [8, 8, 8]
-        else:
-            # CUDA arms the same block: the runner injects the constant
-            # continue drafts, so the deploy stop id is the two-wide
-            # continue/stop marker and the head stays collapsed.
-            assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
-            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
-            # Either absent (falls back to the top-level false) or explicitly
-            # false; the regression this guards against is true.
-            assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
-            assert stages[1].yaml_engine_args["speculative_config"] == {
-                "method": "ngram",
-                "num_speculative_tokens": 15,
-                "prompt_lookup_min": 1,
-                "prompt_lookup_max": 1,
-            }
-            # K-step books its span with the synchronous runner contract.
-            assert stages[1].yaml_engine_args["async_scheduling"] is False
-            # CUDA Code2Wav uses two replicas with eight slots each.
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 8]
+        assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
+        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
+        assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
+        assert stages[1].yaml_engine_args["speculative_config"] == {
+            "method": "ngram",
+            "num_speculative_tokens": 15,
+            "prompt_lookup_min": 1,
+            "prompt_lookup_max": 1,
+        }
+        assert stages[1].yaml_engine_args["async_scheduling"] is False
+        expected_seqs = [8, 8, 8] if platform == "npu" else [16, 16, 8]
+        assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == expected_seqs
 
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
@@ -3503,6 +3515,7 @@ class TestPlatformOverrides:
             "moss_tts_nano.yaml",
             "chatterbox_turbo.yaml",
             "chatterbox.yaml",
+            "minicpmo_4_5.yaml",
         )
         rocm_full_mrv2 = platform == "rocm" and filename in (
             "qwen3_tts.yaml",

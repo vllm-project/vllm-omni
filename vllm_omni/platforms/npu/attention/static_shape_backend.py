@@ -424,6 +424,44 @@ class OmniStaticShapeAttentionBackendImpl(AscendAttentionBackendImpl):
         torch_npu.npu_fused_infer_attention_score.out(workspace=workspace, out=[output, lse], **fia_kwargs)
         return output.view(bucket, self.num_heads, self.head_size), bucket
 
+    def forward_impl(self, query, key, value, kv_cache, attn_metadata, output):
+        if getattr(attn_metadata, "talker_prefill_exact", False):
+            hidden, _ = self._static_shape_prefill_fia(
+                query, key.contiguous(), value.contiguous(), attn_metadata, output
+            )
+            return hidden.view_as(output)
+        fused = getattr(attn_metadata, "talker_fused_frame", None)
+        if fused is None:
+            return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
+        bias, lse, capacity = fused
+        rows = int(query.shape[0])
+        key, value, block_size, block_table, _ = self._get_fia_params(key, value, attn_metadata, kv_cache)
+        kwargs = dict(
+            query=query,
+            key=key,
+            value=value,
+            pse_shift=bias,
+            block_table=block_table,
+            input_layout="TND",
+            block_size=block_size,
+            actual_seq_lengths=list(range(1, rows + 1)),
+            actual_seq_lengths_kv=[capacity] * rows,
+            num_key_value_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            scale=self.scale,
+            sparse_mode=0,
+            pre_tokens=SWA_INT_MAX,
+            next_tokens=0,
+        )
+        workspace = static_shape_decode.graph_workspace(
+            rows,
+            capacity,
+            (rows, self.num_heads, self.num_kv_heads, self.head_size, block_size, capacity, query.dtype),
+            lambda: torch_npu._npu_fused_infer_attention_score_get_max_workspace(**kwargs),
+        )
+        torch_npu.npu_fused_infer_attention_score.out(workspace=workspace, out=[output, lse], **kwargs)
+        return output
+
     def full_graph_fia(self, query, key, value, attn_metadata, output, layer=None):
         if getattr(attn_metadata, "static_shape_prefill_bucket", None) is not None:
             return self._static_shape_prefill_fia(query, key, value, attn_metadata, output)
