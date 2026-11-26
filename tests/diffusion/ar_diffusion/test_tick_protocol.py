@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 
@@ -106,3 +107,10 @@ def test_tick_snapshot_is_detached_and_deeply_immutable() -> None:
 
 def test_legacy_request_has_no_typed_tick() -> None:
     assert ARDiffusionTickRequest.from_extra_args({"session_id": "legacy"}) is None
+
+
+def test_chunk_metadata_legacy_imports_resolve_to_the_diffusion_output_type():
+    from vllm_omni.diffusion.data import ARDiffusionChunkMetadata as DiffusionChunkMetadata
+    from vllm_omni.experimental.ar_diffusion import ARDiffusionChunkMetadata as PackageChunkMetadata
+
+    assert ARDiffusionChunkMetadata is PackageChunkMetadata is DiffusionChunkMetadata

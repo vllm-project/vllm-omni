@@ -16,7 +16,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.compile import regionally_compile
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import ARDiffusionChunkMetadata, DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
     VideoMediaOutput,
@@ -74,7 +74,6 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
-    ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams

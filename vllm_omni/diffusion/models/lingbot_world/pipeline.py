@@ -25,7 +25,7 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import ARDiffusionChunkMetadata, DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_fast_path import install_wan_decoder_fast_path
 from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import install_wan_spatial_shard_decode
@@ -92,7 +92,6 @@ from vllm_omni.experimental.ar_diffusion.streaming_decode import (
     WanStreamingDecoder,
 )
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
-    ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
 )
 

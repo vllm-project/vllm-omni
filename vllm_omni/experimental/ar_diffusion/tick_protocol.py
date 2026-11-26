@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Typed request boundary shared by AR-Diffusion models and serving APIs.
 
 The transport layer owns event ordering and snapshots. Model adapters consume
@@ -11,6 +12,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
+
+from vllm_omni.diffusion.data import ARDiffusionChunkMetadata as ARDiffusionChunkMetadata
 
 AR_DIFFUSION_TICK_KEY = "ar_diffusion_tick"
 
@@ -173,30 +176,3 @@ class ARDiffusionTickRequest:
             reset=value.get("reset", False),  # type: ignore[arg-type]
             close_session=value.get("close_session", False),  # type: ignore[arg-type]
         )
-
-
-@dataclass(frozen=True)
-class ARDiffusionChunkMetadata:
-    """Identity metadata returned with one generated AR block."""
-
-    session_id: str
-    request_id: str
-    chunk_index: int
-    applied_event_ids: tuple[int, ...] = ()
-
-    @classmethod
-    def from_tick(cls, tick: ARDiffusionTickRequest) -> ARDiffusionChunkMetadata:
-        return cls(
-            session_id=tick.session_id,
-            request_id=tick.request_id,
-            chunk_index=tick.chunk_index,
-            applied_event_ids=tick.applied_event_ids,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "session_id": self.session_id,
-            "request_id": self.request_id,
-            "chunk_index": self.chunk_index,
-            "applied_event_ids": list(self.applied_event_ids),
-        }

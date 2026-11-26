@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Internal realtime session control plane for AR-Diffusion.
 
 This module owns transport-level identity, event ordering, backpressure, and
@@ -15,8 +16,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Generic, Protocol, TypeVar
 
+from vllm_omni.diffusion.data import ARDiffusionChunkMetadata
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
-    ARDiffusionChunkMetadata,
     ARDiffusionControlInput,
     ARDiffusionTickRequest,
 )

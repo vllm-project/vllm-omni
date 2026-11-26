@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """AsyncOmni consumer for typed realtime AR-Diffusion ticks."""
 
 from __future__ import annotations
@@ -7,8 +8,8 @@ import copy
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any, Protocol
 
+from vllm_omni.diffusion.data import ARDiffusionChunkMetadata
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
-    ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
 )
 from vllm_omni.inputs.data import (
