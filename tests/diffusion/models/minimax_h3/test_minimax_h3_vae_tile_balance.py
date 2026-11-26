@@ -209,6 +209,14 @@ def test_install_is_npu_only_idempotent_and_context_scoped():
         assert torch.equal(model.encode_temporal(unsupported), unsupported + 1)
 
 
+def test_opted_in_npu_reports_missing_checkpoint_collective():
+    model = Model()
+    model._all_gather_tiled_results = lambda *_: None
+    adapter = SimpleNamespace(_device_target=Device("npu"), decode_only=False, model=model)
+    with pytest.raises(ValueError, match="h3_vae_encode_tile_balance_max_tasks.*all_gather_var_shape"):
+        balance.install_video_tile_balance(adapter, 8)
+
+
 def test_installed_wrapper_runs_two_clip_parallel_candidate():
     global _REMOTE_GATHER
 

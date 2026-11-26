@@ -11,9 +11,6 @@ from types import MethodType
 from typing import Any, cast
 
 import torch
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
 
 _CONFIG_KEY = "h3_vae_encode_tile_balance_max_tasks"
 _ACTIVE = ContextVar("h3_vae_encode_tile_balance", default=False)
@@ -215,7 +212,12 @@ def _run(
 
 
 def install_video_tile_balance(adapter: Any, max_tasks: int | None) -> bool:
-    """Install the opt-in NPU scheduler after the temporal encode fork."""
+    """Install the scheduler once for an opted-in, encode-capable NPU VAE.
+
+    The checkpoint must expose callable encode_temporal and
+    _all_gather_tiled_results methods. The gather method must resolve
+    all_gather_var_shape from its module globals.
+    """
 
     if max_tasks is None or adapter._device_target.type != "npu" or adapter.decode_only:
         return False
@@ -229,9 +231,11 @@ def install_video_tile_balance(adapter: Any, max_tasks: int | None) -> bool:
     gather_function = getattr(gather_method, "__func__", gather_method)
     gather_namespace = getattr(gather_function, "__globals__", None)
     all_gather_var_shape = gather_namespace.get("all_gather_var_shape") if isinstance(gather_namespace, dict) else None
-    if not callable(original) or not callable(all_gather_var_shape):
-        logger.warning_once("MiniMax H3 checkpoint does not expose encode tile-balance collectives")
-        return False
+    if not all(callable(method) for method in (original, gather_method, all_gather_var_shape)):
+        raise ValueError(
+            f"MiniMax H3 {_CONFIG_KEY} requires checkpoint encode_temporal, "
+            "_all_gather_tiled_results and all_gather_var_shape"
+        )
 
     def encode_temporal(instance: Any, x: torch.Tensor) -> torch.Tensor:
         if not _ACTIVE.get() or x.ndim != 5 or not instance.parallel_tiling:

@@ -350,7 +350,11 @@ class _VideoVAEPartProxy(nn.Module):
 
 
 class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
-    """Adapter around the checkpoint's native parallel-tiled video VAE."""
+    """Adapter around the checkpoint's native parallel-tiled video VAE.
+
+    On NPU, a positive encode_tile_balance_max_tasks controls the cross-clip
+    scheduling window for reference-video encoding. None uses native scheduling.
+    """
 
     decode_dtype: torch.dtype = torch.float16
     _pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
@@ -496,9 +500,9 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # current decode (or None): the equal-shape gather checks local tiles
         # against this prediction, not merely against each other.
         self._tile_gather_expected_hw: tuple[int, int] | None = None
+        install_video_tile_balance(self, encode_tile_balance_max_tasks)
         if self._tile_gather_reuse_enabled():
             self._install_persistent_tile_gather()
-        install_video_tile_balance(self, encode_tile_balance_max_tasks)
 
     def _build_residency_stagers(self, device: torch.device) -> None:
         """Stage the encode and decode halves of the remote separately.
