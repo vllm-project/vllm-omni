@@ -262,7 +262,7 @@ def prepare_stage0_window(
     runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
     window = runtime_config.get("duplex_window_config")
     mode = window.get("sliding_window_mode", "off") if isinstance(window, dict) else "off"
-    if mode not in {"basic", "context"}:
+    if mode not in {"basic", "context", "evidence"}:
         # Without a window the worker keeps no unit history to carry.
         session._minicpmo45_carried_window = None
 
@@ -294,7 +294,7 @@ def prepare_stage0_window(
     # async lookahead can overwrite the worker's pending terminator after
     # the scheduler accepted the segment stop. Window retention is optional.
     if not isinstance(window, dict) or (
-        mode not in {"basic", "context"}
+        mode not in {"basic", "context", "evidence"}
         and (
             not runtime_config.get("duplex_boundary_token_ids")
             or duplex.get("session_window_owned") is False
@@ -337,8 +337,34 @@ def prepare_stage0_window(
             session._minicpmo45_window_previous_token_ids = list(carry.get("previous", ()))
     drop_count = 0
     dropped_len = 0
+    selected = None
 
-    if mode == "basic":
+    if mode == "evidence":
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_evidence import (
+            EvidenceScorer,
+            select_evidence_units,
+        )
+
+        previous = getattr(session, "model_intermediate_buffer", None) or {}
+        previous_duplex = previous.get("duplex") or {}
+        observation = previous_duplex.get("window_evidence")
+        scorer = getattr(session, "_minicpmo45_evidence_scorer", None)
+        if scorer is None:
+            scorer = session._minicpmo45_evidence_scorer = EvidenceScorer()
+        if observation is not None:
+            route, units[-1]["evidence_score"] = scorer.score(*observation)
+            if (costs := previous_duplex.get("window_modalities")) and route != "av":
+                vision, audio = costs
+                if unit_len >= 3 + vision + audio:
+                    units[-1]["remove_media"] = (1 + vision, audio) if route == "vision" else (1, vision)
+        if projected_len > int(window["basic_window_high_tokens"]):
+            unit_tokens = sum(unit["length"] for unit in units)
+            fixed = projected_len - unit_tokens
+            budget = max(0, int(window["basic_window_low_tokens"]) - fixed)
+            selected = select_evidence_units(units, budget, int(window["evidence_history_tokens"]))
+            drop_count = len(units) - len(selected)
+            dropped_len = unit_tokens - sum(unit["length"] for _, unit in selected)
+    elif mode == "basic":
         try:
             high = int(window.get("basic_window_high_tokens", 8000))
             low = int(window.get("basic_window_low_tokens", 6000))
@@ -374,9 +400,9 @@ def prepare_stage0_window(
         session._minicpmo45_window_previous_len = len(previous_with_marker)
         projected_len += len(previous_with_marker) - old_previous_len
 
-    retained_units = units[drop_count:]
+    retained_units = units[drop_count:] if selected is None else [unit for _, unit in selected]
     session._minicpmo45_window_units = retained_units
-    if drop_count == 0 and not carried_units:
+    if dropped_len == 0 and not carried_units:
         session._minicpmo45_window_open_start = boundary
         return False
 
@@ -411,6 +437,15 @@ def prepare_stage0_window(
         "previous_marker_token_ids": marker_ids,
         "replacement_prompt_len": replacement_len,
     }
+    if selected is not None:
+        duplex["stage0_window"]["keep_unit_indices"] = [index for index, _ in selected]
+        projections = [
+            (position, *units[index]["remove_media"])
+            for position, (index, unit) in enumerate(selected)
+            if unit["length"] != units[index]["length"]
+        ]
+        if projections:
+            duplex["stage0_window"]["project_media"] = projections
     if carried_units:
         duplex["stage0_window"]["carried_units"] = len(carried_units)
         duplex["stage0_window"]["carried_unit_lengths"] = [int(unit["length"]) for unit in carried_units]

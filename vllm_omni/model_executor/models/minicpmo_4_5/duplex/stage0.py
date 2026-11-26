@@ -509,7 +509,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         rt = runtime_config or {}
         window_config = rt.get("duplex_window_config")
         state.window_enabled = bool(rt.get("duplex_boundary_token_ids")) or (
-            isinstance(window_config, dict) and window_config.get("sliding_window_mode") in {"basic", "context"}
+            isinstance(window_config, dict)
+            and window_config.get("sliding_window_mode") in {"basic", "context", "evidence"}
         )
         state.wrap_unit_audio_markers = bool(rt.get("duplex_wrap_unit_audio_markers", False))
         state.allow_speech_interruption = bool(rt.get("duplex_allow_speech_interruption", False))
@@ -1148,7 +1149,27 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "MiniCPM-o Stage-0 window history is shorter than the scheduler drop plan: "
                 f"drop={drop_units}, completed={len(state.window_units)}"
             )
-        del state.window_units[:drop_units]
+        keep_indices = stage0_window.get("keep_unit_indices")
+        if keep_indices is None:
+            del state.window_units[:drop_units]
+        else:
+            if (
+                len(keep_indices) != len(state.window_units) - drop_units
+                or keep_indices != sorted(set(keep_indices))
+                or any(not 0 <= index < len(state.window_units) for index in keep_indices)
+            ):
+                raise _UnrecoverableWindowError("Inconsistent MiniCPM-o evidence window selection")
+            state.window_units = [state.window_units[index] for index in keep_indices]
+            for index, start, count in stage0_window.get("project_media", ()):
+                unit = state.window_units[index]
+                stop = start + count
+                if start < 1 or count <= 0 or stop >= len(unit.token_ids) - 1:
+                    raise _UnrecoverableWindowError("Inconsistent MiniCPM-o evidence projection")
+                state.window_units[index] = _MiniCPMO45WindowUnit(
+                    embeds=self._slice_embed_list(unit.embeds, 0, start)
+                    + self._slice_embed_list(unit.embeds, stop, len(unit.token_ids)),
+                    token_ids=unit.token_ids[:start] + unit.token_ids[stop:],
+                )
 
         mode = stage0_window.get("mode")
         embeds: list[Any] = []

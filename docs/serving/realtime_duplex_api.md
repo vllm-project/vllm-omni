@@ -654,6 +654,14 @@ available to the Thinker. The retained time span depends on the input and
 generated speech; these limits are token counts, not a fixed number of seconds.
 
 Pass `extra_body={"sliding_window_mode": "off"}` to retain the full history.
+The opt-in `"evidence"` mode uses the same high and low watermarks. It
+keeps a continuous recent suffix and budgets up to `evidence_history_tokens`
+(800 by default) for older units ranked by frame changes, audio peaks and
+their temporal alignment. A selected unit can keep only the relevant modality
+when the input layout permits it. The Thinker re-prefills selected units in
+their original order after a trim. This mode uses the native checkpoint and
+listen/speak decisions.
+
 The `"context"` mode instead retains `context_max_units` (24) recent units
 plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
 The window configuration is fixed when the session is created.

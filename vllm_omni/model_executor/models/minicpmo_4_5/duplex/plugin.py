@@ -22,6 +22,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import lru_cache
+from io import BytesIO
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -48,7 +49,7 @@ from vllm_omni.engine.duplex.plugin import (
     reject_changed_runtime_value,
     reject_private_runtime_keys,
 )
-from vllm_omni.model_executor.common.duplex.payload import payload_audio
+from vllm_omni.model_executor.common.duplex.payload import decode_pcm_f32le_payload, payload_audio
 from vllm_omni.model_executor.common.duplex.payload import payload_sample_count as _duplex_pcm_sample_count
 from vllm_omni.model_executor.common.request_outputs import coerce_int as _coerce_int
 from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
@@ -167,8 +168,6 @@ def _duplex_base_frame_blocks(frame: str, tile_pixels: int | None) -> int:
     """
     if tile_pixels is None:
         return _DUPLEX_HD_SLICES_PER_BASE_FRAME
-
-    from io import BytesIO
 
     from PIL import Image
 
@@ -383,6 +382,19 @@ def build_duplex_data_plane_prompt(
         # force_listen. A session that did not ask for them samples exactly
         # as before: neutral values never touch the payload.
         payload = {**payload, "listen_prob_scale": listen_scale, "listen_top_k": listen_top_k}
+    model_fields: dict[str, object] = {"scheduler_token_id": token_id}
+    window = runtime_config.get("duplex_window_config")
+    if isinstance(window, dict) and window.get("sliding_window_mode") == "evidence":
+        model_fields["window_evidence"] = _window_evidence(payload)
+        if (
+            vision_tokens
+            and not first_audio_window
+            and _duplex_pcm_sample_count(payload) == MiniCPMO45DuplexPolicy.CHUNK_SAMPLES
+        ):
+            audio_tokens = MiniCPMO45DuplexPolicy.audio_token_count(MiniCPMO45DuplexPolicy.CHUNK_SAMPLES)
+            if runtime_config.get("duplex_wrap_unit_audio_markers"):
+                audio_tokens += 2
+            model_fields["window_modalities"] = (vision_tokens, audio_tokens)
     return build_duplex_append_prompt(
         request_id=request_id,
         fence=fence,
@@ -393,8 +405,39 @@ def build_duplex_data_plane_prompt(
         payload=payload,
         final=final,
         prompt_token_ids=[token_id] * token_budget,
-        model_fields={"scheduler_token_id": token_id},
+        model_fields=model_fields,
     )
+
+
+def _window_evidence(payload: object) -> tuple[bytes, float, float]:
+    from PIL import Image
+
+    frame = b""
+    if frames := _duplex_frames(payload):
+        try:
+            with open_image(BytesIO(b64decode(frames[0], validate=True))) as image:
+                image.draft("RGB", (16, 16))
+                frame = image.convert("RGB").resize((16, 16), Image.Resampling.BOX).tobytes()
+        except (BinasciiError, ValueError, OSError, Image.DecompressionBombError):
+            pass
+    if payload_audio(payload) is None:
+        return frame, 0.0, 0.0
+    try:
+        pcm = decode_pcm_f32le_payload(payload, sample_rate_hz=MiniCPMO45DuplexPolicy.SAMPLE_RATE_HZ)
+    except ValueError:
+        return frame, 0.0, 0.0
+    samples = np.frombuffer(pcm, dtype="<f4")
+    window_samples = MiniCPMO45DuplexPolicy.SAMPLE_RATE_HZ // 50
+    count = len(samples) // window_samples
+    if not count:
+        return frame, 0.0, 0.0
+    windows = np.clip(samples[: count * window_samples], -1.0, 1.0).reshape(-1, window_samples)
+    envelope = np.mean(windows * windows, axis=1)
+    energy = float(np.max(envelope))
+    if not math.isfinite(energy) or energy <= 0:
+        return frame, 0.0, 0.0
+    onset = max(0.0, (float(np.max(envelope[:10])) - float(np.median(envelope))) / energy)
+    return frame, energy, onset
 
 
 # ---- engine policy helpers: listen decision ----
@@ -1133,6 +1176,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             "basic_window_low_tokens",
             "context_previous_max_tokens",
             "context_max_units",
+            "evidence_history_tokens",
         )
         provided = {name: extra_body.pop(name) for name in names if name in extra_body}
         if not provided:
