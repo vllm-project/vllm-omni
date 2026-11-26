@@ -1744,6 +1744,20 @@ can expose function tokens. Model-local postprocess feedback alone does not
 expose a client tool call. Forced feedback remains queued until an eligible
 frame's postprocess consumes it once.
 
+Inside a call, Nemotron decodes back to back. The thinker publishes
+`nvc_function_fast_path` on frames decoded while its function head is inside a
+tool call, and the session's plugin reports `fast_path_active`. The session then
+answers each such frame with its own silence unit at once instead of waiting for
+the client's next 80 ms unit. One token per append still holds; only the frame
+that feeds it changes. Client appends that arrive meanwhile are dropped after
+counting on the input clock and are never buffered, appended or replayed, and
+Stage-2 audio decoded alongside a fast step is not delivered. Fast steps do not
+count against the response continuation limit: the plugin caps them
+(`_FAST_PATH_MAX_STEPS`, like NVIDIA's `MAX_TOOL_TOKENS`) and the frame that
+decodes `EOTC` clears the flag, after which client-paced continuation resumes.
+A finished or failed call request ends the fast path even when its last frame
+still carried the flag, so the session returns to appending client frames.
+
 Turn plugins may bind their stage identities in `configure_pipeline` and select
 an append's entry with `input_stage_id(payload)` (default 0). The request context
 and orchestrator retain that entry stage. Session prompt preparation receives

@@ -1751,6 +1751,60 @@ class DuplexSessionRunner:
         self.tasks.active_response_task = None
         return True
 
+    async def _dropped_frame_audio(self, event: dict[str, object], audio: str | bytes) -> tuple[int, int]:
+        """Samples and rate of a client frame the fast path discards.
+
+        Counted exactly as the buffering path counts it, so ``audio_end_ms``
+        keeps naming the client's input position: the payload is converted the
+        same way, which is what makes G.711 count one byte per sample.
+        """
+        fmt_raw = event.get("format")
+        fmt = fmt_raw if isinstance(fmt_raw, str) else "pcm16"
+        sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
+        sample_rate_hz = int(sr_raw) if isinstance(sr_raw, int | float) else 16000
+        if fmt.lower() not in CONVERTIBLE_INPUT_FORMATS:
+            return helpers.pcm_sample_count(audio, fmt), sample_rate_hz
+        encoded = base64.b64encode(audio).decode("ascii") if isinstance(audio, bytes) else audio
+        try:
+            converted, converted_fmt, converted_rate = await self.offload(
+                convert_input_audio_with_rate,
+                encoded,
+                fmt,
+                sample_rate_hz=sample_rate_hz,
+            )
+        except ValueError:
+            # The buffering path refuses this frame; a dropped one only owes
+            # the clock its position, which the raw count still gives.
+            return helpers.pcm_sample_count(audio, fmt), sample_rate_hz
+        if converted_rate is not None:
+            sample_rate_hz = int(converted_rate)
+        return helpers.pcm_sample_count(converted, converted_fmt), sample_rate_hz
+
+    async def _drop_frame_on_fast_path(self, event: dict[str, object]) -> bool:
+        """Consume one client append without submitting it while the model decodes a tool call.
+
+        A fast-path append already supplies the model's next 80 ms frame, so a
+        real frame would queue a second unit for the same step. The frame is
+        accounted for on the input clock (the client's position still moves)
+        but never buffered, appended or replayed.
+        """
+        if not self.run.fast_path_active:
+            return False
+        audio = event.get("audio") or event.get("data")
+        clock = self._input_clock
+        ack = self._current_input_ack
+        if clock is not None and ack is not None and isinstance(audio, str | bytes) and audio:
+            samples, sample_rate_hz = await self._dropped_frame_audio(event, audio)
+            clock.note_input_audio(ack, samples=samples, sample_rate_hz=sample_rate_hz)
+            clock.note_input_handled(ack, samples=samples, sample_rate_hz=sample_rate_hz)
+        self.run.fast_path_dropped_frames += 1
+        logger.debug(
+            "Duplex session %s: dropped client frame #%d while the model decodes a tool call",
+            self.session.session_id,
+            self.run.fast_path_dropped_frames,
+        )
+        return True
+
     async def _on_append_audio(
         self,
         event: dict[str, object],
@@ -1758,6 +1812,8 @@ class DuplexSessionRunner:
         release_queued_input: Callable[[], None] | None = None,
     ) -> None:
         """Prepare audio, then replace its admission charge with a PCM reservation."""
+        if await self._drop_frame_on_fast_path(event):
+            return
         session = self.session
         session.mark_user_input_activity()
         audio = event.get("audio") or event.get("data")
@@ -2500,6 +2556,7 @@ class DuplexSessionRunner:
         response_owned: bool,
         expected_epoch: int | None,
         expected_model_turn_id: int | None,
+        fast_path: bool = False,
     ) -> bool:
         session = self.session
         model_state = self.model_state
@@ -2528,7 +2585,7 @@ class DuplexSessionRunner:
             if pending_silence is not None and not pending_silence.done():
                 return False
         append_tail = self.tasks.append_tail
-        if (append_tail is None or append_tail.done()) and self._real_input_waiting():
+        if not fast_path and (append_tail is None or append_tail.done()) and self._real_input_waiting():
             self._defer_silence_continuation(
                 expected_epoch=expected_epoch,
                 expected_response_id=response_id,
@@ -2542,21 +2599,27 @@ class DuplexSessionRunner:
         # accepted between the snapshot and this continuation's submission
         # re-anchors the chain; _still_valid() then skips the stale unit.
         anchor = model_state.last_native_submit_monotonic
-        # Align the next silence unit to submission_time_N + chunk_period and
-        # sleep only the remaining budget. The deadline is stored by the
-        # acceptance callback when the append actually submits, so skipped or
-        # stale continuations never advance the clock.
-        delay_s, next_silence_deadline = compute_silence_continuation_deadline(
-            chunk_period_s=chunk_period_s,
-            now=time.monotonic(),
-            last_submit=anchor,
-            current_deadline=model_state.silence_deadline_monotonic,
-        )
+        if fast_path:
+            # The model is decoding back to back: nothing to wait for and no
+            # paced deadline to keep. The client frames this step replaces are
+            # dropped, so a real append cannot have moved the anchor either.
+            delay_s, next_silence_deadline = 0.0, 0.0
+        else:
+            # Align the next silence unit to submission_time_N + chunk_period and
+            # sleep only the remaining budget. The deadline is stored by the
+            # acceptance callback when the append actually submits, so skipped or
+            # stale continuations never advance the clock.
+            delay_s, next_silence_deadline = compute_silence_continuation_deadline(
+                chunk_period_s=chunk_period_s,
+                now=time.monotonic(),
+                last_submit=anchor,
+                current_deadline=model_state.silence_deadline_monotonic,
+            )
         if delay_s > 0:
             await asyncio.sleep(delay_s)
         # A session.update may have turned continuation off while this one waited.
         disabled = not self._silence_continuation_enabled()
-        waiting_for_input = (append_tail is None or append_tail.done()) and self._real_input_waiting()
+        waiting_for_input = not fast_path and (append_tail is None or append_tail.done()) and self._real_input_waiting()
         tail_moved = self.tasks.append_tail is not append_tail
         stale = self.model.silence_continuation_is_stale(
             request_id=request_id,
@@ -2584,33 +2647,35 @@ class DuplexSessionRunner:
             return False
 
         def _still_valid() -> bool:
-            return (
+            if not self._silence_continuation_enabled():
                 # Still allowed: a session.update may have turned continuation off
                 # while this unit waited behind the append in flight.
-                self._silence_continuation_enabled()
+                return False
+            if not fast_path:
                 # The anchor changed (a real append was accepted) after this
-                # continuation was planned; the unit is outdated.
-                and model_state.last_native_submit_monotonic == anchor
-                and not self._real_input_waiting()
-                and not self.model.silence_continuation_is_stale(
-                    request_id=request_id,
-                    response_id=response_id,
-                    response_owned=response_owned,
-                    expected_epoch=expected_epoch,
-                    expected_model_turn_id=expected_model_turn_id,
-                )
+                # continuation was planned; the unit is outdated. A fast-path
+                # unit owns the frame, so its own append is the only claimant.
+                if model_state.last_native_submit_monotonic != anchor or self._real_input_waiting():
+                    return False
+            return not self.model.silence_continuation_is_stale(
+                request_id=request_id,
+                response_id=response_id,
+                response_owned=response_owned,
+                expected_epoch=expected_epoch,
+                expected_model_turn_id=expected_model_turn_id,
             )
 
         def _on_append_accepted(submit_time: float) -> None:
-            # Commit timing state once the runtime accepts the append. If the
-            # submission is more than one chunk period past the planned
-            # deadline, the schedule is stale: restart from the actual
-            # submission. Small delays keep the planned cadence so ordinary
-            # jitter does not accumulate as drift.
+            # Commit timing state once the runtime accepts the append.
             model_state.last_native_submit_monotonic = submit_time
-            model_state.silence_deadline_monotonic = (
-                submit_time + chunk_period_s if submit_time > next_silence_deadline else next_silence_deadline
-            )
+            if not fast_path:
+                # If the submission is more than one chunk period past the
+                # planned deadline, the schedule is stale: restart from the
+                # actual submission. Small delays keep the planned cadence so
+                # ordinary jitter does not accumulate as drift.
+                model_state.silence_deadline_monotonic = (
+                    submit_time + chunk_period_s if submit_time > next_silence_deadline else next_silence_deadline
+                )
             # This unit is encoded outside the PCM buffer, so the buffer would
             # otherwise still treat the next speech as the 1035 ms first window.
             note_audio_window = getattr(model_state.audio_buffer, "note_audio_window_started", None)
@@ -2872,6 +2937,10 @@ class DuplexSessionRunner:
         audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
         # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
         self.run.concurrent_turn_requests_released = False
+        # The model is no longer filling the call this cancel tears down, so
+        # client frames are appended again instead of dropped.
+        self.run.fast_path_active = False
+        self.run.fast_path_dropped_frames = 0
         should_commit = self.model.should_commit_response_to_history(session, old_response_id)
         committed_message = session.end_response(
             commit_text=should_commit,

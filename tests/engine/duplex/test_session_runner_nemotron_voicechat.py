@@ -45,6 +45,7 @@ from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import ErrorEvent
 from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage, OpenDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import load_duplex_plugin
+from vllm_omni.engine.duplex.session import runner as runner_module
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallState
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex import plugin as plugin_module
@@ -155,10 +156,10 @@ async def harness(monkeypatch):
         yield h
 
 
-async def deliver(h, token_id=12, **metadata):
+async def deliver(h, token_id=12, finished=False, **metadata):
     output = SimpleNamespace(
         request_id=h.stage0_request_id(),
-        finished=False,
+        finished=finished,
         multimodal_output={},
         outputs=[SimpleNamespace(text="", token_ids=[token_id], multimodal_output={})],
     )
@@ -990,3 +991,173 @@ async def test_an_accepted_result_reaches_the_next_model_turn_after_the_call_bec
     Thinker._sync_forced_function_response(worker_state, h.session.runtime_config)
     assert worker_state["forced_function_tokens"] == [42]
     assert worker_state["function_response_generation"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Fast path: decode tool-call tokens back to back                             #
+# --------------------------------------------------------------------------- #
+
+
+def submitted_payloads(h: Harness) -> list[dict]:
+    return [
+        dict(submission.prompt["model_intermediate_buffer"]["duplex"]["payload"]) for submission in h.port.submissions
+    ]
+
+
+async def deliver_decoded_frame(h: Harness, *, fast_path: bool):
+    """A Stage-0 frame the thinker decoded inside (or outside) a tool call."""
+    return await deliver(h, nvc_function_fast_path=1 if fast_path else 0)
+
+
+async def open_speaking_response(h: Harness) -> None:
+    """Speak one frame first, the way the model does before it calls a tool.
+
+    That text frame opens the auto response the session paces, so a following
+    frame has a continuation to schedule if it is not on the fast path.
+    """
+    events = await deliver(h, token_id=7)
+    assert "response.created" in types(events)
+
+
+@pytest.mark.asyncio
+async def test_a_call_before_the_model_speaks_also_appends_back_to_back(harness):
+    h = harness
+    await h.run(append_audio(samples=1280))
+    # The model called a tool without saying anything first: no response owns
+    # the turn yet, so the frame's fence names the turn the step appends into.
+    assert h.session.active_response_id is None
+
+    events = await deliver_decoded_frame(h, fast_path=True)
+
+    assert error_codes(events) == []
+    assert len(h.port.submissions) == 2
+    payload = submitted_payloads(h)[-1]
+    assert payload["fast_path"] is True
+    assert payload["duplex_turn_id"] == h.session.turn_id
+    assert h.runner.run.fast_path_active is True
+
+
+@pytest.mark.asyncio
+async def test_a_tool_call_frame_is_appended_again_without_waiting_for_the_clock(harness, monkeypatch):
+    h = harness
+    paced: list[dict[str, object]] = []
+    real = runner_module.compute_silence_continuation_deadline
+
+    def spy(**kwargs):
+        paced.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(runner_module, "compute_silence_continuation_deadline", spy)
+    await h.run(append_audio(samples=1280))
+    await open_speaking_response(h)
+    assert len(h.port.submissions) == 1
+
+    events = await deliver_decoded_frame(h, fast_path=True)
+
+    assert error_codes(events) == []
+    # No clock: the next frame is submitted as this one is handled.
+    assert paced == []
+    assert len(h.port.submissions) == 2
+    payload = submitted_payloads(h)[-1]
+    assert payload["fast_path"] is True
+    assert h.runner.run.fast_path_active is True
+
+
+@pytest.mark.asyncio
+async def test_client_frames_are_dropped_until_the_call_ends(harness, monkeypatch):
+    h = harness
+    paced: list[dict[str, object]] = []
+    real = runner_module.compute_silence_continuation_deadline
+
+    def spy(**kwargs):
+        paced.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(runner_module, "compute_silence_continuation_deadline", spy)
+    await h.run(append_audio(samples=1280))
+    await open_speaking_response(h)
+    await deliver_decoded_frame(h, fast_path=True)
+    submissions = len(h.port.submissions)
+
+    # The model supplies the frame, so the client's is consumed, not buffered.
+    events = await h.run(append_audio(samples=1280))
+    assert error_codes(events) == []
+    assert len(h.port.submissions) == submissions
+    assert h.runner.run.fast_path_dropped_frames == 1
+    assert not h.runner.model_state.audio_buffer.has_pending()
+
+    # The frame that leaves the call is the last fast step: the listen after it
+    # is paced again, and the next client frame is appended.
+    paced.clear()
+    await deliver_decoded_frame(h, fast_path=False)
+    assert h.runner.run.fast_path_active is False
+    assert paced
+    submissions = len(h.port.submissions)
+    events = await h.run(append_audio(samples=1280))
+    assert error_codes(events) == []
+    assert len(h.port.submissions) == submissions + 1
+    assert submitted_payloads(h)[-1].get("fast_path") is not True
+
+
+@pytest.mark.asyncio
+async def test_a_finished_call_request_stops_dropping_client_frames(harness):
+    h = harness
+    await h.run(append_audio(samples=1280))
+    await deliver_decoded_frame(h, fast_path=True)
+    assert h.runner.run.fast_path_active is True
+
+    # The request ends while the frame still says "inside the call" (an aborted
+    # call): nothing is decoding, so the client's frame is the model's next
+    # input again instead of a duplicate of a frame that will never come.
+    await deliver(
+        h,
+        nvc_function_fast_path=1,
+        finished=True,
+    )
+    assert h.runner.run.fast_path_active is False
+
+    submissions = len(h.port.submissions)
+    events = await h.run(append_audio(samples=1280))
+    assert error_codes(events) == []
+    assert len(h.port.submissions) == submissions + 1
+    assert submitted_payloads(h)[-1].get("fast_path") is not True
+
+
+@pytest.mark.asyncio
+async def test_the_fast_path_stops_at_the_step_budget(harness, monkeypatch):
+    h = harness
+    monkeypatch.setattr(plugin_module, "_FAST_PATH_MAX_STEPS", 3)
+    await h.run(append_audio(samples=1280))
+
+    for _ in range(3):
+        await deliver_decoded_frame(h, fast_path=True)
+        assert h.runner.run.fast_path_active is True
+    assert h.runner.plugin._fast_path_steps[h.stage0_request_id()] == 3
+
+    # Over budget the call still finishes, at one token per client frame.
+    await deliver_decoded_frame(h, fast_path=True)
+    assert h.runner.run.fast_path_active is False
+    submissions = len(h.port.submissions)
+    events = await h.run(append_audio(samples=1280))
+    assert error_codes(events) == []
+    assert len(h.port.submissions) == submissions + 1
+
+
+@pytest.mark.asyncio
+async def test_audio_decoded_alongside_a_fast_step_is_not_delivered(harness):
+    h = harness
+    await h.run(append_audio(samples=1280))
+    await deliver_decoded_frame(h, fast_path=True)
+
+    events = await h.deliver_and_settle(
+        tts_output(h.stage0_request_id(), samples=1764), stage_id=2, segment_finished=True
+    )
+    assert "response.output_audio.delta" not in types(events)
+    assert h.session.playback.generated_ms == 0
+
+    # The same Stage-2 frame after the call is the model speaking again.
+    await deliver_decoded_frame(h, fast_path=False)
+    events = await h.deliver_and_settle(
+        tts_output(h.stage0_request_id(), samples=1764), stage_id=2, segment_finished=True
+    )
+    assert "response.output_audio.delta" in types(events)

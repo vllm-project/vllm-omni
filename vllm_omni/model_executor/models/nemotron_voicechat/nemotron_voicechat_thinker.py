@@ -33,6 +33,9 @@ Timeline contract (verified against NeMo ``_init_inference``/``_step_zero``/
 * The function channel is load-bearing for numerical correctness (fusion
   weight 2.0), emits tool calls, and accepts client tool results while keeping
   the text channel padded during forced response injection.
+* Inside a tool call the thinker can be driven back to back: a fast-path append
+  carries a silence frame where client audio would go, and one token per append
+  still holds, so the call completes without waiting on the 80 ms client frame.
 """
 
 from __future__ import annotations
@@ -280,6 +283,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
     omni_client_multimodal_output_keys = (
         "nvc_function_token",
         "nvc_function_response_consumed_generation",
+        "nvc_function_fast_path",
     )
 
     @classmethod
@@ -531,6 +535,18 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             if any(generations):
                 multimodal_outputs["nvc_function_response_consumed_generation"] = [
                     torch.tensor([generation], dtype=torch.int64) for generation in generations
+                ]
+            # Whether this frame was decoded inside a tool call, one entry per
+            # request: the engine drives the call back to back while it is set.
+            fast_path = [
+                int(bool(self._sessions.get(info.get("request_id"), {}).get("function_call_active", False)))
+                if isinstance(info, dict)
+                else 0
+                for info in info_dicts
+            ]
+            if any(fast_path):
+                multimodal_outputs["nvc_function_fast_path"] = [
+                    torch.tensor([flag], dtype=torch.int64) for flag in fast_path
                 ]
         # One client token per request, taken from that request's scheduled
         # tail. A shared padded tail would publish another request's decision,

@@ -148,6 +148,57 @@ def test_function_state_follows_request_identity_when_sampling_rows_move():
     assert model._sessions["one"]["function_call_active"] is False
 
 
+def published_fast_paths(envelope, requests: tuple[str, ...] = ("one",)) -> list[int] | None:
+    """The per-request fast-path flags this wire payload publishes, if any."""
+    flags = envelope.multimodal_outputs.get("nvc_function_fast_path")
+    if flags is None:
+        return None
+    assert len(flags) == len(requests)
+    return [int(flag.reshape(-1)[0]) if hasattr(flag, "reshape") else int(flag) for flag in flags]
+
+
+def sample_then_publish(model, functions, requests=("one",)):
+    """Sample one frame, then build the wire projection the same wake publishes.
+
+    ``make_omni_output`` reads the function state the previous sample committed,
+    so the real order is sample then publish; ``sample_frame`` publishes before
+    sampling and therefore shows the frame before it.
+    """
+    sample_frame(model, functions, requests)
+    hidden = torch.nn.functional.one_hot(torch.tensor(functions), num_classes=32).to(torch.float32)
+    return model.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[{"request_id": name} for name in requests],
+        request_token_spans=[(index, index + 1) for index in range(len(requests))],
+    )
+
+
+def test_fast_path_flag_is_on_exactly_inside_the_published_call():
+    model = sampler_shell()
+    flags = []
+    for raw in (SOTC, 7, EOTC, 7):
+        # Outside a call the thinker publishes no flag at all, so the engine
+        # reads absence as "pace this frame with the client clock again".
+        published = published_fast_paths(sample_then_publish(model, [raw]))
+        flags.append(0 if published is None else published[0])
+    assert flags == [1, 1, 0, 0]
+
+
+def test_fast_path_flag_is_published_per_request():
+    model = sampler_shell()
+    envelope = sample_then_publish(model, [SOTC, 7], ("one", "two"))
+    assert published_fast_paths(envelope, ("one", "two")) == [1, 0]
+    # The other request enters while the first leaves: the flags follow identity.
+    envelope = sample_then_publish(model, [EOTC, SOTC], ("two", "one"))
+    assert published_fast_paths(envelope, ("two", "one")) == [0, 1]
+
+
+def test_fast_path_flag_is_absent_while_no_call_is_open():
+    model = sampler_shell()
+    envelope = sample_then_publish(model, [7])
+    assert published_fast_paths(envelope) is None
+
+
 @pytest.mark.parametrize("failure", ["missing_request", "duplicate_request", "missing_decisions"])
 def test_invalid_sampling_batch_changes_no_request_policy(failure):
     model = sampler_shell()
