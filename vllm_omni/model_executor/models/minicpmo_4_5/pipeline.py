@@ -20,6 +20,9 @@ from vllm_omni.config.stage_config import (
 )
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni"
+_SCHEDULER_WINDOW_POLICY = (
+    "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
+)
 MINICPMO45_REFERENCE_AUDIO_KEY = "_minicpmo45_reference_audio"
 _CODEC_EOS_TOKEN_ID = 6561  # tts_config.num_audio_tokens - 1
 
@@ -66,9 +69,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="text",
             owns_tokenizer=True,
-            scheduler_window_policy=(
-                "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
-            ),
+            scheduler_window_policy=_SCHEDULER_WINDOW_POLICY,
             requires_multimodal_data=True,
             engine_output_type="latent",
             supports_native_mrv2_data_plane=True,
@@ -136,6 +137,7 @@ MINICPMO_4_5_THINKER_ONLY_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="text",
             owns_tokenizer=True,
+            scheduler_window_policy=_SCHEDULER_WINDOW_POLICY,
             requires_multimodal_data=True,
             engine_output_type="latent",
             supports_native_mrv2_data_plane=True,
