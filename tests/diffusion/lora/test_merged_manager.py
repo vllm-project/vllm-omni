@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -43,6 +45,22 @@ def _request(adapter_id=1):
         },
         peft_config={"r": 2, "lora_alpha": 3, "target_modules": ["gate"]},
     )
+
+
+def test_tensor_lora_request_bypasses_injected_loader(pipeline):
+    model, _, _ = pipeline
+    loader = Mock()
+    manager = DiffusionLoRAManager(
+        model,
+        torch.device("cpu"),
+        torch.bfloat16,
+        lora_application="merged",
+        lora_loader=loader,
+    )
+
+    manager.merge_adapter(_request())
+
+    loader.load.assert_not_called()
 
 
 def test_native_merge_reuses_tp_packing_without_replacing_live_modules(pipeline):
