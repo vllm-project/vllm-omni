@@ -111,6 +111,14 @@ def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: An
     return False
 
 
+def _release_runner_session_window(worker: Any, session_id: str) -> None:
+    worker = getattr(worker, "worker", worker)
+    model = worker.model_runner.get_model()
+    release = getattr(model, "release_session_window", None)
+    if release is not None:
+        release(session_id)
+
+
 def _release_runner_shm_resources(worker: Any, request_ids: list[str]) -> int:
     worker = getattr(worker, "worker", worker)
     release = getattr(getattr(worker, "model_runner", None), "release_omni_shm_resources", None)
@@ -209,6 +217,12 @@ class StageEngineCoreProc(EngineCoreProc):
             release_overflowed = getattr(self.scheduler, "release_overflowed_requests", None)
             if release_overflowed is not None:
                 release_overflowed(request)
+
+    def omni_release_session_window(self, session_id: str) -> None:
+        policy = getattr(self.scheduler, "_window_policy", None)
+        if policy is not None:
+            policy.release_session(session_id)
+            self.model_executor.collective_rpc(_release_runner_session_window, args=(session_id,))
 
     def omni_append_text(self, update: TextInputUpdate | dict[str, object]) -> dict[str, object]:
         """Accept an append on the engine loop, ordered with ADD and ABORT."""

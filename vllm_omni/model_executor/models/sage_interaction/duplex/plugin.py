@@ -182,7 +182,9 @@ def build_sage_data_plane_prompt(
     if isinstance(payload, dict) and (listen_scale != 1.0 or listen_top_k > 0):
         payload = {**payload, "listen_prob_scale": listen_scale, "listen_top_k": listen_top_k}
 
-    model_fields: dict[str, object] = {"scheduler_token_id": token_id}
+    # Sage uses the shared in-request window, but has different delegate and
+    # listen boundaries from the stock MiniCPM-o replay protocol.
+    model_fields: dict[str, object] = {"scheduler_token_id": token_id, "session_window_replay": False}
     if submitted_tool_result_generation is not None:
         model_fields[SAGE_SUBMITTED_TOOL_RESULT_GENERATION_KEY] = int(submitted_tool_result_generation)
 
