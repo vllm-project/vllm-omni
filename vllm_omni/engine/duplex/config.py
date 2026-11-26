@@ -236,7 +236,7 @@ class DuplexCapabilities:
                 "model_native_duplex" if self.supports_model_native_turn_policy else "turn_based_duplex"
             ),
             "adapter_patterns": self.adapter_patterns,
-            "input_modes": ["append_audio_chunk"],
+            "input_modes": ["append_audio_chunk"] + (["append_text"] if self.accepts_input_modality("text") else []),
             "signal_sources": self.signal_sources,
             "stage_handoff_transport": self.stage_handoff_transport,
             "chunk_period_ms": self.chunk_period_ms,
@@ -450,17 +450,31 @@ def input_clocked(extra_body: object) -> bool:
     return isinstance(extra_body, Mapping) and extra_body.get(INPUT_CLOCK_KEY) == INPUT_CLOCK_VALUE
 
 
-def apply_input_clock_capabilities(capabilities: DuplexCapabilities, extra_body: object) -> DuplexCapabilities:
-    """An input-clocked session never overlaps turns: do not advertise ``supports_concurrent_turn_requests``.
+def apply_input_clock_capabilities(
+    capabilities: DuplexCapabilities, extra_body: object, *, input_modalities: frozenset[str] | None = None
+) -> DuplexCapabilities:
+    """The capabilities of an input-clocked session: no overlapping turns, and only the model's clocked modalities.
 
     The clock credits outputs to the model units in order, so the runner keeps
     the concurrent-turn gate shut in such a session and a commit during a
     response waits for it (the deferred-turn path). The session's advertised
-    capabilities say so, instead of repeating the model's flag.
+    capabilities say so (no ``supports_concurrent_turn_requests``), instead of
+    repeating the model's flag. ``input_modalities``
+    (``DuplexModelPlugin.input_clock_input_modalities``) keeps only those input
+    modalities: the modality check then refuses the others
+    (``invalid_input_modality``), and the client sees it in the capabilities.
     """
-    if not input_clocked(extra_body) or not capabilities.supports_concurrent_turn_requests:
+    if not input_clocked(extra_body):
         return capabilities
-    return replace(capabilities, supports_concurrent_turn_requests=False)
+    if capabilities.supports_concurrent_turn_requests:
+        capabilities = replace(capabilities, supports_concurrent_turn_requests=False)
+    if input_modalities is not None:
+        capabilities = replace(
+            capabilities,
+            required_input_modalities=capabilities.required_input_modalities & input_modalities,
+            optional_input_modalities=capabilities.optional_input_modalities & input_modalities,
+        )
+    return capabilities
 
 
 @dataclass
@@ -522,6 +536,13 @@ class DuplexSessionConfig:
     def normalized(self) -> DuplexSessionConfig:
         """Apply the clamps / defaults ``from_event`` applies to a wire object (typed configs skip them)."""
         return DuplexSessionConfig.from_event({"session": self.as_dict()})
+
+    @property
+    def resolved_modalities(self) -> list[str]:
+        """Output modalities after admission; ``None`` means the deployment default is not applied yet."""
+        if self.modalities is None:
+            raise RuntimeError("output modalities are unresolved; apply with_output_capabilities() first")
+        return self.modalities
 
     def with_output_capabilities(self, capabilities: DuplexCapabilities) -> DuplexSessionConfig:
         modalities = capabilities.resolve_output_modalities(self.modalities)

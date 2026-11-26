@@ -522,12 +522,14 @@ class TestSingleStageModeDetection:
             deploy_config="/fake/duplex.yaml",
             resolved_config_path="/fake/duplex.yaml",
             patch_deploy_config=False,
+            revision="pinned",
         )
 
         get_pipeline_config.assert_called_once_with(
             model="fake-model",
             trust_remote_code=False,
             deploy_config_path="/fake/duplex.yaml",
+            revision="pinned",
         )
         load_deploy_config.assert_called_once_with("/fake/duplex.yaml")
         # The turn-based engine only keeps the resolved deploy profile for introspection.

@@ -49,7 +49,7 @@ def nightly(request):
                 families[family].add(step["label"])
     assert families["accuracy"]
     assert families["perf"]
-    assert bool(families["duplex_perf"]) == (platform == "cuda")
+    assert bool(families["duplex_perf"]) == (platform in {"cuda", "npu"})
     return platform, path, doc, families
 
 
@@ -107,10 +107,19 @@ def test_shared_changes_keep_accuracy_and_perf(nightly, changed_file):
 
 
 @pytest.mark.parametrize(
+    "changed_file",
+    ["vllm_omni/worker_v2/omni_model_runner.py", "vllm_omni/core/prefix_cache/manager.py"],
+)
+def test_v2_runtime_selects_relevant_jobs(nightly, changed_file):
+    platform, _, _, families = nightly
+    qwen_labels = set().union(*families.values())
+    expected = {"cuda": qwen_labels, "npu": families["duplex_perf"], "rocm": set()}
+    assert _selected(nightly, [changed_file, MINICPM]) & qwen_labels == expected[platform]
+
+
+@pytest.mark.parametrize(
     "changed_file,platforms",
     [
-        ("vllm_omni/worker_v2/omni_model_runner.py", {"cuda"}),
-        ("vllm_omni/core/prefix_cache/manager.py", {"cuda"}),
         ("vllm_omni/platforms/cuda/platform.py", {"cuda"}),
         ("docker/Dockerfile.ci", {"cuda"}),
         ("requirements/cuda.txt", {"cuda"}),

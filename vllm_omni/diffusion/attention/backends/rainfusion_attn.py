@@ -22,6 +22,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION_METRICS
 
 logger = init_logger(__name__)
 
@@ -416,6 +417,9 @@ class RainFusionAttentionImpl(AttentionImpl):
             kernel_dtype="fp16",
             input_scale=float(metadata.extra.get("laser_input_scale", 256.0)),
         )
+        isolation = metadata.extra.get(REFERENCE_ISOLATION_METRICS)
+        if isolation is not None and plan.sparse_query_rows:
+            isolation.record_sparse_layer()
         if used_q == query.shape[1]:
             return out
         padded = torch.zeros_like(query)

@@ -23,8 +23,8 @@ class GlmTTSAdapter(ARTTSAdapter):
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
-        self._text_tokenizer = None
-        self._text_frontend = None
+        self._text_tokenizer: Any = None
+        self._text_frontend: Any = None
 
     def _text_tokenizer_and_frontend(self):
         from vllm_omni.model_executor.models.glm_tts.glm_tts import (
@@ -34,7 +34,10 @@ class GlmTTSAdapter(ARTTSAdapter):
         from vllm_omni.model_executor.models.glm_tts.text_frontend import GLMTTSTextFrontend
 
         if self._text_tokenizer is None:
-            config = self.ctx.engine_client.model_config
+            engine_client = self.ctx.engine_client
+            if engine_client is None:
+                raise RuntimeError("GLM-TTS adapter requires an engine client")
+            config = engine_client.model_config
             tokenizer_path = getattr(config, "tokenizer", None) or resolve_glm_tts_tokenizer_path(config.model)
             self._text_tokenizer = load_glm_tts_tokenizer(
                 tokenizer_path,
@@ -146,8 +149,11 @@ class GlmTTSAdapter(ARTTSAdapter):
         max_ratio = getattr(hf_cfg, "max_token_text_ratio", 20)
         stage_min_tokens = getattr(sampling_params_list[0], "min_tokens", None)
         stage_max_tokens = getattr(sampling_params_list[0], "max_tokens", None)
-        cap_candidates = [int(cap) for cap in (stage_max_tokens, request.max_new_tokens) if cap is not None]
-        hard_cap = min(cap_candidates) if cap_candidates else None
+        stage_cap = int(stage_max_tokens) if stage_max_tokens is not None else None
+        request_cap = int(request.max_new_tokens) if request.max_new_tokens is not None else None
+        hard_cap = stage_cap
+        if request_cap is not None:
+            hard_cap = request_cap if hard_cap is None else min(hard_cap, request_cap)
 
         min_tokens = max(1, int(text_token_len * min_ratio))
         if stage_min_tokens is not None:
@@ -155,9 +161,16 @@ class GlmTTSAdapter(ARTTSAdapter):
         if hard_cap is not None:
             min_tokens = min(min_tokens, hard_cap)
 
-        max_tokens = max(min_tokens, int(text_token_len * max_ratio))
-        if hard_cap is not None:
-            max_tokens = min(max_tokens, hard_cap)
+        if request_cap is not None:
+            # An explicit OpenAI max_new_tokens value overrides the model's
+            # text-ratio heuristic, while the deploy-stage cap remains the
+            # safety ceiling.  This lets callers reserve enough decode budget
+            # for voices whose acoustic prefix outlives the heuristic.
+            max_tokens = min(request_cap, stage_cap) if stage_cap is not None else request_cap
+        else:
+            max_tokens = max(min_tokens, int(text_token_len * max_ratio))
+            if stage_cap is not None:
+                max_tokens = min(max_tokens, stage_cap)
         sampling_params_list[0].min_tokens = min_tokens
         sampling_params_list[0].max_tokens = max_tokens
         seed = getattr(request, "seed", None)

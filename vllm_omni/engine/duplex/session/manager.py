@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 from opentelemetry import trace
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.commands import AppendAudio, Commit, DuplexCommand
+from vllm_omni.engine.duplex.commands import AppendAudio, AppendText, Commit, DuplexCommand
 from vllm_omni.engine.duplex.config import (
     DuplexConfigError,
     apply_input_clock_capabilities,
@@ -342,6 +342,20 @@ class DuplexSessionManager:
             # inputs that arrived before it began closing (its teardown
             # acknowledgement covers them).
             return
+        if isinstance(command, AppendText):
+            if not session.capabilities.accepts_input_modality("text"):
+                self.emit(
+                    session,
+                    [
+                        self._error_event(
+                            "native_text_append_unsupported", "This model does not accept text appends", command=command
+                        )
+                    ],
+                )
+                return
+            if not command.text:
+                self.emit(session, [self._error_event("bad_event", "Text must be non-empty", command=command)])
+                return
         if isinstance(command, AppendAudio):
             has_audio = bool(command.audio)
             has_video = bool(command.video_frames)
@@ -353,8 +367,17 @@ class DuplexSessionManager:
                 )
                 runner.input_refused(command, "invalid_input_modality")
                 return
+        if isinstance(command, AppendAudio | AppendText):
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
-            pending_bytes = len(command.audio) + sum(len(frame) for frame in command.video_frames)
+            try:
+                pending_bytes = (
+                    len(command.text.encode("utf-8"))
+                    if isinstance(command, AppendText)
+                    else len(command.audio) + sum(len(frame) for frame in command.video_frames)
+                )
+            except UnicodeEncodeError:
+                self.emit(session, [self._error_event("bad_event", "Text must be valid UTF-8", command=command)])
+                return
             if not session.reserve_input_bytes(pending_bytes, limit=limit, queued=True):
                 self.emit(
                     session,
@@ -630,11 +653,16 @@ class DuplexSessionManager:
                 raise DuplexSessionError(f"Duplex session already exists: {session_id}", code="session_exists")
             max_sessions = self.admission_limit
             collect_stats = bool(getattr(self.runtime_config, "collect_stats", False))
-            capabilities = apply_session_stats_capability(
-                self.plugin.deployment_capabilities(max_sessions=max_sessions), collect_stats
+            capabilities = apply_input_clock_capabilities(
+                apply_session_stats_capability(
+                    self.plugin.deployment_capabilities(max_sessions=max_sessions), collect_stats
+                ),
+                message.session_config.extra_body,
+                input_modalities=self.plugin.input_clock_input_modalities,
             )
             config = message.session_config.with_output_capabilities(capabilities)
             if self._admission_count() >= max_sessions:
+                self.stage_port.check_session_availability(session_id)
                 self.stage_port.reject_session("global_capacity_exhausted")
                 raise DuplexSessionError(
                     f"duplex_session_capacity_exhausted: limit={max_sessions}",
@@ -657,7 +685,6 @@ class DuplexSessionManager:
                 raise
             except ValueError as exc:
                 raise DuplexRuntimeConfigError(str(exc)) from exc
-            capabilities = apply_input_clock_capabilities(capabilities, config.extra_body)
             validate_session_tools(capabilities, config.extra_body)
             session = DuplexEngineSession(
                 session_id=session_id,
@@ -709,7 +736,9 @@ class DuplexSessionManager:
             error_code, _, _ = self._control_error(exc)
             if holds_admission_slot and (session_trace := self.session_traces.pop(session_id, None)) is not None:
                 session_trace.end("error", error_code)
-            if error_code in {"resource_exhausted", "session_exists"}:
+            if error_code == "replica_unavailable":
+                self.stage_port.reject_session(error_code)
+            if error_code in {"replica_unavailable", "resource_exhausted", "session_exists"}:
                 logger.info("open_duplex_session rejected: %s", exc)
             else:
                 logger.exception("open_duplex_session failed: %s", exc)

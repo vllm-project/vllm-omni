@@ -159,6 +159,14 @@ class PcmAppendBuffer(ABC):
     @abstractmethod
     def has_pending(self) -> bool: ...
 
+    def has_ready_unit(self, *, chunk_period_ms: int) -> bool:
+        """Whether buffered input can precede a text response's continuation.
+
+        Buffers that distinguish incomplete media from ready units may override
+        this; otherwise every pending input keeps priority over generated silence.
+        """
+        return self.has_pending()
+
     @abstractmethod
     def has_reserved(self) -> bool: ...
 
@@ -201,11 +209,12 @@ class PcmAppendBuffer(ABC):
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None: ...
 
     def prepare_backlog(self, *, operation_id: str, chunk_period_ms: int) -> PcmAppendReservation | None:
-        """Reserve one more whole unit from audio already buffered, if there is one (input-clocked sessions).
+        """Reserve one more complete buffered media unit, leaving partial PCM.
 
         After an append emitted its unit, an input-clocked session calls this
         until it returns ``None``, so an append longer than one unit submits
         every whole unit it completed and is acknowledged after all of them.
+        Text appends also drain these units first, preserving media/text order.
         Default: ``None`` (one unit per append; the rest waits for later
         appends).
         """
@@ -368,6 +377,8 @@ class DuplexDataPlaneContext:
     response_format: str = "wav"
     speed: float | None = None
     modalities: tuple[str, ...] = ()
+    # Producer turn captured at interception, when available (Stage0).
+    model_turn_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -539,8 +550,8 @@ class DuplexModelPlugin(ABC):
     projects_intermediate_outputs: bool = False
     supports_auxiliary_requests: bool = False
     #: Whether sessions of this model may set ``extra_body.clock == "input"``;
-    #: otherwise such a session is refused (``input_clock_unsupported``). No
-    #: model opts in yet. A plugin opts in once ``unit_decision`` /
+    #: otherwise such a session is refused (``input_clock_unsupported``).
+    #: MiniCPM-o 4.5 opts in. A plugin opts in once ``unit_decision`` /
     #: ``unit_output_complete`` match its real unit boundaries, and only if
     #: Stage 0 ends every accepted submission with exactly one segment end, in
     #: submission order, with the unit's decision taken on that segment-ending
@@ -559,6 +570,16 @@ class DuplexModelPlugin(ABC):
     #: its input's acknowledgement was fixed and is reported with the next
     #: client input; a plugin that relies on those paths does not opt in yet.
     supports_input_clock: bool = False
+    #: Input modalities an input-clocked session of this model accepts, or
+    #: ``None`` for the model's usual ones. A model whose committed turn can
+    #: split into several Stage-0 submissions for some modality (vision units
+    #: it replays separately, ``PcmAppendBuffer.prepare_commit_prefix``) is
+    #: not accounted for by the clock when that commit is deferred behind a
+    #: response, so it names the other modalities here: the session is created
+    #: without the rest (``apply_input_clock_capabilities``) and an append
+    #: carrying one of them is refused (``invalid_input_modality``) and
+    #: acknowledged as rejected.
+    input_clock_input_modalities: frozenset[str] | None = None
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
     #: Reasons this model can show a notice for. The notice goes through the
@@ -767,6 +788,7 @@ class DuplexModelPlugin(ABC):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None: ...
 
     def project_intermediate_output(
@@ -843,6 +865,7 @@ class DuplexModelPlugin(ABC):
         segment_finished: bool,
         output: object,
         context: object,
+        streaming_context: object | None = None,
     ) -> bool:
         """Return True when the next user commit may start while prior TTS drains.
 
@@ -866,6 +889,19 @@ class DuplexModelPlugin(ABC):
         """
         del stage_count
         return frozenset()
+
+    def prewarms_downstream_stages(self, request_id: str) -> bool:
+        """Whether a new Stage0 request pre-submits its downstream stages.
+
+        In async-chunk mode the orchestrator pre-submits every connector-fed
+        stage after Stage0 when the request is first sent. Return False when
+        this request can never reach those stages (for example, a turn whose
+        response modalities have no audio), so no placeholder is created only
+        to be aborted when the turn ends. Called after ``plan_append`` bound
+        the request. Default is True.
+        """
+        del request_id
+        return True
 
     # ---- input-clocked sessions (extra_body.clock == "input") ----
 

@@ -43,13 +43,13 @@ REFERENCE_TEXT_IMG2TEXT = (
 
 
 # (model, stage_config_path, extra_omni_kwargs) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
-# Cold ROCm AITER MHA builds can consume most of the default 600-second stage
-# deadline. Match the online BAGEL coverage so the compiled kernel can finish
-# and leave bounded headroom for the stage-ready handshake.
+# Cold ROCm AITER MHA builds have taken nearly 1,690 seconds under CI load.
+# Keep the offline weekly owner bounded while leaving headroom for import and
+# the stage-ready handshake after compilation completes.
 _OMNI_RUNNER_PARAM = (
     MODEL_NAME,
     STAGE_CONFIG,
-    {"stage_init_timeout": 1800, "init_timeout": 2100},
+    {"stage_init_timeout": 2400, "init_timeout": 2700},
 )
 
 pytestmark = [
@@ -68,7 +68,7 @@ def _extract_text(omni_outputs: list) -> str:
     return ""
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_bagel_text2text(run_level, omni_runner: OmniRunner) -> None:
     """Test Bagel text2text produces correct text output."""
     omni = omni_runner.omni
@@ -89,7 +89,7 @@ def test_bagel_text2text(run_level, omni_runner: OmniRunner) -> None:
         assert text == REFERENCE_TEXT_TEXT2TEXT, f"Text mismatch: expected {REFERENCE_TEXT_TEXT2TEXT!r}, got {text!r}"
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_bagel_img2text(run_level, omni_runner: OmniRunner) -> None:
     """Test Bagel img2text produces correct text output."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")

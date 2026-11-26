@@ -2,11 +2,9 @@
 
 ## Status and target
 
-**Historical V1 integration contract.** PersonaPlex is unavailable with vLLM
-0.34 and V2-only execution: its Talker requires the retired Model Runner V1.
-The retained default profile is rejected during configuration loading. The V2
-Code2Wav component does not make the complete workflow runnable; a model-owner
-V2 migration is still required.
+On vLLM 0.34, use the [PersonaPlex MRv2 duplex profile](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/personaplex_duplex_mrv2.yaml).
+Stage 0 MRv2 requires duplex mode with `async_chunk` enabled. The default
+V1 profile is retained for historical reference.
 
 PersonaPlex (`nvidia/personaplex-7b-v1`, a Moshi finetune) was served by the
 [Unified Full-Duplex Framework](fullduplex.md) through one model plugin,
@@ -272,7 +270,7 @@ conversational turn boundary.
 `tests/e2e/online_serving/test_personaplex_duplex.py` when
 `PERSONAPLEX_MODEL_PATH` is set) defined the earlier default `personaplex.yaml`
 validation contract below. It does not establish readiness with vLLM 0.34;
-the current profile is unavailable until its V1 Talker is migrated to V2.
+use the MRv2 duplex profile for current deployments.
 
 1. the server reaches ready without a local eager override; `/health` is 200;
 2. `/v1/realtime?duplex=1` reports `model_native_duplex`, `chunk_period_ms=80`

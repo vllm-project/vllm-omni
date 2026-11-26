@@ -17,11 +17,13 @@ import pytest
 from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
+from vllm_omni import platforms
 from vllm_omni.config.omni_config import (
     VllmOmniDiffusionStageConfig,
     normalize_and_validate_diffusion_engine_ingress_kwargs,
 )
-from vllm_omni.config.resolver import OmniConfigResolution
+from vllm_omni.config.pipeline_registry import resolve_pipeline_config
+from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
 from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER
 from vllm_omni.engine.stage_engine_startup import StageReplicaResources
@@ -34,7 +36,7 @@ from vllm_omni.entrypoints.cli.serve import (
     run_headless,
 )
 from vllm_omni.entrypoints.omni_base import OmniBase
-from vllm_omni.entrypoints.utils import parse_stage_overrides
+from vllm_omni.entrypoints.utils import parse_stage_overrides, prepare_stage_config_inputs
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -401,7 +403,7 @@ def test_serve_native_checkpoint_validation(model_class, exists, native, tmp_pat
     checkpoint = tmp_path / "anima.safetensors"
     if exists:
         checkpoint.touch()
-    argv = ["serve", str(checkpoint), "--omni"]
+    argv = ["serve", str(checkpoint), "--omni", "--revision", "pinned"]
     if model_class is not None:
         argv.extend(["--model-class-name", model_class])
     args = _parse_serve_args(argv)
@@ -414,7 +416,7 @@ def test_serve_native_checkpoint_validation(model_class, exists, native, tmp_pat
         detect_model.assert_not_called()
         validate_llm.assert_not_called()
     else:
-        detect_model.assert_called_once_with(str(checkpoint))
+        detect_model.assert_called_once_with(str(checkpoint), revision="pinned")
         validate_llm.assert_called_once_with(args)
 
 
@@ -642,7 +644,7 @@ def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(moc
     mocker.patch.object(serve_module, "_build_multi_api_stage_runtime", return_value=runtime)
     mocker.patch.object(serve_module, "_wait_for_multi_api_server_completion")
     mocker.patch("signal.signal")
-    mocker.patch("vllm.entrypoints.openai.api_server.setup_server", return_value=("127.0.0.1:8000", socket))
+    mocker.patch("vllm.entrypoints.launchers.launcher.setup_server", return_value=("127.0.0.1:8000", socket))
     mocker.patch("vllm.v1.metrics.prometheus.setup_multiprocess_prometheus")
     start_manager = mocker.patch.object(serve_module, "_start_api_server_process_manager", return_value=manager)
 
@@ -763,6 +765,19 @@ def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
 
     assert args.ulysses_a2a_permute is True
     assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
+
+
+def test_serve_parser_accepts_ulysses_overlap_chunks() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        ["serve", "fake-model", "--omni", "--ulysses-a2a-permute", "--ulysses-overlap-chunks", "4"]
+    )
+
+    assert args.ulysses_overlap_chunks == 4
+    assert args.get_explicit_kwargs_dict()["ulysses_overlap_chunks"] == 4
 
 
 def test_serve_parser_accepts_server_level_mixfusion_flags() -> None:
@@ -919,7 +934,8 @@ def test_parse_stage_overrides_valid_json() -> None:
     assert parsed == {"0": {"devices": "0,1"}, "1": {"devices": "2"}}
 
 
-def test_serve_parser_parses_stage_overrides_before_resolution() -> None:
+@pytest.mark.parametrize("stage_id", ["0", "00"])
+def test_serve_parser_parses_stage_overrides_before_resolution(stage_id: str) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
@@ -930,7 +946,7 @@ def test_serve_parser_parses_stage_overrides_before_resolution() -> None:
             "fake-model",
             "--omni",
             "--stage-overrides",
-            '{"0": {"devices": "0,1"}}',
+            f'{{"{stage_id}": {{"devices": "0,1"}}}}',
         ]
     )
 
@@ -964,6 +980,11 @@ def test_parse_stage_overrides_invalid_json_raises() -> None:
 def test_parse_stage_overrides_rejects_invalid_stage_ids(payload: str) -> None:
     with pytest.raises(argparse.ArgumentTypeError, match="non-negative integer stage ids"):
         _parse_stage_overrides(payload)
+
+
+def test_parse_stage_overrides_rejects_duplicate_logical_stage_ids() -> None:
+    with pytest.raises(argparse.ArgumentTypeError, match="more than one key for stage 0"):
+        _parse_stage_overrides('{"0": {"enforce_eager": true}, "00": {"enforce_eager": false}}')
 
 
 def test_parse_stage_overrides_preserves_arbitrary_override_fields() -> None:
@@ -1004,6 +1025,62 @@ def test_serve_warns_once_per_ignored_stage_override(caplog: pytest.LogCaptureFi
     ]
     launch.assert_called_once_with(args)
     assert args.get_explicit_kwargs_dict()["stage_overrides"] == {"0": {"env": {"TEST_ENV": "1"}}}
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        ([], None),
+        (["--stage-id", "none"], None),
+        (["--stage-id", "0"], [0.25, 0.8, 0.15]),
+        (
+            ["--stage-id", "0", "--stage-overrides", '{"0": {"gpu_memory_utilization": 0.4}}'],
+            [0.4, 0.8, 0.15],
+        ),
+        (
+            ["--stage-overrides", '{"01": {"gpu_memory_utilization": 0.4}, "2": {"gpu_memory_utilization": 0.3}}'],
+            [0.25, 0.4, 0.3],
+        ),
+    ],
+)
+def test_serve_stage_owned_flag_targets_at_most_one_stage(
+    extra_args: list[str], expected: list[float] | None, mocker: MockerFixture
+) -> None:
+    pipeline = resolve_pipeline_config("qwen2_5_omni")
+    assert pipeline is not None
+    mocker.patch("vllm_omni.config.config_factory.StageConfigFactory.get_pipeline_config", return_value=pipeline)
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=False)
+    mocker.patch.dict("os.environ", {"VLLM_DISABLE_LOG_LOGO": "1"})
+    mocker.patch.object(platforms.current_omni_platform, "device_name", "cuda")
+    parser = TrackingArgumentParser()
+    command = OmniServeCommand()
+    command.subparser_init(parser.add_subparsers(dest="subparser"))
+    distributed_args = ["--omni-master-address", "127.0.0.1", "--omni-master-port", "26000"]
+    args = parser.parse_args(
+        ["serve", "fake-model", "--omni", "--gpu-memory-utilization", "0.25", *distributed_args, *extra_args]
+    )
+    command.validate(args)
+    budgets: list[float] = []
+
+    async def resolve_before_startup(args: TrackingNamespace) -> None:
+        inputs = prepare_stage_config_inputs(args.model, args.get_explicit_kwargs_dict(), trust_remote_code=None)
+        config = resolve_omni_config(
+            inputs.model,
+            trust_remote_code=inputs.trust_remote_code,
+            cli_overrides=inputs.kwargs,
+            deploy_config_path=inputs.deploy_config_path,
+            stage_overrides=inputs.stage_overrides,
+            strategy_config_path=inputs.strategy_config_path,
+        )
+        budgets.extend(stage.cache_config.gpu_memory_utilization for stage in config.stage_configs)
+
+    mocker.patch("vllm_omni.entrypoints.cli.serve.omni_run_server", resolve_before_startup)
+    if expected is None:
+        with pytest.raises(ValueError, match=r"--gpu-memory-utilization .*\[0, 1, 2\].*--stage-overrides"):
+            OmniServeCommand.cmd(args)
+    else:
+        OmniServeCommand.cmd(args)
+        assert budgets == expected
 
 
 def test_parse_stage_overrides_warns_and_skips_non_stage_fields(caplog) -> None:

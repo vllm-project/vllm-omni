@@ -111,6 +111,8 @@ class ResponseState:
     stage_metrics: dict[str, dict[str, object]] = field(default_factory=dict)
     stage_metric_tpot_weighted_ms: dict[str, float] = field(default_factory=dict)
     stage_metric_tpot_weight: dict[str, int] = field(default_factory=dict)
+    #: Running sums behind each interval mean, keyed by (stage id, list field).
+    stage_metric_interval_sums: dict[tuple[str, str], float] = field(default_factory=dict)
     request_started_at_s_by_turn: dict[int, float] = field(default_factory=dict)
     active_response_request_started_at_s: float | None = None
     active_response_ttft_ms: float | None = None
@@ -247,6 +249,7 @@ class DuplexEngineSession:
     #: before the response those tokens end up in exists, so they are held here
     #: and folded into the first response that opens after them.
     _pending_stage_metrics: list[dict[str, dict[str, object]]] = field(default_factory=list, repr=False)
+    _ended_response_stage_metrics: dict[str, dict[str, dict[str, object]]] = field(default_factory=dict, repr=False)
     _playback: PlaybackLedger = field(default_factory=PlaybackLedger, repr=False)
     _conversation: ConversationHistory = field(default_factory=ConversationHistory, repr=False)
     _context_ledger: DuplexContextLedger = field(default_factory=DuplexContextLedger, repr=False)
@@ -685,12 +688,14 @@ class DuplexEngineSession:
 
         placeholder = self._conversation.history_item_placeholders.pop(item_id, None)
         if placeholder is not None:
-            for index, candidate in enumerate(self._conversation.messages):
-                if candidate is placeholder:
-                    self._conversation.messages[index] = message
+            messages = self._conversation.messages
+            # A response reserves its slot when it opens, so search from the newest message.
+            for index in range(len(messages) - 1, -1, -1):
+                if messages[index] is placeholder:
+                    messages[index] = message
                     break
             else:
-                self._conversation.messages.append(message)
+                messages.append(message)
         elif not any(candidate is message for candidate in self._conversation.messages):
             self._conversation.messages.append(message)
         self._conversation.item_ids[item_id] = message
@@ -992,8 +997,10 @@ class DuplexEngineSession:
         message = _object_dict(role="user", content=[input_audio_part])
         if transcript:
             message["transcript"] = transcript
+        messages = self._conversation.messages
+        # The slot was reserved when the response opened, so search from the newest message.
         index = (
-            next((i for i, candidate in enumerate(self._conversation.messages) if candidate is text_slot), None)
+            next((i for i in range(len(messages) - 1, -1, -1) if messages[i] is text_slot), None)
             if text_slot is not None
             else None
         )
@@ -1178,10 +1185,16 @@ class DuplexEngineSession:
             self.reserve_history_item(f"item_{response_id}")
         return response_id
 
+    def pop_ended_response_stage_metrics(self, response_id: object) -> dict[str, dict[str, object]] | None:
+        if not isinstance(response_id, str):
+            return None
+        return self._ended_response_stage_metrics.pop(response_id, None)
+
     def _clear_response_metrics(self) -> None:
         self._response.stage_metrics.clear()
         self._response.stage_metric_tpot_weighted_ms.clear()
         self._response.stage_metric_tpot_weight.clear()
+        self._response.stage_metric_interval_sums.clear()
 
     def _response_aggregator_wall_start_ts(self) -> float:
         now_wall_s = time.time()
@@ -1316,7 +1329,7 @@ class DuplexEngineSession:
         if not snapshot:
             return
         if self.active_response_id is not None:
-            self.accumulate_response_stage_metrics(snapshot)
+            self.add_response_stage_metrics(snapshot)
             return
         self._pending_stage_metrics.append(snapshot)
 
@@ -1324,14 +1337,22 @@ class DuplexEngineSession:
         self,
         stage_metrics: Mapping[Any, Any] | None,
     ) -> dict[str, dict[str, object]]:
+        self.add_response_stage_metrics(stage_metrics)
+        return self.response_stage_metrics_snapshot()
+
+    def response_stage_metrics_snapshot(self) -> dict[str, dict[str, object]]:
+        return copy.deepcopy(self._response.stage_metrics)
+
+    def add_response_stage_metrics(self, stage_metrics: Mapping[Any, Any] | None) -> None:
+        """Fold a stage snapshot into the active response without copying the totals."""
         if self.active_response_id is None:
-            return copy.deepcopy(self._response.stage_metrics)
+            return
         if self._pending_stage_metrics:
             pending, self._pending_stage_metrics = self._pending_stage_metrics, []
             for held in pending:
-                self.accumulate_response_stage_metrics(held)
+                self.add_response_stage_metrics(held)
         if not isinstance(stage_metrics, Mapping):
-            return copy.deepcopy(self._response.stage_metrics)
+            return
 
         additive_fields = (
             "num_tokens_in",
@@ -1382,13 +1403,18 @@ class DuplexEngineSession:
             for list_name, mean_name in interval_fields:
                 values = raw_values.get(list_name)
                 if isinstance(values, list):
-                    existing = current.get(list_name, [])
-                    combined = list(existing) if isinstance(existing, list) else []
-                    combined.extend(
+                    combined = current.get(list_name)
+                    if not isinstance(combined, list):
+                        combined = current[list_name] = []
+                    added = [
                         value for value in values if isinstance(value, int | float) and not isinstance(value, bool)
-                    )
-                    current[list_name] = combined
-                    current[mean_name] = sum(combined) / len(combined) if combined else 0.0
+                    ]
+                    combined.extend(added)
+                    # Keep a running sum so each update costs its own samples, not the whole reply.
+                    key = (stage_id, list_name)
+                    total = self._response.stage_metric_interval_sums.get(key, 0.0) + sum(added)
+                    self._response.stage_metric_interval_sums[key] = total
+                    current[mean_name] = total / len(combined) if combined else 0.0
 
             tpot_ms = raw_values.get("vllm_tpot_ms")
             token_count = raw_values.get("num_tokens_out")
@@ -1407,8 +1433,6 @@ class DuplexEngineSession:
             for name, value in raw_values.items():
                 if name not in handled_fields:
                     current[str(name)] = copy.deepcopy(value)
-
-        return copy.deepcopy(self._response.stage_metrics)
 
     def accumulate_overlap_speech(self, duration_ms: int) -> int:
         self._input.overlap_speech_ms += max(0, int(duration_ms))
@@ -1570,6 +1594,15 @@ class DuplexEngineSession:
         ):
             self._conversation.retired_audio_item_ids.add(item_id)
 
+    def release_zero_audio_response(self, response_id: str | None) -> None:
+        """Release a reply that produced no audio; it never receives a playback ACK."""
+        if response_id is None:
+            return
+        playback = self._playback.by_response.get(response_id)
+        if playback is not None and max(playback.sent_ms, playback.generated_ms) == 0:
+            self.release_response_history_snapshot(response_id)
+            self.release_response_playback(response_id)
+
     def history_item_has_audio(self, item_id: str) -> bool:
         """Whether this item's response produced audio, including after cleanup.
 
@@ -1683,6 +1716,10 @@ class DuplexEngineSession:
     ) -> dict[str, object] | None:
         self._log_response_aggregator()
         response_id = self._response.active_response_id
+        if response_id is not None and not self.capabilities.emits_audio:
+            ended_metrics = self.accumulate_response_stage_metrics(None)
+            if ended_metrics:
+                self._ended_response_stage_metrics[response_id] = ended_metrics
         if self.perf is not None and response_id is not None:
             self.perf.end_response(response_id)
         response_input_commit_seq = self._response.active_response_input_commit_seq
@@ -2182,6 +2219,7 @@ class DuplexEngineSession:
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
         self._clear_response_metrics()
+        self._ended_response_stage_metrics.clear()
         self._restore_response_config()
 
     def signal_turn(self, event_type: str, payload: Mapping[str, object] | None = None) -> TurnEvent:
@@ -2217,7 +2255,7 @@ class DuplexEngineSession:
             "active_response_id": self.active_response_id,
             "active_response_turn_id": self.active_response_turn_id,
             "model": self.config.model,
-            "modalities": list(self.config.modalities or ()),
+            "modalities": list(self.config.resolved_modalities),
             "instructions": self.config.instructions,
             "voice": self.config.voice,
             "response_format": self.config.response_format,
