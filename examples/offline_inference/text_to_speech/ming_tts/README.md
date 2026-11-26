@@ -24,8 +24,8 @@ connectors, async chunking, memory limits, and sampling defaults.
 
 The example supports both:
 
-- **Blocking eager** via `vllm_omni/deploy/ming_tts.yaml`
-- **Async chunk eager** via `vllm_omni/deploy/ming_tts.yaml` (default `async_chunk: true`)
+- **Blocking** via `vllm_omni/deploy/ming_tts.yaml` (`--no-async-chunk`)
+- **Async chunk** via `vllm_omni/deploy/ming_tts.yaml` (default `async_chunk: true`; pass `--enforce-eager` for eager mode)
 
 ## Setup
 
@@ -214,7 +214,7 @@ output frame counts and Stage-1 patch counts for every case:
 | `--max-decode-steps` | Override `ming_max_decode_steps` |
 | `--num-prompts` | Repeat the same case N times. Outputs are indexed when `N > 1` |
 | `--streaming` | Use `AsyncOmni` and async_chunk transport |
-| `--enforce-eager` | Recommended for Ming dense; non-eager is out of scope |
+| `--enforce-eager` | Force eager execution (disables Stage 0 piecewise CUDA graphs) |
 | `--enable-stats` / `--log-stats` | Enable vLLM-Omni per-request stats logging |
 | `--stats-log-file` | Optional path for the stats log |
 | `--metadata-json` | Optional path for the run manifest JSON |

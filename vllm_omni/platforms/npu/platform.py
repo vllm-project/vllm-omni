@@ -255,19 +255,46 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def apply_diffusion_model_patches(cls, model, od_config) -> None:
+        from vllm_omni.platforms.npu._310p import is_310p
         from vllm_omni.platforms.npu.models.minimax_h3_image import apply_minimax_h3_image_graphs
 
         apply_minimax_h3_image_graphs(model, od_config)
+        if od_config.model_class_name == "QwenImage21Pipeline" and is_310p():
+            from vllm_omni.platforms.npu._310p.patch.qwen_image_21 import apply_qwen_image_21_patches
+
+            apply_qwen_image_21_patches(model, od_config)
 
     @classmethod
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
         from vllm_ascend.ascend_forward_context import set_mc2_mask, set_mc2_tokens_capacity
 
+        from vllm_omni.platforms.npu._310p import disable_internal_format, disable_jit_compile, is_310p
         from vllm_omni.platforms.npu.models.minimax_h3 import (
             apply_minimax_h3_qwen3vl_patch,
             apply_minimax_h3_qwen3vl_sdpa_patch,
             apply_minimax_h3_qwen3vl_swiglu_patch,
         )
+
+        is_310 = is_310p(device)
+        if is_310:
+            # 310P has no JIT tiling compiler; leaving it enabled makes the
+            # first call of every op shape stall on TBE subprocesses.
+            disable_jit_compile()
+            # Keep conv outputs in the plain layout; several 310P ops reject
+            # the private NCDHW/NZ "internal format".
+            disable_internal_format()
+            # 310P has no working SDPA/FIA kernel; route every NPU attention
+            # call through npu_prompt_flash_attention (or the chunked
+            # fallback for causal/masked cases) before any module is built.
+            from vllm_omni.platforms.npu._310p.patch.attention import apply_attention_patches
+
+            apply_attention_patches()
+            # 310P matmul is FP16-only: BF16 falls back to the vector unit and
+            # runs ~100x slower. Serve the BF16 checkpoint in FP16 instead.
+            if od_config.dtype == torch.bfloat16:
+                logger.info("310P: serving %s in float16 instead of bfloat16", od_config.model_class_name)
+                od_config.dtype = torch.float16
+            logger.info("310P: %s runs with dtype=%s", od_config.model_class_name, od_config.dtype)
 
         # These patches import the MiniMax encoder package, whose __init__ loads
         # pipeline_minimax_h3 → diffusion.data. Doing that during platform

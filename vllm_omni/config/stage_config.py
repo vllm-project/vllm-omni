@@ -654,6 +654,7 @@ class StageDeployConfig:
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
     ulysses_a2a_permute: bool | None = None
+    ulysses_overlap_chunks: int | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     sequence_parallel_size: int | None = None
@@ -701,6 +702,7 @@ class StageDeployConfig:
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
+    vae_stack_tiles: bool | None = None
     vae_fast_path: str | None = None
     vae_encode_fast_path: str | None = None
     boundary_ratio: float | None = None
@@ -716,6 +718,7 @@ class StageDeployConfig:
     num_weight_load_threads: int | None = None
     diffusion_offload_config: dict[str, Any] | None = None
     kv_offload_config: dict[str, Any] | None = None
+    kv_isolate: bool | None = None
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool | None = None

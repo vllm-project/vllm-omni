@@ -120,15 +120,16 @@ def render_joyai_session_prompt(
             if working_messages is not None
             else [{"type": "image"} for _ in images]
         )
-        content.extend({"type": "text", "text": block} for block in blocks)
-        content.append(
+        # Match the visual path's query-before-frame conversation format.
+        content[:0] = [
+            *({"type": "text", "text": block} for block in blocks),
             {
                 "type": "text",
                 "text": f"{USER_QUERY_HEADER}\n{query}"
                 if query
                 else "Observe the current scene and choose whether to speak or stay silent.",
-            }
-        )
+            },
+        ]
         memory = render_joyai_memory_prefix(summary, visual_summaries)
         prefix = [{"role": "user", "content": value} for value in (memory, instruction) if value]
         if working_messages is not None:

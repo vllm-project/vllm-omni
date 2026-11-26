@@ -38,14 +38,125 @@ the model plugins.
 The optional process runtime isolates the orchestrator from the frontend GIL
 and serves sessions only. See [process runtime usage, ownership, and limits](../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
 
+## Incremental text input
+
+`AppendText` is admitted only when the model advertises `text` as an input
+modality. MiniCPM-o consumes each fragment as a native TEXT unit in automatic
+response mode. The manager rejects text that cannot be encoded as UTF-8 with a
+request-scoped `bad_event`, then charges UTF-8 bytes before mailbox admission; the
+runner keeps that charge until its ordered append task completes or is
+cancelled. Text shares the audio/video append tail and epoch fencing, without
+flushing partial PCM or advancing the first audio-encoder window. Before queuing
+text, the runner submits any complete buffered media units through that same
+append tail, preserving their input flags and leaving incomplete PCM buffered.
+Eligible audio appends also submit every complete buffered unit on either
+clock, including appends arriving after text has opened the response. An
+overlap policy that defers an append still keeps its media buffered.
+
+The MiniCPM plugin tokenizes off the owner loop and reserves exactly the
+context/previous-unit closure, `<unit>`, and text tokens. Stage 0 embeds these
+tokens using the native `streaming_prefill(text_list=...)` layout and retains
+them in sliding-window units. Repeated prefill of the same append identity
+reuses its embeddings. `force_listen` permits intermediate fragments to enter
+the KV cache without generating a reply; an unforced text unit opens the
+assistant turn once during prefill, since text has no microphone silence
+marking the end of input. When no response is active, the runner creates one before submission;
+an empty `<|chunk_eos|>` unit returns directly to the session to advance the
+normal continuation clock instead of waiting for nonexistent Talker output.
+This shortcut applies only to model-confirmed unforced text input. Empty audio
+units retain their Talker handoff and segment boundary, including when the
+chunk terminator is their only token, so input-clock acknowledgements keep
+their unit ownership.
+For a response released by unforced text, incomplete buffered PCM does not
+block that clock. The PCM remains charged and unconsumed; queued appends,
+reserved input, and complete audio or vision units retain priority over
+generated silence. Stage 0 confirms this exception for the epoch and model turn
+that consumed the text, using the bridge's turn snapshot before handoff. The
+active response at text admission may still belong to the previous Talker turn;
+it must not receive the new turn's continuation permission. An empty first unit
+waits for the previous response's final audio and `response.done` before opening
+the new response and continuing. Cancellation discards this deferred unit. The exception does not
+carry over to a later audio-only response or a new epoch. Disabling silence continuation or
+using the input clock still prevents synthetic units.
+An empty Talker segment, such as a unit containing only `<|speak|>` and a
+chunk terminator, uses the same deferred response transition when Stage 0 has
+confirmed its text turn. It retains its normal handoff and segment boundary;
+the session binds continuation to that text turn even if the previous response
+has ended before the empty segment arrives.
+For units returned directly to the session, the Talker handoff skips their
+completed control tokens in cumulative output before aligning the next speech
+unit's text and hidden states.
+Replayed prefill cannot reopen an ended reply. This does not change the separate
+conversation-item text-turn capability or replace assistant playback controls.
+
 ## Playback completion ownership
 
 Cancellation of a retained model stream identifies the response owning its
 queued audio, even after generation completes. The Realtime projection clears
 that playback without emitting a second terminal for the completed response.
 
+Deployment output capabilities are resolved after `configure_pipeline` using
+`deployment_capabilities`. A topology consisting of one final text stage
+advertises text output only and no playback ACK, audio truncation, or stage
+handoff. Other topologies retain their model plugin's output contract.
+`DuplexCapabilities.emits_audio` is the shared deployment predicate for output
+projection, history, synthesis parameters and calibration. Both typed and
+native truncation commands use one control-layer check of
+`supports_audio_truncate`, including audio-capable models that disable it.
+The engine capability property and session admission share this resolution.
+Startup warmup uses the engine's output defaults and, for text output, seeds
+an opening user turn and waits for a completed response containing text.
+
+`DuplexSessionConfig.modalities=None` preserves omission until admission.
+Both wire aliases are validated before defaults; unavailable output is rejected
+before reserving a session replica or creating a stage request. Live updates
+and response overrides validate a candidate before adopting configuration or
+reserving response options. Modality names are normalized to lowercase before
+validation. Explicit empty lists, normalized duplicates and conflicting aliases
+fail.
+
+A text-only deployment projects model results through existing text events.
+Its data plane still owns native unit and turn boundaries. Text responses
+reserve their history position before continued input, commit emitted text
+on completion or cancellation regardless of playback policy, and release
+playback bookkeeping without ACKs. Whitespace-only output creates no assistant
+history item or snapshot; meaningful emitted text is preserved verbatim.
+The unconditional bypass is deployment-scoped. On audio-capable deployments,
+a reply with zero generated/sent audio and no audio-completion dependency
+commits text without an ACK through the zero-audio fallback. Replies whose
+text depends on complete audio still follow alignment and playback checks.
+Selecting text output alone does not implement per-request TTS skipping.
+Cancellation rejects old-epoch results
+through the existing fence. Audio calibration is not started for deployments
+without audio output.
+
+MiniCPM-o 4.5 registers `minicpmo_4_5_thinker_only`, a Stage 0-only pipeline
+selected by a deploy config's `pipeline` key. Its data plane sends Stage 0
+output as text and ends a unit at LISTEN, `chunk_eos` or `chunk_tts_eos`; a
+unit ends the turn only when its final token before the terminator is
+`<|turn_eos|>`. Later text or a speak decision keeps the response open.
+The session requires a fast tokenizer and decodes cumulative tokens
+in unit order, so a snapshot spanning turns keeps each turn's text separate.
+Stage 0 metrics are cumulative snapshots under
+`metadata.vllm_omni.stage_metrics`. `response.speak` carries the running
+totals and text deltas omit them; the event that ends the response carries the
+final values: `response.done`, or `audio.cancelled` when it is cancelled.
+A snapshot that spans two turns is charged to the first reply, since the
+engine reports one set of metrics per snapshot.
+The first text delta carries server TTFT under
+`metadata.vllm_omni.response_request_metrics`, including responses already
+opened by `response.create` or `input_audio_buffer.commit`.
+
 `DuplexEngineSession` owns response snapshots and playback cursors. Output
 completion and a client's full `playback.ack` can arrive in either order.
+On all deployments, continuation-limit endings discard uncommitted text and
+release response state if the reply produced no audio. Failed responses and
+`conversation: "none"` endings also release zero-audio state without committing
+text to history. On audio-capable
+deployments, a later ACK for that released response fails with
+`playback_item_not_found` without restoring its state. Text-only deployments
+reject ACKs with `unsupported_operation`. The built-in playback helper skips
+finished replies with no audio.
 `finalize_response_playback` is the shared check used by ACK processing,
 normal response completion, draining response completion, and cancellation.
 It retains state while that response is active, any of its requests are still
@@ -604,8 +715,8 @@ vllm_omni/
 │   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
 ├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)
 │   ├── realtime/                    the OpenAI Realtime API itself
-│   │   ├── events.py                RealtimeEvent + OpenAI's 30 server events (21 ship as Tier 1;
-│   │   │                            9 have a Tier 2 twin in protocol/duplex)
+│   │   ├── events.py                RealtimeEvent + OpenAI's 30 server events (20 ship as Tier 1;
+│   │   │                            10 have a Tier 2 twin in protocol/duplex)
 │   │   ├── commands.py              RealtimeCommand + OpenAI's 10 client commands (8 Tier 1,
 │   │   │                            2 with a Tier 2 twin) --- wire_type + fields, no payload()
 │   │   ├── formats.py               audio format spellings, what is supported, per-session validation
@@ -619,8 +730,8 @@ vllm_omni/
 │       ├── __init__.py              re-exports the Tier 1 helper functions (audio, formats,
 │       │                            items, session, capabilities) so the engine never
 │       │                            imports protocol/realtime directly
-│       ├── events.py                the whole 44-event vocabulary: 21 Tier-1 re-exports,
-│       │                            9 Tier-2 subclasses (session.created + resume_token, ...),
+│       ├── events.py                the whole 44-event vocabulary: 20 Tier-1 re-exports,
+│       │                            10 Tier-2 subclasses (session.created + resume_token, ...),
 │       │                            14 Tier-3 events (listen/speak, playback, resume, ...);
 │       │                            DuplexEvent = RealtimeEvent
 │       ├── commands.py              the whole 17-command vocabulary: 8 Tier-1 re-exports,
@@ -649,6 +760,7 @@ vllm_omni/
 │       ├── turn_detection.py        server-side VAD turn detector used by the session
 │       ├── audio.py                 compatibility re-export, via protocol/duplex
 │       ├── vad.py / intermediate.py
+│       ├── response_judge.py        post-ASR judge: does a committed turn need a reply
 │       └── session/                 one engine-resident session and everything that runs it
 │           ├── engine_session.py    DuplexEngineSession: ledgers, lease, fence, stage resources, append sequencing
 │           ├── runner.py            DuplexSessionRunner (per-session mailbox on the orchestrator loop)
@@ -1294,6 +1406,14 @@ cannot reopen a retired gate; the early-stop marker is removed at response end.
 A successful write is not proof of server acceptance, and the runner never sends
 playback ACKs on behalf of the application.
 
+The output-decision and concurrent-turn-release hooks receive the current
+request's streaming context. A host plugin can use that context to share a
+decision with its stage-input bridge without retaining request state on the
+shared plugin. For the optional response judge, AURA returns its listen
+decision from `decide_output`; the generic orchestrator does not interpret
+judge output. AURA resolves its stage roles in `configure_pipeline`, before
+serving requests, and rejects missing required roles or duplicate roles.
+
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage
 sampling defaults once the stage pools exist. Plugin hooks that may block
@@ -1372,7 +1492,36 @@ all of them for that append. The timeouts' defaults are the same for every
 model (a per-plugin default is a possible follow-up). A plugin enables the mode with
 `supports_input_clock = True` once those hooks match its real unit
 boundaries; sessions of other models that ask for it are refused
-(`input_clock_unsupported`). No model opts in yet.
+(`input_clock_unsupported`). A plugin whose committed turn can split into
+several Stage-0 submissions for some input modality (vision units it
+replays separately, `prepare_commit_prefix`) names the modalities its
+clocked sessions do accept in `input_clock_input_modalities`; the session
+is then created without the others (`apply_input_clock_capabilities`), so
+the modality check refuses them (`invalid_input_modality`). MiniCPM-o 4.5
+opts in, for audio: its Code2Wav stage streams across unit boundaries, so
+its `unit_output_complete` waits for the Talker segment end and the Code2Wav
+output of the chunk that flushes the unit's remaining codes
+(`tts_is_last_chunk`). The orchestrator reads each stage's stream
+independently, so the flushes of several queued units can arrive before the
+first Talker segment end while the engine hands every final-stage output to
+the oldest speaking unit; the hook therefore counts the flags in `state` and
+consumes them in unit order, the n-th flag completing the n-th speaking unit
+(a Code2Wav segment end alone does not complete a unit, so a trailing
+control-only turn-end snapshot of the previous unit cannot complete the next
+one); a Stage-0 segment that
+hands the Talker nothing (`<|speak|>` straight into `<|chunk_eos|>`, or the
+chunk terminator drawn as the unit's first decision) is forwarded as an
+empty hand-off, which the Talker closes like any segment, so every speaking
+unit has a Talker segment end and a flagged Code2Wav output of its own and
+the default `unit_decision` is enough; and its input buffer implements
+`prepare_backlog`. The flag marks the end of what the bridge hands Code2Wav
+for the unit, not of its audio: the vocoder's lookahead, and a remainder
+shorter than 5 frames that the connector carries into the next unit's first
+chunk, put the unit's last codec frames (usually 200–440 ms of audio; no
+structural bound) into audio emitted with the next unit, as in real-time
+operation, so the codec path is the same with and without the clock. Only
+the chunk that ends the turn flushes everything; the API doc states this lag
+in the model's entry.
 
 What a plugin must guarantee before it opts in:
 
@@ -1446,6 +1595,15 @@ ending in U+FFFD may continue to complete its UTF-8 bytes when a positive
 cap is set. That cap keeps the token that crosses the target, then closes
 the chunk before another draw. Hard token and request caps retain priority;
 explicit `force_listen` bypasses only the soft character target.
+
+The listen decision takes the released `streaming_generate` knobs. A session
+created with `extra_body={"listen_prob_scale": s}` multiplies the listen logit
+by `s` after the repetition penalty, and `extra_body={"listen_top_k": k}`
+returns `<|listen|>` outright when it ranks within the top-`k` logits, before
+the final draw. Both default to neutral (`1.0` / unset) and are validated at
+session creation; they ride the append payload next to `force_listen` and
+cannot change once the session exists. An early listen never enters the
+repetition history, matching the reference decoder's early return.
 
 MiniCPM-o preserves the stage-2 sampled `<|turn_eos|>`, including after text
 without sentence-ending punctuation. The sampler does not infer whether an
@@ -1595,11 +1753,38 @@ comes from the first tokenizer-owning stage, matching frontend comprehension
 ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
 enters ASR and carries the original observation context through the handoff.
 
-JoyAI keeps an empty assistant message for a retained visual observation's
-response when cancellation leaves no committed speech. This preserves the turn
-boundary in both direct and ASR-handoff prompts without restoring unheard text
-or treating cancellation as a model silence decision. The boundary follows the
-existing recent-history budget and disappears when its history item is deleted.
+JoyAI renders a retained visual observation's unheard response as an assistant
+message containing only `</response>`. The Session history item remains empty;
+the model prompt keeps JoyAI's action marker to close the previous observation.
+This preserves the turn boundary in both direct and ASR-handoff prompts without
+restoring unheard text or treating cancellation as a model silence decision.
+The boundary follows the existing recent-history budget and disappears when
+its history item is deleted.
+
+Both text and speech queries precede their observation's frames inside the same
+user message, matching the visual reference frontend. The ASR handoff and
+reconstructed history preserve this query-before-frame format.
+Spoken observations retain the public Session item ID and its non-reusable
+source ID. JoyAI resolves the current text only while both identities match.
+Deleting and recreating a public item ID must not attach the new item's text to
+old frames, even when the text is identical. Observation ordering anchors also
+retain user source IDs so recreated items cannot inherit old positions.
+The retained transcript precedes the original frames in the same user message,
+matching the ASR handoff. A later
+camera observation must not move the transcript into a separate user turn.
+Deleted transcripts stay absent; cancelled output does not discard an accepted
+user transcript.
+
+The default JoyAI silence persona keeps ongoing user instructions active across
+replies: a completed answer does not finish an instruction about future
+observations. Each new observation must be evaluated against applicable ongoing
+instructions before choosing silence. This does not force a spoken response for
+every camera commit; silence remains valid when no instruction or scene change
+calls for speech. The absence of a new query is not by itself a reason to stay
+silent: an ongoing instruction may require a reply to the newest observation.
+Answered one-time questions and unmet conditions in ongoing instructions do not
+require another reply. An explicit `joyai_system_prompt` still replaces the persona.
+
 The ASR handoff retains frame timestamps and observation-to-history references,
 so an old frame precedes its reply boundary and the new transcript accompanies
 only the current observation. Both paths apply the image limit before selecting
@@ -1776,3 +1961,85 @@ cancels its tasks and releases its recordings.
   during playback; `--inline` drives the same scenario through
   `InlineDuplexClient`), `tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py`
   (admission, resume, takeover, expiry).
+
+## Realtime-Venus delegation speech condition
+
+Realtime-Venus selects the native duplex engine by default through
+`realtime_venus_omni.yaml`;
+`realtime_venus_omni_turn.yaml` selects the ordinary turn engine. Both
+profiles inherit the corresponding MiniCPM-o duplex or turn deployment,
+including its Flow precision, step count and stage settings.
+
+Realtime-Venus reuses the MiniCPM-o stage implementation. Its optional
+`delegate_open_token_id` and `delegate_close_token_id` belong to the model
+plugin's special-token metadata. At the native Thinker-to-Talker handoff,
+the bridge removes delegation delimiters and their enclosed token/hidden-state
+rows from speech conditioning while preserving the complete text output.
+Delegation parsing uses the full current unit, including a delimiter sampled
+in the opening decision slot. That decision updates the mute state even when
+it has no speech-condition row; the remaining speech rows retain MiniCPM's
+original alignment. Delimiter-only units still carry their text and mask
+transition, so a closing decision in a later unit can resume speech.
+The mask is request-local, continues across units, and resets at a new turn
+or the turn-end token. Delegation can also mask the turn-end speech row;
+dialogue termination is derived from the original Thinker unit.
+Models without these optional IDs retain their existing handoff.
+
+The Venus session plugin additionally projects one completed delegate span per
+model turn as the shared Realtime `delegate(question)` function. Parsing is
+request/turn-local and accepts spans split across text deltas. A repetition of
+the same completed span within that model turn cannot execute a second call.
+The application
+executes the call; the shared session ledger owns result admission, deadlines,
+repeat suppression and interruption policy. MiniCPM-o continues to advertise
+`tool_mode: none`.
+
+Accepted Venus results are tokenized as `<backend>result</backend>` into a
+bounded private runtime queue. The delimiters are encoded separately; reserved
+token spellings inside the result body are encoded as ordinary text, preserving
+their readable content without adding model control tokens.
+Results wait for a projected turn-end or genuine model-listen boundary;
+synthetic segment-complete listen events only schedule another unit and leave
+the result queued. Closing a delegate span alone does not end the foreground turn.
+An identical completed span repeated in a later unit also permits injection,
+so a model waiting for its backend cannot strand the accepted result in a loop.
+The next append reserves their exact token count and feeds them after that
+unit's media in the existing Thinker KV. They also
+belong to the unit's sliding-window history and reopen the speech gate after a
+completed turn. Ownership transfers to the stage only on successful submission;
+the commit removes only the submitted generations, retaining newer arrivals.
+Cancellation clears unsubmitted results; submitted requests retain the ordinary
+epoch fence. This is native duplex continuation, not HTTP `tool_calls` or the
+external Venus Harness/memory runtime.
+
+A fully muted unit following speech sets model-owned `meta.speech_flush`.
+The Talker appends only its audio-begin embedding to the existing condition,
+with a 26-token maximum and no minimum. The codec bridge drains pending frames
+and closes the vocoder stream, but does not set the dialogue `turn_end` or mark
+that dialogue turn as already terminal. These flags travel with the condition's
+sequence identity so delayed outputs cannot flush a later condition. The flag
+is explicitly false on subsequent units; it cannot stick through metadata merge.
+
+Repeated muted units and a bare turn terminator after the flush produce no new
+codec tokens. Speech resuming in the same dialogue turn replaces the Talker
+prompt/KV and starts a fresh vocoder stream. The first speech after initial
+delegation-only units also starts with fresh Talker prompt/KV and a zero minimum
+codec-token budget, even though there was no earlier speech to flush. Subsequent
+speech units continue normally. A new turn or request resets all delegation
+state. This keeps speech lifecycle independent of dialogue lifecycle.
+
+`meta.text_without_audio` opts Venus units into text delivery independent of
+speech generation. It travels through Talker and Code2Wav for every unit,
+including mixed delegation/speech units that sample codec EOS before producing
+any audio frames. The codec bridge consumes their pending text at the unit
+boundary; the data plane emits it once using the same cache-epoch/chunk-sequence
+deduplication as audio. It does not wait for later speech or replay the text with
+the next audible unit. Stock MiniCPM keeps its existing audio-gated delivery.
+Zero-frame flushes on a live native request carry a scheduling placeholder so
+the generation receiver retains their text and boundary metadata, including
+speech-only flushes with `last_chunk=True`. `code_flat_numel=0` keeps the
+placeholder out of vocoder input; it does not close the resumable request.
+
+This filtering does not execute delegated work or supply the external Venus
+memory runtime. The [Realtime-Venus recipe](gh-file:recipes/inclusionAI/Realtime-Venus.md)
+defines the currently exposed serving scope and validation limitations.

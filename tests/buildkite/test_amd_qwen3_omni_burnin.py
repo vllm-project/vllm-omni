@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
+import shlex
 import stat
 from pathlib import Path
 
@@ -17,6 +18,7 @@ SOURCE_DEPENDENCIES = Path(".buildkite/common/ci_source_file_dependencies.yml")
 COLLECTION_GUARD = Path(".buildkite/amd/scripts/assert-pytest-collection.sh")
 RUNNER = Path(".buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh")
 CORRECTNESS_TEST = Path("tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py")
+ACCURACY_TEST = Path("tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py")
 PERF_CONFIGS = {
     "Qwen3-Omni No-Async-Chunk Perf": Path("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json"),
     "Qwen3-Omni Async-Chunk Perf": Path("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json"),
@@ -24,6 +26,19 @@ PERF_CONFIGS = {
 RUNNER_COMMAND = "bash .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh"
 
 JOB_SPECS = {
+    "Qwen3-Omni Function Expansion": {
+        "pool": "mi300_2",
+        "timeout": 180,
+        "source_group": "omni_qwen3_omni_function",
+        "artifact": "artifacts/rocm-qwen3-omni-function-expansion/**/*",
+        "gpus": "2",
+        "tests": "28",
+        "results": "0",
+        "marks": "full_model and rocm and MI325 and cards_2",
+        "target": "tests/e2e/online_serving/test_qwen3_omni_expansion.py",
+        "inner_timeout": "165m",
+        "config": None,
+    },
     "Qwen3-Omni Multi-Replica Correctness": {
         "pool": "mi300_4",
         "timeout": 180,
@@ -87,7 +102,7 @@ def _sweep_count(params: dict) -> int:
     return len(request_rate) + len(concurrency)
 
 
-def test_qwen3_omni_correctness_blocks_while_perf_stays_nonblocking() -> None:
+def test_qwen3_omni_nightly_job_contracts() -> None:
     nightly = _pipeline_steps(NIGHTLY_PIPELINE)
     for label, expected in JOB_SPECS.items():
         step = nightly[label]
@@ -97,7 +112,7 @@ def test_qwen3_omni_correctness_blocks_while_perf_stays_nonblocking() -> None:
         assert step["agent_pool"] == expected["pool"]
         assert step["depends_on"] == "amd-build"
         assert step["mirror_hardwares"] == ["amdproduction"]
-        assert step["grade"] == ("Blocking" if expected["config"] is None else "NonBlocking")
+        assert step["grade"] == ("Blocking" if label == "Qwen3-Omni Multi-Replica Correctness" else "NonBlocking")
         assert step["timeout_in_minutes"] == expected["timeout"]
         assert step["source_file_dependencies"] == expected["source_group"]
         assert step["artifact_paths"] == [artifact]
@@ -117,6 +132,22 @@ def test_qwen3_omni_correctness_blocks_while_perf_stays_nonblocking() -> None:
     for path in (READY_PIPELINE, MERGE_PIPELINE):
         labels = _pipeline_steps(path)
         assert JOB_SPECS.keys().isdisjoint(labels)
+
+
+def test_qwen3_omni_perf_bounds_rocm_runtime_resources() -> None:
+    nightly = _pipeline_steps(NIGHTLY_PIPELINE)
+    expected = {
+        "MIOPEN_FIND_MODE": "FAST",
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+    }
+
+    for label in ("Qwen3-Omni No-Async-Chunk Perf", "Qwen3-Omni Async-Chunk Perf"):
+        env = nightly[label]["env"]
+        assert {name: env[name] for name in expected} == expected
+
+    correctness_env = nightly["Qwen3-Omni Multi-Replica Correctness"]["env"]
+    assert expected.keys().isdisjoint(correctness_env)
 
 
 def test_runner_requires_complete_artifacts_and_clean_teardown() -> None:
@@ -141,6 +172,22 @@ def test_runner_requires_complete_artifacts_and_clean_teardown() -> None:
     assert "--assert-baseline" not in source
 
 
+def test_aiter_smoke_requires_three_distinct_server_configurations() -> None:
+    step = _pipeline_steps(NIGHTLY_PIPELINE)["Qwen3-Omni AITER-on Smoke"]
+    assert step["grade"] == "Blocking"
+    assert step["agent_pool"] == "mi300_2"
+    assert step["env"]["QWEN3_OMNI_EXPECT_AITER_MM_ENCODER"] == "1"
+    enable, run = step["commands"]
+    assert enable == "export VLLM_ROCM_USE_AITER=1"
+    command, runner, cards, count, timeout, artifact, *nodes, flag, marks = shlex.split(run)
+    assert (command, runner) == ("bash", ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh")
+    assert (cards, count, timeout) == ("2", "3", "75m")
+    assert step["artifact_paths"] == [f"artifacts/{artifact}/**/*"]
+    target = "tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001"
+    assert nodes == [f"{target}[{param}]" for param in ("default", "async_chunk", "batch_token_2048")]
+    assert (flag, marks) == ("-m", "full_model and rocm and MI325 and cards_2")
+
+
 def test_runner_is_a_dependency_of_function_and_perf_jobs() -> None:
     dependencies = yaml.safe_load(SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
     runner = str(RUNNER)
@@ -159,6 +206,13 @@ def test_qwen3_omni_correctness_enables_only_the_new_rocm_resource() -> None:
     assert source.count("current_omni_platform.is_rocm()") == 2
     assert "stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S" in source
     assert "init_timeout=QWEN3_OMNI_COLD_INIT_TIMEOUT_S" in source
+
+
+def test_qwen3_omni_accuracy_uses_the_rocm_cold_start_timeout() -> None:
+    source = ACCURACY_TEST.read_text(encoding="utf-8")
+    assert "QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S" in source
+    assert "stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S" in source
+    assert "if current_omni_platform.is_rocm() else None" in source
 
 
 def test_qwen3_omni_perf_counts_and_existing_baselines_are_preserved() -> None:
@@ -186,7 +240,7 @@ def test_qwen3_omni_perf_counts_and_existing_baselines_are_preserved() -> None:
         assert all("MI325" not in keys for keys in baseline_keys)
 
 
-def test_qwen3_omni_async_perf_uses_default_v2_profile_and_cold_start_timeout() -> None:
+def test_qwen3_omni_perf_uses_default_v2_profile_and_cold_start_timeout() -> None:
     async_config = json.loads(PERF_CONFIGS["Qwen3-Omni Async-Chunk Perf"].read_text(encoding="utf-8"))[0]
     async_server = async_config["server_params"]
     assert "stage_config_name" not in async_server
@@ -200,4 +254,4 @@ def test_qwen3_omni_async_perf_uses_default_v2_profile_and_cold_start_timeout() 
     no_async_config = json.loads(PERF_CONFIGS["Qwen3-Omni No-Async-Chunk Perf"].read_text(encoding="utf-8"))[0]
     no_async_server = no_async_config["server_params"]
     assert "stage_config_name" not in no_async_server
-    assert "--stage-init-timeout" not in no_async_server["extra_cli_args"]
+    assert no_async_server["extra_cli_args"] == ["--no-async-chunk", "--stage-init-timeout", "900"]
