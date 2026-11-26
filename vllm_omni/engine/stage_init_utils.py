@@ -28,7 +28,6 @@ from typing import Any, Literal, cast
 
 import regex as re
 from vllm.config import VllmConfig
-from vllm.config.utils import replace
 from vllm.logger import init_logger
 from vllm.multimodal.cache import LruKeyReplicatedSenderCache, ShmObjectStoreSenderCache
 from vllm.pooling_params import PoolingParams
