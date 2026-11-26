@@ -15,6 +15,10 @@ from vllm.v1.engine import (
     EngineCoreRequest,
 )
 
+# Stable stop-reason prefix shared by the scheduler and duplex client errors.
+CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
+
+
 # Where a receiver gets a request's stage payload: the sender's connector address, or the
 # serialized payload itself for a run request.
 PayloadSenderInfo: TypeAlias = dict[str, Any] | bytes

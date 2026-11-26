@@ -14,7 +14,7 @@ from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConf
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, DuplexFence, ToolCallAbandonReason
 from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext, DuplexRuntimeConfigError, EncodeAudio
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import MiniCPMO45DataPlaneSession
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import TOKENIZER_KEY, MiniCPMO45DuplexPlugin
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import APPEND_TEXT_TOKEN_IDS_KEY
 from vllm_omni.model_executor.models.realtime_venus.delegation import DelegateParser
 
@@ -23,7 +23,6 @@ if TYPE_CHECKING:
 
 _RESULTS = "venus_function_results"
 _GENERATION = "venus_function_generation"
-_TOKENIZER = "venus_tokenizer_ref"
 _SUBMITTED = "_venus_submitted_result_generation"
 _MAX_RESULT_CHARS = 4000
 _MAX_QUEUED_TOKENS = 4096
@@ -104,7 +103,6 @@ class RealtimeVenusDuplexPlugin(MiniCPMO45DuplexPlugin):
     private_runtime_config_keys = MiniCPMO45DuplexPlugin.private_runtime_config_keys | {
         _RESULTS,
         _GENERATION,
-        _TOKENIZER,
     }
     abandoned_tool_call_reasons = frozenset(
         {
@@ -131,9 +129,7 @@ class RealtimeVenusDuplexPlugin(MiniCPMO45DuplexPlugin):
         self, config: DuplexSessionConfig, *, model_config: ModelConfig | None
     ) -> dict[str, object]:
         self.validate_client_extra_body(config.extra_body)
-        runtime = await super().prepare_runtime_config(config, model_config=model_config)
-        runtime[_TOKENIZER] = getattr(model_config, "model", "")
-        return runtime
+        return await super().prepare_runtime_config(config, model_config=model_config)
 
     def validate_client_extra_body(self, extra_body: object) -> None:
         super().validate_client_extra_body(extra_body)
@@ -171,7 +167,7 @@ class RealtimeVenusDuplexPlugin(MiniCPMO45DuplexPlugin):
             raise DuplexRuntimeConfigError(
                 "delegate output exceeds 4000 characters", code="invalid_function_call_output"
             )
-        tokenizer = self._tokenizers.get(str(current.get(_TOKENIZER, "")))
+        tokenizer = self._tokenizers.get(str(current.get(TOKENIZER_KEY, "")))
         if tokenizer is None:
             raise DuplexRuntimeConfigError("Venus tokenizer is unavailable", code="invalid_function_call_output")
         # Quoted protocol tags in tool data must remain ordinary text. Encode
