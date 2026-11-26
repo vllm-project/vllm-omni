@@ -128,5 +128,15 @@ def test_data_plane_does_not_project_speech_closed_by_listen_as_model_listen() -
     assert _projected_model_listens([TEXT, TEXT, TURN_EOS, LISTEN]) == []
 
 
-def test_data_plane_projects_a_plain_listen_unit_as_model_listen() -> None:
-    assert len(_projected_model_listens([LISTEN])) == 1
+@pytest.mark.parametrize(
+    ("text_input", "explicit_reply", "continues"),
+    [(False, False, False), (True, False, True), (False, True, False), (True, True, False)],
+)
+def test_data_plane_projects_listen_with_the_append_boundary(text_input, explicit_reply, continues) -> None:
+    session = MiniCPMO45DataPlaneSession(lambda *args, **kwargs: "")
+    output = _stage0_output([LISTEN], text_input=text_input)
+    output.multimodal_output["duplex_explicit_reply"] = explicit_reply
+    (result,) = session.project_output(output)
+    assert result["model_listen"] is True
+    assert result["end_of_turn"] is explicit_reply
+    assert bool(result.get("continue_with_partial_input")) is continues
