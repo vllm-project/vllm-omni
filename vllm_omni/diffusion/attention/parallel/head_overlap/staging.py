@@ -21,7 +21,12 @@ def _stage(
     tile = tl.program_id(0)
     for i in tl.static_range(len(widths)):
         if (tile >= ends[i]) & (tile < ends[i + 1]):
-            offset = (tile - ends[i]) * block + tl.arange(0, block)
+            local_tile = tile - ends[i]
+            # A fused V row can have three times the packed pitch. Large video
+            # layouts can cross 2^31 elements even when one destination cannot.
+            if rows[i] * widths[i] + block >= 2**31 or rows[i] * pitches[i] + column + widths[i] >= 2**31:
+                local_tile = local_tile.to(tl.int64)
+            offset = local_tile * block + tl.arange(0, block)
             row, col = offset // widths[i], offset % widths[i]
             src = sources[i].to(tl.pointer_type(tl.uint16))
             dst = destinations[i].to(tl.pointer_type(tl.uint16))
