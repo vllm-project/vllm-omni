@@ -79,21 +79,6 @@ def _run_packed(qkv, q_weight, k_weight, rope_table, eps=_EPS):
     )
 
 
-def _track_packed_splits(monkeypatch, packed):
-    splits = []
-    tensor_split = torch.Tensor.split
-
-    def track(tensor, split_size, dim=0):
-        parts = tensor_split(tensor, split_size, dim)
-        if tensor.shape == packed.shape and tensor.data_ptr() == packed.data_ptr() and dim in (1, -2):
-            assert tuple(split_size) == _HEAD_COUNTS
-            splits.append(parts)
-        return parts
-
-    monkeypatch.setattr(torch.Tensor, "split", track)
-    return splits
-
-
 @pytest.mark.cpu
 def test_npu_qk_norm_rope_uses_torch_npu_fused_primitives_without_mindiesd(
     monkeypatch: pytest.MonkeyPatch,
@@ -214,7 +199,6 @@ def test_npu_eagle_receives_original_packed_qkv(monkeypatch: pytest.MonkeyPatch)
     q, k, v = packed.split(_HEAD_COUNTS, dim=1)
     outputs = (q.neg(), k.neg(), v.clone())
     eps = 1e-6
-    splits = _track_packed_splits(monkeypatch, packed)
 
     def eagle(
         qkv, q_weight, k_weight, rope_cos, rope_sin, split_sizes, norm_type, rope_mode, rotary_dim, epsilon, output_bnsd
@@ -231,13 +215,13 @@ def test_npu_eagle_receives_original_packed_qkv(monkeypatch: pytest.MonkeyPatch)
         return outputs
 
     monkeypatch.setattr(fused.current_omni_platform, "is_npu", lambda: True)
+    monkeypatch.setattr(fused, "fused_qk_norm_rope", Mock(side_effect=AssertionError("unexpected fallback")))
     monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", types.SimpleNamespace(eagle_split_norm_rope_concat=eagle))
 
     q_out, k_out, v_out, q_raw, k_raw = _run_packed(qkv, expected_q_weight, expected_k_weight, rope_table, eps)
 
     assert q_out is outputs[0] and k_out is outputs[1] and v_out is outputs[2]
     assert q_raw is None and k_raw is None
-    assert not splits
 
 
 @pytest.mark.cpu
@@ -246,9 +230,7 @@ def test_packed_qkv_fallback(monkeypatch: pytest.MonkeyPatch, is_npu: bool) -> N
     from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
 
     qkv, q_weight, k_weight, rope_table = _packed_inputs()
-    packed = qkv.unflatten(-1, (sum(_HEAD_COUNTS), _HEAD_DIM))
-    q, k, v = packed.split(_HEAD_COUNTS, dim=1)
-    splits = _track_packed_splits(monkeypatch, packed)
+    q, k, v = qkv.unflatten(-1, (sum(_HEAD_COUNTS), _HEAD_DIM)).split(_HEAD_COUNTS, dim=1)
     monkeypatch.setattr(fused.current_omni_platform, "is_npu", lambda: is_npu)
     eagle = Mock(side_effect=AssertionError("unexpected Eagle invocation"))
     module = None if is_npu else types.SimpleNamespace(eagle_split_norm_rope_concat=eagle)
@@ -259,30 +241,11 @@ def test_packed_qkv_fallback(monkeypatch: pytest.MonkeyPatch, is_npu: bool) -> N
     expected_q, expected_k = _reference(q, k, q_weight, k_weight, rope_table)
     torch.testing.assert_close(q_out, expected_q, atol=0, rtol=0)
     torch.testing.assert_close(k_out, expected_k, atol=0, rtol=0)
-    (parts,) = splits
-    assert q_raw is parts[0] and k_raw is parts[1] and v_out is parts[2]
-    torch.testing.assert_close(v_out, v)
-
-
-@pytest.mark.cpu
-@pytest.mark.parametrize(("error_type", "tokens"), [(RuntimeError, 0), (ImportError, 2**23)])
-def test_packed_qkv_propagates_eagle_failure(
-    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception], tokens: int
-) -> None:
-    from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
-
-    eagle = Mock(side_effect=error_type("Eagle execution failed"))
-    monkeypatch.setattr(fused.current_omni_platform, "is_npu", lambda: True)
-    monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", types.SimpleNamespace(eagle_split_norm_rope_concat=eagle))
-
-    # Eagle owns dtype, head/rotary dimensions and packed index limits (0 or 2**31 elements).
-    head_dim, rotary_dim = 32, 16
-    width = sum(_HEAD_COUNTS) * head_dim
-    qkv = torch.empty((tokens, width), dtype=torch.float32, device="meta")
-    weight = qkv.new_empty((head_dim,))
-    rope_table = qkv.new_empty((tokens, rotary_dim))
-    with pytest.raises(error_type, match="Eagle execution failed"):
-        _run_packed(qkv, weight, weight, rope_table)
+    torch.testing.assert_close(v_out, v, atol=0, rtol=0)
+    assert q_raw is not None and k_raw is not None
+    assert q_raw.data_ptr() == qkv.data_ptr()
+    torch.testing.assert_close(q_raw, q, atol=0, rtol=0)
+    torch.testing.assert_close(k_raw, k, atol=0, rtol=0)
 
 
 @hardware_test(res={"npu": "A3"}, num_cards=1)

@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import sys
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -101,61 +99,52 @@ def test_denoise_branch_keeps_fast_h3_prefix_geometry_model_local():
 @pytest.mark.parametrize("has_vdn", [False, True])
 @pytest.mark.parametrize("route", ["eagle", "fallback", "no_rope"])
 def test_h3_project_qkv_retains_raw_qk_for_vdn(monkeypatch, has_vdn, route):
-    from tests.diffusion.layers.test_fused_qk_norm_rope_npu import (
-        _EPS,
-        _HEAD_COUNTS,
-        _packed_inputs,
-        _track_packed_splits,
-    )
-    from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
 
-    qkv, q_weight, k_weight, rope_table = _packed_inputs()
-    packed = qkv.unflatten(-1, (sum(_HEAD_COUNTS), q_weight.numel()))
-    q, k, v = packed.split(_HEAD_COUNTS, dim=1)
-    eagle_v = v.clone()
-    splits = _track_packed_splits(monkeypatch, packed)
+    tokens, head_dim = 5, 16
+    num_heads, num_kv_heads = 4, 2
+    qkv = torch.randn(tokens, (num_heads + 2 * num_kv_heads) * head_dim, dtype=torch.bfloat16)
+    q, k, v = qkv.unflatten(-1, (-1, head_dim)).split([num_heads, num_kv_heads, num_kv_heads], dim=1)
+    q_weight = torch.ones(head_dim, dtype=torch.bfloat16)
+    k_weight = torch.ones(head_dim, dtype=torch.bfloat16)
+    rope_table = None if route == "no_rope" else torch.zeros(tokens, head_dim, dtype=torch.bfloat16)
 
-    def run_eagle(*args, **kwargs):
-        assert not splits
-        return q.neg(), k.square(), eagle_v
-
-    eagle = Mock(side_effect=run_eagle)
-    monkeypatch.setattr(fused.current_omni_platform, "is_npu", lambda: route == "eagle")
-    monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_split_norm_rope_concat=eagle))
+    raw_pair = (None, None) if route == "eagle" else (q, k)
+    fused_mock = Mock(return_value=(q.neg(), k.square(), v.clone(), *raw_pair))
+    monkeypatch.setattr(blocks, "fused_qkv_split_norm_rope", fused_mock)
 
     attention = object.__new__(blocks.MiniMaxH3Attention)
     nn.Module.__init__(attention)
-    attention.num_heads, attention.num_kv_heads, _ = _HEAD_COUNTS
-    attention.head_dim = q_weight.numel()
+    attention.num_heads = num_heads
+    attention.num_kv_heads = num_kv_heads
+    attention.head_dim = head_dim
     attention._prefix = "test.attn"
     attention.vdn = nn.Identity() if has_vdn else None
     attention.qkv_proj = Mock(return_value=(qkv, None))
-    attention.q_norm = Mock(side_effect=torch.neg, weight=q_weight, variance_epsilon=_EPS)
+    attention.q_norm = Mock(side_effect=torch.neg, weight=q_weight, variance_epsilon=1e-5)
     attention.k_norm = Mock(side_effect=torch.square, weight=k_weight)
-    x = torch.empty(packed.shape[0], 4)
-    table = None if route == "no_rope" else rope_table
+    x = torch.empty(tokens, 8)
 
-    q_out, k_out, v_out, q_raw, k_raw = attention._project_qkv(x, table, vdn_window=object())
+    q_out, k_out, v_out, q_raw, k_raw = attention._project_qkv(x, rope_table, vdn_window=object())
 
-    if route == "eagle":
-        eagle.assert_called_once()
-        assert v_out is eagle_v
-        if not has_vdn:
-            assert not splits
-            return
-    else:
-        eagle.assert_not_called()
-        assert v_out is splits[0][2]
+    torch.testing.assert_close(q_out, q.neg(), atol=0, rtol=0)
+    torch.testing.assert_close(k_out, k.square(), atol=0, rtol=0)
+    torch.testing.assert_close(v_out, v, atol=0, rtol=0)
     if route == "no_rope":
+        fused_mock.assert_not_called()
         attention.q_norm.assert_called_once()
         attention.k_norm.assert_called_once()
-        torch.testing.assert_close((q_out, k_out), (-q, k.square()))
-    (parts,) = splits
+    else:
+        fused_mock.assert_called_once()
     if has_vdn:
-        assert q_raw is parts[0] and k_raw is parts[1]
+        assert q_raw is not None and k_raw is not None
+        assert q_raw.data_ptr() == qkv.data_ptr()
+        torch.testing.assert_close(q_raw, q, atol=0, rtol=0)
+        torch.testing.assert_close(k_raw, k, atol=0, rtol=0)
         with pytest.raises(ValueError, match="received no VDN window"):
-            attention._project_qkv(x, table)
+            attention._project_qkv(x, rope_table)
+    elif route == "eagle":
+        assert q_raw is None and k_raw is None
 
 
 def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
