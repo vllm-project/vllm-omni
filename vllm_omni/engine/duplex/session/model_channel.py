@@ -232,7 +232,7 @@ class ModelChannel:
             "session_id": session.session_id,
             "response_id": response_id,
             "epoch": epoch,
-            "modalities": list(response_config.modalities),
+            "modalities": list(response_config.resolved_modalities),
         }
         if request_id is not None:
             payload["request_id"] = request_id
@@ -437,6 +437,11 @@ class ModelChannel:
             else:
                 snapshot = session.history_snapshot()
                 history, item_ids = session.history, snapshot.item_ids
+            user_item_ids = tuple(
+                item_id
+                for item_id, message in zip(item_ids, history)
+                if item_id is not None and message.get("role") == "user"
+            )
             prompt_session = {
                 **request_context.session_config,
                 # Keep the prompt accessor's nested content identity: Qwen
@@ -446,7 +451,12 @@ class ModelChannel:
                 # as read-only; only the session writes authoritative history.
                 "conversation": list(history),
                 "conversation_item_ids": item_ids,
-                "modalities": list(session.response_config.modalities),
+                # Public IDs can be reused; source IDs survive transcript
+                # updates but change when an item is deleted and recreated.
+                "conversation_user_source_ids": dict(
+                    zip(user_item_ids, session.user_source_ids_for_items(user_item_ids))
+                ),
+                "modalities": list(session.response_config.resolved_modalities),
             }
             prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
             prompt_session["stage_sampling_params"] = request_context.sampling_params
@@ -669,7 +679,7 @@ class ModelChannel:
             auto_responds=self._out.auto_responds(),
             response_format=response_config.response_format,
             speed=response_config.speed,
-            modalities=tuple(response_config.modalities),
+            modalities=tuple(response_config.resolved_modalities),
         )
 
     # ------------------------------------------------------------------ #
@@ -959,7 +969,9 @@ class ModelChannel:
         )
         if self._ctx.run.closing or response_id is None:
             return
+        self._stash_text_only_stage_metrics(model_result)
         session.end_response(commit_text=False)
+        session.release_zero_audio_response(response_id)
         settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id, release_owner=True)
         self._out.emit(
             {
@@ -1116,6 +1128,8 @@ class ModelChannel:
         ):
             return close_reason, emitted_response
         active_response_id = session.active_response_id
+        if active_response_id is not None:
+            self._stash_text_only_stage_metrics(model_result)
         auto_continuations_remaining = active_response_id is None or self.response_continuations_remaining(
             active_response_id
         )
@@ -1129,6 +1143,27 @@ class ModelChannel:
         if non_terminal_auto_listen:
             self._ctx.services.spawn(
                 self.maybe_continue_response(expected_epoch=expected_epoch), name="duplex-continue"
+            )
+            return close_reason, emitted_response
+        # A resident request never finishes: clearing it here would leave an
+        # explicit text response open forever, so continue it instead.
+        if (
+            not auto_response
+            and not session.capabilities.emits_audio
+            and session.capabilities.supports_core_resumable_request
+            and active_response_id is not None
+            and isinstance(data_plane_request_id, str)
+            and data_plane_request_id == session.active_request_id
+            and model_result.get("end_of_turn") is not True
+        ):
+            self._ctx.services.spawn(
+                self.maybe_continue_response(
+                    expected_epoch=expected_epoch,
+                    expected_response_id=active_response_id,
+                    finished_segment=True,
+                    finished_request_id=data_plane_request_id,
+                ),
+                name="duplex-continue",
             )
             return close_reason, emitted_response
         if not auto_response and data_plane_request_id == session.active_request_id:
@@ -1187,18 +1222,27 @@ class ModelChannel:
                         completed_turn_id = session.active_response_turn_id
                     if completed_turn_id is not None:
                         session.complete_model_turn(completed_turn_id)
-            session.end_response(commit_text=False, preserve_request=auto_response)
-            settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id)
-            self._out.emit(
-                {
-                    "type": "response.done",
-                    "session_id": session.session_id,
-                    "response_id": response_id,
-                    "epoch": session.epoch,
-                    "committed": False,
-                    "playback": session.playback.as_dict(),
-                }
+            continuation_limited = auto_response and ended_turn_id is None and not auto_continuations_remaining
+            should_commit = not continuation_limited and self.should_commit_response_to_history(session, response_id)
+            committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
+            committed = self._settle_finished_response(
+                session,
+                response_id,
+                should_commit=should_commit,
+                committed_message=committed_message,
             )
+            done: dict[str, object] = {
+                "type": "response.done",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "committed": committed,
+                "playback": session.playback.as_dict(),
+            }
+            if continuation_limited:
+                done["status"] = "incomplete"
+                done["status_details"] = {"type": "incomplete", "reason": "continuation_limit"}
+            self._out.emit(done)
         await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
         return close_reason, emitted_response
 
@@ -1424,10 +1468,11 @@ class ModelChannel:
             tts_segment_ended = (
                 model_result.get("stage_role") == "tts" and model_result.get("abort_data_plane_request") is True
             )
-            if (
-                tts_segment_ended
-                and auto_response
-                and (model_turn_id is not None or session.active_response_id is not None)
+            text_unit_ended = model_result.get("segment_complete") is True
+            auto_continues = auto_response and (model_turn_id is not None or session.active_response_id is not None)
+            # Without a TTS stage, unit ends are the only thing that continues an explicit response.
+            if (tts_segment_ended and auto_continues) or (
+                text_unit_ended and (auto_continues or session.active_response_id is not None)
             ):
                 if (
                     not draining
@@ -1458,6 +1503,10 @@ class ModelChannel:
                     ),
                     name="duplex-continue",
                 )
+            # A unit forwarded to _on_model_listen above is attributed there, once.
+            # Like a listen, an empty unit with no open response is not held for the next one.
+            if session.active_response_id is not None:
+                self._stash_text_only_stage_metrics(model_result)
             return close_reason, emitted_response
         request_key = data_plane_request_id if isinstance(data_plane_request_id, str) else None
         draining_response_id = (
@@ -1527,8 +1576,10 @@ class ModelChannel:
             if self._ctx.run.closing:
                 return close_reason, emitted_response
         stage_metrics = model_result.get("stage_metrics")
-        response_stage_metrics = session.accumulate_response_stage_metrics(
-            stage_metrics if isinstance(stage_metrics, Mapping) else None
+        session.add_response_stage_metrics(stage_metrics if isinstance(stage_metrics, Mapping) else None)
+        # Only response.speak and audio deltas carry the running totals; copy them just for those.
+        response_stage_metrics = (
+            session.response_stage_metrics_snapshot() if response_created or session.capabilities.emits_audio else None
         )
         if response_created:
             speak_payload = {
@@ -1551,16 +1602,17 @@ class ModelChannel:
                 return close_reason, emitted_response
         target_id = draining_response_id if draining_response_id not in (None, session.active_response_id) else None
         previous_sent_ms = session.playback_for_response(target_id).sent_ms
-        text_chars_before_append = len(session.assistant_transcript(target_id))
+        # Transcript lengths only align text with audio; a text-only reply has none.
+        emits_audio = session.capabilities.emits_audio
+        text_chars_before_append = len(session.assistant_transcript(target_id)) if emits_audio else 0
         if isinstance(text, str) and text:
             if target_id is not None:
                 session.append_draining_assistant_text(target_id, text)
             else:
                 session.append_assistant_text(text)
         duration_ms = model_result.get("audio_duration_ms")
-        text_chars = len(session.assistant_transcript(target_id))
         mark_duration_ms = None
-        mark_text_chars: int | None = text_chars
+        mark_text_chars: int | None = len(session.assistant_transcript(target_id)) if emits_audio else None
         if model_result.get("audio_text_mark") is False:
             mark_text_chars = None
         if isinstance(duration_ms, int | float):
@@ -1593,40 +1645,59 @@ class ModelChannel:
         )
         if self._ctx.history_calibration is not None and response_id is not None:
             self._ctx.history_calibration.record(target_id or response_id, model_result)
-        payload = {
-            "type": "response.output_audio.delta",
-            "session_id": session.session_id,
-            "response_id": response_id,
-            "epoch": session.epoch,
-            "text": text if isinstance(text, str) else "",
-            "audio": audio if isinstance(audio, str) else "",
-            "format": (
-                model_result.get("audio_format")
-                if isinstance(model_result.get("audio_format"), str)
-                else session.response_config.response_format
-            ),
-            "end_of_turn": end_of_turn,
-            "model_speak": True,
-        }
-        if mark_duration_ms is not None:
-            payload["audio_duration_ms"] = mark_duration_ms
-        if audio_text_marks:
-            payload["audio_text_marks"] = audio_text_marks
-        elif mark_duration_ms is not None and mark_text_chars is not None:
-            payload["audio_text_marks"] = [
-                {"text_chars": max(0, int(mark_text_chars)), "audio_end_ms": max(0, int(mark_duration_ms))}
-            ]
-        payload["playback"] = session.playback_for_response(target_id).as_dict()
-        sample_rate_hz = model_result.get("sample_rate_hz") or model_result.get("audio_sample_rate_hz")
-        if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
-            payload["sample_rate_hz"] = int(sample_rate_hz)
-        self._attach_runtime_metadata(
-            payload,
-            model_result,
-            stage_metrics=response_stage_metrics,
-            response_request_metrics=response_request_metrics,
-        )
-        self._out.emit(payload)
+        if not emits_audio:
+            if has_text:
+                text_delta: dict[str, object] = {
+                    "type": "response.text.delta",
+                    "session_id": session.session_id,
+                    "response_id": response_id,
+                    "epoch": session.epoch,
+                    "delta": text,
+                }
+                # The response may already be open, so created/speak carried no TTFT.
+                # Stage metrics grow with the reply; response.done carries the final values.
+                self._attach_runtime_metadata(
+                    text_delta,
+                    model_result,
+                    response_request_metrics=response_request_metrics,
+                    include_stage_metrics=False,
+                )
+                self._out.emit(text_delta)
+        else:
+            payload = {
+                "type": "response.output_audio.delta",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "text": text if isinstance(text, str) else "",
+                "audio": audio if isinstance(audio, str) else "",
+                "format": (
+                    model_result.get("audio_format")
+                    if isinstance(model_result.get("audio_format"), str)
+                    else session.response_config.response_format
+                ),
+                "end_of_turn": end_of_turn,
+                "model_speak": True,
+            }
+            if mark_duration_ms is not None:
+                payload["audio_duration_ms"] = mark_duration_ms
+            if audio_text_marks:
+                payload["audio_text_marks"] = audio_text_marks
+            elif mark_duration_ms is not None and mark_text_chars is not None:
+                payload["audio_text_marks"] = [
+                    {"text_chars": max(0, int(mark_text_chars)), "audio_end_ms": max(0, int(mark_duration_ms))}
+                ]
+            payload["playback"] = session.playback_for_response(target_id).as_dict()
+            sample_rate_hz = model_result.get("sample_rate_hz") or model_result.get("audio_sample_rate_hz")
+            if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
+                payload["sample_rate_hz"] = int(sample_rate_hz)
+            self._attach_runtime_metadata(
+                payload,
+                model_result,
+                stage_metrics=response_stage_metrics,
+                response_request_metrics=response_request_metrics,
+            )
+            self._out.emit(payload)
         if session.perf is not None and mark_duration_ms is not None and isinstance(response_id, str):
             session.perf.record_audio(response_id=response_id, duration_ms=mark_duration_ms - previous_sent_ms)
         if self._ctx.run.closing:
@@ -1736,6 +1807,7 @@ class ModelChannel:
                 )
                 or committed
             )
+        session.release_zero_audio_response(response_id)
         settle_response_runtime(
             self._ctx.plugin,
             session,
@@ -1775,6 +1847,13 @@ class ModelChannel:
             }
         )
 
+    def _stash_text_only_stage_metrics(self, model_result: Mapping[str, object]) -> None:
+        if self._ctx.session.capabilities.emits_audio:
+            return
+        stage_metrics = model_result.get("stage_metrics")
+        if isinstance(stage_metrics, Mapping):
+            self._ctx.session.stash_stage_metrics(stage_metrics)
+
     @staticmethod
     def _normalize_audio_text_marks(
         audio_text_marks: list[object] | None,
@@ -1807,6 +1886,7 @@ class ModelChannel:
         *,
         stage_metrics: Mapping[str, object] | None = None,
         response_request_metrics: Mapping[str, object] | None = None,
+        include_stage_metrics: bool = True,
     ) -> None:
         metadata: dict[str, object] = {}
         runtime_impl = model_result.get("runtime_impl")
@@ -1826,7 +1906,7 @@ class ModelChannel:
         if isinstance(listen_source, str) and listen_source:
             metadata["listen_source"] = listen_source
         effective_stage_metrics = stage_metrics if stage_metrics is not None else model_result.get("stage_metrics")
-        if isinstance(effective_stage_metrics, Mapping):
+        if include_stage_metrics and isinstance(effective_stage_metrics, Mapping):
             metadata["stage_metrics"] = {
                 str(stage_id): dict(values)
                 for stage_id, values in effective_stage_metrics.items()
@@ -1856,7 +1936,7 @@ class ModelChannel:
         )
         return count < limit
 
-    async def _finish_bounded_auto_response(
+    async def _finish_response_at_continuation_limit(
         self,
         *,
         expected_epoch: int | None,
@@ -1890,7 +1970,8 @@ class ModelChannel:
             return
         if response_turn_id is not None:
             session.complete_model_turn(response_turn_id)
-        session.end_response(commit_text=False, preserve_request=True)
+        session.end_response(commit_text=False, preserve_request=self._out.auto_responds())
+        session.release_zero_audio_response(response_id)
         settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id, release_owner=True)
         self._out.emit(
             {
@@ -1900,6 +1981,8 @@ class ModelChannel:
                 "epoch": response_epoch,
                 "committed": False,
                 "playback": session.playback.as_dict(),
+                "status": "incomplete",
+                "status_details": {"type": "incomplete", "reason": "continuation_limit"},
             }
         )
 
@@ -2022,8 +2105,8 @@ class ModelChannel:
             self._AUTO_RESPONSE_MAX_CONTINUATION_UNITS if auto_response else self._RESPONSE_MAX_CONTINUATION_UNITS
         )
         if count >= continuation_limit:
-            if auto_response:
-                await self._finish_bounded_auto_response(
+            if auto_response or (finished_segment and response_owned):
+                await self._finish_response_at_continuation_limit(
                     expected_epoch=expected_epoch,
                     model_turn_id=payload_turn_id_value,
                 )

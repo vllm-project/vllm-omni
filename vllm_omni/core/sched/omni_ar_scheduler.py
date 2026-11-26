@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, replace
-from typing import Any, TypedDict
+from typing import Any, TypedDict, cast
 
 import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -30,7 +30,7 @@ from vllm_omni.core.sched.omni_scheduler_mixin import (
     OmniSchedulerMixin,
     _request_finishes_on_next_stop,
 )
-from vllm_omni.core.sched.output import OmniChunkCommit
+from vllm_omni.core.sched.output import OmniCachedRequestData, OmniChunkCommit, OmniNewRequestData
 from vllm_omni.core.sched.seeded_isolation import isolation_plan, request_is_seeded
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
@@ -40,11 +40,14 @@ from vllm_omni.core.sched.utils import (
 )
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
+from vllm_omni.engine.messages import TextInputUpdate
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import CONTINUE_TOKEN_ID
 from vllm_omni.worker_v2.ngram_adapter import is_thinker_ngram, use_scheduler_ngram
 
 logger = init_logger(__name__)
+
+_TEXT_INPUT_WAIT_TIMEOUT_SECONDS = 10.0
 
 
 class _ChunkSaveKwargs(TypedDict, total=False):
@@ -202,6 +205,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     """
 
     max_num_active_reqs: int
+    max_num_running_reqs: int
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
@@ -299,6 +303,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # until the engine consumes the owner's abort from its ordered input queue.
         self._overflowed_streaming_requests: set[str] = set()
         self._hold_payloadless_outputs = _holds_payloadless_outputs(self.vllm_config.model_config)
+        self._model_input_streams = {}
         # External finishes release Request before their terminal output is assembled.
         self._held_token_ids: dict[str, list[int]] = {}
         self._init_prefill_admission_policy()
@@ -308,6 +313,31 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
             return
         super().add_request(request)
+
+    def register_input_stream(self, request_id: str, stream: object) -> None:
+        """Register a stream that was validated before scheduler admission."""
+        self._model_input_streams[request_id] = stream
+
+    def append_text(self, update: TextInputUpdate) -> None:
+        """Append only to an active, explicitly opted-in request."""
+        stream = self._model_input_streams.get(update.request_id)
+        request = self.requests.get(update.request_id)
+        if stream is None or request is None or request.is_finished():
+            raise ValueError(f"No active input stream for request {update.request_id}")
+        stream.append(update.token_ids, final=update.final)
+
+    def _fail_input_stream_request(self, request: Request, reason: str) -> None:
+        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        if pending is None:
+            pending = self._pending_input_timeout_outputs = {}
+        request.stop_reason = reason
+        pending[request.request_id] = (
+            request.client_index,
+            OmniEngineCoreOutput(
+                request_id=request.request_id, new_token_ids=[], finish_reason=FinishReason.ERROR, stop_reason=reason
+            ),
+        )
+        self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
 
     def release_overflowed_requests(self, request_ids: Iterable[str]) -> None:
         """Release admission fences after an ordered abort, never an eager one."""
@@ -868,6 +898,90 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._enforce_kstep_span_uniformity(scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
+    def _find_text_input_waits(self) -> set[str]:
+        """Expire text waits before isolating queues, then return the blocked IDs."""
+        streams = getattr(self, "_model_input_streams", None)
+        if not streams:
+            return set()
+        blocked_ids = set()
+        now = time.monotonic()
+        for request_id, stream in list(streams.items()):
+            request = self.requests[request_id]
+            if stream.is_ready(request):
+                stream.wait_started_at = None
+            elif stream.wait_started_at is None:
+                stream.wait_started_at = now
+                blocked_ids.add(request_id)
+            elif now - stream.wait_started_at >= _TEXT_INPUT_WAIT_TIMEOUT_SECONDS:
+                self._fail_input_stream_request(
+                    request, f"Timed out waiting for text input after {_TEXT_INPUT_WAIT_TIMEOUT_SECONDS:g}s"
+                )
+            else:
+                blocked_ids.add(request_id)
+        return blocked_ids
+
+    def _prepare_text_input_waits(self, blocked_ids: set[str]):
+        """Park input-starved requests and return this tick's restoration data."""
+        if not blocked_ids:
+            return None
+        original_running = list(self.running)
+        held = {request for request in original_running if request.request_id in blocked_ids}
+        held_waiting = []
+        for waiting_queue in (self.waiting, self.kv_holding_waiting):
+            blocked = [request for request in waiting_queue if request.request_id in blocked_ids]
+            if blocked:
+                waiting_queue.remove_requests(blocked)
+                held_waiting.append((waiting_queue, blocked))
+        original_running_limit = self.max_num_running_reqs
+        original_active_limit = self.max_num_active_reqs
+        if held:
+            self.running[:] = [request for request in self.running if request not in held]
+            self.max_num_running_reqs -= len(held)
+            self.max_num_active_reqs -= len(held)
+        return original_running, held, held_waiting, original_running_limit, original_active_limit
+
+    def _restore_text_input_waits(self, waiting_state) -> None:
+        """Restore parked requests before the outer Omni queue/limit restoration."""
+        if waiting_state is None:
+            return
+        original_running, held, held_waiting, original_running_limit, original_active_limit = waiting_state
+        self.max_num_running_reqs = original_running_limit
+        self.max_num_active_reqs = original_active_limit
+        if held:
+            retained = set(self.running)
+            # Restore the order of running requests as well
+            self.running[:] = [request for request in original_running if request in held or request in retained] + [
+                request for request in self.running if request not in original_running
+            ]
+        for waiting_queue, blocked in held_waiting:
+            waiting_queue.prepend_requests(blocked)
+
+    def _attach_text_input_updates(self, scheduler_output: SchedulerOutput) -> None:
+        streams = getattr(self, "_model_input_streams", None)
+        if not streams:
+            return
+        for new_request in scheduler_output.scheduled_new_reqs:
+            new_request = cast(OmniNewRequestData, new_request)
+            stream = streams.get(new_request.req_id)
+            if stream is not None:
+                new_request.model_intermediate_buffer = {
+                    **(new_request.model_intermediate_buffer or {}),
+                    "input_stream_update": stream.take_update(reset=True),
+                }
+        cached = cast(OmniCachedRequestData, scheduler_output.scheduled_cached_reqs)
+        for request_id in cached.req_ids:
+            stream = streams.get(request_id)
+            update = stream.take_update(reset=False) if stream is not None else None
+            if update is not None:
+                additional = getattr(cached, "additional_information", None)
+                if additional is None:
+                    additional = cached.additional_information = {}
+                previous = additional.get(request_id)
+                additional[request_id] = {
+                    **(deserialize_additional_information(previous) if previous else {}),
+                    "input_stream_update": update,
+                }
+
     @staticmethod
     def _request_is_runnable(request: Any) -> bool:
         """Whether upstream would consider this request runnable now.
@@ -1184,17 +1298,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # refuses the rest.
         self._drop_talker_drafts_if_prefill_pending()
 
+        blocked_text_requests = self._find_text_input_waits()
         step = self._begin_seeded_isolation()
         original_max_num_active_reqs = self.max_num_active_reqs
         self.max_num_active_reqs = step.limit
+        text_input_waits = None
         scheduled_any = False
         try:
+            text_input_waits = self._prepare_text_input_waits(blocked_text_requests)
             scheduler_output = super().schedule(throttle_prefills)
             scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", None)
             if scheduled_tokens is None and isinstance(scheduler_output, dict):
                 scheduled_tokens = scheduler_output.get("num_scheduled_tokens")
             scheduled_any = bool(scheduled_tokens)
         finally:
+            self._restore_text_input_waits(text_input_waits)
             self.max_num_active_reqs = original_max_num_active_reqs
             self._finish_seeded_isolation(step, scheduled_any=scheduled_any)
 
@@ -1207,6 +1325,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             include_cached_payloads=True,
         )
+        self._attach_text_input_updates(scheduler_output)
         finished_reqs = self.get_finished_requests_needing_kv_transfer()
 
         # Wrap in omni scheduler output to carry transfer metadata.
@@ -2542,6 +2661,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         assert request.is_finished()
         self._record_full_payload_discard(request)
 
+        streams = getattr(self, "_model_input_streams", None)
+        if streams is not None:
+            streams.pop(request.request_id, None)
         self._omits_kv_transfer_cache.pop(request.request_id, None)
 
         # [Upstream compat] Discard request from in-flight prefills set added
