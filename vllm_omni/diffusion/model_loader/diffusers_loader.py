@@ -116,6 +116,19 @@ def _natural_sort_key(filepath: str) -> list:
     return [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", os.path.basename(filepath))]
 
 
+def _is_offline_quantized_checkpoint(quant_config: object) -> bool:
+    """Return True when quantized weights are serialized in the checkpoint."""
+    checkpoint_markers = (
+        "is_checkpoint_quantized",
+        "is_checkpoint_fp8_serialized",
+        "is_checkpoint_nvfp4_serialized",
+        "is_checkpoint_mixed_precision_serialized",
+    )
+    if getattr(quant_config, "data_type", None) == "mx_fp":
+        return True
+    return any(bool(getattr(quant_config, marker, False)) for marker in checkpoint_markers)
+
+
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
 DIFFUSION_MODEL_BIN_WEIGHTS_INDEX = "diffusion_pytorch_model.bin.index.json"
@@ -749,11 +762,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # then move back to CPU afterward.
         offload_after_quant = False
         if load_device == "cpu" and self.quant_config is not None and device is not None:
-            quant_cfg = self.quant_config
-            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
-                quant_cfg, "is_checkpoint_quantized", False
-            )
-            if not is_offline:
+            if not _is_offline_quantized_checkpoint(self.quant_config):
                 load_device = device.type
                 offload_after_quant = True
                 logger.info(
