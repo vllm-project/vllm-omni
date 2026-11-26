@@ -1252,7 +1252,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         return waits
 
     def _clear_recv_delivery_state(self, req_id: str) -> None:
-        self._recv_wait_since().pop(req_id, None)
+        # A sender never starts a recv clock. Creating the map here would
+        # attach it to every finished request, including stage 0.
+        waits = getattr(self, "_recv_waiting_since", None)
+        if waits is not None:
+            waits.pop(req_id, None)
         super()._clear_recv_delivery_state(req_id)
 
     def _full_payload_recv_deadline(self, req_id: str) -> float | None:
