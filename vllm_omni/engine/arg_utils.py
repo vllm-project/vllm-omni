@@ -436,6 +436,7 @@ class OmniEngineArgs(EngineArgs):
     vae_stack_tiles: bool | None = None
     vae_fast_path: str | None = None
     vae_encode_fast_path: str | None = None
+    vae_tile_per_rank: bool | None = None
     enable_multithread_weight_load: bool | None = None
     enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
@@ -876,6 +877,7 @@ class OrchestratorArgs:
     vae_stack_tiles: bool = True
     vae_fast_path: str = "lossless"
     vae_encode_fast_path: str = "lossless"
+    vae_tile_per_rank: bool = True
     enable_multithread_weight_load: bool = True
     enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
@@ -960,6 +962,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "vae_stack_tiles",
         "vae_fast_path",
         "vae_encode_fast_path",
+        "vae_tile_per_rank",
         "enable_multithread_weight_load",
         "enable_broadcast_weight_load",
         "num_weight_load_threads",

@@ -1082,6 +1082,17 @@ class OmniServeCommand(CLISubcommand):
         )
 
         omni_config_group.add_argument(
+            "--vae-tile-per-rank",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Distributed Wan VAE tile decode (--vae-parallel-mode tile with --vae-patch-parallel-size > 1): "
+                "one tile per rank on a 2D rank grid, same blend overlap (default). --no-vae-tile-per-rank keeps "
+                "diffusers' fixed 256-pixel tiles, whose output does not depend on the number of cards."
+            ),
+        )
+
+        omni_config_group.add_argument(
             "--vae-encode-fast-path",
             choices=("off", "lossless", "channels_last"),
             default="lossless",
@@ -1288,9 +1299,10 @@ class OmniServeCommand(CLISubcommand):
             "--vae-parallel-mode",
             type=str,
             default="tile",
-            choices=["tile", "batch", "spatial_shard_height", "spatial_shard_width"],
+            choices=["tile", "crop", "batch", "spatial_shard_height", "spatial_shard_width"],
             help="VAE parallel decode strategy for diffusion models. "
             "'tile' (default) uses patch/tile parallel decode; "
+            "'crop' (Wan VAEs) decodes one margin-padded crop per rank on a 2D rank grid; "
             "'batch' distributes complete images for AutoencoderKL/Flux2 with DP/PP/CFG sizes of 1; "
             "'spatial_shard_height'/'spatial_shard_width' use spatially-sharded decode that splits "
             "decoder feature maps along height/width and exchanges halo regions. The "

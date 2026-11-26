@@ -35,6 +35,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
+from vllm_omni.diffusion.layers import fused_add_norm_quant
+from vllm_omni.diffusion.layers.fused_add_norm_quant import (
+    can_fuse_add_layernorm_quant_2seg,
+    fused_add_layernorm_quant_2seg,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingS2VGrid
 from vllm_omni.diffusion.models.wan2_2.rope import RotaryEmbeddingWanS2V, WanS2VRotaryPosEmbed
 from vllm_omni.platforms import current_omni_platform
@@ -151,10 +156,11 @@ class WanS2VSelfAttention(nn.Module):
         self.rotary_embedding = RotaryEmbeddingWanS2V()
 
     def forward(self, x, seq_lens, grid_sizes, freqs):
-        b, s = x.shape[:2]
-
-        # Fused QKV
+        # Fused QKV. x may be a QuantizedActivation from the block's fused norm1, so the
+        # shapes come from the projection output.
         qkv, _ = self.to_qkv(x)
+        b, s = qkv.shape[:2]
+
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -177,7 +183,7 @@ class WanS2VSelfAttention(nn.Module):
         key = key.view(b, s, self.num_kv_heads, self.head_dim)
         hidden_states = self.attn(query, key, value)
         hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.type_as(x)
+        hidden_states = hidden_states.type_as(qkv)
 
         # Output
         hidden_states = self.to_out(hidden_states)
@@ -269,7 +275,8 @@ class WanS2VCrossAttention(nn.Module):
         )
 
     def forward(self, x, context, context_lens=None):
-        b, n, d = x.size(0), self.num_heads, self.head_dim
+        # x may be a QuantizedActivation from the block's fused norm3; context has its batch.
+        b, n, d = context.size(0), self.num_heads, self.head_dim
 
         q = self.norm_q(self.to_q(x)).view(b, -1, n, d)
         k = self.norm_k(self.to_k(context)).view(b, -1, n, d)
@@ -281,6 +288,24 @@ class WanS2VCrossAttention(nn.Module):
 
         x = self.to_out(x)
         return x
+
+
+def _segment_bounds(seg_boundary, x: torch.Tensor) -> list:
+    """[0, end of the noisy tokens, end] of this rank's tokens (the block's two modulation segments)."""
+    return [0, min(max(0, seg_boundary), x.size(1)), x.size(1)]
+
+
+def _segment_scale(t: torch.Tensor, gate: torch.Tensor, seg_idx: list) -> torch.Tensor:
+    """``t`` with each segment's tokens times that segment's gate (``gate`` [B, 2, C])."""
+    return torch.cat([t[:, seg_idx[i] : seg_idx[i + 1]] * gate[:, i : i + 1] for i in range(2)], dim=1)
+
+
+def _segment_modulate(t: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, seg_idx: list) -> torch.Tensor:
+    """``t * (1 + scale) + shift`` with each segment's own ``scale`` / ``shift`` row ([B, 2, C])."""
+    return torch.cat(
+        [t[:, seg_idx[i] : seg_idx[i + 1]] * (1 + scale[:, i : i + 1]) + shift[:, i : i + 1] for i in range(2)],
+        dim=1,
+    )
 
 
 class WanS2VTransformerBlock(nn.Module):
@@ -340,7 +365,12 @@ class WanS2VTransformerBlock(nn.Module):
         context=None,
         context_lens=None,
         e=None,
+        ffn_residual=None,
+        defer_ffn_residual=False,
     ):
+        """``ffn_residual`` is the previous block's deferred ``(ff_output, gate)``; with
+        ``defer_ffn_residual`` this block returns ``(x, (ff_output, gate))`` instead of adding
+        its own FFN residual, so the next block folds it into its norm1 kernel."""
         x = hidden_states
         if encoder_hidden_states is None:
             encoder_hidden_states = e
@@ -348,41 +378,62 @@ class WanS2VTransformerBlock(nn.Module):
             raise ValueError("S2V transformer block requires modulation states.")
 
         e = encoder_hidden_states
-        seg_boundary = e[1]
-        seg_idx = [0, min(max(0, seg_boundary), x.size(1)), x.size(1)]
+        seg_idx = _segment_bounds(e[1], x)
+        seg = seg_idx[1]
         e = e[0]
 
         # Modulation parameters — self.modulation will be cast to match e's dtype
         e = (self.modulation.unsqueeze(2).to(e.dtype) + e).chunk(6, dim=1)
         e = [element.squeeze(1) for element in e]
 
-        # Self-attention with per-segment modulation
-        norm_x = self.norm1(x).type_as(x)
-        parts = []
-        for i in range(2):
-            parts.append(norm_x[:, seg_idx[i] : seg_idx[i + 1]] * (1 + e[1][:, i : i + 1]) + e[0][:, i : i + 1])
-        norm_x = torch.cat(parts, dim=1)
+        # 1. Self-attention with per-segment modulation. With a deferred FFN residual its
+        # gated add, norm1, the modulation and attn's MXFP8 input quantization are one kernel.
+        norm_x = None
+        if ffn_residual is not None:
+            # x is the previous block's output, owned by the transformer loop.
+            ff_prev, gate_prev = ffn_residual
+            if can_fuse_add_layernorm_quant_2seg(self.self_attn.to_qkv, x, gate_prev, e[1], e[0]):
+                x, norm_x = fused_add_layernorm_quant_2seg(
+                    self.self_attn.to_qkv, x, ff_prev, gate_prev, 1 + e[1], e[0], seg, self.norm1.eps
+                )
+            else:
+                x = x + _segment_scale(ff_prev, gate_prev, seg_idx)
+        if norm_x is None:
+            norm_x = self.norm1(x).type_as(x)
+            norm_x = _segment_modulate(norm_x, e[1], e[0], seg_idx)
 
         y = self.self_attn(norm_x, seq_lens, grid_sizes, freqs)
-        y_parts = []
-        for i in range(2):
-            y_parts.append(y[:, seg_idx[i] : seg_idx[i + 1]] * e[2][:, i : i + 1])
-        x = x + torch.cat(y_parts, dim=1)
 
-        # Cross-attention
-        x = x + self.cross_attn(self.norm3(x).type_as(x), context, context_lens)
+        # 2. Cross-attention: the gated self-attention residual, norm3 and attn's to_q input
+        # quantization as one kernel where available.
+        norm3 = self.norm3 if isinstance(self.norm3, nn.LayerNorm) else None
+        if norm3 is not None and can_fuse_add_layernorm_quant_2seg(
+            self.cross_attn.to_q, x, e[2], norm3.weight, norm3.bias
+        ):
+            # Without a deferred residual x is the block input, which the caller may still hold;
+            # with one it is already the loop-owned tensor norm1 updated in place.
+            residual = x if ffn_residual is not None else x.clone()
+            x, norm3_x = fused_add_layernorm_quant_2seg(
+                self.cross_attn.to_q, residual, y, e[2], norm3.weight, norm3.bias, seg, norm3.eps
+            )
+        else:
+            x = x + _segment_scale(y, e[2], seg_idx)
+            norm3_x = self.norm3(x).type_as(x)
+        y = self.cross_attn(norm3_x, context, context_lens)
 
-        # FFN with per-segment modulation
-        norm2_x = self.norm2(x).type_as(x)
-        parts = []
-        for i in range(2):
-            parts.append(norm2_x[:, seg_idx[i] : seg_idx[i + 1]] * (1 + e[4][:, i : i + 1]) + e[3][:, i : i + 1])
-        norm2_x = torch.cat(parts, dim=1)
+        # 3. FFN with per-segment modulation, same fusion for the residual add, norm2 and the
+        # FFN input quantization. x is ours here.
+        if can_fuse_add_layernorm_quant_2seg(self.ffn.net_0.proj, x, e[4], e[3]):
+            x, norm2_x = fused_add_layernorm_quant_2seg(
+                self.ffn.net_0.proj, x, y, None, 1 + e[4], e[3], seg, self.norm2.eps
+            )
+        else:
+            x = x + y
+            norm2_x = _segment_modulate(self.norm2(x).type_as(x), e[4], e[3], seg_idx)
         y = self.ffn(norm2_x)
-        y_parts = []
-        for i in range(2):
-            y_parts.append(y[:, seg_idx[i] : seg_idx[i + 1]] * e[5][:, i : i + 1])
-        x = x + torch.cat(y_parts, dim=1)
+        if defer_ffn_residual:
+            return x, (y, e[5])
+        x = x + _segment_scale(y, e[5], seg_idx)
         return x
 
 
@@ -1596,6 +1647,26 @@ class WanS2VTransformer3DModel(nn.Module):
             ]
         return x, seq_lens, rope_embs, mask_input
 
+    def _defer_ffn_residual(self) -> bool:
+        """Fold each block's FFN residual into the next block's norm1 kernel (XPU MXFP8 path).
+
+        Only with the fused residual add + LayerNorm + MXFP8 kernel, plain WanS2VTransformerBlocks
+        and no cache backend: cache hooks may keep block inputs, which the deferred path updates
+        in place. VLLM_OMNI_WAN_DEFER_FFN_RESIDUAL=0 turns it off, as for Wan T2V / I2V.
+        """
+        if os.environ.get("VLLM_OMNI_WAN_DEFER_FFN_RESIDUAL", "1").strip().lower() in ("0", "false", "off"):
+            return False
+        if not fused_add_norm_quant._FUSED_ADD_LN_MXFP8:
+            return False
+        if len(self.blocks) == 0 or any(type(b) is not WanS2VTransformerBlock for b in self.blocks):
+            return False
+        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+        if not is_forward_context_available():
+            return False
+        cfg = get_forward_context().omni_diffusion_config
+        return cfg is not None and getattr(cfg, "cache_backend", None) in (None, "", "none")
+
     def _is_sp_active(self) -> bool:
         from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
@@ -1817,9 +1888,23 @@ class WanS2VTransformer3DModel(nn.Module):
             context_lens=context_lens,
         )
 
-        for idx, block in enumerate(self.blocks):
-            x = block(x, **kwargs)
-            x = self.after_transformer_block(idx, x)
+        if self._defer_ffn_residual():
+            # Each block hands its FFN residual to the next block's norm1 kernel (see
+            # WanS2VTransformerBlock.forward). It is added here instead before an audio
+            # injection, which updates x in place, and after the last block.
+            pending = None
+            last = len(self.blocks) - 1
+            for idx, block in enumerate(self.blocks):
+                x, pending = block(x, ffn_residual=pending, defer_ffn_residual=True, **kwargs)
+                if idx == last or idx in self.audio_injector.injected_block_id:
+                    ff_output, gate = pending
+                    x = x + _segment_scale(ff_output, gate, _segment_bounds(e0[1], x))
+                    pending = None
+                x = self.after_transformer_block(idx, x)
+        else:
+            for idx, block in enumerate(self.blocks):
+                x = block(x, **kwargs)
+                x = self.after_transformer_block(idx, x)
 
         # SP: gather hidden_states from all ranks
         x = self.blocks_output_gather(x)

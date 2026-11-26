@@ -555,6 +555,11 @@ class VllmMxfp8OnlineLinearMethod(Mxfp8OnlineLinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Flatten the diffusion (B, S, K) hidden states the MX GEMMs reject."""
+        if not isinstance(x, torch.Tensor):
+            # A QuantizedActivation from a fused activation+quant producer: its
+            # data is already 2-D; restore the producer's leading dims.
+            output = self.kernel.apply_weights(layer, x, bias)
+            return output.reshape(*x.orig_shape[:-1], -1)
         if x.dim() <= 2:
             return super().apply(layer, x, bias)
         ori_shape = x.shape
