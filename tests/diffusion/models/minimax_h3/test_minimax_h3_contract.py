@@ -746,9 +746,7 @@ def test_encoder_task_validation_and_transformer_routing():
     assert pipeline._resolve_task("ref2va") == "ref2va"
     assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "ref2va"
     assert (
-        pipeline._resolve_task(
-            "ref2va", {"image": object()}, turbo_spec=replace(v1_2_spec, ref2va_base=True)
-        )
+        pipeline._resolve_task("ref2va", {"image": object()}, turbo_spec=replace(v1_2_spec, ref2va_base=True))
         == "ref2va"
     )
 
