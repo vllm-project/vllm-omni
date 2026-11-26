@@ -28,6 +28,7 @@ import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
 
+from tests.engine.duplex.test_minicpmo_window_plugin import _stub_tokenizer
 from tests.engine.duplex.test_playback_finalization import _assert_released
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
@@ -61,6 +62,7 @@ from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import REPLAY_CONTEXT_KEY
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1499,6 +1501,97 @@ async def test_commit_projects_the_user_item_and_does_not_resubmit_consumed_audi
         assert len(h.port.submissions) == 1
         assert h.session.input_commit_seq == 1
         assert h.session.history[-1]["role"] == "user"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_commit", [False, True], ids=["commit-before-done", "commit-after-done"])
+async def test_playback_barge_in_replays_committed_input_after_response_done(monkeypatch, late_commit) -> None:
+    _stub_tokenizer(monkeypatch)
+    h = await open_harness()
+    try:
+        h.session.config.playback_commit_policy = "ack_only"
+        frames = [b64(b"first frame"), b64(b"second frame")]
+        for frame in frames:
+            await h.run(replace(append_audio(), video_frames=(frame,)))
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, text="interrupted"))
+        if not late_commit:
+            find(await h.run(commands.Commit(create_response=False)), "input_audio_buffer.committed")
+        done = await h.deliver_and_settle(tts_output(request_id, text="interrupted", turn_end=True))
+        assert find(done, "response.done").status == "completed"
+        if late_commit:
+            find(await h.run(commands.Commit(create_response=False)), "input_audio_buffer.committed")
+
+        interrupted = await h.run(commands.BargeIn())
+        assert find(interrupted, "output_audio_buffer.cleared").response_id == find(done, "response.done").response_id
+        await h.run(append_audio(value=0.15))
+
+        duplex = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert duplex["epoch"] == 1 and duplex["seq"] == 1
+        [turn] = duplex[REPLAY_CONTEXT_KEY]
+        assert turn["user_only"] and turn["response_token_ids"] == []
+        assert [unit["video_frames"] for unit in turn["inputs"]] == [[frame] for frame in frames]
+        assert [unit["audio"] for unit in turn["inputs"]] == [b64(pcm_f32(16000, value=0.05))] * 2
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reuse_cancelled_id", [False, True], ids=["delete-completed", "recreate-cancelled"])
+async def test_barge_in_replay_respects_live_conversation_sources(monkeypatch, reuse_cancelled_id) -> None:
+    _stub_tokenizer(monkeypatch)
+    h = await open_harness()
+    try:
+        h.session.config.playback_commit_policy = "ack_only"
+        first_frame = b64(b"completed turn frame")
+        await h.run(replace(append_audio(), video_frames=(first_frame,)))
+        first = find(await h.run(commands.Commit(create_response=False)), "input_audio_buffer.committed")
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, text="completed"))
+        done = await h.deliver_and_settle(tts_output(request_id, text="completed", turn_end=True))
+        response_id = find(done, "response.done").response_id
+        ack = await h.run(commands.AckPlayback(response_id=response_id, played_ms=1000))
+        assert find(ack, "playback.acknowledged").details["history_committed"]
+
+        cancelled_frame = b64(b"cancelled turn frame")
+        await h.run(replace(append_audio(value=0.1), video_frames=(cancelled_frame,)))
+        cancelled = find(await h.run(commands.Commit(create_response=False)), "input_audio_buffer.committed")
+        await h.deliver_and_settle(tts_output(request_id, samples=48000, text="counting", turn_id=1))
+        assert h.session.active_response_id is not None
+        assert find(await h.run(commands.BargeIn()), "response.done").status == "cancelled"
+
+        deleted_id = cancelled.item_id if reuse_cancelled_id else first.item_id
+        find(await h.run(commands.DeleteItem(item_id=deleted_id)), "conversation.item.deleted")
+        if reuse_cancelled_id:
+            find(
+                await h.run(
+                    commands.CreateItem(
+                        item={
+                            "id": deleted_id,
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "New input with the same ID"}],
+                        }
+                    )
+                ),
+                "conversation.item.created",
+            )
+        retrieved = await h.run(
+            commands.SignalTurn(event="conversation.item.retrieve", signal_payload={"item_id": f"item_{response_id}"})
+        )
+        find(retrieved, "conversation.item.retrieved")
+        await h.run(append_audio(value=0.15))
+
+        duplex = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert duplex["epoch"] == 1 and duplex["seq"] == 1
+        assert duplex["session_window_replay"] is False
+        [turn] = duplex[REPLAY_CONTEXT_KEY]
+        [unit] = turn["inputs"]
+        assert unit["video_frames"] == [first_frame if reuse_cancelled_id else cancelled_frame]
+        assert unit["audio"] == b64(pcm_f32(16000, value=0.05 if reuse_cancelled_id else 0.1))
+        assert turn["response_token_ids"] == (list(map(ord, "completed")) if reuse_cancelled_id else [])
     finally:
         await close_harness(h)
 

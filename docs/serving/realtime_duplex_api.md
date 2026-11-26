@@ -1873,7 +1873,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `session.closed` | 3 | Last event on the socket, emitted once the engine released the session; `reason` ∈ `client_close`, `disconnect`, `timeout`, `transport_error`, `shutdown`, `output_backpressure`, `close_details_exceed_output_limit`, ... |
 | `session.resumed` | 3 | Resume accepted; carries the new `attachment_generation` and rotated `resume_token`; journaled events are replayed after it. |
 | `session.replaced` | 3 | Sent to the superseded socket when another socket resumes the session. |
-| `session.expired` | 3 | Engine lease reaped (`disconnect_grace_expired`, `idle_ttl_expired`); socket closes after it. |
+| `session.expired` | 3 | The engine ended the session (`disconnect_grace_expired`, `idle_ttl_expired`, or `request_cleanup`). The socket closes after the event. |
 | `session.resync_required` | 3 | Replay impossible (`journal_gap` / `journal_overflow`); client must start a new session. |
 | `input_audio_buffer.speech_started` | 1 | Speech onset detected (server VAD, client hint, or RMS heuristic). |
 | `input_audio_buffer.speech_stopped` | 1 | Speech end detected. |
@@ -2110,6 +2110,9 @@ In an input-clocked session the `session` object also carries
 ```json
 {"type": "session.expired", "session_id": "duplex-5f2a…", "reason": "disconnect_grace_expired"}
 ```
+
+When cleanup of a stage request closes the owning session, the reason is
+`request_cleanup`. To continue after this event, open a new session.
 
 `S→C session.resync_required`
 
