@@ -1420,6 +1420,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         encode_only: bool = False,
         decode_only: bool = False,
         trust_remote_code: bool = False,
+        optimize_decode: bool = True,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -1441,10 +1442,12 @@ class MiniMaxH3AudioVAE(nn.Module):
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
         self._stager = None
         self.model = self.remote.model
-        if os.environ.get("H3_VAE_OPERATOR_FIR_C16_INSTALL", "0") == "1" and hasattr(self.model, "decoder"):
+        if optimize_decode and device.type == "npu" and not self.encode_only:
+            from .npu.audio_tconv import install_bigvgan_upsamplers
             from .vae_audio_fir_channel_pack import install
 
             self._h3_fir_c16_modules = install(self.model)
+            install_bigvgan_upsamplers(self.model.decoder)
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._stager = PinnedModuleStager(
                 self.remote,

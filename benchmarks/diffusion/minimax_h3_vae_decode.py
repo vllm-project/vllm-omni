@@ -26,6 +26,7 @@ parser.add_argument("--precision", action="store_true")
 parser.add_argument("--model", type=Path, required=True, help="Task partition containing video_vae and audio_vae")
 parser.add_argument("--inputs", type=Path, required=True, help="torch.save((video_latent, audio_latent))")
 parser.add_argument("--output-dir", type=Path, required=True)
+parser.add_argument("--additional-config", type=json.loads, default={})
 args = parser.parse_args()
 rank = int(os.environ.get("RANK", "0"))
 world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -155,6 +156,11 @@ if rank == 0:
         load_device=torch.device("cpu"),
         decode_only=True,
         trust_remote_code=True,
+        **(
+            {"optimize_decode": args.additional_config["audio_vae_optimized_decode"]}
+            if "audio_vae_optimized_decode" in args.additional_config
+            else {}
+        ),
     )
     audio.load_to_device()
     modules = [m for m in audio.model.decoder.modules() if hasattr(m, "_h3_dense_fir")]
@@ -162,6 +168,9 @@ if rank == 0:
         "audio-loaded-rank0.json",
         {
             "fir_modules": len(modules),
+            "bigvgan_stage_upsamplers": sum(
+                hasattr(module, "_h3_stage_original_forward") for module in audio.model.decoder.modules()
+            ),
             "derived_devices": sorted(
                 {str(b.device) for m in modules for n, b in m.named_buffers() if n.startswith("_h3_")}
             ),

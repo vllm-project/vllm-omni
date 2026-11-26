@@ -14,20 +14,13 @@ diagonal weights keeps every channel independent while filling the tile.
 polyphase decomposition because a dense ``conv_transpose1d`` regresses on
 long sequences. The wrapper falls back to the original forward on CPU,
 during training, or when the packed width is 1.
-
-Environment switches:
-- ``H3_VAE_OPERATOR_FIR_C16_INSTALL=1``: install at construction time.
-- ``H3_VAE_OPERATOR_FIR_C16=1``: execute the packed path per request.
 """
 
-import os
 import types
 
 import torch
 from torch.nn import functional as F
 
-_INSTALL_ENV = "H3_VAE_OPERATOR_FIR_C16_INSTALL"
-_EXECUTE_ENV = "H3_VAE_OPERATOR_FIR_C16"
 _DEFAULT_WIDTH = 16
 
 
@@ -111,7 +104,7 @@ def install(model: torch.nn.Module) -> int:
         fn = _up_phase if name == "UpSample1d" else _low
 
         def forward(self, x, _fn=fn):
-            if os.environ.get(_EXECUTE_ENV, "0") != "1" or x.device.type != "npu" or self.training:
+            if x.device.type != "npu" or self.training:
                 return self._h3_fir_original(x)
             self._h3_fir_c16_calls = getattr(self, "_h3_fir_c16_calls", 0) + 1
             return _fn(self, x)

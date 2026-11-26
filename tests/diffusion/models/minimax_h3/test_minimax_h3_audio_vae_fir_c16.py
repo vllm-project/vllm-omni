@@ -9,6 +9,10 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from vllm_omni.diffusion.models.minimax_h3 import vae_audio_fir_channel_pack as pack
+from vllm_omni.diffusion.models.minimax_h3.npu.audio_tconv import (
+    _conv_transpose1d_as_conv1d,
+    install_bigvgan_upsamplers,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -138,11 +142,10 @@ def test_install_wraps_modules_and_is_idempotent():
     assert pack.install(model) == 0
 
 
-def test_cpu_execution_falls_back_to_the_original_forward(monkeypatch):
+def test_cpu_execution_falls_back_to_the_original_forward():
     up, low = UpSample1d(_taps()), LowPassFilter1d(_taps())
     model = _FakeAudioVAE(up, low)
     pack.install(model)
-    monkeypatch.setenv("H3_VAE_OPERATOR_FIR_C16", "1")
     x = torch.randn(2, 8, 64)
     up.forward(x)
     low.forward(x)
@@ -168,3 +171,16 @@ def test_install_preserves_unsupported_native_filters(unsupported):
     assert pack.install(_FakeAudioVAE(up, low)) == 1
     assert getattr(up.forward, "__func__") is getattr(original, "__func__")
     assert not hasattr(up, "_h3_dense_fir")
+
+
+def test_bigvgan_rewrite_crops_to_native_length_with_bias():
+    layer = nn.ConvTranspose1d(4, 2, 7, stride=3, padding=2)
+    x = torch.randn(2, 4, 13)
+    torch.testing.assert_close(_conv_transpose1d_as_conv1d(x, layer.weight, layer.bias, 3, 2), layer(x))
+
+    decoder = nn.Module()
+    decoder.ups = nn.ModuleList([nn.ModuleList([layer])])
+    decoder.other = nn.ConvTranspose1d(4, 2, 7, stride=3, padding=2)
+    original = decoder.other.forward
+    assert install_bigvgan_upsamplers(decoder) == 1
+    assert decoder.other.forward == original

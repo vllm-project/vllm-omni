@@ -1517,6 +1517,7 @@ class MiniMaxH3Pipeline(
                 load_device=component_load_device,
                 decode_only=not self.load_vae_encoder,
                 trust_remote_code=od_config.trust_remote_code,
+                optimize_decode=additional_config.get("audio_vae_optimized_decode", True),
             )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae

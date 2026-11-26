@@ -93,6 +93,7 @@ class MiniMaxH3DecoderPipeline(
             device=self.device,
             decode_only=True,
             trust_remote_code=od_config.trust_remote_code,
+            optimize_decode=(od_config.additional_config or {}).get("audio_vae_optimized_decode", True),
         )
         self.vae = self.video_vae
         self.weights_sources = []
