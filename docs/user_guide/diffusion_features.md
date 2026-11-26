@@ -59,16 +59,8 @@ of hits and defaults to twice `kv_refresh_interval`.
 `cache_dit_policy="refresh"` keeps the original scheduling. Hit priority
 requires a positive refresh interval; an explicit maximum must be an integer
 at least as large as that interval and is accepted only with `hit`.
-Without the supported single Cache-DiT wrapper, or with separate-CFG caching,
-execution falls back to the original fixed schedule and logs the effective
-policy. Refresh/layout changes still invalidate incompatible residual and
-TaylorSeer history. No isolation mask or RainFusion kernel changes are involved.
-
-Longer reference reuse remains approximate. Evaluate quality and latency:
-prefix replay and history rebuilding can offset the saved block computation.
-
-When `--kv-isolate` is enabled, the entire `--kv-offload-config`, including
-this refresh policy, is ignored.
+Refresh/layout changes still invalidate incompatible residual and
+TaylorSeer history.
 
 #### Experimental MiniMax-H3 Reference Isolation
 
