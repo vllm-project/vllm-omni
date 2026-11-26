@@ -1,5 +1,12 @@
 # Uploaded by upload_pipeline.py --upload (not the Buildkite hook).
 # ``if`` is injected by step ``key`` from skip-ci at upload time.
+# The upload steps below run immediately (no depends_on on the image builds).
+# Per-variant gating happens inside the uploaded test pipelines instead:
+# each NPU preset in common/ci_mirror_hardwares.yml declares
+# ``image_build_depends_on`` next to its image, and upload_pipeline.py merges
+# that key into the test step's depends_on when rendering test-npu-ready.yml /
+# test-npu-nightly.yml, so a variant's tests start as soon as its own image
+# build finishes.
 steps:
   - label: ":buildkit: Build and Push NPU Test Image - A2"
     key: image-build-a2
@@ -82,11 +89,6 @@ steps:
     command: bash .buildkite/npu/scripts/build-npu-image.sh Dockerfile.npu.ci "$${VLLM_IMAGE_TAG}" -310p
 
   - label: "Upload Ready Pipeline"
-    depends_on:
-      - image-build-a2
-      - image-build-a3
-      - image-build-a5
-      - image-build-310p
     key: upload-ready-pipeline
     agents:
       queue: "medium_cpu_queue_premerge"
@@ -95,11 +97,6 @@ steps:
 
   # L4 Test — release-line+NIGHTLY=1 (scheduled), or PR nightly-test label
   - label: "Upload Nightly Pipeline"
-    depends_on:
-      - image-build-a2
-      - image-build-a3
-      - image-build-a5
-      - image-build-310p
     key: upload-nightly-pipeline
     commands:
       - |

@@ -298,6 +298,138 @@ def test_mirror_hardwares_a2b3_npu_4_expands_agents_image_and_plugins() -> None:
         {"name": "swr-secret"},
     ]
     assert step["commands"] == ["pytest -sv tests/example"]
+    # Plain expansion (no NPU test pipeline context): the declaration is
+    # popped and no image-build gate is injected.
+    assert "image_build_depends_on" not in step
+    assert "depends_on" not in step
+
+
+def test_npu_presets_declare_matching_image_build_dependency() -> None:
+    """Each NPU preset's declared gate matches its image tag variant."""
+    suffix_to_key = {
+        "": "image-build-a2",
+        "-a3": "image-build-a3",
+        "-a5": "image-build-a5",
+        "-310p": "image-build-310p",
+    }
+    presets = _load_mirror_hardwares()
+    declared = {name: preset for name, preset in presets.items() if "image_build_depends_on" in preset}
+    assert declared, "NPU presets must declare image_build_depends_on"
+    for name, preset in declared.items():
+        tag = preset["image"].rpartition(":")[2]
+        assert tag.startswith("${BUILDKITE_COMMIT}"), (name, tag)
+        assert preset["image_build_depends_on"] == suffix_to_key[tag.removeprefix("${BUILDKITE_COMMIT}")], name
+    # CUDA presets stay un-declared.
+    assert "image_build_depends_on" not in presets["h100_1"]
+
+
+def test_npu_mirror_steps_gate_on_their_variant_image_build() -> None:
+    """With injection enabled, every NPU preset expands to its declared gate."""
+    for name, preset in _load_mirror_hardwares().items():
+        if "image_build_depends_on" not in preset:
+            continue
+        step = _expand_mirror_hardwares(
+            {"label": f"NPU {name}", "mirror_hardwares": name, "commands": ["pytest -sv tests/example"]},
+            inject_image_build_dep=True,
+        )
+        assert step is not None
+        assert step["depends_on"] == preset["image_build_depends_on"]
+        assert "image_build_depends_on" not in step
+
+
+def test_npu_image_build_gate_merges_with_existing_depends_on() -> None:
+    composed = _expand_mirror_hardwares(
+        {
+            "label": "composed",
+            "mirror_hardwares": "a3_npu_2",
+            "depends_on": [{"step": "capture", "allow_failure": True}],
+            "commands": ["pytest"],
+        },
+        inject_image_build_dep=True,
+    )
+    assert composed["depends_on"] == [{"step": "capture", "allow_failure": True}, "image-build-a3"]
+
+    deduped = _expand_mirror_hardwares(
+        {"label": "deduped", "mirror_hardwares": "a3_npu_2", "depends_on": ["image-build-a3"], "commands": ["pytest"]},
+        inject_image_build_dep=True,
+    )
+    assert deduped["depends_on"] == ["image-build-a3"]
+
+    scalar = _expand_mirror_hardwares(
+        {"label": "scalar", "mirror_hardwares": "310p_npu_2", "depends_on": "other-step", "commands": ["pytest"]},
+        inject_image_build_dep=True,
+    )
+    assert scalar["depends_on"] == ["other-step", "image-build-310p"]
+
+
+def test_cuda_mirror_steps_do_not_gain_image_build_depends_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    step = _expand_mirror_hardwares(
+        {"label": "cuda", "mirror_hardwares": "h100_2", "commands": ["pytest"]},
+        inject_image_build_dep=True,
+    )
+    assert step is not None
+    assert "depends_on" not in step
+
+
+def test_npu_image_gate_applies_only_to_npu_test_pipelines(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    doc = {"steps": [{"label": "NPU step", "mirror_hardwares": "a3_npu_2", "commands": ["pytest"]}]}
+    for name in ("test-npu-ready.yml", "test-npu-nightly.yml"):
+        rendered = _render_test_pipeline(
+            copy.deepcopy(doc),
+            changed_files=None,
+            pipeline_path=Path(f".buildkite/npu/{name}"),
+        )
+        assert rendered["steps"][0]["depends_on"] == "image-build-a3", name
+    rendered = _render_test_pipeline(
+        copy.deepcopy(doc),
+        changed_files=None,
+        pipeline_path=Path(".buildkite/cuda/test-ready.yml"),
+    )
+    assert "depends_on" not in rendered["steps"][0]
+    assert "image_build_depends_on" not in yaml.safe_dump(rendered)
+
+
+def test_npu_bootstrap_uploads_run_before_all_images_are_built() -> None:
+    doc = yaml.safe_load(Path(".buildkite/npu/bootstrap-upload-steps.yml").read_text(encoding="utf-8"))
+    by_key = {step["key"]: step for step in doc["steps"]}
+    assert {"image-build-a2", "image-build-a3", "image-build-a5", "image-build-310p"} <= set(by_key)
+    # Uploads must not wait for the four image builds; the uploaded test steps
+    # gate themselves per variant (see test_npu_test_steps_gate_on_their_own_variant_image).
+    assert "depends_on" not in by_key["upload-ready-pipeline"]
+    assert "depends_on" not in by_key["upload-nightly-pipeline"]
+
+
+@pytest.mark.parametrize(
+    "pipeline_path",
+    [Path(".buildkite/npu/test-npu-ready.yml"), Path(".buildkite/npu/test-npu-nightly.yml")],
+)
+def test_npu_test_steps_gate_on_their_own_variant_image(monkeypatch: pytest.MonkeyPatch, pipeline_path: Path) -> None:
+    """Every step that consumes an NPU CI image depends on that variant's build."""
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    presets = _load_mirror_hardwares()
+    image_to_dep = {
+        preset["image"]: preset["image_build_depends_on"]
+        for preset in presets.values()
+        if "image_build_depends_on" in preset
+    }
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(doc, changed_files=None, pipeline_path=pipeline_path)
+    gated = 0
+    for step in _leaf_steps(rendered["steps"]):
+        image = step.get("image")
+        if not (isinstance(image, str) and image in image_to_dep):
+            continue
+        gated += 1
+        expected = image_to_dep[image]
+        depends_on = step.get("depends_on")
+        if isinstance(depends_on, list):
+            assert expected in depends_on
+        else:
+            assert depends_on == expected
+    assert gated > 0, "expected NPU image-consuming steps in the rendered pipeline"
+    assert "image_build_depends_on" not in yaml.safe_dump(rendered)
 
 
 def test_all_cuda_mirror_hardwares_restore_hf_token_at_runtime() -> None:
@@ -1584,7 +1716,12 @@ def test_lingbot_nightly_uses_independent_perf_and_accuracy_frameworks(monkeypat
     }
     perf = jobs[f"lingbot-{platform}-nightly-performance"]
     accuracy = jobs[f"lingbot-{platform}-nightly-accuracy"]
-    assert not perf.get("depends_on")
+    # Perf stays independent of the accuracy framework. The NPU step only
+    # carries the injected gate on its own variant's image build.
+    if platform == "cuda":
+        assert not perf.get("depends_on")
+    else:
+        assert perf.get("depends_on") == "image-build-a2"
     assert not perf.get("matrix")
     command = " ".join(perf["commands"])
     assert "tests/dfx/perf/scripts/run_benchmark.py" in command

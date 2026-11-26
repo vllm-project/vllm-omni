@@ -138,7 +138,7 @@ Canonical layout (prefer these paths for new changes):
 
 === "NPU"
 
-    **Bootstrap:** [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml) + [`npu/bootstrap-upload-steps.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/bootstrap-upload-steps.yml)—same split as CUDA; builds A2/B3, A3, A5, and 310P CI images, then uploads child test pipelines.
+    **Bootstrap:** [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml) + [`npu/bootstrap-upload-steps.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/bootstrap-upload-steps.yml)—same split as CUDA; builds A2/B3, A3, A5, and 310P CI images in parallel while the child test pipelines upload immediately. Each test step gates only on its own variant's image build: NPU presets in `common/ci_mirror_hardwares.yml` declare `image_build_depends_on` next to their image, and the uploader merges that key into the step's `depends_on` when rendering `test-npu-ready.yml` / `test-npu-nightly.yml` (existing entries and their `allow_failure` settings are preserved), so a variant's tests start as soon as its image is pushed.
 
     **Test YAML:** `npu/test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4).
 
