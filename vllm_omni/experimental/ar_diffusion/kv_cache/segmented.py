@@ -74,6 +74,10 @@ class ARDiffusionSegmentedKVState:
         self._next_id = 0
         self._revision = 0
         self._closed = False
+        # Set when a retention publish could not return every excluded
+        # segment. The session can no longer be attended over, but it must
+        # still be closable so the storage it kept is reclaimed.
+        self._poisoned: BaseException | None = None
         self._prepared: tuple[int, int] | None = None
         self._assembled: set[int] = set()
         self.history_gathers = 0
@@ -93,6 +97,11 @@ class ARDiffusionSegmentedKVState:
     def _check_open(self) -> None:
         if self._closed:
             raise RuntimeError("Segmented KV session is closed")
+        if self._poisoned is not None:
+            raise RuntimeError(
+                "Segmented KV session lost a segment to a failed release; close it instead of "
+                "attending over a history that is no longer complete"
+            ) from self._poisoned
 
     def _staging(self) -> SegmentedStaging:
         return self.cache.segmented_staging[self.cache._kv_branch_index(self.kv_branch)]
@@ -270,15 +279,34 @@ class ARDiffusionSegmentedKVState:
         self._publish_retention(self._validate_retention(handles))
 
     def _publish_retention(self, retained: tuple[SegmentHandle, ...]) -> None:
+        """Move the ledger to ``retained``, then return the excluded segments.
+
+        The ledger has to move before the storage does. Releasing first leaves
+        ``_retained`` naming pages that already went back to the pool when a
+        release fails part-way, and the next ``prepare_layer_views`` would gather
+        them -- reading another request's rows. Restoring the previous ledger is
+        not available either, because a failed release may already have returned
+        some of those segments. So a release failure keeps the new ledger, poisons
+        the session for attention, and raises: the caller fails closed and closes
+        the session, which still reclaims every remaining allocation.
+        """
         keep = set(retained)
-        for handle in tuple(self._allocations):
-            if handle not in keep:
-                self._release(handle)
         if retained != self._retained:
             self._retained = retained
             self._revision += 1
             self._prepared = None
         self._assembled.clear()
+        errors: list[BaseException] = []
+        for handle in tuple(self._allocations):
+            if handle in keep:
+                continue
+            try:
+                self._release(handle)
+            except BaseException as exc:  # noqa: BLE001 - every excluded segment is visited
+                errors.append(exc)
+        if errors:
+            self._poisoned = errors[0]
+            raise errors[0]
 
     def rollback(self) -> None:
         if self._pending is not None:
@@ -288,7 +316,11 @@ class ARDiffusionSegmentedKVState:
         self._assembled.clear()
 
     def _release(self, handle: SegmentHandle) -> None:
-        self.cache.release_history(self._allocations.pop(handle).adapter)
+        # Release before forgetting: if the pool refuses, the handle must stay
+        # in ``_allocations`` so ``close`` can try again rather than leak it.
+        allocation = self._allocations[handle]
+        self.cache.release_history(allocation.adapter)
+        del self._allocations[handle]
 
     def close(self) -> None:
         """Release committed and pending allocations; safe to call twice."""

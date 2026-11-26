@@ -91,7 +91,7 @@ from .geometry import (
     phases_for_frames,
     request_plan,
 )
-from .kv_cache import TaoMateKVHistory
+from .kv_cache import TaoMateKVHistory, TaoMateRetention, resolve_retention
 from .lora import MergedStudentWeights, prepare_taomate_lora
 from .packed import taomate_phase_packed_layout
 from .schedule import euler_eta0_update_, student_sigmas
@@ -243,13 +243,14 @@ class _Session:
         audio_decoder: StreamingAudioDecoder,
         audio_kv_reset_requests: int,
         pad_text_tokens: int = 0,
+        retention: TaoMateRetention | None = None,
     ) -> None:
         self.session_id = session_id
         self.canvas = canvas
         self.pad_text_tokens = int(pad_text_tokens)
         self.seed = int(seed)
         self._cache = cache
-        self.history = TaoMateKVHistory(cache)
+        self.history = TaoMateKVHistory(cache, retention)
         self.video_decoder = video_decoder
         self.audio_decoder = audio_decoder
         self.audio_kv_reset_requests = int(audio_kv_reset_requests)
@@ -616,6 +617,10 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
     diffusion_lora_scale_in_epilogue: ClassVar[bool] = True
     diffusion_lora_fixed_adapter: ClassVar[bool] = True
     _transformer_cls: ClassVar[type] = TaoMateH3DiTModel
+    # Overridden from ``taomate_h3_history_policy`` in __init__. Declared here
+    # so the documented default is the value used whenever the deployment
+    # switch is absent.
+    _tm_retention: TaoMateRetention = TaoMateRetention()
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         _validate_parallel_config(od_config)
@@ -633,6 +638,10 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         self._tm_audio_kv_reset_requests = int(
             model_config.get("taomate_h3_audio_kv_reset_requests", DEFAULT_AUDIO_KV_RESET_REQUESTS)
         )
+        # Which committed video/audio phases stay resident. A deployment switch
+        # rather than a per-request parameter: the choice sizes the segmented KV
+        # budget the runner reserves at load, so it cannot change per request.
+        self._tm_retention = resolve_retention(model_config.get("taomate_h3_history_policy"))
         self._tm_allow_no_lora = bool(model_config.get("taomate_h3_allow_no_lora", False))
         # Optional fixed packed lengths: with a prompt budget every phase kind
         # and the teacher documents keep one shape across prompts, which is
@@ -1239,6 +1248,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
             audio_decoder=StreamingAudioDecoder(self.audio_vae, device=self.device),
             audio_kv_reset_requests=self._tm_audio_kv_reset_requests,
             pad_text_tokens=self._tm_pad_text_tokens,
+            retention=self._tm_retention,
         )
         self._tm_sessions[session_id] = session
         state.chunk_num_steps = STUDENT_STEPS

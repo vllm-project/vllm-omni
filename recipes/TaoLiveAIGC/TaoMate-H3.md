@@ -205,6 +205,7 @@ the supplied YAML files enable additional optimizations.
 | `taomate_h3_width` / `taomate_h3_height` | 480 / 864 | Fixed canvas; both dimensions must be 32-aligned, with short edge 480, 768 or 1088. |
 | `taomate_h3_seed` | 8301 | Default seed. Window `k` uses `seed + k` for audio and `seed + k * 1000003` for video. |
 | `taomate_h3_audio_kv_reset_requests` | 12 | Clear retained audio K/V every N windows while keeping the video sink and recent video. |
+| `taomate_h3_history_policy` | `sink_recent` | Experimental: which committed phases stay resident. `sink_recent` keeps the first phase's video sink plus the newest two phases' audio and video; `recent_only` drops the sink. Any policy must fit the five-segment budget the pipeline reserves, so a larger `recent_phases` is rejected at load. |
 | `taomate_h3_allow_no_lora` | false | Run the base checkpoint without the adapter for debugging. |
 | `taomate_h3_pad_text_tokens` | unset | Bound packed text shapes using 64-token buckets, capped by this budget. Longer prompts run unpinned with a warning. |
 | `taomate_h3_hold_for_prompt` | false | Starting with window 1, wait for a prompt update received since the previous window started. |
