@@ -950,22 +950,13 @@ class MiniCPMO45SchedulerWindowPolicy:
             if duplex.get("seq") == 1 and "duplex_first_append_context_tokens" in cfg:
                 duplex["open_input_start"] = cfg["duplex_first_append_context_tokens"]
                 if self.committed_kv is not None and self.carry is not None:
-                    window = self.carry.windows.get(sid, {})
-                    for old_id, pending in reversed(self.carry.pending.items()):
-                        if duplex_stage0_session_id(old_id) == sid:
-                            window = pending
-                            break
+                    window = self.carry.latest_window(sid)
                     self.committed_kv.prepare(request, max_prompt_len, window.get("source"))
             return None
         if self.carry is None:
             self.carry = MiniCPMO45CarriedWindows()
         carry = self.carry
-        window = carry.windows.get(sid)
-        # Abort may have completed without another scheduler dispatch in between.
-        for old_id, pending in reversed(carry.pending.items()):
-            if duplex_stage0_session_id(old_id) == sid:
-                window = pending
-                break
+        window = carry.latest_window(sid)
         duplex = info.get("duplex") if isinstance(info, dict) else None
         if not isinstance(duplex, dict) or duplex.get("seq") != 1:
             return None
@@ -1088,7 +1079,6 @@ class MiniCPMO45SchedulerWindowPolicy:
         )
         if reanchored is not None or replaced:
             request._minicpmo45_checkpoint_rebased = True
-            request._minicpmo45_committed_boundary = None
         if isinstance(duplex, dict) and (start := getattr(request, "_minicpmo45_window_open_start", None)) is not None:
             duplex["open_input_start"] = start
         if replaced:
@@ -1327,6 +1317,13 @@ class MiniCPMO45CarriedWindows:
         #: Stage-0 requests that finished before their first scheduled step.
         self.unstarted: set[str] = set()
         self.admitted: dict[str, str] = {}
+
+    def latest_window(self, session_id: str) -> dict[str, Any]:
+        # Admission can follow an abort before the worker receives its finish.
+        for request_id, window in reversed(self.pending.items()):
+            if duplex_stage0_session_id(request_id) == session_id:
+                return window
+        return self.windows.get(session_id, {})
 
 
 class MiniCPMO45DuplexWorkerHelper:

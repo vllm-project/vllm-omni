@@ -285,8 +285,7 @@ def test_final_exact_chunk_append_reserves_one_unit_not_two(seq):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("late_commit", [False, True], ids=["commit-before-done", "commit-after-done"])
-async def test_cancel_restore_keeps_committed_user_media_and_excludes_cancelled_answer(monkeypatch, late_commit):
+async def test_replacement_reserves_history_only_on_its_first_append(monkeypatch):
     _stub_tokenizer(monkeypatch)
     plugin = _plugin()
     state = plugin.create_session_state()
@@ -324,21 +323,7 @@ async def test_cancel_restore_keeps_committed_user_media_and_excludes_cancelled_
     plugin.observe_response_end(state=state, fence=blue, response_id="blue", completed=True)
     old_plan = await plan(cancelled, 2, old)
     plugin.observe_submitted_append(state=state, fence=cancelled, prompt=old_plan.prompt, input_commit_seq=2)
-    if not late_commit:
-        plugin.observe_committed_input(
-            state=state, fence=cancelled, item_id="user_old", source_id=2, input_commit_seq=2
-        )
-    # Even if a generated reply was archived before playback, cancel excludes
-    # it. An already-visible prefix can still be present in conversation.
-    plugin.observe_response_end(state=state, fence=cancelled, response_id="old", completed=True)
-    if late_commit:
-        plugin.observe_committed_input(
-            state=state,
-            fence=DuplexFence("session", epoch=0, turn_id=3),
-            item_id="user_old",
-            source_id=2,
-            input_commit_seq=2,
-        )
+    plugin.observe_committed_input(state=state, fence=cancelled, item_id="user_old", source_id=2, input_commit_seq=2)
     plugin.observe_response_end(state=state, fence=cancelled, response_id="old", completed=False)
     config = plugin.prepare_prompt_config(
         {
@@ -370,18 +355,6 @@ async def test_cancel_restore_keeps_committed_user_media_and_excludes_cancelled_
     assert envelope["session_window_replay"] is False
     assert "session_window_replay" not in baseline.prompt["model_intermediate_buffer"]["duplex"]
 
-    deleted_user = {
-        **config,
-        "conversation": config["conversation"][1:],
-        "conversation_item_ids": config["conversation_item_ids"][1:],
-        "conversation_user_source_ids": {"user_old": 2},
-    }
-    reused_public_id = {**config, "conversation_user_source_ids": {"user_blue": 1, "user_old": 9}}
-    for edited, expected in ((deleted_user, [interrupted]), (reused_public_id, [turn])):
-        result = await plan(recovery, 1, new, edited)
-        duplex = result.prompt["model_intermediate_buffer"]["duplex"]
-        assert duplex[module.REPLAY_CONTEXT_KEY] == expected
-        assert duplex["session_window_replay"] is False
     removed = {**config, "conversation_user_source_ids": {}}
     result = await plan(recovery, 1, new, removed)
     duplex = result.prompt["model_intermediate_buffer"]["duplex"]

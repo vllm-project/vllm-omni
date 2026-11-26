@@ -156,20 +156,11 @@ class MiniCPMO45CommittedKV:
             boundary, blocks, request.last_sched_seq, monotonic() + _RETAIN_SECONDS
         )
 
-    def _adopt(self, request: "Request", saved: _Saved) -> int:
-        manager = self.manager
-        if manager is None:
-            return 0
-        manager.req_to_blocks[request.request_id] = list(saved.blocks)
-        manager.num_cached_block[request.request_id] = len(saved.blocks)
-        reused = len(saved.blocks) * manager.block_size
-        request.num_computed_tokens = reused
-        return reused
-
     def prepare(self, request: "Request", max_prompt_len: int, source: str | None) -> None:
         duplex = _duplex(request)
         marker = duplex.get(CHECKPOINT_KEY)
-        if duplex.get("seq") != 1 or duplex.get("epoch") != 1 or not isinstance(marker, dict):
+        manager = self.manager
+        if manager is None or duplex.get("seq") != 1 or duplex.get("epoch") != 1 or not isinstance(marker, dict):
             return
         self.sweep()
         session_id = duplex["session_id"]
@@ -206,9 +197,9 @@ class MiniCPMO45CommittedKV:
         request.block_hashes.clear()
         request.update_block_hashes()
         self.saved.pop(session_id)
-        reused = self._adopt(request, saved)
-        if not reused:
-            self.pool.free_blocks(reversed(saved.blocks))
+        manager.req_to_blocks[request.request_id] = list(saved.blocks)
+        manager.num_cached_block[request.request_id] = len(saved.blocks)
+        reused = request.num_computed_tokens = len(saved.blocks) * manager.block_size
         duplex[CHECKPOINT_KEY] = {
             "source": boundary.request_id,
             "rows": boundary.end,

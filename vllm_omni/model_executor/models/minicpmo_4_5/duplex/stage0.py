@@ -11,6 +11,7 @@ from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
+from itertools import chain, islice
 from threading import Lock
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -566,7 +567,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.pending_speech_response_open = True
 
     def restore_committed_checkpoint(self, state, checkpoint, turns, budget):
-        # The scheduler has validated the source and the old request's settled writes.
         source = self._replay_windows.get(checkpoint["source"])
         if source is None or source.header is None:
             raise _UnrecoverableWindowError("Missing accepted MiniCPM-o checkpoint rows")
@@ -576,20 +576,23 @@ class MiniCPMO45Stage0DuplexRuntime:
         state.context_embeds = [*state.context_prefix_embeds, *state.context_suffix_embeds]
         state.context_token_ids = [*state.context_prefix_token_ids, *state.context_suffix_token_ids]
         rows = checkpoint["rows"] - len(state.context_token_ids)
-        ids = [token for unit in source.token_ids for token in unit]
+        if rows <= 0:
+            raise _UnrecoverableWindowError("Invalid accepted MiniCPM-o checkpoint length")
         if source.embeds is not None:
+            token_groups = source.token_ids
             embeds = [source.embeds[:rows].to(source.device, non_blocking=True)]
         else:
             units = source.unpack()
-            ids = [token for unit in units for token in unit.token_ids]
+            token_groups = [unit.token_ids for unit in units]
             embeds = self._slice_embed_list([embed for unit in units for embed in unit.embeds], 0, rows)
-        if not 0 < rows <= len(ids) or sum(self._tensor_rows(t) for t in embeds) != rows:
+        ids = list(islice(chain.from_iterable(token_groups), rows))
+        if len(ids) != rows or sum(self._tensor_rows(t) for t in embeds) != rows:
             raise _UnrecoverableWindowError("Invalid accepted MiniCPM-o checkpoint length")
         closure = [checkpoint["terminator"], self.unit_end_token_id]
         self.restore_completed_turns(state, turns, budget - len(closure))
         context = state.restored_context
         context.embeds[:0] = [*embeds, *(self._embed_token(token) for token in closure)]
-        context.token_ids[:0] = [*ids[:rows], *closure]
+        context.token_ids[:0] = [*ids, *closure]
         logger.info("MiniCPM-o restored a committed checkpoint with %d accepted rows", checkpoint["rows"])
 
     def restore_completed_turns(

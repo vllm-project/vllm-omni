@@ -775,17 +775,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._commit_minicpmo45_duplex_pending_samples(session_ids={candidate[0] for candidate in candidates})
         staged = []
         for session_id, duplex, payload, kwargs in candidates:
+            if "source" in duplex.get(CHECKPOINT_KEY, {}):
+                continue  # The per-request path reports missing checkpoint rows.
             try:
                 audio_waveform = helper._decode_audio_payload(payload)
                 kwargs.update(helper.frame_kwargs(duplex, payload))
             except ValueError:
                 continue
-            # An admitted checkpoint uses the per-request path, which can report
-            # a missing recovery record as a request error.
-            if "source" not in duplex.get(CHECKPOINT_KEY, {}):
-                staged.append(
-                    (self._minicpmo45_duplex_session_state(helper, session_id, duplex), audio_waveform, kwargs)
-                )
+            staged.append((self._minicpmo45_duplex_session_state(helper, session_id, duplex), audio_waveform, kwargs))
         if len(staged) >= 2:
             helper.stage_prefill_batch(staged)
 
