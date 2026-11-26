@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import fcntl
+import fnmatch
 import importlib
 import json
 import multiprocessing as mp
@@ -794,17 +795,173 @@ def prepare_engine_environment() -> None:
         pass
 
 
+_QWEN3_OMNI_MODEL_ARCH = "Qwen3OmniMoeForConditionalGeneration"
+_QWEN3_OMNI_STAGE_NAMES = ("thinker", "talker", "code2wav")
+_QWEN3_OMNI_STAGE_PREFIXES = tuple(f"{name}." for name in _QWEN3_OMNI_STAGE_NAMES)
+_QWEN3_OMNI_FALLBACK_LAYER_PROBES = (0, 1, 2, 10, 47, 99)
+
+
+def _is_stage_moe_backend_explicit(stage_config: object) -> bool:
+    """Return True if moe_backend was explicitly configured on *stage_config*."""
+    if isinstance(stage_config, BaseVllmOmniStageConfig):
+        return "moe_backend" in getattr(stage_config.model_config, "_omni_explicit_fields", ())
+    source_args = getattr(stage_config, "engine_args", None)
+    if source_args is not None:
+        return _get_attr_or_item(source_args, "moe_backend", None) is not None
+    return False
+
+
+def _get_stage_num_hidden_layers(vllm_config: object, model_stage: str) -> int | None:
+    """Return the stage text hidden layer count when available on *vllm_config*."""
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None:
+        return None
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    num_layers = getattr(hf_text_config, "num_hidden_layers", None)
+    if isinstance(num_layers, int) and not isinstance(num_layers, bool) and num_layers > 0:
+        return num_layers
+    hf_config = getattr(model_config, "hf_config", None)
+    stage_cfg = getattr(hf_config, f"{model_stage}_config", None)
+    stage_text_cfg = getattr(stage_cfg, "text_config", None)
+    num_layers = getattr(stage_text_cfg, "num_hidden_layers", None)
+    if isinstance(num_layers, int) and not isinstance(num_layers, bool) and num_layers > 0:
+        return num_layers
+    return None
+
+
+def _pattern_excludes_stage_probe(pat: str, probe: str, model_stage: str, stage_prefix: str) -> bool:
+    if pat == model_stage or pat == stage_prefix or pat == f"{model_stage}.*":
+        return True
+    if probe.startswith(f"{pat}."):
+        return True
+    if pat.startswith("re:"):
+        try:
+            return re.search(pat[3:], probe) is not None
+        except re.error:
+            return False
+    return fnmatch.fnmatchcase(probe, pat)
+
+
+def _is_stage_excluded_by_patterns(
+    patterns: object,
+    model_stage: str,
+    *,
+    num_hidden_layers: int | None = None,
+) -> bool:
+    """Return True only when *patterns* exclude every MoE layer of *model_stage*."""
+    if not isinstance(patterns, (list, tuple, set, frozenset)):
+        return False
+    cleaned = [raw.strip() for raw in patterns if isinstance(raw, str) and raw.strip()]
+    if not cleaned:
+        return False
+
+    stage_prefix = f"{model_stage}."
+    layer_indices = range(num_hidden_layers) if num_hidden_layers is not None else _QWEN3_OMNI_FALLBACK_LAYER_PROBES
+    for layer_idx in layer_indices:
+        probe = f"{model_stage}.model.layers.{layer_idx}.mlp.experts"
+        if not any(_pattern_excludes_stage_probe(pat, probe, model_stage, stage_prefix) for pat in cleaned):
+            return False
+    return True
+
+
+def _stage_has_quantized_moe(
+    quant_config: object,
+    model_stage: str | None,
+    *,
+    num_hidden_layers: int | None = None,
+) -> bool:
+    """Return True if *quant_config* applies to MoE layers on *model_stage*."""
+    if quant_config is None:
+        return False
+
+    if model_stage:
+        block_names = getattr(quant_config, "block_name_to_quantize", None)
+        if isinstance(block_names, str):
+            block_names = [name.strip() for name in block_names.split(",") if name.strip()]
+        if isinstance(block_names, (list, tuple, set, frozenset)) and block_names:
+            stage_prefix = f"{model_stage}."
+            for raw in block_names:
+                if not isinstance(raw, str):
+                    continue
+                name = raw.strip()
+                if not name:
+                    continue
+                if name == model_stage or name.startswith(stage_prefix):
+                    return True
+                if name not in _QWEN3_OMNI_STAGE_NAMES and not name.startswith(_QWEN3_OMNI_STAGE_PREFIXES):
+                    return True
+            return False
+
+        for attr in ("exclude_modules", "ignore"):
+            if _is_stage_excluded_by_patterns(
+                getattr(quant_config, attr, None),
+                model_stage,
+                num_hidden_layers=num_hidden_layers,
+            ):
+                return False
+
+    return True
+
+
 def _maybe_set_qwen3_omni_moe_backend(
     engine_args_dict: dict[str, Any],
     *,
     moe_backend_is_explicit: bool | None = None,
 ) -> None:
-    """Choose the stable MoE backend when Qwen3-Omni has no explicit choice."""
+    """Choose the stable MoE backend when Qwen3-Omni has no explicit choice.
+
+    Unquantized Qwen3-Omni MoE stages default to triton to avoid
+    FlashInfer/CUTLASS FP16 MoE instability (#7019). Non-MoE generation stages
+    (e.g. code2wav) and stages with explicit quantization settings are left
+    untouched so vLLM's quantization-aware MoE oracle selects a compatible
+    backend (such as Marlin for WNA16 / AutoRound or NVFP4 kernels).
+    """
     if moe_backend_is_explicit is None:
         moe_backend_is_explicit = "moe_backend" in engine_args_dict
-    if engine_args_dict.get("model_arch") == "Qwen3OmniMoeForConditionalGeneration" and not moe_backend_is_explicit:
-        engine_args_dict["moe_backend"] = "triton"
-        logger.info("[stage_init] Set moe_backend=triton for Qwen3-Omni stage")
+    if engine_args_dict.get("model_arch") != _QWEN3_OMNI_MODEL_ARCH or moe_backend_is_explicit:
+        return
+    if engine_args_dict.get("worker_type") == "generation" or engine_args_dict.get("model_stage") == "code2wav":
+        return
+    if engine_args_dict.get("quantization") is not None or engine_args_dict.get("quantization_config") is not None:
+        return
+    engine_args_dict["moe_backend"] = "triton"
+    logger.info("[stage_init] Set moe_backend=triton for Qwen3-Omni stage")
+
+
+def _maybe_reset_qwen3_omni_quantized_moe_backend(
+    vllm_config: VllmConfig,
+    *,
+    model_arch: str | None,
+    model_stage: str | None,
+    moe_backend_is_explicit: bool,
+) -> None:
+    """Revert default triton MoE backend on statically quantized Qwen3-Omni stages.
+
+    Checkpoint-driven static quantization (e.g. AutoRound W4A16, ModelOpt
+    NVFP4/FP8, GPTQ/AWQ) is only resolved when create_engine_config()
+    inspects the checkpoint config. If moe_backend was defaulted to
+    triton rather than explicitly requested by the user, reset it to
+    auto so vLLM's quantized MoE oracle picks a supported kernel.
+    """
+    if (
+        moe_backend_is_explicit
+        or model_arch != _QWEN3_OMNI_MODEL_ARCH
+        or getattr(getattr(vllm_config, "kernel_config", None), "moe_backend", None) != "triton"
+    ):
+        return
+    num_hidden_layers = _get_stage_num_hidden_layers(vllm_config, model_stage) if model_stage else None
+    if not _stage_has_quantized_moe(
+        getattr(vllm_config, "quant_config", None),
+        model_stage,
+        num_hidden_layers=num_hidden_layers,
+    ):
+        return
+    vllm_config.kernel_config.moe_backend = "auto"
+    logger.info(
+        "[stage_init] Reset default moe_backend=triton to auto for quantized Qwen3-Omni stage=%s (quant_config=%s)",
+        model_stage,
+        type(vllm_config.quant_config).__name__,
+    )
 
 
 def split_devices_for_replicas(
@@ -1228,10 +1385,6 @@ def _project_omni_stage_engine_args(
     engine_args["model_arch"] = copy.deepcopy(stage_config.model_config.model_arch)
     # Preserve the legacy adapter key even when the topology leaves it unset.
     engine_args["scheduling_metadata_adapter"] = stage_config.model_config.scheduling_metadata_adapter
-    _maybe_set_qwen3_omni_moe_backend(
-        engine_args,
-        moe_backend_is_explicit="moe_backend" in getattr(stage_config.model_config, "_omni_explicit_fields", ()),
-    )
 
     topology = stage_config.stage_pipeline_config
     topology_engine_args = {
@@ -1278,6 +1431,11 @@ def _project_omni_stage_engine_args(
             "quantization" if isinstance(quantization_config, str) and not is_diffusion else "quantization_config"
         )
         engine_args[quantization_key] = copy.deepcopy(quantization_config)
+
+    _maybe_set_qwen3_omni_moe_backend(
+        engine_args,
+        moe_backend_is_explicit=_is_stage_moe_backend_explicit(stage_config),
+    )
 
     return engine_args
 
@@ -1658,6 +1816,13 @@ def build_vllm_config(
         # VllmConfig is mutable. Reconstructing it replays runtime-added fields
         # through Pydantic validation, which can reject otherwise valid configs.
         vllm_config.quant_config = upgraded
+
+    _maybe_reset_qwen3_omni_quantized_moe_backend(
+        vllm_config,
+        model_arch=engine_args_dict.get("model_arch"),
+        model_stage=engine_args_dict.get("model_stage"),
+        moe_backend_is_explicit=_is_stage_moe_backend_explicit(stage_config),
+    )
 
     custom_voice_dir = engine_args_dict.get("custom_voice_dir")
     if custom_voice_dir:
