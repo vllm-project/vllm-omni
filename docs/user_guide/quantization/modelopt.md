@@ -249,7 +249,9 @@ and native or emulated NVFP4 with TP 2 and 4, Ulysses SP 2 and 4, CFG 2, and
 the pairwise TP/SP/CFG combinations, and with HSDP alone, with Ulysses SP or
 CFG, and with `hsdp_replicate_size=2`. HSDP cannot be combined with CPU offload.
 Under HSDP, NVFP4 packed weights stay replicated, so their memory does not
-shrink with the shard count.
+shrink with the shard count, except with `hsdp_weight_load_strategy="pre_sharded"`,
+which shards them like the other parameters (only scalar global scales stay
+replicated).
 
 ModelOpt FP8 routed experts (`FusedMoE` layers) follow the same schedule. On
 A16 steps, the experts are dequantized from the live FP8 weights and run with

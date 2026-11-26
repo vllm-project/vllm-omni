@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Compare full and pre-sharded Cosmos loading with real two-rank FSDP."""
+"""Compare full and pre-sharded Cosmos loading with real two-rank FSDP.
+
+Quantized variants cover what pre-sharded loading must now support: backend
+post-load processing on real weights, both for online FP8 (BF16 checkpoint)
+and a serialized ModelOpt FP8 checkpoint.
+"""
 
 from contextlib import ExitStack
 from datetime import timedelta
@@ -37,7 +42,21 @@ class _SDPAAttention(nn.Module):
         ).transpose(1, 2)
 
 
-def _load_cosmos_worker(rank, rendezvous, checkpoint_dir, edge):
+def _make_quant_config(quant):
+    if quant is None:
+        return None
+    if quant == "fp8":
+        from vllm_omni.quantization import build_quant_config
+
+        return build_quant_config("fp8")
+    if quant == "modelopt_fp8":
+        from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
+
+        return ModelOptFp8Config.from_config({"quant_method": "modelopt", "quant_algo": "FP8"})
+    raise ValueError(quant)
+
+
+def _load_cosmos_worker(rank, rendezvous, checkpoint_dir, edge, quant):
     from tests.model_executor.helpers import bootstrap_vllm_layer_custom_op_modules
 
     bootstrap_vllm_layer_custom_op_modules()
@@ -59,7 +78,10 @@ def _load_cosmos_worker(rank, rendezvous, checkpoint_dir, edge):
     dist.init_process_group("nccl", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=120))
     try:
         with ExitStack() as stack:
-            stack.enter_context(set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cuda"))))
+            vllm_config = VllmConfig(device_config=DeviceConfig(device="cuda"))
+            # Online FP8 reads the activation dtype from the model config.
+            vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
+            stack.enter_context(set_current_vllm_config(vllm_config))
             stack.enter_context(set_default_torch_dtype(torch.bfloat16))
             # HSDP spans both workers, while every vLLM linear uses TP=1.
             for module in (linear, parameter):
@@ -126,25 +148,45 @@ def _load_cosmos_worker(rank, rendezvous, checkpoint_dir, edge):
                     ]
 
                 def load_weights(self, weights):
-                    state = dict(weights)
-                    self.transformer.load_state_dict(
-                        {name.removeprefix("transformer."): t for name, t in state.items()}
-                    )
+                    # Like Cosmos3OmniDiffusersPipeline: vLLM weight loaders, not
+                    # load_state_dict, so online quantization sees every tensor.
+                    from vllm.model_executor.models.utils import AutoWeightsLoader
+
+                    loaded = AutoWeightsLoader(self).load_weights(weights)
                     self.transformer.post_load_weights()
                     self.transformer.eval()
-                    self.transformer.validate_loaded_weights(set(state))
-                    return set(state)
+                    self.transformer.validate_loaded_weights(loaded)
+                    return loaded
 
-            full = Pipeline()
+            quant_config = _make_quant_config(quant)
             if rank == 0:
+                # Serialized formats come from a model built with the checkpoint's
+                # quantization config; online FP8 quantizes a BF16 checkpoint.
+                config.quantization_config = quant_config if quant == "modelopt_fp8" else None
+                writer = Pipeline()
                 torch.manual_seed(42)
                 with torch.no_grad():
-                    for name, tensor in full.transformer.named_parameters():
-                        tensor.copy_(torch.randn_like(tensor) * 0.02)
-                        if "norm" in name:
-                            tensor.fill_(1)
-                save_file(full.transformer.state_dict(), str(Path(checkpoint_dir) / "model.safetensors"))
+                    for name, tensor in writer.transformer.named_parameters():
+                        if name.endswith("_scale"):
+                            tensor.copy_(torch.rand_like(tensor, dtype=torch.float32) * 0.01 + 0.005)
+                        elif tensor.dtype == torch.float8_e4m3fn:
+                            tensor.copy_((torch.randn(tensor.shape, device=tensor.device) * 64).to(tensor.dtype))
+                        else:
+                            tensor.copy_(torch.randn_like(tensor) * 0.02)
+                            if "norm" in name:
+                                tensor.fill_(1)
+                save_file(writer.transformer.state_dict(), str(Path(checkpoint_dir) / "model.safetensors"))
+                del writer
             dist.barrier()
+            config.quantization_config = quant_config
+
+            def build():
+                # Like _init_from_load_format: HSDP defers construction to the
+                # host only without quantization; quantized layers start on device.
+                with torch.device(device) if quant_config is not None else ExitStack():
+                    return Pipeline()
+
+            full = build()
 
             def load(model):
                 loader = DiffusersPipelineLoader(LoadConfig(), config)
@@ -153,20 +195,32 @@ def _load_cosmos_worker(rank, rendezvous, checkpoint_dir, edge):
 
             full = load(full)
             config.hsdp_weight_load_strategy = "pre_sharded"
-            pre_sharded = load(Pipeline())
+            pre_sharded = load(build())
             full_parameters = dict(full.transformer.named_parameters())
             from torch.distributed.tensor import DTensor
 
+            assert full_parameters.keys() == dict(pre_sharded.transformer.named_parameters()).keys()
+            if quant is not None:
+                # Post-load processing ran on real weights in both strategies.
+                assert any(p.dtype == torch.float8_e4m3fn for p in full_parameters.values())
             for name, actual in pre_sharded.transformer.named_parameters():
                 expected = full_parameters[name]
+                assert actual.dtype == expected.dtype, name
                 if name.startswith("time_embedder."):
                     assert not isinstance(actual, DTensor)
                     assert actual.dtype == torch.float32
+                elif actual.ndim == 0:
+                    # FSDP2 cannot shard scalars (e.g. per-tensor FP8 scales).
+                    assert not isinstance(actual, DTensor) and not isinstance(expected, DTensor), name
                 else:
-                    assert isinstance(actual, DTensor)
+                    assert isinstance(actual, DTensor), name
+                    assert isinstance(expected, DTensor), name
                     actual = actual.full_tensor()
                     expected = expected.full_tensor()
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                # FP8 has no assert_close kernel; compare the bytes.
+                if actual.dtype == torch.float8_e4m3fn:
+                    actual, expected = actual.view(torch.uint8), expected.view(torch.uint8)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=name)
             assert pre_sharded.vae.weight.device == device
             torch.testing.assert_close(pre_sharded.transformer.scratch, full.transformer.scratch)
             assert all(t.device.type != "meta" for t in pre_sharded.transformer.buffers())
@@ -191,16 +245,19 @@ def _load_cosmos_worker(rank, rendezvous, checkpoint_dir, edge):
         dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("quant", [None, "fp8", "modelopt_fp8"], ids=["bf16", "online_fp8", "modelopt_fp8"])
 @pytest.mark.parametrize("edge", [False, True], ids=["cosmos3", "cosmos3_edge"])
 @hardware_test(res={"cuda": "L4"}, num_cards=2)
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.accelerator.device_count() < 2 or not dist.is_nccl_available(),
     reason="requires two CUDA GPUs and NCCL",
 )
-def test_cosmos3_pre_sharded_matches_full_hsdp(tmp_path, edge):
+def test_cosmos3_pre_sharded_matches_full_hsdp(tmp_path, edge, quant):
+    if quant is not None and torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8 linears require compute capability 8.9 or newer")
     torch.multiprocessing.spawn(
         _load_cosmos_worker,
-        args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path), edge),
+        args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path), edge, quant),
         nprocs=2,
         join=True,
     )
