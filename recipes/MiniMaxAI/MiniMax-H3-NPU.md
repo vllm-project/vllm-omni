@@ -679,6 +679,19 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - The lossy configuration (RainFusion + INT8) is validated for T2VA and
   Ref2VA; use the lossless configuration for FL2VA or re-validate first.
 
+## Video VAE encoder tiles
+
+For reference video encoding, merge these parameters into the server's
+`--additional-config` JSON (sizes and overlap are in pixels):
+
+```bash
+--additional-config '{"video_vae_encode_tile_batch_size":4,"video_vae_encode_tile_size":288,"video_vae_encode_tile_overlap":16}'
+```
+
+The default batch size is `1`; omitted geometry uses the checkpoint values.
+Only encoder tiles are affected. The last group is not padded. Changing tile
+geometry can change conditioning latents, so validate it for your input size.
+
 ## Additional resources
 
 - [MiniMax-H3.md](MiniMax-H3.md) — full GPU guide
