@@ -135,9 +135,13 @@ class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
         layer: torch.nn.Module,
         module_name: str,
     ) -> None:
+        from vllm.platforms import current_platform
+
         weight = getattr(layer, "weight", None)
         scale = getattr(layer, "weight_scale", None)
-        if not isinstance(weight, torch.Tensor) or weight.dtype != torch.float8_e4m3fn:
+        # vLLM normalizes E4M3FN checkpoints to E4M3FNUZ on gfx942, doubling the
+        # scale, so materialize() still dequantizes the same values.
+        if not isinstance(weight, torch.Tensor) or weight.dtype != current_platform.fp8_dtype():
             dtype = getattr(weight, "dtype", None)
             raise TypeError(f"{module_name} requires a canonical FP8 weight, got {dtype}")
         if weight.ndim != 2:

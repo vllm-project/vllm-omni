@@ -305,7 +305,8 @@ def test_hunyuan_image3_fp8_moe_maps(moe_env) -> None:
         # Scale the inputs to the calibrated FP8 activation range.
         amax = 448 * checkpoint["shared_mlp.gate_and_up_proj.input_scale"].float()
         x = (torch.randn(64, config.hidden_size, generator=generator) * amax / 4).bfloat16()
-        router_logits, _ = maps.gate(x)
+        # The model routes in FP32 (shared_router_dtype); the gate weight is FP32.
+        router_logits, _ = maps.gate(x.float())
         topk_weights, topk_ids = maps.experts.router.select_experts(x, router_logits)
         dense_w13 = (torch.cat([w1_fp8, w3_fp8], dim=1).float() * w13_scale.float().reshape(-1, 1, 1)).bfloat16()
         dense_w2 = (w2_fp8.float() * w2_scale.float().reshape(-1, 1, 1)).bfloat16()
