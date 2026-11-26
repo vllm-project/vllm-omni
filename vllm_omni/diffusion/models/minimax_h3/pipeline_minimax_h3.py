@@ -699,8 +699,8 @@ def _publish_any_rank_exception(exc: Exception | None) -> None:
     ``text_encoder_tp_size`` ranks. With more than one encoder rank a
     non-zero encoder rank can fail while rank 0 succeeds, and the rank-0
     broadcast drops that failure: the surviving ranks then enter the output
-    broadcast, which every DiT rank has to join, and block there until the
-    collective times out - the same wedge as the rank-0 case.
+    broadcast, which every DiT rank has to join, without the failure - the
+    same divergence as the rank-0 case.
 
     This helper all-gathers the per-rank failure status instead, so the
     lowest failing rank owns the error and every other rank raises the same
