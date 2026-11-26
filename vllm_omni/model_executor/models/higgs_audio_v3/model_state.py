@@ -2,23 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Higgs delay-pattern sampling and owned audio output on Model Runner V2."""
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import async_tensor_h2d
-from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import HiggsAudioSamplingParams
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_sampler import OmniSampler, OmniSamplingOutput
+from vllm_omni.worker_v2.output_snapshot import RequestOutputSnapshot
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
-logger = init_logger(__name__)
+if TYPE_CHECKING:
+    from .spec_decode import HiggsAudioSpeculator
 
+logger = init_logger(__name__)
 
 _DECODE_FIELDS = ("has_codes", "last_codes", "delay_count", "eoc_countdown", "generation_done")
 
@@ -31,6 +34,13 @@ class _AudioReplay:
 
 
 class HiggsModelState(OmniModelState):
+    audio_speculator: "HiggsAudioSpeculator | None" = None
+
+    def initialize_kv_cache(self, kv_cache_config, block_tables) -> None:
+        super().initialize_kv_cache(kv_cache_config, block_tables)
+        if self.audio_speculator is not None:
+            self.audio_speculator.bind_kv_cache(kv_cache_config, block_tables)
+
     def __init__(self, vllm_config, model, encoder_cache, device):
         super().__init__(vllm_config, model, encoder_cache, device)
         model._use_external_decode_cudagraph = True
@@ -94,6 +104,13 @@ class HiggsModelState(OmniModelState):
     def add_request(self, req_index, new_req_data):
         params = new_req_data.sampling_params
         is_warmup = is_warmup_request(new_req_data.req_id)
+        if (
+            self.audio_speculator is not None
+            and not is_warmup
+            and len(new_req_data.prefill_token_ids) > len(new_req_data.prompt_token_ids or ())
+        ):
+            # Skip drafting until KV replay restores the audio state and RNG offset.
+            self.audio_speculator.single_step.add(new_req_data.req_id)
         if not is_warmup and (
             params.frequency_penalty != 0
             or params.presence_penalty != 0
@@ -152,7 +169,10 @@ class HiggsModelState(OmniModelState):
             prefix = "_state_pool_"
         audio_state = tuple(getattr(model, f"{prefix}{name}")[row].clone() for name in _DECODE_FIELDS)
         gen = self.generators.get(req_id)
+        rng = self.audio_speculator.device_rng.get(req_id) if self.audio_speculator is not None else None
         offset = gen.get_offset() if gen is not None else None
+        if rng is not None:
+            offset = int(rng[2].item())
         self.parked[req_id] = _AudioReplay(self.audio_history[req_index, :width].clone(), audio_state, offset)
 
     def on_requests_finished(self, req_ids):
@@ -178,6 +198,9 @@ class HiggsModelState(OmniModelState):
                 getattr(self.model, f"_decode_{name}")[i].copy_(value)
             if replay.rng_offset is not None:
                 self.generators[req_id].set_offset(replay.rng_offset)
+            if self.audio_speculator is not None:
+                self.audio_speculator.device_rng.pop(req_id, None)
+                self.audio_speculator.single_step.discard(req_id)
             rows.append(i)
         if rows:
             self.restored_rows = async_tensor_h2d(rows, dtype=torch.long, device=self.device)
@@ -205,11 +228,13 @@ class HiggsModelState(OmniModelState):
             return
         from .step_kernels import record_audio_history
 
+        rows = payload.get("_higgs_spec_audio")
         # Record the committed rows before MRv2 advances total_len.
         record_audio_history(
             self.audio_history,
             self.audio_history_len,
             snapshot,
+            rows,
             count,
             batch.idx_mapping,
             req_states.total_len.gpu,
@@ -226,6 +251,10 @@ class HiggsModelState(OmniModelState):
                 self.requests.pop(req_id, None)
                 self.request_slots.pop(req_id, None)
                 self.generators.pop(req_id, None)
+                if self.audio_speculator is not None:
+                    self.audio_speculator.pending.pop(req_id, None)
+                    self.audio_speculator.device_rng.pop(req_id, None)
+                    self.audio_speculator.single_step.discard(req_id)
                 self.metadata_key = None
         super().remove_request(req_index_or_id)
 
@@ -271,6 +300,8 @@ class HiggsModelState(OmniModelState):
         embeds = self._apply_audio_feedback(embeds, ids, input_batch)
         if self.replay:
             self._replace_replay_feedback(embeds, input_batch)
+        if self.audio_speculator is not None and not all(is_warmup_request(r) for r in input_batch.req_ids):
+            self.audio_speculator.prepare(self, input_batch, embeds)
         self._static_inputs_embeds[:n].copy_(embeds)
         padded = input_batch.num_tokens_after_padding
         self._static_inputs_embeds[n:padded].zero_()
@@ -317,7 +348,12 @@ class HiggsModelState(OmniModelState):
         model = self.model
         model._ensure_decode_state_capacity(n, embeds.device)
         audio = model.multimodal_embedding(model._decode_last_codes[:n]).to(embeds.dtype)
-        use_audio = model._decode_has_codes[:n] & ((qsl[1:] - qsl[:-1]) == 1)
+        lengths = qsl[1:] - qsl[:-1]
+        if input_batch.num_draft_tokens:
+            # A reserved draft slot does not change the base token's feedback.
+            drafts = async_tensor_h2d(input_batch.num_draft_tokens_per_req, device=lengths.device)
+            lengths = lengths - drafts
+        use_audio = model._decode_has_codes[:n] & (lengths == 1)
         current = embeds.index_select(0, starts)
         result = embeds.clone()
         result.index_copy_(0, starts, torch.where(use_audio[:, None], audio, current))
@@ -357,9 +393,13 @@ class HiggsModelState(OmniModelState):
         return HiggsSampler(sampler, self), None
 
     def finalize_audio_snapshot(self, payload: dict[str, Any], num_sampled: list[int]):
+        if payload and "_higgs_spec_audio" in payload:
+            codes = payload["_higgs_spec_audio"]
+            valid = payload["_higgs_audio_snapshot"][:, self.model.num_codebooks].tolist()
+            return RequestOutputSnapshot(
+                [{"codes.audio": codes[i, :n]} if valid[i] and n else None for i, n in enumerate(num_sampled)]
+            )
         if payload and "_higgs_audio_snapshot" in payload and getattr(self, "direct_payload", False):
-            from vllm_omni.worker_v2.output_snapshot import RequestOutputSnapshot
-
             snapshot = payload["_higgs_audio_snapshot"]
             if snapshot.device.type != "cpu":
                 raise RuntimeError("Higgs snapshot finalized before D2H")
@@ -381,6 +421,26 @@ class HiggsModelState(OmniModelState):
         return self.model.finalize_multimodal_outputs_from_cpu_snapshot(payload)
 
 
+def _first_logit_batch(input_batch: InputBatch) -> InputBatch:
+    """The batch as seen by a sampler given only each request's first logit row.
+
+    A request that joins while others verify drafts falls back to the text
+    sampler, whose per-row parameters must match the logits it receives.
+    """
+    first = input_batch.cu_num_logits[:-1]
+    num_reqs = input_batch.num_reqs
+    return replace(
+        input_batch,
+        expanded_idx_mapping=input_batch.idx_mapping[:num_reqs],
+        expanded_local_pos=torch.zeros_like(input_batch.expanded_local_pos[:num_reqs]),
+        logits_indices=input_batch.logits_indices[first.long()],
+        cu_num_logits=torch.arange(num_reqs + 1, dtype=first.dtype, device=first.device),
+        cu_num_logits_np=np.arange(num_reqs + 1, dtype=input_batch.cu_num_logits_np.dtype),
+        num_draft_tokens=0,
+        num_draft_tokens_per_req=None,
+    )
+
+
 class HiggsSampler(OmniSampler):
     """Higgs audio sampling registered through the upstream sampler factory."""
 
@@ -393,33 +453,64 @@ class HiggsSampler(OmniSampler):
         # penalties, with synthetic non-audio prompts. Keep that path intact.
         if all(is_warmup_request(r) for r in input_batch.req_ids):
             return super().sample_step(hidden_states, input_batch, req_states, grammar_output, standard_sample)
-        if grammar_output is not None or input_batch.num_draft_tokens:
-            raise ValueError("Higgs MRV2 does not support grammar or speculative sampling")
-        metadata = self.state.sampling_metadata(input_batch.req_ids, input_batch.idx_mapping[: input_batch.num_reqs])
+        if grammar_output is not None:
+            raise ValueError("Higgs MRV2 does not support grammar sampling")
+        state = self.state
+        speculator = state.audio_speculator
+        if input_batch.num_draft_tokens and speculator is None:
+            raise ValueError("Higgs MRV2 requires audio candidates for speculative sampling")
+        meta = state.sampling_metadata(input_batch.req_ids, input_batch.idx_mapping[: input_batch.num_reqs])
         hidden = hidden_states[input_batch.logits_indices]
-        logits = self.state.model.compute_logits(hidden, metadata)
         stock_output = None
+        noise, offsets, increment = (None, None, 0)
+        if speculator is not None:
+            noise, offsets, increment = speculator.preview_noise(state, input_batch.req_ids, hidden.device)
+        first_noise = None if noise is None else noise[0].view(-1, state.model.multimodal_embedding.vocab_size)
 
         def sample_text(text_logits):
             nonlocal stock_output
-            stock_output = self.base_sampler(text_logits, input_batch)
+            text_batch = _first_logit_batch(input_batch) if input_batch.num_draft_tokens else input_batch
+            stock_output = self.base_sampler(text_logits, text_batch)
             return stock_output.sampled_token_ids
 
-        restore = {} if self.state.restored_rows is None else {"restored_rows": self.state.restored_rows}
-        sampled = self.state.model.sample(logits, metadata, sample_text=sample_text, **restore)
+        restore = {} if state.restored_rows is None else {"restored_rows": state.restored_rows}
+        if input_batch.num_draft_tokens:
+            first = hidden[input_batch.cu_num_logits[:-1].long()]
+            logits = state.model.compute_logits(first, meta)
+            drafts = input_batch.num_draft_tokens_per_req
+            decode_rows = np.flatnonzero((drafts > 0) & (input_batch.num_scheduled_tokens == drafts + 1))
+            rows = async_tensor_h2d(decode_rows, device=hidden.device)
+            sampled = state.model.sample(
+                logits, meta, sample_text=sample_text, draft_rows=rows, audio_noise=first_noise, **restore
+            )
+        else:
+            logits = state.model.compute_logits(hidden, meta)
+            sampled = state.model.sample(logits, meta, sample_text=sample_text, audio_noise=first_noise, **restore)
+        counts = torch.ones(input_batch.num_reqs, dtype=torch.int32, device=hidden.device)
+        payload = state.model.post_sample_multimodal_outputs(
+            req_ids=input_batch.req_ids,
+            invalid_req_indices=[],
+            multimodal_outputs=None,
+        )
+        if input_batch.num_draft_tokens and speculator.batch is not None:
+            if state.model._step_audio_mode_rows == input_batch.num_reqs:
+                sampled = speculator.verify(
+                    state, hidden, sampled, counts, payload, preview=noise[1] if noise is not None else None
+                )
+            else:
+                # A mixed prefill can use the stock text sampler. Its RNG
+                # calls are outside the audio-only verification contract.
+                speculator.batch = None
+        if offsets is not None and "_higgs_audio_snapshot" in payload:
+            speculator.update_offsets(input_batch.req_ids, offsets + counts * increment)
         count, rejected = get_num_sampled_and_rejected(
-            torch.ones(input_batch.num_reqs, dtype=torch.int32, device=hidden.device),
+            counts,
             input_batch.seq_lens,
             input_batch.cu_num_logits,
             input_batch.idx_mapping,
             req_states.prefill_len.gpu,
         )
-        payload = self.state.model.post_sample_multimodal_outputs(
-            req_ids=input_batch.req_ids,
-            invalid_req_indices=[],
-            multimodal_outputs=None,
-        )
-        self.state.record_audio_history(input_batch, req_states, count, payload)
+        state.record_audio_history(input_batch, req_states, count, payload)
         output = SamplerOutput(
             sampled_token_ids=sampled,
             logprobs_tensors=None if stock_output is None else stock_output.logprobs_tensors,

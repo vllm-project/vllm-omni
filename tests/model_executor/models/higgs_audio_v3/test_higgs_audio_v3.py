@@ -762,7 +762,7 @@ class TestSamplerMethods:
         t._fast_audio_sampler_gpu_fallback_reason = C._fast_audio_sampler_gpu_fallback_reason.__get__(t)
         t._apply_audio_mode_bias_batched = C._apply_audio_mode_bias_batched.__get__(t)
         t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(2, 8, 1026)
-        t._sample_audio_codes = lambda logits, *args: torch.zeros(logits.shape[0], dtype=torch.long)
+        t._sample_audio_codes = lambda logits, *args, noise=None: torch.zeros(logits.shape[0], dtype=torch.long)
         logits = torch.zeros(2, 7)
         logits[:, 2] = 2
         seen = []
