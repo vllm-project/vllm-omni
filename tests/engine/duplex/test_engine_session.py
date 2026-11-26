@@ -851,7 +851,8 @@ def test_from_realtime_maps_wire_fields_and_stores_realtime_keys_in_extra_body()
     assert config.speed == 1.25
     assert config.max_tokens is None
     assert config.response_format == "pcm"
-    assert config.modalities == ["text", "audio"]
+    assert config.modalities is None
+    assert config.with_output_capabilities(DuplexCapabilities()).modalities == ["text", "audio"]
     assert config.extra_body["custom"] is True
     assert config.extra_body["realtime_tools"] == [{"type": "function", "name": "lookup"}]
     assert config.extra_body["realtime_tool_choice"] == "auto"
@@ -1113,7 +1114,7 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
 
     assert caps["implementation_level"] == "model_native_duplex"
     assert caps["supports_input_append"] is True
-    assert caps["input_modes"] == ["append_audio_chunk"]
+    assert caps["input_modes"] == ["append_audio_chunk", "append_text"]
     assert caps["adapter_patterns"] == ["scheduler_data_plane"]
     assert caps["supports_model_internal_state"] is True
     assert caps["requires_model_runner_kv"] is True

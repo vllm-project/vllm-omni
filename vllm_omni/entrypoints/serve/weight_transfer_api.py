@@ -74,10 +74,41 @@ async def init_weight_transfer_engine(request: Request):
 
 @router.post("/start_weight_update")
 async def start_weight_update(request: Request):
-    """Start a new weight update session across all stages."""
+    """Start a new weight update session across all stages.
+
+    Accepts either an empty body (standard upstream ``HTTPVLLMWeightSyncClient``)
+    or a JSON object ``{"update_id": "<token>"}`` for session-scoped abort recovery.
+    """
+    update_id: str | None = None
+    raw_body = await request.body()
+    if raw_body and raw_body.strip():
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError as e:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Invalid JSON format",
+            ) from e
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Request body must be a JSON object",
+            )
+        raw_update_id = body.get("update_id")
+        if raw_update_id is not None:
+            if not isinstance(raw_update_id, str) or not raw_update_id.strip():
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    detail="'update_id' must be a non-empty string",
+                )
+            update_id = raw_update_id
+
     try:
         engine = _get_engine_client(request)
-        await engine.start_weight_update()
+        if update_id is not None:
+            await engine.start_weight_update(update_id=update_id)
+        else:
+            await engine.start_weight_update()
         return JSONResponse(content={"message": "Weight update started"})
     except Exception as err:
         logger.exception("Failed to start weight update")

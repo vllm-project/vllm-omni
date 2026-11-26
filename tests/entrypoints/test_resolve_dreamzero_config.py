@@ -13,15 +13,15 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def test_dreamzero_resolves_through_registry_with_model_defaults(monkeypatch):
     monkeypatch.setattr(
         "vllm_omni.config.config_factory.StageConfigFactory._try_infer_model_type",
-        classmethod(lambda _cls, model, trust_remote_code=True: "vla"),
+        classmethod(lambda _cls, model, trust_remote_code=True, *, revision=None: "vla"),
     )
     monkeypatch.setattr(
         "vllm_omni.config.config_factory.StageConfigFactory.get_hf_config",
-        classmethod(lambda _cls, model, trust_remote_code=True: None),
+        classmethod(lambda _cls, model, trust_remote_code=True, *, revision=None: None),
     )
     monkeypatch.setattr(
         "vllm_omni.config.config_factory._looks_like_dreamzero",
-        lambda _model: True,
+        lambda _model, *, revision=None: True,
     )
 
     resolved = resolve_omni_config(

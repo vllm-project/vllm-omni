@@ -403,7 +403,7 @@ def test_serve_native_checkpoint_validation(model_class, exists, native, tmp_pat
     checkpoint = tmp_path / "anima.safetensors"
     if exists:
         checkpoint.touch()
-    argv = ["serve", str(checkpoint), "--omni"]
+    argv = ["serve", str(checkpoint), "--omni", "--revision", "pinned"]
     if model_class is not None:
         argv.extend(["--model-class-name", model_class])
     args = _parse_serve_args(argv)
@@ -416,7 +416,7 @@ def test_serve_native_checkpoint_validation(model_class, exists, native, tmp_pat
         detect_model.assert_not_called()
         validate_llm.assert_not_called()
     else:
-        detect_model.assert_called_once_with(str(checkpoint))
+        detect_model.assert_called_once_with(str(checkpoint), revision="pinned")
         validate_llm.assert_called_once_with(args)
 
 
@@ -765,6 +765,19 @@ def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
 
     assert args.ulysses_a2a_permute is True
     assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
+
+
+def test_serve_parser_accepts_ulysses_overlap_chunks() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        ["serve", "fake-model", "--omni", "--ulysses-a2a-permute", "--ulysses-overlap-chunks", "4"]
+    )
+
+    assert args.ulysses_overlap_chunks == 4
+    assert args.get_explicit_kwargs_dict()["ulysses_overlap_chunks"] == 4
 
 
 def test_serve_parser_accepts_server_level_mixfusion_flags() -> None:
