@@ -728,6 +728,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     def _minicpmo45_duplex_session_state(self, helper, session_id: str, duplex: dict[str, Any]):
         """The Stage-0 state of ``session_id``, created with its session context on first use."""
         state = helper.sessions.get(session_id)
+        runtime_config = duplex.get("runtime_config")
+        runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
         if state is None:
             from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
                 _MiniCPMO45Stage0SessionState,
@@ -737,12 +739,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             helper.sessions[session_id] = state
             session_config = duplex.get("session_config")
             session_config = dict(session_config) if isinstance(session_config, dict) else {}
-            runtime_config = duplex.get("runtime_config")
-            runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
             if hasattr(helper.thinker, "audio_past_key_values"):
                 helper.thinker.audio_past_key_values = None
             helper._configure_streaming_processor(state)
             helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
+        elif runtime_config and hasattr(helper, "_sync_session_runtime_config"):
+            helper._sync_session_runtime_config(state, runtime_config)
         return state
 
     @staticmethod

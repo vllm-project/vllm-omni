@@ -129,7 +129,13 @@ def build_sage_data_plane_prompt(
     vision_tokens = _duplex_vision_tokens(payload, tile_pixels=_duplex_vision_tile_pixels(runtime_config))
     token_budget = _sage_audio_token_budget(payload, wrap_audio_markers=wrap_audio_markers) + vision_tokens
 
-    if _duplex_payload_is_vision_only(payload):
+    if isinstance(payload, dict) and payload.get("type") == "text":
+        text_ids = payload["text_token_ids"]
+        if not isinstance(text_ids, list) or not text_ids:
+            raise ValueError("Text append requires encoded text tokens")
+        lead_tokens = duplex_first_append_context_reserve(runtime_config) if seq <= 1 else 2
+        token_budget = lead_tokens + 1 + len(text_ids)
+    elif _duplex_payload_is_vision_only(payload):
         lead_tokens = duplex_first_append_context_reserve(runtime_config) if seq <= 1 else 2
         token_budget = lead_tokens + 1 + vision_tokens
     elif seq <= 1 or first_audio_window:
@@ -162,6 +168,19 @@ def build_sage_data_plane_prompt(
     ):
         payload = {**payload, "force_listen": True}
 
+    raw_listen_scale = runtime_config.get("duplex_listen_prob_scale")
+    try:
+        listen_scale = 1.0 if raw_listen_scale is None else float(raw_listen_scale)
+    except (TypeError, ValueError):
+        listen_scale = 1.0
+    raw_listen_top_k = runtime_config.get("duplex_listen_top_k")
+    try:
+        listen_top_k = max(0, int(raw_listen_top_k)) if raw_listen_top_k is not None else 0
+    except (TypeError, ValueError):
+        listen_top_k = 0
+    if isinstance(payload, dict) and (listen_scale != 1.0 or listen_top_k > 0):
+        payload = {**payload, "listen_prob_scale": listen_scale, "listen_top_k": listen_top_k}
+
     model_fields: dict[str, object] = {"scheduler_token_id": token_id}
     if submitted_tool_result_generation is not None:
         model_fields[SAGE_SUBMITTED_TOOL_RESULT_GENERATION_KEY] = int(submitted_tool_result_generation)
@@ -190,10 +209,10 @@ def _current_unit_tokens(token_ids: list[int], special_token_ids: Mapping[str, i
         if (tid := special_token_ids.get(key)) is not None
     }
     end = len(token_ids)
-    # Ignore the current unit's own trailing terminator(s) when locating its start.
-    scan_end = end
-    while scan_end > 0 and token_ids[scan_end - 1] in terminators:
-        scan_end -= 1
+    # Ignore only the current unit's own single trailing terminator so a
+    # listen-only unit after a prior delegate unit never walks back into the
+    # previous unit.
+    scan_end = end - 1 if token_ids[end - 1] in terminators else end
     start = 0
     for idx in range(scan_end - 1, -1, -1):
         if token_ids[idx] in terminators:
@@ -520,18 +539,15 @@ class SageInteractionDuplexPlugin(MiniCPMO45DuplexPlugin):
             special_token_ids.update(_special_token_ids(output_metadata))
             delegate_id = special_token_ids.get("delegate_token_id")
             if delegate_id is not None:
-                token_ids = _completion_token_ids(completion) or list(segment_token_ids)
-                unit_ids = _current_unit_tokens(
-                    max(
-                        (
-                            token_ids,
-                            _coerce_int_list(getattr(completion, "cumulative_token_ids", None)),
-                            list(segment_token_ids),
-                        ),
-                        key=len,
-                    ),
-                    special_token_ids,
+                source_ids = (
+                    list(segment_token_ids)
+                    if segment_token_ids
+                    else (
+                        _completion_token_ids(completion)
+                        or _coerce_int_list(getattr(completion, "cumulative_token_ids", None))
+                    )
                 )
+                unit_ids = _current_unit_tokens(source_ids, special_token_ids)
                 if delegate_id in unit_ids:
                     delegate_pos = unit_ids.index(delegate_id)
                     terminators = {

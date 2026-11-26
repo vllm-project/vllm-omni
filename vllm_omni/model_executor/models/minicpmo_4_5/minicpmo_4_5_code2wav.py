@@ -553,6 +553,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be 0 or >= code2wav_min_batch_size")
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
+        self._default_prompt_missing = False
         self._default_prompt_normalized: tuple[str, str] | None = None
         self._onset_merge = read_bool_flag(extra, "cfm_onset_merge", False)
         self._cross_turn_buckets = read_bool_flag(extra, "cfm_cross_turn_buckets", False)
@@ -704,16 +705,17 @@ class MiniCPMO45Code2Wav(nn.Module):
             return entry.cache_id, entry.path, cache_key
 
         default_wav, default_cache_id = self._normalized_default_prompt()
-        resolved_wav = str(_scalar(meta.get("prompt_wav"), default_wav))
-        if not Path(resolved_wav).is_file():
+        meta_prompt_wav = _scalar(meta.get("prompt_wav"))
+        meta_prompt_cache_id = _scalar(meta.get("prompt_cache_id"))
+        if getattr(self, "_default_prompt_missing", False) and meta_prompt_wav is None and meta_prompt_cache_id is None:
             raise _batch_error(
                 "missing_ref_audio",
                 request_id=state_id,
-                prompt_wav=resolved_wav,
+                prompt_wav=default_wav,
             )
         return (
-            str(_scalar(meta.get("prompt_cache_id"), default_cache_id)),
-            resolved_wav,
+            str(default_cache_id if meta_prompt_cache_id is None else meta_prompt_cache_id),
+            str(default_wav if meta_prompt_wav is None else meta_prompt_wav),
             None,
         )
 
@@ -1855,7 +1857,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         # paths and must not trigger a hub download (#5442).
         self.model_path = _resolve_model_dir(self.model_path, self._model_revision)
         prompt_path = Path(self._default_prompt_wav)
-        if not prompt_path.is_file():
+        self._default_prompt_missing = not prompt_path.is_file()
+        if self._default_prompt_missing:
             if self._prompt_wav_override is not None:
                 raise FileNotFoundError(f"MiniCPM-o Code2Wav prompt audio not found: {prompt_path}")
             logger.warning(
@@ -2153,13 +2156,12 @@ class MiniCPMO45Code2Wav(nn.Module):
             return True
 
         precapture("HiFT", backend.precapture_hift)
-        prompt_wav, prompt_cache_id = self._normalized_default_prompt()
-        if not Path(prompt_wav).is_file():
+        if getattr(self, "_default_prompt_missing", False):
             logger.info(
-                "MiniCPM-o Code2Wav: no bundled default prompt audio at %s; skipping default-voice graph precapture",
-                prompt_wav,
+                "MiniCPM-o Code2Wav: no bundled default prompt audio; skipping default-voice graph precapture",
             )
             return
+        prompt_wav, prompt_cache_id = self._normalized_default_prompt()
         try:
             features = backend.prepare_prompt(prompt_cache_id, prompt_wav)
         except Exception:

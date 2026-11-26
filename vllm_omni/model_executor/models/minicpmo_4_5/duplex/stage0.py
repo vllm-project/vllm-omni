@@ -274,6 +274,18 @@ class MiniCPMO45Stage0DuplexRuntime:
                 )
         return processor
 
+    @staticmethod
+    def _sync_session_runtime_config(
+        state: _MiniCPMO45Stage0SessionState,
+        runtime_config: dict[str, object],
+    ) -> None:
+        if "duplex_max_speak_tokens_per_chunk" in runtime_config:
+            speak_cap = _optional_int(runtime_config.get("duplex_max_speak_tokens_per_chunk"))
+            state.max_speak_tokens_per_chunk = speak_cap if speak_cap is not None and speak_cap > 0 else None
+        if "duplex_max_delegate_query_tokens" in runtime_config:
+            delegate_cap = _optional_int(runtime_config.get("duplex_max_delegate_query_tokens"))
+            state.max_delegate_query_tokens = delegate_cap if delegate_cap is not None and delegate_cap > 0 else None
+
     def _prepare_session_context(
         self,
         state: _MiniCPMO45Stage0SessionState,
@@ -289,10 +301,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         rt = runtime_config or {}
         state.wrap_unit_audio_markers = bool(rt.get("duplex_wrap_unit_audio_markers", False))
         state.allow_speech_interruption = bool(rt.get("duplex_allow_speech_interruption", False))
-        speak_cap = _optional_int(rt.get("duplex_max_speak_tokens_per_chunk"))
-        state.max_speak_tokens_per_chunk = speak_cap if speak_cap is not None and speak_cap > 0 else None
-        delegate_cap = _optional_int(rt.get("duplex_max_delegate_query_tokens"))
-        state.max_delegate_query_tokens = delegate_cap if delegate_cap is not None and delegate_cap > 0 else None
+        self._sync_session_runtime_config(state, rt)
         if not self._stage_runtime_ready():
             return
         self._require_special_token_ids()

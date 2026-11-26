@@ -523,3 +523,242 @@ def test_llm2tts_skips_short_circuited_delegate_unit_before_speak() -> None:
     tts_inputs = llm2tts([llm_output], prompt=[{"prompt_token_ids": [151683]}], _streaming_context=streaming_ctx)
     assert len(tts_inputs) == 1
     assert list(tts_inputs[0]["model_intermediate_buffer"]["ids"]["tts"]) == [100, 101, 151717]
+
+
+def test_text_append_budget_and_listen_knobs_forwarded() -> None:
+    fence = DuplexFence(session_id="s1", epoch=1)
+    rt: dict[str, object] = {
+        "duplex_first_append_context_tokens": 50,
+        "duplex_scheduler_token_id": 151683,
+        "duplex_listen_prob_scale": 0.5,
+        "duplex_listen_top_k": 4,
+        SAGE_WRAP_AUDIO_MARKERS_KEY: True,
+    }
+    text_ids = list(range(200, 296))  # 96 tokens (> 64 fallback budget)
+
+    # First unit text append: context(50) + <unit>(1) + 96 = 147.
+    p1 = build_sage_data_plane_prompt(
+        request_id="r1",
+        fence=fence,
+        session_config={},
+        runtime_config=rt,
+        seq=1,
+        turn_seq=1,
+        payload={"type": "text", "text_token_ids": text_ids},
+        final=False,
+    )
+    assert len(p1["prompt_token_ids"]) == 50 + 1 + 96
+    payload1 = p1["model_intermediate_buffer"]["duplex"]["payload"]
+    assert payload1["listen_prob_scale"] == 0.5
+    assert payload1["listen_top_k"] == 4
+
+    # Subsequent text append with 6 prepended tool tokens: lead(2) + <unit>(1) + 96 + 6 = 105.
+    p2 = build_sage_data_plane_prompt(
+        request_id="r1",
+        fence=fence,
+        session_config={},
+        runtime_config=rt,
+        seq=2,
+        turn_seq=2,
+        payload={"type": "text", "text_token_ids": text_ids},
+        final=False,
+        prepend_text_token_ids=[151644, 1, 2, 3, 4, 151645],
+        submitted_tool_result_generation=1,
+    )
+    assert len(p2["prompt_token_ids"]) == 2 + 1 + 96 + 6
+
+    # Neutral listen knobs leave payload untouched.
+    p3 = build_sage_data_plane_prompt(
+        request_id="r1",
+        fence=fence,
+        session_config={},
+        runtime_config={"duplex_scheduler_token_id": 151683, "duplex_listen_prob_scale": 1.0, "duplex_listen_top_k": 0},
+        seq=2,
+        turn_seq=2,
+        payload={"audio": _pcm_b64(16000), "format": "pcm_f32le", "sample_rate_hz": 16000},
+        final=False,
+    )
+    payload3 = p3["model_intermediate_buffer"]["duplex"]["payload"]
+    assert "listen_prob_scale" not in payload3
+    assert "listen_top_k" not in payload3
+
+
+def test_decide_output_does_not_retrigger_delegate_on_following_listen_units() -> None:
+    plugin = SageInteractionDuplexPlugin(_encode_audio_noop)
+    tok = _FakeSageTokenizer()
+    plugin._tokenizers["/fake/sage"] = tok
+
+    query_ids = tok.encode('{"query":"weather in Tokyo"}', add_special_tokens=False)
+    delegate_unit = [151748, *query_ids, 151718]
+    specials = {
+        "listen_token_id": 151705,
+        "chunk_eos_token_id": 151718,
+        "chunk_tts_eos_token_id": 151721,
+        "unit_end_token_id": 151684,
+        "delegate_token_id": 151748,
+    }
+
+    def _make_output(token_ids: list[int], cumulative_ids: list[int], stop_reason: int) -> OmniRequestOutput:
+        completion = SimpleNamespace(
+            token_ids=token_ids,
+            cumulative_token_ids=cumulative_ids,
+            text="",
+            stop_reason=stop_reason,
+        )
+        return OmniRequestOutput(
+            request_id="req-repeat",
+            stage_id=0,
+            final_output_type="text",
+            outputs=[completion],
+            finished=True,
+        )
+
+    # 1. Delegate unit emits delegate DIRECT_RESPONSE.
+    out_delegate = _make_output(delegate_unit, delegate_unit, 151718)
+    dec1 = plugin.decide_output(
+        stage_id=0,
+        final_stage_id=2,
+        segment_finished=True,
+        segment_token_ids=tuple(delegate_unit),
+        segment_output_metadata={"special_token_ids": specials},
+        output=out_delegate,
+    )
+    assert dec1 is not None
+    assert dec1.metadata["duplex_native_decision"] == "delegate"
+
+    # 2. Listen-only unit after delegate (even when cumulative IDs are passed) must resolve to listen.
+    cum_listen_1 = [*delegate_unit, 151705]
+    for seg_ids in ((151705,), tuple(cum_listen_1)):
+        out_listen = _make_output(cum_listen_1, cum_listen_1, 151705)
+        dec_listen = plugin.decide_output(
+            stage_id=0,
+            final_stage_id=2,
+            segment_finished=True,
+            segment_token_ids=seg_ids,
+            segment_output_metadata={"special_token_ids": specials},
+            output=out_listen,
+        )
+        assert dec_listen is not None
+        assert dec_listen.action == DuplexOutputAction.DIRECT_RESPONSE
+        assert dec_listen.metadata["duplex_native_decision"] == "listen"
+
+    # 3. Second consecutive listen-only unit after delegate also stays listen.
+    cum_listen_2 = [*delegate_unit, 151705, 151705]
+    out_listen_2 = _make_output(cum_listen_2, cum_listen_2, 151705)
+    dec_listen_2 = plugin.decide_output(
+        stage_id=0,
+        final_stage_id=2,
+        segment_finished=True,
+        segment_token_ids=tuple(cum_listen_2),
+        segment_output_metadata={"special_token_ids": specials},
+        output=out_listen_2,
+    )
+    assert dec_listen_2 is not None
+    assert dec_listen_2.metadata["duplex_native_decision"] == "listen"
+
+    # 4. Speak unit after delegate + listens forwards to Talker (returns None).
+    speak_unit = [151706, 200, 201, 151718]
+    cum_speak = [*cum_listen_2, *speak_unit]
+    out_speak = _make_output(speak_unit, cum_speak, 151718)
+    dec_speak = plugin.decide_output(
+        stage_id=0,
+        final_stage_id=2,
+        segment_finished=True,
+        segment_token_ids=tuple(speak_unit),
+        segment_output_metadata={"special_token_ids": specials},
+        output=out_speak,
+    )
+    assert dec_speak is None
+
+
+def test_session_update_syncs_speak_cap_without_clobbering_delegate_cap() -> None:
+    plugin = SageInteractionDuplexPlugin(_encode_audio_noop)
+    tok = _FakeSageTokenizer()
+    plugin._tokenizers["/fake/sage"] = tok
+    model_config = SimpleNamespace(model="/fake/sage", revision=None)
+
+    cfg = DuplexSessionConfig(modalities=("text",), max_tokens=20)
+    rt = asyncio.run(plugin.prepare_runtime_config(cfg, model_config=model_config))
+    assert rt[SAGE_MAX_SPEAK_TOKENS_KEY] == 20
+    assert rt[SAGE_MAX_DELEGATE_TOKENS_KEY] == 256
+
+    embed = torch.nn.Embedding(151750, 8)
+    fake_thinker = SimpleNamespace(parameters=lambda: iter([embed.weight]), get_input_embeddings=lambda: embed)
+    fake_processor = SimpleNamespace(
+        tokenizer=tok,
+        get_streaming_chunk_size=lambda: 16000,
+        process_audio_streaming=lambda audio, **kw: {"audio_features": torch.zeros(1, 80, 100)},
+    )
+    stage_model = SimpleNamespace(
+        thinker=fake_thinker,
+        processor=fake_processor,
+        tokenizer=tok,
+        config=SimpleNamespace(),
+    )
+    helper = MiniCPMO45Stage0DuplexRuntime(stage_model, device="cpu")
+    model = object.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model._minicpmo45_duplex_data_plane_helper = helper
+    model._minicpmo45_tokenizer_cache = tok
+
+    # First lookup creates the Stage 0 session state with cap=20.
+    state = model._minicpmo45_duplex_session_state(helper, "s-upd", {"session_config": {}, "runtime_config": rt})
+    assert state.max_speak_tokens_per_chunk == 20
+    assert state.max_delegate_query_tokens == 256
+
+    # session.update lowers max_tokens to 5 while keeping delegate cap at 256.
+    cfg_updated = DuplexSessionConfig(modalities=("text",), max_tokens=5, instructions=cfg.instructions)
+    rt_updated = plugin.runtime_config_for_update(cfg_updated, rt)
+    assert rt_updated[SAGE_MAX_SPEAK_TOKENS_KEY] == 5
+    assert rt_updated[SAGE_MAX_DELEGATE_TOKENS_KEY] == 256
+
+    state2 = model._minicpmo45_duplex_session_state(
+        helper,
+        "s-upd",
+        {"session_config": {}, "runtime_config": rt_updated},
+    )
+    assert state2 is state
+    assert state.max_speak_tokens_per_chunk == 5
+    assert state.max_delegate_query_tokens == 256
+
+    # Verify the sampler enforces the updated speak cap (5) while leaving delegate uncapped.
+    model._minicpmo45_duplex_row_sessions = {0: "s-upd", 1: "s-upd"}
+    model._minicpmo45_duplex_row_payloads = {0: {}, 1: {}}
+    model._minicpmo45_duplex_row_max_tokens = {0: 256, 1: 256}
+    token_ids = MiniCPMO45DuplexPolicy.token_ids_from_tokenizer(tok)
+    recent = {
+        0: [token_ids["speak_token_id"], 200, 201, 202],  # 4 tokens >= 5 - 1 -> capped
+        1: [token_ids["delegate_token_id"], *([200] * 10)],  # delegate unit -> uncapped
+    }
+    capped = model._minicpmo45_duplex_capped_rows([0, 1], recent, token_ids)
+    assert 0 in capped
+    assert 1 not in capped
+
+
+def test_code2wav_resolve_prompt_only_errors_when_default_missing_at_load() -> None:
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
+
+    model = object.__new__(MiniCPMO45Code2Wav)
+    model._request_prompt_keys = {}
+    model._runtime_prompts = {}
+    model._default_prompt_id = "HT_ref_audio"
+    model._prompt_wav_override = None
+    model.model_path = "/nonexistent/model"
+    model._default_prompt_normalized = ("/nonexistent/model/assets/HT_ref_audio.wav", "HT_ref_audio")
+
+    # Stock contract: _default_prompt_missing=False does not stat or fail on stub paths.
+    model._default_prompt_missing = False
+    cache_id, wav_path, key = model._resolve_prompt("req-stock", {}, {}, None)
+    assert cache_id == "HT_ref_audio"
+    assert wav_path == "/nonexistent/model/assets/HT_ref_audio.wav"
+    assert key is None
+
+    # Sage fallback: _default_prompt_missing=True fails cleanly when request brings no prompt/cache id.
+    model._default_prompt_missing = True
+    with pytest.raises(RuntimeError, match="missing_ref_audio"):
+        model._resolve_prompt("req-sage", {}, {}, None)
+
+    # Request carrying an explicit prompt_cache_id or prompt_wav is still allowed.
+    cache_id2, _, _ = model._resolve_prompt("req-cached", {}, {"prompt_cache_id": "cached_voice"}, None)
+    assert cache_id2 == "cached_voice"
+    _, wav_path2, _ = model._resolve_prompt("req-wav", {}, {"prompt_wav": "/custom/voice.wav"}, None)
+    assert wav_path2 == "/custom/voice.wav"
