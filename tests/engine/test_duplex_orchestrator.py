@@ -56,8 +56,15 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState, build_engine_core_request_from_tokens
-from vllm_omni.engine.stage_pool import StageUnavailableError
+from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import MiniCPMO45Stage0DuplexRuntime
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+    MiniCPMO45CarriedWindows,
+    MiniCPMO45SchedulerWindowPolicy,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -129,6 +136,7 @@ def _open_message(
     *,
     output_buffer: DuplexOutputBuffer | None = None,
     session_id: str = SESSION_ID,
+    modalities: tuple[str, ...] = ("text",),
 ) -> OpenDuplexSessionMessage:
     return OpenDuplexSessionMessage(
         control_id=f"open-{session_id}",
@@ -136,7 +144,7 @@ def _open_message(
         output_buffer=output_buffer or DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
         session_config=DuplexSessionConfig(
             model="openbmb/MiniCPM-o-4_5",
-            modalities=["text"],
+            modalities=list(modalities),
             instructions="public instructions",
             extra_body={"auto_response": True, **(extra_body or {})},
         ),
@@ -437,6 +445,52 @@ async def test_append_submits_the_resumable_stage0_request_and_counts_it_running
     assert counter.value == 0
 
 
+@pytest.mark.asyncio
+async def test_resumable_append_refreshes_stage_submit_ts(monkeypatch) -> None:
+    """A later append on the same request id must not keep the first segment's clock."""
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.time", lambda: clock["now"])
+    orchestrator, _, rpc_q, _ = _build()
+    await _open(orchestrator, rpc_q)
+    request_id = _stage0_request_id()
+
+    await _submit(orchestrator, _append_audio())
+    request_state = orchestrator.request_states[request_id]
+    assert request_state.stage_submit_ts[0] == pytest.approx(1_000.0)
+
+    clock["now"] = 5_000.0
+    await _submit(orchestrator, _append_audio())
+    assert request_state.stage_submit_ts[0] == pytest.approx(5_000.0)
+
+    await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_duplex_submit_excludes_llm_send_wait(monkeypatch) -> None:
+    """Duplex LLM submit() starts the stage clock after a delayed send, not before."""
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.time", lambda: clock["now"])
+    seen_at_submit: list[float] = []
+    orchestrator, _, rpc_q, _ = _build()
+    await _open(orchestrator, rpc_q)
+    request_id = _stage0_request_id()
+    pool = orchestrator.stage_pools[0]
+    original = pool.submit_initial
+
+    async def delayed_submit_initial(req_id, req_state, request, **kwargs):
+        seen_at_submit.append(req_state.stage_submit_ts.get(0, -1.0))
+        clock["now"] = 1_500.0
+        return await original(req_id, req_state, request, **kwargs)
+
+    pool.submit_initial = delayed_submit_initial
+    await _submit(orchestrator, _append_audio())
+    request_state = orchestrator.request_states[request_id]
+    assert seen_at_submit == [-1.0]
+    assert request_state.stage_submit_ts[0] == pytest.approx(1_500.0)
+
+    await orchestrator.session_manager.shutdown()
+
+
 @pytest.fixture
 def ephemeral_submissions(mocker):
     orchestrator, clients, _, _ = _build(stages=2)
@@ -535,6 +589,24 @@ async def test_ephemeral_prewarm_does_not_hold_stage_input_lock(ephemeral_submis
     finally:
         first.cancel()
         await asyncio.gather(first, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_prewarm_follows_plugin_choice(ephemeral_submissions, mocker):
+    orchestrator, clients, submissions, _ = ephemeral_submissions
+    orchestrator.async_chunk = True
+    # "first" stands for a turn that can never reach the downstream stages.
+    mocker.patch.object(
+        orchestrator.plugin, "prewarms_downstream_stages", side_effect=lambda request_id: request_id != "first"
+    )
+    prewarm = mocker.patch.object(orchestrator, "_prewarm_async_chunk_stages", return_value=True)
+
+    assert (await orchestrator.submit(submissions[0])).request_id == "first"
+    assert (await orchestrator.submit(submissions[1])).request_id == "second"
+
+    # Stage0 still gets both requests; only the downstream prewarm is skipped.
+    assert [args[0].request_id for args in clients[0].add_request_calls] == ["first", "second"]
+    assert [call.args[0] for call in prewarm.call_args_list] == ["second"]
 
 
 @pytest.mark.asyncio
@@ -675,6 +747,32 @@ async def test_session_owned_outputs_reach_the_runner_and_never_the_client_queue
 
 
 @pytest.mark.asyncio
+async def test_text_continuation_uses_model_turn_snapshot_before_handoff() -> None:
+    orchestrator, _, rpc_q, output_q = _build(stages=2)
+    await _open(orchestrator, rpc_q)
+    try:
+        await _submit(orchestrator, _append_audio())
+        request_id = _stage0_request_id()
+        request_state = orchestrator.request_states[request_id]
+        bridge = request_state.streaming.bridge_states["duplex"]
+        bridge["model_turn_id"] = 1
+        output = _tts_output(request_id)
+        output.finished = False
+        output.multimodal_output = {"duplex_text_input": True}
+        assert not await orchestrator._intercept_stage_output(0, 0, output, request_state, None, None)
+        # The bridge can advance immediately, before the runner mailbox drains.
+        bridge["model_turn_id"] = 2
+        await _settle(orchestrator)
+        runner = orchestrator.session_manager.runner_for_request_id(request_id)
+        assert runner is not None
+        assert runner.run.partial_input_continuation_turn == (0, 1)
+        assert runner.session.active_response_id is None
+        assert output_q.empty()
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_streaming_segment_stop_keeps_response_open_until_real_terminal(mocker) -> None:
     """Codec segment EOS must not close the duplex response before the real stop."""
     orchestrator, _, rpc_q, output_q = _build(stages=2)
@@ -808,6 +906,8 @@ async def test_terminal_stage_error_closes_session_before_another_append(mocker,
         events = [await output_buffer.get() for _ in range(output_buffer.pending_events)]
         events.extend(output_q.get_nowait().event for _ in range(output_q.qsize()))
         types = [event.type for event in events]
+        (error,) = [event for event in events if event.type == "error"]
+        assert error.code == "context_length_exceeded" and error.message == reason
         assert types.index("error") < types.index("session.expired")
         assert types[-1] == "session.expired"
         # A request-local failure must release admission without evicting the replica.
@@ -1315,6 +1415,64 @@ def _placement_config(**kwargs) -> DuplexSessionRuntimeConfig:
     )
 
 
+@pytest.mark.parametrize("groups", [None, [{0: 0}, {0: 1}]], ids=["implicit", "explicit"])
+@pytest.mark.asyncio
+async def test_least_sessions_skips_replica_that_exited_before_ready(groups) -> None:
+    # StageRuntime leaves a hole for replica 0 when it exits before READY.
+    survivor = FakeStageClient(final_output=True)
+    pool = StagePool(
+        0,
+        [None, survivor],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=_stage_configs(1)[0],
+    )
+    orchestrator = DuplexOrchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+        plugin=MiniCPMO45DuplexPlugin(_encode_audio),
+        duplex_session_config=_placement_config(replica_groups=groups),
+    )
+    try:
+        assert (await _open(orchestrator, orchestrator.rpc_async_queue)).ok
+        await _submit(orchestrator, _append_audio())
+        assert survivor.add_request_calls
+        request = survivor.add_request_calls[0][0]
+        assert request.request_id == _stage0_request_id()
+        assert pool.get_bound_replica_id(request.request_id) == 1
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("groups", [None, [{0: 0, 1: 0}, {0: 1, 1: 1}]], ids=["implicit", "explicit"])
+async def test_crossed_startup_failures_respect_session_groups(groups) -> None:
+    pools = [StagePool(0, [None, FakeStageClient()]), StagePool(1, [FakeStageClient(final_output=True), None])]
+    rpc: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
+    orchestrator = DuplexOrchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=rpc,
+        stage_pools=pools,
+        plugin=MiniCPMO45DuplexPlugin(_encode_audio),
+        duplex_session_config=_placement_config(replica_groups=groups),
+    )
+    try:
+        result = await _open(orchestrator, rpc)
+        if groups is None:
+            assert result.ok
+            assert [orchestrator.replica_placement.route(SESSION_ID, stage) for stage in (0, 1)] == [1, 0]
+        else:
+            assert not result.ok and result.error_code == "replica_unavailable"
+            assert not result.error_retryable
+            snapshot = orchestrator.replica_placement.snapshot()
+            assert snapshot["groups"] == groups
+            assert not snapshot["sessions"]
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_payload_sender_info_binds_from_explicit_session_state(monkeypatch) -> None:
     orchestrator, _, rpc_q, _ = _build(replicas=2, runtime_config=_placement_config(replica_groups=[{0: 1}, {0: 0}]))
@@ -1537,6 +1695,168 @@ async def test_failed_initial_submit_evicts_session_replica_after_binding_rollba
         assert set(orchestrator.session_manager.runners) == {"healthy"}
         assert not orchestrator.stage_pools[failing_stage].is_replica_available(0)
         assert (failing_stage, 0) in orchestrator.replica_placement.snapshot()["unavailable"]
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+def _enable_managed_windows(orchestrator, mocker):
+    pool = orchestrator.stage_pools[0]
+    pool.stage_vllm_config.model_config.scheduler_window_policy = (
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
+    )
+    for client in pool.clients:
+        client.resources = SimpleNamespace(engine_manager=object())
+        client.call_utility_async = mocker.AsyncMock()
+    return pool
+
+
+@pytest.mark.asyncio
+async def test_sage_uses_its_stage0_route_without_a_window_replay_lease(mocker):
+    from vllm_omni.model_executor.models.sage_interaction.duplex.plugin import SageInteractionDuplexPlugin
+
+    orchestrator, _, rpc_q, _ = _build(stages=3, replicas=2, plugin=SageInteractionDuplexPlugin(_encode_audio))
+    pool = _enable_managed_windows(orchestrator, mocker)
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        await _submit(orchestrator, _append_audio())
+        (submitted,) = [args[0] for client in pool.clients for args in client.add_request_calls]
+        duplex = submitted.model_intermediate_buffer["duplex"]
+        assert duplex["session_window_replay"] is False
+        assert "session_window_owned" not in duplex
+        assert SESSION_ID not in orchestrator._window_replicas
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_managed_window_follows_cancelled_epoch_and_releases_both_copies(mocker):
+    orchestrator, _, rpc_q, _ = _build(stages=2, replicas=2)
+    pool = _enable_managed_windows(orchestrator, mocker)
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        await _submit(orchestrator, _append_audio())
+        index, owner = orchestrator._window_replicas[SESSION_ID]
+        first = _stage0_request_id()
+        await orchestrator._intercept_stage_output(
+            1, 0, _tts_output(first), orchestrator.request_states[first], None, None
+        )
+        await _settle(orchestrator)
+        session = orchestrator.session_manager.get(SESSION_ID)
+        assert session.active_response_id
+        await _submit(orchestrator, commands.CancelResponse(response_id=session.active_response_id))
+        await _submit(orchestrator, _append_audio())
+        second = _stage0_request_id(1)
+        assert [args[0].request_id for args in owner.add_request_calls] == [first, second]
+        assert all(
+            args[0].model_intermediate_buffer["duplex"]["session_window_owned"] for args in owner.add_request_calls
+        )
+        assert not pool.clients[1 - index].add_request_calls
+
+        policy = MiniCPMO45SchedulerWindowPolicy()
+        policy.carry = MiniCPMO45CarriedWindows()
+        policy.carry.windows.update({SESSION_ID: {}, "sibling": {}})
+        helper = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+        sibling_req = duplex_resource_request_id(DuplexFence("sibling"), "stage0")
+        helper._replay_sources = {SESSION_ID: first, "sibling": sibling_req}
+        helper._replay_windows = {first: object(), second: object(), sibling_req: object()}
+        helper._handed_window_units = {}
+        helper._carried_window_units = {}
+        model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+        model._minicpmo45_duplex_data_plane_helper = helper
+        worker = SimpleNamespace(model_runner=SimpleNamespace(get_model=lambda: model))
+        core = StageEngineCoreProc.__new__(StageEngineCoreProc)
+        core.scheduler = SimpleNamespace(_window_policy=policy)
+        core.model_executor = SimpleNamespace(collective_rpc=lambda fn, args: [fn(worker, *args)])
+
+        # Replace transport only: dispatch the actual utility method on the core.
+        def utility(method, *args):
+            return getattr(core, method)(*args)
+
+        owner.call_utility_async.side_effect = utility
+        assert (await _close(orchestrator, rpc_q)).ok
+        owner.call_utility_async.assert_any_await("omni_release_session_window", SESSION_ID)
+        assert set(policy.carry.windows) == set(helper._replay_sources) == {"sibling"}
+        assert set(helper._replay_windows) == {sibling_req}
+        assert SESSION_ID not in orchestrator._window_replicas
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_dies", [False, True])
+async def test_managed_window_release_timeout_and_owner_retirement(mocker, monkeypatch, owner_dies):
+    orchestrator, _, rpc_q, _ = _build(replicas=2, runtime_config=_placement_config(replica_groups=[{0: 0}, {0: 1}]))
+    pool = _enable_managed_windows(orchestrator, mocker)
+    ack = asyncio.Event()
+
+    async def delayed_release(method, *args):
+        if method == "omni_release_session_window":
+            await ack.wait()
+
+    try:
+        manager = orchestrator.session_manager
+        assert (await _open(orchestrator, rpc_q)).ok
+        assert (await _open(orchestrator, rpc_q, session_id="healthy")).ok
+        await _submit(orchestrator, _append_audio())
+        await _submit(orchestrator, _append_audio(), session_id="healthy")
+        index, owner = orchestrator._window_replicas[SESSION_ID]
+        owner.call_utility_async.side_effect = delayed_release
+        monkeypatch.setattr(pool, "RELEASE_RPC_TIMEOUT_S", 0.02)
+        assert (await _close(orchestrator, rpc_q)).ok
+        assert SESSION_ID in manager._closing
+        assert SESSION_ID in orchestrator.replica_placement.snapshot()["sessions"]
+        pending = orchestrator._window_releases[SESSION_ID]
+        if owner_dies:
+            await orchestrator._handle_dead_replica(0, index, EngineDeadError("owner died during close"))
+        else:
+            ack.set()
+        await manager.reap_expired()
+        done, _ = await asyncio.wait((pending,), timeout=1)
+        assert pending in done and pending.cancelled() == owner_dies
+        assert SESSION_ID not in manager._closing
+        assert SESSION_ID not in orchestrator._window_releases
+        assert SESSION_ID not in orchestrator._window_replicas
+        assert set(orchestrator.replica_placement.snapshot()["sessions"]) == {"healthy"}
+        assert [call.args for call in owner.call_utility_async.await_args_list].count(
+            ("omni_release_session_window", SESSION_ID)
+        ) == 1
+        await _submit(orchestrator, _append_audio(), session_id="healthy")
+        assert "healthy" in manager.runners
+    finally:
+        ack.set()
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_managed_window_owner_failure_expires_only_its_session(mocker):
+    # Legacy placement has no session reservation to identify the failed owner.
+    orchestrator, _, rpc_q, output_q = _build(replicas=2, runtime_config=DuplexSessionRuntimeConfig(max_sessions=2))
+    pool = _enable_managed_windows(orchestrator, mocker)
+    buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    try:
+        assert (await _open(orchestrator, rpc_q, output_buffer=buffer)).ok
+        assert (await _open(orchestrator, rpc_q, session_id="healthy")).ok
+        await _submit(orchestrator, _append_audio())
+        await _submit(orchestrator, _append_audio(), session_id="healthy")
+        index, owner = orchestrator._window_replicas[SESSION_ID]
+        healthy_owner = orchestrator._window_replicas["healthy"]
+        assert healthy_owner[0] != index
+        await orchestrator._handle_dead_replica(0, index, EngineDeadError("window owner failed"))
+        await _settle(orchestrator)
+        await orchestrator.session_manager.reap_expired()
+        assert set(orchestrator.session_manager.runners) == {"healthy"}
+        assert orchestrator._window_replicas == {"healthy": healthy_owner}
+        assert not pool.is_replica_available(index)
+        events = [await buffer.get() for _ in range(buffer.pending_events)]
+        while not output_q.empty():
+            message = output_q.get_nowait()
+            if isinstance(message, DuplexSessionEventMessage):
+                events.append(message.event)
+        assert any(event.type == "error" and event.code == "replica_unavailable" for event in events)
+        assert sum(event.type == "session.expired" and event.session_id == SESSION_ID for event in events) == 1
+        assert ("omni_release_session_window", SESSION_ID) not in [
+            call.args for call in owner.call_utility_async.await_args_list
+        ]
     finally:
         await orchestrator.session_manager.shutdown()
 

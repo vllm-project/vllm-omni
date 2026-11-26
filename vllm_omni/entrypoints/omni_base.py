@@ -78,7 +78,7 @@ def _weak_shutdown_engine(engine: OmniEngineBase) -> None:
         pass
 
 
-def omni_snapshot_download(model_id: str) -> str:
+def omni_snapshot_download(model_id: str, *, revision: str | None = None) -> str:
     if os.path.exists(model_id):
         return model_id
 
@@ -99,13 +99,15 @@ def omni_snapshot_download(model_id: str) -> str:
     if envs.VLLM_USE_MODELSCOPE:
         from modelscope.hub.snapshot_download import snapshot_download
 
+        if revision is not None:
+            return snapshot_download(model_id, revision=revision)
         return snapshot_download(model_id)
 
     # Modular Diffusers repositories describe independently loadable
     # components. Let the selected pipeline download only its component
     # sources instead of eagerly materializing the entire repository.
     try:
-        if file_or_path_exists(model_id, "modular_model_index.json", revision=None):
+        if file_or_path_exists(model_id, "modular_model_index.json", revision=revision):
             return model_id
     except (huggingface_hub.errors.GatedRepoError, huggingface_hub.errors.RepositoryNotFoundError):
         # Preserve the more helpful errors raised by the full-download path.
@@ -116,6 +118,7 @@ def omni_snapshot_download(model_id: str) -> str:
             model_name_or_path=model_id,
             cache_dir=None,
             allow_patterns=["*"],
+            revision=revision,
             require_all=True,
         )
     except huggingface_hub.errors.GatedRepoError:
@@ -202,8 +205,8 @@ class OmniBase(PDDisaggregationMixin):
 
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
-        model = omni_snapshot_download(model)
-        self.__dict__["_name"] = self.__class__.__name__
+        model = omni_snapshot_download(model, revision=kwargs.get("revision"))
+        self._initialize_output_state()
         self.model = model
         self.log_stats = log_stats
         self.collect_stage_metrics = collect_stage_metrics
@@ -242,7 +245,6 @@ class OmniBase(PDDisaggregationMixin):
         # (explicit ``False``) is not fallen-back-through by ``or``.
         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
-        self.request_states: dict[str, ClientRequestState] = {}
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
@@ -263,6 +265,11 @@ class OmniBase(PDDisaggregationMixin):
 
         # PD disaggregation state (detects if a prefill/decode stage pair is configured)
         self._init_pd_state()
+
+    def _initialize_output_state(self) -> None:
+        """Bookkeeping shared by generation and session-only frontends."""
+        self.__dict__["_name"] = self.__class__.__name__
+        self.request_states: dict[str, ClientRequestState] = {}
 
     def _create_engine(self, **engine_kwargs: Any) -> OmniEngineBase:
         """Construct this entrypoint's engine (``AsyncOmniEngine`` for turn-based use)."""

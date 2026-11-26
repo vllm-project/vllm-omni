@@ -49,7 +49,7 @@ def _first_request_images(outputs) -> list:
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": ["L4", "B200"]})
+@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"})
 def test_qwen_image_autoround_w4a16_load():
     """Load the W4A16 quantized Qwen-Image model and run a minimal generation.
 
@@ -71,7 +71,7 @@ def test_qwen_image_autoround_w4a16_load():
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": ["L4", "B200"]})
+@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"})
 def test_qwen_image_autoround_w4a16_generate():
     """Full generation: 512×512, 20 steps, CFG=5.0.
 
@@ -95,7 +95,14 @@ def test_qwen_image_autoround_w4a16_generate():
         img = images[0]
 
         # Save for manual inspection
-        output_path = Path(__file__).resolve().parents[4] / "ar_coffee_full.png"
+        output_dir = Path(
+            os.environ.get(
+                "QWEN_IMAGE_AUTOROUND_ARTIFACT_DIR",
+                Path(__file__).resolve().parents[4],
+            )
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / "ar_coffee_full.png"
         img.save(str(output_path))
 
         assert img.width == WIDTH and img.height == HEIGHT

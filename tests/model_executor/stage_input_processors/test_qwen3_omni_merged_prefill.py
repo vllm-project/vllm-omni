@@ -49,6 +49,7 @@ class _Manager:
     def __init__(self) -> None:
         self.put_req_chunk: defaultdict[str, int] = defaultdict(int)
         self.request_payload: dict[str, dict] = {}
+        self.uses_dflash = False
         self._pending_streaming_prefills: dict[str, dict] = {}
         self.config = SimpleNamespace(
             hf_config=SimpleNamespace(
@@ -245,3 +246,69 @@ def test_talker_prefill_without_marker_needs_hidden_states():
     span = torch.zeros(len(PROMPT) + 1, TALKER_HIDDEN, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="hidden_states.output"), torch.no_grad():
         _model().talker_preprocess_prefill(None, span, merged)
+
+
+def test_resumable_dflash_rebuilds_prefill_and_keeps_only_committed_rows():
+    manager = _Manager()
+    manager.uses_dflash = True
+    prompt = [IM_START, USER, NL, 13, IM_END, NL, IM_START, ASSISTANT, NL]
+    embeds, hidden, _, tts = _thinker_rows(prompt)
+    for segment in range(2):
+        first = FIRST_TOKEN + 10 * segment
+        history = PROMPT if segment else []
+        req = _request([first], resumable=True, prompt=history + prompt)
+        for start, end in ((0, 4), (4, len(prompt))):
+            prefill = {
+                "hidden_states": {"layers": {0: embeds[start:end], ACCEPT: hidden[start:end]}},
+                "embed": {f"tts_{name}": value for name, value in tts.items()},
+            }
+            assert q3.thinker2talker_async_chunk(manager, prefill, req) is None
+
+        tokens = [first, first + 1, first + 2, first + 3]
+        rows = torch.arange(4 * THINKER_HIDDEN, dtype=embeds.dtype).reshape(4, THINKER_HIDDEN)
+        span = {
+            "hidden_states": {"layers": {0: rows}},
+            "meta": {"decode_span": True, "committed_token_count": len(tokens)},
+            "ids": {"output": tokens},
+        }
+        chunk = q3.thinker2talker_async_chunk(
+            manager,
+            span,
+            req,
+            is_finished=True,
+            new_token_ids=tokens[1:3],
+        )
+        assert chunk.ids.prompt == prompt
+        assert chunk.ids.all == prompt + [first]
+        assert chunk.meta.next_stage_prompt_len == 15
+        assert chunk.meta.resumable and chunk.meta.decode_span
+        assert torch.equal(chunk.embed.prefill[-1], rows[0])
+        assert torch.equal(chunk.embed.decode, rows[1:2])
+        assert chunk.meta.committed_token_count == 2
+        assert not manager._pending_streaming_prefills
+        manager.put_req_chunk["r"] += 1
+
+
+def test_native_dflash_continuation_uses_confirmed_count_without_token_history():
+    manager = _Manager()
+    manager.put_req_chunk["r"] = 2
+    request = _request([])
+    request.output_token_count = 6
+    request.output_stopped = True
+    request.sampled_token_ids = [101, 102, IM_END]
+    embeds = torch.arange(4).reshape(4, 1)
+    chunk = q3.thinker2talker_async_chunk(
+        manager,
+        {
+            "hidden_states": {"layers": {0: embeds}},
+            "meta": {"decode_span": True, "committed_token_count": 4},
+            "ids": {"output": [101, 102, IM_END, 103]},
+        },
+        request,
+    )
+
+    assert chunk is not None and chunk.embed is not None and chunk.ids is not None
+    assert chunk.ids.output == [101, 102]
+    assert chunk.embed.decode_token_start == 3
+    assert chunk.embed.decode_token_end == 5
+    torch.testing.assert_close(chunk.embed.decode, embeds[:2])

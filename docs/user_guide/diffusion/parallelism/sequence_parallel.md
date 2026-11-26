@@ -241,8 +241,10 @@ In `DiffusionParallelConfig`:
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
 
 On CUDA, set `ulysses_a2a_permute=True` (CLI: `--ulysses-a2a-permute`) to use CE.
-This requires `ulysses_mode="strict"`, `ulysses_degree > 1`, and peer-accessible
-GPUs on one NVLink-connected node.
+This requires `ulysses_mode="strict"`, `ulysses_degree > 1`, and GPUs on one node
+with CUDA peer access between every pair: NVLink, or PCIe with P2P enabled
+(check with `nvidia-smi topo -p2p r`). The link type changes performance, not
+correctness.
 
 ```bash
 vllm serve Qwen/Qwen-Image --omni --ulysses-degree 2 --ulysses-a2a-permute
@@ -265,6 +267,19 @@ On NPU, the flag retains the existing
 - Small images (<1024px) - overhead exceeds benefit, use single GPU with cache instead
 
 ---
+
+## Compiling FA4 Ring attention
+
+On Blackwell, Ring prefers vLLM's bundled FlashAttention dispatcher. When it
+selects FA4, compiled Ring uses the bundled FA4 kernel. Ring can also use
+standalone CuTe FA4 when the bundled dispatcher is unavailable.
+
+With `torch.compile` enabled and PyTorch 2.14 or newer, set the following before
+starting workers to enable experimental native P2P compilation:
+
+```bash
+export TORCHDYNAMO_ENABLE_P2P_COMPILATION=1
+```
 
 ## Troubleshooting
 

@@ -67,29 +67,35 @@ def covered_scenes(transcript: str, scenes: list[dict]) -> list[int]:
     return covered
 
 
-def evaluate_session(transcript: str, events: list[dict], scenes: list[dict]) -> dict:
+def evaluate_session(
+    transcript: str,
+    events: list[dict],
+    scenes: list[dict],
+    *,
+    forced_response_windows: list[tuple[int, int]] | None = None,
+) -> dict:
     covered = covered_scenes(transcript, scenes)
     missing = [scene["scene"] for scene in scenes if scene["scene"] not in covered]
     created: list[str] = []
     done: list[str] = []
     errors = []
-    # The fixture streams one turn and commits once, so the last commit is the
-    # forced one and the window matches the driver's committed_index. A
-    # multi-commit session would need this to key off the same commit the
-    # driver's final create answered, not simply the last one.
-    last_commit_index = max(
-        (index for index, event in enumerate(events) if event.get("type") == "input_audio_buffer.committed"),
-        default=-1,
-    )
+    if forced_response_windows is None:
+        last_commit = max(
+            (i for i, event in enumerate(events) if event.get("type") == "input_audio_buffer.committed"),
+            default=-1,
+        )
+        forced_response_windows = [(last_commit, len(events))] if last_commit >= 0 else []
+    for start, end in forced_response_windows:
+        if not (0 <= start < end <= len(events)) or events[start].get("type") != "input_audio_buffer.committed":
+            raise ValueError("Forced-response windows must start at an acknowledged commit")
     for index, event in enumerate(events):
         kind = event.get("type", "")
         if kind in {"error", "client.timeout", "client.error"}:
-            # A definitive refusal that answered a create after the commit is
-            # the protocol working as intended (the model already answered
-            # every scene and only trailing silence was retained). One that
-            # predates the commit came from another ask and stays a protocol
-            # error.
-            if kind == "error" and index > last_commit_index and ErrorEvent(event).code in DEFINITIVE_REFUSAL_CODES:
+            if (
+                kind == "error"
+                and ErrorEvent(event).code in DEFINITIVE_REFUSAL_CODES
+                and any(start < index < end for start, end in forced_response_windows)
+            ):
                 continue
             errors.append(event)
         if kind in {"response.created", "response.done"}:

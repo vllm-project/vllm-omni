@@ -83,7 +83,7 @@ def test_npu_host_lengths_preserve_gather_without_device_readback(monkeypatch, b
         torch.testing.assert_close(v, expected_v)
         return (_dense_attention(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))[0],)
 
-    provider.npu_fusion_attention = attention
+    setattr(provider, "npu_fusion_attention", attention)  # stand-in torch_npu module
     monkeypatch.setitem(sys.modules, "torch_npu", provider)
     kwargs = dict(
         block_table=table,

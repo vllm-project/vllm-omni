@@ -135,6 +135,7 @@ class GenerateSampleResult:
     audio_bytes: int = 0
     audio_sample_rate: int = 24_000
     error: str = ""
+    generated: bool = True
 
 
 @dataclass(frozen=True)
@@ -761,6 +762,7 @@ async def generate_sample(
     clock: str = "media",
     overwrite: bool = False,
     unit_ms: int = 1000,
+    collect_stage_metrics: bool = False,
     prepared: PreparedSample | None = None,
     defer_artifacts: bool = False,
     additional_headers: dict[str, str] | None = None,
@@ -801,7 +803,7 @@ async def generate_sample(
             raise ValueError(
                 f"existing response {output} has no chunk times; pass --overwrite or choose another response directory"
             )
-        return GenerateSampleResult(output=output)
+        return GenerateSampleResult(output=output, generated=False)
     if prepared is not None and prepared.mix != mix:
         raise ValueError(f"prepared input uses mix={prepared.mix!r}, not {mix!r}")
     if server_turns:
@@ -839,6 +841,8 @@ async def generate_sample(
     stats_event_id: str | None = None
     input_committed = False
     stream_start: float | None = None
+    if collect_stage_metrics:
+        extra_body = {**(extra_body or {}), "return_stage_metrics": True}
     async with client:
         await client.configure(
             model,
@@ -847,6 +851,8 @@ async def generate_sample(
             extra_body=extra_body,
             auto_response=not server_turns,
             turn_detection=session_turn_detection(turn_detection),
+            # Use the deployment default; a text-only deployment rejects audio.
+            modalities=None,
         )
         frame_transport = select_frame_transport(_session_capabilities(client))
         if not server_turns:
@@ -1074,7 +1080,13 @@ async def generate_sample(
             finished.add(response.get("id"))
             # Barge-in cancels an individual turn, not the input clip. Its
             # preceding responses and already emitted text remain judge input.
-            if response.get("status", "completed") not in {"completed", "cancelled"}:
+            status = response.get("status", "completed")
+            details = response.get("status_details")
+            # A reply stopped at the continuation limit keeps the text it already emitted.
+            at_limit = (
+                status == "incomplete" and isinstance(details, dict) and details.get("reason") == "continuation_limit"
+            )
+            if status not in {"completed", "cancelled"} and not at_limit:
                 errors.append(f"Response did not complete: {response}")
     # A turn may be created while closing the continuous session. Record this
     # boundary in metadata; drain/close timeouts and server errors above still
