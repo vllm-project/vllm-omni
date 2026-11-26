@@ -6,6 +6,9 @@
 Run through the shared GPU scheduler with fresh worker processes.
 """
 
+from types import MethodType, SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -21,7 +24,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.local_model, *hardware_marks(res={"cuda": "H100"}, num_cards=2)]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "H100"}, num_cards=2)]
 
 
 def _attention(q, k, v):
@@ -34,19 +37,9 @@ def _attention(q, k, v):
 
 
 def _check_uneven(group, device, rank):
-    from vllm_omni.diffusion.attention.parallel.ulysses_ce_overlap import (
-        CEOverlapUlysses,
-        PreparationError,
-        prepare_local,
-    )
-
-    def fail_one_rank():
-        if rank == 1:
-            raise torch.OutOfMemoryError("injected before rendezvous")
-        return 1
-
-    with pytest.raises(PreparationError, match="injected"):
-        prepare_local(fail_one_rank, group.cpu_group)
+    from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
+    from vllm_omni.diffusion.attention.parallel.head_overlap import head_policy
+    from vllm_omni.diffusion.attention.parallel.ulysses_ce_overlap import CEOverlapUlysses
 
     plan = CEOverlapUlysses(group.ulysses_group, device=device)
     s, h, d = 127, 16, 64
@@ -55,6 +48,43 @@ def _check_uneven(group, device, rank):
     torch.manual_seed(101 + rank)
     packed = torch.randn(1, s, 3, h, d, device=device, dtype=torch.bfloat16)
     inputs = packed.unbind(2)
+    # A recoverable OOM on just one rank is voted on before the symmetric
+    # rendezvous. Both ranks can still use native collectives afterwards.
+    policy = head_policy.HeadPolicy(group.cpu_group, 120)
+    strategy = SimpleNamespace(_sp_group=group, _ulysses_pg=group.ulysses_group, head_layer_name="self")
+    layer = SimpleNamespace(
+        causal=False,
+        softmax_scale=d**-0.5,
+        borrow_ulysses_output=False,
+        effective_attention=lambda: (None, FlashAttentionBackend, None),
+        _with_kv_cache_dtype=lambda md: md,
+    )
+    layer._run_local_attention = MethodType(lambda self, q, k, v, md: _attention(q, k, v), layer)
+
+    def prepare(*args):
+        if rank:
+            raise torch.OutOfMemoryError("injected before rendezvous")
+        return head_policy.HeadPolicy._prepare(*args)
+
+    with (
+        patch.object(head_policy, "candidate", return_value=(((8,), (3, 5)), 0)),
+        patch.object(policy, "_prepare", prepare),
+    ):
+        policy.begin_component(None, (), {})
+        assert policy.try_run(strategy, layer, *inputs, None) is None
+        policy.finish_component(None, (), None)
+    assert not policy.pending and not next(iter(policy.layouts.values())).selected
+    # Other callers may retain views across any number of later calls.
+    trial = next(iter(policy.layouts.values()))
+    plan._configure(s, h, d, (3, 5), packed.dtype)
+    trial.plan, trial.selected = plan, True
+    policy.begin_component(None, (), {})
+    retained = policy.try_run(strategy, layer, *inputs, None)[:, :3]
+    copy = retained.clone()
+    for scale in (0.5, -1.0, 2.0):
+        scaled = (packed * scale).unbind(2)
+        policy.try_run(strategy, layer, *scaled, None)
+    torch.testing.assert_close(retained, copy, rtol=0, atol=0)
     peers = [torch.empty_like(packed) for _ in range(2)]
     dist.all_gather(peers, packed, group=group.ulysses_group)
     q, k, v = torch.cat(peers, dim=1).unbind(2)

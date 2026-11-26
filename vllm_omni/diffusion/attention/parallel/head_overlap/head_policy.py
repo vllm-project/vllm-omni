@@ -111,6 +111,7 @@ def frozen_graph_policy(original_context):
 class Trial:
     widths: tuple
     tail_rows: int
+    signature: tuple = ()
     example: tuple = ()
     observations: dict = field(default_factory=dict)
     timers: list = field(default_factory=list)
@@ -152,10 +153,9 @@ class HeadPolicy:
         )
 
         self.slots = {}
-        if not frozen:
-            for name, key in self.routes.items():
-                trial = self.layouts[key]
-                if key in self.pending and trial.seen < _UNTIMED + _SAMPLES:
+        if self.pending and not frozen:
+            for name, trial in self.routes.items():
+                if trial.selected is None and trial.seen < _UNTIMED + _SAMPLES:
                     index = trial.seen - _UNTIMED
                     trial.seen += 1
                     if index >= 0:
@@ -164,6 +164,9 @@ class HeadPolicy:
     def try_run(self, strategy, layer, q, k, v, md):
         """Return None to execute the normal attention path, including native CE."""
         name = strategy.head_layer_name
+        trial = self.routes.get(name)
+        if self.discovery is None and (trial is None or trial.plan is None):
+            return None
         if q.ndim != 4 or q.shape[0] != 1 or not q.is_cuda or q.dtype != torch.bfloat16:
             return None
         world = strategy._sp_group.ulysses_world_size
@@ -207,21 +210,22 @@ class HeadPolicy:
                 return None
         # Each owner is bound to one device, process group and installed BF16 FA3 backend.
         # A cached signature describes every participating Q/K/V layout, including the prefix KV.
-        signature = (
-            world,
-            tuple(tensor_spec(x) for x in (q, k, v)),
-            tuple(tensor_spec(x) for x in joint),
-            md.joint_strategy if joint else None,
-            md.video_layout.latent_grid if md is not None and md.video_layout else None,
-            layer.softmax_scale,
-            layer.borrow_ulysses_output,
-        )
-        trial = self.layouts.get(signature)
+        placement = md.joint_strategy if joint else None
+        grid = md.video_layout.latent_grid if md is not None and md.video_layout else None
         if self.discovery is not None:
-            trial = trial or self.discovered.get(signature)
+            signature = (
+                world,
+                tuple(tensor_spec(x) for x in (q, k, v)),
+                tuple(tensor_spec(x) for x in joint),
+                placement,
+                grid,
+                layer.softmax_scale,
+                layer.borrow_ulysses_output,
+            )
+            trial = self.layouts.get(signature) or self.discovered.get(signature)
             if trial is None and len(self.layouts) + len(self.discovered) < 16:
                 choices, tail = candidate(q.shape[2] // world, q.shape[1] * world, world, self.sms)
-                trial = self.discovered[signature] = Trial(choices[-1], tail)
+                trial = self.discovered[signature] = Trial(choices[-1], tail, signature)
                 if len(choices) == 1:
                     trial.selected = False
                 else:
@@ -229,7 +233,17 @@ class HeadPolicy:
             if trial is not None:
                 self.discovery.append((name, signature))
             return None
-        if self.routes.get(name) != signature or trial is None or trial.plan is None:
+        # All admitted tensors have batch one, dense heads, BF16 and the same
+        # device. Validate the variable geometry without rebuilding/hashing the
+        # discovery signature or recursively walking the metadata every layer.
+        _, input_specs, joint_specs, expected_placement, expected_grid, _, _ = trial.signature
+        if (
+            q.shape != input_specs[0][0]
+            or placement != expected_placement
+            or grid != expected_grid
+            or any(x.stride(1) != spec[1][1] for x, spec in zip((q, k, v), input_specs))
+            or any(x.shape != spec[0] or x.stride(1) != spec[1][1] for x, spec in zip(joint, joint_specs))
+        ):
             return None
 
         kernel = layer._run_local_attention
@@ -277,7 +291,7 @@ class HeadPolicy:
             # ranks derive the entire next component schedule from this table.
             names = Counter(name for name, _ in order)
             visits = {name: key for name, key in order if agreed and names[name] == 1}
-            self.visits[self.component_key] = visits
+            self.visits[self.component_key] = {name: trials[key] for name, key in visits.items()}
             keys = self.component_layouts[self.component_key] = tuple(dict.fromkeys(visits.values()))
             for key in keys:
                 trial = self.layouts.setdefault(key, trials[key])
