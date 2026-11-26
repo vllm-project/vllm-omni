@@ -7,7 +7,7 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from enum import Enum
-from typing import Protocol, get_args
+from typing import Protocol, cast, get_args
 
 import torch
 import torch.nn as nn
@@ -156,7 +156,8 @@ class LoRAManager:
             lora_loader: Optional instance-scoped adapter loader. A pipeline may
                 alternatively expose ``diffusion_lora_loader`` during worker
                 initialization. The default preserves filesystem loading and
-                pipeline-owned loader hooks.
+                pipeline-owned loader hooks. The caller retains ownership of an
+                injected loader; this manager never closes it.
         """
         self.pipeline = pipeline
         self.device = device
@@ -194,16 +195,18 @@ class LoRAManager:
         self._expected_lora_modules = self._expand_expected_modules_for_moe(self._expected_lora_modules)
         # A custom pipeline can supply its loader during worker initialization;
         # direct manager users can override it explicitly at construction time.
-        pipeline_loader = getattr(pipeline, "diffusion_lora_loader", None)
-        self._lora_loader = (
-            lora_loader
-            or pipeline_loader
-            or FilesystemLoRALoader(
+        selected_loader = lora_loader
+        if selected_loader is None:
+            selected_loader = getattr(pipeline, "diffusion_lora_loader", None)
+        if selected_loader is None:
+            selected_loader = FilesystemLoRALoader(
                 pipeline=self.pipeline,
-                expected_lora_modules=list(self._expected_lora_modules),
+                expected_lora_modules=self._expected_lora_modules,
                 dtype=self.dtype,
             )
-        )
+        if not callable(getattr(selected_loader, "load", None)):
+            raise TypeError("lora_loader must provide a callable load(request) method")
+        self._lora_loader = cast(LoRALoader, selected_loader)
 
         # LRU-style cache management
         self.max_cached_adapters = max_cached_adapters  # max_cpu_loras

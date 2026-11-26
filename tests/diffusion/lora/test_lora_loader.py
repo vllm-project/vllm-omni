@@ -89,7 +89,7 @@ def test_default_loader_preserves_pipeline_owned_loader(monkeypatch: pytest.Monk
     from_dir.assert_not_called()
 
 
-def test_pipeline_can_supply_loader_during_worker_initialization():
+def test_pipeline_can_expose_loader_to_manager():
     pipeline = _pipeline()
     pipeline.diffusion_lora_loader = Mock()
     pipeline.diffusion_lora_loader.load.return_value = _loaded_adapter()
@@ -117,3 +117,27 @@ def test_custom_loaders_are_instance_scoped_and_can_supply_memory_adapters():
     first_loader.load.assert_called_once_with(first_request)
     second_loader.load.assert_called_once_with(second_request)
     assert first_manager._lora_loader is not second_manager._lora_loader
+
+
+@pytest.mark.parametrize("source", ["constructor", "pipeline"])
+def test_invalid_loader_fails_at_construction(source: str):
+    pipeline = _pipeline()
+    loader = object()
+    kwargs = {}
+    if source == "pipeline":
+        pipeline.diffusion_lora_loader = loader
+    else:
+        kwargs["lora_loader"] = loader
+
+    with pytest.raises(TypeError, match="callable load"):
+        DiffusionLoRAManager(pipeline, torch.device("cpu"), torch.bfloat16, **kwargs)
+
+
+def test_manager_close_does_not_close_caller_owned_loader():
+    loader = Mock()
+    manager = DiffusionLoRAManager(_pipeline(), torch.device("cpu"), torch.bfloat16, lora_loader=loader)
+
+    manager.close()
+    manager.close()
+
+    loader.close.assert_not_called()

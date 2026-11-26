@@ -4,10 +4,13 @@
 from typing import Protocol
 
 import torch
+from vllm.logger import init_logger
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
+
+logger = init_logger(__name__)
 
 
 class LoRALoader(Protocol):
@@ -16,6 +19,10 @@ class LoRALoader(Protocol):
     Implementations may keep adapter source state, such as in-memory tensors,
     in the loader instance. The manager remains responsible for validation,
     layer binding, scaling, and adapter lifecycle.
+
+    The caller retains ownership of an injected loader and its resources.
+    LoRAManager never closes it. Pipeline-supplied loaders follow the owning
+    pipeline/worker lifecycle and may be reused across manager reinitialization.
     """
 
     def load(self, lora_request: LoRARequest) -> tuple[LoRAModel, PEFTHelper]:
@@ -30,7 +37,7 @@ class FilesystemLoRALoader:
         self,
         *,
         pipeline: object,
-        expected_lora_modules: list[str],
+        expected_lora_modules: set[str],
         dtype: torch.dtype,
     ) -> None:
         self._pipeline = pipeline
@@ -39,6 +46,7 @@ class FilesystemLoRALoader:
 
     def load(self, lora_request: LoRARequest) -> tuple[LoRAModel, PEFTHelper]:
         lora_path = get_adapter_absolute_path(lora_request.lora_path)
+        logger.debug("Resolved LoRA path: %s", lora_path)
         model_loader = getattr(self._pipeline, "_load_diffusion_lora_adapter", None)
         loaded = None
         if callable(model_loader):
