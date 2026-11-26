@@ -142,6 +142,7 @@ class _MiniCPMO45Stage0SessionState(MiniCPMO45TurnState):
     context_suffix_token_ids: list[int] = field(default_factory=list)
     window_units: list[_MiniCPMO45WindowUnit] = field(default_factory=list)
     window_enabled: bool = False
+    restored_context: _MiniCPMO45WindowUnit | None = None
     window_previous_ids: list[int] = field(default_factory=list)
     window_previous_marker: list[int] = field(default_factory=list)
     pending_window_unit: _MiniCPMO45WindowUnit | None = None
@@ -564,6 +565,80 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.current_turn_ended = False
             state.pending_speech_response_open = True
 
+    def restore_completed_turns(
+        self,
+        state: _MiniCPMO45Stage0SessionState,
+        turns: list[dict[str, Any]],
+        token_budget: int,
+    ) -> None:
+        """Build a silent prefill prefix using normalized media and settled assistant text."""
+        restored = _MiniCPMO45WindowUnit()
+        replay = None
+        previous_epoch = None
+        for turn in turns:
+            user_only = turn.get("user_only") is True
+            if replay is None or previous_epoch != turn["epoch"] or user_only:
+                # Keep the live media encoder on its fresh request clock.
+                replay = _MiniCPMO45Stage0SessionState(session_id=state.session_id)
+                previous_epoch = turn["epoch"]
+            for payload in turn["inputs"]:
+                result = self._stage_prefill_embeddings_only(
+                    replay,
+                    self._decode_audio_payload(payload),
+                    input_text_token_ids=payload.get("text_token_ids"),
+                    video_frames=self._decode_video_frames_payload(payload),
+                    force_listen=True,
+                )
+                if result["success"] is not True:
+                    raise ValueError(f"MiniCPM-o could not restore a completed input: {result['reason']}")
+                restored.embeds.append(result["inputs_embeds"])
+                restored.token_ids.extend(result["input_token_ids"])
+                replay.pending_terminator_token = self.listen_token_id
+            suffix = (
+                [self.listen_token_id, self.unit_end_token_id]
+                if user_only
+                else [
+                    self.tts_bos_token_id,
+                    *turn["response_token_ids"],
+                    self.turn_eos_token_id,
+                    self.chunk_tts_eos_token_id,
+                    self.unit_end_token_id,
+                ]
+            )
+            restored.embeds.extend(self._embed_token(token_id) for token_id in suffix)
+            restored.token_ids.extend(suffix)
+            # The response already closed the final unit. Subsequent input in
+            # this historical epoch uses the same encoder, but opens a new unit.
+            replay.audio_chunk_idx = 0
+            replay.pending_terminator_token = None
+        padding = token_budget - len(restored.token_ids)
+        if padding < 0:
+            raise ValueError(
+                f"MiniCPM-o completed context requires {len(restored.token_ids)} tokens, reserved {token_budget}"
+            )
+        if padding:
+            pad_id = self.stage_padding_token_id()
+            pad = self._embed_token(pad_id)
+            restored.embeds[:0] = [pad] * padding
+            restored.token_ids[:0] = [pad_id] * padding
+        state.restored_context = restored
+        if replay is not None and turns[-1].get("resumes_audio_window") is True:
+            # The user's accepted input is already on this encoder's time line.
+            state.streaming_processor = replay.streaming_processor
+            state.audio_buffer = replay.audio_buffer
+            state.audio_encoder_chunk_idx = replay.audio_encoder_chunk_idx
+            state.audio_past_key_values = replay.audio_past_key_values
+        if turns:
+            logger.info(
+                "MiniCPM-o restored %d completed response(s), %d interrupted user turn(s), "
+                "%d media unit(s), %d prefix tokens, session=%s",
+                sum(not turn.get("user_only") for turn in turns),
+                sum(turn.get("user_only") is True for turn in turns),
+                sum(len(turn["inputs"]) for turn in turns),
+                token_budget,
+                state.session_id,
+            )
+
     def _stage_prefill_embeddings_only(self, state, audio_waveform, **kwargs: Any) -> dict[str, object]:
         """Run :meth:`_stage_prefill_steps` for one append, encoding its units one at a time."""
         return self._run_prefill_steps([self._stage_prefill_steps(state, audio_waveform, **kwargs)])[0]
@@ -734,6 +809,9 @@ class MiniCPMO45Stage0DuplexRuntime:
         if state.audio_chunk_idx == 0 and state.context_embeds:
             embed_parts.extend(state.context_embeds)
             token_ids.extend(state.context_token_ids)
+        if state.audio_chunk_idx == 0 and (restored := state.restored_context) is not None:
+            embed_parts.extend(restored.embeds)
+            token_ids.extend(restored.token_ids)
 
         # Consume every complete processor chunk in the buffer so the appended
         # span and the scheduler's slot reservation agree exactly. The serving
@@ -849,10 +927,13 @@ class MiniCPMO45Stage0DuplexRuntime:
             units_built += 1
             if state.window_enabled:
                 if state.pending_window_unit is None:
-                    state.pending_window_unit = _MiniCPMO45WindowUnit()
+                    state.pending_window_unit = state.restored_context or _MiniCPMO45WindowUnit()
+                state.restored_context = None
                 state.pending_window_unit.embeds.extend(embed_parts[unit_embed_start:])
                 state.pending_window_unit.token_ids.extend(token_ids[unit_token_start:])
             chunk_size = self._streaming_chunk_size(processor)
+        if units_built:
+            state.restored_context = None
         if text_token_ids and units_built:
             # Official mixed-mode prefill puts <backend> text after the media
             # and samples from its final token, in the same resident KV.

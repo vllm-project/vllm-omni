@@ -87,6 +87,7 @@ def _copy_list(value: object) -> list[object] | None:
 @dataclass
 class InputBufferState:
     commit_seq: int = 0
+    clear_seq: int = 0
     overlap_speech_ms: int = 0
     reserved_input_bytes: int = 0
     queued_input_bytes: int = 0
@@ -499,6 +500,10 @@ class DuplexEngineSession:
     @property
     def input_commit_seq(self) -> int:
         return self._input.commit_seq
+
+    @property
+    def input_clear_seq(self) -> int:
+        return self._input.clear_seq
 
     @property
     def history(self) -> tuple[dict[str, object], ...]:
@@ -970,6 +975,7 @@ class DuplexEngineSession:
     def cancel_pending_input(self) -> dict[str, int]:
         """Drop processed input reservations, not appends still queued in the mailbox."""
         cancelled = {"text_chunks": 0, "audio_chunks": 0}
+        self._input.clear_seq += 1
         self.release_buffered_input_bytes()
         self._input.pending_turns = 0
         self.turn_state = DuplexTurnState.IDLE

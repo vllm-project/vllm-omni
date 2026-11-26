@@ -40,6 +40,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     APPEND_TEXT_TOKEN_IDS_KEY,
+    REPLAY_CONTEXT_KEY,
     MiniCPMO45DuplexPolicy,
     record_turn_sample,
 )
@@ -819,7 +820,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             helper._configure_streaming_processor(state)
             helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
             restore_window_units = getattr(helper, "restore_window_units", None)
-            if restore_window_units is not None:
+            if replay := duplex.get(REPLAY_CONTEXT_KEY):
+                helper.restore_completed_turns(state, replay, duplex["duplex_replay_token_budget"])
+            elif restore_window_units is not None:
                 restore_window_units(state)
         elif runtime_config and hasattr(helper, "_sync_session_runtime_config"):
             helper._sync_session_runtime_config(state, runtime_config)

@@ -343,6 +343,9 @@ class ModelChannel:
         session = self._ctx.session
         # Session stats: the chunk's in-engine interval starts when its append is taken up.
         accepted_ns = session.perf.now_ns() if session.perf is not None else 0
+        # A final residual belongs to the current commit. Live units await the next one.
+        input_commit_seq = session.input_commit_seq + (0 if final else 1)
+        input_clear_seq = session.input_clear_seq
         if self._ctx.stage_port.stage_count == 0:
             raise RuntimeError("duplex_data_plane_has_no_stage")
         fence = helpers.append_fence(session, payload)
@@ -548,6 +551,10 @@ class ModelChannel:
                 update = session.commit_append(reservation)
                 session.bind_stage_request(stage_id, request_id, fence=fence)
                 self._ctx.plugin.commit_append_plan(request_id)
+                if final or input_clear_seq == session.input_clear_seq:
+                    self._ctx.plugin.observe_submitted_append(
+                        state=self._ctx.model_state, fence=fence, prompt=prompt, input_commit_seq=input_commit_seq
+                    )
             except BaseException:
                 if perf is not None and perf_chunk is not None:
                     perf.drop_chunk(perf_chunk)
@@ -1224,7 +1231,9 @@ class ModelChannel:
                         session.complete_model_turn(completed_turn_id)
             continuation_limited = auto_response and ended_turn_id is None and not auto_continuations_remaining
             should_commit = not continuation_limited and self.should_commit_response_to_history(session, response_id)
-            committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
+            committed_message = self._end_completed_response(
+                response_id, should_commit=should_commit, preserve_request=auto_response
+            )
             committed = self._settle_finished_response(
                 session,
                 response_id,
@@ -1765,7 +1774,9 @@ class ModelChannel:
                 if not auto_response:
                     data_plane.mark_terminal(data_plane_request_id)
             should_commit = self.should_commit_response_to_history(session, response_id)
-            committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
+            committed_message = self._end_completed_response(
+                response_id, should_commit=should_commit, preserve_request=auto_response
+            )
             committed = self._settle_finished_response(
                 session,
                 response_id,
@@ -1791,6 +1802,21 @@ class ModelChannel:
                 abort_prewarmed=model_result.get("abort_data_plane_request") is True,
             )
         return close_reason, emitted_response
+
+    def _end_completed_response(
+        self, response_id: str | None, *, should_commit: bool, preserve_request: bool
+    ) -> dict[str, object] | None:
+        session = self._ctx.session
+        if should_commit and response_id is not None:
+            turn_id = session.active_response_turn_id
+            fence = DuplexFence(session.session_id, session.epoch, session.turn_id if turn_id is None else turn_id)
+            self._ctx.plugin.observe_response_end(
+                state=self._ctx.model_state,
+                fence=fence,
+                response_id=response_id,
+                completed=True,
+            )
+        return session.end_response(commit_text=should_commit, preserve_request=preserve_request)
 
     def _settle_finished_response(self, session, response_id, *, should_commit: bool, committed_message) -> bool:
         """Store the final history before reconciling an ACK received earlier."""
@@ -1829,7 +1855,9 @@ class ModelChannel:
             return
         session.complete_model_turn(int(model_turn_id) - 1)
         should_commit = self.should_commit_response_to_history(session, response_id)
-        committed_message = session.end_response(commit_text=should_commit, preserve_request=True)
+        committed_message = self._end_completed_response(
+            response_id, should_commit=should_commit, preserve_request=True
+        )
         committed = self._settle_finished_response(
             session,
             response_id,
@@ -2064,7 +2092,9 @@ class ModelChannel:
             model_state.clear_continuation()
             if response_id is not None and not session.response_has_draining_request(response_id):
                 should_commit = self.should_commit_response_to_history(session, response_id)
-                committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
+                committed_message = self._end_completed_response(
+                    response_id, should_commit=should_commit, preserve_request=auto_response
+                )
                 committed = self._settle_finished_response(
                     session,
                     response_id,

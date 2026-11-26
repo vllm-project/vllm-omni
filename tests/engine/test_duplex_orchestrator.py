@@ -1729,9 +1729,19 @@ async def test_sage_uses_its_stage0_route_without_a_window_replay_lease(mocker):
 
 
 @pytest.mark.asyncio
-async def test_managed_window_follows_cancelled_epoch_and_releases_both_copies(mocker):
+@pytest.mark.parametrize("use_committed_history", [False, True])
+async def test_managed_window_follows_cancelled_epoch_and_releases_both_copies(mocker, use_committed_history):
     orchestrator, _, rpc_q, _ = _build(stages=2, replicas=2)
     pool = _enable_managed_windows(orchestrator, mocker)
+    plan_append = orchestrator.plugin.prepare_append_plan
+
+    async def prepare_append(**kwargs):
+        plan = await plan_append(**kwargs)
+        if use_committed_history and kwargs["fence"].epoch:
+            plan.prompt["model_intermediate_buffer"]["duplex"]["session_window_replay"] = False
+        return plan
+
+    mocker.patch.object(orchestrator.plugin, "prepare_append_plan", prepare_append)
     try:
         assert (await _open(orchestrator, rpc_q)).ok
         await _submit(orchestrator, _append_audio())
@@ -1747,9 +1757,9 @@ async def test_managed_window_follows_cancelled_epoch_and_releases_both_copies(m
         await _submit(orchestrator, _append_audio())
         second = _stage0_request_id(1)
         assert [args[0].request_id for args in owner.add_request_calls] == [first, second]
-        assert all(
-            args[0].model_intermediate_buffer["duplex"]["session_window_owned"] for args in owner.add_request_calls
-        )
+        first_duplex, second_duplex = [args[0].model_intermediate_buffer["duplex"] for args in owner.add_request_calls]
+        assert first_duplex["session_window_owned"]
+        assert second_duplex.get("session_window_owned", False) is not use_committed_history
         assert not pool.clients[1 - index].add_request_calls
 
         policy = MiniCPMO45SchedulerWindowPolicy()

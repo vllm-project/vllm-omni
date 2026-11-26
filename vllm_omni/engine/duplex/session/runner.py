@@ -71,6 +71,7 @@ from vllm_omni.engine.duplex.config import (
     resolve_tool_result_timeout_s,
 )
 from vllm_omni.engine.duplex.contracts import (
+    DuplexFence,
     DuplexOutputContext,
     DuplexOutputDecision,
     DuplexStagePort,
@@ -1367,6 +1368,7 @@ class DuplexSessionRunner:
         model_state.clear_committed_audio()
         self.memory.forget_committed_input()
         session.cancel_pending_input()
+        self.plugin.observe_input_clear(state=model_state)
         # A clear starts a new turn: drop the detector's speech (and semantic
         # pause) state too, or a later stop would commit the cleared turn.
         self.control.reset_vad()
@@ -1382,6 +1384,19 @@ class DuplexSessionRunner:
 
     def emit(self, payload: dict[str, object]) -> None:
         """Apply an internal event to the session, project it, and send it."""
+        if payload.get("type") == "input.committed":
+            item_id = payload.get("realtime_item_id")
+            turn_id = payload.get("turn_id")
+            if isinstance(item_id, str) and isinstance(turn_id, int) and payload.get("epoch") == self.session.epoch:
+                sources = self.session.user_source_ids_for_items((item_id,))
+                if sources and not payload.get("empty"):
+                    self.plugin.observe_committed_input(
+                        state=self.ctx.model_state,
+                        fence=DuplexFence(self.session.session_id, self.session.epoch, turn_id),
+                        item_id=item_id,
+                        source_id=sources[0],
+                        input_commit_seq=self.session.input_commit_seq,
+                    )
         self.out.emit(payload)
 
     def _emit_events(self, events: list[DuplexEvent]) -> None:
@@ -2872,6 +2887,12 @@ class DuplexSessionRunner:
         audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
         # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
         self.run.concurrent_turn_requests_released = False
+        if old_response_id is not None:
+            turn_id = session.active_response_turn_id
+            fence = session.fence if turn_id is None else DuplexFence(session.session_id, old_epoch, turn_id)
+            self.plugin.observe_response_end(
+                state=self.ctx.model_state, fence=fence, response_id=old_response_id, completed=False
+            )
         should_commit = self.model.should_commit_response_to_history(session, old_response_id)
         committed_message = session.end_response(
             commit_text=should_commit,

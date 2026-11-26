@@ -831,22 +831,18 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 and isinstance(getattr(model_config, "scheduler_window_policy", None), str)
                 and duplex_window_replay_enabled(submission.prompt.get("model_intermediate_buffer"))
             )
-            if keeps_window:
-                owner = self._window_replicas.get(context.session_id)
-                if owner is not None:
-                    pinned_replica_id, client = owner
-                    if pool.clients[pinned_replica_id] is not client or not pool.is_replica_available(
-                        pinned_replica_id
-                    ):
-                        raise StageUnavailableError(f"duplex window owner for {context.session_id} is unavailable")
-                else:
-                    if pinned_replica_id is None:
-                        pinned_replica_id = await pool.pick(context.request_id)
-                    client = pool.clients[pinned_replica_id]
-                    # Independently managed workers may outlive a detached client.
-                    # Only a process this deployment owns can hold a durable lease.
-                    if getattr(getattr(client, "resources", None), "engine_manager", None) is not None:
-                        self._window_replicas[context.session_id] = (pinned_replica_id, client)
+            owner = self._window_replicas.get(context.session_id) if context.stage_id == 0 else None
+            if owner is not None:
+                pinned_replica_id, client = owner
+                if pool.clients[pinned_replica_id] is not client or not pool.is_replica_available(pinned_replica_id):
+                    raise StageUnavailableError(f"duplex window owner for {context.session_id} is unavailable")
+            elif keeps_window:
+                if pinned_replica_id is None:
+                    pinned_replica_id = await pool.pick(context.request_id)
+                client = pool.clients[pinned_replica_id]
+                # Only a process this deployment owns can hold a durable lease.
+                if getattr(getattr(client, "resources", None), "engine_manager", None) is not None:
+                    self._window_replicas[context.session_id] = (pinned_replica_id, client)
             if pinned_replica_id is not None:
                 pool.bind_request_to_replica(context.request_id, pinned_replica_id)
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}

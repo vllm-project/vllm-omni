@@ -659,7 +659,8 @@ plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
 The window configuration is fixed when the session is created.
 
 On a locally managed Stage-0 replica, a barge-in or `response.cancel` ends the
-old output. Its replacement re-prefills the accepted Thinker context before
+old output. In a session without a committed user history item, the replacement
+re-prefills the accepted Thinker context before
 processing its first input, including the processed rows of an unfinished
 unit. If the first new input is unforced text or carries a delegated tool
 result, it can open a reply on that same unit. In `"off"` mode, if the
@@ -669,6 +670,11 @@ room to sample within the model context limit, the session ends with
 on its Stage-0 replica until replacement or session cleanup. Model text can
 include speech the client has not played yet, and a new response can return to
 the interrupted topic. A replica failure still ends the session.
+
+Once a MiniCPM-o user input has a committed history item, replacement
+requests restore media from current committed user items and text from
+completed replies. This path excludes the cancelled reply and honours
+history deletion, including deletion followed by reuse of the public item ID.
 
 An independently hosted Stage-0 replica uses the bounded handoff in `"basic"`
 and `"context"`: the same replica can offer completed units for 10 seconds
