@@ -1257,6 +1257,18 @@ def _make_stage_cfg(stage_id: int, stage_type: str) -> SimpleNamespace:
     )
 
 
+_HEADLESS_DEPLOYMENT_ID = "test-deployment-id"
+
+
+def _patch_headless_deployment_id(mocker: MockerFixture, *, module: Any | None = None) -> None:
+    """Headless tests mock registration; also stub the deployment-id prefetch."""
+    target = module if module is not None else "vllm_omni.engine.stage_engine_startup.fetch_deployment_id"
+    if module is None:
+        mocker.patch(target, return_value=_HEADLESS_DEPLOYMENT_ID)
+    else:
+        mocker.patch.object(module, "fetch_deployment_id", return_value=_HEADLESS_DEPLOYMENT_ID)
+
+
 def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: MockerFixture) -> None:
     """LLM headless: each loop iteration registers with auto-assigned
     replica_id (master picks a free slot) and spawns one
@@ -1280,6 +1292,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    _patch_headless_deployment_id(mocker)
     mocker.patch(
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
@@ -1301,6 +1314,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
             output_address="tcp://127.0.0.1:26003",
             replica_id=0,
             coordinator_router_address="tcp://127.0.0.1:26100",
+            deployment_id=_HEADLESS_DEPLOYMENT_ID,
         ),
     )
     mock_manager_cls = mocker.patch(
@@ -1366,6 +1380,7 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    _patch_headless_deployment_id(mocker)
     mocker.patch(
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
@@ -1388,6 +1403,7 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(
                 output_address=f"tcp://127.0.0.1:2720{idx}",
                 replica_id=idx,
                 coordinator_router_address=None,
+                deployment_id=_HEADLESS_DEPLOYMENT_ID,
             )
             for idx in (0, 1)
         ],
@@ -1429,6 +1445,7 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    _patch_headless_deployment_id(mocker)
     mocker.patch(
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
@@ -1447,6 +1464,7 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
             output_address="tcp://127.0.0.1:26003",
             replica_id=0,
             coordinator_router_address="tcp://127.0.0.1:26100",
+            deployment_id=_HEADLESS_DEPLOYMENT_ID,
         ),
     )
     fake_manager = SimpleNamespace(
@@ -1504,6 +1522,7 @@ def test_run_headless_generic_diffusion_launches_structured_stage(mocker: Mocker
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch.object(startup_module.stage_init_utils, "load_omni_transfer_config_for_model", return_value=None)
+    _patch_headless_deployment_id(mocker, module=startup_module)
     mocker.patch.object(
         startup_module.initialization,
         "resolve_omni_kv_config_for_stage",
@@ -1580,6 +1599,7 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    _patch_headless_deployment_id(mocker)
     mocker.patch(
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
@@ -1598,6 +1618,7 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
             output_address="tcp://127.0.0.1:26003",
             replica_id=0,
             coordinator_router_address=None,
+            deployment_id=_HEADLESS_DEPLOYMENT_ID,
         ),
     )
     mocker.patch(
