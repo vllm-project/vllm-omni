@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionKVCacheMode, DiffusionOutput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -31,6 +31,7 @@ POS = "positive"
 NEG = "negative"
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+_DENSE_KV_MODE = DiffusionKVCacheMode.DENSE_LEGACY
 
 
 @pytest.fixture(autouse=True)
@@ -647,18 +648,25 @@ def test_execute_stepwise_closes_session_when_request_finishes(monkeypatch):
 
 
 @pytest.mark.parametrize("reason", ["interaction", "timeout"])
-def test_execute_stepwise_resumes_inside_bound_session_before_batch(monkeypatch, reason):
+def test_execute_stepwise_dispatches_resume_inside_the_bound_session(monkeypatch, reason):
+    """The main worker owns the dispatch; the AR runner owns the binding around it."""
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput, StepWait
 
     pipeline = StepCapablePipeline(lingbot_like_spec())
     runner = make_runner(pipeline, step_execution=True)
-    state = SimpleNamespace(ready=False)
+    # ``step_in_chunk`` is read by the AR runner's chunk-grouping policy.
+    state = SimpleNamespace(ready=False, step_in_chunk=0)
     runner.state_cache = {"req-1": state}
+    # The wave-level cleanup consults the KV mode even for an empty finished set.
+    # The grouping policy reads ``streaming_output``; keep it off so this test
+    # observes a single core pass per call.
+    runner.od_config = SimpleNamespace(cache_backend=None, diffusion_kv_mode=_DENSE_KV_MODE, streaming_output=False)
 
     def resume(request_state, received_reason):
         assert request_state is state
         assert received_reason == reason
+        # The resume must see the session bound: this is the AR runner's contract.
         assert pipeline.bound_state is not None
         request_state.ready = True
 
@@ -667,14 +675,15 @@ def test_execute_stepwise_resumes_inside_bound_session_before_batch(monkeypatch,
         assert pipeline.bound_state is not None
         return StepWait()
 
-    monkeypatch.setattr(pipeline, "ar_diffusion_resume_step", resume, raising=False)
-    monkeypatch.setattr(pipeline, "ar_diffusion_step_wait", wait, raising=False)
+    monkeypatch.setattr(pipeline, "resume_step", resume, raising=False)
+    monkeypatch.setattr(pipeline, "step_wait", wait, raising=False)
 
-    def execute(self, output):
+    def core(self, scheduler_output, **kwargs):
+        # The main worker must have resumed before it builds any batch.
         assert state.ready, "Resume must update prompts before input batching"
         return BatchRunnerOutput.from_list([RunnerOutput("req-1", result=DiffusionOutput())])
 
-    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", execute)
+    monkeypatch.setattr(DiffusionModelRunner, "_execute_stepwise_core", core)
     scheduled = scheduler_output()
     scheduled.step_resumes["req-1"] = reason
     output = runner.execute_stepwise(scheduled)
@@ -687,11 +696,12 @@ def test_step_resume_failure_releases_session(monkeypatch):
     pipeline = StepCapablePipeline(lingbot_like_spec())
     runner = make_runner(pipeline, step_execution=True)
     runner.state_cache = {"req-1": object()}
+    runner.od_config = SimpleNamespace(cache_backend=None, diffusion_kv_mode=_DENSE_KV_MODE)
 
     def resume(state, reason):
         raise ValueError("fallback encoding failed")
 
-    monkeypatch.setattr(pipeline, "ar_diffusion_resume_step", resume, raising=False)
+    monkeypatch.setattr(pipeline, "resume_step", resume, raising=False)
     scheduled = scheduler_output()
     scheduled.step_resumes["req-1"] = "timeout"
     with pytest.raises(ValueError, match="fallback encoding failed"):

@@ -1428,13 +1428,13 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
                 time.perf_counter() - started,
             )
 
-    def ar_diffusion_step_wait(self, state: StepRequestState) -> StepWait | None:
+    def step_wait(self, state: StepRequestState) -> StepWait | None:
         """The scheduler owns waiting and the deadline; no model steps poll."""
         if state.extra.get("taomate_held"):
             return StepWait(timeout_seconds=self._tm_hold_max_seconds or None)
         return None
 
-    def ar_diffusion_resume_step(self, state: StepRequestState, reason: Literal["interaction", "timeout"]) -> None:
+    def resume_step(self, state: StepRequestState, reason: Literal["interaction", "timeout"]) -> None:
         if not state.extra.get("taomate_held"):
             raise RuntimeError("TaoMate-H3 resumed a request that was not waiting")
         if reason == "interaction":
@@ -1458,6 +1458,10 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
             self.prepare_next_chunk(state)
         finally:
             state.extra.pop("taomate_resuming", None)
+
+    # Deprecated aliases; the worker reads ``step_wait``/``resume_step`` first.
+    ar_diffusion_step_wait = step_wait
+    ar_diffusion_resume_step = resume_step
 
     def _hold_fallback_embeddings(self) -> tuple[torch.Tensor, torch.Tensor] | None:
         if self._tm_hold_fallback_prompt is None:
