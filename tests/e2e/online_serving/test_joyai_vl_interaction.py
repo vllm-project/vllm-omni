@@ -13,7 +13,7 @@ import pytest
 from PIL import Image
 
 from tests.e2e.online_serving.helpers.joyai_vl_interaction import joyai_server_params
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.clients.duplex import DuplexClient, EventCollector, ReconnectPolicy, SessionConfig
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.full_model, pytest.mark.omni]
@@ -170,7 +170,9 @@ async def run_observations(url, model, output_dir, *, expect_streaming=False, in
 @pytest.mark.parametrize(
     "omni_server,with_asr",
     [
-        pytest.param(joyai_server_params(), False, id="visual-duplex"),
+        # The ASR path returns an empty response on MI300 (AMD build 17564), so only
+        # the visual path runs on ROCm.
+        pytest.param(joyai_server_params(), False, id="visual-duplex", marks=hardware_marks(res={"rocm": "MI325"})),
         pytest.param(joyai_server_params(asr=True), True, id="asr-duplex"),
     ],
     indirect=["omni_server"],

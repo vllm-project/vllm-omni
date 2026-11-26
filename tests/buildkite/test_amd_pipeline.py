@@ -28,7 +28,7 @@ AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
 AMD_COLLECTION_GUARD = Path(".buildkite/amd/scripts/assert-pytest-collection.sh")
-R2_01_EXPECTED_COUNT = 1456
+R2_01_EXPECTED_COUNT = 1460
 AMD_SOURCE_DEPENDENCIES = Path(".buildkite/common/ci_source_file_dependencies.yml")
 AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scripts/combine_test_suites.py"
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
@@ -916,6 +916,12 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
     ),
 )
 
+# Migrated jobs retain exactly one guard for their original collection. This
+# job also owns a separately guarded blocking parity suite.
+_ROCM_MIGRATED_AMD_GPU_EXTRA_COLLECTION_GUARDS = {
+    "Qwen3-TTS Base E2E Test": 1,
+}
+
 
 def test_ready_and_merge_pipelines_have_no_cuda_marker_selectors() -> None:
     assert _amd_marker_selector_inventory("cuda") == set()
@@ -926,7 +932,13 @@ def test_migrated_amd_gpu_jobs_select_exact_rocm_collections() -> None:
         step = _find_step(label, pipeline_path)
         assert step.get("grade") == grade
 
-        collect_commands = [command for command in step["commands"] if AMD_COLLECTION_GUARD.name in command]
+        all_collect_commands = [command for command in step["commands"] if AMD_COLLECTION_GUARD.name in command]
+        assert len(all_collect_commands) == 1 + _ROCM_MIGRATED_AMD_GPU_EXTRA_COLLECTION_GUARDS.get(label, 0)
+        collect_commands = [
+            command
+            for command in all_collect_commands
+            if marker_expression in _marker_expressions({"commands": [command]})
+        ]
         run_commands = [
             command
             for command in step["commands"]
@@ -1239,6 +1251,54 @@ def test_qwen3_tts_base_preserves_advanced_model_arguments() -> None:
     assert argv[run_level_index + 1] == "advanced_model"
 
 
+@pytest.mark.parametrize(
+    ("label", "pipeline_path", "timeout_minutes"),
+    [
+        ("Qwen3-TTS E2E Test", AMD_READY_PIPELINE, None),
+        ("Qwen3-TTS Base E2E Test", AMD_MERGE_PIPELINE, 60),
+    ],
+    ids=["ready", "merge"],
+)
+def test_qwen3_tts_eager_warmup_parity_is_blocking(
+    label: str,
+    pipeline_path: Path,
+    timeout_minutes: int | None,
+) -> None:
+    step = _find_step(label, pipeline_path)
+    commands = step["commands"]
+    path = "tests/model_executor/models/qwen3_tts/test_eager_decoder_warmup.py"
+    marker = "core_model and rocm and cards_1"
+
+    assert step["grade"] == "Blocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert "artifacts/rocm-qwen3-tts-eager-warmup/**/*" in step["artifact_paths"]
+    if timeout_minutes is not None:
+        assert step["timeout_in_minutes"] == timeout_minutes
+
+    collect_commands = [command for command in commands if AMD_COLLECTION_GUARD.name in command and path in command]
+    assert len(collect_commands) == 1
+    collect_argv = split(collect_commands[0])
+    bash_at = collect_argv.index("bash")
+    assert collect_argv[bash_at : bash_at + 3] == ["bash", str(AMD_COLLECTION_GUARD), "4"]
+    assert path in collect_argv
+    assert _marker_expressions({"commands": collect_commands}) == [marker]
+
+    run_commands = [
+        command
+        for command in commands
+        if AMD_COLLECTION_GUARD.name not in command and path in command and "pytest" in split(command)
+    ]
+    assert len(run_commands) == 1
+    run_argv = split(run_commands[0])
+    assert run_argv[:4] == ["timeout", "--signal=TERM", "--kill-after=1m", "8m"]
+    assert _marker_expressions({"commands": run_commands}) == [marker]
+    assert "--junitxml=" in run_commands[0]
+
+    joined = "\n".join(commands)
+    assert "Expected four eager decoder parity tests" in joined
+    assert "Eager decoder parity did not fully pass" in joined
+
+
 def test_qwen3_accuracy_defers_artifact_path_expansion() -> None:
     step = _find_step("Qwen3-Omni Accuracy", AMD_NIGHTLY_PIPELINE)
     staging_command = next(command for command in step["commands"] if "artifact_dir=" in command)
@@ -1462,6 +1522,71 @@ def test_cosyvoice_full_default_backend_suite_runs_nightly() -> None:
         "tts",
         "rocm-cosyvoice3-e2e-nightly",
     ]
+
+
+@pytest.mark.parametrize(
+    ("label", "argv"),
+    [
+        (
+            "Omni Full-Model Additions · 1-GPU",
+            [
+                "tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py",
+                "13",
+                "omni",
+                "rocm-omni-full-model-additions",
+                "tests/e2e/online_serving/test_minicpmo_4_5_expansion.py",
+                "tests/e2e/online_serving/test_joyai_vl_interaction.py",
+            ],
+        ),
+        (
+            "TTS Full-Model Additions · 1-GPU",
+            [
+                "tests/e2e/offline_inference/test_yue2.py",
+                "13",
+                "tts",
+                "rocm-tts-full-model-additions",
+                "tests/e2e/online_serving/test_chatterbox_expansion.py",
+                "tests/e2e/online_serving/test_cosyvoice3_voice_isolation.py",
+            ],
+        ),
+    ],
+)
+def test_cuda_function_gap_nightly_jobs_are_nonblocking_burn_in(label: str, argv: list[str]) -> None:
+    step = _find_step(label, AMD_NIGHTLY_PIPELINE)
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 150
+    assert step["env"]["ROCM_E2E_TIMEOUT_MINUTES"] == "135"
+    assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
+    assert split(step["commands"][-1]) == ["bash", ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh", *argv]
+
+
+def test_tts_additions_restore_aiter_mha_and_cap_cpu_threads() -> None:
+    step = _find_step("TTS Full-Model Additions · 1-GPU", AMD_NIGHTLY_PIPELINE)
+
+    assert step["commands"][0] == 'eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"'
+    assert len(step["commands"]) == 2
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        assert step["env"][var] == "4"
+
+
+def test_qwen3_omni_realtime_merge_job_mirrors_cuda_h100_entrypoints() -> None:
+    step = _find_step("MERGE · Qwen3-Omni Realtime and Duplex Entrypoints · 2-GPU", AMD_MERGE_PIPELINE)
+    commands = "\n".join(step["commands"])
+    marker = "-m 'advanced_model and omni and rocm and MI325 and cards_2 and not nvidia_only'"
+
+    assert step["agent_pool"] == "mi300_2"
+    assert step["grade"] == "NonBlocking"
+    assert step["source_file_dependencies"] == "omni_qwen3_omni_duplex_playback_function"
+    assert "assert-pytest-collection.sh 29" in commands
+    assert "if tests != 29 or skipped != 0" in commands
+    assert commands.count(marker) == 2
+    for path in (
+        "tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py",
+        "tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py",
+    ):
+        assert commands.count(path) == 2
 
 
 def test_amd_template_preserves_step_retry_policy() -> None:
@@ -5973,14 +6098,13 @@ def test_entrypoints_full_nightly_uses_focused_source_dependencies() -> None:
         assert "vllm_omni/entrypoints/" not in paths
 
 
-def test_qwen_duplex_rocm_mark_is_limited_to_the_full_model_method() -> None:
+def test_qwen_duplex_rocm_mark_covers_the_whole_playback_class() -> None:
     source = Path("tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py").read_text(encoding="utf-8")
-    assert ('@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)\nclass TestQwen3OmniDuplexPlayback:') in source
-    assert source.count('@hardware_test(res={"rocm": "MI325"}, num_cards=2)') == 1
-    full_method_prefix = source.split("def test_speech_interrupts_playback_full", maxsplit=1)[0].rsplit(
-        "@pytest.mark.full_model", maxsplit=1
-    )[1]
-    assert '@hardware_test(res={"rocm": "MI325"}, num_cards=2)' in full_method_prefix
+    assert (
+        '@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)\nclass TestQwen3OmniDuplexPlayback:'
+    ) in source
+    # The class mark already selects the full_model method on ROCm.
+    assert '@hardware_test(res={"rocm": "MI325"}, num_cards=2)' not in source
 
 
 def test_bagel_rocm_nightly_allows_cold_aiter_startup() -> None:
@@ -6355,7 +6479,12 @@ def test_qwen3_tts_ready_pins_selected_customvoice_core_nodes() -> None:
 
     assert step["grade"] == "Blocking"
     assert "timeout 30m" in command
-    assert _marker_expressions(step) == [_QWEN3_TTS_READY_MARKER, _QWEN3_TTS_READY_MARKER]
+    assert _marker_expressions(step) == [
+        _QWEN3_TTS_READY_MARKER,
+        _QWEN3_TTS_READY_MARKER,
+        "core_model and rocm and cards_1",
+        "core_model and rocm and cards_1",
+    ]
     for node in _QWEN3_TTS_READY_NODES:
         assert command.count(node) == 1
     assert "diff -u /tmp/qwen3-tts-ready-expected.txt" in command

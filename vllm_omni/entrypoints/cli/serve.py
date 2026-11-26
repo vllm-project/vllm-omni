@@ -362,8 +362,11 @@ class OmniServeCommand(CLISubcommand):
         from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 
         model = getattr(args, "model_tag", None) or getattr(args, "model", None)
+        revision = getattr(args, "revision", None)
         native_single_file = resolve_native_single_file(getattr(args, "model_class_name", None))
-        if model and ((native_single_file is not None and os.path.isfile(model)) or is_diffusion_model(model)):
+        if model and (
+            (native_single_file is not None and os.path.isfile(model)) or is_diffusion_model(model, revision=revision)
+        ):
             if api_server_count is not None and api_server_count > 1:
                 raise ValueError("--api-server-count > 1 is not supported for diffusion models")
             logger.info("Detected diffusion model: %s", model)
@@ -824,6 +827,16 @@ class OmniServeCommand(CLISubcommand):
                 "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
                 "TorchNPU NPUSHMEM and Triton-Ascend, "
                 "with libshmem.so on LD_LIBRARY_PATH. Defaults to disabled."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--ulysses-overlap-chunks",
+            type=int,
+            default=None,
+            help=(
+                "With --ulysses-a2a-permute on CUDA, split each rank's attention heads into this many chunks and "
+                "move them on copy engines while earlier chunks compute (must divide num_heads / ulysses_degree; "
+                "0 disables). Requires strict pure Ulysses. Defaults to disabled."
             ),
         )
         omni_config_group.add_argument(

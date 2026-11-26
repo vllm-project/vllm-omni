@@ -1693,11 +1693,38 @@ comes from the first tokenizer-owning stage, matching frontend comprehension
 ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
 enters ASR and carries the original observation context through the handoff.
 
-JoyAI keeps an empty assistant message for a retained visual observation's
-response when cancellation leaves no committed speech. This preserves the turn
-boundary in both direct and ASR-handoff prompts without restoring unheard text
-or treating cancellation as a model silence decision. The boundary follows the
-existing recent-history budget and disappears when its history item is deleted.
+JoyAI renders a retained visual observation's unheard response as an assistant
+message containing only `</response>`. The Session history item remains empty;
+the model prompt keeps JoyAI's action marker to close the previous observation.
+This preserves the turn boundary in both direct and ASR-handoff prompts without
+restoring unheard text or treating cancellation as a model silence decision.
+The boundary follows the existing recent-history budget and disappears when
+its history item is deleted.
+
+Both text and speech queries precede their observation's frames inside the same
+user message, matching the visual reference frontend. The ASR handoff and
+reconstructed history preserve this query-before-frame format.
+Spoken observations retain the public Session item ID and its non-reusable
+source ID. JoyAI resolves the current text only while both identities match.
+Deleting and recreating a public item ID must not attach the new item's text to
+old frames, even when the text is identical. Observation ordering anchors also
+retain user source IDs so recreated items cannot inherit old positions.
+The retained transcript precedes the original frames in the same user message,
+matching the ASR handoff. A later
+camera observation must not move the transcript into a separate user turn.
+Deleted transcripts stay absent; cancelled output does not discard an accepted
+user transcript.
+
+The default JoyAI silence persona keeps ongoing user instructions active across
+replies: a completed answer does not finish an instruction about future
+observations. Each new observation must be evaluated against applicable ongoing
+instructions before choosing silence. This does not force a spoken response for
+every camera commit; silence remains valid when no instruction or scene change
+calls for speech. The absence of a new query is not by itself a reason to stay
+silent: an ongoing instruction may require a reply to the newest observation.
+Answered one-time questions and unmet conditions in ongoing instructions do not
+require another reply. An explicit `joyai_system_prompt` still replaces the persona.
+
 The ASR handoff retains frame timestamps and observation-to-history references,
 so an old frame precedes its reply boundary and the new transcript accompanies
 only the current observation. Both paths apply the image limit before selecting
