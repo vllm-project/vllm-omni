@@ -5,7 +5,7 @@
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 
 import pytest
 import torch
@@ -211,7 +211,8 @@ def test_install_is_npu_only_idempotent_and_context_scoped():
 
 def test_opted_in_npu_reports_missing_checkpoint_collective():
     model = Model()
-    model._all_gather_tiled_results = lambda *_: None
+    empty_gather = FunctionType((lambda *_: None).__code__, {})
+    model._all_gather_tiled_results = empty_gather
     adapter = SimpleNamespace(_device_target=Device("npu"), decode_only=False, model=model)
     with pytest.raises(ValueError, match="h3_vae_encode_tile_balance_max_tasks.*all_gather_var_shape"):
         balance.install_video_tile_balance(adapter, 8)
