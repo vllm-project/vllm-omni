@@ -89,7 +89,9 @@ class _Projection(nn.Module):
             parameter.nvfp4_field = field
             self.register_parameter(field, parameter)
         if "input_scale" not in spec.tensors:
-            self.register_buffer("input_scale", torch.ones(1, dtype=torch.float32))
+            # Not in the export: a fixed unit scale. Keep it out of state_dict so
+            # checkpoint-driven loaders (e.g. pre-sharded HSDP) do not expect it.
+            self.register_buffer("input_scale", torch.ones(1, dtype=torch.float32), persistent=False)
 
     def weight_loader(self, parameter: nn.Parameter, value: torch.Tensor, shard_id: str | int | None = None) -> None:
         del shard_id
