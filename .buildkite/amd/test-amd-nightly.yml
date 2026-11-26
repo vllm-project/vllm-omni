@@ -189,7 +189,7 @@ steps:
           - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
           - export BENCHMARK_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-perf-qwen-image-21-4gpu/benchmark-results"
           # PROBE ONLY: the warmup hangs on CI; make the workers print their stacks (faulthandler).
-          - (sleep 540; pkill -ABRT -f 'vLLM-Omni::Diff|DiffusionWorker' || true) &
+          - (sleep 540; pkill -ABRT -f '[v]LLM-Omni::Diff|[D]iffusionWorker' || true) &
           - >-
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
             4 1 165m rocm-perf-qwen-image-21-4gpu
