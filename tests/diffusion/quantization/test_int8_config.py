@@ -711,3 +711,174 @@ class TestGPUInt8Smoke:
         qx, x_scale, _ = ops.scaled_int8_quant(x.reshape(-1, 64), scale=None)
         expected = (qx.float() @ qweight.float().t()) * x_scale * scale.t()
         torch.testing.assert_close(output, expected.reshape(2, 16, 128).to(output.dtype), rtol=1e-2, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# Static per-tensor activations and SmoothQuant
+# ---------------------------------------------------------------------------
+
+
+def _static_config(**kwargs):
+    return build_quant_config("int8", is_checkpoint_int8_serialized=True, **kwargs)
+
+
+def test_from_config_static_and_smoothquant():
+    from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+    config = DiffusionInt8Config.from_config(
+        {"quant_method": "int8", "activation_scheme": "static", "smoothquant": {"alpha": 0.5}}
+    )
+    assert config.activation_scheme == "static"
+    assert config.smoothquant is True
+    default = DiffusionInt8Config.from_config({"quant_method": "int8"})
+    assert default.activation_scheme == "dynamic"
+    assert default.smoothquant is False
+
+
+def test_unknown_activation_scheme_is_rejected():
+    from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+    with pytest.raises(ValueError, match="Unsupported activation scheme"):
+        DiffusionInt8Config.from_config({"quant_method": "int8", "activation_scheme": "per_group"})
+
+
+def test_static_and_smoothquant_need_serialized_checkpoint():
+    from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+    with pytest.raises(ValueError, match="static"):
+        DiffusionInt8Config(is_checkpoint_int8_serialized=False, activation_scheme="static")
+    with pytest.raises(ValueError, match="smoothquant"):
+        DiffusionInt8Config(is_checkpoint_int8_serialized=False, smoothquant=True)
+    with pytest.raises(ValueError, match="smoothquant"):
+        DiffusionInt8Config(is_checkpoint_int8_serialized=True, smoothquant="yes")
+
+
+@pytest.fixture(autouse=False)
+def _tp_stub(mocker: MockerFixture):
+    group = mocker.Mock()
+    group.rank_in_group = 0
+    group.world_size = 1
+    mocker.patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0, create=True)
+    mocker.patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1, create=True)
+    mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=group)
+
+
+def _make_layer(config, mocker: MockerFixture, n=6, k=8, shards=(6,)):
+    from vllm_omni.quantization.int8_config import Int8LinearMethod
+
+    kernel = mocker.Mock()
+    init_kernel = mocker.patch("vllm_omni.quantization.int8_config.init_int8_linear_kernel", return_value=kernel)
+    method = Int8LinearMethod(config)
+    layer = Module()
+    method.create_weights(
+        layer,
+        input_size_per_partition=k,
+        output_partition_sizes=list(shards),
+        input_size=k,
+        output_size=n,
+        params_dtype=torch.bfloat16,
+        weight_loader=None,
+    )
+    return method, layer, kernel, init_kernel
+
+
+def test_dynamic_path_registers_no_extra_params(mocker: MockerFixture, _tp_stub):
+    method, layer, _, init_kernel = _make_layer(_static_config(), mocker)
+    assert layer.weight.dtype == torch.int8
+    assert tuple(layer.weight_scale.shape) == (6, 1)
+    assert not hasattr(layer, "input_scale")
+    assert not hasattr(layer, "pre_quant_scale")
+    assert init_kernel.call_args.kwargs["is_static_input_scheme"] is False
+
+
+def test_static_registers_input_scale_per_shard(mocker: MockerFixture, _tp_stub):
+    method, layer, _, init_kernel = _make_layer(
+        _static_config(activation_scheme="static"), mocker, n=6, k=8, shards=(2, 2, 2)
+    )
+    assert init_kernel.call_args.kwargs["is_static_input_scheme"] is True
+    assert layer.input_scale.dtype == torch.float32
+    assert tuple(layer.input_scale.shape) == (3,)
+    assert not hasattr(layer, "pre_quant_scale")
+
+
+def test_smoothquant_registers_pre_quant_scale_and_loads(mocker: MockerFixture, _tp_stub):
+    method, layer, _, _ = _make_layer(_static_config(smoothquant=True), mocker)
+    assert layer.pre_quant_scale.dtype == torch.float32
+    assert tuple(layer.pre_quant_scale.shape) == (8,)
+    values = torch.arange(1, 9, dtype=torch.float32)
+    layer.pre_quant_scale.weight_loader(layer.pre_quant_scale, values)
+    assert torch.equal(layer.pre_quant_scale.data, values)
+    with pytest.raises(ValueError, match="pre_quant_scale"):
+        layer.pre_quant_scale.weight_loader(layer.pre_quant_scale, values[:4])
+
+
+def test_smoothquant_apply_multiplies_input_before_kernel(mocker: MockerFixture, _tp_stub):
+    method, layer, kernel, _ = _make_layer(_static_config(smoothquant=True, activation_scheme="static"), mocker)
+    pre = torch.tensor([0.5, 1.0, 2.0, 4.0, 0.25, 8.0, 1.0, 1.0])
+    layer.pre_quant_scale.data.copy_(pre)
+    seen = {}
+
+    def fake_apply(layer_, x2d, bias):
+        seen["x"] = x2d
+        return torch.zeros(x2d.shape[0], 6, dtype=x2d.dtype)
+
+    kernel.apply_weights.side_effect = fake_apply
+    x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+    out = method.apply(layer, x)
+    assert out.shape == (2, 3, 6)
+    expected = (x * pre.to(x.dtype)).reshape(-1, 8)
+    assert seen["x"].dtype == torch.bfloat16
+    assert torch.equal(seen["x"], expected)
+
+
+def test_dynamic_apply_passes_input_unchanged(mocker: MockerFixture, _tp_stub):
+    method, layer, kernel, _ = _make_layer(_static_config(), mocker)
+    seen = {}
+
+    def fake_apply(layer_, x2d, bias):
+        seen["x"] = x2d
+        return torch.zeros(x2d.shape[0], 6, dtype=x2d.dtype)
+
+    kernel.apply_weights.side_effect = fake_apply
+    x = torch.randn(4, 8, dtype=torch.bfloat16)
+    method.apply(layer, x)
+    assert torch.equal(seen["x"], x)
+
+
+def _ref_static_quant(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """CPU reference of symmetric static INT8 quantization."""
+    return torch.clamp(torch.round(x.float() / scale), -128, 127).to(torch.int8)
+
+
+def test_static_quant_reference_math():
+    x = torch.tensor([[0.0, 1.0, -2.0, 127.0, -300.0]])
+    scale = torch.tensor(1.0)
+    assert _ref_static_quant(x, scale).tolist() == [[0, 1, -2, 127, -128]]
+    # input_scale = amax / 127 maps amax to 127 and stays within 0.5 step elsewhere.
+    x = torch.randn(64, 32)
+    scale = x.abs().max() / 127
+    q = _ref_static_quant(x, scale)
+    assert int(q.abs().max()) == 127
+    assert (q.float() * scale - x).abs().max() <= scale / 2 + 1e-6
+
+
+def test_smoothquant_equivalence():
+    """(x * p) @ (W * s)^T == x @ W^T when p = 1 / s."""
+    torch.manual_seed(0)
+    w = torch.randn(6, 8, dtype=torch.float64)
+    x = torch.randn(5, 8, dtype=torch.float64)
+    s = torch.rand(8, dtype=torch.float64) + 0.5
+    pre = 1.0 / s
+    assert torch.allclose((x * pre) @ (w * s).t(), x @ w.t())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="scaled_int8_quant needs CUDA")
+def test_scaled_int8_quant_static_matches_reference_cuda():
+    from vllm import _custom_ops as ops
+
+    x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
+    scale = (x.abs().max().float() / 127).reshape(1).to("cuda")
+    q, x_scale, _ = ops.scaled_int8_quant(x, scale)
+    ref = _ref_static_quant(x, scale)
+    assert (q.int() - ref.int()).abs().max() <= 1
+    assert torch.allclose(x_scale.float(), scale)
