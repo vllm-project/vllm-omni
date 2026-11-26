@@ -5,6 +5,7 @@ import importlib
 import sys
 import types
 
+import numpy as np
 import pytest
 import torch
 from vllm.platforms import current_platform
@@ -282,7 +283,7 @@ def test_sage3_unverified_and_invalid_paths(monkeypatch, case):
     elif case == "shape":
         v = v[:, :12]
     result = impl.resolve_execution_path(context, q, k, v, metadata)
-    expected = SupportStatus.UNSUPPORTED if case in ("dtype", "shape") else SupportStatus.UNMIGRATED
+    expected = SupportStatus.UNSUPPORTED if case in ("causal_cross", "dtype", "shape") else SupportStatus.UNMIGRATED
     assert result.support.status is expected
 
 
@@ -429,7 +430,7 @@ def test_sage3_prefix_kv_slicing_and_compile(monkeypatch: pytest.MonkeyPatch):
         torch.compiler.reset()
 
 
-@pytest.mark.parametrize("bad_len", [True, False, 4.0, 0, -1, 13])
+@pytest.mark.parametrize("bad_len", [True, False, 4.0, np.int64(4), torch.tensor(4), 0, -1, 13])
 def test_sage3_rejects_invalid_valid_kv_length(monkeypatch: pytest.MonkeyPatch, bad_len):
     from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
 
@@ -448,29 +449,38 @@ def test_sage3_rejects_invalid_valid_kv_length(monkeypatch: pytest.MonkeyPatch, 
 
 
 @pytest.mark.parametrize("variant", [None, "sage3_sm100", "sage3_sm120", "sage3_sm121"])
-@pytest.mark.parametrize(("q_len", "kv_len", "valid_len"), [(12, 12, 8), (10, 12, 8), (6, 12, 8)])
-def test_sage3_causal_rejects_partial_valid_kv_length(
-    monkeypatch: pytest.MonkeyPatch, variant, q_len: int, kv_len: int, valid_len: int
+@pytest.mark.parametrize(
+    ("q_len", "kv_len", "metadata"),
+    [
+        (12, 12, AttentionMetadata(extra={"valid_kv_length": 8})),
+        (10, 12, AttentionMetadata(extra={"valid_kv_length": 8})),
+        (6, 12, AttentionMetadata(extra={"valid_kv_length": 8})),
+        (12, 8, None),
+        (12, 8, AttentionMetadata()),
+        (6, 8, None),
+    ],
+)
+def test_sage3_causal_rejects_mismatched_kv_length(
+    monkeypatch: pytest.MonkeyPatch, variant, q_len: int, kv_len: int, metadata: AttentionMetadata | None
 ):
     from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
 
     module = load_sage_attn3_module(
-        monkeypatch, lambda *args, **kwargs: pytest.fail("kernel must not run on causal partial valid_kv_length")
+        monkeypatch, lambda *args, **kwargs: pytest.fail("kernel must not run on causal length mismatch")
     )
     monkeypatch.setattr(module, "_sage3_kernel_variant", lambda q: variant)
     impl = module.SageAttention3Impl(2, 64, 0.125, causal=True)
     q = torch.empty(1, q_len, 2, 64, dtype=torch.bfloat16)
     k = torch.empty(1, kv_len, 2, 64, dtype=torch.bfloat16)
     v = torch.empty(1, kv_len, 2, 64, dtype=torch.bfloat16)
-    metadata = AttentionMetadata(extra={"valid_kv_length": valid_len})
 
     result = impl.resolve_execution_path(ExecutionContext(platform="cuda" if variant else "cpu"), q, k, v, metadata)
     assert result.support.status is SupportStatus.UNSUPPORTED
-    assert "causal attention with valid_kv_length" in result.support.reason
+    assert "causal attention requires matching query and K/V lengths" in result.support.reason
     assert result.requested_support(ExecutionContext(platform="cuda" if variant else "cpu")).status is (
         SupportStatus.UNSUPPORTED
     )
-    with pytest.raises(ValueError, match="causal attention with valid_kv_length"):
+    with pytest.raises(ValueError, match="causal attention requires matching query and K/V lengths"):
         impl.forward_cuda(q, k, v, metadata)
 
 
@@ -601,6 +611,26 @@ def test_sage3_delta_s_tma_stride_overflow_guard(monkeypatch: pytest.MonkeyPatch
     assert "delta_s TMA batch stride" in result.support.reason
     with pytest.raises(ValueError, match="delta_s TMA batch stride"):
         impl.forward_cuda(q, q, q)
+
+    # Exact INT32 boundary for H=56, D=128 self-attention (no batch multiplier):
+    # S=70016 -> 547 groups, stride=2,144,730,112 <= INT32_MAX (SUPPORTED);
+    # S=70017 -> 548 groups, stride=2,152,579,072 > INT32_MAX (UNSUPPORTED).
+    q_ok_b1 = torch.empty(1, 70016, heads, head_dim, device="meta", dtype=torch.bfloat16)
+    q_ok_b2 = torch.empty(2, 70016, heads, head_dim, device="meta", dtype=torch.bfloat16)
+    q_over = torch.empty(1, 70017, heads, head_dim, device="meta", dtype=torch.bfloat16)
+    assert (
+        impl.resolve_execution_path(ExecutionContext(platform="cuda"), q_ok_b1, q_ok_b1, q_ok_b1, None).support.status
+        is SupportStatus.SUPPORTED
+    )
+    assert (
+        impl.resolve_execution_path(ExecutionContext(platform="cuda"), q_ok_b2, q_ok_b2, q_ok_b2, None).support.status
+        is SupportStatus.SUPPORTED
+    )
+    over_result = impl.resolve_execution_path(ExecutionContext(platform="cuda"), q_over, q_over, q_over, None)
+    assert over_result.support.status is SupportStatus.UNSUPPORTED
+    assert "delta_s TMA batch stride" in over_result.support.reason
+    with pytest.raises(ValueError, match="delta_s TMA batch stride"):
+        impl.forward_cuda(q_over, q_over, q_over)
 
     # Causal attention builds the same delta_s TMA layout and must also be rejected on overflow.
     impl_causal = module.SageAttention3Impl(heads, head_dim, head_dim**-0.5, causal=True)
