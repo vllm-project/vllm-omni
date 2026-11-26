@@ -5,8 +5,11 @@
 
 import asyncio
 import base64
+import json
 from dataclasses import replace
+from types import SimpleNamespace
 
+import msgspec
 import pytest
 import torch
 
@@ -16,8 +19,18 @@ from tests.engine.duplex.test_session_runner import (
     close_harness,
     listen_output,
     open_harness,
+    stage_stats,
     tts_output,
     types,
+)
+from tests.engine.duplex.test_session_runner_minicpmo_thinker_only import (
+    CHUNK_EOS,
+    SPEAK,
+    TURN_EOS,
+    A,
+    B,
+    _stage0,
+    _thinker_only_plugin,
 )
 from tests.model_executor.models.minicpmo_4_5.helpers import stage0_vision_runtime
 from tests.model_executor.models.minicpmo_4_5.test_native_duplex_sampling import (
@@ -29,7 +42,11 @@ from tests.model_executor.models.minicpmo_4_5.test_native_duplex_sampling import
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
+from vllm_omni.engine.duplex.config import DuplexSessionConfig
+from vllm_omni.engine.duplex.contracts import DuplexFence
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex import plugin as plugin_module
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -37,6 +54,41 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.fixture(autouse=True)
 def text_tokenizer(monkeypatch):
     _stub_tokenizer(monkeypatch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thinker_only", [False, True])
+async def test_text_append_uses_custom_tokenizer_path_and_revision_after_serialization(monkeypatch, thinker_only):
+    plugin = _thinker_only_plugin()
+    tokenizer = plugin._tokenizers.pop(plugin_module._tokenizer_key(None))
+    if not thinker_only:
+        plugin.configure_pipeline(MINICPMO_4_5_PIPELINE)
+    loaded = []
+
+    def load_tokenizer(config):
+        loaded.append(plugin_module._tokenizer_ref(config))
+        return tokenizer
+
+    monkeypatch.setattr(plugin_module, "_load_tokenizer", load_tokenizer)
+    model_config = SimpleNamespace(model="model-path", tokenizer="tokenizer-path", tokenizer_revision="revision-a")
+    runtime = await plugin.prepare_runtime_config(DuplexSessionConfig(modalities=["text"]), model_config=model_config)
+    runtime = msgspec.msgpack.decode(msgspec.msgpack.encode(json.loads(json.dumps(runtime))))
+    assert runtime["duplex_tokenizer_key"] == json.dumps(("tokenizer-path", "revision-a"))
+    assert loaded == [("tokenizer-path", "revision-a")]
+    plan = await plugin.prepare_append_plan(
+        request_id="text-append",
+        fence=DuplexFence("text-append"),
+        session_config={},
+        runtime_config=runtime,
+        seq=1,
+        turn_seq=1,
+        payload={"type": "text", "text": "嗯，"},
+        final=False,
+        sampling_params=None,
+    )
+    assert plan.prompt["model_intermediate_buffer"]["duplex"]["payload"]["text_token_ids"] == tokenizer.encode(
+        "嗯，", add_special_tokens=False
+    )
 
 
 def _text_output(request_id: str, *, empty: bool = False):
@@ -139,6 +191,56 @@ async def test_unforced_text_continues_after_an_empty_model_unit(buffered_sample
             payload = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
             assert base64.b64decode(payload["audio"]) == append_audio(samples=buffered_samples).audio + tail.audio
             assert h.session.pending_input_bytes == 0
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_unit", [[CHUNK_EOS], [SPEAK, A, CHUNK_EOS]], ids=["empty", "text"])
+async def test_thinker_only_unforced_text_continues_past_partial_pcm(first_unit):
+    h = await open_harness(plugin=_thinker_only_plugin(), stage_count=1)
+    try:
+        await h.run(append_audio(samples=8000))
+        events = await h.run(commands.AppendText(text="Say it now."))
+        assert "response.created" in types(events)
+        response_id = h.session.active_response_id
+        request_id = h.stage0_request_id()
+        submitted = len(h.port.submissions)
+
+        async def deliver(token_ids, text, *, tokens_out):
+            output = _stage0(request_id, token_ids, text, stop=True)
+            output.multimodal_output["duplex_text_input"] = True
+            metrics = stage_stats(stage_id=0, request_id=request_id, num_tokens_out=tokens_out, itls_ms=[20.0])
+            return await h.deliver_and_settle(
+                output, stage_id=0, segment_finished=True, model_turn_id=0, metrics=metrics
+            )
+
+        events = await deliver(first_unit, "嗯，" if A in first_unit else "", tokens_out=1)
+        assert "error" not in types(events)
+        # The unit continues without more client audio; the partial PCM stays buffered.
+        assert len(h.port.submissions) == submitted + 1
+        assert h.session.active_response_id == response_id
+        assert h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == 8000 * 4
+
+        events = await deliver(
+            [*first_unit, SPEAK, B, TURN_EOS, CHUNK_EOS], "嗯，好的" if A in first_unit else "好的", tokens_out=4
+        )
+        done = [event for event in events if event.type == "response.done"]
+        assert len(done) == 1, types(events)
+        assert done[0].response_id == response_id
+        assert done[0].status == "completed"
+        # Each snapshot counts once, whether its unit was empty or carried text.
+        stage0 = done[0].to_realtime()["response"]["metadata"]["vllm_omni"]["stage_metrics"]["0"]
+        assert stage0["num_tokens_out"] == 5
+        assert stage0["stage_gen_time_ms"] == pytest.approx(240.0)
+        assert stage0["vllm_itls_ms"] == [20.0, 20.0]
+        assert h.session.pending_input_bytes == 8000 * 4
+        # The buffered PCM is intact: completing its unit submits it unchanged, ahead of the new tail.
+        tail = append_audio(samples=8000, value=0.1)
+        await h.run(tail)
+        payload = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
+        assert base64.b64decode(payload["audio"]) == append_audio(samples=8000).audio + tail.audio
+        assert h.session.pending_input_bytes == 0
     finally:
         await close_harness(h)
 
