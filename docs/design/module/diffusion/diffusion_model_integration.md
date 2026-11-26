@@ -38,7 +38,9 @@ loading, adapters, shared layers, and model-specific processing.
 ### DIFF-MODEL-INV-001: Pipelines implement one runtime contract
 
 **Rule:** A pipeline MUST declare its supported modalities, configuration,
-inputs, outputs, loading path, and runtime capabilities.
+inputs, outputs, loading path, and runtime capabilities (including its
+merged-LoRA capability via `SupportsMergedLoRA` or an explicit registry entry in
+`vllm_omni/lora/capability.py`).
 
 ### DIFF-MODEL-INV-002: Registration is the selection boundary
 
