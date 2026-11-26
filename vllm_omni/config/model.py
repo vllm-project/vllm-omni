@@ -169,6 +169,8 @@ class OmniModelConfig(ModelConfig):
     sampling_extra_args_keys: tuple[str, ...] = ()
     requires_full_payload_input: bool = False
     scheduling_metadata_adapter: str | None = None
+    #: Dotted class path for this stage's optional scheduler window policy.
+    scheduler_window_policy: str | None = None
 
     def compile_factors(self) -> CompileFactors:
         """Compile factors for the Omni Model config, used for the compile cache.
@@ -192,7 +194,10 @@ class OmniModelConfig(ModelConfig):
             hashed.omni_kv_config = dict(self.omni_kv_config)
             hashed.omni_kv_config["connector_config"] = connector_hash_factors(self.omni_kv_config["connector_config"])
 
-        return super(OmniModelConfig, hashed).compile_factors()
+        factors = super(OmniModelConfig, hashed).compile_factors()
+        # Window policies run in the scheduler and do not change the model graph.
+        factors.pop("scheduler_window_policy", None)
+        return factors
 
     @property
     def registry(self):
@@ -344,11 +349,20 @@ class OmniModelConfig(ModelConfig):
 
         omni_cfg._maybe_override_text_config()
         omni_cfg._validate_startup_task_type()
+        omni_cfg._validate_response_judge_config()
 
         if omni_cfg.hf_config is not None:
             omni_cfg.hf_config.architectures = omni_cfg.architectures
 
         return omni_cfg
+
+    def _validate_response_judge_config(self) -> None:
+        if self.model_stage != "response_judge":
+            return
+        # Reject a bad judge configuration at startup, not on the first turn.
+        from vllm_omni.engine.duplex.response_judge import JudgeSpec
+
+        JudgeSpec.for_model_config(self)
 
     @classmethod
     def _validate_omni_fields(cls, **omni_kwargs):

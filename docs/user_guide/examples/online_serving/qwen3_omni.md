@@ -425,6 +425,15 @@ prefill chunk size, while `max_model_len` bounds each request's total context.
 A ready stage input exceeding that stage's context limit ends with a
 request-local error containing the prompt length and configured limit.
 
+## Other Thinker speculation with async_chunk
+
+With `async_chunk: true`, speech supports DFlash and `ngram_gpu` on the
+Thinker. `ngram_gpu` forwards each step's accepted tokens to the Talker through
+the same committed-span path as DFlash, for turn-mode requests only.
+Initialization rejects other methods, and `ngram_gpu` with
+`session_mode=duplex`, before loading Thinker weights. Disable `async_chunk`
+to use other methods.
+
 ## Example materials
 
 ??? abstract "gradio_demo.py"

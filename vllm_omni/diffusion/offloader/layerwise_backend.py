@@ -304,8 +304,8 @@ def _install_layerwise_hook_group(
     # resident probe would hide an offloaded block from synchronous recovery.
     probes = {
         id(block): materialization_probe(
-            {name: tensor for name, tensor in block.named_parameters() if id(tensor) not in resident_tensor_ids},
-            {name: tensor for name, tensor in block.named_buffers() if id(tensor) not in resident_tensor_ids},
+            _streamed_tensors(block.named_parameters(), resident_tensor_ids),
+            _streamed_tensors(block.named_buffers(), resident_tensor_ids),
         )
         for block in block_list
     }

@@ -1276,6 +1276,18 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
     _hsdp_shard_conditions = [is_transformer_block_module]
 
+    stacked_params_mapping: list[tuple[str, str, str]] = [
+        # (param_name, shard_name, shard_id)
+        # self-attn
+        (".to_qkv", ".to_q", "q"),
+        (".to_qkv", ".to_k", "k"),
+        (".to_qkv", ".to_v", "v"),
+        # cross-attn
+        (".add_kv_proj", ".add_q_proj", "q"),
+        (".add_kv_proj", ".add_k_proj", "k"),
+        (".add_kv_proj", ".add_v_proj", "v"),
+    ]
+
     # Sequence Parallelism plan (following diffusers' _cp_plan pattern)
     # Similar to Z-Image's UnifiedPrepare, we use ImageRopePrepare to create
     # a module boundary where _sp_plan can shard hidden_states and vid_freqs together.
@@ -1588,17 +1600,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         return Transformer2DModelOutput(sample=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            # self-attn
-            (".to_qkv", ".to_q", "q"),
-            (".to_qkv", ".to_k", "k"),
-            (".to_qkv", ".to_v", "v"),
-            # cross-attn
-            (".add_kv_proj", ".add_q_proj", "q"),
-            (".add_kv_proj", ".add_k_proj", "k"),
-            (".add_kv_proj", ".add_v_proj", "v"),
-        ]
+        stacked_params_mapping = list(self.stacked_params_mapping)
         # Expose packed shard mappings for LoRA handling of fused projections.
         self.stacked_params_mapping = stacked_params_mapping
 

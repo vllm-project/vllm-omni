@@ -9,7 +9,13 @@ import torch
 from torch import nn
 
 from tests.diffusion.offloader.helpers import patch_offload_runtime
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionSpec,
+    BlockSparseSpec,
+    DiffusionParallelConfig,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.offloader import adaln_cache
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend
@@ -229,3 +235,43 @@ def test_invalid_cache_options_are_rejected_before_loading(kwargs):
 def test_cache_requires_ordinary_dit_layer_offload(kwargs):
     with pytest.raises(ValueError, match="enable_adaln_cache requires"):
         OmniDiffusionConfig(model="fake-model", enable_adaln_cache=True, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("default", True),
+        ("role", True),
+        ("legacy", False),
+        ("offload_off", False),
+        ("cache_off", False),
+        ("wrong_topology", False),
+        ("no_attention", False),
+    ],
+)
+def test_default_binding_policy_is_independent_of_sparse_sdk_pr(monkeypatch, case, expected):
+    # Inspect only the normalized policy; model loading and offload admission are separate contracts.
+    config = object.__new__(OmniDiffusionConfig)
+    config.enable_layerwise_offload = case != "offload_off"
+    config.enable_adaln_cache = case != "cache_off"
+    config.parallel_config = DiffusionParallelConfig(
+        ulysses_degree=4 if case == "wrong_topology" else 8,
+        allgather_degree=2,
+        data_parallel_size=1,
+    )
+    sparse = BlockSparseSpec()
+    if case == "legacy":
+        monkeypatch.delattr(sparse, "parallel", raising=False)
+        monkeypatch.delattr(BlockSparseSpec, "parallel", raising=False)
+    else:
+        # Only presence matters here; parsing the SDK extension is covered by its own PR.
+        object.__setattr__(sparse, "parallel", {})
+    spec = AttentionSpec(backend="RAINFUSION_ATTN", block_sparse=sparse)
+    config.diffusion_attention_config = (
+        None
+        if case == "no_attention"
+        else AttentionConfig(default=None, per_role={"self": spec})
+        if case == "role"
+        else AttentionConfig(default=spec)
+    )
+    assert config.default_npu_cpu_binding is expected

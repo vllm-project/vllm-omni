@@ -141,7 +141,7 @@ def _make_file_lora_request(adapter_dir: Path) -> LoRARequest:
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_bagel_lora_scale_and_deactivation(omni_runner: OmniRunner, tmp_path) -> None:
     """Validate LoRA effect, bounded perturbation, and clean deactivation."""
     omni = omni_runner.omni

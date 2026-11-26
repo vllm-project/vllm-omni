@@ -554,7 +554,7 @@ def test_ltx_quality_gate_uses_official_eager_defaults(monkeypatch):
     assert captured.sampling.guidance_scale is None
 
 
-_marks = hardware_marks(res={"cuda": ["H100", "B200"]})
+_marks = hardware_marks(res={"cuda": ["H100", "B200"], "rocm": "MI325"})
 _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUALITY_OUTPUT_DIR" in os.environ else None
 
 
@@ -562,7 +562,13 @@ def _quality_param(c: QualityTestConfig):
     marks = list(_marks)
     if c.id == "fp8_sensenova_u1":
         marks = hardware_marks(res={"cuda": "H200"})
+    if c.id == "fp8_flux2_dev_text_encoder":
+        # On MI300 CI the pod stops responding while the FP8 arm loads the
+        # 24B text encoder with CPU offload (AMD builds 17607, 17617).
+        marks = list(hardware_marks(res={"cuda": ["H100", "B200"]}))
     if c.id == "fp8_qwen_image":
+        # Disabled everywhere; keep it out of the ROCm selection rather than skipped there.
+        marks = list(hardware_marks(res={"cuda": ["H100", "B200"]}))
         marks.append(
             pytest.mark.skip(reason="Qwen-Image FP8 quality gate temporarily disabled (see CI / issue tracker).")
         )

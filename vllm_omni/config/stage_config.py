@@ -45,6 +45,7 @@ _TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
     {
         "requires_full_payload_input",
         "scheduling_metadata_adapter",
+        "scheduler_window_policy",
     }
 )
 
@@ -481,6 +482,8 @@ class StagePipelineConfig:
     # Optional model-owned adapter for runner payload metadata that affects
     # scheduling. The scheduler only receives its typed effects.
     scheduling_metadata_adapter: str | None = None
+    # Optional scheduler-side streaming window policy, owned by this stage.
+    scheduler_window_policy: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -654,6 +657,7 @@ class StageDeployConfig:
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
     ulysses_a2a_permute: bool | None = None
+    ulysses_overlap_chunks: int | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     sequence_parallel_size: int | None = None
@@ -701,6 +705,7 @@ class StageDeployConfig:
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
+    vae_stack_tiles: bool | None = None
     vae_fast_path: str | None = None
     vae_encode_fast_path: str | None = None
     boundary_ratio: float | None = None
@@ -1512,6 +1517,8 @@ def _build_engine_args(
     if ps.execution_type is StageExecutionType.LLM_AR and ps.recompute_preemption != "allow":
         engine_args["recompute_preemption"] = ps.recompute_preemption
     engine_args["scheduling_metadata_adapter"] = ps.scheduling_metadata_adapter
+    if ps.scheduler_window_policy is not None:
+        engine_args["scheduler_window_policy"] = ps.scheduler_window_policy
     return engine_args
 
 
