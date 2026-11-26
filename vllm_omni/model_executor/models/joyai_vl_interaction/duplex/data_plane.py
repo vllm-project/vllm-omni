@@ -66,6 +66,8 @@ class WorkingObservation:
     query_item_id: str | None = None
     history_anchor_item_ids: tuple[str, ...] = ()
     response_item_id: str | None = None
+    transcript_item_id: str | None = None
+    user_item_sources: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass
@@ -135,6 +137,8 @@ class Observation:
     query_reference: QueryReference | None = None
     response_frame_id: int = -1
     response_time_s: float = 0.0
+    transcript_item_id: str | None = None
+    user_item_sources: tuple[tuple[str, int], ...] = ()
 
     def absorb(self, output: object) -> tuple[str, bool]:
         """Fold one stage output into the cumulative action text.
