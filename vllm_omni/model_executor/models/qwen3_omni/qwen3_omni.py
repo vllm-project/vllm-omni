@@ -218,6 +218,12 @@ class Qwen3OmniMoeForConditionalGeneration(
     )
     packed_modules_mapping = Qwen3OmniMoeThinkerForConditionalGeneration.packed_modules_mapping
 
+    def merged_lora_spec(self):
+        """Expose merged-LoRA capability derived from upstream SupportsLoRA declarations."""
+        from vllm_omni.lora.capability import merged_lora_spec_from_ar_model
+
+        return merged_lora_spec_from_ar_model(self)
+
     def _maybe_apply_model_mapping(self) -> None:
         apply_outer_quant_config_mapping(self)
 
@@ -300,6 +306,22 @@ class Qwen3OmniMoeForConditionalGeneration(
             if spec_config is not None:
                 if spec_config.method in ("eagle3", "extract_hidden_states"):
                     raise ValueError("Qwen3-Omni auxiliary hidden-state speculation only supports DFlash")
+                if self.is_staged_run and getattr(vllm_config.model_config, "async_chunk", False):
+                    # Other methods would reach the Talker as multi-row decode
+                    # chunks, which the async-chunk processor drops.
+                    if not (spec_config.use_dflash() or spec_config.method == "ngram_gpu"):
+                        raise ValueError(
+                            "Qwen3-Omni async_chunk speech supports only DFlash and ngram_gpu speculation, "
+                            f"got method={spec_config.method!r}; disable async_chunk or use a supported method"
+                        )
+                    if (
+                        spec_config.method == "ngram_gpu"
+                        and getattr(vllm_config.model_config, "session_mode", "turn") == "duplex"
+                    ):
+                        raise ValueError(
+                            "Qwen3-Omni ngram_gpu with async_chunk does not support session_mode=duplex; "
+                            "use session_mode=turn or disable speculation"
+                        )
                 if spec_config.use_dflash():
                     if getattr(vllm_config.model_config, "session_mode", "turn") == "duplex":
                         raise ValueError(
@@ -395,11 +417,12 @@ class Qwen3OmniMoeForConditionalGeneration(
             self._codec_codebook_size = int(talker_config.code_predictor_config.vocab_size)
             # Codebook 0 uses V1's per-request CUDA generator (see
             # Qwen3OmniTalkerSampler). Residual codebooks receive their own
-            # request-local generator through get_mtp_seed. Keep the external
-            # uniform buffer disabled: explicit generators bypass the outer MTP
-            # graph while the predictor's inner graphs remain available, and
-            # switching to whole-span uniforms would change the sampling stream.
-            self.mtp_sample_uniforms = False
+            # request-local generator through get_mtp_seed. Feed their noise
+            # through a static tensor so seeded requests can still replay the
+            # whole-MTP graph. Preserve the eager predictor's per-step draw
+            # shapes so enabling that graph does not change any RNG stream.
+            self.mtp_sample_uniforms = True
+            self.mtp_sample_uniforms_preserve_eager_stream = True
             self.mrv2_custom_sampler = mrv2_talker_sampler
             self.mtp_sample_steps = max(0, int(talker_config.code_predictor_config.num_code_groups) - 1)
             self.mtp_sample_vocab_size = self._codec_codebook_size
@@ -522,6 +545,10 @@ class Qwen3OmniMoeForConditionalGeneration(
     @property
     def mtp_output_key(self) -> tuple[str, str]:
         return getattr(self, "talker_mtp_output_key", ("codes", "audio"))
+
+    @property
+    def mtp_accepts_per_row_generators(self) -> bool:
+        return bool(getattr(self, "talker_mtp_accepts_per_row_generators", False))
 
     @property
     def mtp_graph_safe(self) -> bool:

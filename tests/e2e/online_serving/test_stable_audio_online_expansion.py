@@ -23,7 +23,7 @@ from vllm_omni.watermarking import AudioSealWatermarker, AudioTensor
 STABLE_AUDIO_TEST_MODEL = os.environ.get("STABLE_AUDIO_TEST_MODEL", "stabilityai/stable-audio-open-1.0")
 T2A_PROMPT = "A piano playing a gentle melody with soft room ambience."
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"})
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4", "rocm": "MI300"})
 
 
 def _stable_audio_server_cases(model: str):

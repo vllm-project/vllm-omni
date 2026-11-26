@@ -38,6 +38,7 @@ from vllm.v1.engine import FinishReason
 from vllm.v1.request import Request, RequestStatus
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
+from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
 # isort: on
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -272,6 +273,25 @@ def _stage_running_chunk(sched, request: Request) -> None:
     sched.requests[request.request_id] = request
     sched.running.append(request)
     _ready_chunk_ids(sched).add(request.request_id)
+
+
+def test_minicpmo_code2wav_keeps_admission_until_abort():
+    scheduler = _make_scheduler(receive_path="native", max_num_seqs=2)
+    stage = MINICPMO_4_5_PIPELINE.stages[2]
+    scheduler._retains_state_across_chunks = stage.retains_state_across_chunks
+    first, second, waiting = (_make_request(name, 8) for name in ("first", "second", "waiting"))
+    for request in (first, second, waiting):
+        _stage_waiting_chunk(scheduler, request)
+
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) == {first.request_id, second.request_id}
+    for request in (first, second):
+        request.num_computed_tokens = len(request.prompt_token_ids)
+        _ready_chunk_ids(scheduler).discard(request.request_id)
+
+    assert not scheduler.schedule().num_scheduled_tokens
+    scheduler.finish_requests([first.request_id], RequestStatus.FINISHED_ABORTED)
+    assert scheduler.schedule().num_scheduled_tokens == {waiting.request_id: 8}
 
 
 @pytest.mark.parametrize("queue_name", ["running", "waiting"])

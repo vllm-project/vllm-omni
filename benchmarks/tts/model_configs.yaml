@@ -7,6 +7,18 @@
 # is tracked here.
 
 models:
+  ResembleAI/chatterbox-turbo: &chatterbox
+    supported_tasks: [default_voice, voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: false
+    task_extra_body:
+      default_voice:
+        voice: default
+      voice_clone: {}
+
+  ResembleAI/chatterbox: *chatterbox
+
   gradium/phonon-31m-en:
     supported_tasks: [default_voice]
     backend: openai-audio-speech
@@ -49,6 +61,18 @@ models:
     endpoint: /v1/audio/speech
     task_extra_body:
       voice_clone: {}
+
+  # Bench at 44.1 kHz: export VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=44100.
+  inclusionAI/Ming-omni-tts-0.5B: &ming_tts_dense
+    supported_tasks: [default_voice, voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: false
+    task_extra_body:
+      default_voice: {}
+      voice_clone: {}
+
+  inclusionAI/Ming-3.0-tts-0.5b: *ming_tts_dense
 
   IndexTeam/IndexTTS-2.5:
     supported_tasks: [voice_clone]

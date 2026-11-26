@@ -195,6 +195,14 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
     def has_pending(self) -> bool:
         return bool(self._buffer or self._vision_queue)
 
+    def has_ready_unit(self, *, chunk_period_ms: int) -> bool:
+        if self._vision_queue:
+            return True
+        if self._sample_rate_hz is None:
+            return False
+        min_samples = max(1, int(self._sample_rate_hz * max(1, int(chunk_period_ms)) / 1000))
+        return len(self._buffer) >= min_samples * 4
+
     def has_reserved(self) -> bool:
         return bool(self._reservations)
 
@@ -414,6 +422,16 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
 
     def retains_separate_vision_units(self) -> bool:
         return True
+
+    def prepare_backlog(self, *, operation_id: str, chunk_period_ms: int) -> MiniCPMO45PcmAppendReservation | None:
+        """Reserve the next complete audio or vision unit, retaining partial PCM."""
+        if not self.has_ready_unit(chunk_period_ms=chunk_period_ms):
+            return None
+        return self.prepare_append(
+            {"type": "audio", "audio": "", "format": "pcm_f32le", "sample_rate_hz": self._sample_rate_hz or 16000},
+            operation_id=operation_id,
+            chunk_period_ms=chunk_period_ms,
+        )
 
     def prepare_commit_prefix(
         self, *, operation_id: str, chunk_period_ms: int

@@ -90,6 +90,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`IFM/PAN2.md`](./IFM/PAN2.md) | PAN 2 text-to-video and image-to-video, offline and `/v1/videos` | 1x, 4x, or 8x GPUs with 141 GB or more (H200, B200, B300) |
 | [`IndexTeam/IndexTTS-2.md`](./IndexTeam/IndexTTS-2.md) | Online serving for voice-cloned TTS with optional emotion control | 1x L4 24GB or larger CUDA GPU |
 | [`IndexTeam/IndexTTS-2_5.md`](./IndexTeam/IndexTTS-2_5.md) | Online + offline multilingual voice-cloned TTS with native speed and emotion control | 1x NVIDIA H20 96GB |
+| [`InternLM/Sage-Interaction.md`](./InternLM/Sage-Interaction.md) | Live full-duplex spoken dialogue with native `<\|delegate\|>` tool handoff over `/v1/realtime?duplex=1` | 1x NVIDIA RTX 6000D 85GB (or 80GB+ CUDA GPU) |
 | [`Microsoft/VibeVoice-1.5B-H100.md`](./Microsoft/VibeVoice-1.5B-H100.md) | Offline single-speaker TTS with optional voice clone (eager) | 1x H100 80GB |
 | [`MiniMaxAI/MiniMax-H3.md`](./MiniMaxAI/MiniMax-H3.md) | T2VA, FL2VA, image+audio Ref2VA, and multi-video Ref2VA serving | 1x GPU with CPU offload / 4x B300 |
 | [`MiniMaxAI/MiniMax-H3-Image-AMD.md`](./MiniMaxAI/MiniMax-H3-Image-AMD.md) | Six-step text-to-image and image editing HTTP serving | 1x–8x AMD Instinct MI325X or MI350X (measured) |
@@ -103,6 +104,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`MiniMaxAI/MiniMax-H3-Image-RTX-PRO-6000.md`](./MiniMaxAI/MiniMax-H3-Image-RTX-PRO-6000.md) | MiniMax-H3-Image text-to-image and reference editing | 1x (offload), 2x or 4x RTX PRO 6000 Blackwell 96GB (measured) |
 | [`MiniMaxAI/MiniMax-H3-Image-XPU.md`](./MiniMaxAI/MiniMax-H3-Image-XPU.md) | MiniMax-H3-Image text-to-image and reference editing on XPU | 1x or 2x with DLO, 4x Intel Arc Pro B70 32GB (measured) |
 | [`MiniMaxAI/MiniMax-H3-Image-NPU.md`](./MiniMaxAI/MiniMax-H3-Image-NPU.md) | MiniMax-H3-Image text-to-image and reference editing on Ascend | 1x or 8x Atlas 800T A3 / Atlas 800I A2 / Atlas 350 |
+| [`NetEase-Youdao/Confucius4-TTS-H200.md`](./NetEase-Youdao/Confucius4-TTS-H200.md) | Online + offline multilingual voice-cloned TTS | 1x NVIDIA H200 141GB |
 | [`krea/Krea-2.md`](./krea/Krea-2.md) | Text-to-image (Turbo + Raw), offline + online, with LoRA | 1x H100 80GB / 1x Intel Arc Pro B70 32GB |
 | [`Kandinsky/Kandinsky6-TI2VA.md`](./Kandinsky/Kandinsky6-TI2VA.md) | Text/image-to-video-and-audio, offline and `/v1/videos` | 1x H100 80GB with CPU offload; 2x H100 for parallel modes |
 | [`LTX/LTX-2.md`](./LTX/LTX-2.md) | LTX-2/LTX-2.3 text-to-video and image-to-video with synchronized audio | H200 141GB / 96GB-class GPU / 1x Intel Arc Pro B70 32GB |
@@ -144,6 +146,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Qwen/Qwen3-TTS.md`](./Qwen/Qwen3-TTS.md) | Text-to-speech serving (CustomVoice / VoiceDesign / Base) | 1x H100/A100 80GB / 1x AMD MI300X |
 | [`Qwen/Qwen3-TTS-RTX4070TiSUPER.md`](./Qwen/Qwen3-TTS-RTX4070TiSUPER.md) | Text-to-speech serving on a 16 GB consumer card (0.6B CustomVoice) | 1x RTX 4070 Ti SUPER 16GB |
 | [`Qwen/Qwen3-TTS-Ascend910B3.md`](./Qwen/Qwen3-TTS-Ascend910B3.md) | Text-to-speech serving (1.7B CustomVoice / VoiceDesign / Base), qualified on v0.28.0 | 1x Ascend 910B3 64GB |
+| [`ResembleAI/Chatterbox-H100.md`](./ResembleAI/Chatterbox-H100.md) | English text-to-speech with a built-in or reference voice: one profile per model, with the upstream comparison | 1x H100 SXM, 80 GB |
 | [`SenseNova/SenseNova-U1.md`](./SenseNova/SenseNova-U1.md) | Unified image generation and understanding | 1x or 2x H200 / 1x AMD MI300X |
 | [`SenseNova/SenseNova-U1.5.md`](./SenseNova/SenseNova-U1.5.md) | Unified image generation and understanding, with an 8-step distilled LoRA | 1x A800 80GB |
 | [`StabilityAI/Stable-Audio-3-Medium.md`](./StabilityAI/Stable-Audio-3-Medium.md) | Offline + online text-to-audio diffusion (1.4B DiT, up to 380 s) | 1x RTX 4090 24GB |

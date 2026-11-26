@@ -905,6 +905,7 @@ def _resolve_duplex_av_inputs(
 
 async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     output_dir = Path(args.output_dir)
+    modalities = getattr(args, "modalities", None)
     stream_writer = _StreamingOutputWriter(output_dir)
 
     input_wav, video_frames, stacked_video_frames = _resolve_duplex_av_inputs(
@@ -929,6 +930,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             ref_audio=_ref_audio_data_url(args.ref_audio),
             temperature=args.temperature,
             instructions=args.instructions,
+            modalities=tuple(modalities.split(",")) if modalities else None,
             extra_body={
                 "sliding_window_mode": args.sliding_window_mode,
                 "basic_window_high_tokens": args.basic_window_high_tokens,
@@ -1422,6 +1424,12 @@ def parse_args() -> argparse.Namespace:
             "Optional reference WAV for the MiniCPM-o duplex assistant voice. "
             "The server defaults to the model-bundled assets/HT_ref_audio.wav."
         ),
+    )
+    parser.add_argument(
+        "--modalities",
+        choices=("audio,text", "text"),
+        default=None,
+        help="Output modalities. Defaults to what the deployment advertises.",
     )
     parser.add_argument("--output-dir", default="/tmp/minicpmo_realtime_duplex_demo")
     parser.add_argument("--chunk-ms", type=int, default=200)

@@ -23,6 +23,7 @@ from vllm_omni.engine.duplex.config import (
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import TurnEvent
+from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.engine_session import (
     RESPONSE_REQUEST_MEASUREMENT_ORIGIN,
     DuplexEngineSession,
@@ -670,6 +671,21 @@ def test_accept_fence_rejects_stale_or_foreign_fences():
     assert session.accepted_fence == DuplexFence("sid-fence", epoch=1, turn_id=0)
 
 
+def test_append_fence_never_falls_behind_the_accepted_fence():
+    """The user talks over a reply: the reply's turn still owns the response
+    slot, but the accepted fence has moved on. Input must still be accepted."""
+    session = _session("sid-overlap")
+    session.complete_model_turn(0)
+    session.complete_model_turn(1)
+    session.begin_response(turn_id=1)
+    assert session.active_response_turn_id < session.accepted_fence.turn_id
+
+    fence = helpers.append_fence(session, None)
+
+    assert fence == session.accepted_fence
+    session.commit_append(session.prepare_append(fence))  # no DuplexFenceMismatchError
+
+
 def test_prepare_and_commit_append_sequence_chunks_per_turn_and_epoch():
     session = _session("sid-append")
     fence = session.fence
@@ -835,7 +851,8 @@ def test_from_realtime_maps_wire_fields_and_stores_realtime_keys_in_extra_body()
     assert config.speed == 1.25
     assert config.max_tokens is None
     assert config.response_format == "pcm"
-    assert config.modalities == ["text", "audio"]
+    assert config.modalities is None
+    assert config.with_output_capabilities(DuplexCapabilities()).modalities == ["text", "audio"]
     assert config.extra_body["custom"] is True
     assert config.extra_body["realtime_tools"] == [{"type": "function", "name": "lookup"}]
     assert config.extra_body["realtime_tool_choice"] == "auto"
@@ -1097,7 +1114,7 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
 
     assert caps["implementation_level"] == "model_native_duplex"
     assert caps["supports_input_append"] is True
-    assert caps["input_modes"] == ["append_audio_chunk"]
+    assert caps["input_modes"] == ["append_audio_chunk", "append_text"]
     assert caps["adapter_patterns"] == ["scheduler_data_plane"]
     assert caps["supports_model_internal_state"] is True
     assert caps["requires_model_runner_kv"] is True

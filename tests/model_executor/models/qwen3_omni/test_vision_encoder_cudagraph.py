@@ -422,3 +422,57 @@ def test_thinker_duplex_without_dflash_reaches_model_loading(monkeypatch):
     monkeypatch.setattr(outer_module, "init_vllm_registered_model", load_model)
     with pytest.raises(RuntimeError, match="reached weight loading"):
         outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+def _spec(method):
+    return SimpleNamespace(
+        method=method,
+        use_dflash=lambda: method == "dflash",
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config={"target_layer_ids": [1, 3]})),
+    )
+
+
+@pytest.mark.parametrize("method", ["ngram", "draft_model", "mtp", "suffix"])
+def test_thinker_rejects_unsupported_async_chunk_speculation_before_loading(monkeypatch, method):
+    cfg = _config()
+    cfg.model_config.async_chunk = True
+    cfg.speculative_config = _spec(method)
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", lambda **kwargs: pytest.fail("loaded model"))
+    with pytest.raises(ValueError, match="async_chunk speech supports only DFlash and ngram_gpu"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+def test_thinker_rejects_duplex_ngram_gpu_async_chunk_before_loading(monkeypatch):
+    cfg = _config()
+    cfg.model_config.async_chunk = True
+    cfg.model_config.session_mode = "duplex"
+    cfg.speculative_config = _spec("ngram_gpu")
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", lambda **kwargs: pytest.fail("loaded model"))
+    with pytest.raises(ValueError, match="ngram_gpu.*duplex"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+@pytest.mark.parametrize(
+    "method, async_chunk, session_mode",
+    [
+        ("dflash", True, "turn"),
+        ("ngram_gpu", True, "turn"),
+        ("ngram_gpu", False, "duplex"),
+        ("ngram", False, "turn"),
+        ("draft_model", False, "turn"),
+    ],
+)
+def test_thinker_supported_async_chunk_speculation_reaches_model_loading(
+    monkeypatch, method, async_chunk, session_mode
+):
+    cfg = _config()
+    cfg.model_config.async_chunk = async_chunk
+    cfg.model_config.session_mode = session_mode
+    cfg.speculative_config = _spec(method)
+
+    def load_model(**kwargs):
+        raise RuntimeError("reached weight loading")
+
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", load_model)
+    with pytest.raises(RuntimeError, match="reached weight loading"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
