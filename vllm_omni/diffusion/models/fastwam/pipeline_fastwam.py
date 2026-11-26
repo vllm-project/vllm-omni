@@ -23,6 +23,7 @@ solvers (``MIOPEN_DEBUG_CONV_DIRECT`` / ``MIOPEN_DEBUG_CONV_GEMM`` not set to 0)
 
 from __future__ import annotations
 
+import gc
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -38,6 +39,7 @@ from vllm_omni.diffusion.models.fastwam.config import (
     check_checkpoint_matches_preset,
     resolve_config,
 )
+from vllm_omni.diffusion.models.fastwam.kernel_backend import FastWAMKernelContext, load_fastwam_kernel_backend
 from vllm_omni.diffusion.models.fastwam.modeling.fastwam import FastWAMModel
 from vllm_omni.diffusion.models.fastwam.policy import (
     _BASE_MODEL_PATTERNS,
@@ -54,6 +56,7 @@ from vllm_omni.diffusion.models.fastwam.processing_fastwam import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -97,11 +100,22 @@ def _noise_generator(sampling_params: OmniDiffusionSamplingParams) -> torch.Gene
     return None
 
 
+def _release_device_memory() -> None:
+    """Free what a kernel backend that failed half-way through loading may still hold on the device."""
+    gc.collect()
+    current_omni_platform.empty_cache()
+
+
 class FastWAMPipeline(nn.Module):
     """FastWAM world-action model served as an OpenPI robot policy.
 
     Registered as ``"FastWAMPipeline"``. The variant is chosen by
     ``model_config.fastwam_variant`` (default ``cae_fastwam_libero``).
+
+    An optional kernel backend (``VLLM_OMNI_FASTWAM_KERNELS``, off by default; see
+    :mod:`~vllm_omni.diffusion.models.fastwam.kernel_backend`) can serve the action inference
+    instead of the stock PyTorch model. It then compiles its own regions, so the runner's
+    ``torch.compile`` is skipped for it.
     """
 
     # Component roles for the runner (compile, offload, sequence-parallel hooks).
@@ -142,29 +156,66 @@ class FastWAMPipeline(nn.Module):
         base_model_dir = resolve_local_dir(
             str(model_config.get("base_model") or DEFAULT_BASE_MODEL), _BASE_MODEL_PATTERNS
         )
+        device = get_local_device()
+        kernel_backend = load_fastwam_kernel_backend(
+            FastWAMKernelContext(
+                cfg=cfg,
+                model_dir=model_dir,
+                base_model_dir=base_model_dir,
+                device=device,
+                dtype=dtype,
+                platform=current_omni_platform,
+            ),
+            on_fallback=_release_device_memory,
+        )
         self.policy = FastWAMPolicy(
             cfg=cfg,
             model_dir=model_dir,
             base_model_dir=base_model_dir,
-            device=get_local_device(),
+            device=device,
             dtype=dtype,
             action_postprocess=action_postprocess,
             default_suite=model_config.get("task_suite"),
+            kernel_backend=kernel_backend,
         )
         # Registered as children by role so the runner sees every parameter and
         # compiles only the experts.
-        model = self.policy.model
-        self.mot = model.mot
-        self.text_encoder = model.text_encoder
-        self.vae_encoder = model.vae_encoder
-        self.proprio_encoder = model.proprio_encoder
-        self.action_codec = model.action_codec
+        if kernel_backend is None:
+            model = self.policy.model
+            assert model is not None
+            components: dict[str, nn.Module | None] = {
+                "mot": model.mot,
+                "text_encoder": model.text_encoder,
+                "vae_encoder": model.vae_encoder,
+                "proprio_encoder": model.proprio_encoder,
+                "action_codec": model.action_codec,
+            }
+        else:
+            components = dict(kernel_backend.components)
+            # The runner calls setup_compile() instead of compiling _dit_modules when it exists.
+            self.setup_compile = self._kernel_backend_compiles_itself
+        self.mot = components["mot"]
+        self.text_encoder = components["text_encoder"]
+        self.vae_encoder = components["vae_encoder"]
+        self.proprio_encoder = components["proprio_encoder"]
+        self.action_codec = components["action_codec"]
         self._validate_policy_server_config(model_config.get("policy_server_config"))
 
     @property
-    def model(self) -> FastWAMModel:
-        """The whole FastWAM model (its components are registered on the pipeline by role)."""
+    def model(self) -> FastWAMModel | None:
+        """The whole stock FastWAM model (``None`` when a kernel backend serves the model)."""
         return self.policy.model
+
+    @property
+    def kernel_backend(self) -> Any:
+        """The active kernel backend, or ``None`` for the stock path."""
+        return self.policy.kernel_backend
+
+    def _kernel_backend_compiles_itself(self) -> None:
+        logger.info(
+            "FastWAM kernel backend %r compiles its own regions; the runner's torch.compile is not applied.",
+            self.policy.kernel_backend.name,
+        )
 
     @property
     def cfg(self) -> FastWAMConfig:

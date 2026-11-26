@@ -30,6 +30,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.fastwam.config import REPO_CONFIG, ActionCodecConfig, FastWAMConfig
+from vllm_omni.diffusion.models.fastwam.kernel_backend import FastWAMActionBackend
 from vllm_omni.diffusion.models.fastwam.modeling.action_codec import ActionLatentDecoder
 from vllm_omni.diffusion.models.fastwam.modeling.fastwam import FastWAMModel
 from vllm_omni.diffusion.models.fastwam.modeling.umt5_encoder import (
@@ -129,7 +130,12 @@ def load_vae_encoder_state(vae_dir: str) -> dict[str, torch.Tensor]:
 
 
 class FastWAMPolicy:
-    """Owns the FastWAM model, tokenizer, prompt-context cache and per-suite statistics."""
+    """Owns the FastWAM model, tokenizer, prompt-context cache and per-suite statistics.
+
+    With an optional kernel backend (:mod:`~vllm_omni.diffusion.models.fastwam.kernel_backend`) the
+    backend owns the model and the prompt encoding; the stock model is then not built (``model`` is
+    ``None``) and only the observation processing, statistics and post-processing stay here.
+    """
 
     def __init__(
         self,
@@ -141,12 +147,12 @@ class FastWAMPolicy:
         dtype: torch.dtype,
         action_postprocess: str = "libero",
         default_suite: str | None = None,
+        kernel_backend: FastWAMActionBackend | None = None,
     ) -> None:
-        from transformers import AutoTokenizer
-
         self.model_dir = model_dir
         self.device = torch.device(device)
         self.action_postprocess = action_postprocess
+        self.kernel_backend = kernel_backend
 
         if cfg.action_codec_checkpoint:
             codec_payload = _load_pt(os.path.join(model_dir, cfg.action_codec_checkpoint), mmap=False)
@@ -162,6 +168,37 @@ class FastWAMPolicy:
 
         policy_payload = _load_pt(os.path.join(model_dir, cfg.policy_checkpoint), mmap=True)
         cfg.check_policy_state_dict(policy_payload["mot"])
+        self._prompt_cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+        self._stats: dict[str, FastWAMStats] = {}
+        self.model: FastWAMModel | None = None
+        self.tokenizer = None
+        if kernel_backend is None:
+            self.model, self.tokenizer = self._build_model(cfg, policy_payload, codec_payload, base_model_dir, dtype)
+        del policy_payload
+        logger.info(
+            "Loaded FastWAM variant %s (action expert %d/%d, %d %s tokens, shift %.1f%s) on %s in %s%s.",
+            cfg.variant,
+            cfg.action_hidden_dim,
+            cfg.action_ffn_dim,
+            cfg.num_action_tokens,
+            "latent" if cfg.action_codec is not None else "action",
+            cfg.action_shift,
+            "" if cfg.validated else "; NOT validated",
+            self.device,
+            dtype,
+            "" if kernel_backend is None else f", served by kernel backend {kernel_backend.name!r}",
+        )
+
+    def _build_model(
+        self,
+        cfg: FastWAMConfig,
+        policy_payload: dict[str, Any],
+        codec_payload: dict[str, Any] | None,
+        base_model_dir: str,
+        dtype: torch.dtype,
+    ) -> tuple[FastWAMModel, Any]:
+        """Build the stock model on the meta device, adopt the checkpoint tensors and load the tokenizer."""
+        from transformers import AutoTokenizer
 
         # Build on the meta device and adopt the checkpoint tensors (no random init
         # of ~11B parameters). The VAE encoder is built for real: it carries
@@ -198,24 +235,7 @@ class FastWAMPolicy:
         if codec is not None:
             model.action_codec = codec.to(device=self.device, dtype=torch.float32)
         model.eval().requires_grad_(False)
-        self.model = model
-        del policy_payload
-
-        self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(base_model_dir, "tokenizer"))
-        self._prompt_cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
-        self._stats: dict[str, FastWAMStats] = {}
-        logger.info(
-            "Loaded FastWAM variant %s (action expert %d/%d, %d %s tokens, shift %.1f%s) on %s in %s.",
-            cfg.variant,
-            cfg.action_hidden_dim,
-            cfg.action_ffn_dim,
-            cfg.num_action_tokens,
-            "latent" if cfg.action_codec is not None else "action",
-            cfg.action_shift,
-            "" if cfg.validated else "; NOT validated",
-            self.device,
-            dtype,
-        )
+        return model, AutoTokenizer.from_pretrained(os.path.join(base_model_dir, "tokenizer"))
 
     def check_suite(self, suite: str | None) -> None:
         """Raise ``ValueError`` unless ``suite`` is usable with this checkpoint."""
@@ -241,6 +261,8 @@ class FastWAMPolicy:
 
     def encode_prompt(self, task: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Prompt context, cached per unique instruction (it is a pure function of the text)."""
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError("encode_prompt is not available when a kernel backend serves the model.")
         prompt = self.cfg.prompt_template.format(task=task)
         cached = self._prompt_cache.get(prompt)
         if cached is not None:
@@ -267,20 +289,31 @@ class FastWAMPolicy:
         stats = self.stats(obs.suite)
         image = build_image(obs.images, cfg.camera_size)
         proprio = stats.state.normalize(torch.as_tensor(obs.state, dtype=torch.float32).unsqueeze(0))
-        context, context_mask = self.encode_prompt(obs.task)
         suite_id = None
         if cfg.action_codec is not None and cfg.action_codec.num_suites:
             if obs.suite is None:
                 raise ValueError("A suite-conditioned action codec needs a task_suite.")
             suite_id = cfg.suite_ids[obs.suite]
-        actions = self.model.infer_action(
-            image,
-            context,
-            context_mask,
-            proprio,
-            num_steps=num_steps,
-            generator=generator,
-            suite_id=suite_id,
-        )
+        if self.kernel_backend is not None:
+            actions = self.kernel_backend.infer_action(
+                image,
+                cfg.prompt_template.format(task=obs.task),
+                proprio,
+                num_steps=num_steps,
+                generator=generator,
+                suite_id=suite_id,
+            )
+        else:
+            assert self.model is not None
+            context, context_mask = self.encode_prompt(obs.task)
+            actions = self.model.infer_action(
+                image,
+                context,
+                context_mask,
+                proprio,
+                num_steps=num_steps,
+                generator=generator,
+                suite_id=suite_id,
+            )
         denormalized = stats.action.denormalize(actions.unsqueeze(0)).numpy()[0]
         return postprocess_actions(denormalized, self.action_postprocess)
