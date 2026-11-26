@@ -51,6 +51,8 @@ reference extraction remains disabled because it regressed the C16 screen.
 
 ## References
 
+- [Two-card Ascend features and serving](MiniCPM-o-4_5-Ascend.md).
+
 - Default deploy configs (auto-loaded by HF `model_type=minicpmo` +
   `hf_config.version="4.5"`):
     - Default single-GPU compatibility layout (auto-loaded):
