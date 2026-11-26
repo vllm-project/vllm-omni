@@ -4784,8 +4784,12 @@ def test_voxtral_tts_nightly_splits_c1_latency_from_throughput_and_stress() -> N
             "test_voxtral_tts": "2",
         },
     )
-    for step, cases, results, kind in zip(
-        (latency, remaining), expected_nodes, expected_results, ("latency", "perf"), strict=True
+    expected_env = (
+        {"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"},
+        {"MIOPEN_FIND_MODE": "FAST", "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"},
+    )
+    for step, cases, results, env, kind in zip(
+        (latency, remaining), expected_nodes, expected_results, expected_env, ("latency", "perf"), strict=True
     ):
         artifact = f"rocm-voxtral-tts-{kind}"
         assert step["agent_pool"] == "mi300_1"
@@ -4793,7 +4797,7 @@ def test_voxtral_tts_nightly_splits_c1_latency_from_throughput_and_stress() -> N
         assert step["mirror_hardwares"] == ["amdproduction"]
         assert step["timeout_in_minutes"] == 180
         assert step["source_file_dependencies"] == ["tts_voxtral_tts_perf", "rocm_tts_perf_runner"]
-        assert step["env"] == {"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"}
+        assert step["env"] == env
         assert step["artifact_paths"] == [f"artifacts/{artifact}/**/*"]
         (command,) = step["commands"]
         args = split(command)
