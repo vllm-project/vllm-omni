@@ -1,7 +1,7 @@
 # MiniMax H3 on Ascend 950PR / 950DT
 
-> Joint video and audio generation — Ascend NPU deployment guide for the
-> four-card Ascend 950PR / 950DT route
+> Joint video and audio generation — Ascend NPU deployment guide for
+> four-card and eight-card Ascend 950PR / 950DT routes
 
 ## Summary
 
@@ -9,10 +9,13 @@
 - Model: [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3)
 - Tasks: T2VA, FL2VA, and Ref2VA
 - Mode: OpenAI-compatible `/v1/videos` HTTP serving
-- Hardware: Ascend 950PR / Ascend 950DT, 4x NPU (128 GB HBM per device)
+- Hardware: Ascend 950PR / Ascend 950DT, 4x or 8x NPU
+  (128 GB HBM per device)
 - Maintainer: Community
 
-This recipe covers the four-card 950PR / 950DT configuration at 1344x768.
+This recipe covers four-card and eight-card 950PR / 950DT configurations at
+1344x768. The eight-card profile was qualified on a host with two four-NPU
+UB domains.
 For the eight-card Atlas 800I A2 / A3 route, see
 [MiniMax-H3-NPU.md](MiniMax-H3-NPU.md); checkpoint layout, container
 preparation, MindIE-SD installation, and the ffmpeg/decord dependencies are
@@ -115,6 +118,60 @@ vllm serve "${MODEL}" \
 
 The recommended lossy configuration uses a **start=8 / end=12** dense-fallback
 window; see below for more aggressive settings.
+
+### Eight-card configuration on a split-domain 950PR host
+
+This profile was qualified on an x86_64 Atlas 150 host with eight 128 GB
+Ascend 950PR NPUs. NPU 0-3 form one UB domain and NPU 4-7 form the other;
+communication between the domains traverses SYS/NUMA.
+
+On this tested topology, do not set `HCCL_NPU_SOCKET_PORT_RANGE=auto`. With
+automatic NPU-side socket-port allocation enabled, startup and `/health`
+succeeded, but the first video request failed during `HcclBroadcast` on the
+rank 0 to rank 4 path. Leaving the variable unset restored successful
+generation. See
+[#10645](https://github.com/vllm-project/vllm-omni/issues/10645).
+
+The following T2VA BF16 command was qualified with the software environment
+listed in the eight-card evidence section below:
+
+```bash
+export PORT=9098
+export MODEL=/path/to/MiniMax-H3
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=14400
+export VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT=14400
+export VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=14400
+export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=14400
+export HCCL_CONNECT_TIMEOUT=120
+export PYTHONDONTWRITEBYTECODE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+unset HCCL_NPU_SOCKET_PORT_RANGE
+
+vllm serve "${MODEL}" \
+  --omni \
+  --host 0.0.0.0 \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --task-type fl2va \
+  --num-gpus 8 \
+  --usp 8 \
+  --ring 1 \
+  --text-encoder-tp-size 8 \
+  --vae-parallel-mode tile \
+  --vae-use-tiling \
+  --vae-patch-parallel-size 8 \
+  --enable-diffusion-pipeline-profiler
+```
+
+The `--task-type fl2va` partition serves both T2VA and FL2VA. Restart with
+`--task-type ref2va` and the Ref2VA checkpoint for Ref2VA requests. The
+qualification matrix records each task's tested DiT parallel layout; do not
+assume that one layout is interchangeable across all three tasks.
 
 ### Ref2VA on a 950PR that reports ~86 GB HBM
 
@@ -243,6 +300,34 @@ stays on the device, while without DLO (lossy rows) the quantized weights are
 resident in HBM. Peak memory stays well inside the 128 GB per-device capacity
 in both cases. These numbers describe the validated shapes rather than a
 general throughput guarantee.
+
+### Eight-card qualification evidence
+
+The following results used `quay.io/ascend/vllm-omni:v0.33.0rc1-a5`,
+vLLM-Omni `0.1.dev1+g08e9267ed.npu`, vLLM-Ascend
+`0.19.1rc2.dev3349+g221fb096c.d20261104`, torch-npu `2.10.0.post7`, and
+MindIE-SD `3.2.0`. Output resolution was 1344x768. The 124-frame and
+362-frame workloads are referred to as 5 s and 15 s respectively.
+
+Each row is one representative successful run. Run-to-run variance and a
+quality comparison were not measured. Peak memory is reported per NPU. The
+T2VA FlashGen4 rows use four denoising steps, so they are not an equal-step
+comparison against the 50-step BF16 rows.
+
+| Task | Frames | Configuration | DiT layout | Steps | E2E (s) | DiT (s) | DiT/step (s) | Peak memory (MB) |
+| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| T2VA | 124 | BF16 dense | USP8 | 50 | 137.625 | 133.701 | 2.674 | 33,445 |
+| T2VA | 124 | FlashGen4 + RainFusion + MXFP8 (mix) | USP8 | 4 | 8.218 | 4.385 | 1.096 | 57,958 |
+| T2VA | 362 | BF16 dense | USP8 | 50 | 761.321 | 750.742 | 15.015 | 34,562 |
+| T2VA | 362 | FlashGen4 + RainFusion + MXFP8 (mix) | USP8 | 4 | 23.732 | 13.313 | 3.328 | 58,825 |
+| FL2VA | 124 | BF16 dense | TP8 | 50 | 148.112 | 144.015 | 2.880 | 33,491 |
+| FL2VA | 124 | RainFusion + MXFP8 (mix) | TP8 | 50 | 120.154 | 116.008 | 2.320 | 29,726 |
+| FL2VA | 362 | BF16 dense | TP8 | 50 | 788.380 | 777.414 | 15.548 | 34,742 |
+| FL2VA | 362 | RainFusion + MXFP8 (mix) | TP8 | 50 | 492.401 | 481.516 | 9.630 | 31,274 |
+| Ref2VA | 124 | BF16 dense | TP8 | 50 | 410.165 | 399.129 | 7.983 | 33,513 |
+| Ref2VA | 124 | RainFusion + MXFP8 (mix) | USP8 | 50 | 213.919 | 202.815 | 4.056 | 58,290 |
+| Ref2VA | 362 | BF16 dense | TP8 | 50 | 2,802.427 | 2,771.573 | 55.431 | 41,215 |
+| Ref2VA | 362 | RainFusion + MXFP8 (mix) | USP8 | 50 | 1,389.345 | 1,358.997 | 27.180 | 59,978 |
 
 ## Known limitations
 
