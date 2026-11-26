@@ -138,6 +138,30 @@ def test_ingest_orders_units_and_derives_records() -> None:
     assert records[0].model == {"rep_penalty": 1.05}
 
 
+def test_failed_submit_annotation_does_not_label_the_next_unit() -> None:
+    ledger = SessionActionLedger(session_id="s1")
+    ledger.bind_listening(epoch=0, turn_id=1)
+    failed = ledger.note_input_unit(0, 1, modality="audio", origin="client", commit_ns=1)
+    kept = ledger.note_input_unit(0, 2, modality="audio", origin="client", commit_ns=2)
+    ledger.discard_input_annotation(0, failed)
+    ledger.discard_input_annotation(0, failed)
+    ledger.ingest(_payload(seq=4, unit_index=0), epoch=0, turn_id=1, response_id=None, stage_id=0, input_modality="")
+    ledger.bind_response("r1", epoch=0, turn_id=2)
+    [set_] = ledger.take_terminal_sets()
+    assert set_.input_origins == ("client",)
+    assert set_.input_commit_ns == (2,)
+    assert kept != failed
+
+
+def test_commit_flush_origin_is_engine() -> None:
+    from vllm_omni.engine.duplex.session.model_channel import capture_input_origin
+    from vllm_omni.protocol.duplex.action_records import ORIGIN_CLIENT, ORIGIN_ENGINE
+
+    assert capture_input_origin({"type": "audio"}) == ORIGIN_CLIENT
+    assert capture_input_origin({"engine_injected_unit": True}) == ORIGIN_ENGINE
+    assert capture_input_origin({"retained_committed_unit": True, "type": "audio"}) == ORIGIN_ENGINE
+
+
 def test_input_origin_follows_submit_order_not_the_capture_seq() -> None:
     """A unit's capture seq is the model's counter, not the append reservation."""
     ledger = SessionActionLedger(session_id="s1")

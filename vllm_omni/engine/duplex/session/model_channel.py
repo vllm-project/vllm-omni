@@ -181,6 +181,17 @@ def _capture_input_modality(payload: object) -> str:
     return "audio"
 
 
+def capture_input_origin(payload: object) -> str:
+    """Ledger origin for one append.
+
+    Injected silence and a commit flush of audio already fed are engine.
+    A paced client chunk is client.
+    """
+    if isinstance(payload, Mapping) and (payload.get("engine_injected_unit") or payload.get("retained_committed_unit")):
+        return ORIGIN_ENGINE
+    return ORIGIN_CLIENT
+
+
 def _with_action_capture_envelope(
     prompt: dict[str, object], *, seed: int | None, response_index: int
 ) -> dict[str, object]:
@@ -377,8 +388,7 @@ class ModelChannel:
         # read and drop the engine-injected marker before the
         # plugin plans the append; it is ledger bookkeeping, not a model hint.
         engine_unit = isinstance(payload, Mapping) and bool(payload.get("engine_injected_unit"))
-        # A commit flush resubmits audio the client already fed. It is not another chunk.
-        retained_unit = isinstance(payload, Mapping) and bool(payload.get("retained_committed_unit"))
+        input_origin = capture_input_origin(payload)
         if isinstance(payload, dict):
             payload.pop("engine_injected_unit", None)
             payload.pop("retained_committed_unit", None)
@@ -537,12 +547,13 @@ class ModelChannel:
                     submitted_ns=accepted_ns,
                 )
                 prompt = with_perf_chunk(prompt, perf_chunk)
+            input_note: int | None = None
             if session.actions is not None and session.config.action_capture:
-                session.actions.note_input_unit(
+                input_note = session.actions.note_input_unit(
                     fence.epoch,
                     reservation.update.seq,
                     modality=("silence" if engine_unit else _capture_input_modality(payload)),
-                    origin=(ORIGIN_ENGINE if engine_unit or retained_unit else ORIGIN_CLIENT),
+                    origin=input_origin,
                 )
                 prompt = _with_action_capture_envelope(
                     prompt,
@@ -567,6 +578,8 @@ class ModelChannel:
                 if callable(note_appended):
                     note_appended(session.session_id)
             except BaseException:
+                if input_note is not None and session.actions is not None:
+                    session.actions.discard_input_annotation(fence.epoch, input_note)
                 if perf is not None and perf_chunk is not None:
                     perf.drop_chunk(perf_chunk)
                 raise
@@ -597,6 +610,8 @@ class ModelChannel:
                 session.bind_stage_request(stage_id, request_id, fence=fence)
                 self._ctx.plugin.commit_append_plan(request_id)
             except BaseException:
+                if input_note is not None and session.actions is not None:
+                    session.actions.discard_input_annotation(fence.epoch, input_note)
                 if perf is not None and perf_chunk is not None:
                     perf.drop_chunk(perf_chunk)
                 try:

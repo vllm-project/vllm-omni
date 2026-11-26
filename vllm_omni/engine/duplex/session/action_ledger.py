@@ -97,10 +97,10 @@ class SessionActionLedger:
         self._open: _OpenScope | None = None
         # scope key -> sealed set; at most RETAINED_SEALED_SETS entries.
         self._sealed: OrderedDict[str, DuplexActionRecordSet] = OrderedDict()
-        # Submit-order input annotations (modality, origin, commit time) per epoch.
-        # Claimed one per new unit_index. The capture seq is not the key: one
-        # unit emits several payloads, so that counter runs ahead of append seqs.
-        self._input_annotations: dict[int, deque[tuple[str, str, int | None]]] = {}
+        # Submit-order annotations per epoch, claimed once per new unit_index.
+        # The capture seq is not the key: one unit emits several payloads.
+        self._input_note_seq = 0
+        self._input_annotations: dict[int, deque[tuple[int, str, str, int | None]]] = {}
         # Scope keys already sealed once (ingest accounting that outlives
         # collection): a payload for one of these is invalid, never a gap.
         self._sealed_keys: set[str] = set()
@@ -115,18 +115,31 @@ class SessionActionLedger:
 
     # ---- engine-side annotations (no payload involved) ----
 
-    def note_input_unit(
-        self, epoch: int, seq: int, *, modality: str, origin: str, commit_ns: int | None = None
-    ) -> None:
+    def note_input_unit(self, epoch: int, seq: int, *, modality: str, origin: str, commit_ns: int | None = None) -> int:
         """Queue one append's input annotation, in submit order.
 
         ``seq`` is the append reservation. It is not the lookup key: a unit's
         capture seq is the model's own counter and runs ahead of these
-        reservations. Unknown origins are rejected.
+        reservations. Unknown origins are rejected. The returned token drops
+        this note if the submit never opens a unit.
         """
         if origin not in INPUT_ORIGINS:
             raise ActionLedgerError(f"unknown capture input origin: {origin!r}")
-        self._input_annotations.setdefault(epoch, deque()).append((str(modality), str(origin), commit_ns))
+        token = self._input_note_seq
+        self._input_note_seq += 1
+        self._input_annotations.setdefault(epoch, deque()).append((token, str(modality), str(origin), commit_ns))
+        return token
+
+    def discard_input_annotation(self, epoch: int, token: int) -> None:
+        """Drop a note that was never claimed. A claimed note is already gone."""
+        queue = self._input_annotations.get(epoch)
+        if not queue:
+            return
+        kept = deque(item for item in queue if item[0] != token)
+        if kept:
+            self._input_annotations[epoch] = kept
+        else:
+            self._input_annotations.pop(epoch, None)
 
     def claim_input_unit(self, epoch: int) -> tuple[str, str, int | None]:
         """The next submit-order annotation, or engine-origin when none is waiting.
@@ -137,7 +150,10 @@ class SessionActionLedger:
         queue = self._input_annotations.get(epoch)
         if not queue:
             return ("audio", ORIGIN_ENGINE, None)
-        return queue.popleft()
+        _token, modality, origin, commit_ns = queue.popleft()
+        if not queue:
+            self._input_annotations.pop(epoch, None)
+        return modality, origin, commit_ns
 
     # ---- scope lifecycle ----
 
