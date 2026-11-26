@@ -118,6 +118,7 @@ th {
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-VoiceDesign | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | [Ascend 910B3 (v0.28.0)](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-TTS-Ascend910B3.md) |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-Base | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | [Ascend 910B3 (v0.28.0)](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-TTS-Ascend910B3.md) |
 | `ChatterboxForConditionalGeneration` | Chatterbox Turbo and Original (English, built-in voice and voice cloning) | `ResembleAI/chatterbox-turbo`, `ResembleAI/chatterbox` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ResembleAI/Chatterbox-H100.md) |
+| `Confucius4TTSTalkerForConditionalGeneration` | Confucius4-TTS | `netease-youdao/Confucius4-TTS` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NetEase-Youdao/Confucius4-TTS-H200.md) |
 | `MingTTSForConditionalGeneration` | Ming-omni-tts dense 0.5B | `inclusionAI/Ming-omni-tts-0.5B` | ✅︎ | | | ✅︎ | — |
 | `MingTTSForConditionalGeneration` | Ming-3.0-TTS dense 0.5B | `inclusionAI/Ming-3.0-tts-0.5b` | ✅︎ | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/inclusionAI/Ming-omni-tts.md) |
 | `Ming3TTSForConditionalGeneration` | Ming-3.0-TTS Tiny (Ling V3 MoE) | `inclusionAI/Ming-3.0-tts-tiny` | ✅︎ | | | ✅︎ | — |

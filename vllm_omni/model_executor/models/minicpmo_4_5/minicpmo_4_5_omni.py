@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -64,6 +65,7 @@ def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
     # Row-local snapshots replace the previous append's value, including when
     # audio follows text on the same resumable scheduler request.
     outputs["duplex_text_input"] = [info.get("text_input") is True for info in duplex_rows]
+    outputs["duplex_explicit_reply"] = [info.get("duplex_explicit_reply") is True for info in duplex_rows]
     prompt_rows = []
     for duplex_info in duplex_rows:
         prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
@@ -183,6 +185,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self.requires_raw_input_tokens = self.model_stage == "llm"
 
         if self.model_stage == "llm":
+            if (
+                current_omni_platform.is_npu()
+                and (vllm_config.additional_config or {}).get("minicpmo_visual_a16_prefill") is True
+            ):
+                from vllm_omni.platforms.npu.models.minicpmo_visual_precision import enable_visual_prefill_a16
+
+                enable_visual_prefill_a16(vllm_config.quant_config)
             # Initialize thinker model (image preprocessing + vision encoder + 3D resampler)
             self.thinker = init_vllm_registered_model(
                 vllm_config=vllm_config,
@@ -558,6 +567,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": str(exc)}}
             result = helper._stage_prefill_embeddings_only(state, audio_waveform, **prefill_kwargs)
         update_result = dict(result)
+        update_result["duplex_explicit_reply"] = (
+            duplex.get("final") is True and payload.get("_native_explicit_reply") is True
+        )
         if result.get("stage0_window_replaced") is True:
             window = duplex.get("stage0_window", {})
             logger.info(
@@ -997,6 +1009,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if spec is None:
                 return duplex_sampler, None
 
+            if current_omni_platform.is_npu() and spec.method == "dspark":
+                if self.vllm_config.scheduler_config.async_scheduling:
+                    raise ValueError("MiniCPM-o MRv2 duplex DSpark requires synchronous Thinker scheduling")
+                if os.environ.get("MINICPMO_NPU_DSPARK_NATIVE_GATHER") == "1":
+                    from vllm.v1.worker.gpu.spec_decode import rejection_sampler as rejection_module
+
+                    def gather_draft_sampled(
+                        input_ids, positions, logits_indices, expanded_idx_mapping, expanded_local_pos, prefill_len
+                    ):
+                        rows = logits_indices.long()
+                        ids = input_ids.index_select(0, rows)
+                        pos = positions.index_select(0, rows)
+                        prefill = prefill_len.index_select(0, expanded_idx_mapping.long())
+                        placeholders = (expanded_local_pos > 0) & (pos - expanded_local_pos < prefill)
+                        return ids.masked_fill(placeholders, -1), pos
+
+                    rejection_module.gather_draft_sampled = gather_draft_sampled
+                    logger.info("MiniCPM-o MRv2 DSpark uses the native NPU draft gather")
             from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
             return duplex_sampler, RejectionSampler(sampler, spec, sampler.req_states.draft_tokens.device)
@@ -1653,13 +1683,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             sampled == listen_id
             and 0 <= tts_bos_id
             and state is not None
-            and not getattr(state, "current_turn_ended", True)
-            and not getattr(state, "allow_speech_interruption", False)
             and not force_listen
             and not (
                 isinstance(payload, dict)
                 and payload.get("open_assistant_turn") is True
                 and getattr(state, "pending_speech_response_open", False)
+            )
+            and (
+                (
+                    not getattr(state, "current_turn_ended", True)
+                    and not getattr(state, "allow_speech_interruption", False)
+                )
+                or (
+                    getattr(state, "pending_speech_context", False)
+                    and (
+                        getattr(state, "idle_reply_due", False)
+                        or (isinstance(payload, dict) and payload.get("_native_explicit_reply") is True)
+                    )
+                )
             )
         ):
             return int(tts_bos_id)
@@ -1705,6 +1746,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         tts_bos_id = token_ids.get("tts_bos_token_id", -1)
         turn_eos_id = token_ids.get("turn_eos_token_id", -1)
         delegate_id = token_ids.get("delegate_token_id", -1)
+        if not force_listen and getattr(state, "idle_reply_due", False):
+            logger.info("MiniCPM-o duplex post-idle reply decision session=%s token=%d", state.session_id, sampled)
+            state.idle_reply_due = False
         if sampled in self._minicpmo45_chunk_terminator_token_ids(token_ids):
             state.pending_terminator_token = int(sampled)
             state.last_terminator_token = int(sampled)
@@ -1722,6 +1766,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 with suppress(Exception):
                     state.pending_speech_response_open = False
             return
+        state.speech_after_idle = False
         if delegate_id >= 0 and sampled == delegate_id:
             with suppress(Exception):
                 state.in_delegate_unit = True

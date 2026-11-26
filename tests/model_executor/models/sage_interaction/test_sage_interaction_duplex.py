@@ -175,10 +175,12 @@ def test_capabilities_and_tool_validation() -> None:
 
 
 def test_prepare_runtime_config_defaults_and_stage0_budget() -> None:
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import _tokenizer_key
+
     plugin = SageInteractionDuplexPlugin(_encode_audio_noop)
     tok = _FakeSageTokenizer()
-    plugin._tokenizers["/fake/sage"] = tok
     model_config = SimpleNamespace(model="/fake/sage", revision=None)
+    plugin._tokenizers[_tokenizer_key(model_config)] = tok
 
     cfg = DuplexSessionConfig(modalities=("text",), instructions=None)
     rt = asyncio.run(plugin.prepare_runtime_config(cfg, model_config=model_config))
@@ -679,10 +681,12 @@ def test_decide_output_does_not_retrigger_delegate_on_following_listen_units() -
 
 
 def test_session_update_syncs_speak_cap_without_clobbering_delegate_cap() -> None:
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import _tokenizer_key
+
     plugin = SageInteractionDuplexPlugin(_encode_audio_noop)
     tok = _FakeSageTokenizer()
-    plugin._tokenizers["/fake/sage"] = tok
     model_config = SimpleNamespace(model="/fake/sage", revision=None)
+    plugin._tokenizers[_tokenizer_key(model_config)] = tok
 
     cfg = DuplexSessionConfig(modalities=("text",), max_tokens=20)
     rt = asyncio.run(plugin.prepare_runtime_config(cfg, model_config=model_config))

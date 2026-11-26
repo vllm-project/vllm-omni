@@ -26,6 +26,10 @@ class NPUARWorker(OmniWorkerMixin, OmniNPUWorkerBase):
 
     def init_device(self):
         self.device = self._init_device()
+        if self.use_v2_model_runner:
+            from vllm_omni.platforms.npu.minicpmo_shared_kv import install_minicpmo_shared_kv
+
+            install_minicpmo_shared_kv(self.vllm_config)
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)
 

@@ -128,17 +128,26 @@ def first_value(value: object, default: object = None) -> object:
     return value if value is not None else default
 
 
+def text_input_is_complete(info_dict: Mapping[str, Any]) -> bool:
+    """Read the validated input lifecycle; ordinary requests have complete text."""
+    stream = info_dict.get("input_stream")
+    return stream.get("final", False) if isinstance(stream, Mapping) else True
+
+
 def has_tts_text_conditioning(
     info_dict: dict[str, Any], hidden_states: object = None, *, allow_blank_text: bool = True
 ) -> bool:
     """Whether a request carries the text the Talker conditions on.
 
-    That is ``text`` as a non-empty list with a truthy first item, precomputed
-    text ids, or a trailing-text hidden state. The Talker's ``preprocess`` raises
-    when this is false. ``allow_blank_text=False`` also rejects whitespace-only
-    text and precomputed ids that :func:`coerce_token_ids` would discard, for
-    the stage-0 check.
+    That is incremental ``input_stream.token_ids``, ``text`` as a non-empty
+    list with a truthy first item, precomputed text ids, or a trailing-text
+    hidden state. The Talker's ``preprocess`` raises when this is false.
+    ``allow_blank_text=False`` also rejects whitespace-only text and precomputed
+    ids that :func:`coerce_token_ids` would discard, for the stage-0 check.
     """
+    stream = info_dict.get("input_stream")
+    if isinstance(stream, dict) and stream.get("token_ids"):
+        return True
     text_list = info_dict.get("text")
     if isinstance(text_list, list) and text_list and text_list[0]:
         first = text_list[0]
@@ -1019,6 +1028,8 @@ class Qwen3TTSPromptEmbedsBuilder:
 
     @staticmethod
     def _non_streaming_mode(info_dict: dict[str, Any], task_type: str) -> bool:
+        if "input_stream" in info_dict:
+            return False
         value = info_dict.get("non_streaming_mode")
         if isinstance(value, list):
             value = value[0] if value else None
@@ -1299,6 +1310,26 @@ class Qwen3TTSPromptEmbedsBuilder:
 
     # -------------------- main entry point --------------------
 
+    def build_streaming_text_update(
+        self,
+        text_token_ids: list[int],
+        *,
+        input_complete: bool,
+    ) -> torch.Tensor:
+        """Project validated body tokens without introducing another codec BOS.
+
+        Args:
+            text_token_ids: Already-tokenized TTS text body, without chat wrappers.
+            input_complete: Append text EOS only for the final input update.
+
+        Returns:
+            Text conditioning rows, shaped ``[tokens, hidden]``.
+
+        """
+        token_ids = text_token_ids + ([self._config.tts_eos_token_id] if input_complete else [])
+        ids = to_device_nonblocking(torch.tensor(token_ids, dtype=torch.long), self._device())
+        return self._project_text_ids(ids)
+
     def build_prompt_embeds(
         self,
         *,
@@ -1314,7 +1345,9 @@ class Qwen3TTSPromptEmbedsBuilder:
                 (``PRECOMPUTED_TEXT_IDS_KEY``, ``PRECOMPUTED_REF_IDS_KEY``,
                 ``PRECOMPUTED_REF_CODE_KEY``, ``NORMALIZED_REF_AUDIO_KEY``).
                 Consumed keys are popped so the caller doesn't re-feed them
-                on subsequent prefill chunks.
+                on subsequent prefill chunks. Incomplete CustomVoice text
+                uses the interleaved layout without appending text EOS;
+                execution must pause once the available text is exhausted.
 
         Returns:
             ``(talker_prompt, trailing_text_hidden, ref_code_len, ref_code)``:
@@ -1350,7 +1383,10 @@ class Qwen3TTSPromptEmbedsBuilder:
             input_ids = to_device_nonblocking(
                 tok(build_assistant_text(text), return_tensors="pt", padding=False)["input_ids"], dev
             )
-
+        stream = info_dict.get("input_stream")
+        if isinstance(stream, dict):
+            body = to_device_nonblocking(torch.tensor(stream["token_ids"], dtype=torch.long), dev).reshape(1, -1)
+            input_ids = torch.cat((input_ids[:, :3], body, input_ids[:, -5:]), dim=1)
         # Optional instruct prefix.
         instruct = (info_dict.get("instruct") or [""])[0]
         instruct_embed = None
@@ -1784,15 +1820,16 @@ class Qwen3TTSPromptEmbedsBuilder:
                 talker_prompt = torch.cat([talker_prompt, text_all + pad_row, eos_row, tail], dim=1)
                 trailing_text_hidden = tts_pad_embed
             else:
-                first_text = text_projection(text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]
+                if isinstance(stream, dict):
+                    first_text = self._project_text_ids(input_ids[:, 3:4])
+                    trailing_text_hidden = self._project_text_ids(input_ids[:, 4:-5])
+                else:
+                    first_text = text_projection(text_embedding(input_ids[:, 3:4]))
+                    trailing_text_hidden = text_projection(text_embedding(input_ids[:, 4:-5]))
+                first_text = first_text + codec_input[:, -1:]
                 talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
-                trailing_text_hidden = torch.cat(
-                    (
-                        text_projection(text_embedding(input_ids[:, 4:-5])),
-                        tts_eos_embed,
-                    ),
-                    dim=1,
-                )
+                if text_input_is_complete(info_dict):
+                    trailing_text_hidden = torch.cat((trailing_text_hidden, tts_eos_embed), dim=1)
 
         elif task_type == "VoiceDesign":
             # No known speaker identity; only codec tags + text.

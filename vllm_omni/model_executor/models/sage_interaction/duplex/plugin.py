@@ -33,6 +33,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import (
     PRIVATE_RUNTIME_CONFIG_KEYS as _MINICPMO45_PRIVATE_KEYS,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import (
+    TOKENIZER_KEY,
     MiniCPMO45ClientRuntimeConfigError,
     MiniCPMO45DuplexPlugin,
     _completion_token_ids,
@@ -486,8 +487,11 @@ class SageInteractionDuplexPlugin(MiniCPMO45DuplexPlugin):
                 code="resource_exhausted",
             )
 
-        model_path = current.get(SAGE_MODEL_PATH_KEY)
-        tokenizer = self._tokenizers.get(model_path if isinstance(model_path, str) else "")
+        tokenizer_key = current.get(TOKENIZER_KEY)
+        tokenizer = self._tokenizers.get(tokenizer_key) if isinstance(tokenizer_key, str) else None
+        if tokenizer is None:
+            model_path = current.get(SAGE_MODEL_PATH_KEY)
+            tokenizer = self._tokenizers.get(model_path if isinstance(model_path, str) else "")
         if tokenizer is None and self._tokenizers:
             tokenizer = next((tok for tok in self._tokenizers.values() if tok is not None), None)
         if tokenizer is None:

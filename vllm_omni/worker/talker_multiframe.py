@@ -62,6 +62,7 @@ Off when stage 1's deploy config carries no speculative_config.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -90,26 +91,11 @@ _LOGGED_ENGAGE = False
 
 
 def neutralize_kstep_min_tokens(logitsprocs: Any) -> None:
-    """Stop vLLM's ``min_tokens`` layer from censoring the stop signal.
+    """Delegate the minimum codec length to the model's frame counter.
 
-    The yaml ``min_tokens: 50`` is enforced by ``MinTokensLogitsProcessor``
-    writing -inf into the stop-token logits. It unmasks once
-    ``len(output_token_ids) >= min_tokens``, a counter owned by vLLM's spec
-    bookkeeping; while that counter lags, the request's only stop signal stays
-    masked and ``finished_reason`` can only be ``length`` (observed on stage 1:
-    all length, zero stop).
-
-    The real minimum-length guard lives elsewhere:
-    ``talker_codec_sample.greedy_codec_sample`` masks the codec EOS itself via
-    ``state.step < min_tokens``, using the model's own frame counter. This vLLM
-    layer is therefore redundant and, under multi-frame decode, also swallows
-    the stop signal -- clear its list and leave the minimum to the model-side
-    guard.
-
-    ``min_toks`` is re-registered by ``update_state`` every step, so this must
-    be called every step (the caller places it right before sampling). Never
-    raises.
-    """
+    Clear the runner's re-registered minimum-token mask each step so it
+    cannot suppress the continue/stop control row. The model still masks
+    codec EOS while state.step is below min_tokens."""
     try:
         for proc in getattr(logitsprocs, "non_argmax_invariant", None) or []:
             if not type(proc).__name__.endswith("MinTokensLogitsProcessor"):
@@ -158,20 +144,11 @@ def _log_fold_once(reason: str) -> None:
 
 
 def applies(model: Any, model_kwargs_extra: dict[str, Any]) -> int:
-    """Frames this step should run, or 0 when the loop must not engage.
+    """Return the uniform query width for a Talker-only decode step.
 
-    Returns the uniform per-request query length of a pure decode step over a
-    Talker that can build its own decode embedding. Anything else -- a prefill,
-    a mixed step, a batch whose requests were scheduled different token counts
-    -- returns 0 and the caller takes the ordinary single-forward path.
-
-    Every refusal says so once. A step that schedules several tokens per
-    request and then takes the single-forward path is not merely slow: that
-    path samples one frame from the *last* row of each span and reports one
-    stop row for a step that needs one per position, so it corrupts the codec
-    stream and the scheduler's accounting alike. `_model_forward` turns those
-    into an error rather than letting them run.
-    """
+    Prefill, mixed and uneven batches return zero. The caller must reject
+    multi-token rows when the frame loop declines; sampling only the last
+    row would corrupt codec output and scheduler accounting."""
     if not supports_multi_frame_decode(model):
         # Every other stage: not a refusal, just not this model.
         return 0
@@ -247,6 +224,7 @@ def run(
     model_kwargs_extra: dict[str, Any],
     narrow: NarrowStep | None = None,
     keep_cuda_narrow_on_decline: bool = False,
+    frame_forward: Callable[[int, Callable[[], Any]], torch.Tensor] | None = None,
 ) -> Any:
     """Run ``frames`` codec frames and return the merged step output.
 
@@ -280,7 +258,25 @@ def run(
     frame_outputs = []
     frame_stop_logits = []
     frame_hidden = []
+    terminal_tail = None
+    if (
+        narrow is None
+        and inputs_embeds is not None
+        and inputs_embeds.device.type == "npu"
+        and os.getenv("MINICPMO_NPU_KSTEP_SKIP_TERMINAL_TAIL") == "1"
+    ):
+        terminal_tail = getattr(model, "terminal_kstep_tail", None)
     for frame in range(frames):
+        if frame > 0 and terminal_tail is not None:
+            tail = terminal_tail(frame_outputs[-1].text_hidden_states, infos)
+            if tail is not None:
+                output, stops = tail
+                frame_outputs.extend([output] * (frames - frame))
+                frame_stop_logits.extend([stops] * (frames - frame))
+                if frame_forward is not None:
+                    frame_hidden.extend([output.text_hidden_states.clone()] * (frames - frame))
+                logger.info_once("[minicpmo] MRv2 skips fully stopped Talker graph replays")
+                break
         if narrow is not None:
             # Frame 0's embeddings are already in the buffer, but at the rows a
             # K-query step laid them out on: request r's is at row r*K, and the
@@ -295,7 +291,9 @@ def run(
                 _write_frame_embeddings(model, target_embeds, input_ids, spans, infos, frame, narrow=narrow)
         elif frame > 0:
             _write_frame_embeddings(model, inputs_embeds, input_ids, spans, infos, frame)
-        if narrow is not None and hasattr(narrow, "run_model"):
+        if frame_forward is not None:
+            hidden = frame_forward(frame, run_model)
+        elif narrow is not None and hasattr(narrow, "run_model"):
             hidden = narrow.run_model(run_model, capture=False)
         else:
             hidden = run_model()
@@ -306,7 +304,9 @@ def run(
             if narrow is not None
             else [(int(start) + frame, int(start) + frame + 1) for start, _ in spans]
         )
-        if narrow is not None:
+        if frame_forward is not None:
+            frame_kwargs["request_token_spans"] = [(i, i + 1) for i in range(len(spans))]
+        if narrow is not None or frame_forward is not None:
             # The graph writes one row per request and the next frame overwrites
             # it, so this frame's hidden state has to be kept before the replay
             # that follows.
@@ -322,7 +322,7 @@ def run(
         _LOGGED_ENGAGE = True
         logger.info("[minicpmo] multi-frame Talker decode engaged: %d codec frames per step", frames)
     merged = model.merge_frame_outputs(frame_outputs, frame_stop_logits)
-    if narrow is not None and frame_hidden:
+    if frame_hidden:
         # (frames, rows, hidden) -> (rows * frames, hidden), request-major --
         # the layout `logits_indices` reads. OmniOutput is a NamedTuple.
         merged = merged._replace(
@@ -360,6 +360,10 @@ def _write_frame_embeddings(
     """
     if inputs_embeds is None:
         raise RuntimeError("MiniCPM-o multi-frame decode requires an inputs_embeds buffer")
+    if narrow is None and input_ids is not None:
+        write_batch = getattr(model, "write_kstep_frame_embeddings", None)
+        if write_batch is not None and write_batch(inputs_embeds, spans, infos, frame):
+            return
     for index, ((start, _), info) in enumerate(zip(spans, infos)):
         # The token to embed always sits at the step's own row; only where the
         # embedding goes changes when the narrow graph is the one replaying.
@@ -396,52 +400,12 @@ def constant_drafts(
     scheduled_draft_counts: list[int] | None = None,
     fold_short_rows: bool = False,
 ) -> list[list[int]]:
-    """`continue` repeated -- for the whole batch, or for none of it.
+    """Propose the same continuation width for every request, or none.
 
-    The drafts are how the next step gets K query positions per request, and
-    the multi-frame loop can only run a step whose requests all have the *same*
-    span: it replays one captured uniform-decode graph and samples one codec
-    frame per position. So drafting per request is not an option.
-
-    ``scheduled_draft_counts[i]`` is how many draft positions the scheduler
-    actually gave request *i* in the step that produced row *i* -- the
-    authoritative split between the two one-token shapes that must not be
-    confused:
-
-    * a row shorter than the step's own schedule (1 sampled +
-      ``scheduled`` drafts) on a step that *did* carry drafts is a stop
-      row firing mid-span: the rejection sampler truncated it to the
-      frames it accepted, so its next-step schedule is j+1 wide against
-      the neighbours' K -- non-uniform, fold the batch. A row exactly as
-      wide as the step scheduled is *not* a stop even below ``frames``:
-      the scheduler itself shortened the span (the uniform rewrite in
-      ``omni_ar_scheduler``), and this step must emit drafts or the
-      scheduler's booked frames never reach stage 2 and the requests
-      starve;
-    * a row of length 1 on a step that carried *no* drafts is the expected
-      shape of a prefill result or of an ordinary one-frame step (an
-      intentional single-frame fallback, or the step right after such a
-      fallback). Folding here would starve the K-step loop forever: the next
-      step schedules one token again, produces another one-token row, and no
-      drafts are ever emitted (Buildkite three-tier bench: 31/32 requests
-      failed on exactly this stall). A draftless step is precisely where the
-      K-step span starts or resumes, so those rows draft.
-
-    Mixed batches -- some requests drafted, some not -- cannot share a span
-    and fold. So: every request drafts, or nobody does.
-
-    ``fold_short_rows`` gates the stop-truncated-row folding above. The
-    caller (``npu_ar_model_runner.propose``) is the only place that can tell
-    a *live* short row -- a request that already ran multi-frame and fired
-    its codec stop mid-span, which must fold or the neighbours schedule
-    against a dead speaker -- from a row that merely looks short because its
-    step's drafts were scheduler padding: that request re-drafted is what
-    keeps the K-step alive across the padding step. Passing the flag False
-    keeps the pre-split behaviour of never folding on row length.
-
-    When ``scheduled_draft_counts`` is None the caller predates the scheduler
-    split and every row is assumed to sit on a drafted step.
-    """
+    Compare accepted rows with their actual scheduled draft counts to
+    distinguish an early stop from a normal one-token step. After a stop
+    or incompatible remaining context, clear the entire batch until a
+    uniform K-step can resume. Never draft for individual rows."""
     for index in range(num_reqs):
         sampled = None
         if isinstance(valid_sampled_token_ids, list) and index < len(valid_sampled_token_ids):
@@ -471,36 +435,11 @@ def constant_drafts(
 
 
 def ensure_stop_token_vocab(runner: Any, logits: Any) -> None:
-    """Let vLLM's rejection-sampler output survive the Talker's narrow head.
+    """Use the model's control-row width when parsing accepted tokens.
 
-    `RejectionSampler.parse_output` keeps a sampled token only while it is both
-    not the placeholder and `< vocab_size`, and stage 1's `input_batch` reports
-    a vocab size of **0** -- the Talker's vLLM-level head is the two-wide
-    continue/stop row `compute_logits` builds, not a tokenizer vocabulary, and
-    nothing had ever needed the number. With 0 the mask is empty, every
-    accepted token is dropped, and the request comes back having generated
-    nothing: the scheduler then never rolls back the tokens it advanced for the
-    step and schedules a negative count two steps later.
-
-    A single-frame step never reached this. It returns one token per request,
-    which `_bookkeeping_sync` takes down the `max_gen_len == 1` branch, and that
-    branch does not consult `vocab_size` at all.
-
-    Raising it back to the width of the row the model actually emits is the
-    whole fix -- and that width is `STOP_ROW_WIDTH` (two), *not* the width of
-    whatever tensor the caller happens to be holding. The Talker's vLLM-level
-    head is the two-wide continue/stop row `compute_logits` builds, so two is
-    what every `vocab_size` reader has to see.
-
-    The width has to be the row the model emits, not the width of whatever
-    tensor the caller happens to be holding: `InputBatch.add_request` stores
-    `top_k = vocab_size` as its "no top-k" sentinel, which only holds for 0 and
-    2. A hidden width (768) instead passes the `parse_output` filter by accident
-    but leaves `top_k_reqs` non-empty, and the Ascend `enable_reduce_sample`
-    branch then treats the two-column distribution as a 768-way one -- the stop
-    row does not survive into the request's token list and the request runs to
-    `max_tokens`.
-    """
+    A zero vocabulary drops every accepted control token and prevents
+    scheduler rollback. Update the runner and sampler metadata to the
+    continue/stop head width without changing codec sampling."""
     if logits is None or not supports_multi_frame_decode(runner.model):
         return
     batch = getattr(runner, "input_batch", None)

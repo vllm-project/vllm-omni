@@ -150,6 +150,45 @@ def _run_schedule(scheduler: OmniARScheduler, monkeypatch: pytest.MonkeyPatch) -
     return seen
 
 
+@pytest.mark.parametrize("resumable", [False, True])
+def test_near_full_talker_refill_preserves_drafts_for_one_step(monkeypatch, resumable):
+    incoming = _StubRequest("incoming")
+    incoming.arrival_time = 10.0
+    incoming.resumable = resumable
+    scheduler = _make_scheduler(parked=0, waiting=[incoming])
+    scheduler.max_num_running_reqs = scheduler.max_num_active_reqs = 16
+    scheduler.num_spec_tokens = 15
+    scheduler.max_model_len = 4096
+    scheduler._talker_kstep_armed = lambda: True
+    scheduler._talker_refill_coalesce = True
+    scheduler._last_talker_refill_deferred = False
+    scheduler.running = [
+        SimpleNamespace(
+            request_id=f"active-{i}",
+            resumable=False,
+            num_in_flight_tokens=0,
+            num_computed_tokens=100,
+            num_tokens=101,
+            prompt_token_ids=[0] * 50,
+            spec_token_ids=[1] * 15,
+        )
+        for i in range(15)
+    ]
+    active = scheduler.running.copy()
+    del scheduler._drop_talker_drafts_if_prefill_pending
+    monkeypatch.setattr(ar_sched_mod.time, "time", lambda: 10.2)
+    first_step = _run_schedule(scheduler, monkeypatch)
+    if resumable:
+        assert first_step["admitted"] == "incoming"
+        assert all(not request.spec_token_ids for request in active)
+    else:
+        assert first_step["admitted"] is None
+        assert list(scheduler.waiting) == [incoming]
+        assert all(len(request.spec_token_ids) == 15 for request in active)
+        assert _run_schedule(scheduler, monkeypatch)["admitted"] == "incoming"
+        assert all(not request.spec_token_ids for request in active)
+
+
 def test_seeded_request_is_admitted_while_a_streaming_session_is_parked(monkeypatch) -> None:
     """Regression for review P2: a parked session must not consume the solo slot."""
     seeded = _StubRequest("seeded", seed=42)
