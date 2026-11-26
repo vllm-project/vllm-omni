@@ -185,10 +185,17 @@ class DiffusionInt8Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: list[str] | None = None,
         smoothquant: bool | dict[str, Any] | None = None,
+        runtime: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
 
         self.is_checkpoint_int8_serialized = is_checkpoint_int8_serialized
+        # Model runtime metadata, for example the Cosmos3 MAPS
+        # ``diffusion_step_policy``. The model reads it from the checkpoint
+        # config. The linear method does not use it.
+        if runtime is not None and not isinstance(runtime, dict):
+            raise ValueError(f"runtime must be a dict, got {runtime!r}")
+        self.runtime = runtime or {}
 
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
@@ -234,6 +241,7 @@ class DiffusionInt8Config(QuantizationConfig):
         activation_scheme = cls.get_from_keys_or(config, ["activation_scheme"], "dynamic")
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         smoothquant = cls.get_from_keys_or(config, ["smoothquant"], None)
+        runtime = cls.get_from_keys_or(config, ["runtime"], None)
 
         if not ignored_layers:
             ignored_layers = cls.get_from_keys_or(config, ["modules_to_not_convert"], None)
@@ -242,6 +250,7 @@ class DiffusionInt8Config(QuantizationConfig):
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             smoothquant=smoothquant,
+            runtime=runtime,
         )
 
     def get_quant_method(

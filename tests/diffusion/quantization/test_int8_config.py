@@ -1037,3 +1037,44 @@ def test_sm100_kernel_apply_weights_fused_pre_quant_scale_cuda():
     fused = kernel.apply_weights(layer, x, pre_quant_scale=pq)
     unfused = kernel.apply_weights(layer, (x * pq.to(x.dtype)).contiguous())
     assert torch.equal(fused, unfused)
+
+
+_CHECKPOINT_QUANT_CONFIG_WITH_POLICY = {
+    "quant_method": "int8",
+    "is_checkpoint_int8_serialized": True,
+    "activation_scheme": "dynamic",
+    "ignored_layers": [],
+    "smoothquant": {"alpha": 0.5},
+    "runtime": {
+        "diffusion_step_policy": {
+            "schema_version": 1,
+            "type": "first_last_n",
+            "index_space": "denoising_loop_iteration",
+            "scope": ["transformer"],
+            "default_mode": "native",
+            "first_steps": {"count": 3, "mode": "a16"},
+            "last_steps": {"count": 3, "mode": "a16"},
+            "overlap": "a16",
+            "reasoner": "a16",
+        }
+    },
+}
+
+
+def test_int8_config_accepts_runtime_policy_from_checkpoint():
+    """A serialized INT8 checkpoint can store the MAPS policy under ``runtime``."""
+    kwargs = {k: v for k, v in _CHECKPOINT_QUANT_CONFIG_WITH_POLICY.items() if k != "quant_method"}
+    config = build_quant_config("int8", **kwargs)
+    assert config.is_checkpoint_int8_serialized
+    assert config.smoothquant
+    assert config.runtime == _CHECKPOINT_QUANT_CONFIG_WITH_POLICY["runtime"]
+
+    from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+    parsed = DiffusionInt8Config.from_config(_CHECKPOINT_QUANT_CONFIG_WITH_POLICY)
+    assert parsed.runtime == _CHECKPOINT_QUANT_CONFIG_WITH_POLICY["runtime"]
+
+
+def test_int8_config_rejects_non_mapping_runtime():
+    with pytest.raises(ValueError, match="runtime must be a dict"):
+        build_quant_config("int8", is_checkpoint_int8_serialized=True, runtime="maps")
