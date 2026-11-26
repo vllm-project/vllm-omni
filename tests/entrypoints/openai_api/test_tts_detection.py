@@ -141,6 +141,8 @@ _PIPELINE_STAGES = [
     "chatterbox_original_t3",
     "chatterbox_t3",
     "code2wav",
+    "confucius4_tts_decoder",
+    "confucius4_tts_talker",
     "cosyvoice3_code2wav",
     "cosyvoice3_talker",
     "dac_decoder",
@@ -192,6 +194,7 @@ _ARCHS = [
     "BreezeForConditionalGeneration",
     "MingTTSForConditionalGeneration",
     "CovoAudioForConditionalGeneration",
+    "Confucius4TTSTalkerForConditionalGeneration",
     "MyCovoAudioThing",
     "Qwen3TTSForConditionalGeneration",
 ]

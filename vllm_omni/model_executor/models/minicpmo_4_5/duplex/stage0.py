@@ -167,6 +167,9 @@ class _MiniCPMO45Stage0SessionState(MiniCPMO45TurnState):
     staged_prefill: tuple[tuple[int | None, int], dict[str, object]] | None = None
     pending_terminator_token: int | None = None
     last_terminator_token: int | None = None
+    quiet_audio_units: int = 0
+    speech_after_idle: bool = False
+    idle_reply_due: bool = False
     pending_speech_append_identity: tuple[int | None, int] | None = None
     generated_tokens: list[int] = field(default_factory=list)
     # Per-append raw draws and their returned IDs. A sampled listen can be
@@ -858,6 +861,18 @@ class MiniCPMO45Stage0DuplexRuntime:
             elif is_speech or (vision_only and num_frames):
                 state.pending_speech_context = True
                 state.pending_speech_append_identity = append_identity
+        if is_speech:
+            # The audio front end bounds its streaming history at 30 seconds.
+            # Allow one reply at the end of the first voiced turn after that gap.
+            state.speech_after_idle |= state.quiet_audio_units >= 30 and state.current_turn_ended
+            state.quiet_audio_units = 0
+            state.idle_reply_due = False
+        elif not (num_frames or has_text or text_token_ids):
+            state.quiet_audio_units += units_built
+            state.idle_reply_due |= state.speech_after_idle
+            state.speech_after_idle = False
+        else:
+            state.quiet_audio_units = 0
         if append_identity is not None:
             state.prepared_append_identity = append_identity
             state.prepared_inputs_embeds = inputs_embeds

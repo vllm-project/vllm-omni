@@ -48,12 +48,13 @@ def test_init_builds_duplex_runtime_only_for_duplex_thinker(
         lambda self: build_devices.append(torch.get_default_device()),
     )
     vllm_config = SimpleNamespace(
+        additional_config={},
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(),
             multimodal_config=None,
             model_stage=model_stage,
             session_mode=session_mode,
-        )
+        ),
     )
 
     # The loader constructs the model under the target-device context.

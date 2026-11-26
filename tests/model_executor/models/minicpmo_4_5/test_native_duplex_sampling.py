@@ -440,6 +440,26 @@ def _policy_row(payload):
     )
 
 
+@pytest.mark.parametrize("post_idle", [True, False], ids=["post-idle", "explicit-commit"])
+def test_reopening_a_closed_turn_preserves_the_raw_sample_for_replay(post_idle):
+    state = _MiniCPMO45Stage0SessionState(
+        session_id="s0", pending_speech_context=True, idle_reply_due=post_idle, prepared_append_identity=(0, 1)
+    )
+    state.replay_samples[1] = ([], [])
+    model = _policy_model_with_state(state)
+    payload = {} if post_idle else {"_native_explicit_reply": True}
+    model.prepare_duplex_sampling(torch.zeros(1, VOCAB), None, rows=(_policy_row(payload),))
+
+    model._record_minicpmo45_duplex_generation_token(0, LISTEN)
+    token = model._finalize_minicpmo45_native_duplex_sample(0, LISTEN, TOKEN_IDS)
+    model._record_minicpmo45_duplex_terminator(0, token, TOKEN_IDS)
+
+    assert token == TOKEN_IDS["tts_bos_token_id"]
+    assert state.accepted_sampling_history(1, [token]) == [LISTEN]
+    assert state.pending_speech_response_open and not state.current_turn_ended
+    assert not state.idle_reply_due
+
+
 @pytest.mark.parametrize("empty_opening_chunk", [False, True])
 def test_response_create_unit_releases_turn_ended_latch(empty_opening_chunk):
     """A response.create unit opens the assistant turn despite the latch.

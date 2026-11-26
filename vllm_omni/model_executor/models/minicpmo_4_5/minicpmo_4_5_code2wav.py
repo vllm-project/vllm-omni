@@ -407,7 +407,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         )
         from vllm_omni.platforms import current_omni_platform
 
-        extra = stage_connector_extra(self.vllm_config)
+        extra = self._extra_config()
         # Resolved on every platform so an invalid value fails at startup
         # instead of inside the first forward/prefetch (_stage_matmul_policy).
         self._tf32_mode = _tf32_mode(extra)
@@ -480,11 +480,18 @@ class MiniCPMO45Code2Wav(nn.Module):
             encoder_rows = list(range(1, int(encoder_rows) + 1))
         if not encoder_rows or any(row < 1 for row in encoder_rows):
             raise ValueError("MiniCPM-o code2wav_encoder_graph_rows must be positive")
+        padded_history = int(extra.get("code2wav_encoder_padded_flow_history", 0))
+        if padded_history < 0 or padded_history % 2:
+            raise ValueError("code2wav_encoder_padded_flow_history must be zero or a positive even number")
         self._chunk_encoder_graph_config = {
+            "padded_flow_history": padded_history,
+            "padded_flow_continuations": os.getenv("VLLM_OMNI_REPLICA_ID", "0") == "0"
+            and read_bool_flag(extra, "code2wav_encoder_padded_flow_continuations", False),
             "enabled": read_bool_flag(extra, "enable_code2wav_encoder_graph", False),
             "max_graphs": int(extra.get("code2wav_encoder_max_graphs", 8)),
             "capture_after": int(extra.get("code2wav_encoder_capture_after", 2)),
             "capture_after_precapture": read_bool_flag(extra, "code2wav_encoder_capture_after_precapture", False),
+            "precapture_tails": read_bool_flag(extra, "code2wav_encoder_tail_precapture", False),
             "rows": [row for row in encoder_rows if not max_num_seqs or row <= int(max_num_seqs)],
         }
         self._cfm_graph_config = {
@@ -606,6 +613,14 @@ class MiniCPMO45Code2Wav(nn.Module):
         logger.info("Default prompt normalized onto the %.2fs window: %s", self._ref_max_seconds, path)
         self._default_prompt_normalized = (str(path), cache_id)
         return self._default_prompt_normalized
+
+    def _extra_config(self) -> dict[str, Any]:
+        result = stage_connector_extra(self.vllm_config)
+        if os.getenv("MINICPMO_CODE2WAV_SECONDARY_TIGHT_MEMORY") == "1" and os.getenv("VLLM_OMNI_REPLICA_ID") == "1":
+            result["token2wav_setup_cache_size"] = 2
+            result["token2wav_setup_host_cache_size"] = 64
+            result["micro_batch_size"] = int(result.get("secondary_vocoder_micro_batch_size", 2))
+        return result
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device, dtype=torch.float32)
@@ -1832,7 +1847,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         )
         from vllm_omni.platforms import current_omni_platform
 
-        extra = stage_connector_extra(self.vllm_config)
+        extra = self._extra_config()
         # Hub repo ids only need to become local directories once the vocoder
         # assets are actually read; unit tests construct this model with fake
         # paths and must not trigger a hub download (#5442).
@@ -1963,6 +1978,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         if read_bool_flag(extra, "token2wav_s3_cuda_graph", False):
             if token2wav.enable_s3_cuda_graph(self.vllm_config):
                 logger.info("MiniCPM-o Code2Wav: exact-shape S3 CUDA graphs enabled")
+        if int(extra.get("token2wav_setup_host_cache_size", 0)):
+            logger.info(
+                "Code2Wav reference cache: host=%d device=%d replica=%s",
+                int(extra["token2wav_setup_host_cache_size"]),
+                self._setup_cache_size,
+                os.getenv("VLLM_OMNI_REPLICA_ID", "0"),
+            )
         self.backend = BatchedToken2Wav(
             token2wav,
             trt_stepper=trt_stepper,
@@ -1972,6 +1994,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             chunk_encoder_graph_config=self._chunk_encoder_graph_config,
             bfloat16_attention_cache=read_bool_flag(extra, "code2wav_bfloat16_attention_cache", False),
             setup_cache_size=self._setup_cache_size,
+            setup_host_cache_size=int(extra.get("token2wav_setup_host_cache_size", 0)),
             cfm_tf32=tf32_mode != "off",
             encoder_graph_config=self._encoder_graph_config,
             cfm_float16=read_bool_flag(extra, "cfm_float16", False),
@@ -2116,6 +2139,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     for attr in (
                         "_encoder_graphs",
                         "_chunk_encoder_graph",
+                        "_tail_encoder_graph",
                         "hift_graph_wrapper",
                         "_cfm_graph_wrapper",
                         "_whole_euler_graph_wrapper",
