@@ -30,7 +30,7 @@ from vllm_omni.diffusion.media import (
     VideoTensorSpec,
     VideoValueRange,
 )
-from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo, MixFusionSequenceInfo
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -1775,13 +1775,38 @@ def test_request_runner_preserves_client_error_before_rpc(monkeypatch, batch_siz
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_profile_run_preserves_prepared_packing_contract(monkeypatch):
+@pytest.mark.parametrize(
+    ("first_info", "second_info", "expected_packed"),
+    [
+        pytest.param(MixFusionRequestInfo(1, 8, 1, 8), MixFusionRequestInfo(1, 12, 1, 8), True, id="image"),
+        pytest.param(
+            MixFusionSequenceInfo((1, 4, 4, 8), 8, (12,), (21,), 1, min_chunk_tokens=1),
+            MixFusionSequenceInfo((1, 4, 4, 12), 12, (13,), (26,), 1, min_chunk_tokens=1),
+            True,
+            id="prefix-kv",
+        ),
+        pytest.param(
+            MixFusionSequenceInfo((1, 4, 4, 8), 8, (12,), (21,), 1, min_chunk_tokens=1),
+            MixFusionRequestInfo(1, 12, 1, 8),
+            False,
+            id="mixed-layouts",
+        ),
+        pytest.param(
+            MixFusionSequenceInfo((1, 4, 4, 8), 8, (12,), (21,), 1, min_chunk_tokens=1),
+            MixFusionSequenceInfo((1, 4, 4, 12), 12, (13,), (25,), 1, min_chunk_tokens=1),
+            False,
+            id="invalid-prefix-geometry",
+        ),
+        pytest.param(MixFusionRequestInfo(1, 8, 1, 8), MixFusionRequestInfo(1, 12, 1, 4), False, id="over-budget"),
+    ],
+)
+def test_profile_run_preserves_prepared_packing_contract(monkeypatch, first_info, second_info, expected_packed):
     runner = _make_runner(cache_backend=None, cache_backend_name=None)
     runner.od_config.step_execution = True
     requests = [_make_request(), _make_request()]
     requests[0].request_id, requests[1].request_id = "a", "b"
-    requests[0].mixfusion_info = MixFusionRequestInfo(1, 8, 1, 8)
-    requests[1].mixfusion_info = MixFusionRequestInfo(1, 12, 1, 8)
+    requests[0].mixfusion_info = first_info
+    requests[1].mixfusion_info = second_info
     captured = []
 
     def execute(output, **kwargs):
@@ -1789,8 +1814,13 @@ def test_profile_run_preserves_prepared_packing_contract(monkeypatch):
 
     runner._execute_stepwise = execute
     monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", lambda: None)
-    runner.profile_run(requests)
-    assert captured == [True]
+    if expected_packed:
+        runner.profile_run(requests)
+        assert captured == [True]
+    else:
+        with pytest.raises(ValueError, match="Memory profile requests must form one valid MixFusion batch"):
+            runner.profile_run(requests)
+        assert not captured
 
 
 @pytest.mark.core_model

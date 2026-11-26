@@ -116,8 +116,8 @@ class SupportsStepExecution(Protocol):
 
     def denoise_step(
         self, input_batch: InputBatch, *, states: Sequence[StepRequestState] | None = None, **kwargs: Any
-    ) -> torch.Tensor | None:
-        """Run one denoise forward on the runner-assembled batch."""
+    ) -> torch.Tensor | list[torch.Tensor] | None:
+        """Run one denoise forward, returning a dense tensor or per-request predictions in batch order."""
         ...
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Host-only MixFusion eligibility and layout-specific admission.
+"""Host-only MixFusion request metadata and chunk-budget admission.
 
 Attention backend selection is deliberately absent: dense attention buckets
 can execute the same heterogeneous batch as a native varlen kernel.
@@ -64,29 +64,20 @@ class MixFusionSequenceInfo:
     def condition_key(self) -> tuple[str, int]:
         return ("prefix_kv", self.num_images)
 
-
-def fits_mixfusion_budget(requests: Sequence[MixFusionRequestInfo | MixFusionSequenceInfo]) -> bool:
-    """Apply the declared layout's admission policy to the whole candidate batch."""
-    if not requests:
-        raise ValueError("MixFusion requires a nonempty candidate batch")
-    sequences = [info for info in requests if isinstance(info, MixFusionSequenceInfo)]
-    if len(sequences) == len(requests):
-        return all(
-            min(info.latent_shape) > 0
-            and info.image_tokens > 0
-            and info.special_tokens > 0
-            and bool(info.prefix_lengths)
-            and len(info.prefix_lengths) == len(info.query_lengths)
+    def has_valid_geometry(self) -> bool:
+        """Check the prepared sequence summary before admitting this request."""
+        return (
+            len(self.latent_shape) == 4
+            and min(self.latent_shape) > 0
+            and self.image_tokens > 0
+            and self.special_tokens > 0
+            and bool(self.prefix_lengths)
+            and len(self.prefix_lengths) == len(self.query_lengths)
             and all(
-                0 <= p and p + info.special_tokens + info.image_tokens <= q
-                for p, q in zip(info.prefix_lengths, info.query_lengths, strict=True)
+                0 <= prefix and prefix + self.special_tokens + self.image_tokens <= query
+                for prefix, query in zip(self.prefix_lengths, self.query_lengths, strict=True)
             )
-            for info in sequences
-        ) and fits_chunk_budget(sequences)
-    chunks = [info for info in requests if isinstance(info, MixFusionRequestInfo)]
-    if len(chunks) == len(requests):
-        return fits_chunk_budget(chunks)
-    return False
+        )
 
 
 def fits_chunk_budget(requests: Sequence[MixFusionRequestInfo | MixFusionSequenceInfo]) -> bool:

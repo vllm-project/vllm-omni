@@ -14,7 +14,7 @@ from tests.diffusion.models.hunyuan_image3.test_hunyuan_image3_step_execution im
 from vllm_omni.diffusion.data import AttentionScheduleConfig, DiffusionKVCacheMode
 from vllm_omni.diffusion.mixfusion.execution_plan import build_document_plan
 from vllm_omni.diffusion.mixfusion.plan import MixFusionSequenceRequest
-from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability, MixFusionSequenceInfo, fits_mixfusion_budget
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability, MixFusionSequenceInfo, fits_chunk_budget
 from vllm_omni.diffusion.mixfusion.setup import prepare_mixfusion_admission
 from vllm_omni.diffusion.models.hunyuan_image3 import pipeline_hunyuan_image3 as pipeline_module
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
@@ -107,7 +107,7 @@ def test_chunk_scheduler_applies_image_budget_and_refreshes_members(monkeypatch)
         requests.append(request)
     # Individual requests fit, but moving one below the aggregate budget
     # prevents it from sharing a batch with another two-branch request.
-    assert not fits_mixfusion_budget([requests[0].mixfusion_info, replace(requests[1].mixfusion_info, max_chunks=3)])
+    assert not fits_chunk_budget([requests[0].mixfusion_info, replace(requests[1].mixfusion_info, max_chunks=3)])
     scheduler.add_request(requests[0])
     assert scheduler.schedule().scheduled_request_ids == ["0"]
     scheduler.add_request(requests[1])
@@ -233,8 +233,21 @@ def test_first_and_later_packed_masks_match_existing_hunyuan_masks(monkeypatch, 
 
 
 @pytest.mark.parametrize(
-    "changes", [{"image_tokens": 0}, {"prefix_lengths": ()}, {"query_lengths": (1,)}, {"latent_shape": (1, 4, 0, 8)}]
+    "changes",
+    [
+        {"image_tokens": 0},
+        {"prefix_lengths": ()},
+        {"query_lengths": (1, 1)},
+        {"latent_shape": (1, 4, 0, 8)},
+        {"latent_shape": ()},
+    ],
 )
-def test_invalid_host_sequence_never_admitted(changes):
-    info = MixFusionSequenceInfo((1, 4, 8, 8), 16, (12,), (32,), 1, min_chunk_tokens=16)
-    assert not fits_mixfusion_budget([replace(info, **changes)])
+def test_invalid_host_sequence_never_admitted(monkeypatch, changes):
+    config, preprocess, _ = _preprocessor(monkeypatch)
+    request = preprocess(_request(guidance_scale=5.0))
+    layout = request.prepared_layout
+    request.prepared_layout = replace(layout, mixfusion_sequence=replace(layout.mixfusion_sequence, **changes))
+
+    prepare_mixfusion_admission(_AdmissionEngine(config), request)
+
+    assert request.mixfusion_info is None

@@ -237,8 +237,8 @@ resolves those sources on the loaded pipeline and sends the
 serializable values to the engine. Its common host preparation resolves
 image counts, image token lengths and request-specific constraints before admission,
 without embedding or device tensors. A grid layout uses common image geometry
-preparation; a prefix-KV layout reads a validated summary from the model's
-existing CPU tokenizer/layout preprocessor.
+preparation. For a prefix-KV layout, admission validates the sequence summary
+from the model's existing CPU tokenizer/layout preprocessor.
 
 Only requests with prepared grid or sequence metadata relax the resolution key.
 Dense and packed requests have distinct keys. Static unsupported combinations
@@ -248,10 +248,10 @@ to meet the chunk policy even alone, also keep dense scheduling. Existing
 per-prompt input isolation remains in effect.
 
 `StepScheduler` passes the entire running batch plus each candidate to the
-common `fits_mixfusion_budget` predicate. The image-token GCD must meet the
+common `fits_chunk_budget` predicate. The image-token GCD must meet the
 strictest `mixfusion_min_chunk_tokens`, and total chunks across image rows
-must fit the strictest `mixfusion_max_chunks`. Prefix-KV layouts also validate
-sequence geometry and count each CFG branch as one image row. A candidate that fails
+must fit the strictest `mixfusion_max_chunks`. Prefix-KV layouts count each CFG
+branch as one image row. A candidate that fails
 stays waiting under the normal FIFO policy. The scheduler publishes selected
 requests and a `use_mixfusion` execution flag in `DiffusionSchedulerOutput`.
 It does not publish a chunk size, tensor shape map or packing plan.

@@ -62,7 +62,7 @@ from vllm_omni.diffusion.forward_context import bind_attention_schedule, set_for
 from vllm_omni.diffusion.graph import warn_if_denoise_graph_unsupported
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.types import InteractionPayload
-from vllm_omni.diffusion.mixfusion.scheduling import fits_mixfusion_budget
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionSequenceInfo, fits_chunk_budget
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsInteractionApply,
@@ -1152,10 +1152,19 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         try:
             if getattr(self.od_config, "step_execution", False):
                 packed_requests = [info for request in requests if (info := request.mixfusion_info) is not None]
-                if packed_requests and (
-                    len(packed_requests) != len(requests) or not fits_mixfusion_budget(packed_requests)
-                ):
-                    raise ValueError("Memory profile requests must form one valid MixFusion batch")
+                if packed_requests:
+                    # Profiling bypasses the normal request admission and batch key checks.
+                    prefix_kv = isinstance(packed_requests[0], MixFusionSequenceInfo)
+                    if (
+                        len(packed_requests) != len(requests)
+                        or any(isinstance(info, MixFusionSequenceInfo) != prefix_kv for info in packed_requests)
+                        or any(
+                            isinstance(info, MixFusionSequenceInfo) and not info.has_valid_geometry()
+                            for info in packed_requests
+                        )
+                        or not fits_chunk_budget(packed_requests)
+                    ):
+                        raise ValueError("Memory profile requests must form one valid MixFusion batch")
                 scheduler_output = DiffusionSchedulerOutput(
                     step_id=0,
                     scheduled_new_reqs=[

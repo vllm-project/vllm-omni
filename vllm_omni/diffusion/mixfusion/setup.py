@@ -172,7 +172,7 @@ def prepare_mixfusion_admission(engine: DiffusionEngine, request: OmniDiffusionR
         DEFAULT_MIN_CHUNK_TOKENS,
         mixfusion_requested,
     )
-    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionSequenceInfo, fits_mixfusion_budget
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionSequenceInfo, fits_chunk_budget
 
     request.mixfusion_info = None
     capability = getattr(engine, "mixfusion_capability", None)
@@ -205,11 +205,11 @@ def prepare_mixfusion_admission(engine: DiffusionEngine, request: OmniDiffusionR
             info = attrgetter(capability.request_config.metadata_attr)(request)
         except AttributeError:
             return
-        if isinstance(info, MixFusionSequenceInfo):
+        if isinstance(info, MixFusionSequenceInfo) and info.has_valid_geometry():
             info = replace(info, min_chunk_tokens=min_chunk_tokens, max_chunks=max_chunks)
-            if fits_mixfusion_budget([info]):
+            if fits_chunk_budget([info]):
                 request.mixfusion_info = info
         return
     info = prepare_image_request(request, capability.request_config, min_chunk_tokens, max_chunks)
-    if info is not None and fits_mixfusion_budget([info]):
+    if info is not None and fits_chunk_budget([info]):
         request.mixfusion_info = info
