@@ -18,7 +18,7 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 pytestmark = [
     pytest.mark.full_model,
     pytest.mark.tts,
-    *hardware_marks(res={"cuda": ["L4", "H100", "B200"]}, num_cards=1),
+    *hardware_marks(res={"cuda": ["L4", "H100", "B200"], "rocm": "MI325"}, num_cards=1),
 ]
 
 REPO_ROOT = Path(__file__).resolve().parents[3]

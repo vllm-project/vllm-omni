@@ -36,11 +36,13 @@ client. It uses the existing JoyAI → Qwen3-TTS CustomVoice → Code2Wav pipeli
 
 The native turn and duplex profiles use Model Runner V2 for every stage on CUDA,
 including Qwen3-ASR in the speech-input profile. Other platforms retain Model
-Runner V1. Both duplex profiles (`joyai_vl_interaction_duplex.yaml` and
-`joyai_vl_interaction_asr_duplex.yaml`) stream JoyAI text, per-sentence Talker
-handoffs, and Talker codec chunks into Code2Wav; the turn profiles pass complete
-stage outputs. Session memory and tool delegation use the
-same JoyAI plugin with either runner. To compare against V1 on CUDA, set
+Runner V1. The visual duplex profile (`joyai_vl_interaction_duplex.yaml`)
+streams JoyAI text, per-sentence Talker handoffs, and Talker codec chunks into
+Code2Wav. The ASR duplex profile keeps `async_chunk: false` and passes complete
+stage outputs so cancelling an in-flight spoken response and reconnecting
+cannot resume stale speech from the preceding observation; the turn profiles
+also pass complete outputs. Session memory and tool delegation use the same
+JoyAI plugin with either runner. To compare against V1 on CUDA, set
 `model_runner: v1` on each stage in a deploy override.
 
 The Talker follows Qwen3-TTS's `recompute_preemption: fail` policy: a request
@@ -107,10 +109,11 @@ added to the matching user history item, so later camera observations retain the
 spoken task. Text/video-only turns bypass ASR on this deployment. The final
 expanded prompt is checked against JoyAI's context budget after transcription.
 
-Speech output on this profile uses the same `async_chunk: true` streaming path
-(live JoyAI text deltas, per-sentence Talker handoff, and chunked Code2Wav audio)
-for both spoken (ASR → JoyAI) and bypassed text/video observations. Summary
-memory is a separate follow-up tracked by
+Speech output on this profile uses complete stage outputs (`async_chunk: false`)
+for both spoken (ASR → JoyAI) and bypassed text/video observations. This trades
+first-packet streaming for a fail-closed cancellation and reconnect boundary;
+use the visual duplex profile when chunked output is required without ASR.
+Summary memory is a separate follow-up tracked by
 [RFC #8803](https://github.com/vllm-project/vllm-omni/issues/8803).
 
 ### Tool delegation

@@ -17,10 +17,7 @@ from dataclasses import replace
 
 from transformers import PretrainedConfig
 
-from vllm_omni.config.endpoint_policy import (
-    EndpointRestriction,
-    OmniServingCapability,
-)
+from vllm_omni.config.endpoint_policy import speech_only_endpoint_restrictions
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -34,36 +31,7 @@ COSYVOICE3_PIPELINE = PipelineConfig(
     model_type="cosyvoice3",
     default_deploy_config_name="cosyvoice3.yaml",
     model_arch="CosyVoice3Model",
-    endpoint_restrictions=(
-        EndpointRestriction(
-            OmniServingCapability.COMPLETIONS,
-            "CosyVoice3 does not support the Completions API.",
-        ),
-        EndpointRestriction(
-            OmniServingCapability.CHAT_COMPLETIONS,
-            "CosyVoice3 does not support the Chat Completions API.",
-        ),
-        EndpointRestriction(
-            OmniServingCapability.CHAT_COMPLETIONS_BATCH,
-            "CosyVoice3 does not support the Batch Chat Completions API.",
-        ),
-        EndpointRestriction(
-            OmniServingCapability.RESPONSES,
-            "CosyVoice3 does not support the Responses API.",
-        ),
-        EndpointRestriction(
-            OmniServingCapability.MESSAGES,
-            "CosyVoice3 does not support the Messages API.",
-        ),
-        EndpointRestriction(
-            OmniServingCapability.INVOCATIONS,
-            "CosyVoice3 does not support the Invocations API.",
-        ),
-        EndpointRestriction(
-            OmniServingCapability.GENERATE_TOKENS,
-            "CosyVoice3 does not support the Generate Tokens API.",
-        ),
-    ),
+    endpoint_restrictions=speech_only_endpoint_restrictions("CosyVoice3"),
     stages=(
         StagePipelineConfig(
             stage_id=0,

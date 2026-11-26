@@ -26,9 +26,9 @@ change. It then binds the selected operator set, reuses Omni's existing
 dtype already selected by decode autocast. Unsupported model contracts, tensor
 inputs, execution modes, and devices retain the original implementation.
 
-Hardware dispatch is an explicit allowlist. SM89, SM90, SM100, and SM103 are enabled;
+Hardware dispatch is an explicit allowlist. SM89, SM90, SM100, SM103, and SM120 are enabled;
 other capabilities fall back to the reference path. Bit-exact full-decode and
-operator evidence has been collected on SM89 and SM90, with independent full-decode and
+operator evidence has been collected on SM89, SM90, and SM120, with independent full-decode and
 stress validation on SM103. Enabling a target and claiming it as validated are
 kept separate so the evidence remains clear.
 

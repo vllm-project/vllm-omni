@@ -16,6 +16,7 @@ import os
 import signal
 from typing import Any
 
+import msgspec
 import vllm.v1.engine.core as _vllm_engine_core_module
 from vllm.config import VllmConfig
 from vllm.logger import configure_logging, init_logger
@@ -26,7 +27,7 @@ from vllm.utils.system_utils import (
     decorate_logs,
     set_process_title,
 )
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
 from vllm.v1.engine.utils import (
     EngineZmqAddresses,
@@ -35,7 +36,8 @@ from vllm.v1.engine.utils import (
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
-from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
+from vllm_omni.engine.messages import TextInputUpdate
 from vllm_omni.engine.stage_init_utils import (
     maybe_apply_cfg_scheduler_patches,
     set_death_signal,
@@ -46,6 +48,13 @@ logger = init_logger(__name__)
 
 
 _SIGNAL_EXIT_BASE = 128
+
+
+def _has_input_stream(request: Any) -> bool:
+    payload = getattr(request, "additional_information", None)
+    entries = payload if isinstance(payload, dict) else getattr(payload, "entries", {})
+    native = getattr(request, "model_intermediate_buffer", None) or {}
+    return "input_stream" in native or any(key == "input_stream" or key.startswith("input_stream.") for key in entries)
 
 
 def _install_phase_locks(kwargs: dict[str, Any], local_dp_rank: int) -> None:
@@ -102,6 +111,14 @@ def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: An
     return False
 
 
+def _release_runner_session_window(worker: Any, session_id: str) -> None:
+    worker = getattr(worker, "worker", worker)
+    model = worker.model_runner.get_model()
+    release = getattr(model, "release_session_window", None)
+    if release is not None:
+        release(session_id)
+
+
 def _release_runner_shm_resources(worker: Any, request_ids: list[str]) -> int:
     worker = getattr(worker, "worker", worker)
     release = getattr(getattr(worker, "model_runner", None), "release_omni_shm_resources", None)
@@ -148,9 +165,49 @@ class StageEngineCoreProc(EngineCoreProc):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         current_omni_platform.prepare_stage_engine()
         super().__init__(*args, **kwargs)
+        config = self.vllm_config.model_config
+        model_cls, _ = config.registry.resolve_model_cls(config.architectures, config)
+        self._input_stream_factory = getattr(model_cls, "create_input_stream", None)
         _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
+
+    def add_request(self, request: Any, request_wave: int = 0) -> None:
+        """Validate native input before admitting the request to the scheduler."""
+        stream = None
+        if _has_input_stream(request):
+            factory = self._input_stream_factory
+            if factory is None:
+                self._send_input_stream_error(request, "This model does not support text input append")
+                return
+            try:
+                stream = factory(request, self.vllm_config)
+            except Exception as exc:
+                logger.exception("Rejecting request %s during input stream validation", request.request_id)
+                self._send_input_stream_error(request, str(exc))
+                return
+
+        super().add_request(request, request_wave)
+        if stream is not None and not request.is_finished():
+            self.scheduler.register_input_stream(request.request_id, stream)
+
+    def _send_input_stream_error(self, request: Any, reason: str) -> None:
+        self.output_queue.put_nowait(
+            (
+                request.client_index,
+                OmniEngineCoreOutputs(
+                    finished_requests={request.request_id},
+                    outputs=[
+                        OmniEngineCoreOutput(
+                            request_id=request.request_id,
+                            new_token_ids=[],
+                            finish_reason=FinishReason.ERROR,
+                            stop_reason=reason,
+                        )
+                    ],
+                ),
+            )
+        )
 
     def _handle_client_request(self, request_type: EngineCoreRequestType, request: Any) -> None:
         super()._handle_client_request(request_type, request)
@@ -160,6 +217,22 @@ class StageEngineCoreProc(EngineCoreProc):
             release_overflowed = getattr(self.scheduler, "release_overflowed_requests", None)
             if release_overflowed is not None:
                 release_overflowed(request)
+
+    def omni_release_session_window(self, session_id: str) -> None:
+        policy = getattr(self.scheduler, "_window_policy", None)
+        if policy is not None:
+            policy.release_session(session_id)
+            self.model_executor.collective_rpc(_release_runner_session_window, args=(session_id,))
+
+    def omni_append_text(self, update: TextInputUpdate | dict[str, object]) -> dict[str, object]:
+        """Accept an append on the engine loop, ordered with ADD and ABORT."""
+        try:
+            if not isinstance(update, TextInputUpdate):
+                update = msgspec.convert(update, type=TextInputUpdate)
+            self.scheduler.append_text(update)
+        except (ValueError, msgspec.ValidationError) as exc:
+            return {"error": str(exc)}
+        return {"accepted": True}
 
     def omni_release_request_resources(self, request_ids: list[str]) -> None:
         """Release this stage's inter-stage transfer resources for *request_ids*.
@@ -262,6 +335,17 @@ class StageEngineCoreProc(EngineCoreProc):
             # Setting this env var allows the same graceful fallback to work.
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
             os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
+
+            vllm_config = kwargs.get("vllm_config")
+            model_config = getattr(vllm_config, "model_config", None)
+            connector = getattr(model_config, "stage_connector_config", None) or {}
+            if (
+                int(omni_replica_id) == 0
+                and getattr(model_config, "model_stage", None) == "code2wav"
+                and connector.get("extra", {}).get("minicpmo_code2wav_sync_primary", False)
+            ):
+                vllm_config.scheduler_config.async_scheduling = False
+                logger.info("MiniCPM-o primary Code2Wav uses synchronous EngineCore scheduling")
 
             # Patch the decoder type so process_input_sockets (started
             # during __init__) decodes OmniEngineCoreRequest (which

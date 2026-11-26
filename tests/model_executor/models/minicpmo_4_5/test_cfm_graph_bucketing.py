@@ -15,6 +15,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
     CFMGraphWrapper,
@@ -22,6 +23,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
     _att_keep_ranges,
     _build_capture_mask,
     _capture_query_width,
+    _copy_attention_cache,
     _format_memory_delta,
     _memory_snapshot,
     _whole_euler_att_segments,
@@ -33,6 +35,27 @@ from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_secondary_cfm_attention_copy_splits_strided_history_by_solver_step():
+    source = torch.arange(5 * 2 * 8 * 4, dtype=torch.float32).reshape(5, 2, 8, 4)[:, :, ::2, :]
+    arena = torch.full((5, 2, 7, 4), -1.0)
+    target = arena[:, :, 1:5, :]
+    step_bytes = source[0].numel() * source.element_size()
+    copied_steps = []
+
+    class RecordCopies(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func == torch.ops.aten.copy_.default:
+                copied_steps.append(args[1].shape[0])
+            return func(*args, **(kwargs or {}))
+
+    with RecordCopies():
+        _copy_attention_cache(target, source, max_copy_bytes=2 * step_bytes)
+
+    assert copied_steps == [2, 2, 1]
+    assert torch.equal(target, source)
+    assert torch.all(arena[:, :, :1] == -1) and torch.all(arena[:, :, 5:] == -1)
 
 
 @pytest.mark.parametrize(

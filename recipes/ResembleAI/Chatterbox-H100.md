@@ -14,7 +14,9 @@
 One card serving concurrent streams: each model has one profile, which
 conditions references on the GPU, runs stage 0 with CUDA graphs and the flow
 decoder in BF16 with HiFT in FP32, and admits 64 requests at once, what
-one H100 fits. Cloned voices cost
+one H100 fits. Under load, stage 1 coalesces up to 16 ready decoder chunks
+within a bounded 6 ms window; lightly loaded streams and tails dispatch
+immediately. Cloned voices cost
 more than the built-in voice at every load, because each new reference is
 encoded before its request starts; size for distinct references if the
 traffic is cloning. This recipe also holds the comparison with the canonical
@@ -45,8 +47,8 @@ The request contract is the one in the
 
 | Profile on this hardware | Status |
 | --- | --- |
-| `chatterbox_turbo.yaml` (64 requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | measured through the nightly perf matrix at `feacefc03`, whose deploy files are the shipped ones: 1, 8, 16 and 64 clients, built-in and cloned voices, and the 2-request/s stress case |
-| `chatterbox.yaml` (64 guided requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | as Turbo's row |
+| `chatterbox_turbo.yaml` (64 requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | historical nightly matrix at `feacefc03`, using that revision's deploy profile: 1, 8, 16 and 64 clients, built-in and cloned voices, and the 2-request/s stress case; requalify the current coalescing profile with the post-merge nightly |
+| `chatterbox.yaml` (64 guided requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | same historical matrix and post-merge requalification scope as Turbo |
 
 Real time here is the repository's measure: a median real-time factor
 below 1 in the nightly perf matrix. The matrix below gives the median
