@@ -50,19 +50,20 @@ def _padding_matches(module: nn.Conv3d) -> bool:
     ph, pw = module.padding[1:]
     try:
         with torch.no_grad():
-            for frames in (3, 17):
-                probe = torch.arange(1, 20 * frames + 1, device="cpu", dtype=torch.float32).view(1, 1, frames, 4, 5)
-                spatial = F.pad(probe, (pw, pw, ph, ph, 0, 0), mode=module.pad_mode)
-                expected = F.pad(spatial, (0, 0, 0, 0, 2, 0))
-                actual = module._apply_padding(probe)
-                if not (
-                    isinstance(actual, torch.Tensor)
-                    and actual.dtype == expected.dtype
-                    and actual.device == expected.device
-                    and actual.stride() == expected.stride()
-                    and torch.equal(actual, expected)
-                ):
-                    return False
+            # Only D=17 is eligible, so check the ABI at that depth. T=1 uses the original forward.
+            frames = 17
+            probe = torch.arange(1, 20 * frames + 1, device="cpu", dtype=torch.float32).view(1, 1, frames, 4, 5)
+            spatial = F.pad(probe, (pw, pw, ph, ph, 0, 0), mode=module.pad_mode)
+            expected = F.pad(spatial, (0, 0, 0, 0, 2, 0))
+            actual = module._apply_padding(probe)
+            if not (
+                isinstance(actual, torch.Tensor)
+                and actual.dtype == expected.dtype
+                and actual.device == expected.device
+                and actual.stride() == expected.stride()
+                and torch.equal(actual, expected)
+            ):
+                return False
     except (torch.OutOfMemoryError, torch.AcceleratorError):
         raise
     except (AttributeError, RuntimeError, TypeError, ValueError):
