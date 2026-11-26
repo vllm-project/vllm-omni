@@ -187,6 +187,11 @@ class OpenAIFullDuplexConnection:
 
         self._connected = True
         self._response_task: asyncio.Task | None = None
+        # #11074: transcription-mode sessions replace responses with
+        # per-turn ASR; the committed audio is the only model input.
+        self._transcription_mode = False
+        self._transcription_language: str | None = None
+        self._transcription_prompt: str | None = None
         self._response_cancel_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
         self._session_trace: SessionTrace | None = None
@@ -216,6 +221,12 @@ class OpenAIFullDuplexConnection:
                 except WebSocketDisconnect:
                     break
                 try:
+                    # #11074: a transcription session is requested through
+                    # ``session.type: "transcription"``, which the client-event
+                    # adapter rejects (``type`` is a ``Literal["realtime"]``).
+                    # Absorb it — and the ``input_audio_transcription`` knobs —
+                    # from the raw JSON before validating the rest.
+                    text = self._absorb_transcription_session(text)
                     event = _CLIENT_EVENT_ADAPTER.validate_json(text, extra="ignore")
                 except Exception:
                     await self._send_error(
@@ -606,6 +617,9 @@ class OpenAIFullDuplexConnection:
         if item is None:
             return
         if result.create_response:
+            if self._transcription_mode:
+                await self._run_transcription(item)
+                return
             if self.session.active_response is not None and not detector.config.interrupt_response:
                 await self._send_error(
                     "Cannot create an automatic response while another response is still in progress",
@@ -696,7 +710,141 @@ class OpenAIFullDuplexConnection:
             )
             return
 
-        await self._commit_audio_buffer(event.event_id, item_id=self._speech_item_id)
+        item = await self._commit_audio_buffer(event.event_id, item_id=self._speech_item_id)
+        if item is not None and self._transcription_mode:
+            await self._run_transcription(item)
+
+    def _absorb_transcription_session(self, text: str) -> str:
+        """Absorb the #11074 transcription-session fields, then re-validate.
+
+        ``session.type: "transcription"`` switches the session to
+        transcription-only, but the client-event adapter rejects it — the
+        session's ``type`` is a ``Literal["realtime"]``.
+        ``input_audio_transcription.language`` / ``.prompt`` carry the
+        per-session ASR knobs ``/v1/audio/transcriptions`` accepts. Both are
+        read from the raw JSON here (``extra="ignore"`` strips unknown
+        session fields otherwise); the session type is then normalized so the
+        adapter validates the remaining fields of the update unchanged.
+        """
+        try:
+            raw = json.loads(text)
+        except (ValueError, TypeError):
+            return text
+        if not isinstance(raw, dict) or raw.get("type") != "session.update":
+            return text
+        session = raw.get("session")
+        if not isinstance(session, dict):
+            return text
+        if isinstance(session.get("type"), str):
+            self._transcription_mode = session["type"] == "transcription"
+        transcription_cfg = session.get("input_audio_transcription")
+        if isinstance(transcription_cfg, dict):
+            self._transcription_language = transcription_cfg.get("language") or None
+            self._transcription_prompt = transcription_cfg.get("prompt") or None
+        if session.get("type") == "transcription":
+            session["type"] = "realtime"
+            return json.dumps(raw)
+        return text
+
+    async def _run_transcription(self, item: types.RealtimeConversationItemUserMessage) -> None:
+        """Transcribe one committed audio turn (#11074).
+
+        The committed item's audio is the only model input: no conversation
+        history, no audio output. The text streams back as
+        ``conversation.item.input_audio_transcription.delta`` chunks and a
+        final ``conversation.item.input_audio_transcription.completed``.
+        """
+        audio_content = next(
+            (part for part in item.content if getattr(part, "type", None) == "input_audio"),
+            None,
+        )
+        # The SDK coerces content parts to models (``.type`` / ``.audio``);
+        # tolerate raw dicts from other construction paths too.
+        if isinstance(audio_content, dict):
+            audio = audio_content.get("audio")
+        else:
+            audio = getattr(audio_content, "audio", None)
+        if not audio:
+            return
+
+        # Build the transcription system prompt from the session knobs.
+        parts = ["Transcribe the spoken audio exactly."]
+        if self._transcription_language:
+            parts.append(f"The language is {self._transcription_language}.")
+        if self._transcription_prompt:
+            parts.append(f"Context: {self._transcription_prompt}")
+        parts.append("Output only the transcript text, with no commentary.")
+        instructions = " ".join(parts)
+
+        # Single-turn engine input: system prompt + the committed audio.
+        try:
+            engine_input = await self._build_full_prompt(
+                instructions=instructions,
+                items=[item],
+            )
+        except VLLMValidationError as exc:
+            await self._send_error(str(exc), "invalid_request_error")
+            return
+
+        item_id = item.id or _gen_id("item")
+        request_id = _gen_id("transcription")
+        full_transcript = ""
+        # Same parameter plumbing as a plain response: one entry per stage
+        # from the engine defaults, delta outputs, and greedy decoding on the
+        # thinker — the transcript is deterministic ASR output.
+        sampling_params_list = [
+            sp.clone() if isinstance(sp, SamplingParams) else sp for sp in self.engine.default_sampling_params_list
+        ]
+        thinker_params_configured = False
+        for sp in sampling_params_list:
+            if isinstance(sp, SamplingParams):
+                sp.output_kind = RequestOutputKind.DELTA
+                if not thinker_params_configured:
+                    sp.temperature = 0.0
+                    sp.max_tokens = 4096
+                    thinker_params_configured = True
+        try:
+            gen = self.engine.generate(
+                prompt=engine_input,
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+                output_modalities=["text"],
+            )
+            async for output in gen:
+                outputs = getattr(output, "outputs", None) or ()
+                delta = (outputs[0].text or "") if outputs else ""
+                if delta:
+                    full_transcript += delta
+                    await self._send_event(
+                        {
+                            "type": "conversation.item.input_audio_transcription.delta",
+                            "event_id": _gen_id("evt"),
+                            "item_id": item_id,
+                            "content_index": 0,
+                            "delta": delta,
+                        }
+                    )
+        except Exception as exc:
+            logger.warning("[realtime] transcription failed for %s: %s", item_id, exc)
+            await self._send_event(
+                {
+                    "type": "conversation.item.input_audio_transcription.failed",
+                    "event_id": _gen_id("evt"),
+                    "item_id": item_id,
+                    "error": {"code": "transcription_error", "message": str(exc)},
+                }
+            )
+            return
+
+        await self._send_event(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "event_id": _gen_id("evt"),
+                "item_id": item_id,
+                "content_index": 0,
+                "transcript": full_transcript,
+            }
+        )
 
     async def _handle_audio_clear(self, event: types.InputAudioBufferClearEvent):
         self.session.input_audio_buffer.clear()
@@ -875,6 +1023,15 @@ class OpenAIFullDuplexConnection:
         return items
 
     async def _handle_response_create(self, event: types.ResponseCreateEvent):
+        if self._transcription_mode:
+            # #11074: a transcription session replaces responses with
+            # per-turn ASR; committed audio is already transcribed.
+            await self._send_error(
+                "response.create is not available in a transcription session",
+                "invalid_request_error",
+                event_id=event.event_id,
+            )
+            return
         s = self.session
         response_cfg = event.response
 
