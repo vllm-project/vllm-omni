@@ -21,7 +21,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, BlockSparseAttentionSpec
 
 logger = init_logger(__name__)
 
@@ -65,7 +65,7 @@ def _cached_get_backend_cls(
     """
     from vllm_omni.platforms import current_omni_platform
 
-    backend_cls_path = current_omni_platform.get_diffusion_attn_backend_cls(
+    backend_cls_path = current_omni_platform.resolve_diffusion_attn_backend(
         selected_backend=backend_name,
         head_size=head_size,
         allow_trtllm_default=allow_trtllm_default,
@@ -96,6 +96,23 @@ def _log_backend_resolution(
         role,
         source,
     )
+
+
+def _resolve_sparse_backend(spec: BlockSparseAttentionSpec, head_size: int):
+    """Load the pinned adapter; actual request support is established by preparation.
+
+    Do not translate dependency/initialization failures into compatibility
+    rejections. Ordered provider selection is not supported by this lifecycle.
+    """
+    from vllm_omni.platforms import current_omni_platform
+
+    backend_cls_path = current_omni_platform.resolve_diffusion_attn_backend(
+        selected_backend=spec.backend,
+        head_size=head_size,
+        method="block_sparse",
+        implementation=spec.implementation,
+    )
+    return _load_backend_cls(backend_cls_path), spec
 
 
 def _model_default_backend() -> str | None:
@@ -141,7 +158,7 @@ def get_attn_backend_for_role(
     attention_config: AttentionConfig | None = None,
     role_category: str | None = None,
     allow_trtllm_default: bool = True,
-) -> tuple[type[AttentionBackend], AttentionSpec | None]:
+) -> tuple[type[AttentionBackend], AttentionSpec | BlockSparseAttentionSpec | None]:
     """
     Get attention backend for a specific attention role.
 
@@ -175,7 +192,12 @@ def get_attn_backend_for_role(
         )
 
     if spec is not None:
-        backend_cls = _cached_get_backend_cls(spec.backend, head_size)
+        from vllm_omni.diffusion.data import BlockSparseAttentionSpec
+
+        if isinstance(spec, BlockSparseAttentionSpec):
+            backend_cls, spec = _resolve_sparse_backend(spec, head_size)
+        else:
+            backend_cls = _cached_get_backend_cls(spec.backend, head_size)
         _log_backend_resolution(
             role=role,
             role_category=role_category,
@@ -210,7 +232,7 @@ def get_attn_backend_for_capability(
     attention_config: AttentionConfig | None = None,
     role_category: str | None = None,
 ) -> type[AttentionBackend]:
-    """Resolve the backend class for capability queries such as mask support.
+    """Resolve the selected method's capability surface, not just its provider.
 
     SequenceParallel auto-pad does not know ``head_size``. Explicit
     ``AttentionConfig`` selections are loaded from the registry without
@@ -227,7 +249,13 @@ def get_attn_backend_for_capability(
         )
     if spec is not None:
         from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+        from vllm_omni.diffusion.data import BlockSparseAttentionSpec
 
+        if isinstance(spec, BlockSparseAttentionSpec):
+            from vllm_omni.diffusion.attention.block_sparse import BlockSparseBackend
+
+            _resolve_sparse_backend(spec, HEAD_SIZE_UNKNOWN)
+            return BlockSparseBackend
         return DiffusionAttentionBackendEnum[spec.backend.upper()].get_class()
     backend_cls = _resolve_model_default(HEAD_SIZE_UNKNOWN)
     if backend_cls is not None:

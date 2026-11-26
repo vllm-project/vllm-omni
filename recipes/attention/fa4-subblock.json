@@ -1,0 +1,16 @@
+{
+  "default": {"backend": "FLASH_ATTN"},
+  "per_role": {
+    "cosmos3.gen": {
+      "name": "block_sparse",
+      "config": {
+        "block_size": [64, 64],
+        "selection": {
+          "name": "block_topk",
+          "config": {"target_sparsity": 0.75}
+        },
+        "backend": {"require": "FLASH_ATTN", "implementation": "auto"}
+      }
+    }
+  }
+}

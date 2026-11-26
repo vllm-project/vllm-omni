@@ -19,7 +19,7 @@ from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
-from .fasth3 import FASTH3_BASE_MODEL
+from .fasth3 import FASTH3_BASE_MODEL, _resolve_dit_attention_backend, _resolve_dit_attention_spec
 from .variant import FASTH3_OMNI, FASTH3_V2, H3Variant
 
 if TYPE_CHECKING:
@@ -44,7 +44,7 @@ def _scheduled_vsa_specs(od_config: OmniDiffusionConfig) -> list[tuple[str, Atte
         return []
     specs = []
     for name, profile in schedule.profiles.items():
-        spec, _ = profile.resolve_with_source("self")
+        spec, _ = profile.resolve_with_source("minimax_h3.dit", "self")
         if spec is not None and spec.backend.upper() == "FASTVIDEO_VSA":
             specs.append((name, spec))
     return specs
@@ -176,17 +176,17 @@ class FastH3CheckpointSpec:
     def check_serving_contract(self, *, partition: str, od_config: OmniDiffusionConfig) -> None:
         if partition != self.partition:
             raise ValueError(f"{self.name} requires --task-type {self.partition}")
-        if od_config.lora_path:
+        if getattr(od_config, "lora_path", None):
             raise ValueError(f"{self.name} is a full checkpoint; additional LoRA adapters are unsupported")
-        attention, _ = od_config.diffusion_attention_config.resolve_with_source("self")
-        if attention is None or attention.backend.upper() != "FASTVIDEO_VSA":
+        attention = _resolve_dit_attention_spec(od_config)
+        if _resolve_dit_attention_backend(od_config) != "FASTVIDEO_VSA":
             raise ValueError(f"{self.name} requires --diffusion-attention-backend FASTVIDEO_VSA")
-        if attention.fastvideo_vsa_topk is not None:
+        if getattr(attention, "fastvideo_vsa_topk", None) is not None:
             raise ValueError(
                 f"{self.name} pins VSA sparsity={self.vsa_sparsity}; remove the fixed fastvideo_vsa_topk override"
             )
-        parallel = od_config.parallel_config
-        if parallel.ring_degree != 1 or parallel.allgather_degree != 1:
+        parallel = getattr(od_config, "parallel_config", None)
+        if any(int(getattr(parallel, key, 1) or 1) != 1 for key in ("ring_degree", "allgather_degree")):
             raise ValueError(f"{self.name} supports local attention or pure Ulysses sequence parallelism")
         check_base_vsa_provider(attention, name=self.name, tile_size=self.vsa_tile_size)
         for name, spec in _scheduled_vsa_specs(od_config):
