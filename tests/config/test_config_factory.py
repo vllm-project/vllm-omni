@@ -1586,8 +1586,8 @@ class TestDeployConfigLoading:
         ("filename", "max_sessions"),
         [
             ("minicpmo_4_5.yaml", 16),
-            ("minicpmo_4_5_2gpu.yaml", 4),
-            ("minicpmo_4_5_3gpu.yaml", 4),
+            ("minicpmo_4_5_2gpu.yaml", 16),
+            ("minicpmo_4_5_3gpu.yaml", 16),
             ("minicpmo_4_5_8x4090.yaml", 1),
             ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 16),
             ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 16),
@@ -1665,42 +1665,18 @@ class TestDeployConfigLoading:
         deploy_stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
         stages = merge_pipeline_deploy(resolve_pipeline_config("minicpmo_4_5"), deploy)
 
-        if platform == "npu":
-            assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
-            # The armed head ends on 1; the union keeps the codec EOS inert
-            # (the collapsed head cannot sample it).
-            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
-            # The duplex KV-window contract requires prefix caching off, and the
-            # NPU overlay states that explicitly so a stage-level value can
-            # never turn it back on for this stage.
-            assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
-            assert stages[1].yaml_engine_args["speculative_config"] == {
-                "method": "ngram",
-                "num_speculative_tokens": 7,
-                "prompt_lookup_min": 1,
-                "prompt_lookup_max": 1,
-            }
-            assert stages[1].yaml_engine_args["async_scheduling"] is False
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [8, 8, 8]
-        else:
-            # CUDA arms the same block: the runner injects the constant
-            # continue drafts, so the deploy stop id is the two-wide
-            # continue/stop marker and the head stays collapsed.
-            assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
-            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
-            # Either absent (falls back to the top-level false) or explicitly
-            # false; the regression this guards against is true.
-            assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
-            assert stages[1].yaml_engine_args["speculative_config"] == {
-                "method": "ngram",
-                "num_speculative_tokens": 15,
-                "prompt_lookup_min": 1,
-                "prompt_lookup_max": 1,
-            }
-            # K-step books its span with the synchronous runner contract.
-            assert stages[1].yaml_engine_args["async_scheduling"] is False
-            # CUDA Code2Wav uses two replicas with eight slots each.
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 8]
+        assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
+        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
+        assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
+        assert stages[1].yaml_engine_args["speculative_config"] == {
+            "method": "ngram",
+            "num_speculative_tokens": 15,
+            "prompt_lookup_min": 1,
+            "prompt_lookup_max": 1,
+        }
+        assert stages[1].yaml_engine_args["async_scheduling"] is False
+        expected_seqs = [8, 8, 8] if platform == "npu" else [16, 16, 8]
+        assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == expected_seqs
 
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
