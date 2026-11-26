@@ -191,8 +191,7 @@ QUALITY_CONFIGS = [
         quantization={"text_encoder": "fp8", "transformer": None, "vae": None},
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
-        # gfx942 uses the strictest existing budget until MI300 runs calibrate it.
-        max_lpips={"H100": 0.15, "B200": 0.17, "gfx942": 0.15},
+        max_lpips={"H100": 0.15, "B200": 0.17},
         num_inference_steps=10,
         enable_cpu_offload=True,
         height=1024,
@@ -563,6 +562,10 @@ def _quality_param(c: QualityTestConfig):
     marks = list(_marks)
     if c.id == "fp8_sensenova_u1":
         marks = hardware_marks(res={"cuda": "H200"})
+    if c.id == "fp8_flux2_dev_text_encoder":
+        # On MI300 CI the pod stops responding while the FP8 arm loads the
+        # 24B text encoder with CPU offload (AMD builds 17607, 17617).
+        marks = list(hardware_marks(res={"cuda": ["H100", "B200"]}))
     if c.id == "fp8_qwen_image":
         # Disabled everywhere; keep it out of the ROCm selection rather than skipped there.
         marks = list(hardware_marks(res={"cuda": ["H100", "B200"]}))

@@ -144,7 +144,7 @@ steps:
 
   # MI300 owners for CUDA NIGHTLY "Diffusion · Quantization Test with H100 ·
   # Single-GPU" and "with L4" (same selectors minus the NVIDIA-only FlashInfer /
-  # CuTe DSL backends; GGUF, FLUX.2 and LTX-2 run separately), and for "Diffusion X2V · Wan2.2
+  # CuTe DSL backends; GGUF and LTX-2 run separately), and for "Diffusion X2V · Wan2.2
   # Autoround Function Test". Non-blocking until burn-in.
   - group: ":full_moon: Diffusion Quantization MI300 Nightly"
     steps:
@@ -175,7 +175,6 @@ steps:
             --ignore=tests/diffusion/quantization/test_gguf_diffusion.py
             --deselect tests/diffusion/quantization/test_quantization_fp8.py::test_single_stage_ltx2_fp8_uses_less_memory
             --deselect "tests/diffusion/quantization/test_quantization_quality.py::test_quantization_quality[fp8_ltx2]"
-            --deselect "tests/diffusion/quantization/test_quantization_quality.py::test_quantization_quality[fp8_flux2_dev_text_encoder]"
             -m 'full_model and diffusion and rocm and MI325 and cards_1 and not nvidia_only'
 
       # vllm-gguf-plugin replaces DiffusersPipelineLoader.load_weights with a
@@ -198,26 +197,6 @@ steps:
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
             1 2 75m rocm-diffusion-quantization-gguf
             tests/diffusion/quantization/test_gguf_diffusion.py
-            -m 'full_model and diffusion and rocm and MI325 and cards_1 and not nvidia_only'
-
-      # FLUX.2-dev keeps its 32B transformer and 24B text encoder in host RAM
-      # (CPU offload). After 17 tests in one process the pod stopped responding
-      # while loading the FP8 arm; keep it in a fresh process.
-      - label: "Diffusion · Quantization · FLUX.2 FP8 Text Encoder · 1-GPU"
-        agent_pool: mi300_1
-        depends_on: amd-build
-        mirror_hardwares: [amdproduction]
-        grade: NonBlocking
-        timeout_in_minutes: 90
-        source_file_dependencies: [diffusion_quantization, rocm_diffusion_nightly_runner]
-        artifact_paths:
-          - artifacts/rocm-diffusion-quantization-flux2-te/**/*
-        commands:
-          - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
-          - >-
-            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
-            1 1 75m rocm-diffusion-quantization-flux2-te
-            "tests/diffusion/quantization/test_quantization_quality.py::test_quantization_quality[fp8_flux2_dev_text_encoder]"
             -m 'full_model and diffusion and rocm and MI325 and cards_1 and not nvidia_only'
 
       # LTX-2 (19B) loads BF16 and FP8 copies; keep it in a fresh process so a
