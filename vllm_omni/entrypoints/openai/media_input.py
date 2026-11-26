@@ -96,32 +96,45 @@ def decode_base64_media(data: str, *, max_bytes: int | None, source: str) -> byt
 
 @asynccontextmanager
 async def _stream_media_response(
-    client: httpx.AsyncClient, url: httpx.URL, *, source: str, cookies: httpx.Cookies
+    client: httpx.AsyncClient, url: httpx.URL, *, source: str, cookies: httpx.Cookies, deadline: float
 ) -> AsyncIterator[httpx.Response]:
     """Connect to a checked address and match cookies against the logical URL."""
     if url.scheme not in ("http", "https") or not url.host or url.userinfo:
         raise InvalidInputReferenceError(f"Invalid {source}: expected an HTTP(S) URL without credentials.")
 
     hostname = url.raw_host.decode("ascii")
+    loop = asyncio.get_running_loop()
     try:
-        addresses = await asyncio.get_running_loop().getaddrinfo(
-            hostname, url.port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
-        )
+        addresses = await loop.getaddrinfo(hostname, url.port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
     except OSError as exc:
         raise InvalidInputReferenceError(f"Invalid {source}: could not resolve the media host.") from exc
 
+    public_addresses = []
+    for _, _, _, _, sockaddr in addresses:
+        address = ipaddress.ip_address(sockaddr[0])
+        if isinstance(address, ipaddress.IPv6Address):
+            if address.is_site_local or address.sixtofour is not None:
+                continue
+            address = address.ipv4_mapped or address
+        if address.is_global and not address.is_multicast and not address.is_reserved:
+            public_addresses.append(address)
+
     request = httpx.Request("GET", url, headers={"Accept-Encoding": "identity"})
     cookies.set_cookie_header(request)
-    connect_error: httpx.ConnectError | None = None
+    connect_error: httpx.ConnectError | httpx.ConnectTimeout | None = None
     async with AsyncExitStack() as stack:
-        for _, _, _, _, sockaddr in addresses:
-            address = ipaddress.ip_address(sockaddr[0])
-            if isinstance(address, ipaddress.IPv6Address):
-                if address.is_site_local or address.sixtofour is not None:
-                    continue
-                address = address.ipv4_mapped or address
-            if not address.is_global or address.is_multicast or address.is_reserved:
-                continue
+        for index, address in enumerate(public_addresses):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError
+
+            request_timeout = httpx.Timeout(client.timeout)
+            addresses_left = len(public_addresses) - index
+            request_timeout.connect = remaining
+            if addresses_left > 1:
+                # Reserve time for backups. HTTPX applies this timeout to TCP and TLS separately.
+                connect_phases = 2 if url.scheme == "https" else 1
+                request_timeout.connect = remaining / (addresses_left * connect_phases)
 
             # Connect to the checked address while preserving HTTP routing and TLS verification.
             target = httpx.URL(scheme=url.scheme, host=str(address), port=url.port, raw_path=url.raw_path)
@@ -131,10 +144,11 @@ async def _stream_media_response(
                         request.method,
                         target,
                         headers=request.headers,
+                        timeout=request_timeout,
                         extensions={"sni_hostname": hostname},
                     )
                 )
-            except httpx.ConnectError as exc:
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 connect_error = exc
             else:
                 # HTTPX's client jar is keyed to the connection address. Use the logical URL for cookies.
@@ -152,6 +166,7 @@ async def _stream_media_response(
 async def _download_media_bytes(
     url: str, *, max_bytes: int | None, source: str, follow_redirects: bool, timeout_s: float
 ) -> bytes:
+    deadline = asyncio.get_running_loop().time() + timeout_s
     async with httpx.AsyncClient(
         timeout=timeout_s,
         follow_redirects=False,
@@ -166,7 +181,7 @@ async def _download_media_bytes(
         while True:
             origin = (current_url.scheme, current_url.netloc)
             async with _stream_media_response(
-                client, current_url, source=source, cookies=cookies_by_origin[origin]
+                client, current_url, source=source, cookies=cookies_by_origin[origin], deadline=deadline
             ) as response:
                 if response.has_redirect_location:
                     if not follow_redirects:

@@ -61,6 +61,44 @@ async def test_media_request_uses_checked_ip_with_original_host(mocker, install_
 
 
 @pytest.mark.asyncio
+async def test_media_request_tries_backup_after_connect_timeout(mocker, install_transport):
+    first_address = "2606:4700:4700::1111"
+    backup_address = "93.184.216.34"
+    mocker.patch.object(
+        asyncio.get_running_loop(),
+        "getaddrinfo",
+        return_value=[
+            _address_info(first_address, 443),
+            _address_info("10.0.0.1", 443),
+            _address_info(backup_address, 443),
+        ],
+    )
+    attempted_hosts = []
+
+    async def handle(request):
+        attempted_hosts.append(request.url.host)
+        if request.url.host == first_address:
+            try:
+                await asyncio.wait_for(asyncio.Event().wait(), request.extensions["timeout"]["connect"])
+            except TimeoutError as exc:
+                raise httpx.ConnectTimeout("connection timed out", request=request) from exc
+        assert request.url.host == backup_address
+        assert request.headers["host"] == "media.example.com"
+        assert request.extensions["sni_hostname"] == "media.example.com"
+        return httpx.Response(200, content=b"media")
+
+    install_transport(handle)
+
+    assert (
+        await media_input.download_media_bytes(
+            "https://media.example.com/asset", max_bytes=5, source="reference", timeout_s=0.4
+        )
+        == b"media"
+    )
+    assert attempted_hosts == [first_address, backup_address]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("address", ["127.0.0.1", "10.0.0.1", "::1", "::ffff:10.0.0.1", "ff02::1"])
 async def test_media_request_rejects_non_public_ip(mocker, install_transport, address):
     mocker.patch.object(asyncio.get_running_loop(), "getaddrinfo", return_value=[_address_info(address, 443)])
