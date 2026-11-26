@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import math
 from base64 import b64decode
 from binascii import Error as BinasciiError
@@ -25,6 +26,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
+from tokenizers import Tokenizer
 from vllm.multimodal.image import open_image
 from vllm.multimodal.media import MediaConnector
 from vllm.sampling_params import SamplingParams
@@ -73,6 +75,8 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
     from vllm.config import ModelConfig
 
+    from vllm_omni.config.stage_config import PipelineConfig
+
 
 @dataclass(slots=True)
 class MiniCPMO45ServingSessionState(DefaultDuplexModelSessionState):
@@ -103,6 +107,10 @@ _DUPLEX_HD_SLICES_PER_BASE_FRAME = 3
 # checkpoint's, not a constant, so it is read from the model rather than
 # assumed.
 
+#: Identifies the cached tokenizer for one deployment. Subclasses that reuse
+#: ``_tokenizers`` must look it up under this key, not a path of their own.
+TOKENIZER_KEY = "duplex_tokenizer_key"
+
 PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
     {
         "duplex_stage_sampling_params",
@@ -111,7 +119,7 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "duplex_scheduler_token_id",
         "duplex_listen_prob_scale",
         "duplex_listen_top_k",
-        "duplex_tokenizer_key",
+        TOKENIZER_KEY,
         "duplex_vision_tile_pixels",
         "duplex_first_append_context_tokens",
         "ref_audio_data",
@@ -435,15 +443,26 @@ def _stage_config_value(runtime_config: dict[str, object], key: str, stage_id: i
 # ---- session policy helpers: tokenizer / reference audio ----
 
 
+def _tokenizer_ref(model_config: ModelConfig | None) -> tuple[str, str | None]:
+    path = getattr(model_config, "tokenizer", None) or getattr(model_config, "model", None)
+    revision = getattr(model_config, "tokenizer_revision", None) or getattr(model_config, "revision", None)
+    return (path if isinstance(path, str) else "", revision if isinstance(revision, str) else None)
+
+
+def _tokenizer_key(model_config: ModelConfig | None) -> str:
+    return json.dumps(_tokenizer_ref(model_config))
+
+
 def _load_tokenizer(model_config: ModelConfig | None) -> PreTrainedTokenizerBase | None:
-    model_path = getattr(model_config, "model", None)
-    if not isinstance(model_path, str) or not model_path:
+    tokenizer_path, revision = _tokenizer_ref(model_config)
+    if not tokenizer_path:
         return None
     try:
         from transformers import AutoTokenizer
 
         return AutoTokenizer.from_pretrained(
-            model_path,
+            tokenizer_path,
+            revision=revision,
             trust_remote_code=True,
             local_files_only=True,
         )
@@ -716,15 +735,13 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
         self.data_plane = MiniCPMO45DataPlaneSession(encode_audio)
-        # The tokenizer supplies context counts and incremental text tokens.
-        # It is the same for every session, so load it
-        # once per model path, off the orchestrator loop.
+        # Tokenization and Stage0 text decoding share a tokenizer across sessions; load it
+        # once per tokenizer path and revision, off the orchestrator loop.
         self._tokenizers: dict[str, PreTrainedTokenizerBase | None] = {}
         self._tokenizer_lock = asyncio.Lock()
 
     async def _tokenizer_for(self, model_config: ModelConfig | None) -> PreTrainedTokenizerBase | None:
-        model_path = getattr(model_config, "model", None)
-        key = model_path if isinstance(model_path, str) else ""
+        key = _tokenizer_key(model_config)
         if key in self._tokenizers:
             return self._tokenizers[key]
         async with self._tokenizer_lock:
@@ -776,7 +793,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         sampling_params: object,
     ) -> DuplexAppendPlan:
         if isinstance(payload, dict) and payload.get("type") == "text":
-            key = runtime_config.get("duplex_tokenizer_key", "")
+            key = runtime_config.get(TOKENIZER_KEY, "")
             tokenizer = self._tokenizers.get(key) if isinstance(key, str) else None
             if tokenizer is None:
                 raise ValueError("MiniCPM-o text append requires the model tokenizer")
@@ -951,6 +968,10 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
         return minicpmo45_native_capabilities(max_sessions=max_sessions)
 
+    def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        super().configure_pipeline(pipeline_config)
+        self.data_plane.thinker_only = not self.deployment_capabilities(max_sessions=1).emits_audio
+
     def validate_client_extra_body(self, extra_body: object) -> None:
         reject_private_runtime_keys(
             extra_body,
@@ -979,7 +1000,12 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         if isinstance(initial_user_text, str) and initial_user_text:
             runtime_config["initial_user_text"] = initial_user_text
         tokenizer = await self._tokenizer_for(model_config)
-        runtime_config["duplex_tokenizer_key"] = getattr(model_config, "model", None) or ""
+        runtime_config[TOKENIZER_KEY] = _tokenizer_key(model_config)
+        if self.data_plane.thinker_only:
+            backend = getattr(tokenizer, "backend_tokenizer", None)
+            if not isinstance(backend, Tokenizer):
+                raise DuplexRuntimeConfigError("MiniCPM-o Thinker-only output requires a fast tokenizer.")
+            self.data_plane.tokenizer = backend
         _apply_default_scheduler_policy(runtime_config, config=config, tokenizer=tokenizer, model_config=model_config)
         listen_scale, listen_top_k = _duplex_listen_knobs(extra_body)
         runtime_config["duplex_listen_prob_scale"] = listen_scale
@@ -997,7 +1023,8 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             extra_body.pop("tts_ref_audio")
             ref_audio = extra_tts_ref_audio
 
-        requests_audio = any(str(modality).lower() == "audio" for modality in config.modalities)
+        capabilities = self.deployment_capabilities(max_sessions=1)
+        requests_audio = "audio" in capabilities.resolve_output_modalities(config.modalities)
         default_ref_audio = None
         if ref_audio is None and requests_audio:
             default_ref_audio = await resolve_default_ref_audio(model_config)
@@ -1118,6 +1145,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
 
 __all__ = [
     "PRIVATE_RUNTIME_CONFIG_KEYS",
+    "TOKENIZER_KEY",
     "MiniCPMO45ClientRuntimeConfigError",
     "MiniCPMO45DuplexPlugin",
     "build_duplex_data_plane_prompt",
