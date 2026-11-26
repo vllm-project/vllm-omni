@@ -38,13 +38,21 @@ https://github.com/green-hand-shandong/npu-fft-310p
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import torch
 
 __all__ = [
-    "fft_pow2", "fft_dft", "fft", "ifft", "rfft", "irfft",
-    "stft", "istft", "hann_window", "hamming_window", "kaiser_window",
+    "fft_pow2",
+    "fft_dft",
+    "fft",
+    "ifft",
+    "rfft",
+    "irfft",
+    "stft",
+    "istft",
+    "hann_window",
+    "hamming_window",
+    "kaiser_window",
 ]
 
 
@@ -168,10 +176,13 @@ def fft_dft(x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
 
     pa = torch.view_as_real(a_f)
     pb = torch.view_as_real(b_f)
-    prod = torch.view_as_complex(torch.stack(
-        [pa[..., 0] * pb[..., 0] - pa[..., 1] * pb[..., 1],
-         pa[..., 0] * pb[..., 1] + pa[..., 1] * pb[..., 0]], dim=-1))
-    conv = fft_pow2(prod, inverse=True)[..., n - 1: 2 * n - 1]
+    prod = torch.view_as_complex(
+        torch.stack(
+            [pa[..., 0] * pb[..., 0] - pa[..., 1] * pb[..., 1], pa[..., 0] * pb[..., 1] + pa[..., 1] * pb[..., 0]],
+            dim=-1,
+        )
+    )
+    conv = fft_pow2(prod, inverse=True)[..., n - 1 : 2 * n - 1]
 
     pc = torch.view_as_real(conv)
     out_re = pc[..., 0] * w_half_re - pc[..., 1] * w_half_im
@@ -183,14 +194,13 @@ def fft_dft(x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------- top level
-def fft(input: torch.Tensor, n: Optional[int] = None, dim: int = -1,
-        norm: Optional[str] = None) -> torch.Tensor:
+def fft(input: torch.Tensor, n: int | None = None, dim: int = -1, norm: str | None = None) -> torch.Tensor:
     """torch.fft.fft drop-in (last dim only; 'ortho' norm supported)."""
     assert dim == -1 or dim == input.ndim - 1, "only the last dim is supported"
     x = input
     if n is not None and n != x.shape[-1]:
         pad = n - x.shape[-1]
-        x = torch.nn.functional.pad(x, (0, max(pad, 0)))[:n if pad < 0 else None]
+        x = torch.nn.functional.pad(x, (0, max(pad, 0)))[: n if pad < 0 else None]
     N = x.shape[-1]
     impl = "pow2" if N & (N - 1) == 0 else "dft"
     out = fft_pow2(x, inverse=False) if impl == "pow2" else fft_dft(x, inverse=False)
@@ -199,14 +209,13 @@ def fft(input: torch.Tensor, n: Optional[int] = None, dim: int = -1,
     return out
 
 
-def ifft(input: torch.Tensor, n: Optional[int] = None, dim: int = -1,
-         norm: Optional[str] = None) -> torch.Tensor:
+def ifft(input: torch.Tensor, n: int | None = None, dim: int = -1, norm: str | None = None) -> torch.Tensor:
     """torch.fft.ifft drop-in (last dim only; 'ortho' norm supported)."""
     assert dim == -1 or dim == input.ndim - 1, "only the last dim is supported"
     x = input
     if n is not None and n != x.shape[-1]:
         pad = n - x.shape[-1]
-        x = torch.nn.functional.pad(x, (0, max(pad, 0)))[:n if pad < 0 else None]
+        x = torch.nn.functional.pad(x, (0, max(pad, 0)))[: n if pad < 0 else None]
     N = x.shape[-1]
     impl = "pow2" if N & (N - 1) == 0 else "dft"
     out = fft_pow2(x, inverse=True) if impl == "pow2" else fft_dft(x, inverse=True)
@@ -215,8 +224,7 @@ def ifft(input: torch.Tensor, n: Optional[int] = None, dim: int = -1,
     return out
 
 
-def rfft(input: torch.Tensor, n: Optional[int] = None, dim: int = -1,
-         norm: Optional[str] = None) -> torch.Tensor:
+def rfft(input: torch.Tensor, n: int | None = None, dim: int = -1, norm: str | None = None) -> torch.Tensor:
     """torch.fft.rfft drop-in: real -> one-sided complex64 spectrum."""
     assert dim == -1 or dim == input.ndim - 1
     x = input
@@ -226,8 +234,7 @@ def rfft(input: torch.Tensor, n: Optional[int] = None, dim: int = -1,
     return full[..., : full.shape[-1] // 2 + 1]
 
 
-def irfft(input: torch.Tensor, n: Optional[int] = None, dim: int = -1,
-          norm: Optional[str] = None) -> torch.Tensor:
+def irfft(input: torch.Tensor, n: int | None = None, dim: int = -1, norm: str | None = None) -> torch.Tensor:
     """torch.fft.irfft drop-in: one-sided spectrum -> real signal."""
     assert dim == -1 or dim == input.ndim - 1
     x = input
@@ -239,9 +246,9 @@ def irfft(input: torch.Tensor, n: Optional[int] = None, dim: int = -1,
         pair = torch.view_as_real(x.resolve_conj())
         re, im = pair[..., 0], pair[..., 1]
         mid_re, mid_im = re[..., 1:-1], im[..., 1:-1]
-        full = torch.view_as_complex(torch.stack(
-            [torch.cat([re, mid_re.flip(-1)], dim=-1),
-             torch.cat([im, (-mid_im).flip(-1)], dim=-1)], dim=-1))
+        full = torch.view_as_complex(
+            torch.stack([torch.cat([re, mid_re.flip(-1)], dim=-1), torch.cat([im, (-mid_im).flip(-1)], dim=-1)], dim=-1)
+        )
     else:
         full = torch.cat([x, x[..., 1:-1].flip(-1).conj()], dim=-1)
     out = ifft(full, n=n, dim=dim, norm=norm)
@@ -249,34 +256,41 @@ def irfft(input: torch.Tensor, n: Optional[int] = None, dim: int = -1,
 
 
 # ---------------------------------------------------------------- windows
-def hann_window(window_length: int, periodic: bool = True, dtype=None,
-                device=None, requires_grad: bool = False) -> torch.Tensor:
+def hann_window(
+    window_length: int, periodic: bool = True, dtype=None, device=None, requires_grad: bool = False
+) -> torch.Tensor:
     """torch.hann_window drop-in: generated on CPU (310P cos_ kernel missing)."""
-    w = torch.hann_window(window_length, periodic=periodic,
-                          dtype=dtype or torch.float32, device="cpu")
+    w = torch.hann_window(window_length, periodic=periodic, dtype=dtype or torch.float32, device="cpu")
     return w.to(device) if device is not None else w
 
 
-def hamming_window(window_length: int, periodic: bool = True, dtype=None,
-                   device=None, requires_grad: bool = False) -> torch.Tensor:
-    w = torch.hamming_window(window_length, periodic=periodic,
-                             dtype=dtype or torch.float32, device="cpu")
+def hamming_window(
+    window_length: int, periodic: bool = True, dtype=None, device=None, requires_grad: bool = False
+) -> torch.Tensor:
+    w = torch.hamming_window(window_length, periodic=periodic, dtype=dtype or torch.float32, device="cpu")
     return w.to(device) if device is not None else w
 
 
-def kaiser_window(window_length: int, beta: float, periodic: bool = True,
-                  dtype=None, device=None, requires_grad: bool = False) -> torch.Tensor:
-    w = torch.kaiser_window(window_length, periodic=periodic, beta=beta,
-                            dtype=dtype or torch.float32, device="cpu")
+def kaiser_window(
+    window_length: int, beta: float, periodic: bool = True, dtype=None, device=None, requires_grad: bool = False
+) -> torch.Tensor:
+    w = torch.kaiser_window(window_length, periodic=periodic, beta=beta, dtype=dtype or torch.float32, device="cpu")
     return w.to(device) if device is not None else w
 
 
 # ---------------------------------------------------------------- STFT/ISTFT
-def stft(input: torch.Tensor, n_fft: int, hop_length: Optional[int] = None,
-         win_length: Optional[int] = None, window: Optional[torch.Tensor] = None,
-         center: bool = True, pad_mode: str = "reflect",
-         normalized: bool = False, onesided: bool = True,
-         return_complex: bool = True) -> torch.Tensor:
+def stft(
+    input: torch.Tensor,
+    n_fft: int,
+    hop_length: int | None = None,
+    win_length: int | None = None,
+    window: torch.Tensor | None = None,
+    center: bool = True,
+    pad_mode: str = "reflect",
+    normalized: bool = False,
+    onesided: bool = True,
+    return_complex: bool = True,
+) -> torch.Tensor:
     """torch.stft drop-in (common signatures; onesided complex output)."""
     assert onesided and return_complex, "only onesided complex output is supported"
     if hop_length is None:
@@ -300,10 +314,17 @@ def stft(input: torch.Tensor, n_fft: int, hop_length: Optional[int] = None,
     return spec[..., : n_fft // 2 + 1, :]
 
 
-def istft(input: torch.Tensor, n_fft: int, hop_length: Optional[int] = None,
-          win_length: Optional[int] = None, window: Optional[torch.Tensor] = None,
-          center: bool = True, normalized: bool = False,
-          length: Optional[int] = None, return_complex: bool = False) -> torch.Tensor:
+def istft(
+    input: torch.Tensor,
+    n_fft: int,
+    hop_length: int | None = None,
+    win_length: int | None = None,
+    window: torch.Tensor | None = None,
+    center: bool = True,
+    normalized: bool = False,
+    length: int | None = None,
+    return_complex: bool = False,
+) -> torch.Tensor:
     """torch.istft drop-in: one-sided spectrum -> waveform (overlap-add)."""
     if hop_length is None:
         hop_length = n_fft // 4
@@ -320,9 +341,9 @@ def istft(input: torch.Tensor, n_fft: int, hop_length: Optional[int] = None,
         pair = torch.view_as_real(spec.resolve_conj())
         re, im = pair[..., 0], pair[..., 1]
         mid_re, mid_im = re[..., 1:-1, :], im[..., 1:-1, :]
-        full = torch.view_as_complex(torch.stack(
-            [torch.cat([re, mid_re.flip(-2)], dim=-2),
-             torch.cat([im, (-mid_im).flip(-2)], dim=-2)], dim=-1))
+        full = torch.view_as_complex(
+            torch.stack([torch.cat([re, mid_re.flip(-2)], dim=-2), torch.cat([im, (-mid_im).flip(-2)], dim=-2)], dim=-1)
+        )
     else:
         full = torch.cat([spec, spec[..., 1:-1, :].flip(-2).conj()], dim=-2)
     full = full.transpose(-1, -2)
@@ -341,13 +362,13 @@ def istft(input: torch.Tensor, n_fft: int, hop_length: Optional[int] = None,
     denom = frames.new_zeros(out_len)
     win_sq = (window * window).float()
     for t in range(T):
-        out[..., t * hop_length: t * hop_length + n_fft] += frames[..., t, :]
-        denom[..., t * hop_length: t * hop_length + n_fft] += win_sq
+        out[..., t * hop_length : t * hop_length + n_fft] += frames[..., t, :]
+        denom[..., t * hop_length : t * hop_length + n_fft] += win_sq
     denom = torch.where(denom > 1e-11, denom, torch.full_like(denom, 1e-11))
     out = out / denom
 
     if center:
-        out = out[..., n_fft // 2: out.shape[-1] - n_fft // 2]
+        out = out[..., n_fft // 2 : out.shape[-1] - n_fft // 2]
     if length is not None:
         out = out[..., :length]
     return out
