@@ -84,7 +84,10 @@ def generator2tokenizer_async_chunk(
     # finished and nothing was produced, emit an EOF marker.
     if pending_frames <= 0:
         if finished:
-            payload = OmniPayloadStruct(meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)))
+            payload = OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+            )
             transfer_manager.code_prompt_token_ids.pop(request_id, None)
             return payload
         return None
@@ -99,7 +102,10 @@ def generator2tokenizer_async_chunk(
     # complete chunk was already emitted. Send only EOF in that case instead
     # of replaying the last chunk to the tokenizer.
     if finished and not added_frame and chunk_length == 0:
-        payload = OmniPayloadStruct(meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)))
+        payload = OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+            meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+        )
         transfer_manager.code_prompt_token_ids.pop(request_id, None)
         return payload
 

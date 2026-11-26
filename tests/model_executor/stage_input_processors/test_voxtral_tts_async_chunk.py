@@ -90,14 +90,14 @@ def test_eof_marker_when_finished_with_no_frames():
         request=request,
     )
 
-    assert payload.codes is None
+    assert payload.codes.audio.numel() == 0
     assert payload.meta.finished.item() is True
 
-    # The connector payload schema and its AdditionalInformation wire format
-    # must preserve a terminal-only marker without inventing an empty code tensor.
+    # Preserve the empty audio field through the AdditionalInformation wire format
+    # so downstream consumers can read payload.codes.audio on every chunk.
     wire_payload = serialize_payload(to_dict(payload))
     restored_payload = deserialize_payload(wire_payload)
-    assert "codes" not in restored_payload
+    assert restored_payload["codes"]["audio"].numel() == 0
     assert restored_payload["meta"]["finished"].item() is True
 
 
@@ -299,7 +299,7 @@ def test_interleaved_requests_keep_frames_separate_and_cleanup_on_finish():
     req_a_done = _req("rid-a", finished=True)
     payload_a = generator2tokenizer_async_chunk(transfer_manager, None, req_a_done)
     assert payload_a is not None
-    assert payload_a.codes is None
+    assert payload_a.codes.audio.numel() == 0
     assert payload_a.meta.finished.item()
     assert "rid-a" not in transfer_manager.code_prompt_token_ids
 
