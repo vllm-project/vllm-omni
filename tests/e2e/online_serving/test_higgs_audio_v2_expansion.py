@@ -118,6 +118,9 @@ class TestHiggsAudioV2OnlineHappyPath:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                # This follow-up only checks that abort cleanup left the
+                # server usable; do not make it depend on an exact transcript.
+                "transcript_expected_text": None,
             }
         )
 
