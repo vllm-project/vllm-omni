@@ -222,7 +222,7 @@ class Magi2MultiHeadMoE(nn.Module):
             parameter.mmap_weight_transform = self.ep_slice
 
     def prepare_bf16_weights(self) -> None:
-        """No derived weight layout is required by the native or NPU backend."""
+        """No derived weight layout is required by the native backend."""
 
     def ep_slice(self, checkpoint_tensor: torch.Tensor) -> torch.Tensor:
         """Slice flattened ``(head,expert)`` checkpoint rows for this rank."""

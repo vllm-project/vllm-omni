@@ -116,6 +116,110 @@ def test_npu_mh_moe_token_chunking_is_bit_identical(npu_device, token_chunk):
     assert torch.equal(chunked, unchunked)
 
 
+@hardware_test(res={"npu": "A2"}, num_cards=1)
+def test_npu_mh_moe_chunking_at_the_shipped_default(npu_device, monkeypatch):
+    """The shipped MOE_TOKEN_CHUNK must slice a production-shaped sequence without moving a bit."""
+
+    tokens, heads, head_dim = 20000, 2, 256
+    num_experts, top_k, intermediate = 8, 6, 1280
+    assert tokens > npu_moe.MOE_TOKEN_CHUNK, "the default must slice this sequence"
+
+    generator = torch.Generator().manual_seed(5)
+    x = torch.randn(tokens, heads, head_dim, generator=generator).to(torch.bfloat16)
+    logits = torch.randn(heads, tokens, num_experts, generator=generator)
+    probabilities, indices = torch.topk(torch.softmax(logits, dim=-1), top_k, dim=-1)
+    shape = (heads * num_experts, head_dim, intermediate)
+    gate = (torch.randn(shape, generator=generator) * 0.3).to(torch.bfloat16)
+    up = (torch.randn(shape, generator=generator) * 0.7 - 0.5).to(torch.bfloat16)
+    down = (torch.randn(heads * num_experts, intermediate, head_dim, generator=generator) * 0.2).to(torch.bfloat16)
+    args = (
+        x.to(npu_device),
+        probabilities.to(npu_device),
+        indices.to(npu_device),
+        num_experts,
+        gate.to(npu_device),
+        up.to(npu_device),
+        down.to(npu_device),
+    )
+
+    import torch_npu
+
+    routed_rows = []
+    routing = torch_npu.npu_moe_init_routing_v2
+
+    def record(flat_x, *rest, **kwargs):
+        routed_rows.append(flat_x.shape[0])
+        return routing(flat_x, *rest, **kwargs)
+
+    with torch.no_grad():
+        unchunked = npu_moe.npu_mh_moe_forward(*args, token_chunk=0)
+        monkeypatch.setattr(torch_npu, "npu_moe_init_routing_v2", record)
+        chunked = npu_moe.npu_mh_moe_forward(*args)
+
+    # Rows per routing call prove the slice actually happened; equality alone would also
+    # hold if the loop collapsed back to one full-sequence call.
+    full, tail = divmod(tokens, npu_moe.MOE_TOKEN_CHUNK)
+    assert routed_rows == [npu_moe.MOE_TOKEN_CHUNK * heads] * full + [tail * heads]
+    assert torch.equal(chunked, unchunked)
+
+
+@hardware_test(res={"npu": "A2"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires NPU")
+def test_npu_mh_moe_packed_bank_matches_staged_matmuls(npu_device, monkeypatch):
+    """One grouped MatMul over a [gate|up] bank must agree with two and the native pair."""
+
+    monkeypatch.setenv("MAGI2_FUSED_SWIGLU7", "1")
+    x, probabilities, indices, gate, up, down = _fixed_route_inputs(129, 2, 4)
+    routed = (x.to(npu_device), probabilities.to(npu_device), indices.to(npu_device), 4)
+    gate, up, down = (weight.to(npu_device) for weight in (gate, up, down))
+    with torch.no_grad():
+        staged = npu_moe.npu_mh_moe_forward(*routed, gate, up, down, token_chunk=0)
+        packed = npu_moe.npu_mh_moe_forward(
+            *routed,
+            gate,
+            up,
+            down,
+            packed_gate_up=torch.cat((gate, up), dim=-1),
+            token_chunk=0,
+        )
+
+    torch.testing.assert_close(packed, staged, rtol=8e-3, atol=2e-3)
+
+
+@hardware_test(res={"npu": "A2"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires NPU")
+def test_npu_prepare_bf16_weights_follows_the_switch(npu_device, monkeypatch):
+    """The production packer must honour the switch, keep both weights, and reuse its bank."""
+
+    _, _, _, gate, up, down = _fixed_route_inputs(17, 3, 2)
+    layer = npu_moe.Magi2MultiHeadMoE(
+        Magi2MultiHeadMoEConfig(192, 3, 4, 2, 96, torch.bfloat16),
+        ep_group=Magi2ParallelGroup(None, 1, 0),
+    ).to(npu_device)
+    with torch.no_grad():
+        layer.W_gate.copy_(gate.to(npu_device))
+        layer.W_up.copy_(up.to(npu_device))
+        layer.W_down.copy_(down.to(npu_device))
+    expected_gate, expected_up = layer.W_gate.clone(), layer.W_up.clone()
+    intermediate = layer.W_gate.shape[-1]
+
+    monkeypatch.delenv("MAGI2_FUSED_SWIGLU7", raising=False)
+    layer.prepare_bf16_weights()
+    assert layer.W_gate.untyped_storage().data_ptr() != layer.W_up.untyped_storage().data_ptr()
+
+    monkeypatch.setenv("MAGI2_FUSED_SWIGLU7", "1")
+    layer.prepare_bf16_weights()
+    assert layer.W_gate.untyped_storage().data_ptr() == layer.W_up.untyped_storage().data_ptr()
+    assert layer.W_up.storage_offset() == layer.W_gate.storage_offset() + intermediate
+    torch.testing.assert_close(layer.W_gate, expected_gate, rtol=0, atol=0)
+    torch.testing.assert_close(layer.W_up, expected_up, rtol=0, atol=0)
+
+    # A second call reuses the bank it rebound instead of concatenating again.
+    pointer = layer.W_gate.untyped_storage().data_ptr()
+    layer.prepare_bf16_weights()
+    assert layer.W_gate.untyped_storage().data_ptr() == pointer
+
+
 @hardware_test(res={"npu": "A5"}, num_cards=1)
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires NPU")
 def test_npu_local_forward_uses_real_routing_and_grouped_matmuls(npu_device, mocker):

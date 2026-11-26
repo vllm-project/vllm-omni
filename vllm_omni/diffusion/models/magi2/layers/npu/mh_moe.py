@@ -9,21 +9,14 @@ from __future__ import annotations
 import torch
 import torch_npu
 
+from ...swiglu7_npu import fused_swiglu7_enabled
 from ..native.mh_moe import (
     Magi2MultiHeadMoE as NativeMagi2MultiHeadMoE,
 )
 from ..native.mh_moe import swiglu7_pair
 
-# At 540p each active rank routes 121,010 tokens x 2 local MoE heads x top-6 = 1,452,120
-# expert rows in one call. Each BF16 projection over those rows is 3.46 GiB, and swiglu7_pair
-# casts both to FP32 at 6.92 GiB each. A 6.93 GiB allocation of that shape is what fails on a
-# 64 GiB card: ranks 0-5 each report it in the first routed layer of the first denoising step,
-# while ranks 6-7 hold expert-parallel padding only. That log has no stack, so which FP32
-# temporary failed is not identified.
-#
-# Routing is per token and grouped MatMul is per row, so slicing the token axis and
-# concatenating the slices is the same function: it bounds the intermediates and leaves the
-# values untouched.
+# Routing is per token and grouped MatMul is per row, so slicing the token axis bounds the
+# intermediates and leaves the values untouched.
 MOE_TOKEN_CHUNK = 16384
 
 
@@ -36,11 +29,13 @@ def npu_mh_moe_forward(
     w_up: torch.Tensor,
     w_down: torch.Tensor,
     *,
+    packed_gate_up: torch.Tensor | None = None,
     token_chunk: int = MOE_TOKEN_CHUNK,
 ) -> torch.Tensor:
     """Ascend grouped-MatMul path for independently routed MAGI-2 MoE heads.
 
-    Tokens are routed ``token_chunk`` at a time; ``0`` routes them in one call.
+    ``token_chunk`` routes that many tokens at a time; ``0`` routes them in one call.
+    ``packed_gate_up`` holds gate and up side by side, collapsing their two MatMuls into one.
     """
 
     if x.ndim != 3:
@@ -73,6 +68,7 @@ def npu_mh_moe_forward(
                     w_gate,
                     w_up,
                     w_down,
+                    packed_gate_up=packed_gate_up,
                     token_chunk=0,
                 )
                 for start in range(0, sequence, token_chunk)
@@ -106,17 +102,13 @@ def npu_mh_moe_forward(
         "group_type": 0,
         "group_list": expert_tokens.to(torch.int64),
     }
-    gate = torch_npu.npu_grouped_matmul(
-        x=[sorted_hidden],
-        weight=[w_gate],
-        **grouped_kwargs,
-    )[0]
-    up = torch_npu.npu_grouped_matmul(
-        x=[sorted_hidden],
-        weight=[w_up],
-        **grouped_kwargs,
-    )[0]
-    hidden = swiglu7_pair(gate, up)
+    if packed_gate_up is None:
+        gate = torch_npu.npu_grouped_matmul(x=[sorted_hidden], weight=[w_gate], **grouped_kwargs)[0]
+        up = torch_npu.npu_grouped_matmul(x=[sorted_hidden], weight=[w_up], **grouped_kwargs)[0]
+        hidden = swiglu7_pair(gate, up)
+    else:
+        gate_up = torch_npu.npu_grouped_matmul(x=[sorted_hidden], weight=[packed_gate_up], **grouped_kwargs)[0]
+        hidden = torch_npu.npu_clipped_swiglu(gate_up, interleaved=False)
     sorted_output = torch_npu.npu_grouped_matmul(
         x=[hidden],
         weight=[w_down],
@@ -133,6 +125,36 @@ def npu_mh_moe_forward(
 class Magi2MultiHeadMoE(NativeMagi2MultiHeadMoE):
     """Checkpoint-compatible MAGI-2 MoE with Ascend fused local kernels."""
 
+    def _packed_weights(self) -> torch.Tensor | None:
+        """Return a [gate|up] bank view, rebinding both parameters into it on first use."""
+
+        gate, up = self.W_gate, self.W_up
+        if (
+            not fused_swiglu7_enabled()
+            or not self.has_real_moe_heads
+            or gate.device.type != "npu"
+            or gate.dtype != torch.bfloat16
+        ):
+            return None
+        experts, width, intermediate = gate.shape
+        stride = (width * 2 * intermediate, 2 * intermediate, 1)
+        # Read off the live parameters, so an offload or mmap rebind repacks instead of reusing.
+        if (
+            gate.stride() == up.stride() == stride
+            and up.storage_offset() == gate.storage_offset() + intermediate
+            and gate.untyped_storage().data_ptr() == up.untyped_storage().data_ptr()
+        ):
+            return gate.as_strided((experts, width, 2 * intermediate), stride)
+        with torch.no_grad():
+            bank = torch.cat((gate, up), dim=-1)
+            gate.data, up.data = bank.split(intermediate, dim=-1)
+        return bank
+
+    def prepare_bf16_weights(self) -> None:
+        """Pack the bank at load time, so the first denoising step does not pay for it."""
+
+        self._packed_weights()
+
     def _local_forward(self, x_heads: torch.Tensor) -> torch.Tensor:
         if x_heads.device.type != "npu":
             return super()._local_forward(x_heads)
@@ -145,6 +167,7 @@ class Magi2MultiHeadMoE(NativeMagi2MultiHeadMoE):
             self.W_gate,
             self.W_up,
             self.W_down,
+            packed_gate_up=self._packed_weights() if not torch.is_grad_enabled() else None,
         )
 
 
