@@ -108,6 +108,7 @@ async def open_qwen(
     history_max_bytes=8 * 1024 * 1024,
     requires_audio=True,
     history_policy=None,
+    clock=None,
     **config_overrides: Any,
 ):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
@@ -131,6 +132,7 @@ async def open_qwen(
             history_audio_max_bytes_per_session=history_max_bytes,
         ),
         model_config=None,
+        clock=clock,
     )
     config = DuplexSessionConfig(model="qwen", modalities=["text", "audio"], overlap_policy="barge_in_on_speech")
     for key, value in config_overrides.items():

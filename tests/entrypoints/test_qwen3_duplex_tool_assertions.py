@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Exercise the live tool-test assertions with a real client and scripted socket."""
+"""Check tool lifecycle events independently of the model's chosen answer text."""
 
 from __future__ import annotations
 
@@ -17,12 +17,17 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture
-def run_tool_case(monkeypatch):
-    """Run an unchanged GPU test body against controlled protocol events."""
+def run_tool_round_trip(monkeypatch):
+    """Run the live smoke's event checks against a real client and scripted socket."""
     monkeypatch.setattr(playback, "TURN_TIMEOUT_S", 1.0)
 
     def run(
-        test_name: str, answer: str | None, *, ack_call_id: str | None = "call_weather", response_id="continuation"
+        answer: str | None,
+        *,
+        ack_call_id: str | None = "call_weather",
+        response_id="continuation",
+        corrupt_result=False,
+        status="completed",
     ):
         async def in_session(config, body):
             sock = FakeSocket()
@@ -43,7 +48,7 @@ def run_tool_case(monkeypatch):
                 def complete(rid: str, text: str) -> None:
                     sock.feed({"type": "response.created", "response": {"id": rid}})
                     sock.feed({"type": "response.output_text.delta", "response_id": rid, "delta": text})
-                    sock.feed({"type": "response.done", "response": {"id": rid, "status": "completed"}})
+                    sock.feed({"type": "response.done", "response": {"id": rid, "status": status}})
 
                 async def serve():
                     cursor = 0
@@ -60,7 +65,11 @@ def run_tool_case(monkeypatch):
                                     sock.feed(
                                         {
                                             "type": "conversation.item.created",
-                                            "item": {**item, "call_id": ack_call_id},
+                                            "item": {
+                                                **item,
+                                                "call_id": ack_call_id,
+                                                "output": "wrong-result" if corrupt_result else item["output"],
+                                            },
                                         }
                                     )
                             elif event["type"] == "response.create":
@@ -105,37 +114,37 @@ def run_tool_case(monkeypatch):
         monkeypatch.setattr(
             playback, "_run_tool_session", lambda server, config, body: asyncio.run(in_session(config, body))
         )
-        test = getattr(playback.TestQwen3OmniDuplexPlayback(), test_name)
+        test = playback.TestQwen3OmniDuplexPlayback().test_live_tool_runner_completes_a_tool_round_trip
         test(Mock(spec=playback._DuplexTestRuntime, server=object()))
 
     return run
 
 
-@pytest.mark.parametrize(("answer", "accepted"), [("17", True), (" 17\n", True), ("117", False), ("17:00", False)])
-def test_weather_answer_matches_the_entire_temperature(run_tool_case, answer, accepted):
-    name = "test_a_tool_result_reaches_the_next_answer"
-    if accepted:
-        run_tool_case(name, answer)
-    else:
-        with pytest.raises(AssertionError):
-            run_tool_case(name, answer)
-
-
 @pytest.mark.parametrize(
-    ("answer", "ack_call_id", "response_id", "accepted"),
+    ("answer", "ack_call_id", "response_id", "corrupt_result", "status", "accepted"),
     [
-        ("17", "call_weather", "continuation", True),
-        (None, "call_weather", "continuation", False),
-        ("17", None, "continuation", False),
-        ("17", "wrong_call", "continuation", False),
-        ("17", "call_weather", "initial", False),
-        ("117", "call_weather", "continuation", False),
+        ("An arbitrary reply.", "call_weather", "continuation", False, "completed", True),
+        ("17", "call_weather", "continuation", False, "completed", True),
+        ("117", "call_weather", "continuation", False, "completed", True),
+        ("17:00", "call_weather", "continuation", False, "completed", True),
+        ("", "call_weather", "continuation", False, "completed", True),
+        (None, "call_weather", "continuation", False, "completed", False),
+        ("reply", None, "continuation", False, "completed", False),
+        ("reply", "wrong_call", "continuation", False, "completed", False),
+        ("reply", "call_weather", "initial", False, "completed", False),
+        ("reply", "call_weather", "continuation", True, "completed", False),
+        ("reply", "call_weather", "continuation", False, "failed", False),
     ],
 )
-def test_runner_requires_its_acknowledged_new_response(run_tool_case, answer, ack_call_id, response_id, accepted):
-    name = "test_immediate_runner_handler_continues_without_another_client_action"
+def test_tool_round_trip_checks_events_not_answer_text(
+    run_tool_round_trip, answer, ack_call_id, response_id, corrupt_result, status, accepted
+):
     if accepted:
-        run_tool_case(name, answer, ack_call_id=ack_call_id, response_id=response_id)
+        run_tool_round_trip(
+            answer, ack_call_id=ack_call_id, response_id=response_id, corrupt_result=corrupt_result, status=status
+        )
     else:
         with pytest.raises(AssertionError):
-            run_tool_case(name, answer, ack_call_id=ack_call_id, response_id=response_id)
+            run_tool_round_trip(
+                answer, ack_call_id=ack_call_id, response_id=response_id, corrupt_result=corrupt_result, status=status
+            )

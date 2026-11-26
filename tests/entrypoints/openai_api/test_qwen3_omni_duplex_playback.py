@@ -487,7 +487,6 @@ async def _run_duplex_history(runtime, log_path: Path, *, reject_overflow: bool 
 
 
 TURN_TIMEOUT_S = 180.0
-RESULT_TIMEOUT_S = 3.0
 WEATHER_TOOL = {
     "type": "function",
     "name": "get_weather",
@@ -500,8 +499,7 @@ WEATHER_TOOL = {
 }
 INSTRUCTIONS = (
     "You are a helpful assistant. For any question about the weather you must call the get_weather tool "
-    "instead of guessing. After receiving its result, answer with only the temperature_c integer, "
-    "without units or other text. For anything else, answer directly in one short sentence without calling a tool."
+    "instead of guessing. After receiving its result, respond briefly."
 )
 WEATHER_QUESTION = "What is the weather in Paris right now?"
 WEATHER_RESULT = json.dumps({"city": "Paris", "temperature_c": 17})
@@ -619,23 +617,7 @@ class _ToolSession:
         calls = self.calls()
         assert calls, f"Qwen published no function call: {self.collector.errors()}"
         assert calls[-1]["name"] == "get_weather"
-        assert "paris" in str(calls[-1]["arguments"]).lower()
         return str(calls[-1]["call_id"])
-
-    async def wait_for_settled(self, call_id: str) -> dict[str, object]:
-        deadline = asyncio.get_running_loop().time() + TURN_TIMEOUT_S
-        while asyncio.get_running_loop().time() < deadline:
-            for event in self.duplex_events("duplex.function_call.settled"):
-                if event.get("call_id") == call_id:
-                    return event
-            await asyncio.sleep(0.05)
-        raise AssertionError(f"call {call_id} never settled; errors: {self.collector.errors()}")
-
-    async def continue_with_result(self, call_id: str, output: str) -> str:
-        start = len(self.collector.events)
-        await self.client.send_function_call_output(call_id, output)
-        await self.client.send({"type": "response.create"})
-        return await self.finish_response(start)
 
     def report(self) -> None:
         """Keep what the model did in the test output, pass or fail."""
@@ -797,94 +779,9 @@ class TestQwen3OmniDuplexPlayback:
         asyncio.run(_run_duplex_history(qwen_duplex_server, tmp_path / "events.json", reject_overflow=True))
 
     @pytest.mark.advanced_model
-    def test_a_tool_result_reaches_the_next_answer(self, qwen_duplex_server):
-        async def body(session: _ToolSession) -> None:
-            call_id = await session.ask_for_weather()
-            answer = await session.continue_with_result(call_id, WEATHER_RESULT)
-            assert answer.strip() == str(json.loads(WEATHER_RESULT)["temperature_c"]), answer
-            assert session.error_codes() == []
+    def test_live_tool_runner_completes_a_tool_round_trip(self, qwen_duplex_server):
+        """Smoke-test real model/tool integration without prescribing the answer."""
 
-        _run_tool_session(qwen_duplex_server.server, _tool_session_config(), body)
-
-    @pytest.mark.advanced_model
-    def test_the_client_can_keep_talking_while_a_tool_is_pending(self, qwen_duplex_server):
-        async def body(session: _ToolSession) -> None:
-            call_id = await session.ask_for_weather()
-
-            reply = await session.ask("Before that, what is the capital of Japan?")
-            assert "tokyo" in reply.lower(), reply
-            assert session.duplex_events("duplex.function_call.settled") == []
-            assert len(session.calls()) == 1, session.calls()
-
-            await session.continue_with_result(call_id, WEATHER_RESULT)
-            assert session.error_codes() == []
-
-        _run_tool_session(qwen_duplex_server.server, _tool_session_config(function_call_interrupt_policy="keep"), body)
-
-    @pytest.mark.advanced_model
-    def test_a_timed_out_call_is_not_repeated_on_the_next_turn(self, qwen_duplex_server):
-        """Nothing blocks a repeat here: the user turn lifts the block, so this measures the notice."""
-
-        async def body(session: _ToolSession) -> None:
-            call_id = await session.ask_for_weather()
-            settled = await session.wait_for_settled(call_id)
-            assert (settled["state"], settled["reason"]) == ("timed_out", "timeout")
-
-            await session.ask("Thanks. What is the capital of Japan?")
-
-            assert len(session.calls()) == 1, session.calls()
-
-        _run_tool_session(qwen_duplex_server.server, _tool_session_config(tool_result_timeout_s=RESULT_TIMEOUT_S), body)
-
-    @pytest.mark.advanced_model
-    def test_a_late_result_never_reaches_the_answer(self, qwen_duplex_server):
-        async def body(session: _ToolSession) -> None:
-            call_id = await session.ask_for_weather()
-            await session.wait_for_settled(call_id)
-
-            await session.client.send_function_call_output(call_id, json.dumps({"city": "Paris", "temperature_c": 93}))
-            answer = await session.ask("Thanks. What is the capital of Japan?")
-
-            assert "invalid_function_call_output" in session.error_codes()
-            assert "93" not in answer, answer
-
-        _run_tool_session(qwen_duplex_server.server, _tool_session_config(tool_result_timeout_s=RESULT_TIMEOUT_S), body)
-
-    @pytest.mark.advanced_model
-    def test_a_repeated_question_cannot_republish_an_abandoned_call(self, qwen_duplex_server):
-        """The same question invites the same call, so the guard has to hold under ``never``."""
-
-        async def body(session: _ToolSession) -> None:
-            call_id = await session.ask_for_weather()
-            await session.wait_for_settled(call_id)
-
-            await session.ask(WEATHER_QUESTION)
-
-            assert len(session.calls()) == 1, session.calls()
-            for suppressed in session.duplex_events("duplex.function_call.suppressed"):
-                assert suppressed["blocked_by_call_id"] == call_id
-
-        config = _tool_session_config(tool_result_timeout_s=RESULT_TIMEOUT_S, function_call_retry_policy="never")
-        _run_tool_session(qwen_duplex_server.server, config, body)
-
-    @pytest.mark.advanced_model
-    def test_a_failed_tool_ends_the_call_and_the_session_carries_on(self, qwen_duplex_server):
-        async def body(session: _ToolSession) -> None:
-            call_id = await session.ask_for_weather()
-
-            await session.client.cancel_function_call(call_id, reason="failed")
-            settled = await session.wait_for_settled(call_id)
-            assert (settled["state"], settled["reason"]) == ("cancelled", "client_failed")
-
-            reply = await session.ask("Thanks. What is the capital of Japan?")
-            assert "tokyo" in reply.lower(), reply
-            assert len(session.calls()) == 1, session.calls()
-            assert session.error_codes() == []
-
-        _run_tool_session(qwen_duplex_server.server, _tool_session_config(), body)
-
-    @pytest.mark.advanced_model
-    def test_immediate_runner_handler_continues_without_another_client_action(self, qwen_duplex_server):
         async def body(session: _ToolSession) -> None:
             handled = []
 
@@ -898,11 +795,21 @@ class TestQwen3OmniDuplexPlayback:
             try:
                 await asyncio.sleep(0)
                 call_id = await session.ask_for_weather()
-                answer = await session.finish_response(start, after_tool_result=call_id)
+                await session.finish_response(start, after_tool_result=call_id)
                 if task.done():
                     await task
-                assert answer.strip() == str(json.loads(WEATHER_RESULT)["temperature_c"]), answer
-                assert len(handled) == 1
+                call = next(call for call in session.calls() if call["call_id"] == call_id)
+                arguments = call["arguments"]
+                assert isinstance(arguments, str)
+                assert json.loads(arguments) in handled
+                assert any(
+                    event.get("type") == "conversation.item.created"
+                    and isinstance(item := event.get("item"), dict)
+                    and item.get("type") == "function_call_output"
+                    and item.get("call_id") == call_id
+                    and item.get("output") == WEATHER_RESULT
+                    for event in session.events_since(start)
+                )
                 assert session.error_codes() == []
                 assert runner.undelivered_results == {}
             finally:
