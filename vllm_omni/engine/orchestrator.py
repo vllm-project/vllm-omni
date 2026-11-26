@@ -361,6 +361,8 @@ class StreamingSegmentState:
     # Serialized per-step capture payload; also populated on the terminal
     # poll so the response's final unit is never lost.
     capture_payload: bytes | None = None
+    # The producing step sampled a unit. False is a park or a prompt step.
+    unit_bearing: bool = False
 
 
 @dataclass
@@ -1156,6 +1158,7 @@ class OrchestratorBase:
                     # The payload is part of the delivery contract: per-step
                     # deliveries are non-finished by design and must keep theirs.
                     capture_payload=bytes(capture_payload) if capture_payload is not None else None,
+                    unit_bearing=bool(getattr(eco, "action_capture_expected", False)),
                 )
                 req_state.streaming.new_prompt_len_snapshot = getattr(
                     eco,

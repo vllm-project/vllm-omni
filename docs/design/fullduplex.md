@@ -1630,6 +1630,19 @@ what forcing* — the two surfaces this contract adds.
   at ledger ingest, and the terminal poll recovers the final step's payload.
   With capture off, no field is set, nothing is packed, no bytes cross the
   wire: generation behavior and hot-loop work are unchanged.
+  A delivery the producer marks `action_capture_expected` false (prompt
+  ingestion, a park) sampled nothing and may omit the payload. A
+  unit-bearing delivery without one is a transit loss and stays
+  session-fatal. The payload carries the submit-time `response_index`. A
+  unit still in flight when listening seals folds back into that sealed
+  scope when the index matches; only a sealed set still inside the
+  retention window can be reached. A capture seq that no append reserved
+  is engine-origin: it consumed no new client chunk.
+- **Runner.** Capture publishes on model runner v2. A generated duplex
+  deploy with no `platforms` map selects v2 when the stage declares
+  `supports_duplex_mrv2`. Stock deploys keep the platform map, which
+  selects v2 on CUDA and NPU and leaves other platforms on v1. An
+  explicit stage `model_runner: v1` opts out.
 - **Semantics.** The session ledger (`engine/duplex/session/action_ledger.py`)
   assembles units into sealed, columnar `DuplexActionRecordSet`s — one per
   response, or per listening period (model-native sessions sample the units

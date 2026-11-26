@@ -372,11 +372,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted
         model_runner_output._async_chunk = bool(getattr(self.model_config, "async_chunk", False))
-        if getattr(self, "_action_capture_step", None):
-            model_runner_output.action_capture_payloads = [
-                self._action_capture_step.get(req_id) for req_id in input_batch.req_ids
-            ]
-            self._action_capture_step = {}
+        # A request absent from this step's stash sampled nothing; one present that loses its bytes stays expected.
+        step = getattr(self, "_action_capture_step", None) or {}
+        self._action_capture_step = {}
+        if step:
+            model_runner_output.action_capture_payloads = [step.get(req_id) for req_id in input_batch.req_ids]
+        model_runner_output.action_capture_expected = [req_id in step for req_id in input_batch.req_ids]
 
         prepare_streaming = getattr(self.model_state, "prepare_streaming_audio_output", None)
         streaming_audio = (

@@ -2184,7 +2184,7 @@ def _build_model_config(
         kwargs["recompute_preemption"] = topology.recompute_preemption
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
-    stage_runner = resolve_stage_model_runner(deploy, stage_deploy)
+    stage_runner = resolve_stage_model_runner(deploy, stage_deploy, topology)
     validate_native_mrv2_session(deploy, topology, stage_runner)
     kwargs.setdefault("use_v2_model_runner", stage_runner == "v2")
     kwargs.setdefault(

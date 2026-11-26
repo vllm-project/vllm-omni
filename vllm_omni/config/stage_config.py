@@ -1333,10 +1333,27 @@ def _resolve_execution_mode(
     return _EXECUTION_TYPE_TO_STAGE_WORKER.get(execution_type, (StageType.LLM, None))
 
 
-def resolve_stage_model_runner(deploy: DeployConfig, stage: StageDeployConfig | None) -> str:
-    """The stage's own ``model_runner`` if set, else the deploy-level one."""
+def resolve_stage_model_runner(
+    deploy: DeployConfig,
+    stage: StageDeployConfig | None,
+    pipeline_stage: StagePipelineConfig | None = None,
+) -> str:
+    """The stage pin, else v2 for a platform-less duplex stage that supports it, else the deploy runner.
+
+    Stock deploys carry a ``platforms`` map that already selects v2 on CUDA and
+    NPU and leaves other platforms on v1. A generated deploy has no such map;
+    the dataclass default v1 never publishes duplex capture.
+    """
     runner = getattr(stage, "model_runner", None) if stage is not None else None
-    return runner or deploy.model_runner
+    if runner is not None:
+        return runner
+    if (
+        deploy.session_mode == "duplex"
+        and not deploy.platforms
+        and getattr(pipeline_stage, "supports_duplex_mrv2", False)
+    ):
+        return "v2"
+    return deploy.model_runner
 
 
 def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, stage_runner: str) -> None:
@@ -1449,7 +1466,7 @@ def _build_engine_args(
                     "it is derived from the deploy-level `model_runner` field and the "
                     "pipeline's `supports_native_mrv2_data_plane` declaration."
                 )
-    stage_runner = resolve_stage_model_runner(deploy, ds)
+    stage_runner = resolve_stage_model_runner(deploy, ds, ps)
     validate_native_mrv2_session(deploy, ps, stage_runner)
     engine_args["use_v2_model_runner"] = stage_runner == "v2"
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)

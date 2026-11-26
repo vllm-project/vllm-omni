@@ -266,6 +266,7 @@ _UNIT_PAYLOAD_KEYS = frozenset(
         "terminators",
         "sampling_params",
         "effective_seed",
+        "response_index",
         "streams",
         "model",
     }
@@ -288,6 +289,7 @@ def build_unit_payload(
     terminators: Sequence[Mapping[str, Any]] | None = None,
     sampling_params: Mapping[str, Any] | None = None,
     effective_seed: int | None = None,
+    response_index: int | None = None,
     model: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble one unit's capture payload (producer side).
@@ -324,7 +326,7 @@ def build_unit_payload(
         )
     if stream_names is not None and len(stream_names) != count:
         raise ActionPayloadError(f"stream_names length {len(stream_names)} != {count} tokens")
-    return {
+    payload = {
         "schema_version": ACTION_CAPTURE_WIRE_VERSION,
         "session_id": str(session_id),
         "stage_id": int(stage_id),
@@ -354,6 +356,9 @@ def build_unit_payload(
         "effective_seed": None if effective_seed is None else int(effective_seed),
         "model": dict(model or {}),
     }
+    if response_index is not None:
+        payload["response_index"] = int(response_index)
+    return payload
 
 
 def encode_unit_payload(payload: Mapping[str, Any]) -> bytes:
@@ -440,6 +445,9 @@ def decode_unit_payload(data: bytes | Mapping[str, Any]) -> dict[str, Any]:
         raise ActionPayloadError("action capture 'model' extension must be an object")
     if not isinstance(payload.get("sampling_params", {}), dict):
         raise ActionPayloadError("action capture 'sampling_params' must be an object")
+    response_index = payload.get("response_index")
+    if response_index is not None and (not isinstance(response_index, int) or isinstance(response_index, bool)):
+        raise ActionPayloadError("action capture field 'response_index' must be an integer or null")
     return payload
 
 

@@ -163,6 +163,9 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     # Serialized per-step capture payload; ``stage_payload`` is owned by the
     # run-request return path, so capture gets its own carrier.
     action_capture_payload: bytes | None = None
+    # True when this delivery's step sampled a unit. False means the producer
+    # sampled nothing, so a missing payload is not a transit loss.
+    action_capture_expected: bool = False
     # Duplex session stats (RFC #8325): [epoch, seq, start_ns, duration_ns] step
     # spans of measured duplex chunks, the producing step's chunk last.
     stage_work: list[list[int]] | None = None

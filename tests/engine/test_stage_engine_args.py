@@ -1026,3 +1026,19 @@ def test_skip_tokenizer_init_deploy_configs_do_not_pin_unrelated_hub_tokenizer_o
         engine_args = OmniEngineArgs(**filtered)
         assert engine_args.model == model_dir
         assert engine_args.tokenizer is None
+
+
+def test_platformless_duplex_stage_with_mrv2_support_selects_v2() -> None:
+    """A generated duplex deploy has no platform map; capture publishes only on v2."""
+    from vllm_omni.config.stage_config import resolve_stage_model_runner
+
+    stage = StagePipelineConfig(stage_id=0, model_stage="llm", supports_duplex_mrv2=True)
+    duplex = DeployConfig(session_mode="duplex")
+    turn = DeployConfig(session_mode="turn")
+    pinned = StageDeployConfig(stage_id=0, model_runner="v1")
+    stock = DeployConfig(session_mode="duplex", platforms={"rocm": {}})
+    assert resolve_stage_model_runner(duplex, None, stage) == "v2"
+    assert resolve_stage_model_runner(turn, None, stage) == "v1"
+    assert resolve_stage_model_runner(duplex, pinned, stage) == "v1"
+    assert resolve_stage_model_runner(stock, None, stage) == "v1"
+    assert resolve_stage_model_runner(duplex, None, None) == "v1"

@@ -120,6 +120,9 @@ class DuplexOutputContext:
     # ``None`` on deliveries from non-capture stages and on a closure whose
     # final step sampled no unit.
     segment_capture_payload: bytes | None = None
+    # Fail closed: only a producer that marks the delivery as not unit-bearing
+    # may omit the payload. Other constructors keep the fatal missing-payload path.
+    segment_unit_bearing: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "segment_token_ids", tuple(self.segment_token_ids))

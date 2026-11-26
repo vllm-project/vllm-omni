@@ -1728,6 +1728,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 reason_codes=["terminator_reemit"],
                 stream_names=["boundary"],
                 terminators=[{"token_id": int(token), "kind": self._minicpmo45_terminator_kind(token, token_ids)}],
+                response_index=self._minicpmo45_duplex_capture_response_index(row_idx),
             ),
         )
 
@@ -1768,6 +1769,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         seeds = getattr(self, "_minicpmo45_duplex_capture_seed_by_key", None) or {}
         return seeds.get(entry[0])
 
+    def _minicpmo45_duplex_capture_response_index(self, row_idx: int) -> int | None:
+        """The submit-time response index stamped on this row's capture envelope."""
+        capture = (getattr(self, "_minicpmo45_duplex_row_capture", None) or {}).get(row_idx) or {}
+        response_index = capture.get("response_index")
+        if isinstance(response_index, int) and not isinstance(response_index, bool):
+            return response_index
+        return None
+
     def _minicpmo45_duplex_capture_unit_index(self, row_idx: int) -> int:
         """The row's capture ``unit_index``: its session's unit counter.
 
@@ -1800,6 +1809,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             token,
             token_ids,
             unit_index=self._minicpmo45_duplex_capture_unit_index(row_idx),
+            response_index=self._minicpmo45_duplex_capture_response_index(row_idx),
             reason=reason,
             boundary_prob=boundary_prob,
             stage2_logprob=stage2_logprob,
@@ -1817,6 +1827,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         token_ids: dict[str, int],
         *,
         unit_index: int,
+        response_index: int | None,
         reason: str | None,
         boundary_prob: float | None,
         stage2_logprob: float | None,
@@ -1884,6 +1895,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     "top_p": float(top_p),
                 },
                 effective_seed=effective_seed,
+                response_index=response_index,
                 model={"minicpmo_duplex": model_extension},
             )
         )

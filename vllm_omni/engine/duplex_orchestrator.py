@@ -290,6 +290,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             segment_output_metadata=segment.output_metadata,
             perf_chunks=self._take_perf_chunks(req_state, stage_id),
             segment_capture_payload=segment.capture_payload,
+            segment_unit_bearing=segment.unit_bearing,
         )
         return runner.on_stage_output(
             stage_id,

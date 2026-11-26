@@ -80,6 +80,8 @@ def _enqueue_last_sentence_chunk(
     adapter = scheduler.chunk_transfer_adapter
     if adapter is None:
         return
+    if inter_stage_output is not None and not isinstance(inter_stage_output, dict):
+        raise TypeError(f"last-sentence chunk payload must be a dict, got {type(inter_stage_output).__name__}")
     save_kwargs: _ChunkSaveKwargs = {
         "new_token_ids": new_token_ids,
         "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
@@ -904,6 +906,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         pooler_outputs = model_runner_output.pooler_output
         mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
         capture_outputs = getattr(model_runner_output, "action_capture_payloads", None)
+        capture_expected_flags = getattr(model_runner_output, "action_capture_expected", None)
         inter_stage_outputs = getattr(model_runner_output, "inter_stage_outputs", None)
         # Token-only processors need sampled IDs even without a tensor payload.
         processor = getattr(getattr(self, "chunk_transfer_adapter", None), "custom_process_next_stage_input_func", None)
@@ -1245,6 +1248,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
             capture_output = capture_outputs[req_index] if capture_outputs else None
+            capture_expected = bool(capture_expected_flags[req_index]) if capture_expected_flags else False
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
             if sampling_validation_failed:
                 pooler_output = mm_output = inter_stage_output = None
@@ -1480,6 +1484,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     pooling_output=pooling_output_payload,
                     multimodal_output=mm_output,
                     action_capture_payload=capture_output,
+                    action_capture_expected=capture_expected,
                     stop_reason=request.stop_reason,
                     prefill_stats=prefill_stats,
                     kv_transfer_params=kv_transfer_params,

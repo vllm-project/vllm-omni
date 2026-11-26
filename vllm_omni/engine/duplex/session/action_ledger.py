@@ -14,13 +14,14 @@ from __future__ import annotations
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from vllm_omni.protocol.duplex.action_records import (
     ACTION_CAPTURE_RECORD_VERSION,
     ACTION_SAMPLED,
     INPUT_ORIGINS,
+    ORIGIN_ENGINE,
     STATUS_COMPLETED,
     STATUS_TRUNCATED_CANCEL,
     STATUS_TRUNCATED_CLOSE,
@@ -75,6 +76,9 @@ class _OpenScope:
     units: list[_UnitRow] = field(default_factory=list)
     streams: dict[tuple[str, int, str], DuplexActionStream] = field(default_factory=dict)
     effective_seed: int | None = None
+    # The submit-time response index the scope's draws used. ``None`` until a
+    # payload carries one. Stragglers match this, not the seed alone.
+    response_index: int | None = None
     model: dict[str, Any] = field(default_factory=dict)
     last_seq: int | None = None
     num_sampled: int = 0
@@ -98,6 +102,8 @@ class SessionActionLedger:
         # Scope keys already sealed once (ingest accounting that outlives
         # collection): a payload for one of these is invalid, never a gap.
         self._sealed_keys: set[str] = set()
+        # ``(last_seq, last_unit_index, response_index)`` of each sealed scope.
+        self._sealed_cursors: dict[str, tuple[int | None, int | None, int | None]] = {}
 
     # ---- scope keys ----
 
@@ -116,8 +122,12 @@ class SessionActionLedger:
         self._input_units.setdefault(epoch, {})[seq] = (str(modality), str(origin), commit_ns)
 
     def input_unit(self, epoch: int, seq: int) -> tuple[str, str, int | None]:
-        """The ``(modality, origin, commit_ns)`` annotation for one unit."""
-        return self._input_units.get(epoch, {}).get(seq, ("audio", "client", None))
+        """The annotation ``note_input_unit`` reserved for this seq.
+
+        A seq the model minted for a later unit of the same append was never
+        reserved: that unit consumed no new client chunk, so it is engine-origin.
+        """
+        return self._input_units.get(epoch, {}).get(seq, ("audio", ORIGIN_ENGINE, None))
 
     # ---- scope lifecycle ----
 
@@ -187,8 +197,16 @@ class SessionActionLedger:
             raise ActionLedgerError(f"capture payload epoch {record['epoch']} != delivery epoch {epoch}")
         if int(record["stage_id"]) != int(stage_id):
             raise ActionLedgerError(f"capture payload stage {record['stage_id']} != delivery stage {stage_id}")
+        absorbed = self._absorb_listening_straggler(
+            record, epoch=int(epoch), response_id=response_id, stage_id=int(stage_id)
+        )
+        if absorbed is not None:
+            return absorbed
         seq = int(record["seq"])
         scope = self._require_open(epoch=epoch, response_id=response_id, turn_id=turn_id)
+        payload_index = record.get("response_index")
+        if payload_index is not None and scope.response_index is None:
+            scope.response_index = int(payload_index)
         if scope.last_seq is not None and seq <= scope.last_seq:
             raise ActionLedgerError(
                 f"capture payload seq {seq} is not after {scope.last_seq} in scope {scope.response_id or 'listening'}"
@@ -244,6 +262,120 @@ class SessionActionLedger:
         )
         return len(scope.units) - 1
 
+    def _absorb_listening_straggler(
+        self,
+        record: Mapping[str, Any],
+        *,
+        epoch: int,
+        response_id: str | None,
+        stage_id: int,
+    ) -> int | None:
+        """Fold a payload drawn under a just-sealed listening scope back into that scope.
+
+        Per-unit generation leaves one unit in flight when the response bind
+        seals listening. Its seed is the listening scope's. ``None`` means this
+        payload is not that straggler. Only a sealed set still in the retention
+        window can be reached.
+        """
+        if response_id is None or self._open is None or self._open.is_listening:
+            return None
+        payload_index = record.get("response_index")
+        if self._open.response_id != response_id or record.get("effective_seed") is None or payload_index is None:
+            return None
+        seed = int(record["effective_seed"])
+        payload_index = int(payload_index)
+        # A payload already consistent with the open scope is not a straggler.
+        if self._open.response_index == payload_index:
+            return None
+        seq = int(record["seq"])
+        unit_index = int(record["unit_index"])
+        for key in reversed(self._sealed):
+            sealed = self._sealed[key]
+            last_seq, last_unit, scope_index = self._sealed_cursors.get(key, (None, None, None))
+            if (
+                sealed.response_id is not None
+                or sealed.epoch != epoch
+                or sealed.effective_seed != seed
+                or scope_index != payload_index
+            ):
+                continue
+            if last_seq is None or last_unit is None or seq <= last_seq or unit_index < last_unit:
+                raise ActionLedgerError(
+                    f"capture payload seq {seq} unit_index {unit_index} is not a monotone continuation "
+                    f"of sealed listening scope {key}"
+                )
+            self._sealed[key] = self._extend_sealed(
+                sealed, record, epoch=epoch, seq=seq, unit_index=unit_index, stage_id=stage_id, last_unit=last_unit
+            )
+            self._sealed_cursors[key] = (seq, unit_index, payload_index)
+            return self._sealed[key].num_units() - 1
+        return None
+
+    def _extend_sealed(
+        self,
+        sealed: DuplexActionRecordSet,
+        record: Mapping[str, Any],
+        *,
+        epoch: int,
+        seq: int,
+        unit_index: int,
+        stage_id: int,
+        last_unit: int,
+    ) -> DuplexActionRecordSet:
+        """Append one payload's columns onto a sealed set, folding a repeated unit index."""
+        count = len(record["token_ids"])
+        reasons = list(record.get("reason_codes") or ())[:count]
+        names = list(record.get("stream_names") or ())[:count]
+        reasons += [""] * (count - len(reasons))
+        names += [""] * (count - len(names))
+        token_ids = sealed.token_ids + tuple(int(value) for value in record["token_ids"])
+        logprobs = sealed.logprobs + tuple(record["logprobs"])
+        action_kinds = sealed.action_kinds + tuple(str(value) for value in record["action_kinds"])
+        reason_codes = sealed.reason_codes + tuple(reasons)
+        stream_names = sealed.stream_names + tuple(names)
+        terminators = tuple(dict(term) for term in record.get("terminators") or ())
+        streams = {(stream.name, stream.stage, stream.modality): stream for stream in sealed.streams}
+        for stream in record.get("streams") or ():
+            key = (str(stream["name"]), int(stream["stage"]), str(stream["modality"]))
+            streams.setdefault(key, DuplexActionStream(name=key[0], stage=key[1], modality=key[2]))
+        model = dict(sealed.model)
+        model.update(record.get("model") or {})
+        stream_values = tuple(streams.values())
+        if unit_index == last_unit:
+            offsets = sealed.unit_offsets[:-1] + (sealed.unit_offsets[-1] + count,)
+            unit_terminators = sealed.terminators[:-1] + (sealed.terminators[-1] + terminators,)
+            return replace(
+                sealed,
+                token_ids=token_ids,
+                logprobs=logprobs,
+                action_kinds=action_kinds,
+                reason_codes=reason_codes,
+                stream_names=stream_names,
+                unit_offsets=offsets,
+                terminators=unit_terminators,
+                streams=stream_values,
+                model=model,
+            )
+        modality, origin, commit_ns = self.input_unit(epoch, seq)
+        return replace(
+            sealed,
+            token_ids=token_ids,
+            logprobs=logprobs,
+            action_kinds=action_kinds,
+            reason_codes=reason_codes,
+            stream_names=stream_names,
+            unit_offsets=sealed.unit_offsets + (len(token_ids),),
+            stage_ids=sealed.stage_ids + (stage_id,),
+            input_modalities=sealed.input_modalities + (modality,),
+            input_origins=sealed.input_origins + (origin,),
+            input_commit_ns=sealed.input_commit_ns + (commit_ns,),
+            emission_ns=sealed.emission_ns + (self._clock(),),
+            sampling_params=sealed.sampling_params + (dict(record.get("sampling_params") or {}),),
+            terminators=sealed.terminators + (terminators,),
+            streams=stream_values,
+            model=model,
+        )
+
     # ---- sealing ----
 
     def seal_active_response(self, response_id: str | None, status: str = STATUS_COMPLETED) -> None:
@@ -279,6 +411,12 @@ class SessionActionLedger:
                 code=CODE_RETENTION_OVERFLOW,
             )
         self._sealed[key] = self._freeze(scope, status)
+        last = scope.units[-1] if scope.units else None
+        self._sealed_cursors[key] = (
+            scope.last_seq,
+            None if last is None else last.unit_index,
+            scope.response_index,
+        )
         self._sealed_keys.add(key)
 
     def _freeze(self, scope: _OpenScope, status: str) -> DuplexActionRecordSet:

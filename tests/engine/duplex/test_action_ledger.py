@@ -38,6 +38,7 @@ def _payload(
     streams: tuple[dict, ...] | None = ({"name": "content", "stage": 0, "modality": "audio"},),
     terminators: tuple[dict, ...] | None = None,
     seed: int | None = 42,
+    response_index: int | None = None,
     model: dict | None = None,
 ) -> bytes:
     return encode_unit_payload(
@@ -55,6 +56,7 @@ def _payload(
             terminators=list(terminators) if terminators is not None else None,
             sampling_params={"temperature": 0.7, "top_p": 0.8, "top_k": 20},
             effective_seed=seed,
+            response_index=response_index,
             model=model if model is not None else {"rep_penalty": 1.05},
         )
     )
@@ -323,6 +325,126 @@ def test_pop_oldest_sealed_spills_in_seal_order_until_the_window_has_room() -> N
     assert (next_.response_id, next_.num_units()) == ("r1", 1)
     # The window is empty again; there is nothing more to spill.
     assert ledger.pop_oldest_sealed() is None
+
+
+def test_in_flight_listening_unit_joins_the_sealed_scope() -> None:
+    """A unit sampled under the listening seed lands there after the response bind."""
+    listen_seed, response_seed = 11, 22
+    ledger = SessionActionLedger(session_id="s1")
+    ledger.bind_listening(epoch=0, turn_id=1)
+    ledger.note_input_unit(0, 1, modality="audio", origin="client", commit_ns=5)
+    ledger.ingest(
+        _payload(seq=1, unit_index=3, seed=listen_seed, response_index=0),
+        epoch=0,
+        turn_id=1,
+        response_id=None,
+        stage_id=0,
+        input_modality="",
+    )
+    ledger.bind_response("r1", epoch=0, turn_id=1)
+    # The step still in flight shares the listening unit's counter, then one more unit of that draw.
+    ledger.ingest(
+        _payload(seq=2, unit_index=3, seed=listen_seed, response_index=0, token_ids=(12,), logprobs=(-0.5,)),
+        epoch=0,
+        turn_id=1,
+        response_id="r1",
+        stage_id=0,
+        input_modality="",
+    )
+    ledger.ingest(
+        _payload(seq=3, unit_index=4, seed=listen_seed, response_index=0, token_ids=(13,), logprobs=(-0.4,)),
+        epoch=0,
+        turn_id=1,
+        response_id="r1",
+        stage_id=0,
+        input_modality="",
+    )
+    ledger.ingest(
+        _payload(seq=4, unit_index=5, seed=response_seed, response_index=1, token_ids=(14,), logprobs=(-0.1,)),
+        epoch=0,
+        turn_id=1,
+        response_id="r1",
+        stage_id=0,
+        input_modality="",
+    )
+    ledger.seal_for_close()
+    sets = ledger.take_terminal_sets()
+    listening = next(item for item in sets if item.response_id is None)
+    response = next(item for item in sets if item.response_id == "r1")
+    assert listening.num_units() == 2
+    assert listening.effective_seed == listen_seed
+    assert listening.token_ids == (11, 12, 13)
+    assert listening.unit_offsets == (0, 2, 3)
+    assert response.num_units() == 1
+    assert response.effective_seed == response_seed
+    assert response.token_ids == (14,)
+
+
+def test_non_monotone_listening_straggler_does_not_enter_the_response_scope() -> None:
+    ledger = SessionActionLedger(session_id="s1")
+    ledger.bind_listening(epoch=0, turn_id=1)
+    ledger.ingest(
+        _payload(seq=2, unit_index=3, seed=11, response_index=0),
+        epoch=0,
+        turn_id=1,
+        response_id=None,
+        stage_id=0,
+        input_modality="",
+    )
+    ledger.bind_response("r1", epoch=0, turn_id=1)
+    with pytest.raises(ActionLedgerError, match="not a monotone continuation"):
+        ledger.ingest(
+            _payload(seq=1, unit_index=3, seed=11, response_index=0, token_ids=(12,), logprobs=(-0.5,)),
+            epoch=0,
+            turn_id=1,
+            response_id="r1",
+            stage_id=0,
+            input_modality="",
+        )
+    assert ledger.open_scope_response_id == "r1"
+
+
+def test_response_seeded_payload_does_not_join_the_listening_scope() -> None:
+    ledger = SessionActionLedger(session_id="s1")
+    ledger.bind_listening(epoch=0, turn_id=1)
+    ledger.ingest(
+        _payload(seq=1, unit_index=1, seed=11),
+        epoch=0,
+        turn_id=1,
+        response_id=None,
+        stage_id=0,
+        input_modality="",
+    )
+    ledger.bind_response("r1", epoch=0, turn_id=1)
+    ledger.ingest(
+        _payload(seq=2, unit_index=2, seed=22, token_ids=(9,), logprobs=(-0.2,)),
+        epoch=0,
+        turn_id=1,
+        response_id="r1",
+        stage_id=0,
+        input_modality="",
+    )
+    ledger.seal_for_close()
+    sets = ledger.take_terminal_sets()
+    listening = next(item for item in sets if item.response_id is None)
+    response = next(item for item in sets if item.response_id == "r1")
+    assert listening.num_units() == 1
+    assert listening.token_ids == (11,)
+    assert response.token_ids == (9,)
+    assert response.effective_seed == 22
+
+
+def test_unreserved_capture_seq_is_engine_origin() -> None:
+    """A later unit of one append consumes no new client chunk."""
+    ledger = SessionActionLedger(session_id="s1")
+    ledger.bind_response("r1", epoch=0, turn_id=1)
+    ledger.note_input_unit(0, 1, modality="audio", origin="client", commit_ns=9)
+    _ingest_r1(ledger, _payload(seq=1, unit_index=1))
+    _ingest_r1(ledger, _payload(seq=2, unit_index=2, token_ids=(12,), logprobs=(-0.5,)))
+    ledger.seal_active_response("r1")
+    [set_] = ledger.take_terminal_sets()
+    assert set_.input_origins == ("client", "engine")
+    assert set_.input_commit_ns == (9, None)
 
 
 def test_take_terminal_sets_drains_everything() -> None:

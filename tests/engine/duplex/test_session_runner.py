@@ -218,6 +218,7 @@ class Harness:
         stage_work: Sequence[tuple[int, int, int, int, int]] = (),
         output_chunk: tuple[int, int] | None = None,
         capture_payload: bytes | None = None,
+        segment_unit_bearing: bool = True,
     ) -> bool:
         session = self.session
         fence = session.fence if epoch is None else session.fence.__class__(SESSION_ID, epoch=epoch)
@@ -229,6 +230,7 @@ class Harness:
             segment_output_metadata=dict(segment_output_metadata or {}),
             perf_chunks={(row[1], row[2]) for row in stage_work} | ({output_chunk} if output_chunk else set()),
             segment_capture_payload=capture_payload,
+            segment_unit_bearing=segment_unit_bearing,
         )
         request_id = getattr(output, "request_id", None)
         if not isinstance(request_id, str):

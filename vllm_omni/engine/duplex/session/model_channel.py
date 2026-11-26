@@ -846,10 +846,9 @@ class ModelChannel:
     async def _ingest_action_capture(self, item: StageOutput, expected_epoch: int) -> None:
         """Ingest one delivery's capture payload.
 
-        Payload presence is a property of the delivery kind: a closure
-        (``segment_finished``) samples no unit of its own and carries a payload
-        only when its final step did; a unit-bearing delivery without one lost
-        it in transit. An invalid payload closes the session either way.
+        A closure, or a delivery the producer marked as not unit-bearing, may
+        carry no payload. A unit-bearing delivery without one lost it in
+        transit. An invalid payload closes the session either way.
         """
         session = self._ctx.session
         actions = session.actions
@@ -859,12 +858,15 @@ class ModelChannel:
             return
         payload = item.context.segment_capture_payload
         if payload is None:
-            if item.context.segment_finished:
+            if item.context.segment_finished or not item.context.segment_unit_bearing:
                 logger.info(
-                    "duplex action capture closure without payload: session=%s stage=%s request=%s",
+                    "duplex action capture delivery without payload: session=%s stage=%s request=%s "
+                    "finished=%s unit_bearing=%s",
                     session.session_id,
                     item.stage_id,
                     item.request_id,
+                    item.context.segment_finished,
+                    item.context.segment_unit_bearing,
                 )
                 return
             await self._fail_action_capture(

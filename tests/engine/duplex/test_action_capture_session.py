@@ -381,6 +381,66 @@ async def test_unit_delivery_without_payload_is_fatal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_payload_less_non_unit_delivery_is_skipped_and_the_session_keeps_recording() -> None:
+    """A poll that sampled nothing is not a transit loss, and later units still record."""
+    h = await open_capture_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        parked = SimpleNamespace(
+            request_id=request_id,
+            finished=False,
+            outputs=[SimpleNamespace(text="", token_ids=[11], multimodal_output={})],
+            multimodal_output={},
+        )
+        events = await h.deliver_and_settle(
+            parked,
+            stage_id=0,
+            segment_finished=False,
+            capture_payload=None,
+            segment_unit_bearing=False,
+        )
+        assert "error" not in types(events)
+        assert h.session.state.name == "OPEN"
+        await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            capture_payload=_unit_payload(seq=1),
+        )
+        sets = await drain_after_close(h)
+        assert sets[0].num_units() == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_payload_less_unit_bearing_delivery_stays_fatal() -> None:
+    """The producer said this delivery sampled a unit; a missing payload is still fatal."""
+    h = await open_capture_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        events = await h.deliver_and_settle(
+            SimpleNamespace(
+                request_id=request_id,
+                finished=False,
+                outputs=[SimpleNamespace(text="", token_ids=[11], multimodal_output={})],
+                multimodal_output={},
+            ),
+            stage_id=0,
+            segment_finished=False,
+            capture_payload=None,
+            segment_unit_bearing=True,
+        )
+        assert "error" in types(events)
+        error = next(event for event in events if types([event]) == ["error"])
+        assert error.code == "action_capture_invalid"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_closure_without_payload_is_skipped_and_the_response_seals_completed() -> None:
     """A natural turn end samples no unit, so the closure legitimately carries no payload.
 

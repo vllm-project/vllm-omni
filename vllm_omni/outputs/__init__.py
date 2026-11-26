@@ -98,6 +98,9 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     request_errors: dict[str, str] | None = None
     # Per-request serialized capture payloads, indexed by req_index; ``None`` = off.
     action_capture_payloads: list[bytes | None] | None = None
+    # Parallel to ``req_ids``: True when this step sampled a unit for that request.
+    # A False entry with no payload sampled nothing; True with no payload is a transit loss.
+    action_capture_expected: list[bool] | None = None
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":

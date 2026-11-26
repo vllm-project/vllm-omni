@@ -791,6 +791,7 @@ async def test_non_finished_capture_delivery_keeps_its_payload_in_the_segment_sn
         new_token_ids=[11],
         is_segment_finished=False,
         action_capture_payload=payload,
+        action_capture_expected=True,
     )
     try:
         await orchestrator._process_llm_stage_outputs(0, 0, OmniEngineCoreOutputs(outputs=[output]), set())
@@ -808,6 +809,23 @@ async def test_non_finished_capture_delivery_keeps_its_payload_in_the_segment_sn
         context = on_stage_output.call_args.kwargs["context"]
         assert context.segment_finished is False
         assert context.segment_capture_payload == payload
+        assert segment.unit_bearing is True
+        assert context.segment_unit_bearing is True
+        parked = OmniEngineCoreOutput(
+            request_id=request_id,
+            new_token_ids=[],
+            is_segment_finished=False,
+            action_capture_expected=False,
+        )
+        await orchestrator._process_llm_stage_outputs(0, 0, OmniEngineCoreOutputs(outputs=[parked]), set())
+        assert request_state.streaming.segment(0).unit_bearing is False
+        assert (
+            await orchestrator._intercept_stage_output(
+                0, 0, _audio_request_output(request_id, samples=0, finished=False), request_state, None, None
+            )
+            is False
+        )
+        assert on_stage_output.call_args.kwargs["context"].segment_unit_bearing is False
     finally:
         await orchestrator.session_manager.shutdown()
 
