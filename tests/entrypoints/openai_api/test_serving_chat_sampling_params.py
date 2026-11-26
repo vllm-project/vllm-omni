@@ -415,6 +415,12 @@ def mock_request(mocker: MockerFixture):
     request.frequency_penalty = None
     request.presence_penalty = None
     request.n = None
+    # ChatCompletionRequest logprob defaults
+    request.logprobs = False
+    request.top_logprobs = 0
+    request.prompt_logprobs = None
+    request.logprob_token_ids = None
+    request.echo = False
     # Must be real Python objects (not MagicMock) so the code's explicit-field
     # and extra_body checks work correctly.
     request.model_fields_set = set()
@@ -635,6 +641,29 @@ def test_request_sampling_overrides_preserve_deploy_defaults(mock_engine_client,
     result.stop_token_ids.append(999)
     assert defaults["stop"] == original.stop == ["<|end|>"]
     assert defaults["stop_token_ids"] == original.stop_token_ids == [2, 32000]
+
+
+@pytest.mark.parametrize(
+    "request_kwargs, expected",
+    [
+        ({}, {"logprobs": None, "prompt_logprobs": None, "logprob_token_ids": None}),
+        ({"logprobs": True}, {"logprobs": 0}),
+        ({"logprobs": True, "top_logprobs": 3}, {"logprobs": 3}),
+        ({"logprobs": True, "logprob_token_ids": [5, 7]}, {"logprobs": None, "logprob_token_ids": [5, 7]}),
+        ({"prompt_logprobs": 2}, {"prompt_logprobs": 2, "logprobs": None}),
+        ({"echo": True, "logprobs": True, "top_logprobs": 2}, {"logprobs": 2, "prompt_logprobs": 2}),
+    ],
+)
+def test_request_logprobs_reach_comprehension_stage(mock_engine_client, request_kwargs, expected):
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], **request_kwargs)
+
+    comprehension, other = serving_chat._build_sampling_params_list_from_request(request)
+
+    for field, value in expected.items():
+        assert getattr(comprehension, field) == value
+    # Downstream stages keep their deploy defaults.
+    assert other.logprobs is None and other.prompt_logprobs is None
 
 
 def test_build_sampling_params_list_empty_stop_preserves_yaml(mock_engine_client, mock_request):
