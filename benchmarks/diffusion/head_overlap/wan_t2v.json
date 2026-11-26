@@ -1,0 +1,65 @@
+{
+  "engine": {
+    "dtype": "bfloat16",
+    "quantization_config": {
+      "transformer": {
+        "method": "fp8"
+      },
+      "transformer_2": {
+        "method": "fp8"
+      }
+    },
+    "diffusion_attention_config": {
+      "default": "FLASH_ATTN"
+    },
+    "enable_diffusion_pipeline_profiler": false,
+    "enforce_eager": true,
+    "log_stats": false,
+    "init_timeout": 900,
+    "stage_init_timeout": 900,
+    "ulysses_degree": 4,
+    "ulysses_a2a_permute": true,
+    "text_encoder_tp_size": 1,
+    "tensor_parallel_size": 1,
+    "vae_patch_parallel_size": 4,
+    "num_gpus": 4,
+    "devices": "0,1,2,3",
+    "distributed_executor_backend": "mp",
+    "max_num_seqs": 1
+  },
+  "prompt": {
+    "prompt": "Two anthropomorphic cats in boxing gear on a spotlighted stage.",
+    "negative_prompt": "low quality, blurry, watermark, text",
+    "modalities": [
+      "video"
+    ]
+  },
+  "cases": [
+    {
+      "id": "wan14b-480x832-f33-real-prefix",
+      "sampling": {
+        "height": 480,
+        "width": 832,
+        "num_frames": 33,
+        "num_inference_steps": 8,
+        "guidance_scale": 1.0,
+        "true_cfg_scale": 1.0,
+        "num_outputs_per_prompt": 1,
+        "fps": 16
+      }
+    },
+    {
+      "id": "wan14b-480x832-f65-real-prefix",
+      "sampling": {
+        "height": 480,
+        "width": 832,
+        "num_frames": 65,
+        "num_inference_steps": 8,
+        "guidance_scale": 1.0,
+        "true_cfg_scale": 1.0,
+        "num_outputs_per_prompt": 1,
+        "fps": 16
+      }
+    }
+  ]
+}

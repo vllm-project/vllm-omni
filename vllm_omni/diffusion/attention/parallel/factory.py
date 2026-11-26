@@ -56,7 +56,7 @@ def build_parallel_attention_strategy(
     ulysses_degree = getattr(p, "ulysses_degree", 1)
     ring_degree = getattr(p, "ring_degree", 1)
     allgather_degree = getattr(p, "allgather_degree", 1)
-    ulysses_overlap_chunks = int(getattr(p, "ulysses_overlap_chunks", 0) or 0)
+    ulysses_overlap_chunks = getattr(p, "ulysses_overlap_chunks", 0) or 0
     ulysses_a2a_backend = getattr(p, "ulysses_a2a_backend", AUTO)
     ulysses_a2a_permute = ulysses_a2a_backend == COPY_ENGINE
     if ulysses_a2a_permute:

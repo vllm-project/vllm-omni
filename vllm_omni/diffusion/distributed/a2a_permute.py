@@ -241,6 +241,9 @@ def clear_a2a_permute_workspaces() -> None:
     transport = sys.modules.get("vllm_omni.diffusion.distributed.ulysses_transport")
     if transport is not None:
         transport.clear_ulysses_transport_state()
+    adaptive_ce = sys.modules.get("vllm_omni.diffusion.attention.parallel.head_overlap.head_policy")
+    if adaptive_ce is not None:
+        adaptive_ce.clear()
     with _WORKSPACE_LOCK:
         if not _SYMM_WORKSPACES:
             return

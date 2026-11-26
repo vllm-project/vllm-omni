@@ -1372,6 +1372,24 @@ class Attention(nn.Module):
             if not isinstance(isolation, tuple) or len(isolation) != 2:
                 raise TypeError("reference isolation metadata must be a (state, compact) tuple")
             isolated_dense = self._reference_isolation_dense_impl()
+        policy = getattr(strategy, "head_policy", None)
+        if (
+            policy is not None
+            and policy.enabled_for_call
+            and not torch.compiler.is_compiling()
+            and not use_paged_attention
+            and isolation is None
+            and not self.use_ring
+            and not self._explicit_cross_contract
+            and not strategy._use_sync
+            and strategy._scatter_idx == 2
+            and strategy._gather_idx == 1
+            and get_ulysses_mode(default="strict") == "strict"
+        ):
+            result = policy.try_run(strategy, self, query, key, value, attn_metadata)
+            if result is not None:
+                return result
+
         chunks = self._ulysses_ce_overlap_chunks(strategy, query, key, value, attn_metadata, use_paged_attention)
         if chunks:
             output = self._ulysses_ce_overlap_or_none(strategy, query, key, value, attn_metadata, chunks)

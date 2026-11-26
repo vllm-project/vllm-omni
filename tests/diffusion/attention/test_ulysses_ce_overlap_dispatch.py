@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -199,3 +200,49 @@ def test_failed_verification_leaves_no_verdict(monkeypatch, fail):
     with pytest.raises(RuntimeError):
         call()
     assert verdicts == {}
+
+
+def test_auto_capture_uses_current_component_layout(monkeypatch):
+    from contextlib import nullcontext
+
+    from vllm_omni.diffusion.attention.parallel.head_overlap.head_policy import HeadPolicy, Trial, frozen_graph_policy
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    policy = HeadPolicy(None, 120)
+    for length, split in ((512, False), (4096, True)):
+        policy.begin_component(None, (), {"length": length})
+        policy.component_layouts[policy.component_key] = (length,)
+        policy.layouts[length] = Trial((1, 7), 0, selected=split)
+    with frozen_graph_policy(nullcontext):
+        for length, expected in ((4096, True), (512, False), (1024, False), (4096, True)):
+            policy.begin_component(None, (), {"length": length})
+            assert policy.enabled_for_call is expected
+            assert policy.discovery is None
+
+
+def test_auto_graph_resolves_real_samples_once_before_capture(monkeypatch):
+    from vllm_omni.diffusion.attention.parallel.head_overlap.graph import AdaptiveDenoiseGraph
+    from vllm_omni.diffusion.cuda_graph import GraphedForward
+
+    policy = SimpleNamespace(component_key="layout", generation=0)
+    policy.resolve_pending = Mock(side_effect=lambda key: setattr(policy, "generation", 1))
+
+    class Pipeline:
+        transformer = SimpleNamespace(_ulysses_head_policy=policy)
+
+        def step(self, x):
+            return x + 1
+
+    pipeline = Pipeline()
+    module = Mock(side_effect=pipeline.step)
+    module._fn = pipeline.step
+    runner = AdaptiveDenoiseGraph(module, device="cuda")
+    replay = Mock(return_value=3)
+    monkeypatch.setattr(layer.current_omni_platform, "is_graph_capturing", lambda: False)
+    monkeypatch.setattr(GraphedForward, "__call__", replay)
+    assert [runner(x=2) for _ in range(2)] == [3, 3]
+    policy.resolve_pending.assert_not_called()
+    assert [runner(x=2) for _ in range(3)] == [3, 3, 3]
+    assert module.call_count == runner.eager_calls == 2
+    policy.resolve_pending.assert_called_once_with("layout")
+    assert all(call.kwargs["variant"] == (None, 1) for call in replay.call_args_list)

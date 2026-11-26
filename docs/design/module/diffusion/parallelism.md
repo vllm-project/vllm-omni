@@ -51,6 +51,15 @@ logical order.
 **Rule:** Distributed implementations SHOULD preserve a supported single-rank
 path without distributed initialization.
 
+### Adaptive head overlap
+
+The strict Ulysses `auto` setting shares one policy across a DiT component. Each worker learns from the
+component's real attention calls. New layouts and head partitions must agree across SP ranks before
+allocating symmetric buffers. The communication stream moves subsequent head groups and returns completed
+remote rows while the compute stream runs attention. Keep K/V in canonical sequence order when permuting
+query rows. Join peer writes before returning a caller-owned result. Read trial events only after they
+complete and agree at a component boundary. Graph preparation consumes frozen decisions.
+
 ## Safe-change guide
 
 Test topology validation, single-rank execution, affected parallel modes,

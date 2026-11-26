@@ -1,0 +1,57 @@
+{
+  "engine": {
+    "dtype": "bfloat16",
+    "quantization_config": {
+      "transformer": {
+        "method": "fp8"
+      },
+      "transformer_2": {
+        "method": "fp8"
+      }
+    },
+    "diffusion_attention_config": {
+      "default": "FLASH_ATTN"
+    },
+    "enable_diffusion_pipeline_profiler": false,
+    "enforce_eager": true,
+    "log_stats": false,
+    "init_timeout": 900,
+    "stage_init_timeout": 900,
+    "ulysses_degree": 4,
+    "ulysses_a2a_permute": true,
+    "text_encoder_tp_size": 1,
+    "tensor_parallel_size": 1,
+    "vae_patch_parallel_size": 4,
+    "num_gpus": 4,
+    "devices": "0,1,2,3",
+    "distributed_executor_backend": "mp",
+    "max_num_seqs": 1,
+    "vae_use_slicing": true
+  },
+  "prompt": {
+    "prompt": "Two cats in boxing gear on a spotlighted stage.",
+    "modalities": [
+      "video"
+    ]
+  },
+  "cases": [
+    {
+      "id": "wan22-i2v-ci-832x480_frames81_steps4",
+      "sampling": {
+        "width": 832,
+        "height": 480,
+        "num_inference_steps": 4,
+        "num_frames": 81,
+        "fps": 16,
+        "return_frames": true,
+        "output_type": "np"
+      },
+      "prompt": {
+        "negative_prompt": "Negative prompt for benchmarking diffusion models"
+      },
+      "media": {
+        "image": "tests/assets/qwen_image_edit/qwen_image_edit_2511_test1.png"
+      }
+    }
+  ]
+}

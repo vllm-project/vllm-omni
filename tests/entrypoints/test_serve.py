@@ -798,17 +798,18 @@ def test_serve_parser_rejects_removed_ulysses_a2a_permute(flag: str) -> None:
         parser.parse_args(["serve", "fake-model", "--omni", flag])
 
 
-def test_serve_parser_accepts_ulysses_overlap_chunks() -> None:
+@pytest.mark.parametrize("chunks", [4, "auto"])
+def test_serve_parser_accepts_ulysses_overlap_chunks(chunks) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
 
     args = parser.parse_args(
-        ["serve", "fake-model", "--omni", "--ulysses-a2a-backend", "copy_engine", "--ulysses-overlap-chunks", "4"]
+        ["serve", "fake-model", "--omni", "--ulysses-a2a-backend", "copy_engine", "--ulysses-overlap-chunks", str(chunks)]
     )
 
-    assert args.ulysses_overlap_chunks == 4
-    assert args.get_explicit_kwargs_dict()["ulysses_overlap_chunks"] == 4
+    assert args.ulysses_overlap_chunks == chunks
+    assert args.get_explicit_kwargs_dict()["ulysses_overlap_chunks"] == chunks
 
 
 def test_serve_parser_accepts_server_level_mixfusion_flags() -> None:

@@ -17,7 +17,7 @@ from dataclasses import InitVar, dataclass, field, fields
 from functools import wraps
 from inspect import Parameter, signature
 from pathlib import Path
-from typing import Any, Literal, TypeAlias, TypedDict, cast
+from typing import Annotated, Any, Literal, TypeAlias, TypedDict, cast
 
 import regex as re
 from pydantic import ConfigDict, Field, field_validator, model_validator
@@ -302,7 +302,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     ring_degree: int
     allgather_degree: int
     ulysses_mode: str
-    ulysses_overlap_chunks: int
+    ulysses_overlap_chunks: int | Literal["auto"]
     ulysses_a2a_backend: str
     cfg_parallel_size: int
     vae_patch_parallel_size: int
@@ -906,7 +906,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ring_degree: int = Field(default=1, ge=1)
     allgather_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
-    ulysses_overlap_chunks: int = Field(default=0, ge=0)
+    ulysses_overlap_chunks: Annotated[int, Field(ge=0)] | Literal["auto"] = 0
     ulysses_a2a_backend: str = "auto"
     cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)

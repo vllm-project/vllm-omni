@@ -835,12 +835,13 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--ulysses-overlap-chunks",
-            type=int,
+            type=lambda value: value if value == "auto" else int(value),
+            metavar="N|auto",
             default=None,
             help=(
-                "On the copy-engine transport, split each rank's attention heads into this many chunks and move them "
-                "on copy engines while earlier chunks compute (must divide num_heads / ulysses_degree; 0 disables; "
-                "ignored when auto resolves to nccl). Requires strict pure Ulysses. Defaults to disabled."
+                "On the copy-engine transport, a positive chunk count must divide num_heads / ulysses_degree. "
+                "Use auto to select an uneven head split from real layer timings on supported GPUs. "
+                "Requires strict pure Ulysses. Ignored when the transport resolves to NCCL. 0 disables overlap."
             ),
         )
         omni_config_group.add_argument(

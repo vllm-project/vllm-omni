@@ -254,6 +254,15 @@ vllm serve Qwen/Qwen-Image --omni --ulysses-degree 2 --ulysses-a2a-backend copy_
 On NPU, the flag retains the existing
 [NPU symmetric-memory requirements](../../../design/feature/sequence_parallel.md#npu-symmetric-memory-ulysses).
 
+### Adaptive Ulysses head overlap
+
+On a single SM90 node using dense, noncausal BF16 FA3, enable runtime selection with
+`--ulysses-degree 4 --ulysses-a2a-backend copy_engine --ulysses-overlap-chunks auto`.
+This also works with `Omni(..., ulysses_overlap_chunks="auto")`. The first real forwards for a layout
+prepare and time an uneven split against native packed-QKV CE. The worker logs the selected heads per rank
+and keeps one group when the split does not clear the timing margin. Unsupported attention stays native.
+The initial request includes exploration. Measure it separately from steady-state latency.
+
 ## Best Practices
 
 ### When to Use

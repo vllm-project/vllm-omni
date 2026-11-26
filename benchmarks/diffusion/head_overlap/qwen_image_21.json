@@ -1,0 +1,111 @@
+{
+  "engine": {
+    "dtype": "bfloat16",
+    "quantization_config": {
+      "transformer": {
+        "method": "fp8"
+      }
+    },
+    "diffusion_attention_config": {
+      "default": "FLASH_ATTN"
+    },
+    "enable_diffusion_pipeline_profiler": false,
+    "enforce_eager": true,
+    "log_stats": false,
+    "init_timeout": 900,
+    "stage_init_timeout": 900,
+    "ulysses_degree": 4,
+    "ulysses_a2a_permute": true,
+    "text_encoder_tp_size": 1,
+    "tensor_parallel_size": 1,
+    "vae_patch_parallel_size": 4,
+    "num_gpus": 4,
+    "devices": "0,1,2,3",
+    "distributed_executor_backend": "mp",
+    "max_num_seqs": 1,
+    "vae_use_tiling": true
+  },
+  "prompt": {
+    "prompt": "A red bicycle leaning against a white wall.",
+    "modalities": [
+      "image"
+    ]
+  },
+  "cases": [
+    {
+      "id": "qwen21-turbo-1024x1024-steps8-ref1",
+      "sampling": {
+        "width": 1024,
+        "height": 1024,
+        "num_inference_steps": 8,
+        "true_cfg_scale": 1.0
+      },
+      "media": {
+        "image": "tests/assets/qwen_image_edit/qwen_image_edit_2511_test1.png"
+      }
+    },
+    {
+      "id": "qwen21-turbo-1024x1024-steps8-ref2",
+      "sampling": {
+        "width": 1024,
+        "height": 1024,
+        "num_inference_steps": 8,
+        "true_cfg_scale": 1.0
+      },
+      "media": {
+        "image": [
+          "tests/assets/qwen_image_edit/qwen_image_edit_2511_test1.png",
+          "tests/assets/qwen_image_edit/qwen_image_edit_2511_test2.png"
+        ]
+      }
+    },
+    {
+      "id": "qwen21-turbo-1536x1536-steps8-ref0",
+      "sampling": {
+        "width": 1536,
+        "height": 1536,
+        "num_inference_steps": 8,
+        "true_cfg_scale": 1.0
+      }
+    },
+    {
+      "id": "qwen21-turbo-1536x1536-steps8-ref1",
+      "sampling": {
+        "width": 1536,
+        "height": 1536,
+        "num_inference_steps": 8,
+        "true_cfg_scale": 1.0
+      },
+      "media": {
+        "image": "tests/assets/qwen_image_edit/qwen_image_edit_2511_test1.png"
+      }
+    },
+    {
+      "id": "qwen21-turbo-1536x1536-steps8-ref2",
+      "sampling": {
+        "width": 1536,
+        "height": 1536,
+        "num_inference_steps": 8,
+        "true_cfg_scale": 1.0
+      },
+      "media": {
+        "image": [
+          "tests/assets/qwen_image_edit/qwen_image_edit_2511_test1.png",
+          "tests/assets/qwen_image_edit/qwen_image_edit_2511_test2.png"
+        ]
+      }
+    },
+    {
+      "id": "qwen21-turbo-2048x2048-steps8-ref1",
+      "sampling": {
+        "width": 2048,
+        "height": 2048,
+        "num_inference_steps": 8,
+        "true_cfg_scale": 1.0
+      },
+      "media": {
+        "image": "tests/assets/qwen_image_edit/qwen_image_edit_2511_test1.png"
+      }
+    }
+  ]
+}
