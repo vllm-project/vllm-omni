@@ -383,7 +383,7 @@ def load_minimax_h3_turbo_lora(
             # generation on the Ref2VA base DiT; every other FL2VA/T2VA
             # artifact stays FL2VA-partition-only.
             if spec.filename != _TURBO_V1_2_8STEP_FILENAME:
-                raise ValueError(f"{spec.filename} is an FL2VA/T2VA Turbo artifact; a Ref2VA-only server cannot serve it.")
+                raise ValueError(f"{spec.filename} is an FL2VA/T2VA Turbo LoRA; a Ref2VA-only server cannot serve it.")
             spec = replace(spec, ref2va_base=True)
         # ``combined`` serves ref2va from ``transformers_ref``, but the LoRA
         # target pattern only injects into ``transformer``: the adapter would
