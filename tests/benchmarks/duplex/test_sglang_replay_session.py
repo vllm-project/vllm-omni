@@ -6,12 +6,16 @@
 from __future__ import annotations
 
 import asyncio
+import wave
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pybase64 as base64
 import pytest
 
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_runner as runner
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DuplexSample
 from vllm_omni.benchmarks.duplex.sglang_replay_session import (
     SGLangReplaySession,
     build_sglang_realtime_url,
@@ -93,8 +97,25 @@ class _FakeRealtimeClient:
                 }
             )
         elif event_type == "sglang.input_audio.end":
+            audio_ms = sum(
+                len(base64.b64decode(append["audio"])) / 32
+                for append in self.sent
+                if append["type"] == "input_audio_buffer.append"
+            )
+            drained = {
+                "type": "sglang.input_audio.drained",
+                "client_event_id": event_id,
+                "accepted_end_ms": audio_ms,
+                "consumed_ms": audio_ms if self.finish_mode != "partial_input" else audio_ms - 1,
+                "discarded_ms": 0,
+                "padding_ms": 0,
+                "tail_units": 3,
+                "tail_status": "limit" if self.finish_mode == "limit" else "complete",
+            }
+            if self.finish_mode == "legacy":
+                drained.pop("tail_status")
             if self.finish_mode == "no_response":
-                self._add({"type": "sglang.input_audio.drained", "client_event_id": event_id})
+                self._add(drained)
                 return
             response_id = "response-1"
             audio = base64.b64encode(bytes(3200)).decode("ascii")
@@ -147,15 +168,36 @@ class _FakeRealtimeClient:
                     "ttfp_ms": 34.5,
                 },
             }
-            if self.finish_mode == "normal":
+            if self.finish_mode in {"barge_in", "token_limit"}:
+                status, reason = (
+                    ("cancelled", "user_interruption")
+                    if self.finish_mode == "barge_in"
+                    else ("incomplete", "max_output_tokens")
+                )
+                done["response"] = {"id": response_id, "status": status, "status_details": {"reason": reason}}
+            self._add({"type": "response.output_audio.done", "response_id": response_id})
+            if self.finish_mode == "fatal":
+                self._add({"type": "error", "sglang": {"fatal": True}, "error": {"message": "native pump failed"}})
+            elif self.finish_mode == "no_ack":
+                pass
+            elif self.finish_mode in {
+                "normal",
+                "limit",
+                "legacy",
+                "partial_input",
+                "bad_close",
+                "barge_in",
+                "token_limit",
+            }:
                 self._add(done)
-                self._add({"type": "sglang.input_audio.drained", "client_event_id": event_id})
+                self._add(drained)
             else:
-                self._add({"type": "sglang.input_audio.drained", "client_event_id": event_id})
+                self._add(drained)
                 if self.finish_mode == "drained_before_done":
                     asyncio.get_running_loop().call_later(0.01, lambda: self._add(done))
         elif event_type == "session.close":
-            self._add({"type": "session.closed", "client_event_id": event_id})
+            reason = "idle_timeout" if self.finish_mode == "bad_close" else "client_closed"
+            self._add({"type": "session.closed", "client_event_id": event_id, "reason": reason})
 
     def advance_media_clock(self, media_clock_ms: int) -> None:
         self.media_clock_ms.append(media_clock_ms)
@@ -329,8 +371,19 @@ async def test_sglang_command_wait_ignores_uncorrelated_error():
 
 
 @pytest.mark.asyncio
-async def test_sglang_finish_waits_for_response_done_after_drained():
-    client = _FakeRealtimeClient(finish_mode="drained_before_done")
+@pytest.mark.parametrize(
+    ("mode", "committed", "error"),
+    [
+        ("drained_before_done", True, "before the response terminal"),
+        ("drained_without_done", True, "before the response terminal"),
+        ("legacy", True, "did not finish the native tail"),
+        ("limit", True, "did not finish the native tail"),
+        ("partial_input", False, "did not consume the entire"),
+        ("fatal", False, "native pump failed"),
+    ],
+)
+async def test_sglang_drain_failure_preserves_received_audio(mode, committed, error):
+    client = _FakeRealtimeClient(finish_mode=mode)
     session = SGLangReplaySession(client)
     await session.configure(
         "served-model",
@@ -342,14 +395,15 @@ async def test_sglang_finish_waits_for_response_done_after_drained():
 
     drain = await session.finish_input(timeout_s=1.0)
 
-    assert drain.input_committed and drain.response_done
+    assert drain.input_committed is committed and not drain.response_done
     assert drain.drain_timeout is None
-    assert client.events.count("response.done") == 1
+    assert error in drain.drain_error
+    assert len(client.events.audio_bytes()) == 6400
 
 
 @pytest.mark.asyncio
-async def test_sglang_finish_reports_unfinished_response_after_drained():
-    client = _FakeRealtimeClient(finish_mode="drained_without_done")
+async def test_sglang_finish_has_a_deadline_without_a_drain_barrier():
+    client = _FakeRealtimeClient(finish_mode="no_ack")
     session = SGLangReplaySession(client)
     await session.configure(
         "served-model",
@@ -361,16 +415,15 @@ async def test_sglang_finish_reports_unfinished_response_after_drained():
 
     drain = await session.finish_input(timeout_s=0.05)
 
-    assert drain.input_committed and not drain.response_done
+    assert not drain.input_committed and not drain.response_done
     assert drain.drain_timeout is not None
     assert drain.drain_timeout_state == {
-        "response_ids": ["response-1"],
         "unfinished_response_ids": ["response-1"],
     }
 
 
 @pytest.mark.asyncio
-async def test_sglang_finish_times_out_when_no_response_was_created():
+async def test_sglang_finish_accepts_a_verified_listen_only_session():
     client = _FakeRealtimeClient(finish_mode="no_response")
     session = SGLangReplaySession(client)
     await session.configure(
@@ -383,6 +436,55 @@ async def test_sglang_finish_times_out_when_no_response_was_created():
 
     drain = await session.finish_input(timeout_s=0.05)
 
-    assert drain.input_committed and not drain.response_done
-    assert drain.drain_timeout is not None
-    assert drain.drain_timeout_state == {"response_ids": [], "unfinished_response_ids": []}
+    assert drain.input_committed and drain.response_done
+    assert drain.drain_error is None and drain.drain_timeout is None
+    assert client.events.audio_bytes() == b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["normal", "barge_in", "token_limit", "fatal", "bad_close"])
+async def test_fdb_replay_keeps_wav_on_success_and_protocol_failure(tmp_path: Path, mode: str):
+    client = _FakeRealtimeClient(finish_mode=mode)
+
+    @asynccontextmanager
+    async def session_factory(*args):
+        yield SGLangReplaySession(client)
+
+    sample = DuplexSample(
+        id="1--input",
+        split="v1.0_synthetic_pause_handling",
+        family="fdb",
+        task_type=None,
+        video=None,
+        question_audio="unused",
+        video_duration=0.01,
+    )
+    result = await runner.generate_sample(
+        sample,
+        url="ws://unused/v1/realtime",
+        model="mock",
+        ref_audio=None,
+        output_root=tmp_path,
+        pace="as-fast-as-possible",
+        prepared=runner.PreparedSample(bytes(320), (), 0.01, None, None),
+        defer_artifacts=True,
+        session_factory=session_factory,
+    )
+    if mode in {"normal", "barge_in"}:
+        assert not result.error and result.metadata["drain_ack"]["tail_status"] == "complete"
+        runner.write_sample_result(result)
+        artifact = result.output
+    else:
+        assert {"fatal": "native pump failed", "bad_close": "idle_timeout", "token_limit": "max_output_tokens"}[
+            mode
+        ] in result.error
+        artifact = runner.write_failed_sample_diagnostics(result)
+        assert not result.output.exists()
+    with wave.open(str(artifact.with_suffix(".wav"))) as saved:
+        assert saved.getframerate() == 16000
+        assert saved.readframes(saved.getnframes()) == bytes(6400)
+    if mode in {"barge_in", "token_limit"}:
+        expected = ("cancelled", "user_interruption") if mode == "barge_in" else ("incomplete", "max_output_tokens")
+        assert [(terminal["status"], terminal["reason"]) for terminal in result.metadata["response_terminals"]] == [
+            expected
+        ]

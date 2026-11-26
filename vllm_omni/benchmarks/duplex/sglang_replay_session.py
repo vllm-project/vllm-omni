@@ -15,6 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import pybase64 as base64
+from websockets.exceptions import ConnectionClosed
 
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_media import iter_timed_av_units
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
@@ -145,12 +146,14 @@ class SGLangReplaySession:
 
     frame_transport = FRAME_TRANSPORT_SGLANG_IMAGE
     supports_session_stats = False
+    requires_close_ack = True
 
     def __init__(self, client: _RealtimeClient) -> None:
         self._client = client
         self.events: RealtimeEventCollector = client.events
         self._native_unit_ms = 0
         self._input_modalities: set[str] = set()
+        self._input_samples = 0
         self.session_configuration: dict[str, object] = {}
 
     async def _send_and_wait(
@@ -163,16 +166,26 @@ class SGLangReplaySession:
         event_id = event.get("event_id")
         if not isinstance(event_id, str):
             raise ValueError("correlated SGLang commands require event_id")
-        from_index = len(self.events.events)
+        next_index = len(self.events.events)
+        matched: dict[str, object] | None = None
         deadline = time.monotonic() + timeout_s
         await asyncio.wait_for(self._client.send(event), timeout=timeout_s)
 
         def arrived() -> bool:
-            for received in self.events.events[from_index:]:
-                if received.get("type") == "error" and event_id in _related_event_ids(received):
+            nonlocal next_index, matched
+            for received in self.events.events[next_index:]:
+                event_type = received.get("type")
+                correlated = event_id in _related_event_ids(received)
+                extension = received.get("sglang")
+                fatal = isinstance(extension, Mapping) and extension.get("fatal") is True
+                if event_type == "error" and (correlated or fatal):
+                    raise ConnectionError(_error_message(received))
+                if event_type == response_type and correlated:
+                    matched = received
                     return True
-                if received.get("type") == response_type and event_id in _related_event_ids(received):
-                    return True
+                if event_type == "session.closed":
+                    raise ConnectionError(f"SGLang session closed: {received.get('reason')}")
+            next_index = len(self.events.events)
             self._client.raise_if_reader_stopped()
             return False
 
@@ -180,12 +193,8 @@ class SGLangReplaySession:
         if remaining_s <= 0:
             raise TimeoutError(f"Timed out waiting for {response_type}")
         await wait_for(arrived, timeout_s=remaining_s, label=response_type)
-        for received in self.events.events[from_index:]:
-            if received.get("type") == "error" and event_id in _related_event_ids(received):
-                raise ConnectionError(_error_message(received))
-            if received.get("type") == response_type and event_id in _related_event_ids(received):
-                return received
-        raise RuntimeError(f"SGLang {response_type} waiter completed without an event")
+        assert matched is not None
+        return matched
 
     async def configure(
         self,
@@ -315,51 +324,69 @@ class SGLangReplaySession:
                     "sglang": {"seq": sequence, "t_start_ms": start_ms},
                 }
             )
+            self._input_samples += len(chunk) // PCM16_BYTES_PER_SAMPLE
             if realtime:
                 await asyncio.sleep(max(0.0, started_at + audio_end_ms / 1000 - time.monotonic()))
 
     async def finish_input(self, *, timeout_s: float) -> ReplayDrainResult:
-        deadline = time.monotonic() + timeout_s
-
-        def timeout_result(message: str) -> ReplayDrainResult:
-            return ReplayDrainResult(
-                input_committed=True,
-                drain_timeout=message,
-                drain_timeout_state={
-                    "response_ids": list(self.events.response_ids),
-                    "unfinished_response_ids": [
-                        response_id
-                        for response_id in self.events.response_ids
-                        if not self.events.response_is_done(response_id)
-                    ],
-                },
-            )
-
+        result = ReplayDrainResult()
         try:
-            await self._send_and_wait(
+            ack = await self._send_and_wait(
                 {"type": "sglang.input_audio.end", "event_id": f"evt_{uuid4().hex}"},
                 response_type="sglang.input_audio.drained",
                 timeout_s=timeout_s,
             )
         except TimeoutError as exc:
-            result = timeout_result(str(exc) or "SGLang input drain timed out")
-            result.input_committed = False
+            result.drain_timeout = str(exc) or "SGLang input drain timed out"
+        except (ConnectionClosed, OSError) as exc:
+            result.drain_error = str(exc) or type(exc).__name__
+        if result.drain_error or result.drain_timeout:
+            result.drain_timeout_state = {
+                "unfinished_response_ids": [
+                    response_id
+                    for response_id in self.events.response_ids
+                    if not self.events.response_is_done(response_id)
+                ],
+            }
             return result
 
-        def responses_finished() -> bool:
-            self._client.raise_if_reader_stopped()
-            response_ids = self.events.response_ids
-            return bool(response_ids) and all(self.events.response_is_done(response_id) for response_id in response_ids)
+        result.drain_ack = {
+            key: ack.get(key)
+            for key in ("accepted_end_ms", "consumed_ms", "discarded_ms", "padding_ms", "tail_status", "tail_units")
+        }
+        input_ms = self._input_samples * 1000 / PCM16_SAMPLE_RATE
+        result.input_committed = (
+            ack.get("accepted_end_ms") == input_ms
+            and ack.get("consumed_ms") == input_ms
+            and ack.get("discarded_ms") == 0
+        )
+        if not result.input_committed:
+            result.drain_error = f"SGLang did not consume the entire {input_ms:g} ms input"
+            return result
+        tail_units = ack.get("tail_units")
+        if ack.get("tail_status") != "complete" or type(tail_units) is not int or tail_units < 0:
+            result.drain_error = f"SGLang did not finish the native tail: {result.drain_ack}"
+            return result
 
-        if not responses_finished():
-            remaining_s = deadline - time.monotonic()
-            if remaining_s <= 0:
-                return timeout_result("Timed out waiting for response.done after SGLang input drain")
-            try:
-                await wait_for(responses_finished, timeout_s=remaining_s, label="response.done")
-            except TimeoutError as exc:
-                return timeout_result(str(exc) or "Timed out waiting for response.done after SGLang input drain")
-        return ReplayDrainResult(response_done=True, input_committed=True)
+        terminals: dict[str, set[str]] = {}
+        for event in self.events.events:
+            if event is ack:
+                break
+            response_id = self.events.response_id(event)
+            event_type = event.get("type")
+            if response_id is not None and isinstance(event_type, str):
+                terminals.setdefault(response_id, set()).add(event_type)
+        unfinished = sorted(
+            response_id
+            for response_id, types in terminals.items()
+            if "response.done" not in types
+            or ("response.output_audio.delta" in types and "response.output_audio.done" not in types)
+        )
+        if unfinished:
+            result.drain_error = f"SGLang drained before the response terminal events: {unfinished}"
+        else:
+            result.response_done = True
+        return result
 
     async def acknowledge_playback(self) -> None:
         # SGLang's native protocol does not require playback acknowledgements.
@@ -370,13 +397,16 @@ class SGLangReplaySession:
         raise NotImplementedError("SGLang does not expose vLLM session.stats")
 
     async def close(self, *, timeout_s: float) -> None:
-        if self.events.count("session.closed"):
-            return
-        await self._send_and_wait(
+        for event in self.events.events:
+            if event.get("type") == "session.closed":
+                raise ConnectionError(f"SGLang session closed before the close request: {event.get('reason')}")
+        closed = await self._send_and_wait(
             {"type": "session.close", "event_id": f"evt_{uuid4().hex}"},
             response_type="session.closed",
             timeout_s=timeout_s,
         )
+        if closed.get("reason") != "client_closed":
+            raise ConnectionError(f"SGLang session did not close normally: {closed.get('reason')}")
 
 
 @asynccontextmanager

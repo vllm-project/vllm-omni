@@ -445,7 +445,14 @@ The default is two sessions and one concurrent session.
 Both backends use the same decoded input, realtime pacing, replay lifecycle and
 metric collector. The vLLM backend commits input and acknowledges playback;
 the SGLang backend uses its native `sglang.input_audio.end` / `drained`
-handshake and timestamped image events. `--fdb-turn-detection none` is the
+handshake and timestamped image events. Use an SGLang server that reports
+`tail_status: "complete"` and `tail_units` on the drain acknowledgement. The
+benchmark checks that the entire input was consumed and that every response
+and audio stream finished before the acknowledgement, then waits for a
+correlated `session.closed`. A verified listen-only session is valid. A legacy
+or limited drain, incomplete response, or failed close is not scored; any PCM
+already received is retained under `failed_sessions/`.
+`--fdb-turn-detection none` is the
 default for MiniCPM-o and is required by the SGLang backend. Reference
 audio is encoded once and shared by all sessions. Each invocation creates a
 new `run-*` artifact directory under `--result-dir`, containing per-session
@@ -478,9 +485,10 @@ SGLang adapter also records the configuration echoed by `session.updated` and
 the server's supported sampling fields.
 
 For SGLang, standard TTFT and audio TTFP come from its top-level
-`response_request_metrics`, while RTF and audio continuity use the same
-client-received audio packets as the vLLM run. This keeps server response-start
-timing separate from network delivery cadence.
+`response_request_metrics`. Each backend defines its own server timer, so
+compare client-observed metrics when evaluating the two deployments.
+`duplex_audio_delivery_rtf` uses the same first-to-last PCM receive window
+for both backends. Report it alongside playback underrun and session failures.
 
 ### Omni-DuplexEval Realtime Benchmark
 
@@ -835,8 +843,9 @@ length because input is paced in real time.
 | --- | --- | --- |
 | `duplex_response_ttft_ms` / `duplex_response_ttfp_ms` | server: request accepted by the engine | first text / audio output |
 | `duplex_client_ttft_ms` | client: `response.created` received | first non-empty text delta |
-| `duplex_client_ttfp_ms` | client: last `input_audio_buffer.append` send before this `response.created` (after the previous `response.created` or stream start), when that send was recorded | first audio delta |
+| `duplex_client_ttfp_ms` | client: last non-drain `input_audio_buffer.append` send before this `response.created` (after the previous `response.created` or stream start), when recorded | first audio delta |
 | `duplex_client_rtf` | same append-send start as `duplex_client_ttfp_ms` | last audio delta, divided by emitted audio duration |
+| `duplex_audio_delivery_rtf` | client: first PCM packet received, for responses with at least two packets | last PCM packet received, divided by emitted audio duration |
 | `duplex_busy_rtf` | server: union of the turn's stage work spans (RFC #8325) | that union divided by the turn's emitted audio |
 | `duplex_stall_ratio` | server: the turn span minus that union | the stall time divided by the turn's emitted audio |
 
@@ -857,6 +866,10 @@ measure the full user-speech-end to first-output latency. Per-response `client_r
 through the last audio packet, divided by emitted audio duration, when an append send was recorded. The server start
 point differs between model plugins, so compare server keys only within one model; client append keys are only
 comparable within one adapter / chunk size.
+Native vLLM replay excludes client-generated EOF drain padding from the append clock. Silence present in the
+recorded input still counts. If no eligible append was recorded in the reply window, the append-based metrics
+are absent. First-to-last audio RTF measures packet delivery after the first packet, independently of the append
+and response start clocks. Packet sizes affect this value, so read it alongside playback continuity.
 `duplex_busy_rtf` and `duplex_stall_ratio` are not substitutes for `duplex_client_rtf`. They come from
 `session.stats` (RFC #8325): OmniInteract and Omni-DuplexEval ask once before close; Seed-TTS asks per turn.
 The keys appear only when serve has `duplex_session.collect_stats: true` and the turn is final; otherwise the
@@ -943,9 +956,10 @@ timing from word alignment.
 
 Per-response TTFT and TTFP start when the server begins executing the native model-turn request that owns the response. RTF
 continues to use client receipt of `response.created` through the last audio packet, divided by emitted audio duration.
-When the client recorded `input_audio_buffer.append` sends, `client_ttfp_ms` / `client_rtf` start at the last such send
+When the client recorded non-drain `input_audio_buffer.append` sends, `client_ttfp_ms` / `client_rtf` start at the last such send
 before this `response.created` (after the previous `response.created` or stream start). `client_ttft_ms` still starts at
 `response.created`. Created-origin audio is `response_created_to_first_audio_ms` and is not copied into `client_ttfp_ms`.
+Multi-packet responses also report `audio_delivery_ms` and `audio_delivery_rtf` from the client receive timestamps.
 `busy_rtf` / `stall_ratio` are the RFC #8325 server-side ratios above, present when `duplex_session.collect_stats` is on.
 Global TTFT, TTFP, and RTF cover the complete input-stream window. TPOT/ITL use engine stage-0 timing; ITL is emitted only when every
 token interval is present within a continuous generation segment. Model-unit pacing and gaps between generation segments are

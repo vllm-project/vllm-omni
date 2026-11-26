@@ -50,6 +50,7 @@ DUPLEX_RESPONSE_LATENCY_FIELDS = (
     ("client_ttft_ms", "duplex_client_ttft_ms", "client TTFT", 3, "ms"),
     ("client_ttfp_ms", "duplex_client_ttfp_ms", "client append TTFP", 3, "ms"),
     ("client_rtf", "duplex_client_rtf", "client append RTF", 6, ""),
+    ("audio_delivery_rtf", "duplex_audio_delivery_rtf", "client first-to-last audio RTF", 6, ""),
     ("busy_rtf", "duplex_busy_rtf", "busy RTF", 6, ""),
     ("stall_ratio", "duplex_stall_ratio", "stall ratio", 6, ""),
 )
@@ -306,6 +307,14 @@ def collect_duplex_session_metrics(
             )
             if client_rtf is not None:
                 metric["client_rtf"] = client_rtf
+            audio_delivery_rtf = audio_rtf_from_raw_metric(
+                {
+                    "audio_generation_ms": raw_metric.get("audio_delivery_ms"),
+                    "audio_duration_ms": raw_metric.get("audio_duration_ms"),
+                }
+            )
+            if audio_delivery_rtf is not None:
+                metric["audio_delivery_rtf"] = audio_delivery_rtf
         copied_stages: dict[str, dict[str, object]] = {}
         if isinstance(stages, dict):
             for stage_id, stage_snapshot in stages.items():

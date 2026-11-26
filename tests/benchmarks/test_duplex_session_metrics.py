@@ -87,6 +87,28 @@ def test_client_append_ttfp_is_not_mixed_with_created_ttfp():
     assert bundle.session_metrics["client_ttfp_ms"]["mean"] == 800.0
 
 
+def test_audio_delivery_rtf_uses_only_packet_receive_timestamps():
+    collector = EventCollector()
+    _turn(collector, "single-packet", 8.0, text_s=0.2, audio_s=0.4)
+    collector.add({"type": "response.created", "response": {"id": "streamed"}}, received_at_s=10.0)
+    for received_at_s in (10.5, 11.0):
+        collector.add(
+            {"type": "response.output_audio.delta", "response_id": "streamed", "delta": "AAAA" * 4800},
+            received_at_s=received_at_s,
+        )
+    collector.add({"type": "response.done", "response": {"id": "streamed"}}, received_at_s=11.5)
+
+    bundle = collect_duplex_session_metrics(collector, stream_start=7.0, session_id="s")
+    single_packet, streamed = bundle.request_metrics
+    assert "audio_delivery_rtf" not in single_packet
+    assert "client_rtf" not in streamed
+    assert streamed["audio_delivery_ms"] == 500.0
+    assert streamed["audio_duration_ms"] == 600.0
+    assert streamed["audio_delivery_rtf"] == 0.833333
+    assert streamed["rtf"] == 1.666667
+    assert duplex_response_latency_metrics(bundle.request_metrics)["num_duplex_audio_delivery_rtf_samples"] == 1
+
+
 def test_client_latency_is_absent_for_a_response_without_output():
     collector = EventCollector()
     _turn(collector, "r1", 10.0, text_s=0.3, audio_s=0.4)

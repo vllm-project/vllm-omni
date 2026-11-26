@@ -701,6 +701,8 @@ class ReplayDrainResult:
     input_committed: bool = False
     commit_timeout: str | None = None
     drain_timeout: str | None = None
+    drain_error: str | None = None
+    drain_ack: dict[str, object] | None = None
     drain_timeout_state: dict[str, object] | None = None
 
 
@@ -1047,6 +1049,7 @@ async def generate_sample(
     close_timeout = None
     ack_timeout = None
     input_timeout = None
+    input_error = None
     server_errors: list[str] = []
     session_stats_errors: list[str] = []
     session_stats: dict[str, object] | None = None
@@ -1085,8 +1088,13 @@ async def generate_sample(
             except TimeoutError as exc:
                 input_timeout = str(exc) or "input streaming timed out"
                 logger.warning("DuplexEval: input stalled for sample %s: %s", sample.id, exc)
+            except (ConnectionClosed, OSError) as exc:
+                input_error = str(exc) or type(exc).__name__
 
-            drain = await client.finish_input(timeout_s=_drain_timeout_s(prepared.duration))
+            if input_error is None:
+                drain = await client.finish_input(timeout_s=_drain_timeout_s(prepared.duration))
+            else:
+                drain = ReplayDrainResult()
         finally:
             ack_task.cancel()
             await _bounded_ack_join(ack_task)
@@ -1114,9 +1122,9 @@ async def generate_sample(
             session_stats = fetched or None
         try:
             await client.close(timeout_s=_FINAL_CLOSE_TIMEOUT_S)
-        except TimeoutError as exc:
+        except (TimeoutError, ConnectionClosed, OSError) as exc:
             # Same socket, same stall: record it and tear the transport down.
-            close_timeout = str(exc)
+            close_timeout = str(exc) or type(exc).__name__
             logger.warning("DuplexEval: session close not delivered for sample %s: %s", sample.id, exc)
         events = list(client.events.events)
         collector = _event_collector_from_realtime(client.events)
@@ -1137,8 +1145,11 @@ async def generate_sample(
         "response_done": drain.response_done,
         "input_committed": drain.input_committed,
         "input_timeout": input_timeout,
+        "input_error": input_error,
         "commit_timeout": drain.commit_timeout,
         "drain_timeout": drain.drain_timeout,
+        "drain_error": drain.drain_error,
+        "drain_ack": drain.drain_ack,
         "close_timeout": close_timeout,
         "ack_timeout": ack_timeout,
         "server_errors": server_errors,
@@ -1174,22 +1185,37 @@ async def generate_sample(
     # the reply completed does not: the artifacts are already complete, so
     # ``close_timeout`` is advisory there (like ``ack_timeout``) and only
     # names the transport that died when it is the session that did not finish.
-    errors.extend(str(error) for error in (input_timeout, drain.commit_timeout, drain.drain_timeout) if error)
-    if close_timeout and not drain.response_done:
+    errors.extend(
+        error
+        for error in (input_timeout, input_error, drain.commit_timeout, drain.drain_timeout, drain.drain_error)
+        if error
+    )
+    if close_timeout and (not drain.response_done or getattr(client, "requires_close_ack", False)):
         errors.append(close_timeout)
     finished = set()
+    response_terminals = []
     for event in events:
         response = event.get("response")
         if event.get("type") == "response.done" and isinstance(response, dict):
             finished.add(response.get("id"))
+            details = response.get("status_details")
+            status = response.get("status", "completed")
+            response_terminals.append(
+                {
+                    "id": response.get("id"),
+                    "status": status,
+                    "reason": details.get("reason") if isinstance(details, dict) else None,
+                }
+            )
             # Barge-in cancels an individual turn, not the input clip. Its
             # preceding responses and already emitted text remain judge input.
-            if response.get("status", "completed") not in {"completed", "cancelled"}:
+            if status not in {"completed", "cancelled"}:
                 errors.append(f"Response did not complete: {response}")
     # A turn may be created while closing the continuous session. Record this
     # boundary in metadata; drain/close timeouts and server errors above still
     # fail the sample instead of silently publishing a broken session.
     meta["unfinished_response_ids"] = sorted(set(client.events.response_ids) - finished)
+    meta["response_terminals"] = response_terminals
     output_audio_pcm = client.events.audio_bytes()
     result = GenerateSampleResult(
         output=output,

@@ -1505,11 +1505,11 @@ class ClientAppendStamp(TypedDict):
 
 
 _CLIENT_APPEND_TTFP_ORIGIN = (
-    "last input_audio_buffer.append client send before this response.created receive "
+    "last non-drain input_audio_buffer.append client send before this response.created receive "
     "(after the previous response.created receive or after_s) to first audio packet"
 )
 _CLIENT_APPEND_RTF_ORIGIN = (
-    "last input_audio_buffer.append client send before this response.created receive "
+    "last non-drain input_audio_buffer.append client send before this response.created receive "
     "(after the previous response.created receive or after_s) to last audio packet "
     "divided by emitted audio duration"
 )
@@ -1896,6 +1896,10 @@ class EventCollector:
                     "audio_generation_ms": _rounded_ms(audio_generation_ms),
                     "audio_duration_ms": _rounded_ms(audio_duration_ms),
                 }
+                if len(audio_received_at_s) >= 2:
+                    result["request_metrics"]["audio_delivery_ms"] = _rounded_ms(
+                        (audio_received_at_s[-1] - audio_received_at_s[0]) * 1000.0
+                    )
                 if server_ttft_ms is not None or server_ttfp_ms is not None:
                     request_metrics = result["request_metrics"]
                     assert isinstance(request_metrics, dict)

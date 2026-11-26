@@ -222,6 +222,7 @@ class RealtimeDuplexClient:
         self.events = RealtimeEventCollector()
         self._ws: Any = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._reader_close: ConnectionClosed | None = None
         self._media_clock_ms = 0
 
     async def __aenter__(self) -> RealtimeDuplexClient:
@@ -253,8 +254,8 @@ class RealtimeDuplexClient:
                 if isinstance(event, dict):
                     event.setdefault("_media_clock_ms", self._media_clock_ms)
                     self.events.add(event)
-        except ConnectionClosed:
-            return
+        except ConnectionClosed as exc:
+            self._reader_close = exc
 
     async def get_session_stats(
         self,
@@ -299,9 +300,9 @@ class RealtimeDuplexClient:
                 raise ConnectionError(_session_stats_error_message(event))
         return {}
 
-    async def send(self, event: dict[str, object]) -> None:
+    async def send(self, event: dict[str, object], *, drain_padding: bool = False) -> None:
         await self._ws.send(json.dumps(event))
-        if event.get("type") != "input_audio_buffer.append":
+        if drain_padding or event.get("type") != "input_audio_buffer.append":
             return
         event_id = event.get("event_id")
         self.events.note_client_append(
@@ -328,6 +329,8 @@ class RealtimeDuplexClient:
         error = task.exception()
         if error is not None:
             raise ConnectionError("Realtime WebSocket reader failed") from error
+        if self._reader_close is not None:
+            raise ConnectionError(f"Realtime WebSocket closed: {self._reader_close}") from self._reader_close
         raise ConnectionError("Realtime WebSocket closed before the requested event arrived")
 
     async def configure(
@@ -497,12 +500,12 @@ class RealtimeDuplexClient:
         return frames_sent
 
     async def append_silence(self, duration_ms: int) -> None:
-        """Append one zeroed PCM16 unit, e.g. drain padding after a commit.
+        """Append one zeroed PCM16 unit for drain padding after a commit.
 
         The same ``input_audio_buffer.append`` event shape ``stream_av_units``
         sends — ``duration_ms``/``audio_end_ms`` included, ``_media_clock_ms``
         advanced — so the server's step loop keeps stepping on it as if the
-        clip were still streaming.
+        clip were still streaming. Exclude it from the input latency clock.
         """
         duration_ms = max(0, int(duration_ms))
         if duration_ms == 0:
@@ -517,7 +520,8 @@ class RealtimeDuplexClient:
                 "sample_rate_hz": PCM16_SAMPLE_RATE,
                 "duration_ms": duration_ms,
                 "audio_end_ms": self._media_clock_ms,
-            }
+            },
+            drain_padding=True,
         )
 
     async def commit(self) -> None:

@@ -13,6 +13,7 @@ stop when the drain ends.
 
 import asyncio
 import base64
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -24,6 +25,30 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import PreparedSample
 from vllm_omni.experimental.fullduplex.client import RealtimeDuplexClient, RealtimeEventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_sends_drain_padding_without_stamping_it():
+    sent = []
+
+    class _FakeWs:
+        async def send(self, raw: str) -> None:
+            sent.append(json.loads(raw))
+
+    client = RealtimeDuplexClient("ws://unused")
+    client._ws = _FakeWs()
+    await client.send({"type": "input_audio_buffer.append", "event_id": "real-input", "audio": "AAAA"})
+    await client.commit()
+    await client.append_silence(1000)
+
+    assert [event["type"] for event in sent] == [
+        "input_audio_buffer.append",
+        "input_audio_buffer.commit",
+        "input_audio_buffer.append",
+    ]
+    assert sent[-1]["duration_ms"] == sent[-1]["audio_end_ms"] == 1000
+    assert "drain_padding" not in sent[-1]
+    assert [stamp["event_id"] for stamp in client.events.client_appends] == ["real-input"]
 
 
 class _RecordingClient:
