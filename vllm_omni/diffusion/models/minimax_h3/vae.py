@@ -459,7 +459,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # applies there. It is opt-in on NPU (H3_VAE_FP16_WEIGHTS=1); the XPU default stays on.
         _npu = device.type == "npu" and decoder_path is None
         _fp16_weights = os.environ.get("H3_VAE_FP16_WEIGHTS", "1" if _xpu else "0") == "1"
-        if (_xpu or _npu) and _fp16_weights and decoder is not None:
+        # Persisting the weights in FP16 only matches reference decode while the decode itself runs
+        # in FP16, because it is that autocast which would otherwise re-cast them on every tile.
+        # ``decode_dtype`` is a runtime value, not a device constant -- the NVFP4 decoder sets it to
+        # BF16 above -- so check it here instead of leaving the invariant to ``decoder_path``.
+        if (_xpu or _npu) and _fp16_weights and decoder is not None and self.decode_dtype is torch.float16:
             # CUDA path (ops/vae/__init__.py) persists decoder-block Linear weights in fp16 so autocast does not re-cast
             # every weight on every tile; on XPU that path is never installed. Same cast, env-gated.
             from vllm_omni.diffusion.models.minimax_h3.ops.vae import _decoder_block_linears as _h3_dbl
@@ -467,9 +471,20 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             _linears = _h3_dbl(decoder) or []
             for _lin in _linears:
                 _lin.to(dtype=torch.float16)
-            logger.info(
-                "[H3_VAE_FP16_WEIGHTS] %d decoder-block linears persisted as fp16 device=%s", len(_linears), device
-            )
+            if _linears:
+                logger.info(
+                    "[H3_VAE_FP16_WEIGHTS] %d decoder-block linears persisted as fp16 device=%s", len(_linears), device
+                )
+            else:
+                # _decoder_block_linears returns None unless the decoder matches the CUDA fused
+                # path's structural contract, so an enabled switch can legitimately cast nothing
+                # (a Lite or future decoder). Name that reason rather than report a count of zero,
+                # which reads as if the switch were installed and found no work.
+                logger.warning(
+                    "[H3_VAE_FP16_WEIGHTS] enabled but this decoder does not match the fused-path structure, "
+                    "so no weights were cast device=%s",
+                    device,
+                )
         self.model = self.remote.model
         self._stager = None
         self._encoder_stager = None
