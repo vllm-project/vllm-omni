@@ -707,6 +707,7 @@ source_file_dependencies:
     - tests/helpers/runtime.py
     - tests/helpers/stage_config.py
     - vllm_omni/deploy/qwen3_omni_duplex.yaml
+    - vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
 
   omni_bagel_sleep_function:
     - *bagel

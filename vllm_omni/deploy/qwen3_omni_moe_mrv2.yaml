@@ -48,7 +48,5 @@ stages:
     model_runner: v2
 
 platforms:
-  npu:
-    model_runner: v1
   musa:
     model_runner: v1

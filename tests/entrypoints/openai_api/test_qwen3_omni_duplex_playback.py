@@ -229,6 +229,7 @@ def _duplex_assert_prompt(
     instructions: str,
     request_count: int,
     assistant_texts: list[str] | None = None,
+    full_history: bool = False,
 ):
     captures = []
     for path in runtime.artifacts.glob("*/input.json"):
@@ -238,8 +239,8 @@ def _duplex_assert_prompt(
     assert len(captures) == request_count, captures
     capture = max(captures, key=lambda item: item[0])[1]
     assert capture["audio_count"] == audio_count
-    # The camera belongs to the first user turn and leaves with its audio.
-    image_retained = request_count <= _DUPLEX_AUDIO_HISTORY_LIMIT
+    # Only the recent policy drops the first turn's camera with its audio.
+    image_retained = full_history or request_count <= _DUPLEX_AUDIO_HISTORY_LIMIT
     assert len(capture["images"]) == int(image_retained)
     messages: list[dict[str, Any]] = [{"role": "system", "content": instructions}]
     if assistant_texts is None:
@@ -389,7 +390,7 @@ async def _run_semantic_vad_endpoint(runtime, log_path: Path, *, fixture: str) -
     return events
 
 
-async def _run_duplex_history(runtime, log_path: Path, *, reject_overflow: bool = False) -> None:
+async def _run_duplex_history(runtime, log_path: Path, *, full_history: bool = False) -> None:
     async with _duplex_recorded_session(runtime, log_path, instructions=_DUPLEX_SHORT_INSTRUCTIONS, vad=False) as (
         ws,
         events,
@@ -403,51 +404,23 @@ async def _run_duplex_history(runtime, log_path: Path, *, reject_overflow: bool 
             await _duplex_send_pcm(ws, pcm, trailing_silence=False)
             await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
             await ws.send(json.dumps({"type": "response.create"}))
-            expected_error = (
-                "input_capacity_exceeded" if reject_overflow and turn == _DUPLEX_AUDIO_HISTORY_LIMIT else None
-            )
             await _duplex_receive_until(
                 ws,
                 events,
                 lambda: any(e["type"] == "response.done" for e in events[cursor:]),
-                expected_error_code=expected_error,
             )
             response_id = next(_duplex_response_id(e) for e in events[cursor:] if e["type"] == "response.done")
             assert response_id and response_id not in response_ids
-            if expected_error is not None:
-                terminals = _duplex_response_events(events, response_id, "response.done")
-                assert len(terminals) == 1, terminals
-                response = terminals[0]["response"]
-                assert response["status"] == "failed", response
-                assert response["status_details"]["reason"] == expected_error, response
-                await _duplex_receive_until(
-                    ws,
-                    events,
-                    lambda: any(e["type"] == "error" for e in events[cursor:]),
-                    expected_error_code=expected_error,
-                )
-                error = next(e["error"] for e in events[cursor:] if e["type"] == "error")
-                assert error["code"] == expected_error and error["retryable"] is True, error
-                assert f"{_DUPLEX_AUDIO_HISTORY_LIMIT + 1} audio inputs" in error["message"], error
-                assert not _duplex_response_events(events, response_id, "response.output_audio.delta")
-                _duplex_assert_prompt(
-                    runtime,
-                    session_id,
-                    audio_count=_DUPLEX_AUDIO_HISTORY_LIMIT,
-                    instructions=_DUPLEX_SHORT_INSTRUCTIONS,
-                    request_count=_DUPLEX_AUDIO_HISTORY_LIMIT,
-                    assistant_texts=heard_texts[:-1],
-                )
-                break
             response_ids.append(response_id)
             _duplex_assert_completed_audio(events, response_id)
             _duplex_assert_prompt(
                 runtime,
                 session_id,
-                audio_count=min(turn + 1, _DUPLEX_AUDIO_HISTORY_LIMIT),
+                audio_count=turn + 1 if full_history else min(turn + 1, _DUPLEX_AUDIO_HISTORY_LIMIT),
                 instructions=_DUPLEX_SHORT_INSTRUCTIONS,
                 request_count=turn + 1,
-                assistant_texts=heard_texts[-3:],
+                assistant_texts=heard_texts if full_history else heard_texts[-(_DUPLEX_AUDIO_HISTORY_LIMIT - 1) :],
+                full_history=full_history,
             )
             # Complete playback so pruning is checked against real assistant
             # answers paired with retained user audio. Repeated empty assistant
@@ -481,7 +454,7 @@ async def _run_duplex_history(runtime, log_path: Path, *, reject_overflow: bool 
             assert ack["history_committed"] is True
     for response_id in response_ids:
         _duplex_assert_completed_audio(events, response_id)
-    assert len(response_ids) == (_DUPLEX_AUDIO_HISTORY_LIMIT if reject_overflow else 6)
+    assert len(response_ids) == 6
 
 
 @pytest.mark.omni
@@ -600,9 +573,9 @@ class TestQwen3OmniDuplexPlayback:
         _assert_auto_committed_turns(turns)
 
     @pytest.mark.advanced_model
-    def test_full_history_rejects_audio_overflow(self, qwen_duplex_server, tmp_path: Path):
-        """The unconfigured default preserves sources and rejects a fifth audio input."""
-        asyncio.run(_run_duplex_history(qwen_duplex_server, tmp_path / "events.json", reject_overflow=True))
+    def test_full_history_keeps_six_audio_turns(self, qwen_duplex_server, tmp_path: Path):
+        """The unconfigured default keeps all six audio inputs and heard answers."""
+        asyncio.run(_run_duplex_history(qwen_duplex_server, tmp_path / "events.json", full_history=True))
 
     # Keep this fixture parameter last to group the default-policy cases on one server.
     @pytest.mark.advanced_model
