@@ -3,12 +3,12 @@
 
 """Restore the torch-native rejection sampler on the 910_93 part.
 
-vllm-ascend module-patches vllm's ``rejection_sample`` (and its two helpers)
-onto Triton kernels (``vllm_ascend/patch/worker/patch_rejection_sampler.py``).
-On the 910_93 vector core those kernels fault (acl 507035) during their
-warmup, which is why ``rejection_sampler`` sits in the warmup skip set. The
-skip only moves the fault to the first request -- every verify then
-JIT-compiles the kernel family on the fly, and both stages stall there:
+vllm-ascend rebinds vllm's ``rejection_sample`` onto its own Triton kernels
+(``vllm_ascend/patch/worker/patch_triton.py``). On the 910_93 vector core
+those kernels fault (acl 507035) during their warmup, which is why
+``rejection_sampler`` sits in the warmup skip set. The skip only moves the
+fault to the first request -- every verify then JIT-compiles the kernel
+family on the fly, and both stages stall there:
 stage 0 verifies the n-gram drafts of every decode step, and stage 1
 verifies the always-``continue`` drafts behind the K-step block-table
 growth.
@@ -22,6 +22,14 @@ multi-frame decode is armed there (stage 1's ``speculative_config``). That is
 the one path whose spec width the 910B kernels cannot take, so the restore on
 a 910B is tied to that arming, never to the SoC alone: a 910B deployment
 without the Talker ``speculative_config`` keeps its sampler byte-for-byte.
+
+Current status: the restore is not armed on the current stack. Its caller
+went with the MRv1 runner (removed in #10365), and vllm 0.34 moved the
+sampler to ``vllm.v1.worker.gpu.spec_decode.rejection_sampler`` with a
+Triton implementation of its own, so the module this one reloads
+(``vllm.v1.sample.rejection_sampler``) no longer exists and the restore
+returns early. The gate below therefore only decides -- re-arming the
+restore against the current layout is a separate change.
 """
 
 import importlib.util
@@ -71,9 +79,10 @@ def restore_native_rejection_sampler(vllm_config: Any = None) -> None:
         # leaving _RESTORED False here lets the next call retry instead of
         # skipping the restore for the whole process lifetime. The probe is
         # an env/name lookup and this function runs once per worker init, so
-        # the retry costs nothing. The same probe decides the target check
-        # above: a second probe could report a part that the first one could
-        # not read, and that disagreement would latch the skip.
+        # the retry costs nothing. The one probe read above decides the
+        # target check, this latch and the log line below: a second probe
+        # could report a part that the first one could not read, and that
+        # disagreement would latch the skip.
         if soc_name.strip():
             _RESTORED = True
         return
@@ -100,5 +109,5 @@ def restore_native_rejection_sampler(vllm_config: Any = None) -> None:
             "their warmup is already skipped) and JIT-compiling them on "
             "the first request stalls every stage mid-verify",
             ", ".join(restored),
-            _probe_soc_name(),
+            soc_name,
         )

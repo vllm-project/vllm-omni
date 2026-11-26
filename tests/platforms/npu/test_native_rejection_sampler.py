@@ -165,6 +165,24 @@ def test_the_gate_probes_the_soc_name_once_per_call(monkeypatch, tmp_path):
     assert len(probes) == 1
 
 
+def test_the_restore_path_probes_the_soc_name_once_too(monkeypatch, tmp_path):
+    """The restore path reads the name once as well - the log line reuses it."""
+    leaf = _install_fake_vllm(monkeypatch, tmp_path)
+    _warmup, gate = _load_gate(monkeypatch)
+    probes: list[str] = []
+
+    def fake_probe() -> str:
+        probes.append("Ascend910_93")
+        return "Ascend910_93"
+
+    monkeypatch.setattr(gate, "_probe_soc_name", fake_probe)
+
+    gate.restore_native_rejection_sampler()
+
+    assert leaf.rejection_sample() == "sample"
+    assert len(probes) == 1
+
+
 def test_an_unknown_probe_is_not_latched_and_retries(monkeypatch, tmp_path):
     """An empty probe means "unknown", so a later call may still restore."""
     leaf = _install_fake_vllm(monkeypatch, tmp_path)
