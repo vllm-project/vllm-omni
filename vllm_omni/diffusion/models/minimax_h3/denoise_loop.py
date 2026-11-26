@@ -23,10 +23,12 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
 )
+from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION_STATE
 from vllm_omni.diffusion.sampler import SamplingState, sampler_object
 from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit
+from .reference_isolation import MiniMaxH3ReferenceIsolation, reference_isolation_enabled
 from .sampling import MiniMaxH3Model, MiniMaxH3ModelBatch
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
@@ -100,6 +102,23 @@ class MiniMaxH3DenoiseBranch:
         self.audio_pos_dev = self.audio_pos.to(device)
         self.update_mask_dev = self.update_mask.to(device)
         self.audio_update_mask_dev = self.audio_update_mask.to(device)
+        self.update_idx_dev = self.update_mask.nonzero().view(-1).to(device)
+        self.cond_idx_dev = (~self.update_mask).nonzero().view(-1).to(device)
+        self.audio_update_idx_dev = self.audio_update_mask.nonzero().view(-1).to(device)
+        self.audio_cond_idx_dev = (~self.audio_update_mask).nonzero().view(-1).to(device)
+        video_target_pos = self.img_pos[self.update_mask]
+        video_cond_pos = self.img_pos[~self.update_mask]
+        audio_target_pos = self.audio_pos[self.audio_update_mask]
+        audio_cond_pos = self.audio_pos[~self.audio_update_mask]
+        self.video_target_pos_dev = video_target_pos.to(device)
+        self.video_cond_pos_dev = video_cond_pos.to(device)
+        self.audio_target_pos_dev = audio_target_pos.to(device)
+        self.audio_cond_pos_dev = audio_cond_pos.to(device)
+        groups = torch.zeros(seq_len, dtype=torch.long)
+        for group, positions in enumerate((video_target_pos, video_cond_pos, audio_target_pos, audio_cond_pos), 1):
+            groups[positions] = group
+        self.timestep_groups_present = tuple(sorted(set(groups.tolist())))
+        self.timestep_group_dev = groups.to(device)
         self.x_base = torch.zeros(1, seq_len, MINIMAX_H3_VIDEO_ROW_WIDTH, dtype=torch.float32, device=device)
         self.audio_x_base = torch.zeros(1, seq_len, MINIMAX_H3_AUDIO_ROW_WIDTH, dtype=torch.float32, device=device)
         self.text_pos_dev = packed["text_pos"].view(-1).to(torch.long).to(device)
@@ -193,21 +212,32 @@ class MiniMaxH3DenoiseBranch:
         video_target_timesteps: torch.Tensor | None = None,
         audio_target_timesteps: torch.Tensor | None = None,
     ) -> dict[str, Any]:
+        reference_isolation = self.static_kwargs.get(REFERENCE_ISOLATION_STATE)
+        if reference_isolation is not None:
+            imgvid_cond_timestep = reference_isolation.condition_timestep
         x = self.x_base.clone()
         x[0].index_copy_(0, self.img_pos_dev, video_rows)
         audio_x = self.audio_x_base.clone()
         audio_x[0].index_copy_(0, self.audio_pos_dev, audio_rows)
-        timesteps = torch.empty(self.seq_len, dtype=torch.float32, device=self.device)
-        self.fill_timesteps(
-            timesteps,
-            t_video=t_video,
-            t_audio=t_audio,
-            imgvid_cond_timestep=imgvid_cond_timestep,
-            audio_ref_cond_timestep=audio_ref_cond_timestep,
-            video_target_timesteps=video_target_timesteps,
-            audio_target_timesteps=audio_target_timesteps,
-        )
-        unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
+        if video_target_timesteps is None and audio_target_timesteps is None:
+            unique_timesteps, inverse_indices = self._unique_step_timesteps(
+                t_video=t_video,
+                t_audio=t_audio,
+                imgvid_cond_timestep=imgvid_cond_timestep,
+                audio_ref_cond_timestep=audio_ref_cond_timestep,
+            )
+        else:
+            timesteps = torch.empty(self.seq_len, dtype=torch.float32, device=self.device)
+            self.fill_timesteps(
+                timesteps,
+                t_video=t_video,
+                t_audio=t_audio,
+                imgvid_cond_timestep=imgvid_cond_timestep,
+                audio_ref_cond_timestep=audio_ref_cond_timestep,
+                video_target_timesteps=video_target_timesteps,
+                audio_target_timesteps=audio_target_timesteps,
+            )
+            unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
         return {
             **self.static_kwargs,
             "x": x,
@@ -215,6 +245,29 @@ class MiniMaxH3DenoiseBranch:
             "unique_timesteps": unique_timesteps,
             "inverse_indices": inverse_indices,
         }
+
+    def _unique_step_timesteps(
+        self,
+        *,
+        t_video: float,
+        t_audio: float,
+        imgvid_cond_timestep: float,
+        audio_ref_cond_timestep: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sorted unique timesteps and inverse indices of fill_timesteps' rows, without a host sync."""
+        audio_timestep = t_audio if self.locked_audio_rows is None else 1.0
+        sources = (t_video, t_video, imgvid_cond_timestep, audio_timestep, audio_ref_cond_timestep)
+        values = torch.tensor([float(value) for value in sources], dtype=torch.float32).tolist()
+        unique = sorted({values[group] for group in self.timestep_groups_present})
+        lookup = [unique.index(value) if value in unique else 0 for value in values]
+        unique_dev = self._upload(torch.tensor(unique, dtype=torch.float32))
+        lookup_dev = self._upload(torch.tensor(lookup, dtype=torch.long))
+        return unique_dev, lookup_dev[self.timestep_group_dev]
+
+    def _upload(self, host: torch.Tensor) -> torch.Tensor:
+        if torch.device(self.device).type == "cuda":
+            host = host.pin_memory()
+        return host.to(self.device, non_blocking=True)
 
     def fill_timesteps(
         self,
@@ -238,23 +291,22 @@ class MiniMaxH3DenoiseBranch:
         timestep_groups = (
             (
                 "video_target_timesteps",
-                self.img_pos_dev,
-                self.update_mask_dev,
+                self.video_target_pos_dev,
+                self.video_cond_pos_dev,
                 video_target_timesteps,
                 t_video,
                 imgvid_cond_timestep,
             ),
             (
                 "audio_target_timesteps",
-                self.audio_pos_dev,
-                self.audio_update_mask_dev,
+                self.audio_target_pos_dev,
+                self.audio_cond_pos_dev,
                 audio_target_timesteps,
                 t_audio if self.locked_audio_rows is None else 1.0,
                 audio_ref_cond_timestep,
             ),
         )
-        for name, positions, update_mask, target_timesteps, current_timestep, condition_timestep in timestep_groups:
-            target_positions = positions[update_mask]
+        for name, target_positions, cond_pos, target_timesteps, current_timestep, condition_timestep in timestep_groups:
             if target_timesteps is None:
                 timesteps[target_positions] = current_timestep
             else:
@@ -264,7 +316,7 @@ class MiniMaxH3DenoiseBranch:
                         f"{name} rows {target_timesteps.shape[0]} != target rows {target_positions.shape[0]}"
                     )
                 timesteps[target_positions] = target_timesteps
-            timesteps[positions[~update_mask]] = condition_timestep
+            timesteps[cond_pos] = condition_timestep
 
 
 def minimax_h3_prepare_denoise_rows(
@@ -428,62 +480,76 @@ def minimax_h3_denoise_loop(
             raise ValueError("keep_steps branches must share the same audio row layout")
         if current_omni_platform.is_npu():
             base.prepare_rope_table(model)
-    reference_kv_state = None
-    create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
-    if callable(create_reference_kv_state):
-        reference_kv_state = create_reference_kv_state(
-            global_reference_rows=int((~positive.update_mask).sum()),
+    reference_isolation = None
+    if reference_isolation_enabled(getattr(model, "od_config", None)):
+        if base is not None:
+            raise ValueError("--kv-isolate does not support keep_steps reference-layout switching")
+        if video_edit is not None or audio_edit is not None:
+            raise ValueError("--kv-isolate does not support latent editing")
+        reference_isolation = MiniMaxH3ReferenceIsolation(
+            positive.img_pos[~positive.update_mask],
+            sequence_rows=positive.seq_len,
+            used_rows=positive.used_len,
+            condition_timestep=float(imgvid_cond_noise_aug_for_inference),
             device=device,
         )
-    if reference_kv_state is not None:
-        if base is not None:
-            # The Tier-2 reference KV state is sized for the branch it was built
-            # from; the mid-loop layout switch changes the reference row count.
-            raise ValueError("keep_steps does not support the reference-KV offload state")
-        positive.static_kwargs["reference_kv_state"] = reference_kv_state
-
-    adapter = MiniMaxH3Model(
-        model,
-        positive,
-        (video_rows, audio_rows),
-        (video_edit, audio_edit),
-        (imgvid_cond_noise_aug_for_inference, audio_cond_noise_aug_for_inference),
-    )
-    state = SamplingState((video_rows[update], audio_rows[audio_update]), (sigmas_video, sigmas_audio))
-
-    def write_back_and_update_progress(state):
-        nonlocal video_rows, audio_rows, positive
-        adapter.validate_write_back(state)
-        video_rows, audio_rows = adapter.write_back(state)
-        if base is not None and state.step_index - 1 == keep_steps - 1 and positive is not base:
-            # CodeVideoModel-style early-only video conditioning: after the
-            # leading keep_steps steps, transfer the running target rows onto
-            # the image-only layout before the sampler prepares its next
-            # evaluation. The switch preserves the target rows' order, so the
-            # state's latents stay valid for the new branch unchanged; the
-            # swapped adapter branch/masks point validate/write_back at the
-            # base layout from here on.
-            switched, _, _ = minimax_h3_switch_denoise_branch(
-                base=base,
-                video_rows=video_rows,
-                update=update,
-                base_cond_rows=base_cond_rows,
+    reference_kv_state = None
+    try:
+        create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
+        if callable(create_reference_kv_state):
+            reference_kv_state = create_reference_kv_state(
+                global_reference_rows=int((~positive.update_mask).sum()),
                 device=device,
             )
-            positive = base
-            video_rows = switched
-            adapter.branch = base
-            adapter.rows = (switched, audio_rows)
-            adapter.model_rows = (switched.clone(), adapter.model_rows[1])
-        if update_progress is not None:
-            update_progress(state.step_index - 1, video_rows, audio_rows)
-        check_request_cancellation(synchronize=True)
+        if reference_kv_state is not None:
+            if base is not None:
+                # A layout switch invalidates the branch-specific reference cache.
+                raise ValueError("keep_steps does not support the reference-KV offload state")
+            positive.static_kwargs["reference_kv_state"] = reference_kv_state
+        if reference_isolation is not None:
+            positive.static_kwargs[REFERENCE_ISOLATION_STATE] = reference_isolation
 
-    def step_context(states):
-        check_request_cancellation()
-        return step_profiler(states[0].step_index) if step_profiler is not None else nullcontext()
+        adapter = MiniMaxH3Model(
+            model,
+            positive,
+            (video_rows, audio_rows),
+            (video_edit, audio_edit),
+            (imgvid_cond_noise_aug_for_inference, audio_cond_noise_aug_for_inference),
+        )
+        state = SamplingState((video_rows[update], audio_rows[audio_update]), (sigmas_video, sigmas_audio))
 
-    try:
+        def write_back_and_update_progress(state):
+            nonlocal video_rows, audio_rows, positive
+            adapter.validate_write_back(state)
+            video_rows, audio_rows = adapter.write_back(state)
+            if base is not None and state.step_index - 1 == keep_steps - 1 and positive is not base:
+                # CodeVideoModel-style early-only video conditioning: after the
+                # leading keep_steps steps, transfer the running target rows onto
+                # the image-only layout before the sampler prepares its next
+                # evaluation. The switch preserves the target rows' order, so the
+                # state's latents stay valid for the new branch unchanged; the
+                # swapped adapter branch/masks point validate/write_back at the
+                # base layout from here on.
+                switched, _, _ = minimax_h3_switch_denoise_branch(
+                    base=base,
+                    video_rows=video_rows,
+                    update=update,
+                    base_cond_rows=base_cond_rows,
+                    device=device,
+                )
+                positive = base
+                video_rows = switched
+                adapter.branch = base
+                adapter.rows = (switched, audio_rows)
+                adapter.model_rows = (switched.clone(), adapter.model_rows[1])
+            if update_progress is not None:
+                update_progress(state.step_index - 1, video_rows, audio_rows)
+            check_request_cancellation(synchronize=True)
+
+        def step_context(states):
+            check_request_cancellation()
+            return step_profiler(states[0].step_index) if step_profiler is not None else nullcontext()
+
         with torch.inference_mode():
             sampler_object(sampler).sample(
                 MiniMaxH3ModelBatch({state: adapter}),
@@ -493,9 +559,14 @@ def minimax_h3_denoise_loop(
             )
     finally:
         minimax_h3_publish_denoise_progress(None, None, None)
-        if reference_kv_state is not None:
-            positive.static_kwargs.pop("reference_kv_state", None)
-            reference_kv_state.close()
+        positive.static_kwargs.pop("reference_kv_state", None)
+        positive.static_kwargs.pop(REFERENCE_ISOLATION_STATE, None)
+        try:
+            if reference_kv_state is not None:
+                reference_kv_state.close()
+        finally:
+            if reference_isolation is not None:
+                reference_isolation.close()
     return video_rows, audio_rows
 
 

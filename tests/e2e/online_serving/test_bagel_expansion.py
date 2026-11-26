@@ -29,10 +29,12 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 PROMPT = "A futuristic city skyline at twilight, cyberpunk style, ultra-detailed, high resolution."
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
+BAGEL_COLD_STAGE_INIT_TIMEOUT_S = 1200
+BAGEL_COLD_INIT_TIMEOUT_S = 1800
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
-HSDP_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI300"})
+PARALLEL_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI300"}, num_cards=2)
+HSDP_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI300"}, num_cards=2)
 
 BAGEL_CI_DEPLOY = get_deploy_config_path("ci/bagel.yaml")
 BAGEL_PARALLEL_2_DEPLOY = modify_stage_config(
@@ -72,6 +74,8 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                stage_init_timeout=BAGEL_COLD_STAGE_INIT_TIMEOUT_S,
+                init_timeout=BAGEL_COLD_INIT_TIMEOUT_S,
                 server_args=[
                     "--enable-cpu-offload",
                 ],
@@ -83,6 +87,8 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                stage_init_timeout=BAGEL_COLD_STAGE_INIT_TIMEOUT_S,
+                init_timeout=BAGEL_COLD_INIT_TIMEOUT_S,
                 server_args=[
                     "--cache-backend",
                     "tea_cache",
@@ -95,6 +101,8 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                stage_init_timeout=BAGEL_COLD_STAGE_INIT_TIMEOUT_S,
+                init_timeout=BAGEL_COLD_INIT_TIMEOUT_S,
                 server_args=[
                     "--cache-backend",
                     "cache_dit",
@@ -107,6 +115,8 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                stage_init_timeout=BAGEL_COLD_STAGE_INIT_TIMEOUT_S,
+                init_timeout=BAGEL_COLD_INIT_TIMEOUT_S,
                 stage_config_path=BAGEL_PARALLEL_2_DEPLOY,
                 server_args=[
                     "--cache-backend",
@@ -122,6 +132,8 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                stage_init_timeout=BAGEL_COLD_STAGE_INIT_TIMEOUT_S,
+                init_timeout=BAGEL_COLD_INIT_TIMEOUT_S,
                 stage_config_path=BAGEL_PARALLEL_2_DEPLOY,
                 server_args=[
                     "--usp",
@@ -135,6 +147,8 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                stage_init_timeout=BAGEL_COLD_STAGE_INIT_TIMEOUT_S,
+                init_timeout=BAGEL_COLD_INIT_TIMEOUT_S,
                 stage_config_path=BAGEL_PARALLEL_2_DEPLOY,
                 server_args=[
                     "--ring",
@@ -148,6 +162,8 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                stage_init_timeout=BAGEL_COLD_STAGE_INIT_TIMEOUT_S,
+                init_timeout=BAGEL_COLD_INIT_TIMEOUT_S,
                 server_args=["--enable-layerwise-offload"],
             ),
             id="single_card_layerwise_offload",
@@ -157,6 +173,8 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                stage_init_timeout=BAGEL_COLD_STAGE_INIT_TIMEOUT_S,
+                init_timeout=BAGEL_COLD_INIT_TIMEOUT_S,
                 stage_config_path=BAGEL_HSDP_2_DEPLOY,
                 server_args=[
                     "--use-hsdp",
@@ -171,6 +189,8 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
+                stage_init_timeout=BAGEL_COLD_STAGE_INIT_TIMEOUT_S,
+                init_timeout=BAGEL_COLD_INIT_TIMEOUT_S,
                 stage_config_path=BAGEL_TP_VAE_PP_2_DEPLOY,
             ),
             id="tp_vae_patch_parallel_2",

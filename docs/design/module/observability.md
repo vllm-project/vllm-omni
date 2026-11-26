@@ -41,6 +41,12 @@ changing any of them is a contract change.
 **Rule:** Metrics MUST NOT use request IDs, prompts, outputs, or other unbounded
 values as labels.
 
+### OBS-INV-004: Request diagnostics are bounded and opt-in
+
+**Rule:** Response diagnostics SHOULD require an explicit request or server
+opt-in, retain fixed field sets and configured stage/replica keys, and exclude
+per-token arrays unless the caller explicitly requests them.
+
 ## Safe-change guide
 
 Test registration, label sets, units, lifecycle resets, and representative

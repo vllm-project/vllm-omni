@@ -37,11 +37,11 @@ from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.common.cli_args import make_arg_parser, resolve_default_chat_template_kwargs
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
+from vllm.entrypoints.launchers.app import build_app as build_openai_app
 from vllm.entrypoints.launchers.launcher import serve_http
+from vllm.entrypoints.launchers.launcher import setup_server as setup_openai_server
 from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
-from vllm.entrypoints.openai.api_server import build_app as build_openai_app
-from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
 from vllm.entrypoints.openai.chat_completion.protocol import (
     BatchChatCompletionRequest,
     ChatCompletionRequest,
@@ -588,7 +588,7 @@ async def omni_run_server_worker(
         # not another call to the empty 0.01 s JIT-kernel registry.
         duplex_warmup_frames = 0
         warmup_kind = None
-        if getattr(app.state, "openai_serving_duplex", None) is not None:
+        if isinstance(engine_client, DuplexOmni) and engine_client.engine.duplex_frontend_group_count > 0:
             duplex_cfg = getattr(engine_client, "duplex_session_config", None)
             duplex_warmup_frames = int(getattr(duplex_cfg, "warmup_frames", 0) or 0)
             warmup_kind = startup_warmup_kind(lookup_duplex_plugin(engine_client), duplex_warmup_frames)
@@ -685,6 +685,7 @@ def _should_serve_duplex(model: str, kwargs: dict[str, Any]) -> bool:
         model=model,
         trust_remote_code=bool(kwargs.get("trust_remote_code")),
         deploy_config_path=kwargs.get("deploy_config"),
+        revision=kwargs.get("revision"),
     )
     if pipeline_config is None or not getattr(pipeline_config, "duplex_plugin", None):
         return False
@@ -755,7 +756,7 @@ async def build_async_omni_from_stage_config(
             saved = os.environ.get("CUDA_VISIBLE_DEVICES")
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
             try:
-                AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+                AutoConfig.from_pretrained(args.model, trust_remote_code=True, revision=getattr(args, "revision", None))
             finally:
                 if saved is not None:
                     os.environ["CUDA_VISIBLE_DEVICES"] = saved
@@ -849,7 +850,9 @@ async def _init_duplex_app_state(
     state.openai_serving_chat = await _init_duplex_chat(engine_client, state, args, request_logger)
     state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
     state.server_load_metrics = 0
-    if state.openai_serving_chat is not None:
+    if engine_client.engine.duplex_frontend_group_count == 0:
+        logger.warning("Duplex sessions unavailable on this frontend: no complete replica group survived startup")
+    elif state.openai_serving_chat is not None:
         logger.info(
             "Duplex mode: serving %s over /v1/realtime?duplex=1 and /v1/chat/completions",
             engine_client.model,
