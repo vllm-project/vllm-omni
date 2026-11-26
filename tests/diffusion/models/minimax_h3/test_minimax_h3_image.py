@@ -5,11 +5,13 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 
+from vllm_omni.diffusion.cache.prompt_embed_cache import install_prompt_embed_cache
 from vllm_omni.diffusion.models.minimax_h3 import image_vae
 from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3_image as h3i
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3DiTArchConfig
@@ -507,3 +509,202 @@ def test_reference_limit_matches_model_metadata():
     assert h3i.MINIMAX_H3_IMAGE_MAX_REFERENCES == 16
     metadata = get_diffusion_model_metadata("MiniMaxH3ImagePipeline")
     assert metadata.max_multimodal_image_inputs == h3i.MINIMAX_H3_IMAGE_MAX_REFERENCES
+
+
+class _PromptCacheTokenizer(_FakeTokenizer):
+    def get_added_vocab(self):
+        return {}
+
+    def __len__(self):
+        return 1000
+
+
+class _PromptCacheEncoder(_RecordingEncoder):
+    def __init__(self):
+        super().__init__()
+        self.cudnn_sdp = False
+        self.text_model = SimpleNamespace(config={"hidden_size": 4})
+
+    def encode_ids(self, ids, **vision):
+        self.calls.append("encode")
+        self.last_output = ids.to(torch.bfloat16).unsqueeze(1).repeat(1, 4)
+        return self.last_output
+
+
+@pytest.fixture
+def prompt_cache_pipeline(monkeypatch):
+    # Cache-only fixture: no checkpoint/config loading or accelerator startup.
+    pipe = h3i.MiniMaxH3ImagePipeline.__new__(h3i.MiniMaxH3ImagePipeline)
+    torch.nn.Module.__init__(pipe)
+    pipe.od_config = SimpleNamespace(model="local", revision="one", additional_config={})
+    pipe.text_encoder = _PromptCacheEncoder()
+    pipe.tokenizer = _PromptCacheTokenizer()
+    pipe._dit_rank = 0
+    pipe.text_encoder_tp_size = 1
+    pipe.device = torch.device("cpu")
+    monkeypatch.setattr(h3i, "_broadcast_tensor", lambda tensor, **k: tensor)
+    monkeypatch.setattr(h3i.MiniMaxH3ImagePipeline, "_uses_manual_component_offload", lambda self, c: False)
+    return pipe
+
+
+def _install_prompt_cache(pipe, max_size=2):
+    cache = install_prompt_embed_cache(pipe, max_size=max_size)
+    assert cache is not None, "H3-Image must expose the shared encode_prompt cache entry point"
+    return cache
+
+
+def _encode_condition(pipe, prompt="same", references=None):
+    with torch.inference_mode():
+        return pipe._encode_text(prompt, [] if references is None else references)
+
+
+def test_prompt_cache_hit_and_explicit_clear(prompt_cache_pipeline):
+    cache = _install_prompt_cache(prompt_cache_pipeline)
+    first = _encode_condition(prompt_cache_pipeline)
+    hit = _encode_condition(prompt_cache_pipeline)
+    assert prompt_cache_pipeline.text_encoder.calls.count("encode") == 1
+    assert torch.equal(first[0], hit[0])
+    assert (cache.hits, cache.misses) == (1, 1)
+    cache.clear()
+    _encode_condition(prompt_cache_pipeline)
+    assert prompt_cache_pipeline.text_encoder.calls.count("encode") == 2 and cache.misses == 2
+
+
+def test_prompt_cache_owns_cpu_conditions(prompt_cache_pipeline):
+    cache = _install_prompt_cache(prompt_cache_pipeline)
+    first = _encode_condition(prompt_cache_pipeline)
+    expected = first[0].clone()
+    first[0].fill_(77)
+    first[1].fill_(99)
+    with torch.inference_mode():
+        prompt_cache_pipeline.text_encoder.last_output.fill_(88)
+    hit = _encode_condition(prompt_cache_pipeline)
+    assert torch.equal(hit[0], expected) and hit[1].tolist() == [1] * 4
+    hit[0].fill_(99)
+    assert torch.equal(_encode_condition(prompt_cache_pipeline)[0], expected)
+    for condition in (*cache._store.values(), hit):
+        for tensor in condition:
+            assert tensor.device.type == "cpu"
+            assert not tensor.requires_grad and not torch.is_inference(tensor)
+
+
+def test_prompt_cache_eviction_reaches_native_encoder(prompt_cache_pipeline):
+    cache = _install_prompt_cache(prompt_cache_pipeline, max_size=1)
+    for prompt in ("a", "b", "a"):
+        _encode_condition(prompt_cache_pipeline, prompt)
+    assert prompt_cache_pipeline.text_encoder.calls.count("encode") == 3
+    assert cache.stats()["size"] == 1
+
+
+def test_prompt_cache_references_bypass_without_poisoning_text_entry(prompt_cache_pipeline):
+    from PIL import Image
+
+    cache = _install_prompt_cache(prompt_cache_pipeline)
+    expected = _encode_condition(prompt_cache_pipeline)[0]
+    prompt_cache_pipeline.processor = SimpleNamespace(image_processor=_PromptCacheImageProcessor())
+    for color in ("red", "blue"):
+        _encode_condition(prompt_cache_pipeline, references=[Image.new("RGB", (32, 32), color)])
+    assert torch.equal(_encode_condition(prompt_cache_pipeline)[0], expected)
+    assert prompt_cache_pipeline.text_encoder.calls.count("encode") == 3
+    assert (cache.hits, cache.bypassed) == (1, 2)
+
+
+class _PromptCacheImageProcessor:
+    merge_size = 2
+
+    def __call__(self, images, return_tensors):
+        return {"pixel_values": torch.zeros(len(images), 3), "image_grid_thw": torch.tensor([[1, 2, 2]] * len(images))}
+
+
+@pytest.mark.parametrize("parallel", ["distributed", "encoder_tp", "nonzero_rank"])
+def test_prompt_cache_parallel_bypass_before_lookup(prompt_cache_pipeline, monkeypatch, parallel):
+    cache = _install_prompt_cache(prompt_cache_pipeline)
+    _encode_condition(prompt_cache_pipeline)
+    if parallel == "distributed":
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    elif parallel == "encoder_tp":
+        prompt_cache_pipeline.text_encoder_tp_size = 2
+    else:
+        prompt_cache_pipeline._dit_rank = 1
+        monkeypatch.setattr(h3i, "_broadcast_tensor", lambda tensor, **kwargs: torch.zeros(4, 4))
+    _encode_condition(prompt_cache_pipeline)
+    assert cache.bypassed == 1 and cache.hits == 0
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_prompt_cache_off_preserves_original_conditions(prompt_cache_pipeline, installed):
+    if installed:
+        _install_prompt_cache(prompt_cache_pipeline).enabled = False
+    result = _encode_condition(prompt_cache_pipeline)
+    assert result[0].data_ptr() == prompt_cache_pipeline.text_encoder.last_output.data_ptr()
+    assert torch.is_inference(result[0])
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(lambda p: setattr(p, "text_encoder", _PromptCacheEncoder()), id="encoder"),
+        pytest.param(lambda p: setattr(p, "tokenizer", _PromptCacheTokenizer()), id="tokenizer"),
+        pytest.param(lambda p: p.text_encoder.text_model.config.update(hidden_size=8), id="text_config"),
+        pytest.param(lambda p: setattr(p.text_encoder, "cudnn_sdp", True), id="cudnn"),
+    ],
+)
+def test_prompt_cache_encoding_context_change_invalidates(prompt_cache_pipeline, change):
+    cache = _install_prompt_cache(prompt_cache_pipeline)
+    _encode_condition(prompt_cache_pipeline)
+    change(prompt_cache_pipeline)
+    _encode_condition(prompt_cache_pipeline)
+    assert cache.misses == 2 and cache.hits == 0 and cache.stats()["size"] == 1
+
+
+@pytest.mark.parametrize(
+    ("attribute", "prompt"),
+    [("lstrip", " cat"), ("rstrip", "cat "), ("single_word", "scat"), ("normalized", "SCAT")],
+)
+def test_prompt_cache_added_token_matching_change_invalidates(prompt_cache_pipeline, attribute, prompt):
+    from tokenizers import AddedToken, Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.normalizers import Lowercase
+    from transformers import PreTrainedTokenizerFast
+
+    # Real tokenization changes while vocabulary IDs and length stay identical.
+    vocab = {token: i for i, token in enumerate(["[UNK]", "cat", " ", "s", "scat", *_FakeTokenizer.special])}
+    backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+    backend.normalizer = Lowercase()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+    prompt_cache_pipeline.tokenizer = tokenizer
+    tokenizer.add_tokens([AddedToken("cat", normalized=False)])
+    before_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    before_vocab, before_length = tokenizer.get_added_vocab(), len(tokenizer)
+    cache = _install_prompt_cache(prompt_cache_pipeline)
+    _encode_condition(prompt_cache_pipeline, prompt)
+    tokenizer.add_tokens([AddedToken("cat", **{"normalized": False, attribute: True})])
+    after_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    assert before_ids != after_ids
+    assert tokenizer.get_added_vocab() == before_vocab and len(tokenizer) == before_length
+    result = _encode_condition(prompt_cache_pipeline, prompt)
+    assert prompt_cache_pipeline.text_encoder.calls.count("encode") == 2
+    assert result[0].shape[0] == len(after_ids) and result[1].tolist() == [1] * len(after_ids)
+    assert torch.equal(_encode_condition(prompt_cache_pipeline, prompt)[0], result[0])
+    assert (cache.misses, cache.hits, cache.stats()["size"]) == (2, 1, 1)
+
+
+def test_prompt_cache_vae_configuration_preserves_text_entry(prompt_cache_pipeline):
+    cache = _install_prompt_cache(prompt_cache_pipeline)
+    expected = _encode_condition(prompt_cache_pipeline)
+    prompt_cache_pipeline.od_config.additional_config["vae_tile_parallel"] = False
+    result = _encode_condition(prompt_cache_pipeline)
+    assert prompt_cache_pipeline.text_encoder.calls.count("encode") == 1
+    assert (cache.misses, cache.hits, cache.stats()["size"]) == (1, 1, 1)
+    assert all(torch.equal(actual, original) for actual, original in zip(result, expected, strict=True))
+
+
+def test_prompt_cache_weight_reload_clears_before_failure(prompt_cache_pipeline):
+    cache = _install_prompt_cache(prompt_cache_pipeline)
+    _encode_condition(prompt_cache_pipeline)
+    with pytest.raises(ValueError, match="unexpected"):
+        prompt_cache_pipeline.load_weights([("invalid.weight", torch.zeros(1))])
+    assert cache.stats()["size"] == 0
+    _encode_condition(prompt_cache_pipeline)
+    assert prompt_cache_pipeline.text_encoder.calls.count("encode") == 2
