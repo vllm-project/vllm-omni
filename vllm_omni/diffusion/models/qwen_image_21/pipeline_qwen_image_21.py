@@ -470,12 +470,13 @@ class QwenImage21Pipeline(
         self._img_token_id = self.processor.tokenizer.encode("<|image_pad|>")[0]
         self._max_length = 8192
 
-        # Whether the decoder may be compiled. The compile itself is deferred to the first
-        # decode, see `_maybe_compile_decoder`. Same gate as the other pipelines that compile
-        # their VAE: `--enforce-eager` vetoes it and the platform must support inductor.
+        # Decoder compilation is opt-in because each new spatial shape may compile
+        # on the request path. Eager mode and platforms without Inductor veto it.
         from vllm_omni.platforms import current_omni_platform
 
-        self._decoder_compile_allowed = vae_compile_allowed(bool(self.od_config.enforce_eager), current_omni_platform)
+        self._decoder_compile_allowed = self.od_config.additional_config.get(
+            "qwen_image_21_compile_vae_decoder"
+        ) is True and vae_compile_allowed(bool(self.od_config.enforce_eager), current_omni_platform)
         self._decoder_compile_attempted = False
         self._decoder_eager_forward: Callable[..., torch.Tensor] | None = None
 
