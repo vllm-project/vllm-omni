@@ -973,10 +973,11 @@ class HeliosPipeline(
 
         Runs worker-side while the decoded tensor still lives on the worker
         accelerator, before the chunk output is shipped to the engine. The
-        generated frames pass through unchanged; only the intermediate frames
-        are synthesized. Returns the tensor unchanged when the feature is
-        disabled, otherwise an output envelope carrying the interpolated video
-        and the FPS multiplier metadata consumed by the serving layer.
+        generated frames are restored bit-exactly; only the intermediate
+        frames come from the interpolator. Returns the tensor unchanged when
+        the feature is disabled, otherwise an output envelope carrying the
+        interpolated video and the FPS multiplier metadata consumed by the
+        serving layer.
         """
         if not getattr(sampling, "enable_frame_interpolation", False):
             return video
@@ -986,6 +987,10 @@ class HeliosPipeline(
             scale=sampling.frame_interpolation_scale,
             model_path=sampling.frame_interpolation_model_path,
         )
+        # The interpolator's float32 range round-trip ([-1, 1] -> [0, 1] ->
+        # [-1, 1]) is not bit-exact for small half-precision pixels, so put
+        # the decoded frames back into their slots.
+        interpolated[:, :, :: int(multiplier)] = video
         return {
             "payload": {"video": interpolated},
             "metadata": {"video": {"video_fps_multiplier": int(multiplier)}},

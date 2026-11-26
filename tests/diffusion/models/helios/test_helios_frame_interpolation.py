@@ -37,8 +37,8 @@ _RIFE_AVAILABLE = os.path.isfile(os.path.join(_LOCAL_RIFE_PATH, "flownet.pkl"))
 def _fake_rife(video: torch.Tensor, exp: int, scale: float, model_path):
     """Deterministic stand-in matching the RIFE output contract.
 
-    Original frames pass through unchanged at even indices; synthesized
-    frames (simple midpoints) sit at odd indices. Frame count follows the
+    Original frames pass through unchanged at stride ``2**exp``; the other
+    slots hold synthesized frames (simple midpoints). Frame count follows the
     documented ``(N - 1) * 2**exp + 1`` formula for ``exp`` doubling steps.
     """
     for _ in range(exp):
@@ -50,10 +50,42 @@ def _fake_rife(video: torch.Tensor, exp: int, scale: float, model_path):
     return video, 2**exp
 
 
+def _fake_rife_with_range_roundtrip(video: torch.Tensor, exp: int, scale: float, model_path):
+    """``_fake_rife`` wrapped in the interpolator's float32 range round-trip.
+
+    Weight-free stand-in for ``interpolate_video_tensor`` that reproduces its
+    ``[-1, 1] -> [0, 1] -> [-1, 1]`` conversion, which perturbs small bf16
+    pixels in the original-frame slots.
+    """
+    normalized = video.to(torch.float32) * 0.5 + 0.5
+    interpolated, multiplier = _fake_rife(normalized, exp, scale, model_path)
+    return (interpolated * 2.0 - 1.0).to(video.dtype), multiplier
+
+
 def _make_decoded_video(num_frames: int = _PIXEL_T) -> torch.Tensor:
     return torch.linspace(-1.0, 1.0, _BATCH * 3 * num_frames * _PIXEL_H * _PIXEL_W).reshape(
         _BATCH, 3, num_frames, _PIXEL_H, _PIXEL_W
     )
+
+
+# Exactly representable in bf16, yet the interpolator's range round-trip
+# returns ``2**-20`` for it.
+_NEAR_ZERO_BF16 = 129 * 2**-27
+
+
+def _make_mixed_sign_bf16_video(num_frames: int = _PIXEL_T) -> torch.Tensor:
+    """bf16 video (the decoded-chunk dtype) that exercises the lossy range round-trip.
+
+    A negative pixel selects the ``[-1, 1] -> [0, 1]`` normalization branch,
+    and the near-zero value is planted in the first and last generated frame.
+    The plain linspace fixture cannot trigger the precision loss: none of its
+    values is small enough.
+    """
+    decoded = _make_decoded_video(num_frames=num_frames).to(torch.bfloat16)
+    decoded[0, 0, 0, 0, 0] = -0.5
+    decoded[0, 0, 0, 0, 1] = _NEAR_ZERO_BF16
+    decoded[0, 0, num_frames - 1, 0, 1] = _NEAR_ZERO_BF16
+    return decoded
 
 
 def _make_pipeline(decoded_video: torch.Tensor) -> helios_module.HeliosPipeline:
@@ -137,12 +169,37 @@ class TestPostDecodeFrameInterpolation:
             model_path="/tmp/rife",
         )
 
+    @pytest.mark.parametrize("exp", [1, 2])
+    def test_generated_frames_restored_bit_exactly(self, mocker: MockerFixture, exp: int) -> None:
+        # Weight-free regression: the interpolator's range round-trip perturbs
+        # small bf16 pixels, so the generated frames must be restored.
+        mocker.patch.object(
+            helios_module,
+            "interpolate_video_tensor",
+            side_effect=_fake_rife_with_range_roundtrip,
+        )
+        decoded = _make_mixed_sign_bf16_video(num_frames=5)
+        pipeline = _make_pipeline(decoded)
+        sampling = OmniDiffusionSamplingParams(enable_frame_interpolation=True, frame_interpolation_exp=exp)
+        state = _make_state(sampling)
+
+        result = pipeline.post_decode(state)
+
+        raw, _ = _fake_rife_with_range_roundtrip(decoded, exp, 1.0, None)
+        # The stand-in must really lose the planted value; otherwise this
+        # test would pass without the frame restore.
+        assert not torch.equal(raw[:, :, :: 2**exp], decoded), "fixture no longer triggers the precision loss"
+        video = result.output["payload"]["video"]
+        assert video.shape[2] == (5 - 1) * 2**exp + 1
+        # Generated frames are bit-identical to the decoded chunk ...
+        assert torch.equal(video[:, :, :: 2**exp], decoded)
+        # ... and every other slot is still what the interpolator synthesized.
+        raw[:, :, :: 2**exp] = decoded
+        assert torch.equal(video, raw)
+
     @pytest.mark.skipif(not _RIFE_AVAILABLE, reason="local RIFE weights not available")
     def test_generated_frames_pass_through_unchanged(self) -> None:
-        # bf16 matches the decoded-chunk dtype in production; the interpolator's
-        # range normalization round-trips bf16 bit-exactly, so generated frames
-        # can be compared with strict equality.
-        decoded = _make_decoded_video(num_frames=5).to(torch.bfloat16)
+        decoded = _make_mixed_sign_bf16_video(num_frames=5)
         pipeline = _make_pipeline(decoded)
         state = _make_state(
             OmniDiffusionSamplingParams(
@@ -156,10 +213,9 @@ class TestPostDecodeFrameInterpolation:
 
         video = result.output["payload"]["video"]
         assert video.shape[2] == (5 - 1) * 2 + 1
-        # RIFE runs on the worker accelerator; compare after moving to CPU.
-        video = video.cpu()
-        for idx, original_idx in enumerate(range(0, 5)):
-            assert torch.equal(video[:, :, idx * 2], decoded[:, :, original_idx])
+        # Real RIFE: the restore must line up with the interpolator's actual
+        # frame layout. RIFE runs on the worker accelerator; compare on CPU.
+        assert torch.equal(video[:, :, ::2].cpu(), decoded)
 
     def test_latent_output_skips_interpolation(self, mocker: MockerFixture) -> None:
         interpolate = mocker.patch.object(helios_module, "interpolate_video_tensor")

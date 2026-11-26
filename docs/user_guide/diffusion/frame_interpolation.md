@@ -35,9 +35,11 @@ Frame interpolation is currently supported for:
 Helios generates video in chunks. Interpolation runs worker-side inside
 `post_decode` while each decoded chunk still lives on the worker accelerator,
 so every streamed chunk is interpolated independently. Within a chunk the
-frame count follows the same `(N - 1) * 2**exp + 1` formula, and the actually
-generated frames pass through unchanged (they are bit-preserved through the
-interpolator's range normalization for the VAE's half-precision output).
+frame count follows the same `(N - 1) * 2**exp + 1` formula. After
+interpolation, the generated frames are restored bit-exactly from the decoded
+chunk: the interpolator's float32 range round-trip (`[-1, 1]` to `[0, 1]` and
+back) perturbs small half-precision pixels, so only the synthesized frames
+are taken from its output.
 Every chunk carries the same `video_fps_multiplier` metadata; the final
 chunk's metadata drives the output FPS in the API response.
 
@@ -46,7 +48,7 @@ chunk's metadata drives the output FPS in the API response.
 The video APIs `/v1/videos` and `/v1/videos/sync` accept:
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `enable_frame_interpolation` | bool | `false` | Enable post-generation frame interpolation |
 | `frame_interpolation_exp` | int | `1` | Interpolation exponent. `1=2x`, `2=4x`, etc. |
 | `frame_interpolation_scale` | float | `1.0` | RIFE inference scale |
