@@ -4,6 +4,7 @@
 
 from collections import OrderedDict
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any
 
 import numpy as np
@@ -13,10 +14,7 @@ from vllm.logger import init_logger
 from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.motubrain2_codec import pack_message, unpack_message
-from vllm_omni.entrypoints.openai.stage_params import (
-    get_default_sampling_params_list,
-    resolve_diffusion_sampling_params,
-)
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 router = APIRouter()
 logger = init_logger(__name__)
@@ -59,7 +57,12 @@ class Motubrain2Serving:
         count = sampling.get("n", 1)
         if isinstance(count, (bool, np.bool_)) or not isinstance(count, (int, np.integer)) or count != 1:
             raise ValueError("Motubrain produces a single action chunk per observation")
-        params = resolve_diffusion_sampling_params(get_default_sampling_params_list(self.engine_client))
+        for default in getattr(self.engine_client, "default_sampling_params_list", None) or ():
+            if isinstance(default, OmniDiffusionSamplingParams):
+                params = deepcopy(default)
+                break
+        else:
+            params = OmniDiffusionSamplingParams()
         seed = obs.get("seed")
         if seed is None:
             seed = sampling.get("seed")
