@@ -41,12 +41,15 @@ CASES = {
     },
     "edit": {"size": "2048x2048", "seed": 1234},
 }
-# The configured timeouts budget 39 minutes on CUDA and 44 on NPU, leaving time
+# The configured timeouts budget 39 minutes on CUDA and 65 on NPU, leaving time
 # for environment setup, snapshot resolution, and artifact handling.
 REFERENCE_PREFLIGHT_TIMEOUT_S = 180
 REFERENCE_GENERATION_TIMEOUT_S = 1200
-NPU_REFERENCE_GENERATION_TIMEOUT_S = 1500
+NPU_REFERENCE_GENERATION_TIMEOUT_S = 2100
+OMNI_INIT_TIMEOUT_S = 480
 OMNI_STARTUP_TIMEOUT_S = 600
+NPU_OMNI_INIT_TIMEOUT_S = 1200
+NPU_OMNI_STARTUP_TIMEOUT_S = 1260
 IMAGE_REQUEST_TIMEOUT_S = 180
 
 
@@ -115,8 +118,13 @@ def test_diffusers_similarity(accuracy_artifact_root):
     env = dict(os.environ)
     pythonpath = env.pop("PYTHONPATH", "")
     reference_timeout = REFERENCE_GENERATION_TIMEOUT_S
+    init_timeout = OMNI_INIT_TIMEOUT_S
+    startup_timeout = OMNI_STARTUP_TIMEOUT_S
     if device_type == "npu":
         reference_timeout = NPU_REFERENCE_GENERATION_TIMEOUT_S
+        # Cold checkpoint reads and first-op compilation extend Ascend startup.
+        init_timeout = NPU_OMNI_INIT_TIMEOUT_S
+        startup_timeout = NPU_OMNI_STARTUP_TIMEOUT_S
         env["PATH"] = f"{Path(python).parent}{os.pathsep}{env.get('PATH', os.defpath)}"
         # Keep the CANN compiler modules visible without inheriting serving packages.
         cann_home = env.get("ASCEND_HOME_PATH") or env.get("ASCEND_TOOLKIT_HOME")
@@ -142,11 +150,11 @@ def test_diffusers_similarity(accuracy_artifact_root):
         "--diffusion-offload-config",
         '{"mode":"layer","components":["dit","text_encoder"]}',
         "--init-timeout",
-        "480",
+        str(init_timeout),
     ]
     if device_type == "npu":
         args.append("--enforce-eager")
-    with OmniServer(model, args, startup_timeout=OMNI_STARTUP_TIMEOUT_S) as server:
+    with OmniServer(model, args, startup_timeout=startup_timeout) as server:
         url = f"http://{server.host}:{server.port}/v1/images/"
         for task, case in cases.items():
             request = {**common, **case}

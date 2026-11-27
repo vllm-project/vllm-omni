@@ -95,9 +95,11 @@ status to `selected`. The shared accuracy helpers resolve the device profile.
 All floors currently remain `null`. Gate mode requires each case to meet both
 floors and fails before model startup when the floors are unselected or invalid.
 
-A3 accuracy calibration is paused in Nightly while the Diffusers reference
-failure is investigated. Manual A3 runs use one die for each implementation.
-The Diffusers reference uses leaf-level offload for the text encoder and one
-block per group for the DiT, with a 25-minute generation timeout. For a manual
-run, initialize the CANN environment, source `setup_reference.sh`, and select
+A3 Nightly runs the same two cases on one die per implementation. The
+Diffusers reference uses leaf-level offload for the text encoder and one block
+per group for the DiT, with a 35-minute generation timeout. Omni has 20 minutes
+for engine initialization within a 21-minute server startup budget. The NPU
+phase budgets total 65 minutes of the 75-minute job, and the job retains the
+same calibration artifacts as CUDA. For a manual run, initialize the CANN
+environment, source `setup_reference.sh`, and select
 `full_model and npu and A3 and cards_1`.
