@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 import torch
@@ -80,7 +80,7 @@ class AdaLNWeightCache:
         *,
         max_gib: float,
         reserve_gib: float,
-        startup_bytes: int = 0,
+        streamed_peak_bytes: Callable[[frozenset[int]], int] | None = None,
         resident_ids: frozenset[int] = frozenset(),
     ) -> frozenset[int]:
         if self._originals:
@@ -98,7 +98,9 @@ class AdaLNWeightCache:
         size = sum(physical_storage_numel(t) * t.element_size() for _, t in tensors)
         if size > int(max_gib * 2**30):
             return self._fallback("cache_budget_exceeded", len(tensors), size)
-        reserve = int(reserve_gib * 2**30) + startup_bytes
+        reserve = int(reserve_gib * 2**30)
+        if streamed_peak_bytes is not None:
+            reserve += streamed_peak_bytes(resident_ids | frozenset(id(t) for _, t in tensors))
         try:
             free = int(current_omni_platform.get_free_memory(self.device))
         except (NotImplementedError, RuntimeError, ValueError, TypeError, OverflowError):

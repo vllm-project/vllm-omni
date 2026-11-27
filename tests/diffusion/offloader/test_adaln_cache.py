@@ -180,12 +180,28 @@ def test_backend_installs_cache_or_falls_back_and_preserves_repeated_execution(e
         assert torch.equal(raw(tensor), expected[id(tensor)])
 
 
-def test_startup_prefetch_budget_falls_back_without_cache(monkeypatch):
-    block = DiT().blocks[0]
-    cache = adaln_cache.AdaLNWeightCache(torch.device("cpu"))
-    monkeypatch.setattr(adaln_cache.current_omni_platform, "get_free_memory", lambda _: 1024**3)
-    assert not cache.prepare([block], max_gib=1, reserve_gib=0, startup_bytes=1024**3)
-    assert cache.status.reason == "insufficient_free_memory"
+def test_overlapping_prefetch_budget_falls_back_without_cache(monkeypatch):
+    pipeline = nn.Module()
+    pipeline.transformer = DiT()
+    blocks = pipeline.transformer.blocks
+    blocks.append(Block())
+    for block in blocks:
+        block.weight = nn.Parameter(torch.ones(16), requires_grad=False)
+    # Ordinary LO needs 184 bytes; cache + two streamed blocks needs 212.
+    monkeypatch.setattr(adaln_cache.current_omni_platform, "get_free_memory", lambda _: 200)
+    backend = LayerWiseOffloadBackend(
+        OffloadConfig(
+            strategy=OffloadStrategy.LAYER_WISE,
+            pin_cpu_memory=False,
+            enable_adaln_cache=True,
+            adaln_cache_max_gib=1,
+            adaln_cache_reserve_gib=0,
+        ),
+        torch.device("cpu"),
+    )
+    backend.enable(pipeline)
+    assert backend.enabled and backend.adaln_cache_status.reason == "insufficient_free_memory"
+    backend.disable()
 
 
 def test_a5_rejects_cache_before_tensor_selection_or_allocation(monkeypatch):

@@ -496,20 +496,28 @@ class LayerWiseOffloadBackend(OffloadBackend):
             # Place mandatory resident weights before measuring free memory.
             for component, stack in streamable_dits:
                 move_non_block_state_to_device(component.module, (stack.blocks,), self.device)
-            # Conservatively reserve the ordinary first-block prefetch for every stack.
-            startup_bytes = sum(
-                spec.storage_numel * spec.value.element_size()
-                for _, stack in streamable_dits
-                for block in [stack.blocks[0]]
-                for weights in group_named_tensors_by_dtype(
-                    _streamed_tensors(block.named_parameters(), self.resident_tensor_ids),
-                    _streamed_tensors(block.named_buffers(), self.resident_tensor_ids),
-                ).values()
-                for spec in describe_tensor_storage(weights)
-            )
+
+            def streamed_peak_bytes(resident_ids: frozenset[int]) -> int:
+                # Each ring retains the current block while allocating its successor.
+                peak = 0
+                for _, stack in streamable_dits:
+                    block_bytes = [
+                        sum(
+                            spec.storage_numel * spec.value.element_size()
+                            for weights in group_named_tensors_by_dtype(
+                                _streamed_tensors(block.named_parameters(), resident_ids),
+                                _streamed_tensors(block.named_buffers(), resident_ids),
+                            ).values()
+                            for spec in describe_tensor_storage(weights)
+                        )
+                        for block in stack.blocks
+                    ]
+                    peak += max(a + b for a, b in zip(block_bytes, block_bytes[1:] + block_bytes[:1], strict=True))
+                return peak
+
             cached_ids = self._adaln_cache.prepare(
                 (block for _, stack in streamable_dits for block in stack.blocks),
-                startup_bytes=startup_bytes,
+                streamed_peak_bytes=streamed_peak_bytes,
                 resident_ids=self.resident_tensor_ids,
                 max_gib=self.config.adaln_cache_max_gib,
                 reserve_gib=self.config.adaln_cache_reserve_gib,
