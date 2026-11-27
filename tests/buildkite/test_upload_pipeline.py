@@ -15,6 +15,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "common" / "scripts"))
 
+import upload_pipeline  # noqa: E402
 from ci_conditions import NIGHTLY_LABEL_IF, RELEASE_LINE_BUILDKITE_PATTERN  # noqa: E402
 from skip_ci import resolve_ci_decision  # noqa: E402
 from upload_pipeline import (  # noqa: E402
@@ -33,6 +34,7 @@ from upload_pipeline import (  # noqa: E402
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
+NPU_BOOTSTRAP_STEPS = Path(".buildkite/npu/bootstrap-upload-steps.yml")
 CUDA_READY_YAML = Path(".buildkite/cuda/test-ready.yml")
 AMD_MERGE_YAML = Path(".buildkite/amd/test-amd-merge.yml")
 NIGHTLY_YAML = Path(".buildkite/cuda/test-nightly.yml")
@@ -52,6 +54,83 @@ def _render(changed_files: list[str]) -> str:
         decision=decision,
         path=CUDA_BOOTSTRAP_STEPS,
     )
+
+
+@pytest.mark.parametrize(
+    ("bootstrap", "body", "expected", "image_key"),
+    [
+        (CUDA_BOOTSTRAP_STEPS, "/bk-cuda Simple Test", "Simple Test", "image-build"),
+        (
+            CUDA_BOOTSTRAP_STEPS,
+            "/bk-cuda nightly-omni-minicpmo-4-5-default-seed-tts",
+            "nightly-omni-minicpmo-4-5-default-seed-tts",
+            "image-build",
+        ),
+        (CUDA_BOOTSTRAP_STEPS, "/bk-cuda unknown-job", None, None),
+        (CUDA_BOOTSTRAP_STEPS, "/bk-cuda Omni · Qwen3-Omni Test", None, None),
+        (CUDA_BOOTSTRAP_STEPS, "/bk-cuda ready/Omni · Qwen3-Omni Test", "Omni · Qwen3-Omni Test", "image-build"),
+        (CUDA_BOOTSTRAP_STEPS, "/bk-cuda Simple Test\n/bk-npu ready-platforms-test", None, None),
+        (CUDA_BOOTSTRAP_STEPS, "/bk-npu Simple Test", None, None),
+        (NPU_BOOTSTRAP_STEPS, "/bk-npu ready-platforms-test", "ready-platforms-test", "image-build-a3"),
+        (NPU_BOOTSTRAP_STEPS, "/bk-npu ready-npu-ipc-weight-sharing", "ready-npu-ipc-weight-sharing", "image-build-a2"),
+        (NPU_BOOTSTRAP_STEPS, "/bk-npu ready-platforms-test-310p", "ready-platforms-test-310p", "image-build-310p"),
+        (
+            NPU_BOOTSTRAP_STEPS,
+            "/bk-npu nightly-omni-performance-async-chunk",
+            "nightly-omni-performance-async-chunk",
+            "image-build-a3",
+        ),
+        (NPU_BOOTSTRAP_STEPS, "/bk-npu lingbot-npu-nightly-accuracy", None, None),
+        (NPU_BOOTSTRAP_STEPS, "/bk-cuda ready-platforms-test", None, None),
+    ],
+)
+def test_comment_job_upload(monkeypatch, capsys, bootstrap, body, expected, image_key):
+    monkeypatch.setenv("BUILDKITE_GITHUB_EVENT", "issue_comment")
+    monkeypatch.setenv("BUILDKITE_PULL_REQUEST", "123")
+    monkeypatch.delenv("BUILDKITE_PULL_REQUEST_LABELS", raising=False)
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    monkeypatch.setattr(sys, "argv", ["upload_pipeline.py", "--upload", str(bootstrap)])
+
+    def read_webhook(args, **kwargs):
+        assert args == ["buildkite-agent", "meta-data", "get", "buildkite:webhook"]
+        return json.dumps({"action": "created", "comment": {"body": body}})
+
+    uploads = []
+    monkeypatch.setattr(upload_pipeline.subprocess, "check_output", read_webhook)
+    monkeypatch.setattr(upload_pipeline, "_upload_to_buildkite", uploads.append)
+
+    assert upload_pipeline.main() == (1 if expected is None else 0)
+    if expected is None:
+        assert not uploads
+        assert capsys.readouterr().err
+        return
+
+    assert len(uploads) == 1
+    image, job = yaml.safe_load(uploads[0])["steps"]
+    assert expected in (job.get("key"), job["label"])
+    assert image["key"] == job["depends_on"] == image_key
+    assert "if" not in job
+    assert "automatic_shard" not in job
+    assert job.get("parallelism", 1) == 1
+
+
+@pytest.mark.parametrize("bootstrap", [CUDA_BOOTSTRAP_STEPS, NPU_BOOTSTRAP_STEPS])
+def test_label_event_uses_regular_bootstrap(monkeypatch, bootstrap):
+    monkeypatch.setenv("BUILDKITE_GITHUB_EVENT", "pull_request")
+    monkeypatch.setenv("BUILDKITE_GITHUB_ACTION", "labeled")
+    monkeypatch.setenv("BUILDKITE_PULL_REQUEST_LABELS", "ready")
+    monkeypatch.setattr(sys, "argv", ["upload_pipeline.py", "--upload", str(bootstrap)])
+    uploads = []
+
+    def render_pipeline(path, *, force_all, e2e_only):
+        assert path == upload_pipeline.ROOT / bootstrap
+        assert not force_all and not e2e_only
+        return "regular bootstrap"
+
+    monkeypatch.setattr(upload_pipeline, "_render_pipeline", render_pipeline)
+    monkeypatch.setattr(upload_pipeline, "_upload_to_buildkite", uploads.append)
+    assert upload_pipeline.main() == 0
+    assert uploads == ["regular bootstrap"]
 
 
 @pytest.mark.parametrize("pytest_exit", [0, 1, 124])

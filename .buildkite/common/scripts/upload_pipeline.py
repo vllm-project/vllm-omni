@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import re
 import subprocess
@@ -682,6 +683,9 @@ def _shard_timings() -> dict[str, float] | None:
 
 
 def _plan_automatic_shard(step: dict[str, Any]) -> dict[str, Any]:
+    if "automatic_shard" not in step:
+        return step
+
     from runtime_shard import apply_automatic_shard
 
     return apply_automatic_shard(step, timings=_shard_timings(), root=ROOT, log=_log)
@@ -955,6 +959,87 @@ def _upload_to_buildkite(content: str) -> None:
     )
 
 
+def _comment_job_selector(platform: str) -> str:
+    if not os.environ.get("BUILDKITE_PULL_REQUEST", "").isdigit():
+        raise ValueError("single-job builds require a GitHub PR conversation comment")
+    webhook = subprocess.check_output(
+        ["buildkite-agent", "meta-data", "get", "buildkite:webhook"], text=True, encoding="utf-8"
+    )
+    payload = json.loads(webhook)
+    body = payload["comment"]["body"].strip()
+    command = f"/bk-{platform}"
+    match = re.fullmatch(rf"{command}[ \t]+([^\r\n]+)", body)
+    if payload.get("action") != "created" or not match:
+        raise ValueError(f"expected a new PR comment of the form {command} <step key or exact YAML label>")
+    return match[1]
+
+
+def _render_comment_job(selector: str, bootstrap_path: Path) -> str:
+    """Upload one command step plus its image prerequisite, independent of PR labels."""
+    platform = _get_bootstrap_platform(bootstrap_path)
+    test_prefix = "test-npu" if platform == "npu" else "test"
+    tiers = ("ready", "nightly") if platform == "npu" else ("ready", "merge", "nightly", "weekly")
+    prefix, separator, name = selector.partition("/")
+    if separator and prefix in tiers:
+        tiers = (prefix,)
+        selector = name
+
+    matches = []
+    for tier in tiers:
+        path = bootstrap_path.with_name(f"{test_prefix}-{tier}.yml")
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        upload_key = f"upload-{tier}-pipeline"
+        for group in doc["steps"]:
+            # Only groups admitted on PRs are eligible. Scheduled-only groups and
+            # standalone maintenance steps (such as the nightly report) stay out.
+            if not isinstance(group, dict) or group.get("depends_on") != upload_key:
+                continue
+            condition = group.get("if")
+            if condition and condition.rsplit(" || ", 1)[-1] != f'build.pull_request.labels includes "{tier}-test"':
+                continue
+            for step in group.get("steps", []):
+                if isinstance(step, dict) and selector in (step.get("key"), step.get("label")):
+                    matches.append((doc, path, step))
+
+    if not matches:
+        raise ValueError(f"no {platform.upper()} PR step matches {selector!r}")
+    if len(matches) > 1:
+        raise ValueError(
+            f"multiple {platform.upper()} PR steps match {selector!r}; "
+            "use a unique step key or prefix the label with its tier/"
+        )
+    doc, path, step = matches[0]
+    if (
+        not (step.get("command") or step.get("commands"))
+        or {"if", "skip", "depends_on"}.intersection(step)
+        or step.get("parallelism", 1) != 1
+    ):
+        raise ValueError(f"step {selector!r} cannot run as an independent job")
+
+    step = dict(step)
+    step.pop("automatic_shard", None)
+    selected = _render_test_pipeline({**doc, "steps": [step]}, None, pipeline_path=path)
+    if not selected["steps"]:
+        raise ValueError(f"step {selector!r} is unavailable with the configured CUDA hardware selector")
+    job = selected["steps"][0]
+    bootstrap = yaml.safe_load(_load_bootstrap_steps(bootstrap_path))
+    image_steps = [step for step in bootstrap["steps"] if step.get("key") in BOOTSTRAP_IMAGE_BUILD_KEYS]
+    if platform == "npu":
+        # Match the rendered preset's image to the image actually published by
+        # each bootstrap step. This also covers A2/B3, whose tag has no suffix.
+        image_steps = [
+            step
+            for step in image_steps
+            if "{IMAGE_REGISTRY}/{IMAGE_NAME}:{VLLM_IMAGE_TAG}".format_map(step["env"]) == job.get("image")
+        ]
+    if len(image_steps) != 1:
+        raise ValueError(f"could not identify a unique CI image build for step {selector!r}")
+    (image,) = image_steps
+    job["depends_on"] = image["key"]
+    selected["steps"].insert(0, image)
+    return yaml.safe_dump(selected, sort_keys=False, width=4096)
+
+
 # --- CLI ---
 
 
@@ -991,7 +1076,18 @@ def main() -> int:
         _log(f"missing pipeline file: {path}")
         return 1
 
-    rendered = _render_pipeline(path, force_all=args.all, e2e_only=args.e2e)
+    if (
+        os.environ.get("BUILDKITE_GITHUB_EVENT") == "issue_comment"
+        and path.resolve().parent in (ROOT / ".buildkite/cuda", ROOT / ".buildkite/npu")
+        and path.name == BOOTSTRAP_STEPS_FILENAME
+    ):
+        try:
+            rendered = _render_comment_job(_comment_job_selector(_get_bootstrap_platform(path)), path)
+        except (ValueError, KeyError, subprocess.CalledProcessError) as exc:
+            _log(str(exc))
+            return 1
+    else:
+        rendered = _render_pipeline(path, force_all=args.all, e2e_only=args.e2e)
     if args.upload:
         _upload_shard_file_lists()
         _upload_to_buildkite(rendered)
