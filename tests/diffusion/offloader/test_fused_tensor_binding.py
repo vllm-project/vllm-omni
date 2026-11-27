@@ -156,6 +156,36 @@ def test_plan_builds_fused_bindings_in_loader_order(tmp_path, monkeypatch) -> No
     assert len(gate_up.file_paths) == 2
 
 
+def test_plan_opens_each_fused_checkpoint_file_once(tmp_path, monkeypatch) -> None:
+    """Fused preflight metadata reads are grouped per file, not per slice.
+
+    All five checkpoint keys backing the fused qkv/gate_up tensors live in one
+    shard, so the preflight must open that header once; opening it per source
+    slice would enumerate the shard's keys quadratically as real encoders add
+    more layers to the same file.
+    """
+    from safetensors import safe_open as real_safe_open
+
+    import vllm_omni.diffusion.model_loader.host_weight_plan as plan_module
+
+    opens: list[str] = []
+
+    def counting_safe_open(file_path, **kwargs):
+        opens.append(file_path)
+        return real_safe_open(file_path, **kwargs)
+
+    monkeypatch.setattr(plan_module, "safe_open", counting_safe_open)
+
+    result, _ = _build_plan(tmp_path, monkeypatch)
+
+    assert result.fallback_reason is None
+    shard = str(tmp_path / "text_encoder" / "model.safetensors")
+    # One open for checkpoint key discovery and one for the fused metadata
+    # preflight: the per-slice preflight this guards against would open the
+    # header once per source slice instead.
+    assert opens == [shard, shard]
+
+
 def test_plan_fails_closed_without_a_fusion_policy(tmp_path, monkeypatch) -> None:
     import vllm_omni.diffusion.model_loader.host_weight_plan as plan_module
 

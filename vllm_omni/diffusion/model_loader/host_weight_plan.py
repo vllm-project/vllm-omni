@@ -351,25 +351,42 @@ def _validate_source_metadata(
                         f"transformed={runtime_dtype}, runtime={target.dtype}"
                     )
 
-    for runtime_name, (target, binding) in fused.items():
-        slices: list[torch.Tensor] = []
+    fused_sources: dict[str, dict[str, list[str]]] = {}
+    for runtime_name, (_target, binding) in fused.items():
         for checkpoint_key, file_path in zip(binding.checkpoint_keys, binding.file_paths, strict=True):
-            if not os.path.isfile(file_path):
-                raise _PlanIncompatibleError(f"checkpoint file does not exist: {file_path}")
-            with safe_open(file_path, framework="pt", device="cpu") as handle:
-                if checkpoint_key not in set(handle.keys()):
+            fused_sources.setdefault(file_path, {}).setdefault(checkpoint_key, []).append(runtime_name)
+    # One header open and one key enumeration per file, matching the ordinary
+    # branch above, keeps startup linear in the shard's key count instead of
+    # quadratic in the number of fused source slices.
+    fused_slices: dict[tuple[str, str], torch.Tensor] = {}
+    for file_path, keys in fused_sources.items():
+        if not os.path.isfile(file_path):
+            raise _PlanIncompatibleError(f"checkpoint file does not exist: {file_path}")
+        with safe_open(file_path, framework="pt", device="cpu") as handle:
+            available = set(handle.keys())
+            for checkpoint_key, runtime_names in keys.items():
+                if checkpoint_key not in available:
                     raise _PlanIncompatibleError(
                         f"checkpoint key {checkpoint_key!r} for fused tensor "
-                        f"{runtime_name!r} is missing from {file_path}"
+                        f"{runtime_names[0]!r} is missing from {file_path}"
                     )
                 source = handle.get_slice(checkpoint_key)
                 source_dtype = _SAFETENSORS_DTYPES.get(source.get_dtype())
                 if source_dtype is None:
+                    first_target = fused[runtime_names[0]][0]
                     raise _PlanIncompatibleError(
-                        f"dtype mismatch for fused tensor {runtime_name!r}: "
-                        f"checkpoint={source.get_dtype()}, runtime={target.dtype}"
+                        f"dtype mismatch for fused tensor {runtime_names[0]!r}: "
+                        f"checkpoint={source.get_dtype()}, runtime={first_target.dtype}"
                     )
-                slices.append(torch.empty(tuple(source.get_shape()), dtype=source_dtype, device="meta"))
+                fused_slices[(file_path, checkpoint_key)] = torch.empty(
+                    tuple(source.get_shape()), dtype=source_dtype, device="meta"
+                )
+
+    for runtime_name, (target, binding) in fused.items():
+        slices: list[torch.Tensor] = [
+            fused_slices[(file_path, checkpoint_key)]
+            for checkpoint_key, file_path in zip(binding.checkpoint_keys, binding.file_paths, strict=True)
+        ]
         if binding.fuse is None:
             raise _PlanIncompatibleError(
                 f"fused tensor {runtime_name!r} has no fusion callable; a multi-entry binding cannot be staged"
