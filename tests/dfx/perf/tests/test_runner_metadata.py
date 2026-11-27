@@ -1010,7 +1010,11 @@ def test_perf_sweep_collects_all_baseline_regressions(monkeypatch, pytestconfig)
         ([167.096, 155.2, 156.0], False),
     ],
 )
-def test_perf_sweep_confirms_h100_ttfp_with_median(monkeypatch, tmp_path, ttfp_values, passes):
+@pytest.mark.parametrize(
+    "sweep_name,sweep_value",
+    [("max_concurrency", 64), ("request_rate", 0.5)],
+)
+def test_perf_sweep_confirms_h100_ttfp_with_median(monkeypatch, tmp_path, ttfp_values, passes, sweep_name, sweep_value):
     from tests.dfx.conftest import BENCHMARK_RESULT_PATH_KEY, PerformanceBaselineRegressionError
     from tests.dfx.perf.scripts import run_benchmark
 
@@ -1052,7 +1056,7 @@ def test_perf_sweep_confirms_h100_ttfp_with_median(monkeypatch, tmp_path, ttfp_v
         "test_name": config["test_name"],
         "params": {
             "num_prompts": [4],
-            "max_concurrency": [64],
+            sweep_name: [sweep_value],
             "baseline_confirmation": {
                 "H100": {
                     "metrics": ["median_audio_ttfp_ms", "mean_audio_ttfp_ms"],
@@ -1080,6 +1084,7 @@ def test_perf_sweep_confirms_h100_ttfp_with_median(monkeypatch, tmp_path, ttfp_v
             )
 
     assert len(calls) == 3
+    assert [call["flow"] for call in calls] == [sweep_value] * 3
     assert all("--baseline-confirmation" not in call["args"] for call in calls)
     assert [call.get("result_filename_suffix") for call in calls] == [None, "confirmation-2", "confirmation-3"]
     result_paths = list(tmp_path.glob("attempt-*.json"))
