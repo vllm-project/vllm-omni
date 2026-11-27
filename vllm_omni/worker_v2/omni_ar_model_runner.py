@@ -169,8 +169,17 @@ class OmniARModelRunner(OmniGPUModelRunner):
         num_tokens = min(num_tokens, self.max_num_reqs * self.max_model_len)
         return super()._dummy_run(num_tokens, *args, **kwargs)
 
+    @property
+    def _model_state_drafts(self) -> bool:
+        """Whether the speculator drafts through the model state (Higgs audio)."""
+        return hasattr(self.speculator, "bind_model_state")
+
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         super().load_model(*args, **kwargs)
+        if self._model_state_drafts:
+            # The model state embeds and verifies these drafts in its sampler.
+            self.speculator.bind_model_state(self.model_state)
+            return
         if (
             self.num_speculative_steps > 0
             and self.is_last_pp_rank
@@ -555,6 +564,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
     ) -> None:
         """Draft the next step's tokens, as the parent runner's ``sample_tokens`` does."""
         num_spec_tokens = draft.num_spec_tokens
+        if self._model_state_drafts:
+            proposal = self.speculator.reserve_audio_drafts(self.model_state, input_batch, num_sampled, num_spec_tokens)
+            if proposal is not None:
+                rows, control = proposal
+                self.req_states.draft_tokens[input_batch.idx_mapping[rows]] = control
+            return
         if self._kstep_frames > 1:
             # The placeholders reserve query positions for the next Talker
             # step. Only rows with confirmed codec state may enter that loop.
