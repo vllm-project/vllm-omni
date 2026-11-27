@@ -3,6 +3,7 @@
 """CPU dispatch, padding and fallback checks; NPU benchmarks run separately."""
 
 import importlib.util
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,21 +45,46 @@ def test_scope_resets_after_exception():
 
 
 def test_unsupported_conv_contract():
-    class OtherConv(nn.Conv3d):
-        pass
-
-    assert not ops._supported_module(OtherConv(4, 8, 3))
-    assert not ops._supported_module(nn.Conv3d(4, 8, 3, padding=1))
+    assert not ops._supported_layout(nn.Conv3d(4, 8, 3, padding=1))
 
 
-def test_checkpoint_type_identity_rejects_same_name_subclass():
+def _checkpoint_model(monkeypatch):
     class SpatialParallelConv3d(nn.Conv3d):
+        def __init__(self):
+            super().__init__(4, 8, 3, padding=1)
+            self.causal = True
+            self.pad_mode_t = "constant"
+            self.pad_mode = "reflect"
+
+    class EncoderFCN3D(nn.Module):
         pass
 
-    impostor = type("SpatialParallelConv3d", (SpatialParallelConv3d,), {})
-    assert ops._supported_module(SpatialParallelConv3d(4, 8, 3), SpatialParallelConv3d)
-    assert not ops._supported_module(impostor(4, 8, 3), SpatialParallelConv3d)
-    assert not ops._supported_module(SpatialParallelConv3d(4, 8, 3))
+    namespace = sys.modules[__name__]
+    monkeypatch.setattr(namespace, "SpatialParallelConv3d", SpatialParallelConv3d, raising=False)
+    monkeypatch.setattr(namespace, "EncoderFCN3D", EncoderFCN3D, raising=False)
+    model = nn.Module()
+    model.encoder = EncoderFCN3D()
+    model.encoder.conv = SpatialParallelConv3d()
+    return model
+
+
+def test_checkpoint_type_identity_rejects_same_name_subclass(monkeypatch):
+    model = _checkpoint_model(monkeypatch)
+    impostor = type("SpatialParallelConv3d", (type(model.encoder.conv),), {})
+    model.quant_conv = impostor()
+    assert ops.install_npu_image_conv(model, device=Device()) == 1
+    assert hasattr(model.encoder.conv, "_omni_image_conv_forward")
+    assert not hasattr(model.quant_conv, "_omni_image_conv_forward")
+
+
+@pytest.mark.parametrize("attribute", ["causal", "pad_mode_t", "pad_mode"])
+def test_missing_checkpoint_attribute_keeps_original_forward(monkeypatch, attribute):
+    model = _checkpoint_model(monkeypatch)
+    conv = model.encoder.conv
+    original = conv.forward
+    delattr(conv, attribute)
+    assert ops.install_npu_image_conv(model, device=Device()) == 0
+    assert conv.forward == original
 
 
 @pytest.mark.parametrize("padding_mode", ["reflect", "replicate", "circular"])
@@ -137,7 +163,7 @@ def _cached_model(monkeypatch):
     model.decoder = nn.Conv3d(2, 3, 3).eval()
     # CPU tests isolate cache semantics; the remote-code allowlist and NPU
     # numerical dispatch are validated separately against real checkpoint code.
-    monkeypatch.setattr(ops, "_supported_module", lambda *_: True)
+    monkeypatch.setattr(ops, "_supported_layout", lambda *_: True)
     assert ops.install_npu_image_conv(model, device=Device()) == 1
     return model
 

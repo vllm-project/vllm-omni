@@ -17,10 +17,16 @@ import torch.nn.functional as F
 _IMAGE_ENCODE = ContextVar("h3_npu_image_conv", default=False)
 
 
-def _supported_module(module: nn.Module, conv_type: type[nn.Conv3d] | None = None) -> bool:
+def _supported_layout(module: nn.Conv3d) -> bool:
     if type(module) is nn.Conv3d:
         return module.kernel_size[0] == 1 and module.padding == (0, 0, 0) and module.padding_mode == "zeros"
-    return type(module) is conv_type
+    return (
+        getattr(module, "causal", False)
+        and getattr(module, "pad_mode_t", None) == "constant"
+        and module.kernel_size[0] in (1, 3)
+        and module.padding[0] == module.kernel_size[0] // 2
+        and getattr(module, "pad_mode", None) in ("constant", "reflect", "replicate")
+    )
 
 
 @contextmanager
@@ -34,7 +40,7 @@ def image_encode_context() -> Iterator[None]:
 
 
 def _eligible(module: nn.Conv3d, x: torch.Tensor) -> bool:
-    if not (
+    return (
         _IMAGE_ENCODE.get()
         and not torch.compiler.is_compiling()
         and not module.training
@@ -49,16 +55,7 @@ def _eligible(module: nn.Conv3d, x: torch.Tensor) -> bool:
         and module.groups == 1
         and module.dilation == (1, 1, 1)
         and not getattr(module, "spatial_parallel", False)
-    ):
-        return False
-    if type(module) is nn.Conv3d:
-        return module.kernel_size[0] == 1 and module.padding == (0, 0, 0) and module.padding_mode == "zeros"
-    return (
-        module.causal
-        and module.pad_mode_t == "constant"
-        and module.kernel_size[0] in (1, 3)
-        and module.padding[0] == module.kernel_size[0] // 2
-        and module.pad_mode in ("constant", "reflect", "replicate")
+        and _supported_layout(module)
     )
 
 
@@ -159,7 +156,7 @@ def install_npu_image_conv(model: nn.Module, *, device: torch.device) -> int:
         conv_type = None
     installed = 0
     for module in _encoder_modules(model):
-        if not isinstance(module, nn.Conv3d) or not _supported_module(module, conv_type):
+        if type(module) not in (nn.Conv3d, conv_type) or not _supported_layout(module):
             continue
         if not hasattr(module, "_omni_image_conv_forward"):
             if "forward" in module.__dict__:
