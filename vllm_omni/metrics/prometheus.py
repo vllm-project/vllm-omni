@@ -108,6 +108,22 @@ _kv_wait_s_family = Histogram(
 
 _duplex_families: tuple[Gauge, Counter] | None = None
 _duplex_families_lock = Lock()
+_idle_wake_wait_family: Histogram | None = None
+_idle_wake_wait_lock = Lock()
+
+
+def _idle_wake_wait_metric() -> Histogram:
+    """Register the opt-in idle wake-wait histogram only when emitted."""
+    global _idle_wake_wait_family
+    with _idle_wake_wait_lock:
+        if _idle_wake_wait_family is None:
+            _idle_wake_wait_family = Histogram(
+                defs.IDLE_WAKE_WAIT_S,
+                "Time a request waited at admission for automatic idle sleep/wake to finish, in seconds.",
+                labelnames=_labelnames,
+                buckets=defs.SECONDS_BUCKETS,
+            )
+        return _idle_wake_wait_family
 
 
 def _duplex_metric_families() -> tuple[Gauge, Counter]:
@@ -278,6 +294,11 @@ class OmniPrometheusMetrics:
             model_name=self._model_name,
             connector_type=connector_type or "unknown",
         ).observe(kv_wait_s)
+
+    def observe_idle_wake_wait(self, wait_s: float) -> None:
+        if not self._log_stats or wait_s < 0:
+            return
+        _idle_wake_wait_metric().labels(model_name=self._model_name).observe(wait_s)
 
 
 class OmniRequestCounter:
