@@ -77,6 +77,7 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
 
                 # Broadcast timestep to match batch size
                 timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
+                model_timestep = timestep / 1000
 
                 # Concatenate image latents with noise latents if available (for editing pipelines)
                 latent_model_input = latents
@@ -85,7 +86,7 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
 
                 positive_kwargs = {
                     "hidden_states": latent_model_input,
-                    "timestep": timestep / 1000,
+                    "timestep": model_timestep,
                     "guidance": guidance,
                     "encoder_hidden_states_mask": prompt_embeds_mask,
                     "encoder_hidden_states": prompt_embeds,
@@ -96,7 +97,7 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                 if do_true_cfg:
                     negative_kwargs = {
                         "hidden_states": latent_model_input,
-                        "timestep": timestep / 1000,
+                        "timestep": model_timestep,
                         "guidance": guidance,
                         "encoder_hidden_states_mask": negative_prompt_embeds_mask,
                         "encoder_hidden_states": negative_prompt_embeds,
