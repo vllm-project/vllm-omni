@@ -59,6 +59,7 @@ def main():
             prompt=case["prompt"],
             height=height,
             width=width,
+            min_generation_area=request["extra_params"]["min_generation_area"],
             generator=torch.Generator(device="cpu").manual_seed(case["seed"]),
             output="images",
         )[0]

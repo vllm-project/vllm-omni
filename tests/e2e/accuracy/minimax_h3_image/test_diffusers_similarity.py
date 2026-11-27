@@ -97,6 +97,7 @@ def test_diffusers_similarity(accuracy_artifact_root):
         "num_inference_steps": 6,
         "response_format": "b64_json",
         "output_format": "png",
+        "extra_params": {"min_generation_area": 1024 * 1024},
     }
     request_file = output / "request.json"
     write_json_artifact(

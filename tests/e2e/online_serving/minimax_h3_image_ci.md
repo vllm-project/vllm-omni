@@ -69,9 +69,10 @@ layerwise offload. The test resolves the model's `main` once and passes the
 same local snapshot to both implementations. It records the resolved commit in
 the accuracy results. Both implementations use the same text encoder and run
 the 1024² text-to-image request from the NPU recipe with seed 42. Both use the
-CPU generator and the checkpoint's six-step schedule. The 1024² output is
-generated on the default 2048² canvas and resized. The test keeps one PNG from
-each implementation and records cross-implementation SSIM and PSNR.
+CPU generator and the checkpoint's six-step schedule. The request sets the
+minimum generation area to 1024² so both implementations denoise on a 1024²
+canvas. The test keeps one PNG from each implementation and records
+cross-implementation SSIM and PSNR.
 
 From the repository root, source
 `tests/e2e/accuracy/minimax_h3_image/setup_reference.sh` and run the accuracy
