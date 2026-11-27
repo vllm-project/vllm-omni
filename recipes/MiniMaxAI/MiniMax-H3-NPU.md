@@ -689,12 +689,17 @@ For reference video encoding, merge these parameters into the server's
 ```
 
 The default batch size is `1`; omitted geometry uses the checkpoint values.
-For reference video encoding, equal-length temporal clips can share a tile
-forward as independent samples, without changing the checkpoint's spatial
-rank assignment. The batch size caps the total tile samples per forward.
-Keyframe splits and a padded tail retain their original temporal boundaries.
-Changing encoder tile geometry can change conditioning latents, so validate it
-for your input size. Decoder tiling is unaffected.
+A batch size above `1` lets equal-length reference-video clips share a tile
+forward as independent samples. With VAE tile parallelism enabled, Ascend
+workers distribute `(clip, spatial tile)` pairs across the VAE group. This can
+keep ranks busy even when one clip has fewer tiles than the group has ranks.
+When the combined window has fewer tasks than ranks, idle ranks still join the
+gather without running the encoder. The batch size caps tile samples per
+forward; short batches do not use dummy samples. Single clips, keyframe splits
+and a padded tail keep their existing path. Encoder tile size and overlap must
+be integers divisible by the checkpoint's spatial compression ratio and satisfy
+`0 < overlap < tile size`. Changing geometry may change conditioning latents;
+validate it separately. Decoder tiling is unaffected.
 
 ## Additional resources
 

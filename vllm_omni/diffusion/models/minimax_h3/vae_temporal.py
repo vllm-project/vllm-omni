@@ -32,7 +32,7 @@ from types import MethodType
 import torch
 from vllm.logger import init_logger
 
-from .vae_encode_tiling import encode_tile_batch_size
+from .vae_encode_tiling import encode_clip_group, encode_tile_batch_size
 
 logger = init_logger(__name__)
 
@@ -53,6 +53,8 @@ def _encode_temporal_tail_pad(self, x):
     offset_frame = 1 if self.isolated_first_frame and self.frame_pre_padding == 0 else 0
 
     orig_frames = int(x.shape[2])
+    if not orig_frames or not x.shape[-2] or not x.shape[-1]:
+        raise ValueError("MiniMax H3 video VAE requires frames with non-zero spatial dimensions after alignment")
     pad_size = (offset_frame - orig_frames) % self.clip_length
     padded_frames = orig_frames + pad_size
     num_chunks = (padded_frames - offset_frame) // self.clip_length
@@ -93,11 +95,10 @@ def _encode_temporal_tail_pad(self, x):
             else:
                 z = z_key
         elif count > 1:
-            # Treat clips as samples, not as a longer temporal sequence.
-            # The checkpoint still owns spatial tiling, rank assignment,
-            # gathering and blending for each sample.
+            # Keep clips independent; the checkpoint still owns the spatial
+            # tile grid and blending for each sample.
             clips = clip_x.unflatten(2, (count, self.clip_length)).transpose(1, 2).flatten(0, 1)
-            encoded = self._adaptive_encode(clips)
+            encoded = encode_clip_group(self, clips, count)
             z = encoded.unflatten(0, (sample_batch, count)).transpose(1, 2).flatten(2, 3)
             loss_info = getattr(self.encoder, "loss_info", {})
             if "cls_token" in loss_info:

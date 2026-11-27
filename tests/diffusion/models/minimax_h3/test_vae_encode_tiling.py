@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from datetime import timedelta
+
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch import nn
 
 from vllm_omni.diffusion.models.minimax_h3.vae_encode_tiling import (
+    _gather_clip_tiles,
     configure_video_encode_tiling,
     reference_video_tile_batching,
 )
@@ -63,3 +68,46 @@ def test_reference_encode_batches_across_clips_without_changing_tile_order():
     assert calls == [[0], [1], [4], [5], [8], [9]]
     assert (model.tile_size, model.tile_overlap_min) == (288, 16)
     assert (model.decoder_tile_size, model.decoder_tile_overlap_min) == (256, 64)
+
+
+def _check_clip_tile_gather(rank, rendezvous):
+    world_size = 3
+    dist.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
+    try:
+        # A two-sample batch with distinct IDs per sample, clip and tile.
+        # Cover both an idle rank and an uneven final rank bucket.
+        for tile_count in (1, 2):
+            clip_count = 2
+            values = torch.arange(2 * clip_count * tile_count).reshape(clip_count, tile_count, 2)
+            tasks = values.flatten(0, 1).unbind(0)
+            spatial = _gather_clip_tiles(
+                list(tasks[rank::world_size]), tile_count, clip_count, dist.group.WORLD, torch.device("cpu")
+            )
+            expected = values.permute(1, 2, 0).flatten(1)
+            torch.testing.assert_close(torch.stack(spatial), expected, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_clip_tile_gather_keeps_sample_order_with_idle_ranks(tmp_path):
+    mp.spawn(_check_clip_tile_gather, args=((tmp_path / "tile-group").as_uri(),), nprocs=3)
+
+
+@pytest.mark.parametrize(
+    ("batch", "size", "overlap"),
+    [(0, None, None), (True, None, None), (1, 0, 16), (1, 256, 0), (1, 256, 256), (1, 256, 17), (1, 0.5, 16)],
+)
+def test_invalid_encode_tile_config(batch, size, overlap):
+    model = nn.Identity()
+    model.vae_ratio = 16
+    with pytest.raises(ValueError):
+        configure_video_encode_tiling(model, batch_size=batch, tile_size=size, tile_overlap=overlap)
+
+
+def test_reference_encode_rejects_zero_aligned_tile_extent():
+    model = nn.Identity()
+    model.isolated_first_frame = False
+    with pytest.raises(ValueError, match="non-zero spatial dimensions after alignment"):
+        _encode_temporal_tail_pad(model, torch.empty(1, 3, 2, 0, 16))

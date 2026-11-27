@@ -355,6 +355,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     decode_dtype: torch.dtype = torch.float16
     _pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
     stack_decode_tiles: bool = True
+    encode_tile_batch_size: int = 1
     # Upper bound on the tiles one stacked decoder call takes, so a one-rank
     # decode (every tile of the grid on one rank) stays near the serial peak.
     max_stacked_decode_tiles: int | None = 7
@@ -869,9 +870,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             return nullcontext()
         logger.warning_once(
             "MiniMax-H3 VAE encode splits a %dx%d input into %d tile(s) but "
-            "the tile group has %d ranks; encoding rank-locally for this "
-            "shape instead, which avoids ranks without tiles hanging the "
-            "collective.",
+            "the tile group has %d ranks; the checkpoint's spatial-only "
+            "path will run rank-locally to avoid empty-rank collectives.",
             width,
             height,
             num_tiles,
@@ -1144,11 +1144,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             raise RuntimeError("MiniMax H3 decode-only video VAE cannot encode videos")
         parameter = next(self.parameters())
         previous_dtype = parameter.dtype
-        if previous_dtype != torch.float32:
-            self.to(torch.float32)
         devices = [parameter.device] if parameter.device.type != "cpu" else []
-        shape = getattr(frames, "shape", None)
+        tile_group = None
+        tiling_context = nullcontext()
         if int(getattr(self, "parallel_size", 1)) > 1:
+            shape = getattr(frames, "shape", None)
             if shape is None or len(shape) != 4:
                 raise ValueError("parallel MiniMax H3 video encode requires a rank-4 frame array")
             if int(shape[-1]) in {1, 3, 4}:
@@ -1156,12 +1156,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             else:
                 frame_height, frame_width = int(shape[-2]), int(shape[-1])
             tiling_context = self._encoder_tiling_context(frame_height, frame_width)
-        else:
-            tiling_context = nullcontext()
+            if parameter.device.type == "npu" and self.encode_tile_batch_size > 1 and self.model.parallel_tiling:
+                # Save the group before the native small-grid fallback disables
+                # spatial-only tiling. Its singleton clips still use that fallback.
+                tile_group = self._native_parallel_state()["sp_process_group"]
+        if previous_dtype != torch.float32:
+            self.to(torch.float32)
         try:
             with (
                 tiling_context,
-                reference_video_tile_batching(self.encode_tile_batch_size),
+                reference_video_tile_batching(self.encode_tile_batch_size, tile_group),
                 torch.random.fork_rng(devices=devices, device_type=parameter.device.type),
             ):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
