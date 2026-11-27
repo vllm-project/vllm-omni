@@ -150,6 +150,7 @@ from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE, QWEN3_TTS_PIPELINE
 from vllm_omni.model_executor.models.realtime_venus.pipeline import REALTIME_VENUS_OMNI_PIPELINE
 from vllm_omni.model_executor.models.sage_interaction.pipeline import SAGE_INTERACTION_PIPELINE
+from vllm_omni.model_executor.models.sophon_realtime.pipeline import resolve_sophon_realtime_pipeline
 from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
@@ -278,6 +279,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen3_tts_fused": QWEN3_TTS_FUSED_PIPELINE,
     "realtime_venus_omni": REALTIME_VENUS_OMNI_PIPELINE,
     "sage_interaction": SAGE_INTERACTION_PIPELINE,
+    "sophon_realtime": resolve_sophon_realtime_pipeline,
     "step_audio_2": STEP_AUDIO2_PIPELINE,
     "step_audio_2_asr": STEP_AUDIO2_ASR_PIPELINE,
     "taomate_h3": TAOMATE_H3_PIPELINE,

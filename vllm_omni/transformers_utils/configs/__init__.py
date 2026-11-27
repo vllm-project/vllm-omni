@@ -46,6 +46,8 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "WhisperEncoderConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "AuKConfig": "vllm_omni.transformers_utils.configs.auk",
     "SenseNovaU1Config": "vllm_omni.transformers_utils.configs.sensenova_u1",
+    "SophonRealtimeConfig": "vllm_omni.transformers_utils.configs.sophon_realtime",
+    "Qwen3ASREncoderConfig": "vllm_omni.transformers_utils.configs.sophon_realtime",
     "SenseNovaU1MoELLMConfig": "vllm_omni.transformers_utils.configs.sensenova_u1",
     "ChatterboxConfig": "vllm_omni.transformers_utils.configs.chatterbox",
 }
@@ -88,6 +90,8 @@ __all__ = [
     "SenseNovaU1Config",
     "SenseNovaU1MoELLMConfig",
     "ChatterboxConfig",
+    "SophonRealtimeConfig",
+    "Qwen3ASREncoderConfig",
 ]
 
 
@@ -124,6 +128,7 @@ from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa
 from vllm_omni.transformers_utils.configs import phonon as _phonon  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import realtime_venus as _realtime_venus  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import sensenova_u1 as _sensenova_u1  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import sophon_realtime as _sophon_realtime  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import vibevoice as _vibevoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402

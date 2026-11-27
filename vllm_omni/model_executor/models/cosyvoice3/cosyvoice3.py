@@ -953,6 +953,12 @@ class CosyVoice3Model(
             )
             self.model = self.code2wav.flow_model
             self.hift = self.code2wav.hift
+            # Distilled flows run fewer Euler steps, and some need no
+            # classifier-free guidance; both can be set through hf_overrides.
+            self.flow_n_timesteps = int(getattr(self.config, "flow_n_timesteps", None) or 10)
+            cfg_rate = getattr(self.config, "flow_inference_cfg_rate", None)
+            if cfg_rate is not None:
+                self.code2wav.flow_model.decoder.inference_cfg_rate = float(cfg_rate)
             # Keep additional information synchronized for async_chunk updates.
             self.enable_update_additional_information = True
 
@@ -1894,7 +1900,7 @@ class CosyVoice3Model(
                         prompt_token=speech_token[:1],
                         prompt_feat=speech_feat[:1],
                         embedding=embedding[:1],
-                        n_timesteps=10,
+                        n_timesteps=self.flow_n_timesteps,
                         token_offset_tokens=token_offset,
                     )
 
@@ -1925,7 +1931,7 @@ class CosyVoice3Model(
                 ):
                     streaming_results = self.code2wav.forward_streaming_batch(
                         streaming_flow_items,
-                        n_timesteps=10,
+                        n_timesteps=self.flow_n_timesteps,
                     )
                 else:
                     streaming_results = [
@@ -1935,7 +1941,7 @@ class CosyVoice3Model(
                             prompt_feat=item["prompt_feat"],  # type: ignore[arg-type]
                             embedding=item["embedding"],  # type: ignore[arg-type]
                             cache_state=item.get("cache_state"),  # type: ignore[arg-type]
-                            n_timesteps=10,
+                            n_timesteps=self.flow_n_timesteps,
                             token_offset_tokens=int(item.get("token_offset_tokens", 0)),
                             finalize=bool(item.get("finalize", False)),
                         )

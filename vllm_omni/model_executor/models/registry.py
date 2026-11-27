@@ -193,6 +193,27 @@ _OMNI_MODELS = {
         "confucius4_tts_decoder",
         "Confucius4TTSS2ADecoder",
     ),
+    ## sophon_realtime (Sophon-Realtime-32B Tag / Flash: DuplexJev thinker -> streaming talker -> vocoder)
+    "DuplexJevForConditionalGeneration": (
+        "sophon_realtime",
+        "thinker",
+        "DuplexJevForConditionalGeneration",
+    ),
+    "DuplexJevVisionForConditionalGeneration": (
+        "sophon_realtime",
+        "thinker_vision",
+        "DuplexJevVisionForConditionalGeneration",
+    ),
+    "SophonTagTalker": (
+        "sophon_realtime",
+        "talker_tag",
+        "SophonTagTalker",
+    ),
+    "SophonFlashTalker": (
+        "sophon_realtime",
+        "talker_flash",
+        "SophonFlashTalker",
+    ),
     ## personaplex (Moshi finetune, full-duplex S2S; 2-stage audio->audio offline pipeline)
     # built by lead: personaplex_talker module + PersonaPlexTalkerForConditionalGeneration.
     "PersonaPlexTalkerForConditionalGeneration": (
