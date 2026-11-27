@@ -735,11 +735,9 @@ there is no V1 fallback.
 
 ## Higgs-Audio v2 with Model Runner V2
 
-Higgs-Audio v2 runs the talker (stage 0) on `model_runner: v2` by default;
-the codec stage (stage 1) has no MRV2 path and stays on v1, so the talker's
-outputs ride the legacy transport. Under v2 the talker delegates LM token
-sampling to the native staged sampler, keeping the full request surface —
-penalties and logprobs included — that the V1 engine offers.
+Higgs-Audio v2 runs both stages on `model_runner: v2` by default. Under v2
+the talker delegates LM token sampling to the native staged sampler, keeping
+the full request surface, penalties and logprobs included.
 
 Select one of these deployment profiles:
 

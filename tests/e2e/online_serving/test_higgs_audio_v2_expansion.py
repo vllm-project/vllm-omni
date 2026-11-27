@@ -37,9 +37,8 @@ SERVER_ARGS = ["--trust-remote-code", "--disable-log-stats"]
 # test driver; the engine subprocesses inherit through env_dict).
 SERVER_ENV = {"VLLM_USE_DEEP_GEMM": "0", "VLLM_MOE_USE_DEEP_GEMM": "0"}
 
-# The default profile runs the talker on model_runner v2 with the codec
-# stage on v1; non-CUDA platforms fall back to the v1 runner through the
-# deploy file's platforms section, so this one param guards both runners.
+# The default profile runs both stages on model_runner v2 and has no
+# platforms section, so this one param covers the only supported runner.
 # Under v2 the talker delegates LM token sampling to the native staged
 # sampler, so penalties and logprobs stay in the request surface — unlike
 # Higgs v3, whose owned sampler narrows it.
@@ -92,9 +91,8 @@ class TestHiggsAudioV2OnlineHappyPath:
         """A client aborting mid-stream must not wedge the server.
 
         Exiting the streaming context mid-iteration closes the connection
-        (client-side cancel). Guards request cleanup on the v1 runner and on
-        the MRV2 sampling hook alike. A follow-up request proves the server
-        survived.
+        (client-side cancel). Guards request cleanup on the MRV2 sampling
+        hook. A follow-up request proves the server survived.
         """
         long_text = (
             "This sentence is intentionally long so the stream has plenty of chunks to outlive the reader. " * 20
