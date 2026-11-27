@@ -22,6 +22,7 @@ from vllm.multimodal.inputs import MultiModalBatchedField, MultiModalFieldElem, 
 from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
 
+from tests.helpers.stage_metadata import make_stage_metadata
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_pool import StagePool
@@ -92,7 +93,7 @@ def test_rendered_audio_reaches_each_replica(frontend, mocker, cache_type, num_r
     engine = object.__new__(AsyncOmniEngine)
     engine.stage_configs = []
     engine.single_stage_mode = distributed
-    engine._runtime = mocker.Mock(spec=StageRuntime, stage_pools=[pool])
+    engine._runtime = mocker.Mock(spec=StageRuntime, stage_pools=[pool], stage_metadata=[make_stage_metadata()])
     engine._assign_stage_runtime_fields()
     assert engine.input_processor is processor
     cache = processor.renderer.mm_processor_cache

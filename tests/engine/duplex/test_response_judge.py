@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.stage_metadata import make_stage_metadata
 from vllm_omni.engine.duplex import response_judge as rj
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -440,13 +441,9 @@ def _call_like_the_engine(processor, source_outputs, prompt, owner, **extras):
     """Invoke through the real StageEngineCoreClientBase._call_custom_process_input."""
     from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 
-    client = SimpleNamespace(
-        custom_process_input_func=processor,
-        requires_multimodal_data=True,
-        _stage_hf_config=extras.get("hf_config"),
-        vllm_config=SimpleNamespace(model_config=extras.get("model_config")),
-    )
-    return StageEngineCoreClientBase._call_custom_process_input(client, source_outputs, prompt, owner)
+    metadata = make_stage_metadata(custom_process_input_func=processor, requires_multimodal_data=True)
+    vllm_config = SimpleNamespace(model_config=extras.get("model_config"))
+    return StageEngineCoreClientBase._call_custom_process_input(metadata, vllm_config, source_outputs, prompt, owner)
 
 
 def _bridge_shapes():
