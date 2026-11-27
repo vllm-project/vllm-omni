@@ -2669,7 +2669,7 @@ def test_keyframe_encode_enters_backend_context(monkeypatch, fail_encode):
 
         def encode_images(self, image, *, use_fp16_latent):
             assert events == ["enter"]
-            assert npu_image_conv._IMAGE_ENCODE.get()
+            assert npu_image_conv._IMAGE_ENCODE.get() is not None
             assert image is input_image
             assert use_fp16_latent
             events.append("encode")
@@ -2695,7 +2695,7 @@ def test_keyframe_encode_enters_backend_context(monkeypatch, fail_encode):
         torch.testing.assert_close(rows, torch.ones(1, 4))
 
     assert events == ["enter", "encode", "exit"]
-    assert not npu_image_conv._IMAGE_ENCODE.get()
+    assert npu_image_conv._IMAGE_ENCODE.get() is None
     assert video_vae.model.parallel_tiling
 
 

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -12,81 +11,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 class _OffloadAbort(BaseException):
     pass
-
-
-@pytest.mark.parametrize("whole", [False, True])
-@pytest.mark.parametrize("part", ["encoder", "decoder", "all"])
-def test_image_weight_cache_is_released_before_residency_offload(whole, part, mocker):
-    from vllm_omni.diffusion.models.minimax_h3.ops.vae.npu_image_conv import _weight
-    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
-
-    vae = object.__new__(MiniMaxH3VideoVAE)
-    torch.nn.Module.__init__(vae)
-    vae.model = torch.nn.Module()
-    conv = torch.nn.Conv3d(2, 3, 3)
-    vae.model.encoder = conv
-    conv._omni_image_conv_cache_enabled = True
-    conv._omni_image_conv_weight = None
-    _weight(conv)
-    assert conv._omni_image_conv_weight is not None
-
-    should_release = whole or part != "decoder"
-
-    def check_then_abort():
-        assert (conv._omni_image_conv_weight is None) == should_release
-        raise _OffloadAbort("verify release even when offload fails")
-
-    stager = mocker.Mock()
-    stager.offload.side_effect = check_then_abort
-    vae._stager = stager if whole else None
-    vae._encoder_stager = None if whole else stager
-    vae._decoder_stager = None if whole else stager
-    with pytest.raises(_OffloadAbort):
-        if part == "all":
-            vae.offload_to_cpu()
-        else:
-            vae._offload_part_to_cpu(part)
-    stager.offload.assert_called_once_with()
-
-
-@pytest.mark.parametrize("encode_fails", [False, True])
-def test_image_weight_cache_is_released_before_sequential_offload(encode_fails, monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
-    from vllm_omni.diffusion.models.minimax_h3.ops.vae.npu_image_conv import _weight
-    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE, _VideoVAEPartProxy
-
-    vae = object.__new__(MiniMaxH3VideoVAE)
-    torch.nn.Module.__init__(vae)
-    vae.model = torch.nn.Module()
-    conv = torch.nn.Conv3d(2, 3, 3)
-    vae.model.encoder = conv
-    conv._omni_image_conv_cache_enabled = True
-    conv._omni_image_conv_weight = None
-    pipeline = object.__new__(MiniMaxH3Pipeline)
-    torch.nn.Module.__init__(pipeline)
-    pipeline._model_cpu_offload_modules = [vae]
-    events = []
-
-    @contextmanager
-    def hooked(target):
-        # Stands in for the hook's _to_cpu(), which rebinds p.data on exit
-        # of both the success and the failure path.
-        assert target is vae
-        try:
-            yield
-        finally:
-            events.append(("to_cpu", conv._omni_image_conv_weight))
-
-    monkeypatch.setattr(module, "sequential_offload_component", hooked)
-    with pytest.raises(RuntimeError) if encode_fails else nullcontext():
-        with pipeline._component_on_device(_VideoVAEPartProxy(vae, "encoder")):
-            first = _weight(conv)
-            # Several images in one encode scope reuse the derived weight.
-            assert _weight(conv) is first
-            if encode_fails:
-                raise RuntimeError("encode failed")
-    assert events == [("to_cpu", None)]
 
 
 def _legacy_distributed_offload_config() -> SimpleNamespace:

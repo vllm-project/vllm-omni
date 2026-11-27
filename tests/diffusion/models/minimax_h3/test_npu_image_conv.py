@@ -4,8 +4,11 @@
 
 import importlib.util
 import sys
+import weakref
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -35,13 +38,16 @@ def test_non_npu_keeps_original_modules():
 
 
 def test_scope_resets_after_exception():
-    assert not ops._IMAGE_ENCODE.get()
+    assert ops._IMAGE_ENCODE.get() is None
     with pytest.raises(ValueError), ops.image_encode_context():
-        assert ops._IMAGE_ENCODE.get()
+        outer = ops._IMAGE_ENCODE.get()
+        assert outer is not None
         with ops.image_encode_context():
-            assert ops._IMAGE_ENCODE.get()
+            inner = ops._IMAGE_ENCODE.get()
+            assert inner is not None and inner is not outer
+        assert ops._IMAGE_ENCODE.get() is outer
         raise ValueError("expected")
-    assert not ops._IMAGE_ENCODE.get()
+    assert ops._IMAGE_ENCODE.get() is None
 
 
 def test_unsupported_conv_contract():
@@ -157,121 +163,39 @@ def test_reduction_matches_checkpoint_causal_conv(padding, stride, pad_mode, spa
     assert not torch.equal(ops._forward(conv, x), expected)
 
 
-def _cached_model(monkeypatch):
-    model = nn.Module()
-    model.encoder = nn.Conv3d(2, 3, 3).eval()
-    model.decoder = nn.Conv3d(2, 3, 3).eval()
-    # CPU tests isolate cache semantics; the remote-code allowlist and NPU
-    # numerical dispatch are validated separately against real checkpoint code.
-    monkeypatch.setattr(ops, "_supported_layout", lambda *_: True)
-    assert ops.install_npu_image_conv(model, device=Device()) == 1
-    return model
+@pytest.mark.parametrize("fail_encode", [False, True])
+def test_packed_weight_is_reused_and_released_with_image_scope(fail_encode):
+    conv = nn.Conv3d(2, 3, 3).eval()
+    error_context = pytest.raises(RuntimeError, match="synthetic encode failure") if fail_encode else nullcontext()
+    with error_context, ops.image_encode_context():
+        packed = ops._weight(conv)
+        assert ops._weight(conv) is packed
+        assert torch.equal(packed, conv.weight[:, :, -1:].contiguous())
+        packed_ref = weakref.ref(packed)
+        del packed
+        if fail_encode:
+            raise RuntimeError("synthetic encode failure")
+    assert packed_ref() is None
+    with torch.no_grad():
+        conv.weight.add_(1)
+    with ops.image_encode_context():
+        assert torch.equal(ops._weight(conv), conv.weight[:, :, -1:].contiguous())
 
 
-def test_npu_installer_enables_residency_scoped_cache():
-    model = nn.Module()
-    model.encoder = nn.Conv3d(2, 3, 1).eval()
-    assert ops.install_npu_image_conv(model, device=Device()) == 1
-    assert model.encoder._omni_image_conv_cache_enabled
-    assert model.encoder._omni_image_conv_weight is None
+def test_packed_weight_is_not_shared_across_npu_streams(monkeypatch):
+    # A meta tensor exercises device stream lookup without NPU hardware.
+    conv = nn.Conv3d(2, 3, 3, device="meta")
+    stream = SimpleNamespace(npu_stream=1)
+    backend = SimpleNamespace(current_stream=lambda _: stream)
+    monkeypatch.setattr(torch, "get_device_module", lambda _: backend)
 
-
-def test_cache_reuses_slice_and_rebuilds_after_updates(monkeypatch):
-    model = _cached_model(monkeypatch)
-    conv = model.encoder
-    keys = set(model.state_dict())
-    with torch.inference_mode():
+    with ops.image_encode_context():
         first = ops._weight(conv)
         assert ops._weight(conv) is first
-        assert torch.equal(first, conv.weight[:, :, -1:].contiguous())
-        conv.weight.add_(0.25)
-        updated = ops._weight(conv)
-        assert updated is not first
-        assert torch.equal(updated, conv.weight[:, :, -1:].contiguous())
-    conv.weight = nn.Parameter(conv.weight.detach().clone())
-    replaced = ops._weight(conv)
-    assert replaced is not updated
-    # Storage rebinding need not increment the Parameter version (DLO uses it).
-    conv.weight.data = conv.weight.detach().clone() + 0.5
-    rebound = ops._weight(conv)
-    assert rebound is not replaced
-    assert torch.equal(rebound, conv.weight[:, :, -1:].contiguous())
-    assert set(model.state_dict()) == keys
-    assert not hasattr(model.decoder, "_omni_image_conv_weight")
-
-
-def test_cache_releases_on_state_load_conversion_and_explicit_offload(monkeypatch):
-    model = _cached_model(monkeypatch)
-    conv = model.encoder
-    ops._weight(conv)
-    state = {key: value.detach().clone() for key, value in model.state_dict().items()}
-    model.load_state_dict(state)
-    assert conv._omni_image_conv_weight is None
-    ops._weight(conv)
-    model.double()
-    assert conv._omni_image_conv_weight is None
-    assert ops._weight(conv).dtype == torch.float64
-    ops.clear_npu_image_conv_cache(model)
-    assert conv._omni_image_conv_weight is None
-
-
-def test_unversioned_weights_never_reuse_cache(monkeypatch):
-    model = _cached_model(monkeypatch)
-    with torch.inference_mode():
-        model.encoder.weight = nn.Parameter(model.encoder.weight.clone())
-        before = ops._weight(model.encoder)
-        model.encoder.weight.add_(1)
-        after = ops._weight(model.encoder)
-        assert torch.equal(after, before + 1)
-        assert model.encoder._omni_image_conv_weight is None
-
-
-class _Stream:
-    def __init__(self, handle):
-        if handle is not None:
-            self.npu_stream = handle
-
-
-class _Backend:
-    def __init__(self):
-        self.stream = _Stream("A")
-        self.devices = []
-
-    def current_stream(self, device):
-        self.devices.append(device)
-        return self.stream
-
-
-def test_stream_switch_rebuilds_and_unknown_stream_skips_cache(monkeypatch):
-    # Meta weights take the device-stream branch of _weight_key on CPU hosts.
-    model = _cached_model(monkeypatch)
-    conv = model.encoder.to("meta")
-    backend = _Backend()
-    monkeypatch.setattr(torch, "get_device_module", lambda device: backend)
-
-    def weight_on(handle):
-        backend.stream = _Stream(handle)
-        return ops._weight(conv)
-
-    a1 = weight_on("A")
-    assert weight_on("A") is a1
-    b = weight_on("B")
-    assert b is not a1
-    a2 = weight_on("A")
-    assert a2 is not a1 and a2 is not b
-    assert conv._omni_image_conv_weight[1][-1] == "A"
-    assert backend.devices and all(device == conv.weight.device for device in backend.devices)
-    # A stream without a native handle cannot order reuse, so never cache.
-    weight_on(None)
-    assert conv._omni_image_conv_weight is None
-
-
-def test_fallback_releases_existing_cache(monkeypatch):
-    model = _cached_model(monkeypatch)
-    conv = model.encoder
-    ops._weight(conv)
-    x = torch.randn(1, 2, 3, 4, 5)
-    expected = conv._omni_image_conv_forward(x)
-    # CPU / multi-frame fallback must retain the original convolution.
-    assert torch.equal(conv(x), expected)
-    assert conv._omni_image_conv_weight is None
+        stream.npu_stream = 2
+        second = ops._weight(conv)
+        assert second is not first
+        assert ops._weight(conv) is second
+        del stream.npu_stream
+        assert ops._weight(conv) is not second
+        assert ops._weight(conv) is not ops._weight(conv)

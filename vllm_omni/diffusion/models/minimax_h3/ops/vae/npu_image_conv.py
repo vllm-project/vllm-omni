@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from types import MethodType
@@ -14,7 +14,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-_IMAGE_ENCODE = ContextVar("h3_npu_image_conv", default=False)
+_IMAGE_ENCODE: ContextVar[dict[int, tuple[int | None, torch.Tensor]] | None] = ContextVar(
+    "h3_npu_image_conv", default=None
+)
 
 
 def _supported_layout(module: nn.Conv3d) -> bool:
@@ -31,17 +33,19 @@ def _supported_layout(module: nn.Conv3d) -> bool:
 
 @contextmanager
 def image_encode_context() -> Iterator[None]:
-    """The video and decoder paths never enter this scope."""
-    token = _IMAGE_ENCODE.set(True)
+    """Keep packed weights only for this image's checkpoint encode."""
+    cache: dict[int, tuple[int | None, torch.Tensor]] = {}
+    token = _IMAGE_ENCODE.set(cache)
     try:
         yield
     finally:
+        cache.clear()
         _IMAGE_ENCODE.reset(token)
 
 
 def _eligible(module: nn.Conv3d, x: torch.Tensor) -> bool:
     return (
-        _IMAGE_ENCODE.get()
+        _IMAGE_ENCODE.get() is not None
         and not torch.compiler.is_compiling()
         and not module.training
         and not torch.is_grad_enabled()
@@ -59,10 +63,6 @@ def _eligible(module: nn.Conv3d, x: torch.Tensor) -> bool:
     )
 
 
-def _clear_weight(module: nn.Module, *args) -> None:
-    module._omni_image_conv_weight = None
-
-
 def _encoder_modules(model: nn.Module) -> Iterator[nn.Module]:
     for part in ("encoder", "quant_conv"):
         root = getattr(model, part, None)
@@ -70,71 +70,34 @@ def _encoder_modules(model: nn.Module) -> Iterator[nn.Module]:
             yield from root.modules()
 
 
-def clear_npu_image_conv_cache(model: nn.Module) -> None:
-    """Release derived encoder weights before H3 residency storage is rebound.
-
-    Also call before edits through .data or external aliases, which can bypass
-    PyTorch's version counter. No parameter or state_dict entry is added.
-    """
-    for module in _encoder_modules(model):
-        if getattr(module, "_omni_image_conv_cache_enabled", False):
-            _clear_weight(module)
-
-
-def _apply(self: nn.Module, fn: Callable, recurse: bool = True):
-    _clear_weight(self)
-    return self._omni_image_conv_apply(fn, recurse=recurse)
-
-
-def _weight_key(weight: torch.Tensor) -> tuple | None:
-    try:
-        version = weight._version
-    except RuntimeError:
-        # Inference tensors cannot report mutations: use the live slice.
-        return None
-    if weight.device.type == "cpu":
-        stream = None
-    else:
-        backend = torch.get_device_module(weight.device)
-        current = backend.current_stream(weight.device)
-        stream = getattr(current, "npu_stream", None)
-        if stream is None:
-            return None
-    return (
-        version,
-        weight.data_ptr(),
-        weight.untyped_storage()._cdata,
-        weight.device,
-        weight.dtype,
-        tuple(weight.shape),
-        tuple(weight.stride()),
-        stream,
-    )
-
-
 def _weight(module: nn.Conv3d) -> torch.Tensor:
     source = module.weight
-    use_cache = getattr(module, "_omni_image_conv_cache_enabled", False) and source.shape[2] != 1
-    key = _weight_key(source) if use_cache else None
-    if use_cache:
-        cached = module._omni_image_conv_weight
-        if key is not None and cached is not None and cached[0] is source and cached[1] == key:
-            return cached[2]
-        _clear_weight(module)
+    cache = _IMAGE_ENCODE.get()
+    if cache is None or source.shape[2] == 1:
+        return source[:, :, -1].contiguous().unsqueeze(2)
+    stream = None
+    if source.device.type != "cpu":
+        backend = torch.get_device_module(source.device)
+        stream = getattr(backend.current_stream(source.device), "npu_stream", None)
+        if stream is None:
+            return source[:, :, -1].contiguous().unsqueeze(2)
+    module_id = id(module)
+    cached = cache.get(module_id)
+    if cached is not None and cached[0] == stream:
+        return cached[1]
+    # The checkpoint keeps its parameters fixed throughout encode_images.
+    # Repack on stream changes so the copy and convolution share a stream.
     packed = source[:, :, -1, :, :].contiguous().unsqueeze(2)
-    if key is not None:
-        module._omni_image_conv_weight = (source, key, packed)
+    cache[module_id] = (stream, packed)
     return packed
 
 
 def _forward(self: nn.Conv3d, x: torch.Tensor) -> torch.Tensor:
     if not _eligible(self, x):
-        if getattr(self, "_omni_image_conv_cache_enabled", False):
-            _clear_weight(self)
         return self._omni_image_conv_forward(x)
     # Keep the Conv3D backend and its current HF32 policy. For causal T=1,
     # preceding temporal slices multiply padded zeros. The derived cache
-    # reuses only this exact contiguous slice within one residency interval.
+    # reuses only this exact contiguous slice within one image encode.
     ph, pw = self.padding[1:]
     if ph or pw:
         x = F.pad(x.squeeze(2), (pw, pw, ph, ph), mode=self.pad_mode).unsqueeze(2)
@@ -163,11 +126,5 @@ def install_npu_image_conv(model: nn.Module, *, device: torch.device) -> int:
                 continue
             module._omni_image_conv_forward = module.forward
             module.forward = MethodType(_forward, module)
-        if not getattr(module, "_omni_image_conv_cache_enabled", False):
-            module._omni_image_conv_cache_enabled = True
-            module._omni_image_conv_weight = None
-            module._omni_image_conv_apply = module._apply
-            module._apply = MethodType(_apply, module)
-            module.register_load_state_dict_pre_hook(_clear_weight)
         installed += 1
     return installed
