@@ -55,6 +55,8 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     yield_stage_id: int | None = None
     entry_stage_id: int = 0
     lora_request: LoRARequest | None = None
+    requested_replica_id: int | None = None
+    cfg_companion_ids: dict[str, str] | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -79,6 +81,15 @@ class InteractionMessage(EngineQueueMessage, kw_only=True):
     type: Literal["interaction"] = "interaction"
     request_id: str
     interaction: OmniInteractionPrompt
+
+
+class TextInputUpdate(EngineQueueMessage, kw_only=True):
+    """Committed conditioning tokens, not an extension of the AR prompt."""
+
+    type: Literal["append_text"] = "append_text"
+    request_id: str
+    token_ids: list[int]
+    final: bool = False
 
 
 class CollectiveRPCRequestMessage(EngineQueueMessage, kw_only=True):
@@ -149,6 +160,7 @@ class NextStageInputMessage(EngineQueueMessage, kw_only=True):
     prompt: OmniPromptType
     # Currently, sampling params are set by the stage 0 call & carried to every later call
     sampling_params_list: list[OmniSamplingParams]
+    requested_replica_id: int | None = None
 
     def ensure_valid(self, stage_types: Sequence[str | None]) -> None:
         """Raise ValueError if this input can't be submitted to its receiver stage correctly.

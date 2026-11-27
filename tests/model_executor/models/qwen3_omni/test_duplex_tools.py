@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
@@ -519,6 +520,7 @@ def _tool_call_id_from_turn(turn: dict[str, object]) -> str | None:
 
 def test_expired_id_window_advances_in_order_through_reconcile():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
     live = [f"e{index}" for index in range(1, 65)]
     plan = plugin.plan_append(
@@ -557,6 +559,7 @@ def test_expired_id_window_advances_in_order_through_reconcile():
 
 def test_yield_expiries_stay_ahead_of_ids_the_snapshot_already_evicted():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
     snapshot = [f"e{index}" for index in range(1, 65)]
     plan = plugin.plan_append(
@@ -618,6 +621,7 @@ def test_stream_and_session_close_drop_thinker_cursors():
 
 def test_call_anchors_older_than_the_prompt_window_are_dropped():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
     published = plugin.note_published_function_call({}, call_id="call_old", history_len=1)
     assert published is not None
@@ -677,6 +681,7 @@ def test_call_anchors_older_than_the_prompt_window_are_dropped():
 
 def test_expired_call_ids_keep_only_the_newest_window():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
     oldest = [f"call_{index:03d}" for index in range(64)]
     conversation = [{"role": "user", "content": f"q{index}"} for index in range(20)]
@@ -876,11 +881,13 @@ def test_history_tool_pairs_keep_each_call_with_its_question():
     assert prompt_messages[5]["content"] == "29C"
 
 
-def test_new_user_audio_does_not_rebind_the_previous_question():
+@pytest.mark.parametrize("same_payload", [False, True])
+def test_new_user_audio_does_not_rebind_the_previous_question(same_payload):
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
     state = plugin.create_session_state()
     paris = {"role": "user", "content": [{"type": "audio_url"}]}
-    plugin.prepare_prompt_config({"conversation": [paris]}, state=state, payload={"audio": "paris"})
+    first_payload = {"audio": "paris"}
+    plugin.prepare_prompt_config({"conversation": [paris]}, state=state, payload=first_payload)
     tokyo = {"role": "user", "content": [{"type": "audio_url"}]}
     config = plugin.prepare_prompt_config(
         {
@@ -888,10 +895,10 @@ def test_new_user_audio_does_not_rebind_the_previous_question():
             "qwen_tool_turns": [_weather_turn("call_p", "Paris", "18C", 1)],
         },
         state=state,
-        payload={"audio": "tokyo"},
+        payload=first_payload if same_payload else {"audio": "tokyo"},
     )
     payloads = [message["audio_payload"]["audio"] for message in config["qwen_messages"] if "audio_payload" in message]
-    assert payloads == ["paris", "tokyo"]
+    assert payloads == ["paris", "paris" if same_payload else "tokyo"]
 
 
 def test_missing_parse_function_call_is_not_a_call():

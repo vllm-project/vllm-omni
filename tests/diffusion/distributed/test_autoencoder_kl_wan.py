@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import weakref
+from contextlib import contextmanager, nullcontext
 
 import pytest
 import torch
@@ -7,6 +11,7 @@ from vllm_omni.diffusion.distributed.autoencoders import autoencoder_kl_wan as w
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
     DistributedAutoencoderKLWan,
     OmniAutoencoderKLWan,
+    _requires_gfx11_math_sdpa,
 )
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import TileTask
 
@@ -14,9 +19,23 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyOmniAutoencoderKLWan(OmniAutoencoderKLWan):
-    def __init__(self, *, dtype: torch.dtype):
+    def __init__(self, *, dtype: torch.dtype, head_dim: int | None = None):
         torch.nn.Module.__init__(self)
         self.register_parameter("dummy_weight", torch.nn.Parameter(torch.ones(1, dtype=dtype)))
+        if head_dim is not None:
+            self.attention = WanAttentionBlock(head_dim)
+
+
+class _QKVProjection(torch.nn.Module):
+    def __init__(self, out_channels: int):
+        super().__init__()
+        self.out_channels = out_channels
+
+
+class WanAttentionBlock(torch.nn.Module):
+    def __init__(self, head_dim: int):
+        super().__init__()
+        self.to_qkv = _QKVProjection(head_dim * 3)
 
 
 def test_wan_vae_execution_context_handles_fp32():
@@ -34,19 +53,87 @@ def test_wan_vae_execution_context_handles_bf16():
 
 
 def test_wan_vae_execution_context_uses_platform_autocast(mocker):
-    sentinel = object()
     platform = mocker.Mock()
-    platform.create_autocast_context.return_value = sentinel
+    platform.create_autocast_context.return_value = nullcontext()
     mocker.patch.object(wan_vae_module, "current_omni_platform", platform)
 
     model = _DummyOmniAutoencoderKLWan(dtype=torch.bfloat16)
 
-    assert model._execution_context() is sentinel
+    with model._execution_context():
+        pass
     platform.create_autocast_context.assert_called_once_with(
         device_type=model.dummy_weight.device.type,
         dtype=torch.bfloat16,
         enabled=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("is_rocm", "capability", "dtype", "head_dim", "expected"),
+    [
+        (True, (11, 0), torch.bfloat16, 384, True),
+        (True, (11, 5), torch.float16, 384, True),
+        (True, (9, 4), torch.bfloat16, 384, False),
+        (False, (11, 0), torch.bfloat16, 384, False),
+        (True, (11, 0), torch.float32, 384, False),
+        (True, (11, 0), torch.bfloat16, 256, False),
+    ],
+)
+def test_gfx11_math_sdpa_guard_is_narrow(
+    mocker,
+    is_rocm: bool,
+    capability: tuple[int, int],
+    dtype: torch.dtype,
+    head_dim: int,
+    expected: bool,
+) -> None:
+    platform = mocker.Mock()
+    platform.is_rocm.return_value = is_rocm
+    platform.get_device_capability.return_value = capability
+    mocker.patch.object(wan_vae_module, "current_omni_platform", platform)
+    model = _DummyOmniAutoencoderKLWan(dtype=dtype, head_dim=head_dim)
+
+    assert (
+        _requires_gfx11_math_sdpa(
+            model,
+            device=torch.device("cuda", 0),
+            dtype=dtype,
+        )
+        is expected
+    )
+
+
+def test_wan_vae_execution_context_enters_math_sdpa(mocker) -> None:
+    events = []
+
+    @contextmanager
+    def record_context(name):
+        events.append(("enter", name))
+        yield
+        events.append(("exit", name))
+
+    platform = mocker.Mock()
+    platform.create_autocast_context.return_value = record_context("autocast")
+    mocker.patch.object(wan_vae_module, "current_omni_platform", platform)
+    mocker.patch.object(wan_vae_module, "_requires_gfx11_math_sdpa", return_value=True)
+    sdpa = mocker.patch.object(
+        wan_vae_module,
+        "sdpa_kernel",
+        side_effect=lambda backend: record_context(backend),
+    )
+    model = _DummyOmniAutoencoderKLWan(dtype=torch.bfloat16, head_dim=384)
+
+    with model._execution_context():
+        events.append(("body", None))
+
+    sdpa.assert_called_once_with(wan_vae_module.SDPBackend.MATH)
+    assert events == [
+        ("enter", "autocast"),
+        ("enter", wan_vae_module.SDPBackend.MATH),
+        ("body", None),
+        ("exit", wan_vae_module.SDPBackend.MATH),
+        ("exit", "autocast"),
+    ]
 
 
 @pytest.mark.parametrize("fail_second_chunk", [False, True])

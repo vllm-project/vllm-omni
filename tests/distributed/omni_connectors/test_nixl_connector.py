@@ -21,6 +21,7 @@ import zmq
 
 from tests.helpers.runtime import get_open_port
 from vllm_omni.data_entry_keys import HiddenStatesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.distributed.omni_connectors.connectors.base import PermanentTransferError
 
 pytestmark = [pytest.mark.cpu, pytest.mark.parallel, pytest.mark.core_model]
 
@@ -818,16 +819,47 @@ def test_transfer_done_releases_the_producer_buffer(producer, consumer):
     assert producer._agent.registered == []
 
 
-def test_direct_metadata_has_ephemeral_ownership_endpoint(nixl_connector_cls):
-    connector = nixl_connector_cls({})
+@pytest.mark.parametrize("direct", [False, True])
+def test_ephemeral_ownership_endpoint_supports_metadata_discovery(nixl_connector_cls, direct):
+    connector = nixl_connector_cls({"host": "127.0.0.1", "zmq_port": 0})
+    receiver = None
     try:
         assert connector._zmq_ctx is not None
         assert connector._listener_thread is not None
         _, _, metadata = connector.put("0", "1", "req-4", torch.zeros(2))
-        assert metadata["sender_host"]
-        assert metadata["sender_zmq_port"] > 0
+        endpoint = connector.get_connection_info()
+        assert endpoint["host"] == metadata["sender_host"] == "127.0.0.1"
+        assert endpoint["zmq_port"] == metadata["sender_zmq_port"] > 0
+        receiver = nixl_connector_cls({"role": "receiver"})
+        forwarded = {"source_host": endpoint["host"], "source_port": endpoint["zmq_port"]}
+        resolved = _wait_for_metadata(receiver, "req-4", metadata if direct else forwarded)
+        assert resolved["generation"] == metadata["generation"]
+        assert receiver._notify_transfer_done("req-4", resolved)
+        assert not connector._pending
     finally:
+        if receiver is not None:
+            receiver.close()
+        for pending in connector._pending.values():
+            pending.claims.clear()  # This probe only queries metadata; it never submits DMA.
         connector.close()
+
+
+@pytest.mark.parametrize("role", ["sender", None])
+def test_handshake_bind_failure_cleans_up_partial_initialization(nixl_connector_cls, role):
+    with zmq.Context() as context, context.socket(zmq.ROUTER) as occupied:
+        port = occupied.bind_to_random_port("tcp://127.0.0.1")
+        connector = nixl_connector_cls.__new__(nixl_connector_cls)
+        try:
+            with pytest.raises(RuntimeError, match="failed to bind handshake socket"):
+                connector.__init__({"role": role, "host": "127.0.0.1", "zmq_port": port})
+            assert connector._closed
+            assert connector._zmq_ctx is None
+            assert connector._listener_thread is None
+            assert connector._lease_thread is None
+            assert connector._transfer_thread is None
+            connector.close()  # Cleanup remains safe when __del__ calls it again.
+        finally:
+            connector.close()
 
 
 def test_idle_producer_lease_expires_without_another_put(nixl_connector_cls):
@@ -1116,6 +1148,29 @@ def test_omni_payload_struct_uses_structured_tensor_path(producer):
     assert skeleton["meta"]["left_context_size"] == 2
 
 
+def test_pending_payloads_own_disjoint_tensor_regions(producer):
+    source = torch.arange(256)
+    payload = {"tokens": source, "alias": source, "view": source[:128]}
+    regions: list[tuple[int, int]] = []
+    for key in ("first", "second"):
+        ok, _, metadata = producer.put("0", "1", key, payload)
+        assert ok
+        for group in metadata["descriptor_groups"]:
+            regions.extend((address, address + size) for address, size, *_ in group["regions"])
+
+    # Repeated leaves and concurrent payloads must not register overlapping
+    # memory: retiring one registration must not invalidate another payload.
+    for index, (start, end) in enumerate(regions):
+        assert all(end <= other_start or other_end <= start for other_start, other_end in regions[index + 1 :])
+
+    source.zero_()
+    for key in ("first", "second"):
+        retained = producer._pending[key].tensors
+        torch.testing.assert_close(retained[1], torch.arange(256))
+        torch.testing.assert_close(retained[2], torch.arange(256))
+        torch.testing.assert_close(retained[3], torch.arange(128))
+
+
 def test_partial_group_registration_failure_rolls_back(producer, monkeypatch):
     monkeypatch.setattr(
         producer,
@@ -1345,6 +1400,8 @@ def test_zero_byte_leaves_roundtrip_without_native_descriptors(
         "float_shape",
         "bad_dtype",
         "bad_spec",
+        "missing_specs",
+        "bad_schema",
     ],
 )
 @pytest.mark.usefixtures("reliable_claim_queries")
@@ -1395,13 +1452,17 @@ def test_invalid_empty_tensor_metadata_rejected_before_native_calls(producer, co
         metadata["tensor_specs"][0]["dtype"] = "torch.not_a_dtype"
     elif defect == "bad_spec":
         metadata["tensor_specs"][0] = None
-    assert consumer.get("0", "1", "req-invalid-empty", metadata) is None
+    elif defect == "missing_specs":
+        metadata.pop("tensor_specs")
+    elif defect == "bad_schema":
+        metadata["schema_version"] = 999
+    with pytest.raises(PermanentTransferError):
+        consumer.get("0", "1", "req-invalid-empty", metadata)
     assert copying_native_agent == {"agents": [], "descs": [], "transfers": [], "released": []}
     assert consumer._agent.registered == []
-    # Metadata acquisition now claims the source before validation. With no
-    # submitted DMA, failure safely completes that claim instead of leaking it;
-    # it must still report no successful payload receive.
+    # Metadata acquisition claims the source before validation. With no
+    # submitted DMA, the permanent failure still completes that claim.
     assert producer._pending == producer._published == {}
     assert producer._registered_descs == producer._agent.registered == []
     assert consumer._metrics["gets"] == 0
-    assert consumer._metrics["errors"] == 1
+    assert consumer._metrics["errors"] == 0

@@ -23,6 +23,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
+from vllm_omni.diffusion.distributed.ulysses_transport import AUTO, COPY_ENGINE, select_transport
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
 logger = init_logger(__name__)
@@ -55,7 +56,21 @@ def build_parallel_attention_strategy(
     ulysses_degree = getattr(p, "ulysses_degree", 1)
     ring_degree = getattr(p, "ring_degree", 1)
     allgather_degree = getattr(p, "allgather_degree", 1)
-    ulysses_a2a_permute = getattr(p, "ulysses_a2a_permute", False)
+    ulysses_overlap_chunks = int(getattr(p, "ulysses_overlap_chunks", 0) or 0)
+    ulysses_a2a_backend = getattr(p, "ulysses_a2a_backend", AUTO)
+    ulysses_a2a_permute = ulysses_a2a_backend == COPY_ENGINE
+    if ulysses_a2a_permute:
+        from vllm_omni.diffusion.distributed.a2a_permute import validate_a2a_permute_config
+
+        validate_a2a_permute_config(
+            enforce_eager=getattr(cfg, "enforce_eager", False),
+            ulysses_mode=getattr(p, "ulysses_mode", "strict"),
+            ulysses_degree=ulysses_degree,
+            ring_degree=ring_degree,
+            allgather_degree=allgather_degree,
+            scatter_idx=scatter_idx,
+            gather_idx=gather_idx,
+        )
 
     sp_configured = ulysses_degree > 1 or ring_degree > 1 or allgather_degree > 1
     if not sp_configured:
@@ -108,12 +123,29 @@ def build_parallel_attention_strategy(
     # Ulysses (or Hybrid Ulysses+Ring)
     if ulysses_degree > 1:
         logger.debug(f"Using UlyssesParallelAttention (ulysses_degree={ulysses_degree})")
+        strict_pure = (
+            ring_degree == 1
+            and getattr(p, "ulysses_mode", "strict") == "strict"
+            and (scatter_idx, gather_idx) == (2, 1)
+            and not causal
+        )
+        transport = select_transport(
+            ulysses_a2a_backend,
+            sp_group.ulysses_group,
+            sp_group.ulysses_world_size,
+            cuda_graphs=getattr(cfg, "diffusion_use_graph", False),
+            strict_pure=strict_pure,
+            overlap_chunks=ulysses_overlap_chunks,
+        )
+        ulysses_a2a_permute = transport == COPY_ENGINE
         return UlyssesParallelAttention(
             sp_group=sp_group,
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
             use_sync=use_sync,
             ulysses_a2a_permute=ulysses_a2a_permute,
+            # The overlap runs on the copy-engine exchange only.
+            ce_overlap_chunks=ulysses_overlap_chunks if ulysses_a2a_permute else 0,
         )
 
     # Pure Ring Attention

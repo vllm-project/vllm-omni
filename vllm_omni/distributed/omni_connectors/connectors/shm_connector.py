@@ -17,6 +17,7 @@ from typing import Any
 from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
 
 from ..utils.logging import get_connector_logger
+from ..utils.serialization import OmniSerde
 from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
@@ -62,7 +63,7 @@ class SharedMemoryConnector(OmniConnectorBase):
     def _lock_file(self, name: str) -> str:
         return f"{self.shm_directory}/shm_{name}_lockfile.lock"
 
-    def _write_bytes(self, payload: bytes, name: str) -> dict[str, Any]:
+    def _write_bytes(self, payload: bytes | bytearray | memoryview, name: str) -> dict[str, Any]:
         """Publish payload bytes while the caller holds the segment lock."""
         return shm_write_bytes(payload, name=name)
 
@@ -84,7 +85,9 @@ class SharedMemoryConnector(OmniConnectorBase):
     def __init__(self, config: dict[str, Any]):
         self.config = config
         self.stage_id = config.get("stage_id", -1)
-        scope = config.get("extra", {}).get("wakeup_scope")
+        # load_omni_transfer_config puts the scope in the edge's extra, which
+        # the factory passes as this config.
+        scope = config.get("wakeup_scope")
         self._wake_directory = (
             f"{self.shm_directory}/omni_shm_wake_{os.getuid()}_{hashlib.sha256(str(scope).encode()).hexdigest()[:24]}"
             if scope is not None
@@ -92,6 +95,8 @@ class SharedMemoryConnector(OmniConnectorBase):
         )
         self._pending_keys: OrderedDict[str, None] = OrderedDict()
         self._pending_keys_lock = threading.Lock()
+        self._serde = OmniSerde()
+        self._encode_buffer = threading.local()
         self._metrics = {
             "puts": 0,
             "gets": 0,
@@ -106,6 +111,77 @@ class SharedMemoryConnector(OmniConnectorBase):
         self._wake_path: str | None = None
         self._wake_generation = 0
         self._wake_closed = False
+        self._visibility_path: str | None = None
+        self._publish_visibility()
+
+    def _visibility_directory(self) -> str:
+        # Key by deployment, as the wakeup directory does: an unrelated
+        # deployment under the same UID may reuse these stage ids in this
+        # namespace, and its markers must not count as our peer.
+        scope = self.config.get("wakeup_scope")
+        key = str(scope) if scope is not None else f"ppid_{os.getppid()}"
+        digest = hashlib.sha256(key.encode()).hexdigest()[:24]
+        return f"{self.shm_directory}/omni_shm_visible_{os.getuid()}_{digest}"
+
+    def _publish_visibility(self) -> None:
+        """Leave a file in this process's IPC namespace so peers can see us.
+
+        A connector in another container has its own ``/dev/shm``. Its ``put``
+        still succeeds locally, and the receiver polls an empty namespace with
+        no error. Publishing here lets the sender refuse that transfer.
+        """
+        try:
+            stage = int(self.stage_id)
+        except (TypeError, ValueError):
+            return
+        if stage < 0:
+            return
+        try:
+            directory = self._visibility_directory()
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            # One file per connector. Two connectors for this stage in this
+            # process must not share a name: closing one would hide the other.
+            path = f"{directory}/{stage}_{os.getpid()}_{uuid.uuid4().hex}"
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+            os.close(fd)
+        except OSError as exc:
+            logger.error("SharedMemoryConnector could not publish visibility for stage %s: %s", stage, exc)
+            return
+        self._visibility_path = path
+
+    def _peer_visible(self, to_stage: str) -> bool:
+        """True when this connector is not a staged sender, or the peer's file is here."""
+        try:
+            stage = int(to_stage)
+            own = int(self.stage_id)
+        except (TypeError, ValueError):
+            return True
+        if own < 0:
+            return True
+        try:
+            names = os.listdir(self._visibility_directory())
+        except FileNotFoundError:
+            return False
+        prefix = f"{stage}_"
+        return any(name.startswith(prefix) for name in names)
+
+    def _drop_visibility(self) -> None:
+        path = self._visibility_path
+        self._visibility_path = None
+        if path is None:
+            return
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    def _thread_encode_buffer(self) -> bytearray:
+        """Return this thread's reusable encode buffer."""
+        buffer = getattr(self._encode_buffer, "value", None)
+        if buffer is None:
+            buffer = bytearray()
+            self._encode_buffer.value = buffer
+        return buffer
 
     def _open_wakeup_receiver(self) -> bool:
         if self._wake_closed:
@@ -229,11 +305,19 @@ class SharedMemoryConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
+            if not self._peer_visible(to_stage):
+                logger.error(
+                    "SharedMemoryConnector cannot see stage %s shared memory; refusing put for %s",
+                    to_stage,
+                    put_key,
+                )
+                return False, 0, None
             # Keep per-send housekeeping small when unread chunks accumulate.
             # Explicit sweeps retain a larger budget to drain stale records.
             self.reap_consumed(max_keys=4)
-            payload = self.serialize_obj(data)
-            size = len(payload)
+            buffer = self._thread_encode_buffer()
+            size = self._serde.serialize_into(data, buffer)
+            payload = memoryview(buffer)[:size]
 
             name = self._shm_name(put_key)
             lock_file = self._lock_file(name)
@@ -265,7 +349,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 data_bytes = self._read_bytes(shm_handle)
                 consumed = True
                 fcntl.flock(lockf, fcntl.LOCK_UN)
-            obj = self.deserialize_obj(data_bytes)
+            obj = self._serde.deserialize(data_bytes)
             result = (obj, len(data_bytes))
             return result
         except (BlockingIOError, FileNotFoundError):
@@ -361,6 +445,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             keys = list(self._pending_keys)
         for key in keys:
             self.cleanup(key)
+        self._drop_visibility()
         self._close_wakeups()
 
     def reap_consumed(self, *, max_keys: int = 64) -> None:

@@ -92,11 +92,22 @@ class LingBotDMDBlockRunner:
         condition: torch.Tensor,
         ar: ARBlockContext,
         commit_current: bool,
+        camera_pose: torch.Tensor | None = None,
     ) -> LingBotTransformerCache:
         patch_frames, patch_height, patch_width = self.transformer.config.patch_size
         frames = condition.shape[2] // patch_frames
         height = condition.shape[3] // patch_height
         width = condition.shape[4] // patch_width
+        memory_config = getattr(self.transformer, "worldkv_config", None)
+        if memory_config is not None:
+            memory = ar.state.worldkv(
+                ar.branch,
+                memory_config,
+                tokens_per_frame=height * width,
+            )
+            if camera_pose is not None:
+                memory.set_pose(camera_pose)
+            return LingBotTransformerCache([], ar.cross_attention, worldkv=memory)
         return LingBotTransformerCache(
             self_attention=ar.state.get_kv_caches(
                 ar.branch,
@@ -113,11 +124,14 @@ class LingBotDMDBlockRunner:
         cache: LingBotTransformerCache | None,
         ar: ARBlockContext | None,
         commit_current: bool,
+        camera_pose: torch.Tensor | None = None,
     ) -> LingBotTransformerCache:
         """Pick the cache one transformer call sees: paged when a session is
         bound, else the caller's request-local cache."""
         if ar is not None:
-            return self._paged_cache(condition=condition, ar=ar, commit_current=commit_current)
+            return self._paged_cache(condition=condition, ar=ar, commit_current=commit_current, camera_pose=camera_pose)
+        if cache is not None and cache.worldkv is not None and camera_pose is not None:
+            cache.worldkv.set_pose(camera_pose)
         return cast(LingBotTransformerCache, cache)
 
     # ── one block ────────────────────────────────────────────────────────
@@ -135,6 +149,7 @@ class LingBotDMDBlockRunner:
         timestep_value: float,
         step_index: int,
         camera_cache: CameraModulationCache | None = None,
+        camera_pose: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict flow for one denoise step.
 
@@ -158,7 +173,9 @@ class LingBotDMDBlockRunner:
             timestep=timestep,
             encoder_hidden_states=prompt_embeds,
             camera_hidden_states=camera,
-            cache=self._block_cache(condition=condition, cache=cache, ar=ar, commit_current=commit_probe),
+            cache=self._block_cache(
+                condition=condition, cache=cache, ar=ar, commit_current=commit_probe, camera_pose=camera_pose
+            ),
             start_frame=start_frame,
             update_cache=commit_probe,
             camera_modulation_cache=camera_cache,
@@ -205,6 +222,7 @@ class LingBotDMDBlockRunner:
         ar: ARBlockContext | None,
         start_frame: int,
         camera_cache: CameraModulationCache | None = None,
+        camera_pose: torch.Tensor | None = None,
     ) -> None:
         """Write the finished block's clean x0 into KV and commit its pages.
 
@@ -263,7 +281,9 @@ class LingBotDMDBlockRunner:
             timestep=torch.zeros(1, device=self.device, dtype=torch.float32),
             encoder_hidden_states=prompt_embeds,
             camera_hidden_states=camera,
-            cache=self._block_cache(condition=condition, cache=cache, ar=ar, commit_current=True),
+            cache=self._block_cache(
+                condition=condition, cache=cache, ar=ar, commit_current=True, camera_pose=camera_pose
+            ),
             start_frame=start_frame,
             update_cache=True,
             camera_modulation_cache=camera_cache,
@@ -288,6 +308,7 @@ class LingBotDMDBlockRunner:
         schedule: tuple[tuple[float, float], ...],
         generator: torch.Generator,
         progress_bar: TqdmProgressBar[Any],
+        camera_pose: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Request mode: all probes of one block, then its commit."""
         block_shape = (1, self.transformer.config.out_channels, *condition.shape[2:5])
@@ -308,6 +329,7 @@ class LingBotDMDBlockRunner:
                 timestep_value=timestep_value,
                 step_index=step_index,
                 camera_cache=camera_cache,
+                camera_pose=camera_pose,
             )
             next_sigma = schedule[step_index + 1][1] if step_index + 1 < len(schedule) else None
             current_latents = self.apply_transition(
@@ -323,5 +345,6 @@ class LingBotDMDBlockRunner:
             ar=ar,
             start_frame=start_frame,
             camera_cache=camera_cache,
+            camera_pose=camera_pose,
         )
         return current_latents

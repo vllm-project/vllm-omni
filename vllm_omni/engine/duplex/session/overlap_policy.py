@@ -21,6 +21,7 @@ import pybase64 as base64
 
 from vllm_omni.engine.duplex.config import DuplexOverlapPolicy
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+from vllm_omni.protocol.duplex import base64_decoded_size
 
 
 def decide(
@@ -297,11 +298,9 @@ def input_audio_duration_ms(event: dict[str, object], payload: dict[str, object]
     sample_rate_hz = payload.get("sample_rate_hz")
     audio = payload.get("audio")
     if fmt == "pcm_f32le" and isinstance(sample_rate_hz, int) and sample_rate_hz > 0 and isinstance(audio, str):
-        try:
-            raw = base64.b64decode(audio, validate=True)
-        except (binascii.Error, ValueError):
-            return 0
-        return int((len(raw) // 4) * 1000 / sample_rate_hz)
+        # Measured, not decoded: the runner's segments are base64 this process encoded.
+        size = base64_decoded_size(audio) or 0
+        return int((size // 4) * 1000 / sample_rate_hz)
     return 0
 
 
@@ -313,6 +312,10 @@ def merge_audio_payloads(first: dict[str, object], second: dict[str, object]) ->
         for frame in source
         if isinstance(frame, str) and frame
     ]
+    if first.get("video_frames") and not first.get("audio"):
+        # Coalesce the response, not its committed visual history. A camera
+        # payload has no PCM format; the audio fallback below would drop it.
+        return {**second, "video_frames": merged_frames}
     if (
         first.get("format") == "pcm_f32le"
         and first.get("audio")

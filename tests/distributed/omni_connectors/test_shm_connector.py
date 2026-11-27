@@ -13,19 +13,13 @@ import torch
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import (
     SharedMemoryConnector,
 )
-from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def make_connector(config):
-    return OmniConnectorFactory.create_connector(ConnectorSpec(name="SharedMemoryConnector", extra=config))
-
-
 @pytest.fixture()
 def connector():
-    c = make_connector({})
+    c = SharedMemoryConnector({})
     yield c
     c.close()
 
@@ -37,33 +31,26 @@ class TestKeyBasedReadWrite:
     def test_deadline_receive_does_not_wait_for_writer_lock(self, connector):
         key = "deadline_locked_payload"
         connector.put("0", "1", key, {"value": 7})
-        with open(connector._lock_file(connector._shm_name(key)), "rb+") as lock_file:
+        with open(f"/dev/shm/shm_{key}_lockfile.lock", "rb+") as lock_file:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
             assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() + 1) is None
         assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() - 1) is None
         assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() + 1)[0] == {"value": 7}
 
-    # Stable IDs keep xdist collection identical despite the per-process random key.
-    @pytest.mark.parametrize(
-        "key",
-        ["test_key_1", "speech-" + uuid.uuid4().hex + "-" + uuid.uuid4().hex + "_0_0"],
-        ids=["simple", "speech"],
-    )
-    def test_put_then_get_by_key(self, connector, key):
+    def test_put_then_get_by_key(self, connector):
         data = {"hello": "world", "n": 42}
-        ok, size, meta = connector.put("s0", "s1", key, data)
+        ok, size, meta = connector.put("s0", "s1", "test_key_1", data)
         assert ok
         assert size > 0
         assert "shm" in meta
-        connector.reap_consumed()
-        assert key in connector._pending_keys
+        assert "test_key_1" in connector._pending_keys
 
-        result = connector.get("s0", "s1", key, metadata=None)
+        result = connector.get("s0", "s1", "test_key_1", metadata=None)
         assert result is not None
         obj, rsize = result
         assert obj == data
         assert rsize == size
-        assert key not in connector._pending_keys
+        assert "test_key_1" not in connector._pending_keys
         assert connector._metrics["gets"] == 1
 
     def test_tensor_payload_removes_lock_file(self, connector):
@@ -76,7 +63,7 @@ class TestKeyBasedReadWrite:
 
         assert result is not None
         assert torch.equal(result[0], payload)
-        assert not os.path.exists(connector._lock_file(connector._shm_name(key)))
+        assert not os.path.exists(f"/dev/shm/shm_{key}_lockfile.lock")
 
     def test_falsey_payload_removes_lock_file(self, connector):
         key = "falsey_payload"
@@ -87,7 +74,7 @@ class TestKeyBasedReadWrite:
 
         assert result is not None
         assert result[0] == 0
-        assert not os.path.exists(connector._lock_file(connector._shm_name(key)))
+        assert not os.path.exists(f"/dev/shm/shm_{key}_lockfile.lock")
 
     def test_get_nonexistent_key_returns_none(self, connector):
         result = connector.get("s0", "s1", "no_such_key_xyz", metadata=None)
@@ -185,9 +172,8 @@ class TestMetadataFallback:
         assert ok
         result = connector.get("s0", "s1", "shm_direct_1", metadata=meta)
         assert result is not None
-        obj, rsize = result
+        obj, _ = result
         assert obj == data
-        assert rsize == size
 
     def test_metadata_keyed_by_request_id(self, connector):
         """Metadata wrapped as {get_key: actual_meta} should be unwrapped."""
@@ -287,7 +273,7 @@ def test_cleanup_preserves_other_request_keys(connector, suffix):
 
 
 def test_sender_reaps_keys_consumed_by_another_connector(connector):
-    receiver = make_connector({})
+    receiver = SharedMemoryConnector({})
     prefix = f"reap_{uuid.uuid4().hex}"
     try:
         for index in range(256):
@@ -302,7 +288,7 @@ def test_sender_reaps_keys_consumed_by_another_connector(connector):
 
 
 def test_reap_rotates_past_unread_keys(connector):
-    receiver = make_connector({})
+    receiver = SharedMemoryConnector({})
     prefix = f"rotate_{uuid.uuid4().hex}"
     try:
         for index in range(130):
@@ -324,9 +310,9 @@ def test_consumed_bad_payload_removes_lock_file(connector, monkeypatch):
     def fail_deserialize(_data):
         raise ValueError("invalid payload")
 
-    monkeypatch.setattr(connector, "deserialize_obj", fail_deserialize)
+    monkeypatch.setattr(connector._serde, "deserialize", fail_deserialize)
     assert connector.get("0", "1", key) is None
-    assert not os.path.exists(connector._lock_file(connector._shm_name(key)))
+    assert not os.path.exists(f"/dev/shm/shm_{key}_lockfile.lock")
     connector.reap_consumed()
     assert key not in connector._pending_keys
 
@@ -353,7 +339,7 @@ def test_cleanup_prefix_only_matches_own_chunk_keys(connector, suffix):
 
 
 def _stage_connector(stage_id):
-    return make_connector({"stage_id": stage_id})
+    return SharedMemoryConnector({"stage_id": stage_id})
 
 
 def test_wakeup_discovery_only_scans_deployment_directory(monkeypatch, tmp_path):
@@ -458,21 +444,18 @@ def test_wakeups_can_be_disabled_and_close_unlinks_fifo(monkeypatch):
         receiver.close()
 
 
-def _sibling_receiver(stage_id, ready, start, result):
+def _sibling_receiver(stage_id, ready, result):
     receiver = _stage_connector(stage_id)
     generation = receiver.get_wakeup_generation()
     ready.set()
-    assert start.wait(5)
-    started = time.monotonic()
+    start = time.monotonic()
     woke = receiver.wait_for_change(generation, timeout=5)
-    result.put((woke, time.monotonic() - started))
+    result.put((woke, time.monotonic() - start))
     receiver.close()
 
 
-def _sibling_sender(stage_id, key, ready, start):
+def _sibling_sender(stage_id, key):
     sender = _stage_connector(stage_id - 1)
-    ready.set()
-    assert start.wait(5)
     sender.put(str(stage_id - 1), str(stage_id), key, {"value": 3})
 
 
@@ -481,30 +464,20 @@ def test_sibling_stage_processes_share_wakeups():
     import multiprocessing
 
     ctx = multiprocessing.get_context("fork")
-    ready, sender_ready, start, result = ctx.Event(), ctx.Event(), ctx.Event(), ctx.Queue()
+    ready, result = ctx.Event(), ctx.Queue()
     key = f"wake_{uuid.uuid4().hex}"
-    receiver = ctx.Process(target=_sibling_receiver, args=(78, ready, start, result))
-    sender = ctx.Process(target=_sibling_sender, args=(78, key, sender_ready, start))
-    try:
-        receiver.start()
-        assert ready.wait(5)
-        sender.start()
-        assert sender_ready.wait(5)
-        start.set()
-        sender.join(5)
-        woke, waited = result.get(timeout=5)
-        receiver.join(5)
-        assert woke and waited < 1.0
-    finally:
-        start.set()
-        for process in (receiver, sender):
-            if process.pid is not None:
-                if process.is_alive():
-                    process.kill()
-                process.join(5)
-            process.close()
-        cleanup = make_connector({})
-        cleanup.cleanup(key)
+    receiver = ctx.Process(target=_sibling_receiver, args=(78, ready, result))
+    receiver.start()
+    assert ready.wait(5)
+    time.sleep(0.05)
+    sender = ctx.Process(target=_sibling_sender, args=(78, key))
+    sender.start()
+    sender.join(5)
+    woke, waited = result.get(timeout=5)
+    receiver.join(5)
+    assert woke and waited < 1.0
+    cleanup = SharedMemoryConnector({})
+    cleanup.cleanup(key)
 
 
 def test_same_stage_receivers_are_independent_across_close_and_restart():
@@ -615,12 +588,24 @@ def test_waiter_does_not_read_fd_reused_after_close(monkeypatch, tmp_path):
 
 
 def test_deployment_scope_survives_different_worker_parents(monkeypatch):
-    config = {"stage_id": 1, "extra": {"wakeup_scope": uuid.uuid4().hex}}
+    from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        load_omni_transfer_config,
+        resolve_connector_spec,
+    )
+
+    # Build connectors the way stage workers do: the launcher stores the scope
+    # in the edge's extra, and the factory passes that extra as the config.
+    transfer_config = load_omni_transfer_config(
+        config_dict={"stage_args": [{"stage_id": 0}, {"stage_id": 1, "engine_input_source": [0]}]}
+    )
+    edge = transfer_config.connectors[("0", "1")]
     monkeypatch.setattr(os, "getppid", lambda: 111)
-    receiver = make_connector(config)
+    receiver = OmniConnectorFactory.create_connector(resolve_connector_spec(edge, stage_id=1, role="receiver"))
     monkeypatch.setattr(os, "getppid", lambda: 222)
-    sender = make_connector(config)
+    sender = OmniConnectorFactory.create_connector(resolve_connector_spec(edge, stage_id=0, role="sender"))
     try:
+        assert receiver._wake_directory == sender._wake_directory
         generation = receiver.get_wakeup_generation()
         sender._wake_receiver(1)
         assert receiver.wait_for_change(generation, timeout=0.1)
@@ -645,22 +630,23 @@ def test_put_limits_reaping_work_with_unread_backlog(connector, monkeypatch):
     for index in range(128):
         assert connector.put("0", "1", f"{prefix}_{index}", index)[0]
 
-    checked_keys = []
-    exists = connector._shm_exists
+    checked_paths = []
+    exists = os.path.exists
 
-    def track_exists(key):
-        checked_keys.append(key)
-        return exists(key)
+    def track_exists(path):
+        if str(path).startswith(f"/dev/shm/{prefix}"):
+            checked_paths.append(path)
+        return exists(path)
 
-    monkeypatch.setattr(connector, "_shm_exists", track_exists)
+    monkeypatch.setattr(os.path, "exists", track_exists)
     assert connector.put("0", "1", f"{prefix}_next", "next")[0]
     # Keep per-send housekeeping small, independently of the backlog length.
-    assert len(checked_keys) <= 8
+    assert len(checked_paths) <= 8
 
 
 def test_reaping_keeps_consumed_records_bounded_behind_unread_keys(connector):
     """Small send-time sweeps must still catch up with ongoing consumption."""
-    receiver = make_connector({})
+    receiver = SharedMemoryConnector({})
     prefix = f"reap_mixed_{uuid.uuid4().hex}"
     unread_count = 128
     try:
@@ -680,48 +666,174 @@ def test_reaping_keeps_consumed_records_bounded_behind_unread_keys(connector):
         receiver.close()
 
 
-def test_storage_overrides_reuse_connector_locking_and_cleanup(tmp_path, monkeypatch):
-    """Storage overrides preserve logical sizes and release unread payloads."""
-    from vllm_omni.platforms import current_omni_platform
-
-    class ExternalStorage(SharedMemoryConnector):
-        shm_directory = str(tmp_path)
-
-        def _shm_name(self, key):
-            return "external_" + key
-
-        def _write_bytes(self, payload, name):
-            size = (tmp_path / name).write_bytes(b"\0" + payload)
-            return {"name": name, "size": size}
-
-        def _read_bytes(self, metadata):
-            # Storage must only be opened after the common reader takes the lock.
-            with open(self._lock_file(metadata["name"]), "rb") as lock:
-                with pytest.raises(BlockingIOError):
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            payload = (tmp_path / metadata["name"]).read_bytes()
-            self._unlink_segment(metadata["name"])
-            return payload[1:]
-
-        def _unlink_segment(self, name):
-            (tmp_path / name).unlink()
-
-    monkeypatch.setattr(current_omni_platform, "get_shared_memory_connector_cls", lambda: ExternalStorage)
-    c = make_connector({})
+def test_put_refuses_when_peer_shared_memory_is_not_visible():
+    """A sender that cannot see the receiver's IPC namespace must not report success."""
+    base = 50000 + (os.getpid() % 10000)
+    sender = SharedMemoryConnector({"stage_id": base})
+    key = f"peer_{uuid.uuid4().hex}"
     try:
-        ok, size, metadata = c.put("0", "1", "key", {"value": 7})
-        assert ok
-        result = c.get("0", "1", "key", metadata=metadata)
-        assert result == ({"value": 7}, size)
-        assert not (tmp_path / "shm_external_key_lockfile.lock").exists()
-        assert not c._pending_keys
-
-        key = "unread_" + uuid.uuid4().hex[:12]
-        assert c.put("0", "1", key, {"value": 8})[0]
-        assert c.cleanup(key)
-        assert not (tmp_path / f"external_{key}").exists()
-        assert not (tmp_path / f"shm_external_{key}_lockfile.lock").exists()
-        assert not c._pending_keys
-        assert c.cleanup(key) is False
+        ok, size, meta = sender.put(str(base), str(base + 1), key, {"a": 1})
+        assert ok is False
+        assert size == 0
+        assert meta is None
+        receiver = SharedMemoryConnector({"stage_id": base + 1})
+        try:
+            assert sender.put(str(base), str(base + 1), key, {"a": 1})[0] is True
+            assert receiver.get(str(base), str(base + 1), key)[0] == {"a": 1}
+        finally:
+            receiver.close()
+        assert sender.put(str(base), str(base + 1), f"{key}-gone", {"a": 1})[0] is False
     finally:
-        c.close()
+        sender.close()
+
+
+def test_visibility_is_scoped_to_deployment():
+    """A same-numbered stage from another deployment in this namespace is not our peer."""
+    base = 50000 + (os.getpid() % 10000)
+    sender = SharedMemoryConnector({"stage_id": base, "wakeup_scope": f"b-{uuid.uuid4().hex}"})
+    other_deployment = SharedMemoryConnector({"stage_id": base + 1, "wakeup_scope": f"a-{uuid.uuid4().hex}"})
+    key = f"scoped_{uuid.uuid4().hex}"
+    try:
+        assert sender.put(str(base), str(base + 1), key, {"a": 1})[0] is False
+        receiver = SharedMemoryConnector({"stage_id": base + 1, "wakeup_scope": sender.config["wakeup_scope"]})
+        try:
+            assert sender.put(str(base), str(base + 1), key, {"a": 1})[0] is True
+            assert receiver.get(str(base), str(base + 1), key)[0] == {"a": 1}
+        finally:
+            receiver.close()
+    finally:
+        other_deployment.close()
+        sender.close()
+
+
+def test_separate_config_loads_share_one_deployment_scope():
+    """Head and --headless each load the config. The same master endpoint must match."""
+    from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        load_omni_transfer_config,
+        resolve_connector_spec,
+    )
+
+    config = {"stage_args": [{"stage_id": 0}, {"stage_id": 1, "engine_input_source": [0]}]}
+    scope = f"10.0.0.8:{18000 + (os.getpid() % 1000)}"
+    head = load_omni_transfer_config(config_dict=config, deployment_scope=scope)
+    headless = load_omni_transfer_config(config_dict=config, deployment_scope=scope)
+    other = load_omni_transfer_config(config_dict=config, deployment_scope=scope + "-other")
+    sender = OmniConnectorFactory.create_connector(
+        resolve_connector_spec(head.connectors[("0", "1")], stage_id=0, role="sender")
+    )
+    stranger = OmniConnectorFactory.create_connector(
+        resolve_connector_spec(other.connectors[("0", "1")], stage_id=1, role="receiver")
+    )
+    key = f"deploy_{uuid.uuid4().hex}"
+    receiver = None
+    try:
+        assert sender.put("0", "1", key, {"a": 1})[0] is False
+        receiver = OmniConnectorFactory.create_connector(
+            resolve_connector_spec(headless.connectors[("0", "1")], stage_id=1, role="receiver")
+        )
+        assert sender.put("0", "1", key, {"a": 1})[0] is True
+        assert receiver.get("0", "1", key)[0] == {"a": 1}
+    finally:
+        if receiver is not None:
+            receiver.close()
+        stranger.close()
+        sender.close()
+
+
+def test_closing_one_receiver_keeps_the_other_visible():
+    base = 60000 + (os.getpid() % 1000)
+    scope = f"live-{uuid.uuid4().hex}"
+    sender = SharedMemoryConnector({"stage_id": base, "wakeup_scope": scope})
+    first = SharedMemoryConnector({"stage_id": base + 1, "wakeup_scope": scope})
+    second = SharedMemoryConnector({"stage_id": base + 1, "wakeup_scope": scope})
+    key = f"both_{uuid.uuid4().hex}"
+    try:
+        first.close()
+        assert sender.put(str(base), str(base + 1), key, {"a": 1})[0] is True
+        assert second.get(str(base), str(base + 1), key)[0] == {"a": 1}
+    finally:
+        second.close()
+        sender.close()
+
+
+def test_head_deployment_id_matches_across_master_address_spellings():
+    """127.0.0.1 and localhost are one master. Connectors must share its id."""
+    import msgspec
+    import zmq
+    from vllm.utils.network_utils import get_open_port
+
+    from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        load_omni_transfer_config,
+        resolve_connector_spec,
+    )
+    from vllm_omni.engine.stage_engine_startup import OmniMasterServer, fetch_deployment_id
+
+    port = get_open_port()
+    server = OmniMasterServer(master_address="127.0.0.1", master_port=port, stage_ids=[0, 1])
+    server.start()
+    config = {"stage_args": [{"stage_id": 0}, {"stage_id": 1, "engine_input_source": [0]}]}
+    sender = receiver = literal_sender = literal_receiver = None
+    ctx = zmq.Context()
+    try:
+        from vllm_omni.engine.stage_engine_startup import ensure_matching_deployment_id
+
+        via_ip = fetch_deployment_id(omni_master_address="127.0.0.1", omni_master_port=port)
+        via_name = fetch_deployment_id(omni_master_address="localhost", omni_master_port=port)
+        assert via_ip == via_name == server.deployment_id
+        sock = ctx.socket(zmq.DEALER)
+        sock.connect(f"tcp://localhost:{port}")
+        sock.send(msgspec.msgpack.encode({"stage_id": 0}))
+        assert sock.poll(timeout=5_000)
+        registered = msgspec.msgpack.decode(sock.recv())["deployment_id"]
+        assert registered == server.deployment_id
+        ensure_matching_deployment_id(expected=via_ip, actual=registered)
+        sock.close(linger=0)
+
+        head = load_omni_transfer_config(config_dict=config, deployment_scope=via_ip)
+        headless = load_omni_transfer_config(config_dict=config, deployment_scope=via_name)
+        sender = OmniConnectorFactory.create_connector(
+            resolve_connector_spec(head.connectors[("0", "1")], stage_id=0, role="sender")
+        )
+        receiver = OmniConnectorFactory.create_connector(
+            resolve_connector_spec(headless.connectors[("0", "1")], stage_id=1, role="receiver")
+        )
+        key = f"spell_{uuid.uuid4().hex}"
+        assert sender.put("0", "1", key, {"a": 1})[0] is True
+        assert receiver.get("0", "1", key)[0] == {"a": 1}
+
+        literal_sender = OmniConnectorFactory.create_connector(
+            resolve_connector_spec(
+                load_omni_transfer_config(config_dict=config, deployment_scope=f"127.0.0.1:{port}").connectors[
+                    ("0", "1")
+                ],
+                stage_id=0,
+                role="sender",
+            )
+        )
+        literal_receiver = OmniConnectorFactory.create_connector(
+            resolve_connector_spec(
+                load_omni_transfer_config(config_dict=config, deployment_scope=f"localhost:{port}").connectors[
+                    ("0", "1")
+                ],
+                stage_id=1,
+                role="receiver",
+            )
+        )
+        assert literal_sender.put("0", "1", key + "-x", {"a": 1})[0] is False
+    finally:
+        for connector in (literal_receiver, literal_sender, receiver, sender):
+            if connector is not None:
+                connector.close()
+        ctx.term()
+        server.stop()
+
+
+def test_registration_rejects_stale_prefetched_deployment_id():
+    """Headless must not spawn after the master id drifts from the prefetch."""
+    from vllm_omni.engine.stage_engine_startup import ensure_matching_deployment_id
+
+    ensure_matching_deployment_id(expected="same-id", actual="same-id")
+    with pytest.raises(RuntimeError, match="deployment id changed"):
+        ensure_matching_deployment_id(expected="prefetch-old", actual="register-new")

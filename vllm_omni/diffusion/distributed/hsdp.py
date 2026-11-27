@@ -12,6 +12,7 @@ from torch.distributed import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import (
     MixedPrecisionPolicy,
     fully_shard,
+    register_fsdp_forward_method,
 )
 from vllm.logger import init_logger
 
@@ -178,7 +179,9 @@ def prepare_hsdp_shard_context(
     # keep the original storage dtype on all-gather instead of casting to
     # hsdp_config.param_dtype (typically bfloat16). FP8 GEMM kernels expect
     # FP8 inputs; an implicit FP8 -> bf16 cast would silently break them.
-    has_fp8_params = any(p.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for p in model.parameters())
+    # ROCm gfx942 stores FP8 weights as the FNUZ variants.
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
+    has_fp8_params = any(p.dtype in fp8_dtypes for p in model.parameters())
     preserve_parameter_dtypes = bool(getattr(model, "_hsdp_preserve_parameter_dtypes", False))
     mp_policy = MixedPrecisionPolicy(
         param_dtype=None if has_fp8_params or preserve_parameter_dtypes else hsdp_config.param_dtype,
@@ -296,6 +299,9 @@ def finalize_hsdp_root(model: nn.Module, context: HSDPShardContext) -> None:
     if context.ignored_params:
         root_kwargs["ignored_params"] = context.ignored_params
     fully_shard(model, **root_kwargs)
+    # Auxiliary entrypoints need root unshard hooks in both loading paths.
+    for method_name in getattr(model, "_hsdp_forward_methods", ()):
+        register_fsdp_forward_method(model, method_name)
     for param in model.parameters():
         param.requires_grad = False
 
@@ -324,7 +330,8 @@ def shard_model(
             hsdp_kwargs={
                 "reshard_after_forward": reshard_after_forward,
                 "mesh": mesh,
-                "mp_policy": mp_policy,
+                # torch >= 2.15 fully_shard rejects mp_policy=None; use its default.
+                "mp_policy": mp_policy if mp_policy is not None else MixedPrecisionPolicy(),
             },
             ignored_params=ignored_params,
         )

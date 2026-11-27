@@ -8,15 +8,23 @@ import subprocess
 import sys
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from tests.e2e.accuracy.helpers import assert_video_pixel_close
 from tests.helpers.mark import hardware_marks
 
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "H200"}, num_cards=1)]
+
+# The native PixelUMM decoder is not bitwise to the reference's BF16 kernels
+# (stacked GEMMs, vLLM RMSNorm, per-tile attention). On real latents its error
+# against an FP32 reference decode is within 1.11x of the reference's own BF16
+# error (mean 2.8e-3, p99 2.6e-2, worst frame 32.8 dB), and native vs
+# reference measured mean 2.7e-3, p99 2.4e-2, worst frame 39.6 dB. The bounds
+# allow about twice that BF16 rounding noise; a window or tile bug is far larger.
+VIDEO_TOLERANCE = {"mean_threshold": 6e-3, "p99_threshold": 5.5e-2, "frame_psnr_threshold": 32.0}
 
 PROMPTS = [
     "A forest beside a clear river, daylight.",
@@ -210,9 +218,15 @@ def run_worker(args):
                 )
             expected = load_file(str(args.output / f"turn-{index}.safetensors"))
             torch.testing.assert_close(torch.cat(actual_latents[start:], 2), expected["latents"], rtol=0, atol=0)
-            video = output.output["payload"]["video"]
-            np.testing.assert_array_equal(video, expected["video"].numpy())
-            records.append({"turn": index, "frames": len(video), "latent_max_abs": 0, "uint8_max_abs": 0})
+            video = torch.from_numpy(output.output["payload"]["video"])
+            assert_video_pixel_close(
+                model_name=f"Hy-Nomas turn {index}",
+                actual=video.float() / 255,
+                expected=expected["video"].float() / 255,
+                **VIDEO_TOLERANCE,
+            )
+            uint8_max_abs = (video.int() - expected["video"].int()).abs().max().item()
+            records.append({"turn": index, "frames": len(video), "latent_max_abs": 0, "uint8_max_abs": uint8_max_abs})
         assert sum(record["frames"] for record in records) == args.frames * len(prompts)
         assert output.output["metadata"]["hy_nomas"]["withheld_frames"] == 0
     finally:

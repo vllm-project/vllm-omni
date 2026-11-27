@@ -75,7 +75,7 @@ def generate_stable_audio_short_clip(
 
 
 @pytest.mark.cache
-@hardware_test(res={"cuda": "L4", "xpu": "B60"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI300", "xpu": "B60"})
 def test_stable_audio_quantization_and_teacache() -> None:
     """Stable Audio Open on real Hub weights with FP8 + TeaCache (covers former L2 smoke + L4 features).
 
@@ -104,7 +104,7 @@ def test_stable_audio_quantization_and_teacache() -> None:
         m.close()
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI300", "xpu": "B60"})
 def test_stable_audio_cpu_offload() -> None:
     """Stable Audio Open with FP8 + CPU offload."""
     m = Omni(
@@ -124,7 +124,7 @@ def test_stable_audio_cpu_offload() -> None:
         m.close()
 
 
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI300"})
 def test_stable_audio_watermarking_opt_out() -> None:
     """Offline audio is watermarked by default, and requests can opt out through sampling params."""
     m = Omni(

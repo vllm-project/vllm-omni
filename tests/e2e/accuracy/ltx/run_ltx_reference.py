@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Generate raw LTX video and audio outputs with the official or Omni runtime."""
 
@@ -35,6 +35,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--spatial-upsampler", type=Path)
     parser.add_argument("--distilled-lora", type=Path)
     parser.add_argument("--enable-layerwise-offload", action="store_true")
+    parser.add_argument("--stage-init-timeout", type=int)
+    parser.add_argument("--init-timeout", type=int)
     return parser.parse_args()
 
 
@@ -329,14 +331,19 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request["seed"])
-    omni = Omni(
-        model=args.model,
-        model_class_name=args.model_class_name,
-        enforce_eager=True,
-        enable_layerwise_offload=args.enable_layerwise_offload,
-        diffusion_attention_config=attention_config,
-        parallel_config=DiffusionParallelConfig(),
-    )
+    omni_kwargs = {
+        "model": args.model,
+        "model_class_name": args.model_class_name,
+        "enforce_eager": True,
+        "enable_layerwise_offload": args.enable_layerwise_offload,
+        "diffusion_attention_config": attention_config,
+        "parallel_config": DiffusionParallelConfig(),
+    }
+    if args.stage_init_timeout is not None:
+        omni_kwargs["stage_init_timeout"] = args.stage_init_timeout
+    if args.init_timeout is not None:
+        omni_kwargs["init_timeout"] = args.init_timeout
+    omni = Omni(**omni_kwargs)
     try:
         detected_model_class_name = get_model_class_name(omni)
         model_class_name = args.model_class_name

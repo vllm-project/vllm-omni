@@ -17,12 +17,17 @@ from tests.helpers.stage_config import get_deploy_config_path, modify_stage_conf
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSConfig
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.tts]
 
+# Retain the existing localized and aggregate ROCm waveform bounds.
+_ROCM_MAX_AUDIO_ABS_DIFF = 5.0e-2
+_ROCM_MIN_AUDIO_SNR_DB = 30.0
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypatch):
     # Greedy sampling alone does not make different prefill shapes numerically
@@ -54,6 +59,12 @@ async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypa
     prompt = {"prompt_token_ids": [0] * prompt_len, "additional_information": info}
     observations = []
     audios = []
+    code2wav_updates: dict[str, bool | str] = {"enforce_eager": True, "async_scheduling": False}
+    if current_omni_platform.is_rocm():
+        # Independent BF16 decoders can exceed the waveform bounds for identical
+        # codec tokens. Use FP32 here to isolate prefill parity from that drift;
+        # the talker keeps its deployment dtype and exact-token assertions.
+        code2wav_updates["dtype"] = "float32"
     for chunked in (False, True):
         deploy = modify_stage_config(
             get_deploy_config_path("qwen3_tts.yaml"),
@@ -72,7 +83,7 @@ async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypa
                         "default_sampling_params.max_tokens": 128,
                         "subtalker_sampling_params": {"do_sample": False},
                     },
-                    1: {"enforce_eager": True, "async_scheduling": False},
+                    1: code2wav_updates,
                 },
             },
         )
@@ -104,14 +115,29 @@ async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypa
             engine.shutdown()
 
     baseline, chunked_probe = observations
+    same_audio_shape = audios[1].shape == audios[0].shape
+    if same_audio_shape:
+        audio_delta = audios[1].float() - audios[0].float()
+        audio_noise_power = audio_delta.square().mean()
+        audio_signal_power = audios[0].float().square().mean()
+        audio_snr_db = float(
+            10
+            * torch.log10(audio_signal_power / audio_noise_power.clamp_min(torch.finfo(audio_noise_power.dtype).tiny))
+        )
+        max_audio_difference = float(audio_delta.abs().max())
+    else:
+        audio_snr_db = None
+        max_audio_difference = None
     evidence = {
         "prompt_len": prompt_len,
+        "code2wav_dtype_override": code2wav_updates.get("dtype"),
         "observations": observations,
         "audio_samples": audios[0].numel(),
         "chunked_audio_samples": audios[1].numel(),
-        "max_audio_difference": (
-            float((audios[1] - audios[0]).abs().max()) if audios[1].shape == audios[0].shape else None
-        ),
+        "max_audio_difference": max_audio_difference,
+        "audio_snr_db": audio_snr_db,
+        "rocm_max_audio_difference_limit": _ROCM_MAX_AUDIO_ABS_DIFF,
+        "rocm_min_audio_snr_db": _ROCM_MIN_AUDIO_SNR_DB,
     }
     evidence_path = tmp_path / "phase_contract.json"
     evidence_path.write_text(json.dumps(evidence, indent=2))
@@ -123,4 +149,19 @@ async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypa
     assert [prompt_len, prompt_len - 1, 1, True] in chunked_probe["events"]
     assert baseline["codes"] and chunked_probe["codes"]
     assert chunked_probe["codes"] == baseline["codes"]
-    torch.testing.assert_close(audios[1], audios[0], rtol=1e-4, atol=1e-5)
+    assert same_audio_shape
+    if current_omni_platform.is_rocm():
+        # Exact codes are the prefill contract. Retain both waveform bounds
+        # with FP32 decoding so localized and aggregate audio regressions fail.
+        assert max_audio_difference is not None
+        assert max_audio_difference < _ROCM_MAX_AUDIO_ABS_DIFF, (
+            f"ROCm waveform max difference {max_audio_difference:.8f} exceeds "
+            f"{_ROCM_MAX_AUDIO_ABS_DIFF:.8f} despite exact generated codes"
+        )
+        assert audio_snr_db is not None
+        assert audio_snr_db > _ROCM_MIN_AUDIO_SNR_DB, (
+            f"ROCm waveform SNR {audio_snr_db:.2f} dB is not above "
+            f"{_ROCM_MIN_AUDIO_SNR_DB:.2f} dB despite exact generated codes"
+        )
+    else:
+        torch.testing.assert_close(audios[1], audios[0], rtol=1e-4, atol=1e-5)

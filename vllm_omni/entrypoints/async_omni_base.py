@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from collections.abc import AsyncGenerator, Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput
@@ -32,14 +33,20 @@ from vllm_omni.entrypoints.omni_base import (
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.client_request_state import ClientRequestState
+
 logger = init_logger(__name__)
 # A queued output wakes the final-output loop immediately; this wait only
 # bounds how often the orchestrator liveness check runs while idle.
 _FINAL_OUTPUT_WAIT_S = 1.0
+_SHUTDOWN_REASON = "server is shutting down"
 # Longest the final-output loop dispatches a batch before yielding the loop.
 _FINAL_OUTPUT_YIELD_INTERVAL_S = 0.001
 # Shared DELETE / generate() cleanup abort bound. Env is the documented knob.
 ABORT_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_ABORT_TIMEOUT", 2.0))
+# How long request cleanup waits for interaction-rejection callbacks.
+INTERACTION_ERROR_DRAIN_TIMEOUT_S = 0.5
 
 
 class AsyncEventResolver:
@@ -102,16 +109,17 @@ class AsyncEventResolver:
                     fut.set_result(task_info["received"])
 
 
+def _log_interaction_error_handler_failure(task: asyncio.Future) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("Interaction error callback failed", exc_info=task.exception())
+
+
 class AsyncOmniBase(OmniBase):
     """Shared asyncio foundation of the async entrypoints (see module docstring)."""
 
     def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
-        self.final_output_task: asyncio.Task | None = None
-        self.event_resolver = AsyncEventResolver(orchestrator=self)
-        self.config_path = self.engine.config_path
-        self.input_processor = self.engine.input_processor
-        self.endpoint_restrictions = self.engine.endpoint_restrictions
+        self._initialize_async_frontend()
 
         stage_index = self._get_comprehension_stage_index()
         if stage_index is None:
@@ -125,6 +133,18 @@ class AsyncOmniBase(OmniBase):
 
                 renderer = renderer_from_config(vllm_config)
             self.io_processor = get_io_processor(vllm_config, renderer, io_processor_plugin)
+
+    def _initialize_async_frontend(self) -> None:
+        """Attach engine metadata and the shared output pump without renderers."""
+        self.final_output_task: asyncio.Task | None = None
+        self._output_loop: asyncio.AbstractEventLoop | None = None
+        self._output_loop_lock = threading.Lock()
+        self._frontend_shutting_down = False
+        self.event_resolver = AsyncEventResolver(orchestrator=self)
+        self.config_path = self.engine.config_path
+        self.input_processor = self.engine.input_processor
+        self.endpoint_restrictions = self.engine.endpoint_restrictions
+        self.io_processor = None
 
     # ==================== Subclass seam ====================
 
@@ -140,6 +160,62 @@ class AsyncOmniBase(OmniBase):
         already failed through their per-request queues.
         """
         del error
+
+    async def _release_rejected_interaction(self, request_id: str, event_id: str) -> None:
+        """Seam: drop engine-side state held for a rejected interaction (default: nothing)."""
+        del request_id, event_id
+
+    def _dispatch_interaction_error(self, req_state: ClientRequestState, msg: ErrorMessage) -> None:
+        """Report a rejected mid-stream interaction without failing its request.
+
+        The orchestrator reports a rejected interaction as a non-fatal error
+        tagged with the event_id. The generation keeps running, so the error
+        goes to the request's ``on_error`` callback instead of its output
+        queue, where ``generate()`` would raise on it.
+        """
+        assert msg.request_id is not None and msg.event_id is not None
+        if req_state.interaction_errors_closed:
+            # The request is already cleaning up, and a callback started now
+            # would outlive both the drain and the request state.
+            logger.warning(
+                "[%s] Interaction %s rejected while req %s was finishing: %s",
+                self._name,
+                msg.event_id,
+                msg.request_id,
+                msg.error,
+            )
+            return
+        task = asyncio.ensure_future(
+            self._report_interaction_rejection(req_state, msg.request_id, msg.event_id, msg.error)
+        )
+        req_state.interaction_error_tasks.add(task)
+        task.add_done_callback(req_state.interaction_error_tasks.discard)
+        task.add_done_callback(_log_interaction_error_handler_failure)
+
+    async def _report_interaction_rejection(
+        self, req_state: ClientRequestState, request_id: str, event_id: str, error: str
+    ) -> None:
+        # Release before notifying: the caller may reuse the event_id at once,
+        # and a later release would drop that new reservation.
+        await self._release_rejected_interaction(request_id, event_id)
+        handler = req_state.interaction_error_handler
+        if handler is None:
+            logger.warning("[%s] Interaction %s rejected for req %s: %s", self._name, event_id, request_id, error)
+            return
+        await handler(event_id, error)
+
+    async def _drain_interaction_error_tasks(self, req_state: ClientRequestState) -> None:
+        """Let pending rejection callbacks finish briefly, then cancel the rest.
+
+        Admission closes first, so the output loop cannot add a callback
+        while the wait below is suspended.
+        """
+        req_state.interaction_errors_closed = True
+        tasks = set(req_state.interaction_error_tasks)
+        if tasks:
+            await asyncio.wait(tasks, timeout=INTERACTION_ERROR_DRAIN_TIMEOUT_S)
+        for task in list(req_state.interaction_error_tasks):
+            task.cancel()
 
     def _resolve_transfer_replica(self, stage_id: int, request_id: str) -> int | None:
         """Look up the sticky-routed replica for (stage_id, request_id).
@@ -187,7 +263,10 @@ class AsyncOmniBase(OmniBase):
 
     @property
     def vllm_config(self):
-        """Return the vLLM config for the comprehension stage when present."""
+        """Return engine-provided frontend config, or select a local stage's config."""
+        get_config = getattr(self.engine, "get_frontend_vllm_config", None)
+        if get_config is not None:
+            return get_config()
         stage_index = self._get_comprehension_stage_index()
         if stage_index is None:
             return None
@@ -198,7 +277,10 @@ class AsyncOmniBase(OmniBase):
         return self.vllm_config
 
     def get_diffusion_od_config(self) -> Any | None:
-        """Return the diffusion-stage config when the pipeline has one."""
+        """Return engine-provided frontend config, or inspect local diffusion clients."""
+        get_config = getattr(self.engine, "get_frontend_diffusion_od_config", None)
+        if get_config is not None:
+            return get_config()
         saw_diffusion_stage = any(stage_config.stage_type == "diffusion" for stage_config in self.engine.stage_configs)
         for stage_client in self.engine.stage_clients:
             if getattr(stage_client, "stage_type", None) != "diffusion":
@@ -313,12 +395,23 @@ class AsyncOmniBase(OmniBase):
 
     # ==================== Output Handler ====================
 
+    def _check_frontend_admission(self) -> None:
+        """Bind the serving loop before a request can park or register."""
+        # Serialize the first admission check with shutdown before any loop
+        # has been bound, even when no output pump has started.
+        if self._output_loop is None:
+            with self._output_loop_lock:
+                self._output_loop = asyncio.get_running_loop()
+        if self._frontend_shutting_down:
+            raise OmniEngineDeadError(_SHUTDOWN_REASON)
+
     def _final_output_handler(self) -> None:
         """Start the final output handler if not already running.
 
         This handler reads messages from the Orchestrator output queue and
         routes them to per-request asyncio.Queues.
         """
+        self._check_frontend_admission()
         if self.final_output_task is not None:
             return
 
@@ -368,7 +461,11 @@ class AsyncOmniBase(OmniBase):
                             # death and falls through to the except handler below.
                             if msg.request_id is not None:
                                 req_state = self.request_states.get(msg.request_id)
-                                if req_state is not None:
+                                if req_state is not None and not msg.fatal and msg.event_id is not None:
+                                    # A rejected mid-stream interaction is scoped to
+                                    # its event: report it, keep the generation running.
+                                    self._dispatch_interaction_error(req_state, msg)
+                                elif req_state is not None:
                                     await req_state.queue.put(msg)
                                 else:
                                     logger.warning(
@@ -537,11 +634,15 @@ class AsyncOmniBase(OmniBase):
         for rid in request_ids:
             self._record_request_failure_once(rid, reason="client_abort")
             state = self.request_states.get(rid)
-            input_stream_task = getattr(state, "input_stream_task", None)
-            if input_stream_task is not None and not input_stream_task.done():
-                input_stream_task.cancel()
+            self._cancel_input_pump(getattr(state, "input_stream_task", None))
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
+
+    @staticmethod
+    def _cancel_input_pump(task: asyncio.Task | None) -> None:
+        # A second cancel interrupts async cleanup inside the input iterator.
+        if task is not None and not task.done() and not task.cancelling():  # type: ignore[attr-defined]
+            task.cancel()
 
     @staticmethod
     def _synthetic_abort_output_message(
@@ -603,14 +704,84 @@ class AsyncOmniBase(OmniBase):
 
     # The async entrypoints expose the synchronous base health check as an awaitable.
     async def check_health(self) -> None:  # type: ignore[override]
-        """Check engine health by verifying the Orchestrator process is alive."""
-        OmniBase.check_health(self)
+        """Use an engine's async health check, or inspect its local stage pools."""
+        check_health = getattr(self.engine, "check_health_async", None)
+        if check_health is not None:
+            await check_health()
+        else:
+            OmniBase.check_health(self)
 
     # ==================== Shutdown ====================
 
     def shutdown(self, timeout: float | None = None) -> None:
-        """Shutdown the engine."""
+        """Shutdown the engine and release the frontend's request waiters."""
+        self._close_async_frontend()
+        OmniBase.shutdown(self, timeout)
+
+    def _close_async_frontend(self) -> None:
+        """Close admission and finish loop-owned cleanup before engine teardown."""
+        with self._output_loop_lock:
+            loop = self._output_loop
+            if loop is None:
+                # No output task or request can register before observing this.
+                self._frontend_shutting_down = True
+
+        if loop is not None:
+            try:
+                caller_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                caller_loop = None
+            if loop.is_running() and caller_loop is not loop:
+                self._shutdown_frontend_from_executor(loop)
+            else:
+                self._shutdown_frontend()
+
+    def _shutdown_frontend_from_executor(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Wait for the serving loop callback before engine teardown."""
+        finished = threading.Event()
+
+        def stop_frontend() -> None:
+            try:
+                self._shutdown_frontend()
+            finally:
+                finished.set()
+
+        try:
+            loop.call_soon_threadsafe(stop_frontend)
+        except RuntimeError:
+            if not loop.is_closed():
+                raise
+            return
+        # The launcher awaits this executor call, leaving the serving loop free
+        # to deliver the errors. If the loop stops concurrently, no callback
+        # can run and the executor must still be able to release the engine.
+        while not finished.wait(timeout=0.1) and loop.is_running():
+            pass
+
+    def _shutdown_frontend(self) -> None:
+        """Close admission and stop the output pump on its owning loop."""
+        if self._frontend_shutting_down:
+            return
+        self._frontend_shutting_down = True
+
+        # No coroutine can register a request between this fan-out and
+        # cancellation. Each registered request can drain its own terminal error.
+        for req_state in list(self.request_states.values()):
+            req_state.queue.put_nowait(
+                ErrorMessage(error=_SHUTDOWN_REASON, fatal=True, request_id=req_state.request_id)
+            )
+            # generate() can be waiting for its first input before it starts
+            # reading the output queue. The pump may not have run yet.
+            first_chunk_submitted = req_state.first_chunk_submitted
+            if first_chunk_submitted is not None and not first_chunk_submitted.done():
+                first_chunk_submitted.set_result(None)
+            self._cancel_input_pump(req_state.input_stream_task)
+            for task in list(req_state.interaction_error_tasks):
+                task.cancel()
         if self.final_output_task is not None:
             self.final_output_task.cancel()
             self.final_output_task = None
-        OmniBase.shutdown(self)
+        self._on_frontend_shutdown()
+
+    def _on_frontend_shutdown(self) -> None:
+        """Wake any subclass-owned frontend waiters."""

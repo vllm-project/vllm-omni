@@ -9,6 +9,10 @@ from ..utils.logging import get_connector_logger
 logger = get_connector_logger(__name__)
 
 
+class PermanentTransferError(RuntimeError):
+    """A transfer that cannot succeed by retrying the same get or put."""
+
+
 class OmniConnectorBase(ABC):
     """Base class for all OmniConnectors."""
 
@@ -108,14 +112,14 @@ class OmniConnectorBase(ABC):
 
     @staticmethod
     def serialize_obj(obj: Any) -> bytes:
-        """Serialize a Python object to bytes using centralized serializer."""
+        """Serialize with the shared serializer; connectors may own their own OmniSerde."""
         from ..utils.serialization import OmniSerializer
 
         return OmniSerializer.serialize(obj)
 
     @staticmethod
     def deserialize_obj(data: bytes) -> Any:
-        """Deserialize bytes to Python object using centralized serializer."""
+        """Deserialize with the shared serializer; connectors may own their own OmniSerde."""
         from ..utils.serialization import OmniSerializer
 
         return OmniSerializer.deserialize(data)

@@ -8,7 +8,7 @@ import math
 import os
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -26,32 +26,34 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.interaction.mixin import InteractionMixin
+from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import retrieve_latents
-from vllm_omni.diffusion.offloader.config import offload_enabled
+from vllm_omni.diffusion.offloader import sequential_offload_component
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, offload_enabled, resolve_offload
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.experimental.ar_diffusion import ARDiffusionChunkMetadata
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
 )
 from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState, WanStreamingDecoder
-from vllm_omni.experimental.ar_diffusion.tick_protocol import (
-    ARDiffusionChunkMetadata,
-    ARDiffusionTickRequest,
-)
 
 from .abot_world_transformer import (
     ABotAttentionCache,
     ABotTransformerCache,
     ABotWorldCausalTransformer3DModel,
 )
+from .actions import CAMERA_ACTION_SCRIPT_KEY, PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY
+from .interaction import ABotCameraSession
 from .taew2_2 import TAEW2Decoder
 
 if TYPE_CHECKING:
@@ -73,8 +75,6 @@ _PAGED_KV_BLOCK_ALIGNMENT = 16
 _SOURCE_IMAGE_ERROR = (
     "Unable to load multi_modal_data.image; expected a decodable image within 4096 * 4096 source pixels."
 )
-_PREPROCESSED_ACTION_KEY = "_abot_camera_actions"
-_PREPROCESSED_ACTION_SCRIPT_KEY = "_abot_camera_action_script"
 _ACTION_CONTROL_DIM = 32
 
 
@@ -167,7 +167,6 @@ class _ABotRequestInputs:
     prompt: str
     image: PIL.Image.Image | torch.Tensor
     reference_images: tuple[PIL.Image.Image | torch.Tensor, ...] | None
-    camera_actions: tuple[tuple[str, ...], ...] | None
     camera_action_script: tuple[tuple[tuple[str, ...], ...], ...] | None
     height: int
     width: int
@@ -178,16 +177,6 @@ class _ABotRequestInputs:
     max_sequence_length: int
     flow_shift: float
     generator: torch.Generator
-
-
-@dataclass
-class _ABotARSessionState:
-    next_chunk_index: int = 0
-    prompt: str | None = None
-    generator_state: torch.Tensor | None = None
-    first_frame_latent: torch.Tensor | None = None
-    current_actions: tuple[tuple[str, ...], ...] | None = None
-    prompt_embeds: torch.Tensor | None = None
 
 
 def _resolve_local_model_path(model: str) -> str:
@@ -252,44 +241,6 @@ def _convert_wan_umt5_encoder_state_dict(
     unexpected = set(source) - consumed
     if unexpected:
         raise KeyError(f"Unexpected keys in Wan UMT5 encoder checkpoint: {sorted(unexpected)[:10]}")
-    return converted
-
-
-def _fix_wan22_residual_vae_keys(
-    source: dict[str, torch.Tensor], converted: dict[str, torch.Tensor]
-) -> dict[str, torch.Tensor]:
-    """Restore Wan2.2 residual block nesting lost by Diffusers' converter."""
-    converted = {
-        key: value
-        for key, value in converted.items()
-        if not key.startswith(("encoder.down_blocks.", "decoder.up_blocks.", "decoder.upsamples."))
-    }
-    tail_replacements = {
-        "residual.0.": "norm1.",
-        "residual.2.": "conv1.",
-        "residual.3.": "norm2.",
-        "residual.6.": "conv2.",
-        "shortcut.": "conv_shortcut.",
-    }
-
-    for key, value in source.items():
-        parts = key.split(".")
-        if len(parts) < 6:
-            continue
-        if parts[:2] == ["encoder", "downsamples"] and parts[3] == "downsamples":
-            block, layer, tail = parts[2], int(parts[4]), ".".join(parts[5:])
-            component = f"resnets.{layer}" if layer < 2 else "downsampler"
-            prefix = f"encoder.down_blocks.{block}.{component}."
-        elif parts[:2] == ["decoder", "upsamples"] and parts[3] == "upsamples":
-            block, layer, tail = parts[2], int(parts[4]), ".".join(parts[5:])
-            component = f"resnets.{layer}" if layer < 3 else "upsampler"
-            prefix = f"decoder.up_blocks.{block}.{component}."
-        else:
-            continue
-        for old, new in tail_replacements.items():
-            tail = tail.replace(old, new)
-        converted[prefix + tail] = value
-
     return converted
 
 
@@ -397,21 +348,8 @@ def get_abot_world_pre_process_func(
                 else:
                     raise ValueError("Each reference image must be a PIL image, tensor, or file path.")
 
-        tick = ARDiffusionTickRequest.from_extra_args(getattr(request.sampling_params, "extra_args", None) or {})
-        camera_actions = None
-        if tick is not None:
-            camera_controls = [c for c in tick.controls if c.track == "camera"]
-            if camera_controls:
-                from vllm_omni.diffusion.models.abot_world.actions import (
-                    ABOT_CAMERA_ACTION_SCHEMA,
-                    parse_abot_camera_action_frames,
-                )
-
-                if camera_controls[0].schema == ABOT_CAMERA_ACTION_SCHEMA:
-                    camera_actions = parse_abot_camera_action_frames(camera_controls[0].data, expected_frames=3)
-
         extra_args = dict(getattr(request.sampling_params, "extra_args", None) or {})
-        camera_action_script = extra_args.get("camera_action_script")
+        camera_action_script = extra_args.get(CAMERA_ACTION_SCRIPT_KEY)
         if camera_action_script is not None:
             from vllm_omni.diffusion.models.abot_world.actions import parse_abot_camera_action_script
 
@@ -423,8 +361,7 @@ def get_abot_world_pre_process_func(
             updated_mmd["reference_images"] = tuple(resolved_refs)
         updated_prompt["multi_modal_data"] = updated_mmd
         request.prompt = updated_prompt
-        extra_args[_PREPROCESSED_ACTION_KEY] = camera_actions
-        extra_args[_PREPROCESSED_ACTION_SCRIPT_KEY] = camera_action_script
+        extra_args[PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY] = camera_action_script
         request.sampling_params.extra_args = extra_args
         return request
 
@@ -458,11 +395,13 @@ class ABotWorldCausalPipeline(
     SupportsComponentDiscovery,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
+    InteractionMixin,
 ):
     """ABot-World I2V causal DMD pipeline."""
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _module_offload: bool = False
     _vae_modules: ClassVar[list[str]] = ["vae"]
     dummy_run_num_frames: ClassVar[int] = 0
     _AR_BRANCH = "main"
@@ -488,6 +427,7 @@ class ABotWorldCausalPipeline(
         self._vae_backend = model_config.get("abot_vae", "wan")
         _validate_local_model_files(model_path, vae_backend=self._vae_backend)
         managed_offload = offload_enabled(od_config)
+        self._module_offload = resolve_offload(od_config).strategy is OffloadStrategy.MODEL_LEVEL
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -535,7 +475,6 @@ class ABotWorldCausalPipeline(
         self._ar_height = int(model_config.get("ar_diffusion_height", _DEFAULT_HEIGHT))
         self._ar_width = int(model_config.get("ar_diffusion_width", _DEFAULT_WIDTH))
         self._ar_diffusion_kv_state: ARDiffusionKVState | None = None
-        self._ar_sessions: dict[str, _ABotARSessionState] = {}
 
         self.setup_diffusion_pipeline_profiler(
             profiler_targets=[
@@ -592,137 +531,10 @@ class ABotWorldCausalPipeline(
 
     @staticmethod
     def _load_vae_from_local_pth(vae_pth: str, dtype: torch.dtype) -> DistributedAutoencoderKLWan:
-        """Convert the original Wan2.2 VAE checkpoint to Diffusers names."""
-        from diffusers.loaders.single_file_utils import convert_wan_vae_to_diffusers
-
-        # Wan2.2 TI2V patchifies RGB into 12 pixel-space channels (3 * 2 * 2),
-        # while its actual latent width is z_dim=48. Do not substitute the
-        # 16-channel Wan2.1 VAE here.
-        vae_config = {
-            "_class_name": "AutoencoderKLWan",
-            "base_dim": 160,
-            "decoder_base_dim": 256,
-            "z_dim": 48,
-            "dim_mult": [1, 2, 4, 4],
-            "num_res_blocks": 2,
-            "attn_scales": [],
-            "temperal_downsample": [False, True, True],
-            "dropout": 0.0,
-            "in_channels": 12,
-            "out_channels": 12,
-            "patch_size": 2,
-            "scale_factor_temporal": 4,
-            "scale_factor_spatial": 16,
-            "is_residual": True,
-            "latents_mean": [
-                -0.2289,
-                -0.0052,
-                -0.1323,
-                -0.2339,
-                -0.2799,
-                0.0174,
-                0.1838,
-                0.1557,
-                -0.1382,
-                0.0542,
-                0.2813,
-                0.0891,
-                0.1570,
-                -0.0098,
-                0.0375,
-                -0.1825,
-                -0.2246,
-                -0.1207,
-                -0.0698,
-                0.5109,
-                0.2665,
-                -0.2108,
-                -0.2158,
-                0.2502,
-                -0.2055,
-                -0.0322,
-                0.1109,
-                0.1567,
-                -0.0729,
-                0.0899,
-                -0.2799,
-                -0.1230,
-                -0.0313,
-                -0.1649,
-                0.0117,
-                0.0723,
-                -0.2839,
-                -0.2083,
-                -0.0520,
-                0.3748,
-                0.0152,
-                0.1957,
-                0.1433,
-                -0.2944,
-                0.3573,
-                -0.0548,
-                -0.1681,
-                -0.0667,
-            ],
-            "latents_std": [
-                0.4765,
-                1.0364,
-                0.4514,
-                1.1677,
-                0.5313,
-                0.4990,
-                0.4818,
-                0.5013,
-                0.8158,
-                1.0344,
-                0.5894,
-                1.0901,
-                0.6885,
-                0.6165,
-                0.8454,
-                0.4978,
-                0.5759,
-                0.3523,
-                0.7135,
-                0.6804,
-                0.5833,
-                1.4146,
-                0.8986,
-                0.5659,
-                0.7069,
-                0.5338,
-                0.4889,
-                0.4917,
-                0.4069,
-                0.4999,
-                0.6866,
-                0.4093,
-                0.5709,
-                0.6065,
-                0.6415,
-                0.4944,
-                0.5726,
-                1.2042,
-                0.5458,
-                1.6887,
-                0.3971,
-                1.0600,
-                0.3943,
-                0.5537,
-                0.5444,
-                0.4089,
-                0.7468,
-                0.7744,
-            ],
-        }
         state_dict = torch.load(vae_pth, map_location="cpu", weights_only=True)
         if isinstance(state_dict, dict) and isinstance(state_dict.get("state_dict"), dict):
             state_dict = state_dict["state_dict"]
-        converted = _fix_wan22_residual_vae_keys(state_dict, convert_wan_vae_to_diffusers(state_dict))
-        with torch.device("meta"):
-            vae = DistributedAutoencoderKLWan.from_config(vae_config)
-        vae.load_state_dict(converted, strict=True, assign=True)
-        vae = vae.to(dtype=dtype)
+        vae = DistributedAutoencoderKLWan.from_wan22_state_dict(state_dict).to(dtype=dtype)
         vae.init_distributed()
         return vae
 
@@ -806,7 +618,6 @@ class ABotWorldCausalPipeline(
         self.close_ar_diffusion_session(session_id)
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
-        self._ar_sessions.pop(session_id, None)
         state = self._streaming_decode_states.pop(session_id, None)
         if state is not None:
             state.release()
@@ -863,8 +674,7 @@ class ABotWorldCausalPipeline(
             )
 
         extra_args = getattr(sampling, "extra_args", None) or {}
-        camera_actions = extra_args.get(_PREPROCESSED_ACTION_KEY)
-        camera_action_script = extra_args.get(_PREPROCESSED_ACTION_SCRIPT_KEY)
+        camera_action_script = extra_args.get(PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY)
         flow_shift = _positive_finite_flow_shift(extra_args.get("flow_shift", 5.0))
 
         height = getattr(sampling, "height", None) or _DEFAULT_HEIGHT
@@ -909,7 +719,6 @@ class ABotWorldCausalPipeline(
             prompt=prompt.strip(),
             image=image,
             reference_images=reference_images,
-            camera_actions=camera_actions,
             camera_action_script=camera_action_script,
             height=height,
             width=width,
@@ -1076,22 +885,25 @@ class ABotWorldCausalPipeline(
         if invalidate:
             state.clear_cross_attention()
         if not state.is_cross_attention_populated(self._AR_BRANCH, self._AR_TEXT_CACHE):
-            projected_text = self.transformer.text_embedding(prompt_embeds)
+            # These projections bypass transformer.forward and its offload hook.
+            residency = sequential_offload_component(self.transformer) if self._module_offload else nullcontext()
+            with residency:
+                projected_text = self.transformer.text_embedding(prompt_embeds)
 
-            def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-                for block in self.transformer.blocks:
-                    cross_attention = block.cross_attn
-                    key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(
-                        2,
-                        (cross_attention.num_local_heads, cross_attention.head_dim),
-                    )
-                    value = cross_attention.v(projected_text).unflatten(
-                        2,
-                        (cross_attention.num_local_heads, cross_attention.head_dim),
-                    )
-                    yield key, value
+                def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+                    for block in self.transformer.blocks:
+                        cross_attention = block.cross_attn
+                        key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(
+                            2,
+                            (cross_attention.num_local_heads, cross_attention.head_dim),
+                        )
+                        value = cross_attention.v(projected_text).unflatten(
+                            2,
+                            (cross_attention.num_local_heads, cross_attention.head_dim),
+                        )
+                        yield key, value
 
-            state.populate_cross_attention(self._AR_BRANCH, self._AR_TEXT_CACHE, layer_kv())
+                state.populate_cross_attention(self._AR_BRANCH, self._AR_TEXT_CACHE, layer_kv())
         return [
             ABotAttentionCache(
                 key=layer["k"],
@@ -1239,8 +1051,6 @@ class ABotWorldCausalPipeline(
             ]
         )
         inputs = self._parse_request(req)
-        if ARDiffusionTickRequest.from_extra_args(state.sampling.extra_args) is not None:
-            raise ValueError("ABot step execution does not accept AR-Diffusion ticks.")
         if (inputs.height, inputs.width) != (self._ar_height, self._ar_width):
             raise ValueError("ABot stepwise resolution must match the fixed AR cache geometry.")
         total_chunks = inputs.num_latent_frames // inputs.num_frame_per_block
@@ -1264,18 +1074,20 @@ class ABotWorldCausalPipeline(
             "dtype": dtype,
         }
         self._ar_text_caches(prompt_embeds, invalidate=False)
-        self._prepare_next_chunk(state)
         return state
 
     def _prepare_next_chunk(self, state: StepRequestState) -> None:
         inputs: _ABotRequestInputs = state.extra["inputs"]
         block_frames = inputs.num_frame_per_block
         start_frame = state.chunk_index * block_frames
-        actions = (
-            inputs.camera_action_script[state.chunk_index]
-            if inputs.camera_action_script is not None
-            else inputs.camera_actions
-        )
+        camera = state.interaction_sessions.get("camera")
+        live_actions = camera.chunk_actions if isinstance(camera, ABotCameraSession) else None
+        if inputs.camera_action_script is not None:
+            if live_actions is not None:
+                raise ValueError("Cannot use mid-generation camera interaction together with camera_action_script.")
+            actions = inputs.camera_action_script[state.chunk_index]
+        else:
+            actions = live_actions
         state.extra["start_frame"] = start_frame
         state.extra["action_condition"] = self._build_action_tensor(
             actions, block_frames, inputs.height, inputs.width, state.extra["dtype"]
@@ -1382,8 +1194,6 @@ class ABotWorldCausalPipeline(
         completed_chunk = state.chunk_index
         state.chunk_index += 1
         finished = state.request_denoise_completed
-        if not finished:
-            self._prepare_next_chunk(state)
         return DiffusionOutput(
             output={
                 "payload": payload,
@@ -1392,7 +1202,6 @@ class ABotWorldCausalPipeline(
                         session_id=state.request_id,
                         request_id=state.request_id,
                         chunk_index=completed_chunk,
-                        applied_event_ids=(),
                     ).to_dict()
                 },
             },
@@ -1401,6 +1210,29 @@ class ABotWorldCausalPipeline(
             total_chunks=state.total_chunks,
             finished=finished,
         )
+
+    def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
+        """Expose the next chunk's decoded frame count and latent block size."""
+        num_latent_frames = self._num_frame_per_block
+        num_media_frames = num_latent_frames * self.vae_scale_factor_temporal
+        if state.chunk_index == 0:
+            num_media_frames -= self.vae_scale_factor_temporal - 1
+        fps = state.sampling.fps
+        if fps is None or float(fps) <= 0:
+            # Key actions are applied per chunk, not paced against wall-clock frames;
+            # a unit chunk duration keeps the media spec valid without sampling.fps.
+            fps = float(num_media_frames)
+        return ChunkMediaSpec(
+            num_media_frames=num_media_frames,
+            fps=float(fps),
+            num_latent_frames=num_latent_frames,
+        )
+
+    def prepare_next_chunk(self, state: StepRequestState) -> None:
+        """Prepare the next AR block after chunk-boundary interaction apply."""
+        if state.request_denoise_completed:
+            return
+        self._prepare_next_chunk(state)
 
     def _commit_stepwise_kv(self, state: StepRequestState, latents: torch.Tensor) -> None:
         extra = state.extra
@@ -1423,165 +1255,61 @@ class ABotWorldCausalPipeline(
         self._ar_diffusion_kv_state.commit_paged_context(self._AR_BRANCH)
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        if self._ar_diffusion_kv_state is not None:
+            raise ValueError(
+                "ABot request mode does not run under ARDiffusionEngine session binding; "
+                "enable step execution for AR-Diffusion serving."
+            )
         inputs = self._parse_request(req)
-        tick = ARDiffusionTickRequest.from_extra_args(req.sampling_params.extra_args)
-        if tick is not None and self._ar_diffusion_kv_state is None:
-            raise RuntimeError("ABot typed ticks require ARDiffusionEngine session binding.")
-        if tick is None and self._ar_diffusion_kv_state is not None:
-            raise ValueError("ABot ARDiffusionEngine requests must carry ar_diffusion_tick.")
-
-        session_state: _ABotARSessionState | None = None
-        if tick is not None:
-            if (inputs.height, inputs.width) != (self._ar_height, self._ar_width):
-                raise ValueError("ABot AR-Diffusion resolution must match fixed cache geometry.")
-            session_state = self._ar_sessions.setdefault(tick.session_id, _ABotARSessionState())
-            if tick.chunk_index != session_state.next_chunk_index:
-                raise ValueError(
-                    "ABot realtime chunks must be contiguous: "
-                    f"got {tick.chunk_index}, expected {session_state.next_chunk_index}."
-                )
         schedule = _build_shifted_flow_schedule(flow_shift=inputs.flow_shift)
         dtype = self.transformer.dtype
         out_channels = int(self.transformer.config.out_channels)
         block_frames = inputs.num_frame_per_block
 
-        if (
-            session_state is not None
-            and session_state.prompt == inputs.prompt
-            and session_state.prompt_embeds is not None
-        ):
-            prompt_embeds = session_state.prompt_embeds
-        else:
-            prompt_embeds = self.encode_prompt(
-                inputs.prompt, max_sequence_length=inputs.max_sequence_length, dtype=dtype
-            )
+        prompt_embeds = self.encode_prompt(inputs.prompt, max_sequence_length=inputs.max_sequence_length, dtype=dtype)
         latent_h = inputs.height // self.vae_scale_factor_spatial
         latent_w = inputs.width // self.vae_scale_factor_spatial
 
-        if tick is None:
-            # ── Offline: full video generation ──
-            first_frame_cond = self._encode_first_frame(inputs.image, inputs.height, inputs.width, dtype)
-            cache = self.transformer.allocate_cache(
-                batch_size=1,
-                latent_height=latent_h,
-                latent_width=latent_w,
-                device=self.device,
-                dtype=dtype,
-            )
-            total_steps = (inputs.num_latent_frames // block_frames) * len(ABOT_DMD_TIMESTEPS)
-            generated_blocks: list[torch.Tensor] = []
+        first_frame_cond = self._encode_first_frame(inputs.image, inputs.height, inputs.width, dtype)
+        cache = self.transformer.allocate_cache(
+            batch_size=1,
+            latent_height=latent_h,
+            latent_width=latent_w,
+            device=self.device,
+            dtype=dtype,
+        )
+        total_steps = (inputs.num_latent_frames // block_frames) * len(ABOT_DMD_TIMESTEPS)
+        generated_blocks: list[torch.Tensor] = []
 
-            with self.progress_bar(total=total_steps) as progress_bar:
-                for local_start in range(0, inputs.num_latent_frames, block_frames):
-                    stop = local_start + block_frames
-                    block_actions = (
-                        inputs.camera_actions[local_start:stop] if inputs.camera_actions is not None else None
-                    )
-                    block_action = self._build_action_tensor(
-                        block_actions,
-                        block_frames,
-                        inputs.height,
-                        inputs.width,
-                        dtype,
-                    )
+        block_action = self._build_action_tensor(None, block_frames, inputs.height, inputs.width, dtype)
 
-                    noise = randn_tensor(
-                        (1, out_channels, block_frames, latent_h, latent_w),
-                        generator=inputs.generator,
-                        device=self.device,
-                        dtype=torch.float32,
-                    )
-                    generated_blocks.append(
-                        self._generate_block(
-                            noise_latent=noise,
-                            prompt_embeds=prompt_embeds,
-                            first_frame_latent=first_frame_cond,
-                            action_condition=block_action,
-                            start_frame=local_start,
-                            schedule=schedule,
-                            generator=inputs.generator,
-                            cache=cache,
-                            ar_cross_attention=None,
-                            progress_bar=progress_bar,
-                        )
-                    )
-        else:
-            # ── Realtime: single block ──
-            assert session_state is not None
-            prompt_changed = session_state.prompt is not None and session_state.prompt != inputs.prompt
-            if session_state.first_frame_latent is None:
-                session_state.first_frame_latent = self._encode_first_frame(
-                    inputs.image,
-                    inputs.height,
-                    inputs.width,
-                    dtype,
+        with self.progress_bar(total=total_steps) as progress_bar:
+            for local_start in range(0, inputs.num_latent_frames, block_frames):
+                noise = randn_tensor(
+                    (1, out_channels, block_frames, latent_h, latent_w),
+                    generator=inputs.generator,
+                    device=self.device,
+                    dtype=torch.float32,
                 )
-            # First frame only applies to the very first chunk
-            ff_latent = session_state.first_frame_latent if tick.chunk_index == 0 else None
-
-            _, _, _, latent_h_block, latent_w_block = session_state.first_frame_latent.shape
-            block_action = self._build_action_tensor(
-                inputs.camera_actions,
-                block_frames,
-                inputs.height,
-                inputs.width,
-                dtype,
-            )
-            if session_state.generator_state is not None:
-                inputs.generator.set_state(session_state.generator_state)
-
-            noise = randn_tensor(
-                (1, out_channels, block_frames, latent_h_block, latent_w_block),
-                generator=inputs.generator,
-                device=self.device,
-                dtype=torch.float32,
-            )
-            ar_cross_attention = self._ar_text_caches(prompt_embeds, invalidate=prompt_changed)
-            total_steps = len(ABOT_DMD_TIMESTEPS)
-            cond_start = tick.chunk_index * block_frames
-            with self.progress_bar(total=total_steps) as progress_bar:
-                generated_blocks = [
+                generated_blocks.append(
                     self._generate_block(
                         noise_latent=noise,
                         prompt_embeds=prompt_embeds,
-                        first_frame_latent=ff_latent,
+                        first_frame_latent=first_frame_cond,
                         action_condition=block_action,
-                        start_frame=cond_start,
+                        start_frame=local_start,
                         schedule=schedule,
                         generator=inputs.generator,
-                        cache=None,
-                        ar_cross_attention=ar_cross_attention,
+                        cache=cache,
+                        ar_cross_attention=None,
                         progress_bar=progress_bar,
                     )
-                ]
+                )
 
         generated_latents = torch.cat(generated_blocks, dim=2)
-        if tick is None:
-            cache = None
+        cache = None
 
-        if tick is not None:
-            assert session_state is not None
-            _validate_latent_tensor(
-                generated_latents,
-                expected_channels=int(self.vae.config.z_dim),
-                source="ABot transformer",
-            )
-            if inputs.output_type == "latent":
-                payload = {"latents": generated_latents}
-            else:
-                frames = self._decode_session_chunk(generated_latents, tick.session_id)
-                payload = {"video": self._format_video(frames, inputs.output_type)}
-            session_state.prompt = inputs.prompt
-            session_state.prompt_embeds = prompt_embeds
-            session_state.generator_state = inputs.generator.get_state()
-            session_state.current_actions = inputs.camera_actions
-            session_state.next_chunk_index += 1
-
-            output = {
-                "payload": payload,
-                "metadata": {"ar_diffusion": ARDiffusionChunkMetadata.from_tick(tick).to_dict()},
-            }
-        elif inputs.output_type == "latent":
+        if inputs.output_type == "latent":
             output = generated_latents
         else:
             _validate_latent_tensor(

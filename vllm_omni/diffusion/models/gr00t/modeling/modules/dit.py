@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 import torch.nn.functional as F
@@ -148,6 +148,7 @@ class TimestepEncoder(nn.Module):
 
 class DiT(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = True
+    _repeated_blocks = ["BasicTransformerBlock"]
 
     @register_to_config
     def __init__(

@@ -5,6 +5,11 @@ import torch.nn.functional as F
 from torch import nn
 from x_transformers.x_transformers import apply_rotary_pos_emb
 
+from vllm_omni.model_executor.models.common.ming.cfm_kernels import (
+    cfm_qkv_rope_attn_supported,
+    fused_qkv_rope_attn,
+)
+
 
 def _apply_rope_cached(t, cos, sin):
     """Bit-exact RoPE for ``scale==1`` / interleaved-half.
@@ -118,17 +123,19 @@ class Attention(nn.Module):
         self._qkv_w: torch.Tensor | None = None
         self._qkv_b: torch.Tensor | None = None
 
+    def _qkv_fused(self, x: torch.Tensor) -> torch.Tensor:
+        if self._qkv_w is None:
+            self._qkv_w = torch.cat([self.to_q.weight, self.to_k.weight, self.to_v.weight], dim=0)
+            if self.to_q.bias is not None:
+                self._qkv_b = torch.cat([self.to_q.bias, self.to_k.bias, self.to_v.bias], dim=0)
+        return F.linear(x, self._qkv_w, self._qkv_b)
+
     def _qkv(self, x):
         if self.native_attention:
             # Keep AntOC's three GEMMs for formal checkpoint comparisons;
             # fused BF16 QKV can change rounding even with identical weights.
             return self.to_q(x), self.to_k(x), self.to_v(x)
-        if self._qkv_w is None:
-            self._qkv_w = torch.cat([self.to_q.weight, self.to_k.weight, self.to_v.weight], dim=0)
-            if self.to_q.bias is not None:
-                self._qkv_b = torch.cat([self.to_q.bias, self.to_k.bias, self.to_v.bias], dim=0)
-        qkv = F.linear(x, self._qkv_w, self._qkv_b)
-        return qkv.split(self.inner_dim, dim=-1)
+        return self._qkv_fused(x).split(self.inner_dim, dim=-1)
 
     def _rope_cos_sin(self, freqs):
         seq_len = freqs.shape[-2]
@@ -141,6 +148,25 @@ class Attention(nn.Module):
 
     def forward(self, x, mask=None, rope=None):
         batch_size = x.shape[0]
+        head_dim = self.inner_dim // self.heads
+        if (
+            self.short_attention
+            and mask is None
+            and rope is not None
+            and not self.native_attention
+            and self.q_norm is None
+            and self.k_norm is None
+            and self.pe_attn_head is None
+        ):
+            freqs, xpos_scale = rope
+            scale_is_one = xpos_scale is None or (not torch.is_tensor(xpos_scale) and xpos_scale == 1.0)
+            if scale_is_one and cfm_qkv_rope_attn_supported(x, heads=self.heads, head_dim=head_dim, seq_len=x.shape[1]):
+                cos, sin = self._rope_cos_sin(freqs)
+                x = fused_qkv_rope_attn(self._qkv_fused(x), cos, sin, self.heads)
+                x = self.to_out[0](x)
+                x = self.to_out[1](x)
+                return x
+
         query, key, value = self._qkv(x)
 
         inner_dim = key.shape[-1]

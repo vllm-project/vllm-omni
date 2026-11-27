@@ -207,6 +207,68 @@ def test_successful_retry_counts_valid_zero_and_refreshes_trace(sample_paths, ju
     assert trace[0]["raw_response"] == '{"success_score": 0}'
 
 
+def test_temporal_completion_budget_matches_official_evaluator(judge_http):
+    judge_http.return_value = _reply('{"temporal_score": 2, "is_relevant": 1}')
+    judge = judge_module.DuplexJudge("http://unused", "judge")
+    judge.temporal("prompt", [b"\xff\xd8"])
+    assert judge_http.call_args.kwargs["json"]["max_tokens"] == 800
+
+
+def test_content_and_reminder_completion_budget_stays_at_1200(judge_http):
+    judge_http.return_value = _reply('{"content_score": 2}')
+    judge = judge_module.DuplexJudge("http://unused", "judge")
+    judge.content("prompt")
+    assert judge_http.call_args.kwargs["json"]["max_tokens"] == 1200
+    judge_http.return_value = _reply('{"success_score": 1}')
+    judge.chat("remind")
+    assert judge_http.call_args.kwargs["json"]["max_tokens"] == 1200
+
+
+def _write_rtd_score(root, sample_id, **metadata):
+    path = root / "RTD_OCR" / f"{sample_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"temporal": {"summary": {"avg_temporal_score": 1}}, **metadata}))
+
+
+@pytest.mark.parametrize("max_side", [None, 768], ids=["source", "capped"])
+def test_summary_records_a_uniform_judge_frame_max_side(tmp_path, max_side):
+    _write_rtd_score(tmp_path, "first", judge_frame_max_side=max_side)
+    _write_rtd_score(tmp_path, "second", judge_frame_max_side=max_side)
+    summary = evaluator.summarize_scores(tmp_path)
+    assert summary["samples"] == 2
+    assert summary["judge_frame_max_side"] == max_side
+
+
+def test_summary_rejects_mixed_judge_frame_max_side(tmp_path):
+    _write_rtd_score(tmp_path, "first", judge_frame_max_side=1920)
+    _write_rtd_score(tmp_path, "second", judge_frame_max_side=768)
+    with pytest.raises(ValueError, match=r"mixes judge_frame_max_side values \[1920, 768\]"):
+        evaluator.summarize_scores(tmp_path)
+
+
+def test_summary_treats_a_score_without_the_field_as_source_resolution(tmp_path):
+    _write_rtd_score(tmp_path, "first", judge_frame_max_side=None)
+    _write_rtd_score(tmp_path, "legacy")
+    assert evaluator.summarize_scores(tmp_path)["judge_frame_max_side"] is None
+
+    _write_rtd_score(tmp_path, "capped", judge_frame_max_side=1920)
+    with pytest.raises(ValueError, match="mixes judge_frame_max_side"):
+        evaluator.summarize_scores(tmp_path)
+
+
+def test_summary_combines_capped_rtd_and_legacy_pr_scores(tmp_path):
+    _write_rtd_score(tmp_path, "rtd", judge_frame_max_side=1920)
+    pr_score = tmp_path / "PR_correction" / "pr.json"
+    pr_score.parent.mkdir()
+    pr_score.write_text(json.dumps({"task_type": "correction", "pr": {"total_score": 1}}))
+
+    summary = evaluator.summarize_scores(tmp_path)
+    assert summary["samples"] == 2
+    assert summary["judge_frame_max_side"] == 1920
+    assert summary["rtd"]["mean_avg_temporal_score"] == 1
+    assert summary["pr"]["mean_all_success"] == 1
+
+
 @pytest.mark.parametrize(
     ("replies", "missing_field"),
     [
@@ -225,7 +287,7 @@ def test_rtd_requires_complete_scores_before_publishing(sample_paths, judge_http
     _, response, score = sample_paths
     sample = DuplexSample.from_row({"id": "sample", "split": "RTD_OCR", "video": "unused.mp4", "video_duration": 10})
     monkeypatch.setattr(evaluator, "materialize_media", lambda *args: "unused.mp4")
-    monkeypatch.setattr(evaluator, "_extract_frames", lambda *args: [b"jpeg"])
+    monkeypatch.setattr(evaluator, "_extract_frames", lambda *args, **kwargs: [b"jpeg"])
     judge_http.side_effect = [_reply(json.dumps(reply)) for reply in replies]
     if missing_field:
         with pytest.raises(ValueError, match=missing_field):

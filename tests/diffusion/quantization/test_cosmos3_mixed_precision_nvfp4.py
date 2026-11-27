@@ -14,7 +14,7 @@ from tests.helpers.mark import hardware_marks
 pytestmark = [
     pytest.mark.full_model,
     pytest.mark.diffusion,
-    *hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=1),
+    *hardware_marks(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1),
 ]
 
 

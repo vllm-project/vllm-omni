@@ -189,17 +189,15 @@ def _validate_modelopt_config(quant_config: object | None) -> None:
                     f"{layer_name!r} declares {algorithm!r}"
                 )
             algorithms.add(algorithm)
-        if len(algorithms) != 1:
-            raise ValueError("diffusion_step_policy does not support mixing FP8 and NVFP4 quantized layers")
         # The ModelOpt container also creates unused subconfigs. Validate only
-        # the single quantization format selected by this checkpoint's map.
-        algorithm = algorithms.pop()
-        subconfig = getattr(quant_config, subconfigs[algorithm], None)
-        expected_name = "modelopt" if algorithm == "FP8" else "modelopt_fp4"
-        get_subname = getattr(subconfig, "get_name", None)
-        if not callable(get_subname) or get_subname() != expected_name:
-            raise ValueError(f"diffusion_step_policy requires a serialized ModelOpt {algorithm} subconfig")
-        _validate_modelopt_config(subconfig)
+        # the quantization formats selected by this checkpoint's map.
+        for algorithm in sorted(algorithms):
+            subconfig = getattr(quant_config, subconfigs[algorithm], None)
+            expected_name = "modelopt" if algorithm == "FP8" else "modelopt_fp4"
+            get_subname = getattr(subconfig, "get_name", None)
+            if not callable(get_subname) or get_subname() != expected_name:
+                raise ValueError(f"diffusion_step_policy requires a serialized ModelOpt {algorithm} subconfig")
+            _validate_modelopt_config(subconfig)
 
 
 def _require_serialized(quant_config: object | None, flag: str, format_name: str) -> None:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Offline E2E test for the Audex cascaded speech-to-speech pipeline.
 
 One ``audex_s2s`` deployment serves all three official
@@ -151,7 +151,7 @@ def _chat_once(runner: OmniRunner, prompt: str, seed: int) -> tuple[str, bool]:
     return text, truncated
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 def test_audex_s2s_cascade_round_trip(omni_runner: OmniRunner, run_level: str) -> None:
     """ASR → chat → TTS over one deployment; text passes never emit audio."""
     real_weights = run_level in {"advanced_model", "full_model"}

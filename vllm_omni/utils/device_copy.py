@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Host-to-device copies that do not block the host on queued CUDA/NPU work.
+"""Host-to-device copies that do not block the host on queued CUDA/NPU/XPU work.
 
 A copy from pageable host memory (``tensor.to("cuda")``, ``torch.tensor(...,
 device="cuda")``, ``torch.as_tensor(..., device="cuda")``) makes the CPU wait
@@ -10,7 +10,12 @@ path under async scheduling that removes the CPU/GPU overlap the batch queue
 exists for. Staging the data in
 pinned memory and copying with ``non_blocking`` keeps the host running ahead;
 the caching host allocator keeps the pinned source alive until the copy's
-stream event completes.
+stream event completes. That is a property of the device's caching host
+allocator, not of these helpers; on XPU it is checked with torch 2.14.0+xpu
+by ``tests/platforms/xpu/test_xpu_device_copy.py``.
+
+A source that is already pinned is copied from in place, so the caller must
+not overwrite it until the copy has completed on the stream.
 """
 
 from __future__ import annotations
@@ -23,16 +28,16 @@ from vllm.utils.platform_utils import is_uva_available
 
 
 def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
-    """Copy CPU tensors to CUDA/NPU without waiting for queued device work."""
+    """Copy CPU tensors to CUDA/NPU/XPU without waiting for queued device work."""
     device = torch.device(device)
-    if tensor.device.type != "cpu" or device.type not in {"cuda", "npu"}:
+    if tensor.device.type != "cpu" or device.type not in {"cuda", "npu", "xpu"}:
         return tensor.to(device)
     return tensor.pin_memory().to(device, non_blocking=True)
 
 
 def index_to_device(values: Sequence[int], device: torch.device | str, dtype: torch.dtype = torch.long) -> torch.Tensor:
     """A host index list as a device tensor, without a host sync."""
-    if torch.device(device).type not in {"cuda", "npu"}:
+    if torch.device(device).type not in {"cuda", "npu", "xpu"}:
         return torch.tensor(values, dtype=dtype, device=device)
     return torch.tensor(values, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
 
