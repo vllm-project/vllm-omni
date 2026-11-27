@@ -20,6 +20,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 class _AudioModel(nn.Module):
     def __init__(self, *, projection: bool = True):
         super().__init__()
+        self.decoder = nn.Linear(8, 8)
+        self.decoder.register_buffer("filter", torch.ones(8))
         self.encoder = nn.Linear(4, 4)
         if projection:
             self.pre_block = nn.Linear(4, 4)
@@ -29,8 +31,6 @@ class _AudioModel(nn.Module):
         self.preprocess_proj = nn.Linear(4, 4)
         self.logs_proj = nn.Linear(4, 4)
         self.dec_in_proj = nn.Linear(4, 4)
-        self.decoder = nn.Linear(8, 8)
-        self.decoder.register_buffer("filter", torch.ones(8))
 
 
 class _Remote(nn.Module):
@@ -46,11 +46,14 @@ def _vae(
     encode_only: bool = False,
     tied_storage: bool = False,
     extra_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
+    parameterless_encoder: bool = False,
 ):
     vae = object.__new__(MiniMaxH3AudioVAE)
     nn.Module.__init__(vae)
     vae.remote = _Remote(projection=projection)
     vae.model = vae.remote.model
+    if parameterless_encoder:
+        vae.model.encoder = nn.Identity()
     if root_buffer:
         vae.model.register_buffer("root", torch.ones(1))
     if encode_only:
@@ -159,6 +162,31 @@ def test_encode_waveform_uses_model_device_for_parameterless_encoder(module_enco
 
     assert rows.shape == (2, 4)
     assert length == 1
+
+
+def test_encode_waveform_uses_split_encoder_device_with_parameterless_encoder():
+    vae = _vae(projection=False, parameterless_encoder=True)
+    # Use meta to model a decoder on a different device in a CPU-only test.
+    vae.model.decoder.to("meta")
+    vae.config_dict = {"latent_channels": 4, "latents_mean": [0] * 4, "latents_std": [1] * 4}
+
+    def preprocess(waveform, sample_rate):
+        assert waveform.device == vae.model.mean_proj.weight.device
+        return vae.model.preprocess_proj(waveform)
+
+    vae.model.preprocess = preprocess
+    pipeline = _pipeline(vae)
+    pipeline._uses_manual_component_offload = lambda component: True
+    assert next(vae.model.parameters()).device.type == "meta"
+
+    with pipeline._audio_encoding_component_on_device(vae):
+        assert vae._encoder_stager.loaded
+        assert not vae._decoder_stager.loaded
+        rows, length = vae.encode_waveform(torch.zeros(2, 4), 32000)
+
+    assert rows.shape == (2, 4)
+    assert length == 1
+    assert not vae._encoder_stager.loaded
 
 
 @pytest.mark.parametrize("entry_point", ["reference", "silence"])
