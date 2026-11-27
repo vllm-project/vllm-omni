@@ -17,6 +17,8 @@ during training, or when the packed width is 1.
 """
 
 import types
+from collections.abc import Callable
+from functools import partial
 
 import torch
 from torch.nn import functional as F
@@ -44,37 +46,51 @@ def _phase_filter(filter_: torch.Tensor, width: int) -> torch.Tensor:
         raise ValueError(f"expected 12 FIR taps, got {taps.numel()}")
     result = filter_.new_zeros((width * 2, width, 6))
     for channel in range(width):
-        # ``flip(-1)`` matches conv1d's cross-correlation convention.
         result[2 * channel, channel] = taps[0::2].flip(-1)
         result[2 * channel + 1, channel] = taps[1::2].flip(-1)
     return result
 
 
-def _up_phase(module, x: torch.Tensor) -> torch.Tensor:
+def _up_phase(module, x: torch.Tensor, width: int | None = None) -> torch.Tensor:
+    """Apply the packed even and odd filters and restore time order."""
     batch, channels, _ = x.shape
-    width = _pack_width(batch * channels)
-    if width == 1:
-        return module._h3_fir_original(x)
-    if module.stride != 2 or module.filter.numel() != 12:
-        return module._h3_fir_original(x)
+    width = _pack_width(batch * channels) if width is None else width
     weight = module._h3_phase_fir[: width * 2, :width, :].contiguous()
     padded = F.pad(x, (module.pad, module.pad), mode="replicate")
-    value = F.conv1d(padded.reshape(-1, width, padded.shape[-1]), weight, padding=5)
-    value = value.reshape(-1, width, 2, value.shape[-1]).transpose(-1, -2).contiguous()
-    value = value.reshape(batch, channels, -1) * module.ratio
-    return value[..., module.pad_left : -module.pad_right]
+    phases = F.conv1d(padded.reshape(-1, width, padded.shape[-1]), weight, padding=5)
+    samples = phases.reshape(-1, width, 2, phases.shape[-1]).transpose(-1, -2)
+    samples = samples.reshape(batch, channels, -1) * module.ratio
+    return samples[..., module.pad_left : -module.pad_right]
 
 
-def _low(module, x: torch.Tensor) -> torch.Tensor:
+def _low(module, x: torch.Tensor, width: int | None = None) -> torch.Tensor:
+    """Apply the packed low-pass convolution with native padding and stride."""
     batch, channels, _ = x.shape
-    width = _pack_width(batch * channels)
-    if width == 1:
-        return module._h3_fir_original(x)
+    width = _pack_width(batch * channels) if width is None else width
     weight = module._h3_dense_fir[:width, :width, :].contiguous()
     if module.padding:
         x = F.pad(x, (module.pad_left, module.pad_right), mode=module.padding_mode)
-    value = F.conv1d(x.reshape(-1, width, x.shape[-1]), weight, stride=module.stride)
-    return value.reshape(batch, channels, -1)
+    samples = F.conv1d(x.reshape(-1, width, x.shape[-1]), weight, stride=module.stride)
+    return samples.reshape(batch, channels, -1)
+
+
+def _fir_forward(
+    module: torch.nn.Module,
+    x: torch.Tensor,
+    *,
+    packed_forward: Callable[[torch.nn.Module, torch.Tensor, int], torch.Tensor],
+) -> torch.Tensor:
+    """Dispatch to packed FP32 inference, counting executions and NPU fallbacks separately."""
+    if x.device.type != "npu":
+        return module._h3_fir_original(x)
+    if x.ndim == 3 and x.dtype == module.filter.dtype == torch.float32 and x.numel() and not module.training:
+        width = _pack_width(x.shape[0] * x.shape[1])
+        if width > 1:
+            output = packed_forward(module, x, width)
+            module._h3_fir_c16_calls = getattr(module, "_h3_fir_c16_calls", 0) + 1
+            return output
+    module._h3_fir_fallback_calls = getattr(module, "_h3_fir_fallback_calls", 0) + 1
+    return module._h3_fir_original(x)
 
 
 def install(model: torch.nn.Module) -> int:
@@ -85,31 +101,16 @@ def install(model: torch.nn.Module) -> int:
         if name not in ("UpSample1d", "LowPassFilter1d") or hasattr(module, "_h3_dense_fir"):
             continue
         filter_ = getattr(module, "filter", None)
-        if not isinstance(filter_, torch.Tensor) or filter_.numel() != 12:
+        if not isinstance(filter_, torch.Tensor) or filter_.shape != (1, 1, 12):
             continue
-        if name == "UpSample1d" and (module.stride != 2 or module.ratio != 2):
+        if name == "UpSample1d" and (module.stride != 2 or module.ratio != 2 or module.pad_right <= 0):
             continue
-        module.register_buffer(
-            "_h3_dense_fir",
-            _diagonal_filter(module.filter, _DEFAULT_WIDTH),
-            persistent=False,
-        )
+        module.register_buffer("_h3_dense_fir", _diagonal_filter(filter_, _DEFAULT_WIDTH), persistent=False)
         if name == "UpSample1d":
-            module.register_buffer(
-                "_h3_phase_fir",
-                _phase_filter(module.filter, _DEFAULT_WIDTH),
-                persistent=False,
-            )
+            module.register_buffer("_h3_phase_fir", _phase_filter(filter_, _DEFAULT_WIDTH), persistent=False)
         module._h3_fir_original = module.forward
-        fn = _up_phase if name == "UpSample1d" else _low
-
-        def forward(self, x, _fn=fn):
-            if x.device.type != "npu" or self.training:
-                return self._h3_fir_original(x)
-            self._h3_fir_c16_calls = getattr(self, "_h3_fir_c16_calls", 0) + 1
-            return _fn(self, x)
-
-        module.forward = types.MethodType(forward, module)
+        packed_forward = _up_phase if name == "UpSample1d" else _low
+        module.forward = types.MethodType(partial(_fir_forward, packed_forward=packed_forward), module)
         installed += 1
     return installed
 

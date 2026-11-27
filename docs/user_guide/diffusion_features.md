@@ -38,7 +38,15 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 MiniMax-H3 decode latency. It preserves the video encoder and audio VAE but
 can change generated pixels. Enable it with `additional_config.lightvae_decoder_path`.
 
-#### Experimental MiniMax-H3 Reference Isolation
+#### Experimental MiniMax-H3 Audio Decoder
+
+MiniMax-H3 uses the checkpoint's reference audio decoder by default. On Ascend
+910B4, opt in with `--additional-config '{"audio_vae_optimized_decode":true}'`.
+This replaces eligible FP32 decoder FIR and BigVGAN upsampling convolutions;
+other devices and ineligible calls use the reference implementation. Set the
+option to `false` or omit it to restore the original decoder. Audio encoding,
+video generation, and the output sample rate are unchanged. The optimized
+waveform is not guaranteed to be bit-identical to the reference.
 
 `--kv-isolate` changes MiniMax-H3's bidirectional attention: visual-reference
 queries read only visual-reference K/V, while other valid queries can read all

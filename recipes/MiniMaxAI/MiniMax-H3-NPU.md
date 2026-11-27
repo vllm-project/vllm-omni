@@ -695,15 +695,16 @@ logs. A successful HTTP response alone does not prove the cache was used.
 
 ## Audio VAE decoder optimizations
 
-On Ascend, MiniMax-H3 enables dense C16 FIR packing and phase-decomposed
-convolution for the BigVGAN stage upsamplers by default. To disable both,
-merge this key into the server's `--additional-config` JSON:
+MiniMax-H3 uses the reference audio decoder by default. On Ascend 910B4,
+merge the following into `--additional-config` to try dense C16 FIR packing
+and phase-decomposed convolution for the BigVGAN stage upsamplers:
 
 ```bash
---additional-config '{"audio_vae_optimized_decode": false}'
+--additional-config '{"audio_vae_optimized_decode": true}'
 ```
 
-The switch does not affect reference audio encoding or other platforms.
-For a controlled decoder-only comparison, pass the same JSON to
-`benchmarks/diffusion/minimax_h3_vae_decode.py` and hold the model and captured
-latents constant. Use `true` for the optimized arm and `false` for the reference.
+The optimized decoder can change the FP32 waveform in the last bits. Remove
+this key or set it to `false` for the reference decoder. Reference audio
+encoding, video, and other devices are unaffected. See the
+[diffusion feature guide](../../docs/user_guide/diffusion_features.md#experimental-minimax-h3-audio-decoder)
+for the scope and limitations.

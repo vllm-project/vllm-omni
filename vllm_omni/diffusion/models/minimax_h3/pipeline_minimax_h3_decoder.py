@@ -26,7 +26,7 @@ from .pipeline_minimax_h3 import (
     _prepare_minimax_h3_video_output,
     get_minimax_h3_post_process_func,
 )
-from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
+from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, resolve_audio_vae_optimized_decode
 
 
 def resolve_minimax_h3_decoder_model_path(
@@ -77,6 +77,7 @@ class MiniMaxH3DecoderPipeline(
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         self.device = get_local_device()
+        optimize_audio_decode = resolve_audio_vae_optimized_decode(od_config.additional_config)
         model_path = Path(
             resolve_minimax_h3_decoder_model_path(str(od_config.model), od_config.revision, od_config.task_type)
         )
@@ -93,7 +94,7 @@ class MiniMaxH3DecoderPipeline(
             device=self.device,
             decode_only=True,
             trust_remote_code=od_config.trust_remote_code,
-            optimize_decode=(od_config.additional_config or {}).get("audio_vae_optimized_decode", True),
+            optimize_decode=optimize_audio_decode,
         )
         self.vae = self.video_vae
         self.weights_sources = []

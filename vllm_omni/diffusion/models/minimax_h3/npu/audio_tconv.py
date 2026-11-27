@@ -33,13 +33,23 @@ def _conv_transpose1d_as_conv1d(
 
 
 def _stage_forward(self: nn.ConvTranspose1d, x: torch.Tensor, output_size: list[int] | None = None) -> torch.Tensor:
+    """Run the phase-decomposed convolution for batched FP32 NPU inference."""
     if (
         x.device.type == "npu"
-        and x.dtype in (torch.float32, torch.bfloat16)
-        and self.weight.dtype == x.dtype
+        and x.dtype == torch.float32
+        and x.ndim == 3
+        and not self.training
         and output_size is None
     ):
-        return _conv_transpose1d_as_conv1d(x, self.weight, self.bias, self.stride[0], self.padding[0])
+        weight = self.weight
+        if (
+            weight.dtype == x.dtype
+            and x.numel()
+            and (x.shape[-1] - 1) * self.stride[0] + weight.shape[-1] > 2 * self.padding[0]
+        ):
+            output = _conv_transpose1d_as_conv1d(x, weight, self.bias, self.stride[0], self.padding[0])
+            self._h3_stage_polyphase_calls = getattr(self, "_h3_stage_polyphase_calls", 0) + 1
+            return output
     return self._h3_stage_original_forward(x, output_size)
 
 
@@ -48,7 +58,13 @@ def install_bigvgan_upsamplers(decoder: nn.Module) -> int:
     installed = 0
     for stage in getattr(decoder, "ups", ()):
         for layer in stage:
-            if layer.groups == 1 and layer.dilation == (1,) and layer.output_padding == (0,):
+            if (
+                isinstance(layer, nn.ConvTranspose1d)
+                and not hasattr(layer, "_h3_stage_original_forward")
+                and layer.groups == 1
+                and layer.dilation == (1,)
+                and layer.output_padding == (0,)
+            ):
                 layer._h3_stage_original_forward = layer.forward
                 layer.forward = types.MethodType(_stage_forward, layer)
                 installed += 1
