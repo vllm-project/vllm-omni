@@ -73,8 +73,8 @@ def _config(**overrides) -> CsmConfig:
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
         depth_decoder_config={
             "hidden_size": 32,
             "intermediate_size": 64,
