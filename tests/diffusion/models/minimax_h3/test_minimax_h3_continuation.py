@@ -6,12 +6,21 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.models.minimax_h3.continuation import (
+    _FIRST_WINDOW_CONDITION_KEYS,
+    LatentPrefix,
+    continuation_uses_timeline_guides,
     diffuse_continuation,
+    later_windows_drop_text_images,
     plan_continuation_windows,
     resolve_continuation,
 )
 from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
 from vllm_omni.errors import OmniClientError
+from vllm_omni.model_executor.models.minimax_h3.long_video import (
+    MINIMAX_H3_CONTINUATION_TASKS,
+    check_continuation_conditions,
+    max_output_seconds,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -165,6 +174,140 @@ def test_long_ref2va_defaults_to_continuation_with_explicit_full_opt_out():
     )
 
 
+@pytest.mark.parametrize("task", ["t2va", "fl2va"])
+def test_t2va_and_fl2va_continuation_is_opt_in(task):
+    # long_video alone keeps whole-target sampling for these tasks, as before.
+    assert resolve_continuation({"long_video": True}, task=task, step_execution=False) is None
+    assert max_output_seconds({"long_video": True}, task) == 30.0
+    extra = {"long_video": True, "long_video_mode": "continuation"}
+    # FL2VA windows default shorter: the first frame's look does not survive a 277-frame join with Turbo.
+    assert resolve_continuation(extra, task=task, step_execution=False) == ({"t2va": 277, "fl2va": 141}[task], 22)
+    assert resolve_continuation({**extra, "continuation_window_frames": 209}, task=task, step_execution=False) == (
+        209,
+        22,
+    )
+    assert max_output_seconds(extra, task) == 300.0
+    with pytest.raises(OmniClientError, match="request execution"):
+        resolve_continuation(extra, task=task, step_execution=True)
+
+
+def test_continuation_rejects_unknown_tasks_and_late_keyframes():
+    with pytest.raises(OmniClientError, match="continuation supports"):
+        resolve_continuation({"long_video_mode": "continuation"}, task="t2a", step_execution=False)
+    check_continuation_conditions("t2va", ())
+    check_continuation_conditions("fl2va", (0,))
+    check_continuation_conditions("ref2va", (0, 123))
+    for indices in [(123,), (0, 123)]:
+        with pytest.raises(OmniClientError, match="first frame only"):
+            check_continuation_conditions("fl2va", indices)
+
+
+@pytest.mark.parametrize("with_prefix", [False, True])
+def test_timeline_guides_carry_every_tail_and_keep_keyframes_in_the_first_window(with_prefix):
+    total, window, overlap = 379, 141, 22
+    overlap_v = 7
+    plan = plan_continuation_windows(
+        total, window, overlap, first_overlap=overlap if with_prefix else 0, origin=119 if with_prefix else 0
+    )
+    keyframe = torch.full((4, 96), -1.0)
+    calls = []
+
+    def sample(**kw):
+        calls.append(kw)
+        video = torch.full((1, 24, kw["latent_t"], 2, 2), float(len(calls)))
+        audio = torch.full((2, 32, kw["audio_t"]), float(len(calls)))
+        return video, audio
+
+    kwargs = dict(
+        task="fl2va",
+        num_frames=total,
+        latent_t=(total - 5) // 17 * 5 + 2,
+        latent_h=2,
+        latent_w=2,
+        audio_t=round(total * 40 / 24),
+        visual_condition=keyframe,
+        visual_condition_shape=(1, 2, 2),
+        visual_condition_shapes=None,
+        audio_condition=None,
+        audio_condition_lengths=None,
+        keyframe_frame_indices=[0],
+        guide_blocks=None,
+        # FL2VA conditioning lists the keyframe image as a block too.
+        ref_blocks=[{"kind": "image", "latent_h": 2, "latent_w": 2}],
+        locked_audio_rows=None,
+    )
+    prefix = None
+    if with_prefix:
+        prefix = LatentPrefix(
+            video=torch.zeros(1, 24, overlap_v, 2, 2),
+            audio=torch.zeros(2, 32, plan[0].overlap_audio_t),
+            start_frame=119,
+            overlap_frames=overlap,
+        )
+    video, audio = diffuse_continuation(
+        sample, kwargs, window_frames=window, overlap_frames=overlap, prefix=prefix, timeline_guides=True
+    )
+
+    assert len(calls) == len(plan) == 3
+    first = calls[0]
+    # The request's own keyframe stays in its first window ...
+    assert first["keyframe_frame_indices"] == [0]
+    if with_prefix:
+        # ... behind the hidden prefix, which packs ahead of it.
+        assert first["guide_blocks"][0]["kind"] == "video_audio"
+        assert torch.all(first["visual_condition"][:overlap_v] == 0)
+        assert torch.all(first["visual_condition"][overlap_v:] == -1)
+    else:
+        assert first["guide_blocks"] is None
+        assert first["visual_condition"] is keyframe
+    for index, call in enumerate(calls[1:], start=2):
+        # ... and later windows carry only their predecessor's tail, as a frame-0 AV timeline guide.
+        overlap_audio = plan[index - 1].overlap_audio_t
+        (block,) = call["guide_blocks"]
+        assert block == {
+            "kind": "video_audio",
+            "frame_index": 0,
+            "ref_audio_t": overlap_audio,
+            "latent_t": overlap_v,
+            "latent_h": 2,
+            "latent_w": 2,
+        }
+        assert call["keyframe_frame_indices"] is None
+        assert call["visual_condition_shape"] is None
+        assert call["visual_condition_shapes"] == [(overlap_v, 2, 2)]
+        assert call["audio_condition_lengths"] == [overlap_audio]
+        assert call["ref_blocks"] is None
+        assert torch.all(call["visual_condition"] == index - 1)
+        assert torch.all(call["audio_condition"] == index - 1)
+        assert call["temporal_offset"] == pytest.approx(plan[index - 1].start * 40 / 24)
+    assert video.shape[2] == kwargs["latent_t"] and audio.shape[-1] == kwargs["audio_t"]
+
+
+def test_ref2va_windows_keep_the_latent_guide_reference():
+    calls = []
+
+    def sample(**kw):
+        calls.append(kw)
+        return torch.zeros(1, 24, kw["latent_t"], 2, 2), torch.zeros(2, 32, kw["audio_t"])
+
+    reference = torch.ones(4, 96)
+    kwargs = dict(
+        num_frames=260,
+        latent_t=77,
+        latent_h=2,
+        latent_w=2,
+        audio_t=433,
+        visual_condition=reference,
+        visual_condition_shapes=[(1, 2, 2)],
+        ref_blocks=[{"kind": "image", "latent_h": 2, "latent_w": 2}],
+    )
+    diffuse_continuation(sample, kwargs, window_frames=141, overlap_frames=22)
+    assert len(calls) == 2
+    assert calls[1]["ref_blocks"][-1]["kind"] == "latent_guide"
+    assert calls[1].get("guide_blocks") is None
+    assert torch.all(calls[1]["visual_condition"][:4] == 1)  # the static reference stays in every window
+
+
 def test_different_chunk_prompt_lengths_keep_the_same_media_clock():
     kwargs = dict(
         latent_t=7,
@@ -252,3 +395,242 @@ def test_request_encodes_only_window_prompts_and_prepares_references_once(monkey
         assert [int(hidden[0, 0]) for hidden, _ in texts] == list(range(1, 8))
     else:
         assert "continuation_text_conditioning" not in context
+
+
+@pytest.mark.parametrize(
+    "task,expected",
+    [("ref2va", False), ("t2va", True), ("fl2va", True)],
+)
+def test_which_tasks_carry_the_tail_as_a_timeline_guide(task, expected):
+    # The pipeline passes this to diffuse_continuation, so the loop's two tail
+    # carriers are selected here: a frame-0 timeline guide, or Ref2VA's
+    # latent_guide reference block.
+    assert continuation_uses_timeline_guides(task) is expected
+
+
+def test_only_ref2va_keeps_the_latent_guide_carrier():
+    # Every task the loop accepts is covered by the parametrization above, so a
+    # newly admitted task cannot silently default to one carrier.
+    assert set(MINIMAX_H3_CONTINUATION_TASKS) == {"ref2va", "t2va", "fl2va"}
+    carriers = {task: continuation_uses_timeline_guides(task) for task in MINIMAX_H3_CONTINUATION_TASKS}
+    assert [task for task, guided in carriers.items() if not guided] == ["ref2va"]
+
+
+def test_timeline_guide_windows_keep_their_own_text_origin():
+    # The first T2VA/FL2VA window has no guide and is sampled in the task's native
+    # layout, where media follows that window's text. A shared origin could only
+    # reach the later windows, so none of them takes one.
+    kwargs = dict(num_frames=379, latent_t=112, latent_h=2, latent_w=2, audio_t=632, task="t2va")
+    texts = [(torch.zeros(length, 4), torch.ones(length)) for length in (5, 9, 7)]
+    calls = []
+
+    def sample(**kw):
+        calls.append(kw)
+        return torch.zeros(1, 24, kw["latent_t"], 2, 2), torch.zeros(2, 32, kw["audio_t"])
+
+    diffuse_continuation(
+        sample, kwargs, window_frames=141, overlap_frames=22, text_conditioning=texts, timeline_guides=True
+    )
+    assert [call["text_embeddings"].shape[0] for call in calls] == [5, 9, 7]
+    assert all("media_time_origin" not in call for call in calls)
+
+
+def test_every_denoise_input_is_carried_or_dropped_after_the_first_window():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _MINIMAX_H3_DENOISE_INPUT_KEYS
+
+    # What a later T2VA/FL2VA window still takes from the request.
+    carried = {
+        "task",
+        "text_embeddings",
+        "text_tags",
+        "seed",
+        "latent_t",
+        "latent_h",
+        "latent_w",
+        "audio_t",
+        "num_frames",
+        "num_steps",
+        "video_shift",
+        "audio_shift",
+        "base_schedule",
+        "pad_seq_len",
+        "locked_audio_rows",
+    }
+    # Continuation refuses control and latent-mask editing, so these are always empty in the loop.
+    refused = {"control_rows", "control_context_scale"} | {
+        f"{modality}_edit_{part}_rows" for modality in ("video", "audio") for part in ("clean", "mask", "restore_mask")
+    }
+    first_window = set(_FIRST_WINDOW_CONDITION_KEYS)
+    assert not first_window & carried and not first_window & refused
+    # A new denoise input must be classified here before the loop can carry or drop it.
+    assert set(_MINIMAX_H3_DENOISE_INPUT_KEYS) == carried | refused | first_window
+
+
+def _local_pipeline(monkeypatch, task, *, load_text_encoder=True):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+    from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderMediaConditioning
+
+    pipeline = object.__new__(module.MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.load_text_encoder = load_text_encoder
+    pipeline.load_vae_encoder = True
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace(step_execution=False)
+    pipeline._fasth3 = pipeline._vdn = None
+    pipeline._active_turbo_spec = lambda sampling: None
+    pipeline._has_active_native_lora = lambda sampling: False
+    pipeline._resolve_task = lambda *args, **kwargs: task
+    pipeline._extract_text_conditioning = lambda prompt: (
+        None if load_text_encoder else SimpleNamespace(hidden_states=torch.zeros(3, 5120), token_tags=torch.zeros(3))
+    )
+    encoded, encoded_media = [], []
+
+    def encode_text(prepared):
+        encoded.append(prepared)
+        return torch.full((3, 5120), len(encoded), dtype=torch.bfloat16), torch.zeros(3, dtype=torch.long)
+
+    def encode_media(media):
+        encoded_media.append(media)
+        return MiniMaxH3EncoderMediaConditioning(
+            task=media.task,
+            height=media.height,
+            width=media.width,
+            num_frames=media.num_frames,
+            latent_t=media.latent_t,
+            audio_t=media.audio_t,
+        )
+
+    pipeline.encode_prompt = encode_text
+    pipeline._encode_local_media = encode_media
+    pipeline._prepare_encoder_conditioning_inputs = lambda conditioning, sampling, **_: {
+        "text_embeddings": conditioning.hidden_states,
+        "continuation": resolve_continuation(sampling.extra_args, task=conditioning.task, step_execution=False),
+        "num_frames": conditioning.num_frames,
+        "task": conditioning.task,
+    }
+    return pipeline, encoded, encoded_media
+
+
+def _local_request(task, *, images=1, **extra):
+    from PIL import Image
+
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    extra = {"task": task, "long_video": True, "long_video_mode": "continuation", "duration": 30, **extra}
+    if not images:
+        extra["aspect_ratio"] = "1:1"
+    sampling = OmniDiffusionSamplingParams(width=64, height=64, fps=24, extra_args=extra)
+    request = {"prompt": "main prompt"}
+    if images:
+        request["multi_modal_data"] = {"image": [Image.new("RGB", (256, 256)) for _ in range(images)]}
+    return request, sampling
+
+
+def test_only_fl2va_encodes_text_again_for_later_windows():
+    assert [task for task in MINIMAX_H3_CONTINUATION_TASKS if later_windows_drop_text_images(task)] == ["fl2va"]
+
+
+@pytest.mark.parametrize("prompts", [None, ["first", "second", "third", "fourth", "fifth", "sixth"]])
+def test_fl2va_later_windows_take_text_without_the_first_frame(monkeypatch, prompts):
+    pipeline, encoded, encoded_media = _local_pipeline(monkeypatch, "fl2va")
+    request, sampling = _local_request("fl2va", **({"continuation_prompts": prompts} if prompts else {}))
+    context = pipeline._prepare_request_inputs(request, sampling)
+
+    texts = context["continuation_text_conditioning"]
+    # 30 s at the FL2VA default of 141-frame windows is six windows.
+    assert len(texts) == 6 and texts[0][0] is context["text_embeddings"]
+    with_image = [item for item in encoded if item.images]
+    without = [item for item in encoded if not item.images]
+    # The first window keeps the FL2VA presentation with its picture ...
+    assert len(with_image) == 1 and with_image[0].media.task == "fl2va" and with_image[0].condition_labels
+    # ... and every later one the text-only presentation a continue_from request without an image gets.
+    assert all(item.media.task == "t2va" and not item.condition_labels for item in without)
+    if prompts is None:
+        # One text-only encode serves all later windows, ahead of the request's own encode.
+        assert [item.prompt for item in encoded] == ["main prompt", "main prompt"]
+        assert not encoded[0].images and encoded[1].images
+        assert all(text is texts[1] for text in texts[2:])
+        assert int(texts[1][0][0, 0]) == 1 and int(texts[0][0][0, 0]) == 2
+    else:
+        assert [item.prompt for item in encoded] == prompts
+        assert [int(hidden[0, 0]) for hidden, _ in texts] == [1, 2, 3, 4, 5, 6]
+    # The media is encoded once, as FL2VA.
+    assert len(encoded_media) == 1 and encoded_media[0].task == "fl2va"
+
+
+def test_t2va_and_single_window_fl2va_encode_their_prompt_once(monkeypatch):
+    pipeline, encoded, _ = _local_pipeline(monkeypatch, "t2va")
+    context = pipeline._prepare_request_inputs(*_local_request("t2va", images=0))
+    assert len(encoded) == 1 and "continuation_text_conditioning" not in context
+
+    pipeline, encoded, _ = _local_pipeline(monkeypatch, "fl2va")
+    context = pipeline._prepare_request_inputs(*_local_request("fl2va", duration=5))
+    assert len(encoded) == 1 and encoded[0].images and "continuation_text_conditioning" not in context
+
+
+@pytest.mark.parametrize("task,images,windows", [("t2va", 0, 3), ("fl2va", 1, 6)])
+def test_window_prompts_are_refused_under_distributed_text_offload(monkeypatch, task, images, windows):
+    prompts = [f"prompt {index}" for index in range(windows)]
+    # Text-only prompt encodes in a row are not safe on that backend, so nothing is encoded.
+    pipeline, encoded, encoded_media = _local_pipeline(monkeypatch, task)
+    pipeline._text_encoder_uses_distributed_layerwise_offload = lambda: True
+    with pytest.raises(OmniClientError, match="distributed layerwise offload; send a single prompt"):
+        pipeline._prepare_request_inputs(*_local_request(task, images=images, continuation_prompts=prompts))
+    assert not encoded and not encoded_media
+    # A single prompt for every window stays available there, and so does a one-window request.
+    pipeline._prepare_request_inputs(*_local_request(task, images=images))
+    assert len(encoded) == (1 if task == "t2va" else 2)
+    pipeline._prepare_request_inputs(*_local_request(task, images=images, duration=5, continuation_prompts=["only"]))
+    # Without that offload the prompts are encoded, one per window.
+    pipeline, encoded, _ = _local_pipeline(monkeypatch, task)
+    pipeline._prepare_request_inputs(*_local_request(task, images=images, continuation_prompts=prompts))
+    assert [item.prompt for item in encoded] == prompts
+
+
+def test_distributed_text_offload_is_read_from_the_offload_policy():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    def refuses(*, text_encoder=True, **config):
+        pipeline = object.__new__(MiniMaxH3Pipeline)
+        torch.nn.Module.__init__(pipeline)
+        if text_encoder:
+            pipeline.text_encoder = torch.nn.Identity()
+        pipeline.od_config = OmniDiffusionConfig(**config)
+        return pipeline._text_encoder_uses_distributed_layerwise_offload()
+
+    assert refuses(enable_distributed_layerwise_offload=True)
+    assert not refuses()
+    assert not refuses(enable_layerwise_offload=True)
+    assert not refuses(enable_distributed_layerwise_offload=True, text_encoder=False)
+    # The compact setting picks the distributed backend through a component's weight transfer.
+    allgather = {"mode": "layer", "layer_options": {"dit": {"weight_transfer": "allgather"}}}
+    assert refuses(diffusion_offload_config={**allgather, "components": ["dit", "text_encoder"]})
+    assert not refuses(diffusion_offload_config={**allgather, "components": ["dit"]})
+    assert not refuses(diffusion_offload_config={"mode": "layer", "components": ["dit", "text_encoder"]})
+
+
+def test_fl2va_windows_need_a_local_text_encoder(monkeypatch):
+    pipeline, encoded, _ = _local_pipeline(monkeypatch, "fl2va", load_text_encoder=False)
+    with pytest.raises(OmniClientError, match="requires a local text encoder"):
+        pipeline._prepare_request_inputs(*_local_request("fl2va"))
+    assert not encoded
+    # One window has no later window to encode for.
+    pipeline, _, _ = _local_pipeline(monkeypatch, "fl2va", load_text_encoder=False)
+    pipeline._prepare_request_inputs(*_local_request("fl2va", duration=5))
+
+
+@pytest.mark.parametrize(
+    "task,images,extra,match",
+    [
+        ("t2va", 0, {"continuation_window_frames": 140}, "17n\\+5 frame grid"),
+        ("fl2va", 1, {"continuation_overlap_frames": 23}, "17n\\+5 frame grid"),
+        ("fl2va", 2, {"frame_indices": [0, -1]}, "first frame only"),
+        ("fl2va", 1, {"frame_indices": [-1]}, "first frame only"),
+    ],
+)
+def test_t2va_and_fl2va_options_are_refused_before_any_encoder_pass(monkeypatch, task, images, extra, match):
+    pipeline, encoded, encoded_media = _local_pipeline(monkeypatch, task)
+    with pytest.raises(OmniClientError, match=match):
+        pipeline._prepare_request_inputs(*_local_request(task, images=images, **extra))
+    assert not encoded and not encoded_media
