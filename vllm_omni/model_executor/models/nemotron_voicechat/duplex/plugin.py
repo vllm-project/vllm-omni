@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import random
 from collections.abc import Mapping
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
@@ -86,6 +88,9 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "nvc_function_response_generation",
         "nvc_function_response_batches",
         "nvc_function_response_floor_generation",
+        "nvc_tool_ack_tokens",
+        "nvc_tool_ack_generation",
+        "nvc_tool_ack_batch",
     }
 )
 
@@ -156,6 +161,53 @@ def _render_tool_prompt(instructions: str, tools: list[dict[str, object]]) -> st
         "Based on the tool responses, you can call additional tools if needed, correct tool calls if any "
         "errors are found, or just respond to the user."
     )
+
+
+def _tool_on_hold_messages(definition: Mapping[str, object]) -> tuple[str, ...]:
+    """Read the on-hold phrases a client attached to one tool definition.
+
+    Clients attach ``ack_messages`` to a tool (the Realtime shape) to say what
+    the agent should say out loud while the call runs.
+    """
+    raw = definition.get("ack_messages")
+    if raw is None:
+        return ()
+    items = raw if isinstance(raw, list | tuple) else [raw]
+    return tuple(text for text in (str(item).strip() for item in items) if text)
+
+
+#: A spoken on-hold message is padded so the phrase is followed by silence while
+#: the client's tool is still running. NeMo-Speech.cpp uses the same shape
+#: (``max(17, ceil(0.5 * len))`` pad tokens) so the wait sounds the same here.
+_MIN_ACK_PAD_TOKENS = 17
+_ACK_PAD_RATIO = 0.5
+
+
+def _tool_ack_phrases(tools: list[dict[str, object]]) -> dict[str, list[str]]:
+    """Map each tool to the on-hold phrases its client declared."""
+    phrases: dict[str, list[str]] = {}
+    for tool in tools:
+        name = tool.get("name")
+        messages = _tool_on_hold_messages(tool)
+        if isinstance(name, str) and name and messages:
+            phrases[name] = list(messages)
+    return phrases
+
+
+def _ack_token_sequence(
+    tokenizer: Any,
+    phrase: str,
+    *,
+    bos_id: int,
+    eos_id: int,
+    pad_id: int,
+) -> list[int]:
+    """Tokenise one on-hold phrase into the text timeline the talker speaks."""
+    ids = [int(token_id) for token_id in tokenizer.encode(phrase, add_special_tokens=False)]
+    if not ids:
+        return []
+    pads = max(_MIN_ACK_PAD_TOKENS, int(math.ceil(_ACK_PAD_RATIO * len(phrase))))
+    return [bos_id, *ids, *([pad_id] * pads), eos_id]
 
 
 def _render_tool_response(output: str) -> str:
@@ -418,6 +470,29 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         # the rendered prompt token ids enter Stage-0 KV.
         runtime["instructions"] = instructions
         runtime["nvc_tools_signature"] = tools_signature
+        ack_phrases = _tool_ack_phrases(tools)
+        if ack_phrases:
+            # Tokenise once per session: the publish path runs inside the
+            # session mailbox and must not touch the tokenizer.
+            bos_id = int(special["nvc_text_bos_id"])
+            eos_id = int(special["nvc_text_eos_id"])
+            pad_id = int(special["nvc_text_pad_id"])
+            tokenized = await asyncio.to_thread(
+                lambda: {
+                    name: [
+                        tokens
+                        for tokens in (
+                            _ack_token_sequence(tokenizer, phrase, bos_id=bos_id, eos_id=eos_id, pad_id=pad_id)
+                            for phrase in phrases
+                        )
+                        if tokens
+                    ]
+                    for name, phrases in ack_phrases.items()
+                }
+            )
+            tokenized = {name: sequences for name, sequences in tokenized.items() if sequences}
+            if tokenized:
+                runtime["nvc_tool_ack_tokens"] = tokenized
         self.data_plane.configure_runtime(runtime, tokenizer=tokenizer)
         return runtime
 
@@ -478,6 +553,46 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         if not isinstance(arguments, str):
             arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
         return {"call_id": call_id, "name": name, "arguments": arguments}
+
+    def note_published_function_call(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        call_id: str,
+        history_len: int,
+        name: str | None = None,
+    ) -> dict[str, object] | None:
+        """Queue the called tool's on-hold message for the talker to speak.
+
+        The checkpoint can emit a call and then keep talking; it cannot be
+        told (by prompt or by sampling) to stay quiet while the client runs
+        the tool -- the on-hold block NeMo-Speech.cpp writes into the prompt is
+        stripped before the model sees it. So the wait is filled here instead:
+        the phrase the client declared for this tool is tokenised at session
+        start and, from this frame on, replaces the model's own text token in
+        the talker timeline until it has been spoken.
+        """
+        del call_id, history_len
+        if not name:
+            return None
+        table = runtime_config.get("nvc_tool_ack_tokens")
+        if not isinstance(table, Mapping):
+            return None
+        candidates = table.get(name)
+        if not isinstance(candidates, list) or not candidates:
+            return None
+        selected = candidates[random.randrange(len(candidates))]
+        if not isinstance(selected, list | tuple) or not selected:
+            return None
+        updated = dict(runtime_config)
+        generation = int(updated.get("nvc_tool_ack_generation", 0)) + 1
+        updated["nvc_tool_ack_generation"] = generation
+        updated["nvc_tool_ack_batch"] = {
+            "generation": generation,
+            "name": name,
+            "tokens": [int(token_id) for token_id in selected],
+        }
+        return updated
 
     def runtime_config_for_function_output(
         self,

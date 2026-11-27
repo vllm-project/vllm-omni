@@ -619,7 +619,13 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         # All rows are validated before committing any request's policy state.
         sampled = logits.argmax(dim=-1).to(dtype=torch.int32)
         for row_idx, request_id, session, active, forced, pad_id in decisions:
-            if active or forced:
+            pending_ack = session.get("nvc_tool_ack_pending")
+            if isinstance(pending_ack, list) and pending_ack:
+                # Speak the client's on-hold message in place of this frame's
+                # text token: the phrase reaches the talker and the transcript
+                # through the ordinary sampled-token path.
+                sampled[row_idx] = pending_ack.pop(0)
+            elif active or forced:
                 sampled[row_idx] = pad_id
             session["function_call_active"] = active
             # PAD must also reach the next frame's text fusion, not just the wire.
@@ -947,6 +953,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             session["prefill_embeds"] = self._fuse(pad_ids, timeline, pad_ids)
             del session["prompt_ids"]
         self._sessions[request_id] = session
+        self._sync_tool_ack(session, runtime_config)
         if self._use_function_head:
             self._sync_forced_function_response(session, runtime_config)
 
@@ -993,6 +1000,31 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 "nvc_text_pad_id": pad_id,
             },
         )
+
+    @staticmethod
+    def _sync_tool_ack(session: dict[str, Any], runtime_config: dict[str, Any]) -> None:
+        """Load a newly published on-hold batch into model-owned session state.
+
+        The session publishes the client-declared phrase for a tool call as a
+        runtime batch (``nvc_tool_ack_batch``). The thinker adopts it here, once
+        per generation, as a queue of text tokens that ``sample`` drains one
+        per frame -- the spoken wait NeMo-Speech.cpp implements with
+        ``<TOOL_ACK_MESSAGES>``.
+        """
+        batch = runtime_config.get("nvc_tool_ack_batch")
+        if not isinstance(batch, dict):
+            return
+        try:
+            generation = int(batch.get("generation", 0))
+        except (TypeError, ValueError):
+            return
+        if generation <= int(session.get("nvc_tool_ack_generation", 0)):
+            return
+        tokens = batch.get("tokens")
+        if not isinstance(tokens, list) or not tokens:
+            return
+        session["nvc_tool_ack_generation"] = generation
+        session["nvc_tool_ack_pending"] = [int(token) for token in tokens]
 
     @staticmethod
     def _sync_forced_function_response(

@@ -632,8 +632,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         *,
         call_id: str,
         history_len: int,
+        name: str | None = None,
     ) -> dict[str, object]:
         """Remember the history length at ``function_call.done`` for this call."""
+        del name
         updated = dict(runtime_config)
         anchors = updated.get("qwen_call_anchors")
         copied = dict(anchors) if isinstance(anchors, Mapping) else {}
