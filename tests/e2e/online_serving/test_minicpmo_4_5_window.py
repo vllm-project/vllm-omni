@@ -67,7 +67,8 @@ def test_evidence_window_camera(omni_server, tmp_path):
         )
     )
     _assert_complete(result)
-    assert result["frames_sent"] > 8
+    frames_sent = result["frames_sent"]
+    assert isinstance(frames_sent, int) and frames_sent > 8
 
 
 @hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)

@@ -49,7 +49,7 @@ def select_evidence_units(
         recent_budget -= cost
         split -= 1
 
-    available = min(history_budget, unit_budget - sum(unit["length"] for unit in units[split:]))
+    available = min(history_budget, unit_budget)
     selected = []
     ranking = sorted(range(split), key=lambda index: (units[index].get("evidence_score", 0.0), index), reverse=True)
     for index in ranking:

@@ -262,7 +262,8 @@ def prepare_stage0_window(
     runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
     window = runtime_config.get("duplex_window_config")
     mode = window.get("sliding_window_mode", "off") if isinstance(window, dict) else "off"
-    if mode not in {"basic", "context", "evidence"}:
+    retains_units = mode in {"basic", "context", "evidence"}
+    if not retains_units:
         # Without a window the worker keeps no unit history to carry.
         session._minicpmo45_carried_window = None
 
@@ -294,7 +295,7 @@ def prepare_stage0_window(
     # async lookahead can overwrite the worker's pending terminator after
     # the scheduler accepted the segment stop. Window retention is optional.
     if not isinstance(window, dict) or (
-        mode not in {"basic", "context", "evidence"}
+        not retains_units
         and (
             not runtime_config.get("duplex_boundary_token_ids")
             or duplex.get("session_window_owned") is False
@@ -438,14 +439,10 @@ def prepare_stage0_window(
         "replacement_prompt_len": replacement_len,
     }
     if selected is not None:
-        duplex["stage0_window"]["keep_unit_indices"] = [index for index, _ in selected]
-        projections = [
-            (position, *units[index]["remove_media"])
-            for position, (index, unit) in enumerate(selected)
-            if unit["length"] != units[index]["length"]
+        duplex["stage0_window"]["evidence_keep"] = [
+            (index, *(units[index]["remove_media"] if unit["length"] != units[index]["length"] else (0, 0)))
+            for index, unit in selected
         ]
-        if projections:
-            duplex["stage0_window"]["project_media"] = projections
     if carried_units:
         duplex["stage0_window"]["carried_units"] = len(carried_units)
         duplex["stage0_window"]["carried_unit_lengths"] = [int(unit["length"]) for unit in carried_units]

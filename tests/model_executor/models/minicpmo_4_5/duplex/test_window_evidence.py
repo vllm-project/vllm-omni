@@ -3,11 +3,15 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_evidence import (
     EvidenceScorer,
     select_evidence_units,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import prepare_stage0_window
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_evidence_scorer_sees_silent_visual_and_audio_only_events():
@@ -70,7 +74,7 @@ def test_evidence_plan_tracks_noncontiguous_units_and_projected_length():
     update = SimpleNamespace(prompt_token_ids=[0] * 7, model_intermediate_buffer={"duplex": duplex})
     assert prepare_stage0_window(session, update, segment_output_ids=[])
     plan = duplex["stage0_window"]
-    assert plan["keep_unit_indices"] == [0, 3, 4]
-    assert plan["project_media"] == [(0, 1, 4)]
+    assert isinstance(plan, dict)
+    assert plan["evidence_keep"] == [(0, 1, 4), (3, 0, 0), (4, 0, 0)]
     assert plan["replacement_prompt_len"] == 26
     assert len(update.prompt_token_ids) == 26

@@ -1149,27 +1149,30 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "MiniCPM-o Stage-0 window history is shorter than the scheduler drop plan: "
                 f"drop={drop_units}, completed={len(state.window_units)}"
             )
-        keep_indices = stage0_window.get("keep_unit_indices")
-        if keep_indices is None:
+        evidence_keep = stage0_window.get("evidence_keep")
+        if evidence_keep is None:
             del state.window_units[:drop_units]
         else:
-            if (
-                len(keep_indices) != len(state.window_units) - drop_units
-                or keep_indices != sorted(set(keep_indices))
-                or any(not 0 <= index < len(state.window_units) for index in keep_indices)
-            ):
+            if len(evidence_keep) != len(state.window_units) - drop_units:
                 raise _UnrecoverableWindowError("Inconsistent MiniCPM-o evidence window selection")
-            state.window_units = [state.window_units[index] for index in keep_indices]
-            for index, start, count in stage0_window.get("project_media", ()):
+            retained = []
+            previous_index = -1
+            for index, start, count in evidence_keep:
+                if not previous_index < index < len(state.window_units):
+                    raise _UnrecoverableWindowError("Inconsistent MiniCPM-o evidence window selection")
                 unit = state.window_units[index]
-                stop = start + count
-                if start < 1 or count <= 0 or stop >= len(unit.token_ids) - 1:
-                    raise _UnrecoverableWindowError("Inconsistent MiniCPM-o evidence projection")
-                state.window_units[index] = _MiniCPMO45WindowUnit(
-                    embeds=self._slice_embed_list(unit.embeds, 0, start)
-                    + self._slice_embed_list(unit.embeds, stop, len(unit.token_ids)),
-                    token_ids=unit.token_ids[:start] + unit.token_ids[stop:],
-                )
+                if count:
+                    stop = start + count
+                    if start < 1 or count < 0 or stop >= len(unit.token_ids) - 1:
+                        raise _UnrecoverableWindowError("Inconsistent MiniCPM-o evidence projection")
+                    unit = _MiniCPMO45WindowUnit(
+                        embeds=self._slice_embed_list(unit.embeds, 0, start)
+                        + self._slice_embed_list(unit.embeds, stop, len(unit.token_ids)),
+                        token_ids=unit.token_ids[:start] + unit.token_ids[stop:],
+                    )
+                retained.append(unit)
+                previous_index = index
+            state.window_units = retained
 
         mode = stage0_window.get("mode")
         embeds: list[Any] = []
