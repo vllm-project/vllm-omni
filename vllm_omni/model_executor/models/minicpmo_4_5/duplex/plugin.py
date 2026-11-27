@@ -908,8 +908,16 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         if self.plugin_id == MiniCPMO45DuplexPlugin.plugin_id:
             assert isinstance(state, MiniCPMO45ServingSessionState)
             self._open_replay_epoch(state, fence.epoch)
-            pending_seqs = {unit.input_commit_seq for unit in state.replay_pending}
-            state.replay_commits = {seq: source for seq, source in state.replay_commits.items() if seq in pending_seqs}
+            replay_seqs = {unit.input_commit_seq for unit in state.replay_pending}
+            # A completed reply with mixed inputs can still be cancelled during playback.
+            replay_seqs.update(
+                unit.input_commit_seq
+                for turn in state.replay_completed
+                if turn.epoch == fence.epoch and turn.source is None
+                for unit in turn.inputs
+                if unit.user_media
+            )
+            state.replay_commits = {seq: source for seq, source in state.replay_commits.items() if seq in replay_seqs}
             source = _ReplaySource(item_id, source_id)
             state.replay_commits[input_commit_seq] = source
             state.has_committed_history = True
@@ -947,19 +955,27 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         item_id = f"item_{response_id}"
         inputs = [unit for unit in state.replay_pending if unit.turn_id <= fence.turn_id]
         state.replay_pending = [unit for unit in state.replay_pending if unit.turn_id > fence.turn_id]
-        commit_seq = self._input_commit_seq(inputs)
-        source = state.replay_commits.get(commit_seq) if commit_seq is not None else None
         if completed_text is None:
+            commits = state.replay_commits
             # A generated reply can still be cancelled while the client plays it.
             for index, turn in enumerate(state.replay_completed):
                 if turn.item_id == item_id:
                     del state.replay_completed[index]
-                    inputs, source = turn.inputs, turn.source
+                    inputs = turn.inputs + inputs
+                    commit_seq = self._input_commit_seq(turn.inputs)
+                    if commit_seq is not None and turn.source is not None:
+                        commits = {**commits, commit_seq: turn.source}
                     break
-            inputs = [unit for unit in inputs if unit.user_media]
-            if source is not None and inputs:
-                state.replay_completed.append(_ReplayTurn(None, inputs, fence.epoch, source))
+            groups: dict[int, list[_ReplayInput]] = {}
+            for unit in inputs:
+                if unit.user_media and unit.input_commit_seq in commits:
+                    groups.setdefault(unit.input_commit_seq, []).append(unit)
+            state.replay_completed.extend(
+                _ReplayTurn(None, group, fence.epoch, commits[seq]) for seq, group in groups.items()
+            )
         elif inputs and (state.replay_overflow_turn is None or fence.turn_id > state.replay_overflow_turn):
+            commit_seq = self._input_commit_seq(inputs)
+            source = state.replay_commits.get(commit_seq) if commit_seq is not None else None
             state.replay_completed.append(_ReplayTurn(item_id, inputs, fence.epoch, source, completed_text.strip()))
         while (
             sum(unit.num_bytes for turn in state.replay_completed for unit in turn.inputs) > _REPLAY_MAX_BYTES

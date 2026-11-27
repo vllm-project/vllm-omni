@@ -1614,6 +1614,53 @@ async def test_barge_in_replay_respects_live_conversation_sources(monkeypatch, e
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("later_input", ["uncommitted-silence", "two-committed-sources", "delete-first-source"])
+async def test_cancel_replays_committed_audio_from_the_same_model_turn(monkeypatch, later_input) -> None:
+    _stub_tokenizer(monkeypatch)
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        first_commit = find(await h.run(commands.Commit(create_response=False)), "input_audio_buffer.committed")
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, text="counting", finished=False))
+        response_id = h.session.active_response_id
+        assert response_id is not None
+
+        submissions = len(h.port.submissions)
+        commit_later = later_input != "uncommitted-silence"
+        later_value = 0.1 if commit_later else 0.0
+        await h.run(append_audio(value=later_value, is_speech=commit_later))
+        assert len(h.port.submissions) == submissions + 1
+        first = h.port.submissions[0].prompt["model_intermediate_buffer"]["duplex"]
+        later = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert later["turn_id"] == first["turn_id"] and not later["final"]
+        assert later["payload"]["audio"] == b64(pcm_f32(16000, value=later_value))
+        if commit_later:
+            find(await h.run(commands.Commit(create_response=False)), "input_audio_buffer.committed")
+        assert h.session.active_response_id == response_id
+
+        done = find(await h.run(commands.CancelResponse()), "response.done")
+        assert done.status == "cancelled" and done.response_id == response_id
+        expected_values = [0.05, 0.1] if commit_later else [0.05]
+        if later_input == "delete-first-source":
+            find(await h.run(commands.DeleteItem(item_id=first_commit.item_id)), "conversation.item.deleted")
+            expected_values = [0.1]
+        await h.run(append_audio(value=0.15))
+
+        duplex = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert duplex["epoch"] == 1 and duplex["seq"] == 1
+        assert duplex["session_window_replay"] is False
+        turns = duplex.get(REPLAY_CONTEXT_KEY, [])
+        assert len(turns) == len(expected_values)
+        for turn, value in zip(turns, expected_values):
+            [unit] = turn["inputs"]
+            assert unit["audio"] == b64(pcm_f32(16000, value=value))
+            assert turn["user_only"] and not turn["response_token_ids"]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_barge_in_does_not_replay_coalesced_commits_under_one_item(monkeypatch) -> None:
     _stub_tokenizer(monkeypatch)
     h = await open_harness(auto_response=False)
