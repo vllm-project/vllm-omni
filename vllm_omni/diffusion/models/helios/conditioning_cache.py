@@ -52,6 +52,22 @@ def tensor_version(tensor: torch.Tensor) -> int | None:
         return None
 
 
+def _record_stream(tensor: torch.Tensor) -> None:
+    """Pin a tensor to the current stream of its own device.
+
+    ``tensor.is_cuda`` is only true for CUDA tensors, so the previous guard
+    silently skipped the protection on NPU (and any other accelerator whose
+    torch module exposes ``current_stream``). Resolve the stream module from
+    the device type instead so CUDA and torch_npu-managed devices are covered.
+    """
+    if tensor.device.type == "cpu":
+        return
+    stream_module = getattr(torch, tensor.device.type, None)
+    if stream_module is None or not hasattr(stream_module, "current_stream"):
+        return
+    tensor.record_stream(stream_module.current_stream(tensor.device))
+
+
 @dataclass
 class _Entry:
     source: weakref.ReferenceType
@@ -111,8 +127,7 @@ class HeliosConditioningCache:
                 elif same:
                     same = entry.snapshot is not None and torch.equal(source, entry.snapshot)
                 if same and layers is not None:
-                    if entry.projected.is_cuda:
-                        entry.projected.record_stream(torch.cuda.current_stream(entry.projected.device))
+                    _record_stream(entry.projected)
                     return entry.projected, [(layer["k"], layer["v"]) for layer in layers]
                 # Retire the old value before rebuilding; failure cannot expose it.
                 entry.scope.close()
