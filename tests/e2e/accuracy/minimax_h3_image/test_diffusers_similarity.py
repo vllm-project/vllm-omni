@@ -33,12 +33,16 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 MODEL_ID = "MiniMaxAI/MiniMax-H3-Image"
-T2I_CASE = {
-    "size": "1024x1024",
-    "seed": 42,
-    "prompt": "Documentary photograph of a lighthouse keeper on a cliff at dawn, Kodak Portra 400",
+CASES = {
+    "t2i": {
+        "size": "1024x1024",
+        "extra_params": {"min_generation_area": 1024 * 1024},
+        "seed": 42,
+        "prompt": "Documentary photograph of a lighthouse keeper on a cliff at dawn, Kodak Portra 400",
+    },
+    "edit": {"size": "2048x2048", "seed": 1234},
 }
-# The configured timeouts budget 36 minutes on CUDA and 62 on NPU, leaving time
+# The configured timeouts budget 39 minutes on CUDA and 65 on NPU, leaving time
 # for environment setup, snapshot resolution, and artifact handling.
 REFERENCE_PREFLIGHT_TIMEOUT_S = 180
 REFERENCE_GENERATION_TIMEOUT_S = 1200
@@ -56,18 +60,20 @@ def test_diffusers_similarity(accuracy_artifact_root):
     calibration = os.environ.get("H3_IMAGE_CALIBRATE", "1")
     assert calibration in {"0", "1"}, "H3_IMAGE_CALIBRATE must be 0 or 1"
     policy = json.loads(Path(__file__).with_name("thresholds.json").read_text(encoding="utf-8"))
-    table = {}
-    floors = None
+    tables = {}
+    thresholds = {}
     if calibration == "0":
         assert policy["status"] == "selected", (
             "Select device-specific bounds in thresholds.json after calibration before setting H3_IMAGE_CALIBRATE=0"
         )
-        table = {profile: SimilarityThresholds(**row) for profile, row in policy["t2i"].items()}
-        floors = resolve_similarity_thresholds(table)
-        assert type(floors.ssim) in (float, int) and -1 <= floors.ssim <= 1, "Invalid SSIM floor for t2i"
-        assert type(floors.psnr) in (float, int) and math.isfinite(floors.psnr) and floors.psnr >= 0, (
-            "Invalid PSNR floor for t2i"
-        )
+        for task in CASES:
+            tables[task] = {profile: SimilarityThresholds(**row) for profile, row in policy[task].items()}
+            floors = resolve_similarity_thresholds(tables[task])
+            assert type(floors.ssim) in (float, int) and -1 <= floors.ssim <= 1, f"Invalid SSIM floor for {task}"
+            assert type(floors.psnr) in (float, int) and math.isfinite(floors.psnr) and floors.psnr >= 0, (
+                f"Invalid PSNR floor for {task}"
+            )
+            thresholds[task] = floors
     python = os.environ.get("H3_IMAGE_REFERENCE_PYTHON")
     assert python and Path(python).is_file(), "Source setup_reference.sh first"
     model = hf_api().snapshot_download(
@@ -84,6 +90,8 @@ def test_diffusers_similarity(accuracy_artifact_root):
             "text_encoder/*",
             "tokenizer/*",
             "processor/*",
+            "examples/reference1.png",
+            "examples/prompt.edit.txt",
         ],
         local_files_only=constants.HF_HUB_OFFLINE,
     )
@@ -91,18 +99,22 @@ def test_diffusers_similarity(accuracy_artifact_root):
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = (accuracy_artifact_root / "minimax_h3_image" / run_id).resolve()
     output.mkdir(parents=True)
+    examples = Path(model) / "examples"
+    reference_bytes = (examples / "reference1.png").read_bytes()
+    (output / "edit-input.png").write_bytes(reference_bytes)
+    cases = {
+        **CASES,
+        "edit": {**CASES["edit"], "prompt": (examples / "prompt.edit.txt").read_text(encoding="utf-8").strip()},
+    }
     common = {
         "model": model,
         "generator_device": "cpu",
         "num_inference_steps": 6,
         "response_format": "b64_json",
         "output_format": "png",
-        "extra_params": {"min_generation_area": 1024 * 1024},
     }
     request_file = output / "request.json"
-    write_json_artifact(
-        request_file, {**common, "cases": {"t2i": T2I_CASE}, "revision": revision, "device_type": device_type}
-    )
+    write_json_artifact(request_file, {**common, "cases": cases, "revision": revision, "device_type": device_type})
     command = [python, str(Path(__file__).with_name("run_reference.py")), str(request_file)]
     env = dict(os.environ)
     pythonpath = env.pop("PYTHONPATH", "")
@@ -144,49 +156,62 @@ def test_diffusers_similarity(accuracy_artifact_root):
     if device_type == "npu":
         args.append("--enforce-eager")
     with OmniServer(model, args, startup_timeout=startup_timeout) as server:
-        url = f"http://{server.host}:{server.port}/v1/images/generations"
-        response = requests.post(url, json={**common, **T2I_CASE}, timeout=IMAGE_REQUEST_TIMEOUT_S)
-        response.raise_for_status()
-        images = response.json()["data"]
-        assert len(images) == 1
-        with Image.open(io.BytesIO(base64.b64decode(images[0]["b64_json"], validate=True))) as image:
-            assert image.format == "PNG" and f"{image.width}x{image.height}" == T2I_CASE["size"]
-            rgb = image.convert("RGB")
-            assert any(low != high for low, high in rgb.getextrema())
-            rgb.save(output / "native-t2i.png")
+        url = f"http://{server.host}:{server.port}/v1/images/"
+        for task, case in cases.items():
+            request = {**common, **case}
+            if task == "edit":
+                response = requests.post(
+                    url + "edits",
+                    data=request,
+                    files=[("image", ("reference1.png", reference_bytes, "image/png"))],
+                    timeout=IMAGE_REQUEST_TIMEOUT_S,
+                )
+            else:
+                response = requests.post(url + "generations", json=request, timeout=IMAGE_REQUEST_TIMEOUT_S)
+            response.raise_for_status()
+            images = response.json()["data"]
+            assert len(images) == 1
+            with Image.open(io.BytesIO(base64.b64decode(images[0]["b64_json"], validate=True))) as image:
+                assert image.format == "PNG" and f"{image.width}x{image.height}" == case["size"]
+                rgb = image.convert("RGB")
+                assert any(low != high for low, high in rgb.getextrema())
+                rgb.save(output / f"native-{task}.png")
 
-    with (
-        Image.open(output / "native-t2i.png") as prediction,
-        Image.open(output / "diffusers-t2i.png") as baseline,
-    ):
-        ssim, psnr = compute_image_ssim_psnr(prediction=prediction, reference=baseline)
-    write_json_artifact(
-        output / "metrics.json", {"t2i": {"ssim": ssim, "psnr_db": "inf" if psnr == math.inf else psnr}}
-    )
-    write_accuracy_result(
-        model_id=MODEL_ID,
-        dataset="image_similarity_t2i",
-        metrics={"ssim": ssim, "psnr": psnr},
-        baseline=baseline_from_similarity_thresholds(table) if table else None,
-        result_dir=output,
-        extra={
-            "case": "t2i",
-            "size": T2I_CASE["size"],
-            "seed": T2I_CASE["seed"],
-            "revision": revision,
-            "device_type": device_type,
-            "calibration_only": calibration == "1",
-            "threshold_status": policy["status"],
-        },
-    )
+    metrics: dict[str, dict[str, float | str]] = {}
+    for task in cases:
+        with (
+            Image.open(output / f"native-{task}.png") as prediction,
+            Image.open(output / f"diffusers-{task}.png") as baseline,
+        ):
+            ssim, psnr = compute_image_ssim_psnr(prediction=prediction, reference=baseline)
+        metrics[task] = {"ssim": ssim, "psnr_db": "inf" if psnr == math.inf else psnr}
+    write_json_artifact(output / "metrics.json", metrics)
+    for task, scores in metrics.items():
+        write_accuracy_result(
+            model_id=MODEL_ID,
+            dataset=f"image_similarity_{task}",
+            metrics={"ssim": float(scores["ssim"]), "psnr": float(scores["psnr_db"])},
+            baseline=baseline_from_similarity_thresholds(tables[task]) if task in tables else None,
+            result_dir=output,
+            extra={
+                "case": task,
+                "size": cases[task]["size"],
+                "seed": cases[task]["seed"],
+                "revision": revision,
+                "device_type": device_type,
+                "calibration_only": calibration == "1",
+                "threshold_status": policy["status"],
+            },
+        )
     if calibration == "1":
         pytest.skip(f"Diffusers calibration collected at {output}; accuracy thresholds were not enforced.")
 
-    assert floors is not None
-    assert_similarity_metrics(
-        model_name="MiniMax-H3-Image t2i",
-        ssim_score=ssim,
-        psnr_score=psnr,
-        ssim_threshold=floors.ssim,
-        psnr_threshold=floors.psnr,
-    )
+    for task, floors in thresholds.items():
+        scores = metrics[task]
+        assert_similarity_metrics(
+            model_name=f"MiniMax-H3-Image {task}",
+            ssim_score=float(scores["ssim"]),
+            psnr_score=float(scores["psnr_db"]),
+            ssim_threshold=floors.ssim,
+            psnr_threshold=floors.psnr,
+        )

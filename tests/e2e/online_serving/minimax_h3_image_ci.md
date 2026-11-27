@@ -67,38 +67,43 @@ On one H100, the pinned Modular Diffusers pipeline generates reference images in
 with component-level CPU offload. The vLLM-Omni server uses single-GPU
 layerwise offload. The test resolves the model's `main` once and passes the
 same local snapshot to both implementations. It records the resolved commit in
-the accuracy results. Both implementations use the same text encoder and run
-the 1024² text-to-image request from the NPU recipe with seed 42. Both use the
-CPU generator and the checkpoint's six-step schedule. The request sets the
-minimum generation area to 1024² so both implementations denoise on a 1024²
-canvas. The test keeps one PNG from each implementation and records
-cross-implementation SSIM and PSNR.
+the accuracy results. Both implementations use the same text encoder and fixed
+requests from the NPU recipe. Text-to-image uses seed 42 and generates
+directly on a 1024² canvas. Single-reference editing uses seed 1234 and
+generates on a 2048² canvas. Both cases use a CPU generator and the
+checkpoint's six-step schedule.
+
+For editing, the reference script draws the target and reference noise in
+Omni's order and passes both tensors to Diffusers. Diffusers samples the
+reference VAE posterior using the advanced generator. The test retains one
+PNG per implementation and case and records SSIM and PSNR.
 
 From the repository root, source
 `tests/e2e/accuracy/minimax_h3_image/setup_reference.sh` and run the accuracy
 test with `--run-level full_model`. The first run needs access to the pinned
 Diffusers source and the model's `main` snapshot. For offline runs, cache both
-weight formats in that snapshot. The CUDA Nightly job retains images, metrics,
-and standard `result_acc_*.json` accuracy summaries. The test allocates up to
-3 minutes for reference preflight, 20 for CUDA reference generation, 10 for
-server startup, and 3 for the image request. These limits leave 24 minutes
-of the 60-minute job for setup, cleanup, and artifacts.
+weight formats and `examples/reference1.png` and `examples/prompt.edit.txt` in
+that snapshot. The CUDA Nightly job retains images, metrics, and standard
+`result_acc_*.json` accuracy summaries. The test allocates
+up to 3 minutes for reference preflight, 20 for CUDA reference generation, 10
+for server startup, and 3 per image request. These limits leave at
+least 10 minutes of the 60-minute job for setup, cleanup, and artifacts.
 
 `H3_IMAGE_CALIBRATE` defaults to `1`. Successful calibration reports SKIP
 after retaining artifacts with `calibration_only=true` because it does not
 enforce numerical accuracy floors.
 Runtime errors still fail the test. To enforce thresholds, set `H3_IMAGE_CALIBRATE=0`
-after selecting device-specific `ssim` and `psnr` floors for `t2i` in
-`tests/e2e/accuracy/minimax_h3_image/thresholds.json` and changing its status to
-`selected`. The shared accuracy helpers resolve the device profile.
-All floors currently remain `null`. Gate mode requires the image to meet both
+after selecting device-specific `ssim` and `psnr` floors for both `t2i` and
+`edit` in `tests/e2e/accuracy/minimax_h3_image/thresholds.json` and changing its
+status to `selected`. The shared accuracy helpers resolve the device profile.
+All floors currently remain `null`. Gate mode requires each case to meet both
 floors and fails before model startup when the floors are unselected or invalid.
 
-A3 Nightly runs the same text-to-image case on one die per implementation. The
+A3 Nightly runs the same two cases on one die per implementation. The
 Diffusers reference uses leaf-level offload for the text encoder and one block
 per group for the DiT, with a 35-minute generation timeout. Omni has 20 minutes
 for engine initialization within a 21-minute server startup budget. The NPU
-phase budgets total 62 minutes of the 75-minute job, and the job retains the
+phase budgets total 65 minutes of the 75-minute job, and the job retains the
 same calibration artifacts as CUDA. For a manual run, initialize the CANN
 environment, source `setup_reference.sh`, and select
 `full_model and npu and A3 and cards_1`.
