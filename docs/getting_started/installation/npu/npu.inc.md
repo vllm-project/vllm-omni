@@ -13,25 +13,25 @@ The recommended way to use vLLM-Omni on NPU is through the vLLM-Ascend pre-built
 === "A2"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.30.0
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.34.0
     ```
 
 === "A3"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.30.0-a3
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.34.0-a3
     ```
 
 === "A5"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.30.0-a5
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.34.0-a5
     ```
 
 === "310P (Experimental)"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.30.0-310p
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.34.0-310p
     ```
 
 ```bash
@@ -56,10 +56,10 @@ docker run --rm \
 
 # Inside the container, install vLLM-Omni from source
 cd /vllm-workspace
-git clone -b v0.30.0 https://github.com/vllm-project/vllm-omni.git
+git clone -b v0.34.0 https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
-pip install -v -e . --no-build-isolation
-# or VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
+VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e . --no-build-isolation \
+    --extra-index-url https://ascend.devcloud.huaweicloud.com/cann/pypi/simple
 
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 ```
@@ -109,12 +109,12 @@ Supported images as following.
 | image-tag-a5 | A5 | Ubuntu |
 | image-tag-310p | 310P (experimental) | Ubuntu |
 
-Here's an example deployment command that has been verified on 4 x NPUs:
+The following examples expose four NPUs. Use the image tag for your hardware.
 
 === "A2"
 
     ```bash
-    export IMAGE=quay.io/ascend/vllm-omni:v0.30.0
+    export IMAGE=quay.io/ascend/vllm-omni:v0.34.0
     docker run --rm \
         --name vllm-omni-a2 \
         --shm-size=64g \
@@ -138,7 +138,7 @@ Here's an example deployment command that has been verified on 4 x NPUs:
 === "A3"
 
     ```bash
-    export IMAGE=quay.io/ascend/vllm-omni:v0.30.0-a3
+    export IMAGE=quay.io/ascend/vllm-omni:v0.34.0-a3
     docker run --rm \
         --name vllm-omni-a3 \
         --shm-size=64g \
@@ -162,7 +162,7 @@ Here's an example deployment command that has been verified on 4 x NPUs:
 === "A5"
 
     ```bash
-    export IMAGE=quay.io/ascend/vllm-omni:v0.30.0-a5
+    export IMAGE=quay.io/ascend/vllm-omni:v0.34.0-a5
     docker run --rm \
         --name vllm-omni-a5 \
         --shm-size=64g \
@@ -186,7 +186,7 @@ Here's an example deployment command that has been verified on 4 x NPUs:
 === "310P (Experimental)"
 
     ```bash
-    export IMAGE=quay.io/ascend/vllm-omni:v0.30.0-310p
+    export IMAGE=quay.io/ascend/vllm-omni:v0.34.0-310p
     docker run --rm \
         --name vllm-omni-310p \
         --shm-size=64g \

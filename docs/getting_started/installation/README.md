@@ -1,7 +1,7 @@
 # Installation
 
 !!! important
-    This source checkout targets the official [vLLM 0.34.0 release](https://github.com/vllm-project/vllm/releases/tag/v0.34.0), at commit `62d4bc3c7e33b1b6c906e233e6af2d3506c482ca`. CUDA uses PyTorch 2.14.0 and CUDA 13.0; ROCm and XPU retain their upstream platform runtimes. The CUDA, ROCm and XPU Dockerfiles use published upstream 0.34.0 images. Published Omni wheel instructions below retain the vLLM dependency matching that Omni release.
+    This source checkout targets the official [vLLM 0.34.0 release](https://github.com/vllm-project/vllm/releases/tag/v0.34.0), at commit `62d4bc3c7e33b1b6c906e233e6af2d3506c482ca`. CUDA uses PyTorch 2.14.0 and CUDA 13.0; ROCm and XPU retain their upstream platform runtimes. The CUDA, ROCm and XPU Dockerfiles use published upstream 0.34.0 images. Install the platform runtime that matches the Omni release.
 
     CI results obtained with vLLM 0.34.0rc3 do not qualify the final 0.34.0 artifacts. Final-release model validation and ROCm/XPU runtime qualification remain pending.
 
@@ -17,6 +17,17 @@ vLLM-Omni supports the following hardware platforms:
     - [Intel XPU](gpu.md)
     - [MThreads MUSA](gpu.md)
 - [NPU](npu.md)
+
+## Upgrade to v0.34.0
+
+Install [vLLM-Omni v0.34.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.34.0)
+with vLLM 0.34.0 in a fresh environment. On Ascend, use the matching
+vLLM-Ascend 0.34.0 image for your hardware. Follow the platform guides above
+for pinned installation commands.
+
+[Model Runner V2](../../configuration/stage_configs.md#stage-level-runner-selection)
+is required. Check custom deployments and platform overrides before upgrading:
+any stage that resolves to `model_runner: v1` fails at startup.
 
 ## Source development and demo dependencies
 
