@@ -23,14 +23,22 @@ Both runs used one Ascend 910B3, identical BF16 weights and prompt, 1280 × 704 
 | MP4 export | 6.06 s | 6.61 s |
 | Launch through MP4 export, including engine warm-up | 528.06 s | 371.79 s |
 
-PSNR and SSIM use the 121 uncompressed RGB frames. A separate run collected routing counts so device synchronization for those counters did not affect the reported timings. Of 3,000 self-attention calls, 2,668 used Sol and 332 used FlashAttention. The fraction of query/key block pairs using the pooled approximation was **68.98% within Sol calls** and **61.34% across all calls**. [Full prompt, timings, quality metrics and routing counts](https://github.com/Ea510chan/vllm-omni/blob/55cbafe7dda38f9a41d12595b993faabc8e1c9ac/review/wan2.2-sol-attn/morton-50step/summary.json) · [Generated video comparison (dense left, Sol right)](https://github.com/Ea510chan/vllm-omni/blob/55cbafe7dda38f9a41d12595b993faabc8e1c9ac/review/wan2.2-sol-attn/dense-vs-diag.mp4)
+PSNR and SSIM use the 121 uncompressed RGB frames. A separate run collected routing counts so device synchronization for those counters did not affect the reported timings. Of 3,000 self-attention calls, 2,668 used Sol and 332 used FlashAttention. The fraction of query/key block pairs using the pooled approximation was **68.98% within Sol calls** and **61.34% across all calls**. [Full prompt, timings, quality metrics and routing counts](https://github.com/Ea510chan/vllm-omni/blob/500b0c5a9b01b0bc12653f29793bedbcd5812147/review/wan2.2-sol-attn/morton-50step/summary.json) · [Generated video comparison (dense left, Sol right)](https://github.com/Ea510chan/vllm-omni/blob/500b0c5a9b01b0bc12653f29793bedbcd5812147/review/wan2.2-sol-attn/dense-vs-diag.mp4)
+
+### Generated output comparison
+
+![FlashAttention and default Sol diag at frames 1, 61 and 121](https://raw.githubusercontent.com/Ea510chan/vllm-omni/500b0c5a9b01b0bc12653f29793bedbcd5812147/review/wan2.2-sol-attn/dense-step-sweep/flash-vs-sol-frames.png)
+
+The top row shows FlashAttention and the bottom row shows Sol diag with four initial dense steps. Both rows use the same prompt and seed. The frames come from the archived MP4s. Quality metrics use the uncompressed frames.
 
 ## Dense-step sweep and full dense fallback
 
 The 11-point sweep varied the dense prefix from 0 to 50 in five-step increments. With 30 dense steps, the measured request took 365.23 s with mean PSNR 37.32 dB and SSIM 0.9822 against the sweep's 414.77 s Flash reference. With all 50 steps dense, the request took 415.15 s and the uncompressed frames matched Flash exactly. The 10-, 30- and 45-step timings were repeated on card 6 after other NPU processes were observed during the original runs. The default four-step measurement above used its own 419.22 s Flash reference.
 
-[Complete results, stage timings, occupancy samples, plots and generated videos](https://github.com/Ea510chan/vllm-omni/tree/c78b9bcbbfac6c6daa0bc2c6fddc0e8e89248b9d/review/wan2.2-sol-attn/dense-step-sweep)
+![Request latency and mean PSNR across the 11 dense-step settings](https://raw.githubusercontent.com/Ea510chan/vllm-omni/500b0c5a9b01b0bc12653f29793bedbcd5812147/review/wan2.2-sol-attn/dense-step-sweep/dense-steps-latency-psnr-lines.png)
+
+[Complete results, stage timings, occupancy samples, plots and generated videos](https://github.com/Ea510chan/vllm-omni/tree/500b0c5a9b01b0bc12653f29793bedbcd5812147/review/wan2.2-sol-attn/dense-step-sweep)
 
 ## Validation
 
-The focused suite passed 168 tests at feature revision `758442d34` with MindIE-SD revision `69852419`. Unit tests cover opt-in configuration, step and layer boundaries, provider arguments, Morton cache reuse, the inverse permutation and per-token alignment. The two-step offline NPU case crosses the dense-to-Sol boundary and checks the shape, finite values and pixel variation of the generated 17-frame video. [Unit tests](../../../tests/diffusion/models/wan2_2/test_wan22_sol_attn.py) · [Offline NPU test](../../../tests/e2e/offline_inference/test_wan22_t2v.py) · [Test results](https://github.com/Ea510chan/vllm-omni/blob/55cbafe7dda38f9a41d12595b993faabc8e1c9ac/review/wan2.2-sol-attn/morton-move-tests.log)
+The focused suite passed 168 tests at feature revision `758442d34` with MindIE-SD revision `69852419`. Unit tests cover opt-in configuration, step and layer boundaries, provider arguments, Morton cache reuse, the inverse permutation and per-token alignment. The two-step offline NPU case crosses the dense-to-Sol boundary and checks the shape, finite values and pixel variation of the generated 17-frame video. [Unit tests](../../../tests/diffusion/models/wan2_2/test_wan22_sol_attn.py) · [Offline NPU test](../../../tests/e2e/offline_inference/test_wan22_t2v.py) · [Test results](https://github.com/Ea510chan/vllm-omni/blob/500b0c5a9b01b0bc12653f29793bedbcd5812147/review/wan2.2-sol-attn/morton-move-tests.log)
