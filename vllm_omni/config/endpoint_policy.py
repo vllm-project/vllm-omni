@@ -22,13 +22,16 @@ class RouteTarget(NamedTuple):
     methods: frozenset[str]
     # Indicates an endpoint should be rejected if we are only serving part of the pipeline
     requires_full_pipeline: bool = True
+    # False for server infrastructure endpoints that never run model inference.
+    # Server capabilities that set this to True are shut down in the duplex omni serving case.
+    runs_inference: bool = True
 
 
 class OmniServingCapability(Enum):
     """Server routes that endpoint policies keep or shut down."""
 
-    HEALTH = RouteTarget("/health", frozenset({"GET"}), requires_full_pipeline=False)
-    METRICS = RouteTarget("/metrics", frozenset({"GET"}), requires_full_pipeline=False)
+    HEALTH = RouteTarget("/health", frozenset({"GET"}), requires_full_pipeline=False, runs_inference=False)
+    METRICS = RouteTarget("/metrics", frozenset({"GET"}), requires_full_pipeline=False, runs_inference=False)
     COMPLETIONS = RouteTarget("/v1/completions", frozenset({"POST"}))
     CHAT_COMPLETIONS = RouteTarget("/v1/chat/completions", frozenset({"POST"}))
     CHAT_COMPLETIONS_BATCH = RouteTarget("/v1/chat/completions/batch", frozenset({"POST"}))
@@ -51,6 +54,10 @@ class OmniServingCapability(Enum):
     @property
     def requires_full_pipeline(self) -> bool:
         return self.value.requires_full_pipeline
+
+    @property
+    def runs_inference(self) -> bool:
+        return self.value.runs_inference
 
 
 @dataclass(frozen=True)
