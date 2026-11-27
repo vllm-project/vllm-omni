@@ -23,6 +23,7 @@ import copy
 import json
 import threading
 import time
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -32,7 +33,7 @@ from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities
-from vllm_omni.engine.duplex.contracts import DuplexAppendPlan
+from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_session_id_from_request_id
 from vllm_omni.engine.duplex.plugin import (
     DefaultDuplexModelSessionState,
     DuplexDataPlane,
@@ -189,6 +190,8 @@ class SophonBuffer(PcmAppendBuffer):
     fallback: bool = False
     mute_rid: str | None = None  # premature-reply recovery: stop sending audio for this reply
     spec_id: str | None = None  # current speculative reply (not yet released)
+    spec_ids: set = field(default_factory=set)  # every speculative id this session issued (cleaned up at close)
+    session_id: str | None = None  # the framework session this buffer belongs to (from the first append's fence)
     spec_gen: int = -1
     max_pf: float = 0.0  # max P(finished) across this turn's turn questions
     last_pb: float = 0.0  # latest P(backchannel)
@@ -226,14 +229,24 @@ class SophonBuffer(PcmAppendBuffer):
     def clear(self):
         # Stock semantics: drop buffered user audio and unconfirmed appends. On current main the runner only clears on
         # close, client input.cancel / barge_in and silent commits, so the user's speech during a reply is not lost.
-        self.utt.clear()
-        self.speech_ms = 0.0
-        self.silence_ms = 0.0
-        for r in self.reservations:
-            r._active = False
-        self.reservations.clear()
-        self.check_inflight = False
-        self.decision = None
+        # Everything decided about the dropped audio goes too: a new generation makes in-flight turn checks discard
+        # their result, and an armed or speculative reply for that audio is dropped.
+        with self.lock:
+            self.utt.clear()
+            self.speech_ms = 0.0
+            self.silence_ms = 0.0
+            for r in self.reservations:
+                r._active = False
+            self.reservations.clear()
+            self.check_inflight = False
+            self.decision = None
+            self.decision_ready = False
+            self.gen += 1
+            self.pending_reply = False
+            self.resume_pending = False
+            spec, self.spec_id = self.spec_id, None
+        if spec is not None and self.owner_drop is not None:
+            self.owner_drop(spec)
 
     def _reset_turn(self):
         self.pc_hit = False
@@ -614,6 +627,7 @@ class SophonBuffer(PcmAppendBuffer):
                 import uuid
 
                 self.spec_id = uuid.uuid4().hex
+                self.spec_ids.add(self.spec_id)
                 self.spec_gen = self.gen
                 p = self._payload("reply")
                 p["spec_id"] = self.spec_id
@@ -722,10 +736,11 @@ class SophonDataPlane(DuplexDataPlane):
         self.terminal.add(request_id)
 
     def close_stream(self, request_id):
-        pass
+        self.terminal.discard(request_id)  # no output follows a closed stream
 
     def close_session(self, session_id, *, active_request_id=None):
-        pass
+        self.plugin.close_session(session_id)
+        self.terminal = {rid for rid in self.terminal if duplex_session_id_from_request_id(rid) != session_id}
 
     def project(self, result, *, context=None):
         if not isinstance(result, dict):
@@ -899,14 +914,15 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         self.data_plane = SophonDataPlane(self, encode_audio)
         self.tok = None
         self._tok_lock = asyncio.Lock()
-        self._bufs: dict[int, SophonBuffer] = {}
+        # Weak: a buffer lives as long as the framework's session state holds it; close_session also drops it.
+        self._bufs: weakref.WeakValueDictionary[int, SophonBuffer] = weakref.WeakValueDictionary()
         self._reqs: dict[str, dict] = {}
         self._spec_rid: dict[str, str] = {}  # speculative id -> request id
         self._spec_pending: dict[
             str, str
         ] = {}  # speculative replies released/dropped before being planned: spec_id -> "release"/"drop"
         self._spec_lock = threading.Lock()
-        self._keys: dict[str, SophonBuffer] = {}
+        self._keys: weakref.WeakValueDictionary[str, SophonBuffer] = weakref.WeakValueDictionary()
         self.bridge = None  # prototype: client tool bridge not ported
         self.turn_checker = LoopbackTurnChecker()
         start_warmup(self.turn_checker)
@@ -941,6 +957,39 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         buf.owner_active = self._active_reply
         buf.turn_checker = self.turn_checker
         return DefaultDuplexModelSessionState(audio_buffer=buf)
+
+    def close_session(self, session_id):
+        """The framework closed this session: forget its buffer, history, requests and speculative replies."""
+        bufs = [b for b in list(self._bufs.values()) if b.session_id is not None and b.session_id == session_id]
+        for b in bufs:
+            self._bufs.pop(id(b), None)
+            for k in [k for k, v in list(self._keys.items()) if v is b]:
+                self._keys.pop(k, None)
+            with b.lock:
+                b.history.clear()
+                b.prev_user = None
+                b.utt.clear()
+                b.gen += 1  # in-flight turn checks discard their result
+                b.pending_reply = False
+                b.spec_id = None
+                for r in b.reservations:
+                    r._active = False
+                b.reservations.clear()
+        rids = [
+            rid
+            for rid, info in list(self._reqs.items())
+            if any(info.get("buf") is b for b in bufs) or duplex_session_id_from_request_id(rid) == session_id
+        ]
+        for rid in rids:
+            self._reqs.pop(rid, None)
+        with self._spec_lock:
+            for b in bufs:
+                for sid in b.spec_ids:
+                    self._spec_pending.pop(sid, None)
+                    self._spec_rid.pop(sid, None)
+                b.spec_ids.clear()
+            for sid in [sid for sid, rid in self._spec_rid.items() if rid in rids]:
+                self._spec_rid.pop(sid, None)
 
     def validate_client_extra_body(self, extra_body):
         super().validate_client_extra_body(extra_body)
@@ -1057,6 +1106,8 @@ class SophonRealtimeDuplexPlugin(DuplexModelPlugin):
         if buf is not None and fence is not None:
             with buf.lock:
                 buf.last_turn = max(buf.last_turn or 0, int(getattr(fence, "turn_id", 0)))
+                if buf.session_id is None:
+                    buf.session_id = getattr(fence, "session_id", None)
         lang = runtime_config.get("lang") or "zh"
         if buf is not None:
             buf.lang = lang

@@ -20,6 +20,7 @@ import json
 import os
 import threading
 import time
+import urllib.error
 import urllib.request
 import wave
 from typing import Protocol
@@ -35,6 +36,7 @@ from vllm_omni.model_executor.models.sophon_realtime.core.turn_question import (
     turn_question,
 )
 
+from .env import api_key as _api_key
 from .env import port as _port
 
 logger = init_logger(__name__)
@@ -52,13 +54,23 @@ class TurnChecker(Protocol):
 class LoopbackTurnChecker:
     """Stopgap (#10406 item 4): ask this server's own ``/v1/chat/completions``."""
 
-    def __init__(self, base_url: str | None = None):
+    def __init__(self, base_url: str | None = None, api_key: str | None = None):
         self.base_url = base_url or "http://127.0.0.1:" + _port()
+        self.api_key = api_key if api_key is not None else _api_key()
         self._model_id: str | None = None
+
+    def auth_headers(self) -> dict[str, str]:
+        """``Authorization`` for this server's own endpoints when it was started with ``--api-key``."""
+        return {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
+
+    def _get(self, path: str, timeout: float):
+        return urllib.request.urlopen(
+            urllib.request.Request(self.base_url + path, headers=self.auth_headers()), timeout=timeout
+        )
 
     def _model(self) -> str:
         if self._model_id is None:
-            with urllib.request.urlopen(self.base_url + "/v1/models", timeout=5) as r:
+            with self._get("/v1/models", 5) as r:
                 self._model_id = json.load(r)["data"][0]["id"]
         return self._model_id
 
@@ -95,7 +107,7 @@ class LoopbackTurnChecker:
         req = urllib.request.Request(
             self.base_url + "/v1/chat/completions",
             data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **self.auth_headers()},
         )
         with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_S) as r:
             j = json.load(r)
@@ -107,9 +119,15 @@ class LoopbackTurnChecker:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             try:
-                with urllib.request.urlopen(self.base_url + "/v1/models", timeout=5) as r:
+                with self._get("/v1/models", 5) as r:
                     if r.status == 200:
                         return True
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403):
+                    logger.warning(
+                        "sophon duplex: own endpoint refused the API key (%d); turn checks cannot run", exc.code
+                    )
+                    return False
             except Exception:  # noqa: BLE001
                 pass
             time.sleep(1)
@@ -142,7 +160,7 @@ def _warm(checker: LoopbackTurnChecker) -> None:
     for i in range(2):
         try:
             t = time.monotonic()
-            ok = _warm_realtime(checker.base_url)
+            ok = _warm_realtime(checker.base_url, checker.auth_headers())
             logger.info(
                 "sophon duplex: realtime warm-up %d %s in %.1fs",
                 i,
@@ -155,10 +173,22 @@ def _warm(checker: LoopbackTurnChecker) -> None:
             logger.warning("sophon duplex: realtime warm-up %d failed: %r", i, exc)
 
 
-def _warm_realtime(base_url: str) -> bool:
-    """One short realtime session on this server (bundled clip, then silence) until a reply has finished."""
+def _ws_connect(url: str, headers: dict[str, str]):
+    """websockets.connect with request headers (the keyword changed name in websockets 14)."""
+    import inspect
+
     import websockets
 
+    kw = (
+        "additional_headers"
+        if "additional_headers" in inspect.signature(websockets.connect).parameters
+        else "extra_headers"
+    )
+    return websockets.connect(url, max_size=None, **({kw: headers} if headers else {}))
+
+
+def _warm_realtime(base_url: str, headers: dict[str, str] | None = None) -> bool:
+    """One short realtime session on this server (bundled clip, then silence) until a reply has finished."""
     path = os.path.join(os.path.dirname(__file__), "warmup.wav")
     with wave.open(path, "rb") as w:
         pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
@@ -166,7 +196,7 @@ def _warm_realtime(base_url: str) -> bool:
     url = base_url.replace("http://", "ws://").replace("https://", "wss://") + "/v1/realtime"
 
     async def run() -> bool:
-        async with websockets.connect(url, max_size=None) as ws:
+        async with _ws_connect(url, headers or {}) as ws:
             await ws.send(
                 json.dumps(
                     {

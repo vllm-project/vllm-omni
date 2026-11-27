@@ -854,6 +854,8 @@ class CosyVoice3Model(
     model_sampler_can_defer_rng = True
     supports_sampled_token_ids_cpu_override = True
     _sampling_eps = 1e-5
+    # Euler steps of the flow decoder; code2wav stages read it from the config (hf_overrides) in __init__.
+    flow_n_timesteps: int = 10
 
     @property
     def mrv2_forward_returns_tensor(self) -> bool:

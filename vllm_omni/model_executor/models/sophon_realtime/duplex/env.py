@@ -34,6 +34,11 @@ def port():
     return os.environ.get("SOPHON_PORT") or _argv_after("--port") or "8000"
 
 
+def api_key():
+    """The key `vllm serve` checks (``--api-key``, else ``VLLM_API_KEY``), for calls to this server's own endpoints."""
+    return _argv_after("--api-key") or os.environ.get("VLLM_API_KEY") or None
+
+
 def vision():
     """SOPHON_VISION=0/1 overrides; otherwise look for a vision tower in <model>/thinker (HF ids: assume the released
     vision model)."""
