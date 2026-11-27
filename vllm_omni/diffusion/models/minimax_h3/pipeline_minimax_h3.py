@@ -3392,7 +3392,7 @@ class MiniMaxH3Pipeline(
         """Prepare media once and encode either shared text or each window's text.
 
         Returns initial conditioning and optional request-owned window embeddings.
-        Invalid continuation prompts are broadcast before any encoder collective.
+        Invalid continuation options and prompts are broadcast before any encoder collective.
         """
         group, rank, world_size = _dit_cpu_rank_world()
         prompts = (sampling.extra_args or {}).get("continuation_prompts")
@@ -3432,6 +3432,13 @@ class MiniMaxH3Pipeline(
                     raise OmniClientError(
                         "MiniMax H3 diffusion stage requires text encoder conditioning when text_encoder is not loaded"
                     )
+                # prepare_encoder_inputs validates the same options again; this call
+                # runs first so the step-execution check also precedes reference work.
+                continuation = resolve_continuation(
+                    sampling.extra_args or {},
+                    task=task,
+                    step_execution=bool(getattr(self.od_config, "step_execution", False)),
+                )
                 prepared = prepare_encoder_inputs(
                     raw_prompt,
                     sampling,
@@ -3445,15 +3452,8 @@ class MiniMaxH3Pipeline(
                 # requests keep their original error ordering; when it runs,
                 # it is the same resolver the authoritative check uses, so
                 # pinned schedules cannot make the two disagree. Long-video
-                # continuation resolves before the normalize call so the
-                # helper can reject the combination with zero encoder passes.
-                continuation = None
-                if prompts is not None or (request_context is not None and task == "ref2va"):
-                    continuation = resolve_continuation(
-                        sampling.extra_args or {},
-                        task=task,
-                        step_execution=bool(self.od_config.step_execution),
-                    )
+                # continuation was resolved above, before any encoder work, so
+                # the helper can reject the combination with zero encoder passes.
                 if (sampling.extra_args or {}).get("keep_steps") is None:
                     keep_steps = None
                 else:

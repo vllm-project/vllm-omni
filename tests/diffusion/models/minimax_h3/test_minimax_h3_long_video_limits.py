@@ -16,8 +16,75 @@ from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
     resolve_minimax_h3_shape,
 )
 from vllm_omni.model_executor.models.minimax_h3.long_video import validate_encoded_frame_limit
+from vllm_omni.model_executor.stage_input_processors.minimax_h3 import prepare_encoder_prompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("split_encoder", [False, True], ids=["local", "split"])
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"continuation_overlap_frames": 23}, "overlap must be an integer"),
+        ({"continuation_window_frames": 999}, "window must be an integer"),
+        ({"continuation_window_frames": True}, "window must be an integer"),
+        ({"continuation_overlap_frames": True}, "overlap must be an integer"),
+        ({"continuation_window_frames": 277.0}, "window must be an integer"),
+        ({"continuation_overlap_frames": "22"}, "overlap must be an integer"),
+        ({"continuation_overlap_frames": 277}, "exceed its overlap"),
+        ({"continuation_overlap_frames": 294}, "exceed its overlap"),
+        ({"continuation_window_frames": 90}, "window must be 107..345"),
+        ({"continuation_window_frames": 362}, "window must be 107..345"),
+    ],
+)
+def test_invalid_continuation_rejected_before_reference_loading(mocker, split_encoder, overrides, message):
+    load_images = mocker.patch(
+        "vllm_omni.model_executor.models.minimax_h3.encoder_processing.load_minimax_h3_images",
+        side_effect=AssertionError("invalid continuation must not load references"),
+    )
+    sampling = OmniDiffusionSamplingParams(
+        width=64, height=64, extra_args={"task": "ref2va", "long_video": True, **overrides}
+    )
+    prompt = {"prompt": "test", "multi_modal_data": {"image": "must-not-be-loaded"}}
+    with pytest.raises(OmniClientError, match=message):
+        if split_encoder:
+            prepare_encoder_prompt(prompt, [sampling])
+        else:
+            prepare_encoder_inputs(prompt, sampling)
+    load_images.assert_not_called()
+
+
+@pytest.mark.parametrize("split_encoder", [False, True], ids=["local", "split"])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"continuation_window_frames": 107, "continuation_overlap_frames": 5},
+        {"continuation_window_frames": 345, "continuation_overlap_frames": 328},
+        {"long_video_mode": "full", "continuation_window_frames": 999, "continuation_overlap_frames": 23},
+    ],
+    ids=["minimum-window", "maximum-window", "full-ignores-continuation-geometry"],
+)
+def test_valid_long_video_preparation_preserves_local_and_split_inputs(split_encoder, options):
+    sampling = OmniDiffusionSamplingParams(
+        width=64,
+        height=64,
+        num_frames=96,
+        extra_args={"task": "ref2va", "long_video": True, **options},
+    )
+    prompt = {"prompt": "test", "multi_modal_data": {"image": Image.new("RGB", (256, 256))}}
+    if split_encoder:
+        from vllm_omni.model_executor.models.minimax_h3.conditioning import MINIMAX_H3_ENCODER_REQUEST_KEY
+
+        prepared = prepare_encoder_prompt(prompt, [sampling])
+        media = prepared["additional_information"]["meta"][MINIMAX_H3_ENCODER_REQUEST_KEY]
+        assert prepared["prompt"] == "test"
+        assert media["task"] == "ref2va"
+        assert media["num_frames"] == 107
+    else:
+        prepared = prepare_encoder_inputs(prompt, sampling)
+        assert prepared.prompt == "test"
+        assert prepared.media.task == "ref2va"
+        assert prepared.media.num_frames == 107
 
 
 @pytest.mark.parametrize("mode,limit", [("full", 30), ("continuation", 300), (None, 300)])
