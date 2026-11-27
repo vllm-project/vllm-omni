@@ -436,7 +436,7 @@ def _asr_failures(mode: str, source: str, concurrency: int, gen: dict[str, Any])
     return failures
 
 
-@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("generated", [ASYNC_CHUNK], indirect=True)
 def test_voice_isolation_concurrent_registered(generated, scorers) -> None:
     """
@@ -451,7 +451,7 @@ def test_voice_isolation_concurrent_registered(generated, scorers) -> None:
     _assert_no_leak("concurrent_registered", run, scorers, gate_first_window=True)
 
 
-@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("generated", [ASYNC_CHUNK], indirect=True)
 def test_voice_isolation_concurrent(generated, scorers) -> None:
     """
@@ -466,7 +466,7 @@ def test_voice_isolation_concurrent(generated, scorers) -> None:
     _assert_no_leak("concurrent", run, scorers, gate_first_window=True)
 
 
-@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("generated", [ASYNC_CHUNK, NO_ASYNC_CHUNK], indirect=True)
 def test_voice_isolation_control_c1(generated, scorers) -> None:
     """
@@ -481,7 +481,7 @@ def test_voice_isolation_control_c1(generated, scorers) -> None:
     _assert_no_leak(f"control_c1_{generated}", run, scorers, gate_first_window=False)
 
 
-@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("generated", [ASYNC_CHUNK], indirect=True)
 def test_voice_isolation_control_c1_registered(generated, scorers) -> None:
     """
@@ -496,7 +496,7 @@ def test_voice_isolation_control_c1_registered(generated, scorers) -> None:
     _assert_no_leak(f"control_c1_registered_{generated}", run, scorers, gate_first_window=False)
 
 
-@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=1)
 def test_swapped_labels_fail_with_real_embedders(scorers) -> None:
     """
     The scorer must flag a swap: reference clips as outputs, two labels swapped.
@@ -534,7 +534,7 @@ def _wait_for_free_vram(min_free_gib: float = 16.0, timeout_s: float = 120.0) ->
         time.sleep(2)
 
 
-@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=1)
 def test_voice_isolation_asr(monkeypatch) -> None:
     """
     Speech content of every generated output, as its own failure after the speaker tests.

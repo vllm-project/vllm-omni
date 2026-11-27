@@ -130,11 +130,14 @@ different scales) are scheduled into separate batches.
 
 Constraints:
 
-- The summed rank of the stacked adapters must not exceed **512** per layer.
-  Two or three typical LoRAs (rank 4-64) fit comfortably.
+- The rank of one adapter, and the summed rank of stacked adapters, must not
+  exceed **1024** per layer. Two or three typical LoRAs (rank 4-64) fit
+  comfortably. Per-layer LoRA buffers are allocated at the largest rank seen so
+  far, rounded up to 1, 8, 16, 32, 64, 128, 256, 320, 512, 768 or 1024, so one
+  high-rank adapter raises the memory every wrapped layer reserves.
 - Adapters with a scale of approximately 0 are skipped.
 - Packed-projection stacking requires a compatible loader and packed-module mapping; MiniMax-H3 supports its fused QKV and MLP projections.
-- MiniMax-H3 accepts ordinary adapter stacks and at most one compatible Turbo adapter. Native distilled adapters such as FlashGen cannot be composed with other adapters.
+- MiniMax-H3 accepts ordinary adapter stacks and at most one compatible Turbo adapter. Native distilled adapters such as FlashGen and PDD acceleration adapters cannot be composed with other adapters.
 - FastH3 Omni accepts ordinary adapters with independent scales, including under distributed layerwise offload; Turbo and native distilled adapters remain unsupported with this checkpoint.
 
 Offline: pass a list of `LoRARequest` objects together with a matching list of
@@ -382,10 +385,22 @@ MiniMax-H3 supports the following few-step mechanisms:
   derives the total step count from the request before the adapter schedule is
   known.
 
+FlashGen native adapters require `--lora-application runtime` (the default).
+The loader rejects `merged` application before reading adapter tensors,
+because a globally merged policy does not select the adapter-declared schedule
+or validate its request contract. Native adapters cannot be stacked with other
+active adapters, including cold-loaded sources that are used transiently
+for composition without entering the adapter cache.
+
+Native v2 FL2VA/Ref2VA exports require request `scale=1.0`, `flow_shift=12`
+and `audio_flow_shift=3`. A zero scale disables the adapter and its sampling
+constraints. See the [MiniMax-H3 recipe](gh-file:recipes/MiniMaxAI/MiniMax-H3.md#flashgen-native-lora)
+for base partitions and the validated conditioning scope.
+
 Native artifacts also declare `qkv_layout=grouped`. The H3 loader reorders fused
 `qkv_proj` LoRA rows with the same `_reorder_grouped_qkv_to_qkv` helper used for
-base-weight loading, then binds the packed Q/K/V slices through the legacy PEFT
-manager without modifying `DiffusionLoRAManager`.
+base-weight loading, then binds the packed Q/K/V slices through the PEFT
+manager.
 
 Both runtime adapters run with distributed layerwise offload in request-mode
 generation, where the manager keeps the LoRA A/B buffers resident on the compute

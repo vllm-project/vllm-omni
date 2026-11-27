@@ -37,11 +37,11 @@ from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.common.cli_args import make_arg_parser, resolve_default_chat_template_kwargs
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
+from vllm.entrypoints.launchers.app import build_app as build_openai_app
 from vllm.entrypoints.launchers.launcher import serve_http
+from vllm.entrypoints.launchers.launcher import setup_server as setup_openai_server
 from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
-from vllm.entrypoints.openai.api_server import build_app as build_openai_app
-from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
 from vllm.entrypoints.openai.chat_completion.protocol import (
     BatchChatCompletionRequest,
     ChatCompletionRequest,
@@ -300,12 +300,15 @@ def _own_reuseport_socket(sock: socket.socket, client_count: int) -> socket.sock
         return sock
     if sock.family not in (socket.AF_INET, socket.AF_INET6):
         return sock
+    reuseport = getattr(socket, "SO_REUSEPORT", None)
+    if reuseport is None:
+        return sock
     try:
-        if not sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT):
+        if not sock.getsockopt(socket.SOL_SOCKET, reuseport):
             return sock
         own = socket.socket(family=sock.family, type=socket.SOCK_STREAM)
         own.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        own.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        own.setsockopt(socket.SOL_SOCKET, reuseport, 1)
         own.bind(sock.getsockname()[:2])
     except OSError as e:
         logger.warning("Per-server reuseport listener unavailable (%s); sharing the inherited socket", e)
@@ -479,6 +482,14 @@ async def omni_run_server_worker(
 
         await omni_init_app_state(engine_client, app.state, args)
 
+        if os.getenv("MINICPMO_NPU_THINKER_PREFILL_STARTUP") or os.getenv("MINICPMO_NPU_TALKER_PREFILL_STARTUP"):
+            if getattr(engine_client, "session_only", False):
+                logger.info("Skipping prefill precapture on the session-only frontend")
+            else:
+                from vllm_omni.platforms.npu.worker.prefill_startup import precapture_prefill
+
+                await precapture_prefill(engine_client, shared_dir=getattr(args, "_omni_api_server_shared_dir", None))
+
         # Complete the configured video request before serve_http can expose
         # /health or admit user traffic. Failure unwinds the engine context.
         video_warmup_request = getattr(args, "video_output_warmup", None)
@@ -588,7 +599,7 @@ async def omni_run_server_worker(
         # not another call to the empty 0.01 s JIT-kernel registry.
         duplex_warmup_frames = 0
         warmup_kind = None
-        if getattr(app.state, "openai_serving_duplex", None) is not None:
+        if isinstance(engine_client, DuplexOmni) and engine_client.engine.duplex_frontend_group_count > 0:
             duplex_cfg = getattr(engine_client, "duplex_session_config", None)
             duplex_warmup_frames = int(getattr(duplex_cfg, "warmup_frames", 0) or 0)
             warmup_kind = startup_warmup_kind(lookup_duplex_plugin(engine_client), duplex_warmup_frames)
@@ -666,13 +677,22 @@ async def build_async_omni(
         forkserver.ensure_running()
         logger.debug("Forkserver setup complete!")
 
-    # Context manager to handle async_omni lifecycle
-    # Ensures everything is shutdown and cleaned up on error/exit
-    async with build_async_omni_from_stage_config(
-        args,
-        disable_frontend_multiprocessing=bool(disable_frontend_multiprocessing),
-        client_config=client_config,
-    ) as async_omni:
+    async with AsyncExitStack() as stack:
+        deploy_config = getattr(args, "deploy_config", None)
+        if deploy_config and not getattr(args, "_omni_api_server_shared_dir", None):
+            from vllm_omni.platforms import current_omni_platform
+
+            if current_omni_platform.is_npu():
+                from vllm_omni.model_executor.models.minicpmo_4_5.config import npu_prefill_startup_environment
+
+                stack.enter_context(npu_prefill_startup_environment(deploy_config))
+        async_omni = await stack.enter_async_context(
+            build_async_omni_from_stage_config(
+                args,
+                disable_frontend_multiprocessing=bool(disable_frontend_multiprocessing),
+                client_config=client_config,
+            )
+        )
         yield async_omni
 
 
@@ -685,6 +705,7 @@ def _should_serve_duplex(model: str, kwargs: dict[str, Any]) -> bool:
         model=model,
         trust_remote_code=bool(kwargs.get("trust_remote_code")),
         deploy_config_path=kwargs.get("deploy_config"),
+        revision=kwargs.get("revision"),
     )
     if pipeline_config is None or not getattr(pipeline_config, "duplex_plugin", None):
         return False
@@ -755,7 +776,7 @@ async def build_async_omni_from_stage_config(
             saved = os.environ.get("CUDA_VISIBLE_DEVICES")
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
             try:
-                AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+                AutoConfig.from_pretrained(args.model, trust_remote_code=True, revision=getattr(args, "revision", None))
             finally:
                 if saved is not None:
                     os.environ["CUDA_VISIBLE_DEVICES"] = saved
@@ -849,7 +870,9 @@ async def _init_duplex_app_state(
     state.openai_serving_chat = await _init_duplex_chat(engine_client, state, args, request_logger)
     state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
     state.server_load_metrics = 0
-    if state.openai_serving_chat is not None:
+    if engine_client.engine.duplex_frontend_group_count == 0:
+        logger.warning("Duplex sessions unavailable on this frontend: no complete replica group survived startup")
+    elif state.openai_serving_chat is not None:
         logger.info(
             "Duplex mode: serving %s over /v1/realtime?duplex=1 and /v1/chat/completions",
             engine_client.model,

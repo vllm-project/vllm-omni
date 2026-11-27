@@ -97,6 +97,14 @@ Specify to save benchmark results to a json file
   clocks and timezones must agree. Older result files without `benchmark_end_time`
   cannot establish a sampling window from `date` alone.
 
+- `--omni-isolate-prefix-cache`
+  Give the measured chat/completions requests a fresh, shared `cache_salt`
+  for each benchmark invocation. Ready checks and individual warmup requests
+  use separate salts. Requests within the measured run can still reuse common
+  prefixes. This option rejects an explicit `cache_salt` and does not clear
+  multimodal processor caches or measure cold service startup. Failed warmup
+  requests abort the measurement when this option is enabled.
+
 - `--save-detailed`
 "When saving the results, whether to include per request "
         "information such as response, error, ttfs, tpots, etc."
@@ -414,14 +422,14 @@ This is an annotation-based compatibility selection, not a claim that every
 sample has passed model validation. The job streams question audio with video;
 RTD, future-event reminders and continuous monitoring are outside this workload.
 
-The `c8_accuracy_response_stats_v5` workload uses `--duplex-metric-aggregation response`
+The `c8_accuracy_response_stats` workload uses `--duplex-metric-aggregation response`
 and `--metric-percentiles 50,95` to pool responses for TTFT, audio TTFP and RTF.
 Missing measurements are excluded, never substituted with zero. All sessions
 must finish, publish artifacts and provide measured text/audio latency. The
 judge must evaluate all 120 corrections successfully and produce a finite
 correction success rate. Judging runs after the measured replay and does not
-enter its duration. No calibrated score floor or hardware latency baseline is
-checked in for this expanded workload; establish fresh H100 and B200 baselines.
+enter its duration. See the [Qwen3-Omni benchmark configuration](../../contributing/ci/qwen3_omni_benchmark.md)
+for the hardware-specific accuracy and performance baselines.
 `--dataset-path repo/id@revision` pins a remote Omni-DuplexEval source; local
 directory and parquet paths retain their existing behavior.
 
@@ -602,6 +610,42 @@ flushes a residual unit and that decision covers the end of the clip. A
 successful transport/session result is therefore not proof that every final
 input produced a response, nor an accuracy score.
 
+#### Per-stage metrics
+
+Add `--print-stage` to the serving command above to aggregate the final cumulative
+snapshot from each assistant response. Each response contributes once, even when
+it sends multiple metric updates; a video can therefore contribute several
+responses to each stage table. Serving tables honor `--percentile-metrics` and
+`--percentiles`.
+
+The standalone generation command also supports stage tables:
+
+```bash
+vllm bench omni-duplex-eval --omni generate \
+  --url 'ws://127.0.0.1:8000/v1/realtime?duplex=1' \
+  --model openbmb/MiniCPM-o-4_5 \
+  --ref-audio /path/to/reference.wav \
+  --dataset Hothan/Omni-DuplexEval \
+  --split PR_correction --limit 1 --concurrency 1 \
+  --response-root ./duplex-eval-responses \
+  --overwrite --print-stage
+```
+
+Standalone generation uses a fixed metric selection (`ttft`, `tpot`, `itl`,
+`audio_ttfp`, `audio_duration`) and reports mean, median and P99 where applicable.
+Only successful samples generated in the current run contribute to this table:
+`response_done` must be true and the result must have no error. Failed sessions
+are excluded from the table and counted in a message on stderr. Existing
+response files are skipped by default; their stage snapshots are not loaded for
+printing. The command reports skipped samples on stderr and suggests
+`--overwrite` to regenerate them. If successful samples return no stage snapshots,
+it reports that instead of printing an empty table.
+
+For both regular and duplex stage tables, missing or null `stage_gen_time_ms`
+and `postprocess_time_ms` values are excluded from timing distributions. Measured
+zeros remain samples. Complete snapshots retain the previous statistics; partial
+snapshots no longer lower timing means by contributing artificial zeros.
+
 ### OmniInteract Realtime Benchmark
 
 OmniInteract runs each video as one native-duplex WebSocket sample in the standard serving-benchmark lifecycle:
@@ -777,7 +821,9 @@ scored slot plus unmatched-chunk false positives. Plain `wav_transcript.json` ti
 timing. If transcript chunks include `aligned_words`, the evaluator splits boundary-crossing chunks and derives trigger
 timing from word alignment.
 
-Per-response TTFT and TTFP start when the server begins executing the native model-turn request that owns the response. RTF
+Per-response TTFT and TTFP start at the server's latest accepted native append before the response's first output, not at
+the first append of the model turn: with 200 ms chunks every pre-response silence chunk moves the start forward, so
+user speech that overlaps the reply shortens both. RTF
 continues to use client receipt of `response.created` through the last audio packet, divided by emitted audio duration.
 When the client recorded `input_audio_buffer.append` sends, `client_ttfp_ms` / `client_rtf` start at the last such send
 before this `response.created` (after the previous `response.created` or stream start). `client_ttft_ms` still starts at
@@ -880,8 +926,6 @@ emitted audio duration. Stall ratio is engine-resident time outside that work
 union divided by emitted audio duration; it is not a playback-underrun ratio.
 These client/server response metrics display mean, median and P99. The harness
 requires nonempty, finite measurements; missing stats do not pass as zeros.
-The stats-enabled workload is named `c8_accuracy_response_stats_v5`; it needs a
-new measured baseline rather than reusing the earlier stats-disabled results.
 
 OmniInteract judging uses the same formal outputs as the performance report and
 records All Global IA-QTF1 plus evaluated/skipped counts. The official eligibility
@@ -908,12 +952,8 @@ The `max_concurrent_requests` statistic counts sessions touching each whole-seco
 bucket. At a wave boundary it can exceed the instantaneous concurrency because
 ending and starting sessions in the same second share a bucket.
 
-The configuration is named `c8_accuracy_response_stats_v5` to distinguish its sample
-selection and judging from older workloads. Use matching hardware and workload
-versions for comparisons; previous C1/C8/C16 16-source-pool results are not baselines
-for these expanded jobs. The earlier `c8_accuracy_response_v3` runs used V1
-with Thinker prefix caching disabled; record the runner and cache settings when
-comparing results.
+For performance comparisons, match the hardware, sample IDs, concurrency, model runner,
+prefix caching and session statistics settings.
 
 ### Seed-TTS reference speech as real audio input
 

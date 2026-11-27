@@ -707,6 +707,11 @@ def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_
     args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model=str(tmp_path))
     resolved = OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args))
 
+    assert resolved.scheduler_window_policy == (
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
+    )
+    assert all(config.stage_by_id(i).model_config.scheduler_window_policy is None for i in (1, 2))
+
     if cli_prefix is not None:
         assert resolved.kernel_config.ir_op_priority.rms_norm == ["vllm_c", "native"]
         assert resolved.kernel_config.ir_op_priority.fused_add_rms_norm == ["vllm_c", "native"]
@@ -1090,23 +1095,17 @@ def test_llm_additional_config_roundtrip_and_isolation(stage_id, monkeypatch):
     assert additional_config["backend_options"]["enabled"] is True
 
 
-@pytest.mark.parametrize("deploy_name", ["minicpmo_4_5", "minicpmo_4_5_2gpu", "minicpmo_4_5_3gpu"])
-def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_name):
+def test_minicpmo_two_card_npu_routing_reaches_engine_args(monkeypatch):
     from vllm_omni.engine import stage_init_utils
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
     from vllm_omni.platforms import current_omni_platform
 
     monkeypatch.setattr(current_omni_platform, "device_name", "npu")
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
-    stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
-    expected: dict[str, object] = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
-    if deploy_name == "minicpmo_4_5":
-        # Single-card deploy: batch sizes round up to a capture bucket so the
-        # bounded pool can reuse captures across nearby batch sizes.
-        expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
-    assert stage.runtime_config.additional_config == expected
+    stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path="minicpmo_4_5_2gpu").stage_by_id(2)
     engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
-    assert engine_args["additional_config"] == expected
+    assert engine_args["additional_config"] == stage.runtime_config.additional_config
+    assert engine_args["additional_config"]["minicpmo_vocoder_replica_route"] == "adaptive_secondary"
 
 
 def test_diffusion_additional_config_keeps_diffusion_owner():
@@ -1824,6 +1823,7 @@ def test_sub_config_fields_match_structured_scopes():
         "override_generation_config",
         "enable_prompt_embeds",
         "scheduling_metadata_adapter",
+        "scheduler_window_policy",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)
@@ -1864,7 +1864,8 @@ def test_sub_config_fields_match_structured_scopes():
         "ring_degree",
         "allgather_degree",
         "ulysses_mode",
-        "ulysses_a2a_permute",
+        "ulysses_overlap_chunks",
+        "ulysses_a2a_backend",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
         "vae_parallel_mode",
@@ -2129,14 +2130,14 @@ def test_from_pipeline_config_derives_sequence_parallel_size_from_allgather_degr
     assert stage.parallel_config.world_size == 2
 
 
-def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
+def test_from_pipeline_config_preserves_deployed_ulysses_a2a_backend() -> None:
     pipeline = _resolve_pipeline_or_skip("dreamzero")
     deploy = DeployConfig(
         stages=[
             StageDeployConfig(
                 stage_id=0,
                 ulysses_degree=2,
-                ulysses_a2a_permute=True,
+                ulysses_a2a_backend="copy_engine",
             )
         ]
     )
@@ -2144,7 +2145,18 @@ def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
     stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
-    assert stage.parallel_config.ulysses_a2a_permute is True
+    assert stage.parallel_config.ulysses_a2a_backend == "copy_engine"
+
+
+@pytest.mark.parametrize(
+    "values, message",
+    [
+        ({"ulysses_a2a_backend": "nvshmem"}, "ulysses_a2a_backend must be one of"),
+    ],
+)
+def test_diffusion_parallel_config_rejects_invalid_ulysses_a2a_backend(values, message):
+    with pytest.raises(ValueError, match=message):
+        OmniStageDiffusionParallelConfig(ulysses_degree=2, **values)
 
 
 def test_diffusion_parallel_config_accepts_four_way_guidance_parallelism():

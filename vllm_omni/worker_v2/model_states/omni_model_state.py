@@ -257,7 +257,7 @@ class OmniModelState(DefaultModelState):
         The runner copies the mask with its other outputs and only reads it
         after D2H completes. A failure terminates that request, not the batch.
         """
-        return None
+        return getattr(self, "_preprocess_error", None)
 
     def on_requests_finished(self, req_ids: set[str]) -> None:
         self._mtp_state.finish_audio(req_ids)
@@ -277,8 +277,8 @@ class OmniModelState(DefaultModelState):
         """Adapt existing V1 hooks once, outside the per-step hot path.
 
         Keep the V2 hook precedence for models with an optimized implementation.
-        Both hooks return the same five values; only the embedding argument is
-        optional in the original contract. Errors inside a hook propagate.
+        Both hooks share the return contract; only the embedding argument is
+        optional in the original one. Errors inside a hook propagate.
         """
         hook = getattr(model, "preprocess_decode_batch_mrv2", None)
         if not callable(hook):
@@ -665,6 +665,7 @@ class OmniModelState(DefaultModelState):
         in-place. Decode rows consume cached frame embeddings; MTP itself runs
         after token sampling through post_sample.
         """
+        self._preprocess_error = None
         if not self.has_preprocess:
             return
 
@@ -747,8 +748,11 @@ class OmniModelState(DefaultModelState):
             num_computed_tokens = None
             if req_states is not None:
                 prompt_len = self._get_req_state_value(getattr(req_states, "prompt_len", None), req_idx)
+                num_computed_field = getattr(req_states, "num_computed_tokens_np", None)
+                if num_computed_field is None:
+                    num_computed_field = getattr(req_states, "num_computed_tokens", None)
                 num_computed_tokens = self._get_req_state_value(
-                    getattr(req_states, "num_computed_tokens", None),
+                    num_computed_field,
                     req_idx,
                 )
             if num_computed_tokens is None:
@@ -839,20 +843,31 @@ class OmniModelState(DefaultModelState):
                 batch_ids = input_ids.index_select(0, batch_offsets)
                 batch_embeds = embeds.index_select(0, batch_offsets)
 
-            new_ids, new_embeds, batch_hidden, batch_text_step, updates_by_req = batch_decode_preprocess(
+            result = batch_decode_preprocess(
                 input_ids=batch_ids,
                 input_embeds=batch_embeds,
                 req_infos=[entry[4] for entry in decode_entries],
             )
+            # preprocess_phase_contract.md: hooks return five values with
+            # talker_mtp and (input_ids, inputs_embeds, updates) without it.
+            batch_text_step: torch.Tensor | None = None
+            if len(result) == 5:
+                new_ids, new_embeds, batch_hidden, batch_text_step, updates_by_req = result
+                if batch_hidden.shape[0] != batch_size or batch_text_step.shape[0] != batch_size:
+                    raise RuntimeError(
+                        "Batched Omni preprocess changed the request axis: "
+                        f"expected={batch_size} hidden={batch_hidden.shape[0]} "
+                        f"text_step={batch_text_step.shape[0]}"
+                    )
+            elif len(result) == 3 and not self._has_mtp:
+                new_ids, new_embeds, updates_by_req = result
+            else:
+                expected = "five values" if self._has_mtp else "three or five values"
+                raise RuntimeError(f"Batched Omni preprocess must return {expected}, got {len(result)}")
             if len(updates_by_req) != batch_size:
                 raise RuntimeError(
                     "Batched Omni preprocess returned the wrong update count: "
                     f"expected={batch_size} actual={len(updates_by_req)}"
-                )
-            if batch_hidden.shape[0] != batch_size or batch_text_step.shape[0] != batch_size:
-                raise RuntimeError(
-                    "Batched Omni preprocess changed the request axis: "
-                    f"expected={batch_size} hidden={batch_hidden.shape[0]} text_step={batch_text_step.shape[0]}"
                 )
 
             if self._preprocess_result_needs_writeback(batch_ids, new_ids):
@@ -878,7 +893,7 @@ class OmniModelState(DefaultModelState):
                     decode_mtp_rows.append((i, start))
                 batched_indices.add(i)
                 self.intermediate_buffer.update(req_idx, updates, gpu_keys)
-            if self._has_mtp:
+            if batch_text_step is not None and self._has_mtp:
                 text_step_batches.append(batch_text_step.reshape(batch_size, -1))
 
         for i, req_idx, start, n_tok, info, _is_prefill in preprocess_entries:
@@ -888,6 +903,14 @@ class OmniModelState(DefaultModelState):
             ids_slice = input_ids[start : start + n_tok]
             emb_slice = embeds[start : start + n_tok]
             new_ids, new_emb, updates = self.model.preprocess(ids_slice, emb_slice, **info)
+            if error := updates.pop("request_error", None):
+                if self._preprocess_error is None:
+                    self._preprocess_error = (
+                        torch.zeros(input_batch.num_reqs, dtype=torch.bool, device=input_ids.device),
+                        "Model prefill could not restore accepted session context",
+                    )
+                self._preprocess_error[0][i] = True
+                logger.error("Request %s failed during prefill: %s", input_batch.req_ids[i], error)
 
             # Write back in-place
             seg = min(n_tok, new_ids.shape[0])

@@ -15,7 +15,7 @@ import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 from vllm.logger import init_logger
 
@@ -195,6 +195,46 @@ class PreparedRequest:
     segment_silence_ms: int = 200
 
 
+class IncrementalInputNotReadyError(Exception):
+    """Recoverable initial-input wait, not an invalid request or engine error."""
+
+
+class IncrementalTTSInput(Protocol):
+    """Model-owned input conversion for one ordinary TTS request.
+
+    Each call receives released frontend text, not token IDs or a batch of
+    requests. The handler owns submission, output consumption, cancellation, and
+    EOF. Calls on an instance must be serialized.
+
+    Input conversion must preserve the complete-input model encoding regardless
+    of source chunking or delivery batching. Already submitted input is never
+    revised; EOF flushes the remaining encoding exactly once.
+
+    Before the first successful build, the caller accumulates initial text.
+    ``build`` receives the entire candidate, returning a request or raising
+    ``IncrementalInputNotReadyError`` if more input is required. This signal
+    neither submits a request nor consumes caller-owned input; retry with the
+    complete candidate, not only the newly arrived suffix. Implementations may
+    cache speculative encoding to avoid reprocessing an unchanged prefix.
+
+    EOF cannot require more input: ``build(final=True)`` either returns a
+    complete initial request or raises an actual input/construction error.
+    Catch only ``IncrementalInputNotReadyError`` as a normal wait. Other build
+    failures terminate the utterance; discard the instance rather than retrying.
+    A successful build is performed exactly once per instance.
+
+    After a successful build, ``append`` consumes each text delta exactly once.
+    It may buffer text without submitting an engine update. An empty final
+    append flushes pending text and closes input without ending generation.
+    Append/delivery failures terminate the utterance; do not retry a delta
+    whose engine delivery may already have occurred.
+    """
+
+    async def build(self, text: str, *, final: bool) -> PreparedRequest: ...
+
+    async def append(self, request_id: str, text: str, *, final: bool) -> None: ...
+
+
 @dataclass
 class SpeechServingContext:
     """Shared state and helpers an adapter may use.
@@ -281,6 +321,7 @@ class TTSModelAdapter(ABC):
     reports_length_truncation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    supports_incremental_input: ClassVar[bool] = False
     #: None disables commitment. Opt-in adapters describe their complete
     #: commitment contract so the handler can validate every requested feature.
     text_commitment: ClassVar[TextCommitmentCapabilities | None] = None
@@ -363,6 +404,10 @@ class TTSModelAdapter(ABC):
         the ``voice_name`` / ``voice_created_at`` metadata.
         """
 
+    async def create_incremental_input(self, request: "OpenAICreateSpeechRequest") -> IncrementalTTSInput:
+        """Create fresh model input state; ordinary request validation is shared."""
+        raise ValueError(f"Incremental model input is not supported by {self.name}")
+
     def apply_sampling_overrides(
         self,
         sampling_params_list: list,
@@ -412,6 +457,27 @@ class TTSModelAdapter(ABC):
 
     async def warmup(self) -> None:
         return
+
+    def stage_setting(self, section: str, name: str) -> Any:
+        """The serving stage's deploy setting ``name``, or None when it is unset.
+
+        A typed stage config keeps the setting in one of its sections; a
+        legacy one keeps every setting flat under ``engine_args``. A section
+        the typed config lacks is a caller bug and raises ``AttributeError``;
+        only an unset setting returns None.
+
+        Args:
+            section: The typed config's section that holds the setting, such
+                as ``runtime_config`` for ``additional_config`` or
+                ``scheduler_config`` for ``max_num_seqs``.
+            name: The deploy file's key.
+        """
+        stage = self.ctx.server._tts_stage
+        engine_args = getattr(stage, "engine_args", None)
+        return getattr(getattr(stage, section) if engine_args is None else engine_args, name, None)
+
+    def shutdown(self) -> None:
+        """Release model-specific serving work before the executor shuts down."""
 
     def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
         return None
@@ -478,6 +544,8 @@ class DiffusionTTSAdapter(TTSModelAdapter):
 __all__ = [
     "ARTTSAdapter",
     "DiffusionTTSAdapter",
+    "IncrementalInputNotReadyError",
+    "IncrementalTTSInput",
     "OutputPolicy",
     "PreparedRequest",
     "SpeechServingContext",

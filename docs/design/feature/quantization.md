@@ -193,6 +193,12 @@ and XPU methods to select different kernels or reject unsupported execution at
 model construction time. The user guide is the source of truth for the current
 hardware support matrix.
 
+ROCm online FP8 requires each linear layer's local contracted and output
+dimensions to be divisible by 16. When tensor-parallel sharding leaves either
+local dimension non-aligned, that layer remains in its original precision and
+emits an explicit warning; aligned layers in the same model remain quantized.
+CUDA and pre-quantized FP8 paths retain their existing behavior.
+
 Diffusion INT8 routes CUDA and ROCm to the shared vLLM linear methods for both
 online and serialized weights. Omni adapts batched activations to a matrix at
 the kernel boundary and restores the leading dimensions; kernel selection and

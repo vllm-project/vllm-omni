@@ -16,8 +16,10 @@ Rules under test (see docs section 9.5 of the incident analysis):
 2. ready chunks larger than the full step budget fail their request through
    the standard finish path and queue an explicit ERROR output, which a
    zero-token engine step must still emit exactly once;
-3. non-chunk inputs (sender-only adapter / plain prompts) keep their previous
-   behavior on both paths.
+3. full-payload stage inputs are also atomic because they carry one structured
+   model input rather than an independently decodable token stream;
+4. other non-chunk inputs (sender-only adapter / plain prompts) keep their
+   previous behavior on both paths.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from vllm.v1.engine import FinishReason
 from vllm.v1.request import Request, RequestStatus
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
+from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
 # isort: on
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -272,6 +275,25 @@ def _stage_running_chunk(sched, request: Request) -> None:
     sched.requests[request.request_id] = request
     sched.running.append(request)
     _ready_chunk_ids(sched).add(request.request_id)
+
+
+def test_minicpmo_code2wav_keeps_admission_until_abort():
+    scheduler = _make_scheduler(receive_path="native", max_num_seqs=2)
+    stage = MINICPMO_4_5_PIPELINE.stages[2]
+    scheduler._retains_state_across_chunks = stage.retains_state_across_chunks
+    first, second, waiting = (_make_request(name, 8) for name in ("first", "second", "waiting"))
+    for request in (first, second, waiting):
+        _stage_waiting_chunk(scheduler, request)
+
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) == {first.request_id, second.request_id}
+    for request in (first, second):
+        request.num_computed_tokens = len(request.prompt_token_ids)
+        _ready_chunk_ids(scheduler).discard(request.request_id)
+
+    assert not scheduler.schedule().num_scheduled_tokens
+    scheduler.finish_requests([first.request_id], RequestStatus.FINISHED_ABORTED)
+    assert scheduler.schedule().num_scheduled_tokens == {waiting.request_id: 8}
 
 
 @pytest.mark.parametrize("queue_name", ["running", "waiting"])
@@ -761,3 +783,96 @@ class TestNonChunkBehaviorUnchanged:
         output = sched.schedule()
 
         assert output.num_scheduled_tokens == {}
+
+
+def test_full_payload_code2wav_prompts_are_not_split_to_fill_batch_budget():
+    """A codebook-major prompt must not be reshaped from arbitrary slices."""
+    budget = 65_536
+    prompt_tokens = 34_144
+    sched = _make_scheduler(
+        receive_path="native",
+        budget=budget,
+        enable_chunked_prefill=False,
+        receives_chunks=False,
+    )
+    sched.input_coordinator = OmniSchedulingCoordinator(stage_id=2, async_chunk=False)
+
+    first = _make_request("code2wav-first", prompt_tokens)
+    second = _make_request("code2wav-second", prompt_tokens)
+    for request in (first, second):
+        sched.requests[request.request_id] = request
+        sched.waiting.add_request(request)
+        sched.input_coordinator._full_payload_input_received.add(request.request_id)
+        sched.input_coordinator.finished_requests.add(request.request_id)
+
+    output = sched.schedule()
+
+    assert output.num_scheduled_tokens == {first.request_id: prompt_tokens}
+    assert second in sched.waiting
+    assert second.num_computed_tokens == 0
+
+    first.num_computed_tokens = prompt_tokens
+    first.num_in_flight_tokens = 0
+    next_output = sched.schedule()
+
+    assert next_output.num_scheduled_tokens == {second.request_id: prompt_tokens}
+
+
+def test_stage_zero_bookkeeping_coordinator_does_not_make_plain_prompt_atomic():
+    sched = _make_scheduler(
+        receive_path="native",
+        budget=128,
+        enable_chunked_prefill=True,
+        receives_chunks=False,
+    )
+    sched.input_coordinator = OmniSchedulingCoordinator(stage_id=0, async_chunk=True)
+    request = _make_request("stage-zero", 400)
+    sched.requests[request.request_id] = request
+    sched.waiting.add_request(request)
+
+    output = sched.schedule()
+
+    assert output.num_scheduled_tokens == {request.request_id: 128}
+
+
+@pytest.mark.parametrize("marker_only", [False, True])
+def test_native_segment_boundary_keeps_session_for_second_segment(marker_only):
+    sched = _make_scheduler(receive_path="native")
+    sched._pooling_output_decoder = None
+    sched._pending_data_plane_terminal_req_ids = set()
+    sched.kv_cache_manager.estimate_cached_tokens = lambda request: 0
+
+    def free_request(request):
+        sched.requests.pop(request.request_id, None)
+        return None, None
+
+    sched._free_request = free_request
+    request = _make_request("two-segments", 0 if marker_only else 2)
+    request.resumable = True
+    _stage_waiting_chunk(sched, request)
+    sched.input_coordinator.segment_finished_req_ids.add(request.request_id)
+    first = sched.schedule()
+    runner_output = _make_runner_output()
+    runner_output.req_ids = [request.request_id]
+    runner_output.num_nans_in_logits = {}
+    request.num_computed_tokens = len(request.prompt_token_ids)
+    sched.update_from_output(first, runner_output)
+    assert request.resumable
+    assert request.request_id in sched.requests
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    # A later payload replaces the parked segment's prompt and can execute.
+    request.prompt_token_ids = [7, 8]
+    request.num_computed_tokens = 0
+    request.status = RequestStatus.WAITING
+    sched.input_coordinator.segment_finished_req_ids.discard(request.request_id)
+    sched.input_coordinator.finished_requests.add(request.request_id)
+    sched.input_coordinator.input_terminal_req_ids.add(request.request_id)
+    sched.waiting.add_request(request)
+    _ready_chunk_ids(sched).add(request.request_id)
+    second = sched.schedule()
+    assert second.num_scheduled_tokens == {request.request_id: 2}
+    request.num_computed_tokens = len(request.prompt_token_ids)
+    sched.update_from_output(second, runner_output)
+    assert not request.resumable
+    assert request.request_id not in sched.requests

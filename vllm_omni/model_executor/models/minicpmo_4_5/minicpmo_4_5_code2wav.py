@@ -26,16 +26,17 @@ from vllm.logger import init_logger
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.device_copy import to_device_nonblocking
 
-from .batched_token2wav import (
+from .code2wav.graphs import ResidentAttCache, _format_memory_delta, _memory_snapshot
+from .code2wav.token2wav import (
     BatchedToken2Wav,
     BatchedToken2WavState,
     PromptFeatures,
     row_offset_signature,
     state_shape_signature,
 )
-from .code2wav_watchdog import Code2WavWatchdog
-from .config_flags import read_bool_flag, resolve_token2wav_trt_config
-from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
+from .code2wav.watchdog import Code2WavWatchdog
+from .config import read_bool_flag, resolve_token2wav_trt_config, stage_connector_extra
+from .handoff import TEXT_WITHOUT_AUDIO_KEY
 
 if TYPE_CHECKING:
     from vllm_omni.core.sched.output import OmniRequestPrewarm
@@ -44,6 +45,11 @@ logger = init_logger(__name__)
 
 
 _DEFAULT_PROMPT_WAV = Path("assets") / "HT_ref_audio.wav"
+_FALLBACK_PROMPT_WAVS = (
+    _DEFAULT_PROMPT_WAV,
+    Path("system_ref_audio.wav"),
+    Path("assets") / "system_ref_audio.wav",
+)
 
 
 @lru_cache(maxsize=8)
@@ -124,8 +130,13 @@ def _stage_matmul_policy(tf32_mode: str) -> Iterator[None]:
 
 
 def default_prompt_wav(model_path: str) -> str:
-    """Return the model-bundled MiniCPM prompt WAV path."""
-    return str(Path(model_path) / _DEFAULT_PROMPT_WAV)
+    """Return the model-bundled MiniCPM / Sage-Interaction prompt WAV path."""
+    base = Path(model_path)
+    for rel in _FALLBACK_PROMPT_WAVS:
+        candidate = base / rel
+        if candidate.is_file():
+            return str(candidate)
+    return str(base / _DEFAULT_PROMPT_WAV)
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -358,6 +369,7 @@ class _WorkItem:
     segment_end: bool
     turn_end: bool
     has_payload: bool = True
+    text_without_audio: bool = False
 
 
 def _slot_resident(item: _WorkItem) -> bool:
@@ -478,11 +490,18 @@ class MiniCPMO45Code2Wav(nn.Module):
             encoder_rows = list(range(1, int(encoder_rows) + 1))
         if not encoder_rows or any(row < 1 for row in encoder_rows):
             raise ValueError("MiniCPM-o code2wav_encoder_graph_rows must be positive")
+        padded_history = int(extra.get("code2wav_encoder_padded_flow_history", 0))
+        if padded_history < 0 or padded_history % 2:
+            raise ValueError("code2wav_encoder_padded_flow_history must be zero or a positive even number")
         self._chunk_encoder_graph_config = {
+            "padded_flow_history": padded_history,
+            "padded_flow_continuations": os.getenv("VLLM_OMNI_REPLICA_ID", "0") == "0"
+            and read_bool_flag(extra, "code2wav_encoder_padded_flow_continuations", False),
             "enabled": read_bool_flag(extra, "enable_code2wav_encoder_graph", False),
             "max_graphs": int(extra.get("code2wav_encoder_max_graphs", 8)),
             "capture_after": int(extra.get("code2wav_encoder_capture_after", 2)),
             "capture_after_precapture": read_bool_flag(extra, "code2wav_encoder_capture_after_precapture", False),
+            "precapture_tails": read_bool_flag(extra, "code2wav_encoder_tail_precapture", False),
             "rows": [row for row in encoder_rows if not max_num_seqs or row <= int(max_num_seqs)],
         }
         self._cfm_graph_config = {
@@ -496,14 +515,20 @@ class MiniCPMO45Code2Wav(nn.Module):
             "max_graph_batch": max_graph_batch,
             "micro_batch_size": micro_batch_size,
             "pad_max_rows": extra.get("whole_euler_pad_max_rows"),
-            # Default on for CUDA and NPU. CUDA uses tiled TF32 attention on
-            # SM80+ and SDPA otherwise, so it respects the TF32 opt-out; NPU
-            # uses packed QKV, in-place KV and ACLNN AddLayerNorm, independent
-            # of TF32. An explicit ``cfm_fused_body`` overrides either default.
+            # CUDA FP32 fusion respects the TF32 opt-out. CUDA/ROCm FP16 CFM
+            # and NPU fusion do not depend on TF32. An explicit
+            # ``cfm_fused_body`` overrides these defaults.
             "fused_body": read_bool_flag(
                 extra,
                 "cfm_fused_body",
-                (current_omni_platform.is_cuda() and self._tf32_mode != "off") or current_omni_platform.is_npu(),
+                (current_omni_platform.is_cuda() and self._tf32_mode != "off")
+                or (
+                    (current_omni_platform.is_cuda() or current_omni_platform.is_rocm())
+                    and (
+                        read_bool_flag(extra, "token2wav_float16", False) or read_bool_flag(extra, "cfm_float16", False)
+                    )
+                )
+                or current_omni_platform.is_npu(),
             ),
             "slot_pool": read_bool_flag(extra, "cfm_slot_pool", False),
             "row_offset_merge": read_bool_flag(extra, "cfm_row_offset_merge", False),
@@ -535,6 +560,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be 0 or >= code2wav_min_batch_size")
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
+        self._default_prompt_missing = False
         self._default_prompt_normalized: tuple[str, str] | None = None
         self._onset_merge = read_bool_flag(extra, "cfm_onset_merge", False)
         self._cross_turn_buckets = read_bool_flag(extra, "cfm_cross_turn_buckets", False)
@@ -600,13 +626,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         return self._default_prompt_normalized
 
     def _extra_config(self) -> dict[str, Any]:
-        model_config = getattr(self.vllm_config, "model_config", None)
-        connector = getattr(model_config, "stage_connector_config", None)
-        if isinstance(connector, Mapping):
-            extra = connector.get("extra", connector)
-        else:
-            extra = getattr(connector, "extra", None)
-        return dict(extra) if isinstance(extra, Mapping) else {}
+        result = stage_connector_extra(self.vllm_config)
+        if os.getenv("MINICPMO_CODE2WAV_SECONDARY_TIGHT_MEMORY") == "1" and os.getenv("VLLM_OMNI_REPLICA_ID") == "1":
+            result["token2wav_setup_cache_size"] = 2
+            result["token2wav_setup_host_cache_size"] = 64
+            result["micro_batch_size"] = int(result.get("secondary_vocoder_micro_batch_size", 2))
+        return result
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device, dtype=torch.float32)
@@ -695,9 +720,17 @@ class MiniCPMO45Code2Wav(nn.Module):
             return entry.cache_id, entry.path, cache_key
 
         default_wav, default_cache_id = self._normalized_default_prompt()
+        meta_prompt_wav = _scalar(meta.get("prompt_wav"))
+        meta_prompt_cache_id = _scalar(meta.get("prompt_cache_id"))
+        if getattr(self, "_default_prompt_missing", False) and meta_prompt_wav is None and meta_prompt_cache_id is None:
+            raise _batch_error(
+                "missing_ref_audio",
+                request_id=state_id,
+                prompt_wav=default_wav,
+            )
         return (
-            str(_scalar(meta.get("prompt_cache_id"), default_cache_id)),
-            str(_scalar(meta.get("prompt_wav"), default_wav)),
+            str(default_cache_id if meta_prompt_cache_id is None else meta_prompt_cache_id),
+            str(default_wav if meta_prompt_wav is None else meta_prompt_wav),
             None,
         )
 
@@ -896,6 +929,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             tts_is_last_chunk=tts_is_last_chunk,
             segment_end=bool(_scalar(meta.get("segment_end"), False)),
             turn_end=bool(_scalar(meta.get("turn_end"), False)),
+            text_without_audio=bool(_scalar(meta.get(TEXT_WITHOUT_AUDIO_KEY), False)),
         )
 
     @staticmethod
@@ -1591,6 +1625,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "meta.duplex_audio_chunk_seq": [torch.tensor(item.chunk_seq, dtype=torch.int64) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
                 "meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],
+                f"meta.{TEXT_WITHOUT_AUDIO_KEY}": [
+                    torch.tensor(item.text_without_audio, dtype=torch.bool) for item in items
+                ],
             },
         )
 
@@ -1607,8 +1644,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         By default only validates and enqueues; :meth:`run_idle_prefetch` does
         the work (plus setup with ``token2wav_ref_prefetch_setup``). Optional
         CPU workers materialize and pin references within the same pin budget.
-        A bad payload is logged and skipped, never raised. The V1 GPU, MRv2
-        GPU and NPU generation runners call this hook and
+        A bad payload is logged and skipped, never raised. The MRv2 GPU
+        and NPU generation runners call this hook and
         :meth:`run_idle_prefetch`; runners without these optional hooks prepare
         the reference inline at chunk 0.
         """
@@ -1824,7 +1861,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         # that package's hard-coded `.cuda()` calls, and auto-applies the
         # Ascend fixes (HiFT linear downsample, DiT mask expand, MATH SDPA)
         # on NPU.
-        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+        from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
             MiniCPMO45Token2wav as Token2wav,
         )
         from vllm_omni.platforms import current_omni_platform
@@ -1835,8 +1872,15 @@ class MiniCPMO45Code2Wav(nn.Module):
         # paths and must not trigger a hub download (#5442).
         self.model_path = _resolve_model_dir(self.model_path, self._model_revision)
         prompt_path = Path(self._default_prompt_wav)
-        if not prompt_path.is_file():
-            raise FileNotFoundError(f"MiniCPM-o Code2Wav prompt audio not found: {prompt_path}")
+        self._default_prompt_missing = not prompt_path.is_file()
+        if self._default_prompt_missing:
+            if self._prompt_wav_override is not None:
+                raise FileNotFoundError(f"MiniCPM-o Code2Wav prompt audio not found: {prompt_path}")
+            logger.warning(
+                "MiniCPM-o Code2Wav: bundled default prompt audio not found at %s; "
+                "sessions must provide per-request ref_audio",
+                prompt_path,
+            )
         token2wav_path = Path(self.model_path) / "assets" / "token2wav"
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
@@ -1960,6 +2004,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         if read_bool_flag(extra, "token2wav_s3_cuda_graph", False):
             if token2wav.enable_s3_cuda_graph(self.vllm_config):
                 logger.info("MiniCPM-o Code2Wav: exact-shape S3 CUDA graphs enabled")
+        if int(extra.get("token2wav_setup_host_cache_size", 0)):
+            logger.info(
+                "Code2Wav reference cache: host=%d device=%d replica=%s",
+                int(extra["token2wav_setup_host_cache_size"]),
+                self._setup_cache_size,
+                os.getenv("VLLM_OMNI_REPLICA_ID", "0"),
+            )
         self.backend = BatchedToken2Wav(
             token2wav,
             trt_stepper=trt_stepper,
@@ -1969,6 +2020,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             chunk_encoder_graph_config=self._chunk_encoder_graph_config,
             bfloat16_attention_cache=read_bool_flag(extra, "code2wav_bfloat16_attention_cache", False),
             setup_cache_size=self._setup_cache_size,
+            setup_host_cache_size=int(extra.get("token2wav_setup_host_cache_size", 0)),
             cfm_tf32=tf32_mode != "off",
             encoder_graph_config=self._encoder_graph_config,
             cfm_float16=read_bool_flag(extra, "cfm_float16", False),
@@ -1994,12 +2046,9 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         ``OmniGPUWorkerBase.compile_or_warm_up_model`` calls this right after the
         runner's own init work, i.e. weights loaded, profiling done, nothing
-        served yet. Runners that capture their own graphs (CUDA V1) already run a
-        dummy forward at that point, which fires the deferred sweep first and
-        leaves this a no-op; runners that do not (MRv2, NPU) would otherwise
-        defer the sweep to the first real request, where a C8 duplex replay
-        stalls every in-flight stream for ~1-2 s per graph while its first-wave
-        sessions time out.
+        served yet. If a dummy forward already fired the deferred sweep, this
+        is a no-op. Otherwise, warmup avoids deferring the sweep to the first
+        real request, which would stall every in-flight stream during capture.
 
         Capturing here rather than in ``load_weights`` also keeps the allocator
         layout the runner already uses: a sweep at weight-load time raises the
@@ -2007,11 +2056,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         at concurrency 8.
 
         ``cfm_graph_precapture_at_init`` can turn it off. It stays on by default
-        because this is where CUDA V1 already swept: the runner's own warmup has
-        run by now, so the capture reuses the allocator it warmed instead of
+        because the runner's own warmup has run by now, so capture reuses the
+        allocator it warmed instead of
         raising the reserved footprint the way a weight-load-time sweep does.
         """
-        if self._extra_config().get("cfm_graph_precapture_after_load") is not None:
+        if stage_connector_extra(self.vllm_config).get("cfm_graph_precapture_after_load") is not None:
             logger.warning_once(
                 "MiniCPM-o Code2Wav: cfm_graph_precapture_after_load is ignored; "
                 "the startup sweep is controlled by cfm_graph_precapture_at_init"
@@ -2027,7 +2076,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         runners without a warmup forward (Model Runner V2, Ascend) paid for the
         capture on their first real request. Only an explicit ``false`` opts out.
         """
-        return read_bool_flag(self._extra_config(), "cfm_graph_precapture_at_init", True)
+        return read_bool_flag(stage_connector_extra(self.vllm_config), "cfm_graph_precapture_at_init", True)
 
     def _precapture_before_serve(self) -> None:
         """Run the precapture sweep once, under the context ``forward`` uses.
@@ -2116,6 +2165,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     for attr in (
                         "_encoder_graphs",
                         "_chunk_encoder_graph",
+                        "_tail_encoder_graph",
                         "hift_graph_wrapper",
                         "_cfm_graph_wrapper",
                         "_whole_euler_graph_wrapper",
@@ -2130,6 +2180,11 @@ class MiniCPMO45Code2Wav(nn.Module):
             return True
 
         precapture("HiFT", backend.precapture_hift)
+        if getattr(self, "_default_prompt_missing", False):
+            logger.info(
+                "MiniCPM-o Code2Wav: no bundled default prompt audio; skipping default-voice graph precapture",
+            )
+            return
         prompt_wav, prompt_cache_id = self._normalized_default_prompt()
         try:
             features = backend.prepare_prompt(prompt_cache_id, prompt_wav)
