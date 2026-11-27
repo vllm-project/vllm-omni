@@ -4,10 +4,13 @@
 """Polyphase convolution for the BigVGAN stage upsamplers (PR #8813)."""
 
 import types
+from functools import partial
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+BIGVGAN_MIN_POLYPHASE_LATENT_FRAMES = 128
 
 
 def _conv_transpose1d_as_conv1d(
@@ -32,21 +35,25 @@ def _conv_transpose1d_as_conv1d(
     return out if bias is None else out + bias.reshape(1, -1, 1)
 
 
-def _stage_forward(self: nn.ConvTranspose1d, x: torch.Tensor, output_size: list[int] | None = None) -> torch.Tensor:
-    """Run the phase-decomposed convolution for batched FP32 NPU inference."""
+def _stage_forward(
+    self: nn.ConvTranspose1d,
+    x: torch.Tensor,
+    output_size: list[int] | None = None,
+    *,
+    min_input_samples: int,
+) -> torch.Tensor:
+    """Use the phase path only for the validated long FP32 NPU inference regime."""
     if (
         x.device.type == "npu"
         and x.dtype == torch.float32
         and x.ndim == 3
+        and x.shape[-1] >= min_input_samples
+        and x.numel()
         and not self.training
         and output_size is None
     ):
         weight = self.weight
-        if (
-            weight.dtype == x.dtype
-            and x.numel()
-            and (x.shape[-1] - 1) * self.stride[0] + weight.shape[-1] > 2 * self.padding[0]
-        ):
+        if weight.dtype == x.dtype:
             output = _conv_transpose1d_as_conv1d(x, weight, self.bias, self.stride[0], self.padding[0])
             self._h3_stage_polyphase_calls = getattr(self, "_h3_stage_polyphase_calls", 0) + 1
             return output
@@ -54,18 +61,32 @@ def _stage_forward(self: nn.ConvTranspose1d, x: torch.Tensor, output_size: list[
 
 
 def install_bigvgan_upsamplers(decoder: nn.Module) -> int:
-    """Replace only the stage upsamplers, not the FIR resamplers in AMP blocks."""
+    """Wrap stage convolutions, mapping the latent threshold into each stage's input length."""
     installed = 0
+    min_input_samples = BIGVGAN_MIN_POLYPHASE_LATENT_FRAMES
     for stage in getattr(decoder, "ups", ()):
         for layer in stage:
+            if not isinstance(layer, nn.ConvTranspose1d):
+                continue
+            stride, padding, kernel, dilation, output_padding = (
+                layer.stride[0],
+                layer.padding[0],
+                layer.kernel_size[0],
+                layer.dilation[0],
+                layer.output_padding[0],
+            )
+            min_output_samples = (
+                (min_input_samples - 1) * stride - 2 * padding + dilation * (kernel - 1) + output_padding + 1
+            )
             if (
-                isinstance(layer, nn.ConvTranspose1d)
-                and not hasattr(layer, "_h3_stage_original_forward")
+                not hasattr(layer, "_h3_stage_original_forward")
                 and layer.groups == 1
-                and layer.dilation == (1,)
-                and layer.output_padding == (0,)
+                and dilation == 1
+                and output_padding == 0
+                and min_output_samples > 0
             ):
                 layer._h3_stage_original_forward = layer.forward
-                layer.forward = types.MethodType(_stage_forward, layer)
+                layer.forward = types.MethodType(partial(_stage_forward, min_input_samples=min_input_samples), layer)
                 installed += 1
+            min_input_samples = min_output_samples
     return installed

@@ -43,7 +43,9 @@ can change generated pixels. Enable it with `additional_config.lightvae_decoder_
 MiniMax-H3 uses the checkpoint's reference audio decoder by default. On Ascend
 910B4, opt in with `--additional-config '{"audio_vae_optimized_decode":true}'`.
 This replaces eligible FP32 decoder FIR and BigVGAN upsampling convolutions;
-other devices and ineligible calls use the reference implementation. Set the
+other devices and ineligible calls use the reference implementation. BigVGAN
+stage upsampling keeps the original convolution below 128 input latent
+frames (about 3.2 seconds at the native 40 Hz audio latent rate). Set the
 option to `false` or omit it to restore the original decoder. Audio encoding,
 video generation, and the output sample rate are unchanged. The optimized
 waveform is not guaranteed to be bit-identical to the reference.

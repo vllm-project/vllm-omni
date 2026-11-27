@@ -67,7 +67,11 @@ def _measure(model, waveform_path: Path, output: Path, warmups: int, repeats: in
     fir_modules = [m for m, _, _ in fir]
     stage_modules = [m for m, _, _ in stages]
     arms = [("off", False, False)]
+    stages_eligible = False
     if optimized:
+        from vllm_omni.diffusion.models.minimax_h3.npu.audio_tconv import BIGVGAN_MIN_POLYPHASE_LATENT_FRAMES
+
+        stages_eligible = frames >= BIGVGAN_MIN_POLYPHASE_LATENT_FRAMES
         arms += [("fir", True, False), ("stage", False, True), ("both", True, True)]
     results = {name: [] for name, _, _ in arms}
     for index in range(warmups + repeats):
@@ -85,7 +89,8 @@ def _measure(model, waveform_path: Path, output: Path, warmups: int, repeats: in
             elapsed = time.perf_counter() - start
             fir_calls = _counter(fir_modules, "_h3_fir_c16_calls") - fir_before
             stage_calls = _counter(stage_modules, "_h3_stage_polyphase_calls") - stage_before
-            if bool(fir_calls) != use_fir or bool(stage_calls) != use_stage:
+            expected_stage_calls = len(stages) if use_stage and stages_eligible else 0
+            if bool(fir_calls) != use_fir or stage_calls != expected_stage_calls:
                 raise RuntimeError(f"{name}: unexpected FIR/stage execution counts: {fir_calls}/{stage_calls}")
             sample = {
                 "kind": "warmup" if index < warmups else "measurement",
