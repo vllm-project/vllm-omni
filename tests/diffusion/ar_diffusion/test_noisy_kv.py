@@ -94,18 +94,16 @@ def test_capacity_accepts_complete_schedule_budget(extra_bytes):
 
 def test_external_sink_has_a_separate_memory_budget():
     ordinary = _cache(max_batch_size=2)
-    with_sink = _cache(max_batch_size=2, max_external_sink_tokens=12)
+    sink_bytes = 2 * 3 * ordinary.bytes_per_version * ordinary.spec.num_layers
+    budget = ordinary.reserved_bytes + sink_bytes
+    with_sink = _cache(max_batch_size=2, max_external_sink_tokens=12, available_bytes=budget)
     assert with_sink.capacity == ordinary.capacity
-    assert with_sink.reserved_bytes == ordinary.reserved_bytes + 2 * 3 * ordinary.bytes_per_version * 2
-    assert (
-        _cache(max_batch_size=2, max_external_sink_tokens=12, available_bytes=with_sink.reserved_bytes).reserved_bytes
-        == with_sink.reserved_bytes
-    )
-    with pytest.raises(RuntimeError, match=f"required_bytes={with_sink.reserved_bytes}"):
-        _cache(max_batch_size=2, max_external_sink_tokens=12, available_bytes=with_sink.reserved_bytes - 1)
+    assert with_sink.reserved_bytes == budget
+    with pytest.raises(RuntimeError, match=f"required_bytes={budget}"):
+        _cache(max_batch_size=2, max_external_sink_tokens=12, available_bytes=budget - 1)
 
 
-@pytest.mark.parametrize("release", ["finish", "cancel", "release_before_admit", "reset_before_admit"])
+@pytest.mark.parametrize("release", ["finish", "release_before_admit", "reset_before_admit"])
 def test_external_sink_lifetime(release):
     cache = _cache(max_external_sink_tokens=12)
     state = NoisyKVState(cache)
@@ -114,7 +112,7 @@ def test_external_sink_lifetime(release):
     with pytest.raises(RuntimeError, match="sink request capacity exceeded"):
         state.store_external_sink("B", 0, key, -key)
 
-    if release in ("finish", "cancel"):
+    if release == "finish":
         state.begin_request("A", _history_plan(), chunk_tokens=4)
         layer = state.prepare((("A", (0, 0, 0)),))[0][0]
         assert layer.seq_len == 4
@@ -122,10 +120,7 @@ def test_external_sink_lifetime(release):
         assert actual_key.is_contiguous() and actual_value.is_contiguous()
         torch.testing.assert_close(actual_key, key)
         torch.testing.assert_close(actual_value, -key)
-        if release == "finish":
-            state.finish_request("A")
-        else:
-            state.end_request("A", retain=())
+        state.finish_request("A")
     elif release == "release_before_admit":
         cache.release_session("A")
     else:

@@ -397,6 +397,8 @@ def _sink_pipeline_worker(
             assert len(adapter.completed) == chunks
             for chunk, value in adapter.completed.items():
                 torch.testing.assert_close(value, torch.tensor([latent[chunk]], device=device), rtol=1e-5, atol=1e-5)
+        if standalone:
+            _check_physis_sink_distribution(rank, pp)
         pp.destroy()
         torch.distributed.destroy_process_group()
     finally:
@@ -428,7 +430,7 @@ def test_same_step_fixed_shape_activation_pipeline_matches_serial(steps, groups,
     )
 
 
-def test_causvid_standalone_sink_distributed_pipeline_matches_serial():
+def test_standalone_same_step_sinks_across_layer_groups():
     torch.multiprocessing.spawn(
         _sink_pipeline_worker,
         args=(2, 2, 4, f"tcp://127.0.0.1:{get_open_port()}", 1, True, "cpu", True),
@@ -437,9 +439,8 @@ def test_causvid_standalone_sink_distributed_pipeline_matches_serial():
     )
 
 
-class _PhysisSinkTransformer(torch.nn.Module):
+class _PhysisSinkTransformer:
     def __init__(self, group: int):
-        super().__init__()
         self.start_layer = 2 * group
         self.end_layer = self.start_layer + 2
         self.capture_sink: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None
@@ -461,14 +462,10 @@ class _PhysisSinkTransformer(torch.nn.Module):
         return hidden + 1
 
 
-def _physis_sink_worker(rank, init_method):
+def _check_physis_sink_distribution(rank, pp):
     from vllm_omni.diffusion.models.physis.wan.pipeline_physis_wan import PhysisWanPipeline
 
     world, groups = 4, 2
-    torch.distributed.init_process_group(
-        backend="gloo", init_method=init_method, rank=rank, world_size=world, timeout=timedelta(seconds=90)
-    )
-    pp = GroupCoordinator([list(range(world))], local_rank=rank, torch_distributed_backend="gloo")
     pipeline = PhysisWanPipeline.__new__(PhysisWanPipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.pp_rank, pipeline.step_replicas, pipeline.layer_groups = rank, world // groups, groups
@@ -512,9 +509,3 @@ def _physis_sink_worker(rank, init_method):
         torch.testing.assert_close(key, expected)
         torch.testing.assert_close(value, -expected)
     state.finish_request("A")
-    pp.destroy()
-    torch.distributed.destroy_process_group()
-
-
-def test_physis_last_step_replica_produces_and_distributes_raw_sink():
-    torch.multiprocessing.spawn(_physis_sink_worker, args=(f"tcp://127.0.0.1:{get_open_port()}",), nprocs=4, join=True)
