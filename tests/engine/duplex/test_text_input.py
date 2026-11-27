@@ -17,12 +17,14 @@ from tests.engine.duplex.test_minicpmo_window_plugin import _stub_tokenizer
 from tests.engine.duplex.test_session_runner import (
     append_audio,
     close_harness,
+    find,
     listen_output,
     open_harness,
     stage_stats,
     tts_output,
     types,
 )
+from tests.engine.duplex.test_session_runner import reference_audio_uri as reference_audio_uri
 from tests.engine.duplex.test_session_runner_minicpmo_thinker_only import (
     CHUNK_EOS,
     SPEAK,
@@ -99,6 +101,70 @@ def _text_output(request_id: str, *, empty: bool = False):
     output.multimodal_output.update(duplex_text_input=torch.tensor(True))
     output.multimodal_output["meta.chunk_eos_token_id"] = 151718
     return output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("later_audio", ["uncommitted", "kept", "deleted"])
+async def test_barge_in_replays_native_text(later_audio, reference_audio_uri) -> None:  # noqa: F811
+    h = await open_harness(stage_count=3, modalities=("text", "audio"), extra_body={"ref_audio": reference_audio_uri})
+    try:
+        h.session.config.playback_commit_policy = "ack_only"
+
+        async def complete(text: str, samples: int) -> None:
+            turn = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["turn_id"]
+            done = await h.deliver_and_settle(
+                tts_output(
+                    h.stage0_request_id(),
+                    samples=samples,
+                    text=text,
+                    tts_is_last_chunk=True,
+                    turn_end=True,
+                    turn_id=turn,
+                ),
+                stage_id=2,
+            )
+            find(done, "response.output_audio.delta")
+            response = find(done, "response.done")
+            assert response.status == "completed"
+            ack = await h.run(commands.AckPlayback(response_id=response.response_id, played_ms=1000))
+            assert not any(event.type == "error" for event in ack), ack
+            assert find(ack, "playback.acknowledged").details["history_committed"]
+
+        await h.run(append_audio())
+        find(await h.run(commands.Commit(create_response=False)), "input_audio_buffer.committed")
+        await complete("audio answer", 24000)
+        events = await h.run(commands.AppendText(text="native text"))
+        assert not any(event.type == "error" for event in events)
+        turn = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["turn_id"]
+        await h.deliver_and_settle(_text_output(h.stage0_request_id()), stage_id=0, model_turn_id=turn)
+        await complete("text answer", 48000)
+        assert h.session.input_commit_seq == 1
+
+        await h.run(append_audio(value=0.10))
+        later_item = None
+        if later_audio != "uncommitted":
+            later_item = find(await h.run(commands.Commit(create_response=False)), "input_audio_buffer.committed")
+        turn = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["turn_id"]
+        await h.deliver_and_settle(
+            tts_output(h.stage0_request_id(), samples=72000, text="interrupted", turn_id=turn), stage_id=2
+        )
+        assert find(await h.run(commands.BargeIn()), "response.done").status == "cancelled"
+        if later_audio == "deleted":
+            assert later_item is not None
+            find(await h.run(commands.DeleteItem(item_id=later_item.item_id)), "conversation.item.deleted")
+        await h.run(append_audio(value=0.15))
+
+        replacement = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert (replacement["epoch"], replacement["seq"]) == (1, 1)
+        turns = replacement.get(plugin_module.REPLAY_CONTEXT_KEY, [])
+        assert [turn["response_token_ids"] for turn in turns] == [
+            list(map(ord, "audio answer")),
+            list(map(ord, "text answer")),
+            *([[]] if later_audio == "kept" else []),
+        ]
+        assert turns[1]["inputs"] == [{"text_token_ids": list(map(ord, "native text"))}]
+    finally:
+        await close_harness(h)
 
 
 @pytest.mark.asyncio

@@ -18,11 +18,12 @@ import json
 import math
 from base64 import b64decode
 from binascii import Error as BinasciiError
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from hashlib import sha256
+from itertools import groupby
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -89,12 +90,15 @@ _REPLAY_MAX_TOKENS = 2048
 @dataclass(frozen=True, slots=True)
 class _ReplayInput:
     turn_id: int
-    input_commit_seq: int
+    input_commit_seq: int | None
     payload: dict[str, object]
     num_bytes: int
     token_budget: int
     user_media: bool
     preceding_closure: bool
+
+    def retained_by(self, commits: Collection[int]) -> bool:
+        return self.input_commit_seq is None or self.input_commit_seq in commits
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +129,7 @@ class MiniCPMO45ServingSessionState(DefaultDuplexModelSessionState):
     replay_overflow_turn: int | None = None
     replay_commits: dict[int, _ReplaySource] = field(default_factory=dict)
     replay_completed: list[_ReplayTurn] = field(default_factory=list)
-    has_committed_history: bool = False
+    has_replay_history: bool = False
     checkpoint_eligible: bool = True
 
 
@@ -842,7 +846,12 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         return tuple(configured)
 
     def observe_submitted_append(
-        self, *, state: DuplexModelSessionState, fence: DuplexFence, prompt: Mapping[str, object], input_commit_seq: int
+        self,
+        *,
+        state: DuplexModelSessionState,
+        fence: DuplexFence,
+        prompt: Mapping[str, object],
+        input_commit_seq: int | None,
     ) -> None:
         # The native media/text replay does not cover delegated tool results.
         if self.plugin_id != MiniCPMO45DuplexPlugin.plugin_id:
@@ -869,6 +878,8 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         text_ids = media.get("text_token_ids")
         if not frames and not audio and not text_ids:
             return
+        if input_commit_seq is None:
+            state.has_replay_history = True
         num_bytes = (len(audio) if isinstance(audio, str) else 0) + sum(map(len, frames))
         if isinstance(text_ids, list):
             num_bytes += len(text_ids) * 8
@@ -912,7 +923,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             state.replay_commits = {seq: source for seq, source in state.replay_commits.items() if seq in pending_seqs}
             source = _ReplaySource(item_id, source_id)
             state.replay_commits[input_commit_seq] = source
-            state.has_committed_history = True
+            state.has_replay_history = True
             for index, turn in enumerate(state.replay_completed):
                 if turn.epoch == fence.epoch and any(
                     unit.user_media and unit.input_commit_seq == input_commit_seq for unit in turn.inputs
@@ -921,14 +932,14 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
 
     def observe_input_clear(self, *, state: DuplexModelSessionState) -> None:
         assert isinstance(state, MiniCPMO45ServingSessionState)
-        state.replay_pending = [unit for unit in state.replay_pending if unit.input_commit_seq in state.replay_commits]
+        state.replay_pending = [unit for unit in state.replay_pending if unit.retained_by(state.replay_commits)]
         state.replay_completed = [
             replace(
                 turn,
-                inputs=[unit for unit in turn.inputs if not unit.user_media or unit.input_commit_seq in turn.sources],
+                inputs=[unit for unit in turn.inputs if not unit.user_media or unit.retained_by(turn.sources)],
             )
             for turn in state.replay_completed
-            if turn.sources
+            if turn.sources or any(unit.input_commit_seq is None for unit in turn.inputs)
         ]
         state.checkpoint_eligible = False
 
@@ -955,12 +966,10 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
                     inputs = turn.inputs + inputs
                     commits = {**commits, **turn.sources}
                     break
-            groups: dict[int, list[_ReplayInput]] = {}
-            for unit in inputs:
-                if unit.user_media and unit.input_commit_seq in commits:
-                    groups.setdefault(unit.input_commit_seq, []).append(unit)
+            retained = (unit for unit in inputs if unit.user_media and unit.retained_by(commits))
             state.replay_completed.extend(
-                _ReplayTurn(None, group, fence.epoch, {seq: commits[seq]}) for seq, group in groups.items()
+                _ReplayTurn(None, list(group), fence.epoch, {} if seq is None else {seq: commits[seq]})
+                for seq, group in groupby(retained, key=lambda unit: unit.input_commit_seq)
             )
         elif (
             item_id is not None
@@ -984,7 +993,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         self, config: dict[str, object], *, state: DuplexModelSessionState, payload: dict[str, object]
     ) -> dict[str, object]:
         assert isinstance(state, MiniCPMO45ServingSessionState)
-        if state.has_committed_history:
+        if state.has_replay_history:
             return {
                 **config,
                 REPLAY_CONTEXT_KEY: state.replay_completed.copy(),
@@ -1041,15 +1050,13 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             current_seqs = {
                 seq for seq, source in turn.sources.items() if self._source_is_current(source, messages, sources)
             }
-            if not current_seqs:
-                continue
             text = self._assistant_text(messages, turn.item_id) if turn.item_id is not None else None
             user_only = text is None
             inputs = [
-                unit
-                for unit in turn.inputs
-                if (unit.input_commit_seq in current_seqs if unit.user_media else not user_only)
+                unit for unit in turn.inputs if (unit.retained_by(current_seqs) if unit.user_media else not user_only)
             ]
+            if not any(unit.user_media for unit in inputs):
+                continue
             if user_only:
                 token_ids: list[int] = []
                 delimiters = 0 if inputs[0].preceding_closure else 2

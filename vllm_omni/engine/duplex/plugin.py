@@ -764,7 +764,12 @@ class DuplexModelPlugin(ABC):
         """Commit model-owned context after the stage accepts a fenced append."""
 
     def observe_submitted_append(
-        self, *, state: DuplexModelSessionState, fence: DuplexFence, prompt: Mapping[str, object], input_commit_seq: int
+        self,
+        *,
+        state: DuplexModelSessionState,
+        fence: DuplexFence,
+        prompt: Mapping[str, object],
+        input_commit_seq: int | None,
     ) -> None:
         """Observe an accepted model input on the session owner."""
 

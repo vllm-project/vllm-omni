@@ -1304,7 +1304,7 @@ async def test_clear_keeps_only_committed_replay_history(committed: bool) -> Non
 
         assert "input_audio_buffer.committed" in types(events)
         assert state.replay_completed == ([old_turn] if committed else [])
-        assert state.has_committed_history
+        assert state.has_replay_history
     finally:
         await close_harness(h)
 
