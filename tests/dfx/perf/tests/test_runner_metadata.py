@@ -849,6 +849,49 @@ def test_num_warmups_preserves_explicit_zero():
     assert _resolve_num_warmups({"num_warmups": 0}, default=4) == 0
 
 
+def test_voxtral_perf_replays_c1_readiness_after_nightly_split(monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
+
+    config_path = Path(__file__).with_name("test_tts.json")
+    config = next(
+        case for case in json.loads(config_path.read_text(encoding="utf-8")) if case["test_name"] == "test_voxtral_tts"
+    )
+    phases = {
+        params["eval_phase"]: params
+        for params in config["benchmark_params"]
+        if params["eval_phase"] in {"throughput", "stress"}
+    }
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {"completed": kwargs["num_prompt"]}
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "MI300")
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
+
+    for phase in ("throughput", "stress"):
+        run_benchmark.test_performance_benchmark(
+            ServerEndpoint(model=config["server_params"]["model"]),
+            {"test_name": config["test_name"], "params": phases[phase]},
+            pytestconfig=PytestOptions(assert_baseline=False),
+        )
+
+    assert len(calls) == 2
+    for call, expected_warmups in zip(calls, (8, 2), strict=True):
+        parser = TrackingArgumentParser()
+        OmniBenchmarkServingSubcommand.add_cli_args(parser)
+        args = parser.parse_args(call["args"])
+        assert args.ready_check_timeout_sec == 600
+        assert call["num_warmups"] == expected_warmups
+
+
 @pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
 def test_qwen3_duplex_c8_measures_and_judges_distinct_samples(monkeypatch, dataset, pytestconfig):
     from dataclasses import dataclass

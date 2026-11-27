@@ -73,6 +73,9 @@ class _ProcessWorkerRuntime:
         self.engine = self.runtime.engine
         assert isinstance(self.engine, DuplexOmniEngine)
         self.process_warmup_audio = warmup_silence_unit(self.engine.plugin)
+        factory = getattr(self.engine.plugin, "startup_warmup_turn", None)
+        turn = factory() if callable(factory) else None
+        self.process_warmup_turn = turn if isinstance(turn, dict) else {}
 
     async def check_health(self) -> None:
         await self.runtime.check_health()

@@ -252,6 +252,9 @@ class CEOverlapUlysses:
 
 
 _RUNNERS: dict[tuple, CEOverlapUlysses] = {}
+# Whether the overlap is bit-identical to the standard exchange, per (group, attention kernel, shape, dtype, chunks).
+# Shared by every layer; all ranks run the layers in the same order, so they fill it identically.
+VERDICTS: dict[tuple, bool] = {}
 
 
 def run_ulysses_ce_overlap(pg, query, key, value, attn_fn, *, chunks: int) -> torch.Tensor:
@@ -269,6 +272,7 @@ def run_ulysses_ce_overlap(pg, query, key, value, attn_fn, *, chunks: int) -> to
 def clear_ulysses_ce_overlap_runners() -> None:
     """Release the runners' symmetric-memory workspaces during worker shutdown (called by
     ``a2a_permute.clear_a2a_permute_workspaces``)."""
+    VERDICTS.clear()
     if not _RUNNERS:
         return
     for device in {runner.device for runner in _RUNNERS.values()}:
