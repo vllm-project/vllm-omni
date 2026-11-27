@@ -807,7 +807,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             assert isinstance(self.connector, SharedMemoryConnector)
             key_prefix, num_puts = task["cleanup_shm"]
             for chunk_id in range(num_puts):
-                self.connector.cleanup(f"{key_prefix}_{chunk_id}")
+                self.connector.cleanup_tracked(f"{key_prefix}_{chunk_id}")
             return
         if "release_shm" in task:
             self._release_shm_prefix(task["release_shm"])

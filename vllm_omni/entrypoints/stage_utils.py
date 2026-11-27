@@ -220,8 +220,8 @@ def shm_write_bytes(payload: bytes | bytearray | memoryview, name: str | None = 
     return meta
 
 
-def shm_read_bytes(meta: dict[str, Any]) -> bytes:
-    """Read and unlink shared memory; an omitted size reads the full segment."""
+def shm_read_bytes(meta: dict[str, Any], *, require_unlink: bool = False) -> bytes:
+    """Read the segment and try to unlink it. Strict callers retry if unlink fails."""
     shm = _shm.SharedMemory(name=meta["name"])  # type: ignore[index]
     mv = memoryview(shm.buf)
     data = bytes(mv[: meta.get("size", shm.size)])
@@ -232,8 +232,11 @@ def shm_read_bytes(meta: dict[str, Any]) -> bytes:
         pass
     try:
         shm.unlink()
-    except Exception:
+    except FileNotFoundError:
         pass
+    except Exception:
+        if require_unlink:
+            raise
     return data
 
 

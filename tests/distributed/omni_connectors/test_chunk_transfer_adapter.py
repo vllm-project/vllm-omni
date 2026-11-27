@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import fcntl
+import os
 import threading
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -125,6 +128,64 @@ def test_shm_release_reclaims_undrained_chunks_after_finish(shm_sender):
     assert not any(k.startswith(f"{ext_id}_0_") for k in connector._pending_keys)
     assert connector.get("0", "1", f"{ext_id}_0_1") is None
     assert connector.get("0", "1", sibling_key)[0] == "sibling"
+
+
+@pytest.mark.parametrize("publish_replacement", [False, True], ids=["old-segment", "replacement"])
+@pytest.mark.parametrize("abort", [False, True], ids=["finish", "abort"])
+def test_shm_release_while_another_sender_holds_the_key(shm_sender, monkeypatch, publish_replacement, abort):
+    adapter, sender = shm_sender
+    ext_id = f"release_busy_{uuid.uuid4().hex}"
+    key = f"{ext_id}_0_0"
+    assert sender.put("0", "1", key, "old")[0]
+
+    next_sender = SharedMemoryConnector({})
+    writing, release_attempted = threading.Event(), threading.Event()
+    write_bytes = next_sender._write_bytes
+    flock = fcntl.flock
+
+    def hold_write(payload, name):
+        writing.set()
+        assert release_attempted.wait(timeout=5)
+        if not publish_replacement:
+            raise OSError("write failed before replacing the old segment")
+        return write_bytes(payload, name)
+
+    def observe_release(file, operation):
+        if operation & fcntl.LOCK_NB:
+            # Let a nonblocking attempt observe the busy lock before waking the writer.
+            try:
+                return flock(file, operation)
+            finally:
+                release_attempted.set()
+        release_attempted.set()
+        return flock(file, operation)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            monkeypatch.setattr(next_sender, "_write_bytes", hold_write)
+            writer = executor.submit(next_sender.put, "0", "1", key, "replacement")
+            try:
+                assert writing.wait(timeout=5)
+                monkeypatch.setattr(fcntl, "flock", observe_release)
+                if abort:
+                    adapter._send_single_request({"cleanup_shm": (f"{ext_id}_0", 1)})
+                else:
+                    adapter.release_shm_resources(ext_id)
+                    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+            finally:
+                release_attempted.set()
+            assert writer.result(timeout=5)[0] is publish_replacement
+
+        assert key not in sender._pending_keys
+        if not abort:
+            assert adapter._reclaimed_shm_total == int(not publish_replacement)
+        if publish_replacement:
+            assert next_sender.get("0", "1", key)[0] == "replacement"
+        else:
+            assert not sender._shm_exists(key)
+            assert not os.path.exists(sender._lock_file(key))
+    finally:
+        next_sender.close()
 
 
 @pytest.mark.parametrize("fail_terminal", [False, True])

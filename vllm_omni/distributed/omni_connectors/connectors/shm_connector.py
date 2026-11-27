@@ -11,8 +11,10 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from multiprocessing import shared_memory as shm_pkg
-from typing import Any
+from typing import Any, NamedTuple
 
 from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
 
@@ -21,6 +23,99 @@ from ..utils.serialization import OmniSerde
 from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
+
+_LOCK_PREFIX = "shm_"
+_LOCK_SUFFIX = "_lockfile.lock"
+_STALE_LOCK_GRACE_SECONDS = 60.0
+_next_sweep: dict[str, float] = {}
+_sweep_gate = threading.Lock()
+
+
+class _Publication(NamedTuple):
+    # A distinct record for each successful put, even for backends without a storage identity.
+    segment_identity: object | None
+
+
+def _reset_sweep_after_fork() -> None:
+    global _sweep_gate
+    _sweep_gate = threading.Lock()
+    _next_sweep.clear()
+
+
+os.register_at_fork(after_in_child=_reset_sweep_after_fork)
+
+
+def _current_lock(fd: int, path: str) -> bool:
+    try:
+        return os.path.samestat(os.fstat(fd), os.stat(path, follow_symlinks=False))
+    except FileNotFoundError:
+        return False
+
+
+@contextmanager
+def _publication_lock(path: str, *, blocking: bool = True) -> Iterator[int]:
+    operation = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+    for _ in range(3):
+        with open(path, "a+b") as lock:
+            fcntl.flock(lock, operation)
+            # A consumer may have unlinked this inode while we waited.
+            if _current_lock(lock.fileno(), path):
+                yield lock.fileno()
+                return
+    raise BlockingIOError(f"SHM lock kept changing at {path}")
+
+
+def _unlink_current_lock(fd: int, path: str) -> None:
+    # All callers hold the exclusive lock on fd.
+    try:
+        if _current_lock(fd, path):
+            os.unlink(path)
+    except OSError:
+        pass
+
+
+def _lock_candidate(info: os.stat_result, cutoff: float | None) -> bool:
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_size == 0
+        and info.st_uid == os.geteuid()
+        and (cutoff is None or info.st_mtime <= cutoff)
+    )
+
+
+def _unlink_if_orphan(fd: int, lock: str, segment: str, cutoff: float | None = None) -> None:
+    try:
+        if not _lock_candidate(os.fstat(fd), cutoff):
+            return
+        os.stat(segment, follow_symlinks=False)
+    except FileNotFoundError:
+        _unlink_current_lock(fd, lock)
+    except OSError:
+        pass  # Only definite absence justifies removing the lock.
+
+
+def _sweep_orphan_locks(directory: str) -> None:
+    cutoff = time.time() - _STALE_LOCK_GRACE_SECONDS
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if not (entry.name.startswith(_LOCK_PREFIX) and entry.name.endswith(_LOCK_SUFFIX)):
+                    continue
+                name = entry.name[len(_LOCK_PREFIX) : -len(_LOCK_SUFFIX)]
+                segment = os.path.join(directory, name)
+                try:
+                    if not _lock_candidate(entry.stat(follow_symlinks=False), cutoff) or os.path.lexists(segment):
+                        continue
+                    fd = os.open(entry.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        _unlink_if_orphan(fd, entry.path, segment, cutoff)
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    continue  # Another process may already hold or have removed it.
+    except OSError:
+        pass
 
 
 def _wakeup_enabled() -> bool:
@@ -56,12 +151,23 @@ class SharedMemoryConnector(OmniConnectorBase):
         """
         return os.path.exists(f"{self.shm_directory}/{self._shm_name(key)}")
 
+    def _segment_identity(self, name: str) -> object | None:
+        """Return an identity that changes on replacement, or raise FileNotFoundError if absent.
+
+        Backends with separate storage may override this hook. None disables waiting for a
+        busy lock because this backend cannot distinguish a replacement from the original.
+        """
+        if type(self)._shm_exists is not SharedMemoryConnector._shm_exists:
+            return None
+        info = os.stat(f"{self.shm_directory}/{name}", follow_symlinks=False)
+        return info.st_dev, info.st_ino
+
     def _wakeup_directory(self) -> str:
         # Stage engine processes of one deployment share their launching parent.
         return f"{self.shm_directory}/omni_shm_wake_{os.getuid()}_{os.getppid()}"
 
     def _lock_file(self, name: str) -> str:
-        return f"{self.shm_directory}/shm_{name}_lockfile.lock"
+        return f"{self.shm_directory}/{_LOCK_PREFIX}{name}{_LOCK_SUFFIX}"
 
     def _write_bytes(self, payload: bytes | bytearray | memoryview, name: str) -> dict[str, Any]:
         """Publish payload bytes while the caller holds the segment lock."""
@@ -69,18 +175,13 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def _read_bytes(self, metadata: dict[str, Any]) -> bytes:
         """Read logical payload bytes and unlink under the segment lock."""
-        return shm_read_bytes(metadata)
+        return shm_read_bytes(metadata, require_unlink=True)
 
     def _unlink_segment(self, name: str) -> None:
         """Unlink a segment by its OS name; raise FileNotFoundError if absent."""
         seg = shm_pkg.SharedMemory(name=name)
         seg.close()
         seg.unlink()
-
-    def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
-        if time.monotonic() >= deadline:
-            return None
-        return self.get(from_stage, to_stage, get_key, metadata)
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
@@ -93,7 +194,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             if scope is not None
             else self._wakeup_directory()
         )
-        self._pending_keys: OrderedDict[str, None] = OrderedDict()
+        self._pending_keys: OrderedDict[str, _Publication] = OrderedDict()
         self._pending_keys_lock = threading.Lock()
         self._serde = OmniSerde()
         self._encode_buffer = threading.local()
@@ -113,6 +214,28 @@ class SharedMemoryConnector(OmniConnectorBase):
         self._wake_closed = False
         self._visibility_path: str | None = None
         self._publish_visibility()
+        # A lock name gives us a physical segment name, not a logical key.
+        # A backend with separate storage cannot prove absence by scanning its lock directory.
+        self._orphan_lock_directory = (
+            self.shm_directory
+            if type(self)._shm_exists is SharedMemoryConnector._shm_exists
+            and type(self)._lock_file is SharedMemoryConnector._lock_file
+            else None
+        )
+        self._maybe_sweep_stale_lock_files()
+
+    def _maybe_sweep_stale_lock_files(self) -> None:
+        directory = self._orphan_lock_directory
+        if directory is None:
+            return
+        now = time.monotonic()
+        if now < _next_sweep.get(directory, 0.0):
+            return
+        with _sweep_gate:
+            if now < _next_sweep.get(directory, 0.0):
+                return
+            _next_sweep[directory] = now + _STALE_LOCK_GRACE_SECONDS
+        _sweep_orphan_locks(directory)
 
     def _visibility_directory(self) -> str:
         # Key by deployment, as the wakeup directory does: an unrelated
@@ -305,6 +428,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
+            self._maybe_sweep_stale_lock_files()
             if not self._peer_visible(to_stage):
                 logger.error(
                     "SharedMemoryConnector cannot see stage %s shared memory; refusing put for %s",
@@ -321,15 +445,23 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             name = self._shm_name(put_key)
             lock_file = self._lock_file(name)
-            with open(lock_file, "wb+") as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_EX)
-                meta = self._write_bytes(payload, name)
-                fcntl.flock(lockf, fcntl.LOCK_UN)
+            with _publication_lock(lock_file) as fd:
+                try:
+                    meta = self._write_bytes(payload, name)
+                except BaseException:
+                    if self._orphan_lock_directory is not None:
+                        _unlink_if_orphan(fd, lock_file, f"{self.shm_directory}/{name}")
+                    raise
+                try:
+                    identity = self._segment_identity(name)
+                except OSError:
+                    # Publication already succeeded. Without its identity only immediate cleanup is safe.
+                    identity = None
+                with self._pending_keys_lock:
+                    self._pending_keys[put_key] = _Publication(identity)
 
             # meta contains {'name': ..., 'size': ...}
             metadata = {"shm": meta, "size": size}
-            with self._pending_keys_lock:
-                self._pending_keys[put_key] = None
             self._wake_receiver(to_stage)
 
             self._metrics["puts"] += 1
@@ -341,14 +473,30 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
             return False, 0, None
 
-    def _get_data_with_lock(self, lock_file: str, shm_handle: dict[str, Any]) -> tuple[Any, int] | None:
-        consumed = False
+    def _get_data_with_lock(
+        self, get_key: str, shm_handle: dict[str, Any], *, by_key: bool, deadline: float | None
+    ) -> tuple[Any, int] | None:
+        lock_file = self._lock_file(shm_handle["name"])
         try:
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                data_bytes = self._read_bytes(shm_handle)
-                consumed = True
-                fcntl.flock(lockf, fcntl.LOCK_UN)
+                fd = lockf.fileno()
+                if not _current_lock(fd, lock_file):
+                    return None
+                if deadline is not None and time.monotonic() >= deadline:
+                    return None
+                try:
+                    data_bytes = self._read_bytes(shm_handle)
+                except BaseException:
+                    if self._orphan_lock_directory is not None:
+                        cutoff = time.time() - _STALE_LOCK_GRACE_SECONDS if by_key else None
+                        _unlink_if_orphan(fd, lock_file, f"{self.shm_directory}/{shm_handle['name']}", cutoff)
+                    raise
+                # An explicit handle can select a different segment from the caller's key.
+                if by_key or shm_handle["name"] == self._shm_name(get_key):
+                    with self._pending_keys_lock:
+                        self._pending_keys.pop(get_key, None)
+                _unlink_current_lock(fd, lock_file)
             obj = self._serde.deserialize(data_bytes)
             result = (obj, len(data_bytes))
             return result
@@ -357,22 +505,16 @@ class SharedMemoryConnector(OmniConnectorBase):
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
-        finally:
-            if consumed:
-                try:
-                    os.remove(lock_file)
-                except FileNotFoundError:
-                    pass
 
-    def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
-        """Read a SHM segment addressed purely by *get_key*."""
-        # Take the publication lock before opening a possibly unsized segment.
-        name = self._shm_name(get_key)
-        lock_file = self._lock_file(name)
-        result = self._get_data_with_lock(lock_file, {"name": name})
+    def _get_payload(self, get_key: str, metadata, *, deadline: float | None) -> tuple[Any, int] | None:
+        if isinstance(metadata, dict) and get_key in metadata:
+            metadata = metadata[get_key]
+        # Remote sender information carries no SHM handle; look up the segment by key.
+        by_key = not (isinstance(metadata, dict) and "shm" in metadata)
+        shm_handle = {"name": self._shm_name(get_key)} if by_key else metadata["shm"]
+        result = self._get_data_with_lock(get_key, shm_handle, by_key=by_key, deadline=deadline)
         if result is not None:
-            with self._pending_keys_lock:
-                self._pending_keys.pop(get_key, None)
+            self._metrics["gets"] += 1
         return result
 
     def get(
@@ -382,69 +524,80 @@ class SharedMemoryConnector(OmniConnectorBase):
         get_key: str,
         metadata=None,
     ) -> tuple[Any, int] | None:
-        if metadata is not None:
-            if isinstance(metadata, dict) and get_key in metadata:
-                metadata = metadata.get(get_key)
+        self._maybe_sweep_stale_lock_files()
+        return self._get_payload(get_key, metadata, deadline=None)
 
-            if isinstance(metadata, dict) and "shm" in metadata:
-                shm_handle = metadata["shm"]
-                lock_file = self._lock_file(shm_handle["name"])
-                result = self._get_data_with_lock(lock_file, shm_handle)
-                if result is not None:
-                    with self._pending_keys_lock:
-                        self._pending_keys.pop(get_key, None)
-            else:
-                # Missing or non-SHM metadata falls back to key-based lookup.
-                result = self._get_by_key(get_key)
-        else:
-            result = self._get_by_key(get_key)
-
-        if result is not None:
-            self._metrics["gets"] += 1
-        return result
+    def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
+        """Limit this receive to its own key; a directory sweep has no time bound."""
+        if time.monotonic() >= deadline:
+            return None
+        return self._get_payload(get_key, metadata, deadline=deadline)
 
     def cleanup(self, request_id: str) -> bool:
-        """Unlink the exact key passed to ``put()``, never a request-id prefix.
+        """Try to unlink the exact key without waiting. Return True if its segment was removed."""
+        return self._cleanup_key(request_id, None)
 
-        Returns True when an unconsumed segment was actually unlinked.
-        """
-        key = request_id
-        unlinked = False
+    def cleanup_tracked(self, key: str) -> bool:
+        """Release only the publication this sender has recorded for an aborted transfer."""
         with self._pending_keys_lock:
-            self._pending_keys.pop(key, None)
-            try:
-                self._unlink_segment(self._shm_name(key))
-                logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
-                unlinked = True
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                logger.debug("cleanup: failed to unlink SHM segment %s: %s", key, e)
-            lock_file = self._lock_file(self._shm_name(key))
-            if os.path.exists(lock_file):
+            publication = self._pending_keys.get(key)
+        return publication is not None and self._cleanup_key(key, publication)
+
+    def _cleanup_key(self, key: str, publication: _Publication | None) -> bool:
+        name = self._shm_name(key)
+        lock_file = self._lock_file(name)
+        # A name may be reused while we wait. Wait only when the backend can identify our segment.
+        expected = publication.segment_identity if publication is not None else None
+        unlinked = False
+        try:
+            with _publication_lock(lock_file, blocking=expected is not None) as fd:
+                if publication is not None:
+                    with self._pending_keys_lock:
+                        still_tracked = self._pending_keys.get(key) is publication
+                    if not still_tracked:
+                        if self._orphan_lock_directory is not None:
+                            _unlink_if_orphan(fd, lock_file, f"{self.shm_directory}/{name}")
+                        return False
                 try:
-                    os.remove(lock_file)
-                except OSError:
+                    if expected is not None:
+                        current = self._segment_identity(name)
+                        if current is None:
+                            return False
+                        if current != expected:
+                            # Another connector published the replacement; retire only our old record.
+                            with self._pending_keys_lock:
+                                self._pending_keys.pop(key, None)
+                            return False
+                    self._unlink_segment(name)
+                    unlinked = True
+                except FileNotFoundError:
                     pass
+                except Exception as e:
+                    logger.debug("cleanup: could not reclaim SHM segment %s: %s", key, e)
+                    return False
+                with self._pending_keys_lock:
+                    self._pending_keys.pop(key, None)
+                _unlink_current_lock(fd, lock_file)
+        except OSError as e:
+            logger.debug("cleanup: could not acquire SHM lock for %s: %s", key, e)
         return unlinked
 
     def cleanup_prefix(self, key_prefix: str) -> int:
-        """Unlink every tracked key of the form ``{key_prefix}{chunk_id}``.
-
-        Only keys still in ``_pending_keys`` are considered, and the suffix
-        must be a bare integer chunk id, so another request whose id merely
-        shares the prefix is never matched. Returns the unlinked count.
-        """
+        """Release tracked publications whose suffix after the prefix is a numeric chunk ID."""
         with self._pending_keys_lock:
-            keys = [k for k in self._pending_keys if k.startswith(key_prefix) and k[len(key_prefix) :].isdigit()]
-        return sum(self.cleanup(key) for key in keys)
+            matches = [
+                (key, publication)
+                for key, publication in self._pending_keys.items()
+                if key.startswith(key_prefix) and key[len(key_prefix) :].isdigit()
+            ]
+        return sum(self._cleanup_key(key, publication) for key, publication in matches)
 
     def close(self) -> None:
-        """Unlink all remaining tracked SHM segments."""
+        """Attempt to reclaim remaining publications and close this connector's local resources."""
         with self._pending_keys_lock:
-            keys = list(self._pending_keys)
-        for key in keys:
-            self.cleanup(key)
+            remaining = list(self._pending_keys.items())
+        for key, publication in remaining:
+            self._cleanup_key(key, publication)
         self._drop_visibility()
         self._close_wakeups()
 
@@ -452,9 +605,9 @@ class SharedMemoryConnector(OmniConnectorBase):
         """Bounded round-robin sweep; receivers unlink SHM in another process."""
         with self._pending_keys_lock:
             for _ in range(min(max_keys, len(self._pending_keys))):
-                key, _ = self._pending_keys.popitem(last=False)
+                key, publication = self._pending_keys.popitem(last=False)
                 if self._shm_exists(key):
-                    self._pending_keys[key] = None
+                    self._pending_keys[key] = publication
 
     def health(self) -> dict[str, Any]:
         return {"status": "healthy", **self._metrics}
