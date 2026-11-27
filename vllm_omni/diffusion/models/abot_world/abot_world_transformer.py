@@ -358,6 +358,7 @@ class ABotCausalSelfAttention(nn.Module):
         relative: ABotRelativeRope,
     ) -> torch.Tensor:
         ref = relative.ref_tokens
+
         # fp32 cos/sin tables: the official path rotates at full precision and rounds to bf16 once.
         # The CUDA rotary kernel requires one dtype for the input and the tables, so rotate in fp32 everywhere.
         def rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
