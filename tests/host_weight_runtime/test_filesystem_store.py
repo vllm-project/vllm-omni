@@ -2615,7 +2615,10 @@ def test_producer_raised_eio_remains_nonretryable_producer_failure(tmp_path: Pat
     assert not list(store.artifacts_dir.iterdir())
 
 
-def test_store_and_free_space_capacity_limits_fail_before_publication(tmp_path: Path) -> None:
+def test_store_and_free_space_capacity_limits_fail_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     identity = _identity()
     store_limited = _make_store(tmp_path / "store-limit", capacity=CapacityPolicy(max_store_bytes=1))
     store_result = store_limited.get_or_build(
@@ -2630,9 +2633,14 @@ def test_store_and_free_space_capacity_limits_fail_before_publication(tmp_path: 
 
     free_root = tmp_path / "free-limit"
     free_root.mkdir(mode=0o700)
-    # Leave enough margin for filesystem accounting to move between the
-    # preflight measurement and the capacity check.
-    unavailable_reserve = shutil.disk_usage(free_root).free + (1 << 30)
+    # Pin the probe instead of racing the live filesystem: a concurrent job on
+    # a shared host can free bytes between our measurement and the store's
+    # capacity check, so the reserve margin can be crossed mid-test and the
+    # build wrongly proceeds. With the probe pinned, the min-free decision
+    # depends only on the policy, not on filesystem churn.
+    pinned_usage = shutil.disk_usage(free_root)
+    monkeypatch.setattr(filesystem_store_module.shutil, "disk_usage", lambda _path: pinned_usage)
+    unavailable_reserve = pinned_usage.free + (1 << 30)
     free_limited = _make_store(free_root, capacity=CapacityPolicy(min_free_bytes=unavailable_reserve))
     free_result = free_limited.get_or_build(
         BuildRequest(identity),
