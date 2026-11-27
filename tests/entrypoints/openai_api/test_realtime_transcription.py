@@ -520,6 +520,98 @@ async def test_committed_turns_snapshot_their_asr_options() -> None:
     assert "The language is fr." in turn_c
 
 
+@pytest.mark.asyncio
+async def test_ga_session_shape_knobs_reach_the_asr() -> None:
+    """The GA session shape carries the knobs under audio.input.transcription.
+
+    The OpenAI SDK's ``type: "transcription"`` session sends language and
+    prompt there with no flat key; both shapes must reach the ASR.
+    """
+    connection = _make_connection(_FakeWebSocket(), _TranscribingEngine(["hello"]))
+    ga_update = json.dumps(
+        {
+            "type": "session.update",
+            "session": {
+                "type": "transcription",
+                "audio": {"input": {"transcription": {"language": "en", "prompt": "board meeting"}}},
+            },
+        }
+    )
+
+    out = connection._absorb_transcription_session(ga_update)
+    connection._commit_transcription_session()
+
+    assert connection._transcription_mode is True
+    assert connection._transcription_language == "en"
+    assert connection._transcription_prompt == "board meeting"
+    # The session type is normalized for the adapter (its Literal is
+    # "realtime"); the GA knobs ride audio.input.transcription, a known
+    # field the adapter validates as-is.
+    normalized = json.loads(out)
+    assert normalized["session"]["type"] == "realtime"
+    assert normalized["session"]["audio"]["input"]["transcription"] == {"language": "en", "prompt": "board meeting"}
+
+
+@pytest.mark.asyncio
+async def test_prompt_preparation_failure_is_a_per_item_event() -> None:
+    """A prompt-preparation failure ends with a per-item .failed event.
+
+    The committed item is already announced and turns run asynchronously,
+    so a generic session error without an item_id would leave the client
+    unable to tell which item failed.
+    """
+    websocket = _FakeWebSocket()
+    connection = _make_connection(websocket, _TranscribingEngine([]))
+    connection._absorb_transcription_session(_transcription_update())
+    connection._commit_transcription_session()
+
+    async def _failing_prompt(tools=None, *, instructions=None, items=None, **_kwargs):
+        raise RuntimeError("prompt rendering exploded")
+
+    connection._build_full_prompt = _failing_prompt
+    audio = base64.b64encode(b"\x01\x02" * 100).decode("ascii")
+    item = types.RealtimeConversationItemUserMessage(
+        type="message",
+        role="user",
+        status="completed",
+        id="item-prompt-fail",
+        content=[{"type": "input_audio", "audio": audio}],
+    )
+
+    await connection._run_transcription(item, "en", "board meeting")
+
+    failed = [e for e in _sent_events(websocket) if e["type"] == "conversation.item.input_audio_transcription.failed"]
+    assert len(failed) == 1
+    assert failed[0]["item_id"] == item.id
+    assert failed[0]["error"]["code"] == "transcription_error"
+    assert "prompt rendering exploded" in failed[0]["error"]["message"]
+    # No generic session-level error was sent instead.
+    assert not _events_of_type(websocket, "error")
+
+
+def test_session_acknowledgement_echo_keeps_transcription_on() -> None:
+    """session.updated reports the effective transcription session.
+
+    A client that echoes the acknowledged settings back as its next update
+    must keep the mode (and the knobs) instead of switching it off.
+    """
+    connection = _make_connection(_FakeWebSocket(), _TranscribingEngine([]))
+    connection._absorb_transcription_session(_transcription_update())
+    connection._commit_transcription_session()
+
+    session_obj = connection._build_session_object()
+    assert session_obj["type"] == "transcription"
+    assert session_obj["input_audio_transcription"] == {"language": "en", "prompt": "board meeting"}
+
+    # Echo the acknowledged session back as the next update.
+    echo = json.dumps({"type": "session.update", "session": session_obj})
+    connection._absorb_transcription_session(echo)
+    connection._commit_transcription_session()
+    assert connection._transcription_mode is True
+    assert connection._transcription_language == "en"
+    assert connection._transcription_prompt == "board meeting"
+
+
 def test_absorb_stages_a_candidate_and_normalizes_for_the_adapter() -> None:
     connection = _make_connection(_FakeWebSocket(), _TranscribingEngine([]))
 

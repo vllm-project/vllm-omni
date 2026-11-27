@@ -65,6 +65,7 @@ from vllm_omni.entrypoints.openai.realtime.session import (
     _gen_id,
     merge_session_config,
 )
+from vllm_omni.protocol.realtime.session import input_audio_transcription_config
 from vllm_omni.tracing import SessionTrace, capture_trace_headers
 from vllm_omni.utils.audio import audio_chunk_sample_rate
 from vllm_omni.utils.audio_resample import StreamingAudioResampler
@@ -758,8 +759,10 @@ class OpenAIFullDuplexConnection:
         candidate: dict[str, object] = {}
         if isinstance(session.get("type"), str):
             candidate["mode"] = session["type"] == "transcription"
-        transcription_cfg = session.get("input_audio_transcription")
-        if isinstance(transcription_cfg, dict):
+        # Both shapes carry the knobs: the flat ``input_audio_transcription``
+        # key and the GA session shape's ``audio.input.transcription``.
+        transcription_cfg = input_audio_transcription_config(session)
+        if transcription_cfg is not None:
             candidate["language"] = transcription_cfg.get("language") or None
             candidate["prompt"] = transcription_cfg.get("prompt") or None
         self._pending_transcription_session = candidate or None
@@ -844,17 +847,29 @@ class OpenAIFullDuplexConnection:
         parts.append("Output only the transcript text, with no commentary.")
         instructions = " ".join(parts)
 
-        # Single-turn engine input: system prompt + the committed audio.
+        item_id = item.id or _gen_id("item")
+
+        # Single-turn engine input: system prompt + the committed audio. The
+        # item is already announced and turns run asynchronously, so any
+        # preparation failure must be a per-item terminal event — otherwise
+        # the client cannot tell which committed item failed.
         try:
             engine_input = await self._build_full_prompt(
                 instructions=instructions,
                 items=[item],
             )
-        except VLLMValidationError as exc:
-            await self._send_error(str(exc), "invalid_request_error")
+        except Exception as exc:
+            logger.warning("[realtime] transcription prompt preparation failed for %s: %s", item_id, exc)
+            await self._send_event(
+                {
+                    "type": "conversation.item.input_audio_transcription.failed",
+                    "event_id": _gen_id("evt"),
+                    "item_id": item_id,
+                    "error": {"code": "transcription_error", "message": str(exc)},
+                }
+            )
             return
 
-        item_id = item.id or _gen_id("item")
         request_id = _gen_id("transcription")
         self._active_transcription_request_id = request_id
         full_transcript = ""
@@ -2520,4 +2535,16 @@ class OpenAIFullDuplexConnection:
         obj["object"] = "realtime.session"
         obj["id"] = s.session_id
         obj["expires_at"] = int(s.expires_at)
+        if self._transcription_mode:
+            # #11074: acknowledge the effective transcription session, so a
+            # client echoing the acknowledged settings back keeps the mode
+            # instead of switching the session off.
+            obj["type"] = "transcription"
+            settings = {
+                key: value
+                for key, value in (("language", self._transcription_language), ("prompt", self._transcription_prompt))
+                if value is not None
+            }
+            if settings:
+                obj["input_audio_transcription"] = settings
         return obj

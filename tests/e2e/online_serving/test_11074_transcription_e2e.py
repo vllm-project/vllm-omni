@@ -44,7 +44,7 @@ def _pcm16_24k(wav_path) -> bytes:
     """Upsample the 16 kHz fixture to the 24 kHz the session expects."""
     samples = np.frombuffer(read_pcm16_wav(wav_path), dtype=np.int16).astype(np.float64)
     upsampled = np.interp(
-        np.arange(len(samples) * 3) / 3.0,
+        np.arange(len(samples) * 3 // 2) * 2.0 / 3.0,
         np.arange(len(samples)),
         samples,
     )
