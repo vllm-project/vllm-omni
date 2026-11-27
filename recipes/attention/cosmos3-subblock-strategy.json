@@ -55,6 +55,10 @@
       ]
     }
   },
+  "small_request": {
+    "below_tokens": 20000,
+    "layout": "dense"
+  },
   "schedule": {
     "coordinate": "step_index",
     "phases": [

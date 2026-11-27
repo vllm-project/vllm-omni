@@ -2753,6 +2753,7 @@ class AttentionConfig:
     layouts: dict[str, Any] | None = None
     schedule: dict[str, Any] | None = None
     checkpoint_policy: str = "auto"
+    small_request: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.checkpoint_policy not in ("auto", "ignore"):
@@ -2782,7 +2783,11 @@ class AttentionConfig:
         if active:
             from vllm_omni.diffusion.attention.strategy import AttentionStrategy
 
-            self.strategy = AttentionStrategy(self.presets, self.layout, self.layouts, self.schedule)
+            self.strategy = AttentionStrategy(
+                self.presets, self.layout, self.layouts, self.schedule, self.small_request
+            )
+        elif self.small_request is not None:
+            raise ValueError("small_request requires an active strategy with layouts and a schedule")
 
     @staticmethod
     def _coerce_spec(spec_data: Any, field_name: str) -> AttentionSpec | BlockSparseAttentionSpec:

@@ -45,7 +45,7 @@ per-executor preparation bookkeeping and prepares new geometries on first use.
 
 ## Usage
 
-Pass [cosmos3-subblock-strategy.json](https://github.com/rahul-steiger-nv/vllm-omni/blob/a16c015e17981a4a42179b44247df65beca16f48/recipes/attention/cosmos3-subblock-strategy.json)
+Pass [cosmos3-subblock-strategy.json](../../../recipes/attention/cosmos3-subblock-strategy.json)
 as `diffusion_attention_config`. It keeps ten iterations dense, then uses sparse
 attention in 28 of 36 generation layers; understanding and multi-control stay dense.
 The presets are `fa3_dense` (dense FlashAttention-3) and `fa4_subblock`
@@ -57,7 +57,7 @@ checks the resolved dense implementation is FA3. Sparse execution uses the
 separate FA4 adapter; its `implementation: auto` is required by that API.
 
 For a uniform switch in every generation layer after ten dense iterations, use
-[cosmos3-dense-to-sparse-strategy.json](https://github.com/rahul-steiger-nv/vllm-omni/blob/a16c015e17981a4a42179b44247df65beca16f48/recipes/attention/cosmos3-dense-to-sparse-strategy.json).
+[cosmos3-dense-to-sparse-strategy.json](../../../recipes/attention/cosmos3-dense-to-sparse-strategy.json).
 Understanding and multi-control attention remain FA3 dense in both recipes.
 
 For a dense → mixed → dense schedule, keep the first recipe's presets/layouts
@@ -133,6 +133,14 @@ the request dense. Schedules require valid zero-based logical progress even with
 one reachable layout. Repeated CFG/solver evaluations at the same index reuse the
 same layout. A static `layout` needs no denoising progress. The policy is resolved
 before transformer execution, so local attention does not read the step index.
+
+### Small Cosmos3 requests
+
+The two Cosmos3 example recipes set `"small_request": {"below_tokens": 20000, "layout": "dense"}`.
+Requests with fewer than 20,000 generation tokens use the configured
+dense layout for every denoising step. Larger requests, including exactly 20,000 tokens,
+follow the schedule. Omitting the rule uses the schedule for every size. Cosmos3 counts
+video latent patches before sequence-parallel sharding. Tune the cutoff for the workload.
 
 Distributed modes other than strict Ulysses, caches other than SeaCache, paged/quantized
 KV, step serving and MiniMax integration are outside this PoC.

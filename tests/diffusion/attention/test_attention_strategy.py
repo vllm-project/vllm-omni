@@ -427,3 +427,52 @@ def test_seacache_strategy_rejects_bypassed_full_compilation():
             enforce_eager=False,
             diffusion_compile_granularity="full",
         )
+
+
+@pytest.mark.parametrize(("tokens", "expected"), [(19999, "dense"), (20000, "mixed"), (None, "mixed")])
+def test_small_request_layout_boundary(tokens, expected):
+    raw = recipe()
+    plan = ForwardStrategyPlan.from_strategy(AttentionConfig(**raw).strategy)
+    with override_forward_context(
+        ForwardContext(denoise_step_idx=20, total_denoise_steps=35, generation_tokens=tokens)
+    ):
+        assert plan.layout_names[plan.current_layout()] == expected
+
+
+def test_small_request_layout_stays_reachable_outside_the_schedule():
+    raw = recipe()
+    raw["schedule"]["phases"] = [{"until": None, "layout": "mixed"}]
+    del raw["small_request"]
+    assert tuple(AttentionConfig(**raw).strategy.layouts) == ("mixed",)
+    raw["small_request"] = {"below_tokens": 4096, "layout": "dense"}
+    plan = ForwardStrategyPlan.from_strategy(AttentionConfig(**raw).strategy)
+    assert set(plan.layout_names) == {"dense", "mixed"}
+    with override_forward_context(ForwardContext(denoise_step_idx=0, total_denoise_steps=1, generation_tokens=1024)):
+        assert plan.layout_names[plan.current_layout()] == "dense"
+
+
+@pytest.mark.parametrize(
+    "small_request",
+    [
+        {"below_tokens": 0, "layout": "dense"},
+        {"below_tokens": True, "layout": "dense"},
+        {"below_tokens": 1.5, "layout": "dense"},
+        {"below_tokens": 4096, "layout": "unknown"},
+        {"below_tokens": 4096},
+        {"below_tokens": 4096, "layout": "dense", "extra": 1},
+    ],
+)
+def test_invalid_small_request(small_request):
+    with pytest.raises(ValueError):
+        AttentionConfig(**{**recipe(), "small_request": small_request})
+
+
+def test_small_request_requires_a_scheduled_strategy():
+    with pytest.raises(ValueError, match="small_request"):
+        AttentionConfig(
+            presets={"base": "TORCH_SDPA"},
+            layout={"default": "base"},
+            small_request={"below_tokens": 4096, "layout": "static"},
+        )
+    with pytest.raises(ValueError, match="small_request"):
+        AttentionConfig(small_request={"below_tokens": 4096, "layout": "dense"})

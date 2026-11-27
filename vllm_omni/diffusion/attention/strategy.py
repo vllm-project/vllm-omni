@@ -64,7 +64,7 @@ def _mapping(value, fields, label):
 
 
 class AttentionStrategy:
-    def __init__(self, presets, layout, layouts, schedule):
+    def __init__(self, presets, layout, layouts, schedule, small_request=None):
         if not presets:
             raise ValueError("An attention strategy requires presets")
         self.presets = deepcopy(dict(presets))
@@ -82,8 +82,11 @@ class AttentionStrategy:
             raise ValueError("Layout names must be nonempty strings")
         self.layouts = {name: self._parse_layout(raw) for name, raw in raw_layouts.items()}
         self.coordinate, self.phases = self._parse_schedule(schedule)
+        self.small_request = self._parse_small_request(small_request)
         if self.phases:
             reachable = {name for _, name in self.phases}
+            if self.small_request is not None:
+                reachable.add(self.small_request[1])
             self.layouts = {name: layout for name, layout in self.layouts.items() if name in reachable}
 
     def _parse_layout(self, raw) -> Layout:
@@ -142,6 +145,18 @@ class AttentionStrategy:
             parsed.append((until, phase["layout"]))
             previous = until
         return coordinate, tuple(parsed)
+
+    def _parse_small_request(self, raw) -> tuple[int, str] | None:
+        """Requests below a generation-token count run one layout for every step."""
+        if raw is None:
+            return None
+        if not self.phases:
+            raise ValueError("small_request requires layouts with a schedule")
+        _mapping(raw, {"below_tokens", "layout"}, "small_request")
+        below, name = raw.get("below_tokens"), raw.get("layout")
+        if type(below) is not int or below <= 0 or not isinstance(name, str) or name not in self.layouts:
+            raise ValueError("small_request needs a positive integer below_tokens and a known layout")
+        return below, name
 
     def _preset(self, name):
         if not isinstance(name, str) or name not in self.presets:
@@ -277,12 +292,19 @@ class ForwardStrategyPlan:
     coordinate: str | None
     phases: tuple[tuple[int | float | None, int], ...]
     operations: tuple[AttentionOperation, ...] = ()
+    # (below_tokens, layout index): smaller requests never leave that layout.
+    small_request: tuple[int, int] | None = None
 
     @classmethod
     def from_strategy(cls, strategy, *, operations=()):
         names = tuple(strategy.layouts)
+        small = getattr(strategy, "small_request", None)
         return cls(
-            names, strategy.coordinate, tuple((until, names.index(name)) for until, name in strategy.phases), operations
+            names,
+            strategy.coordinate,
+            tuple((until, names.index(name)) for until, name in strategy.phases),
+            operations,
+            None if small is None else (small[0], names.index(small[1])),
         )
 
     def layout_for_step(self, step: int | None, total: int | None) -> int:
@@ -300,13 +322,16 @@ class ForwardStrategyPlan:
 
     def current_layout(self):
         """Called once at the eager transformer boundary, never by compiled attention."""
-        if self.coordinate is None:
-            return 0
         from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
+        if self.coordinate is None:
+            return 0
         if not is_forward_context_available():
             raise ValueError("Scheduled attention requires logical denoising progress")
         context = get_forward_context()
+        tokens = context.generation_tokens
+        if self.small_request is not None and tokens is not None and tokens < self.small_request[0]:
+            return self.small_request[1]
         return self.layout_for_step(context.denoise_step_idx, context.total_denoise_steps)
 
 

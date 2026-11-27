@@ -68,6 +68,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_step_idx,
     set_forward_context_denoise_total_steps,
+    set_forward_context_generation_tokens,
 )
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
@@ -1350,6 +1351,7 @@ class Cosmos3OmniDiffusersPipeline(
         self._num_timesteps = None
         self._current_step_index = None
         self._current_sigma = None
+        self._generation_tokens: int | None = None
         self._cosmos3_branch_caches: dict[str, tuple[Any, Any]] | None = None
         self._robolab_transforms: dict[bool, Any] = {}
 
@@ -2300,15 +2302,26 @@ class Cosmos3OmniDiffusersPipeline(
         if getattr(self.transformer, "_attention_strategy_runner", None) is not None:
             set_forward_context_denoise_step_idx(step_index)
             set_forward_context_denoise_total_steps(len(timesteps))
+            set_forward_context_generation_tokens(self._generation_tokens)
         self._current_step_index = step_index
         self._num_timesteps = len(timesteps)
         sigmas = getattr(scheduler, "sigmas", None)
         self._current_sigma = sigmas[step_index] if sigmas is not None and step_index < len(sigmas) else None
 
+    def _set_generation_tokens(self, latents: torch.Tensor) -> None:
+        runner = getattr(self.transformer, "_attention_strategy_runner", None)
+        if runner is not None and runner.plan.small_request is not None:
+            patch = self.transformer.latent_patch_size
+            self._generation_tokens = (
+                latents.size(2) * math.ceil(latents.size(3) / patch) * math.ceil(latents.size(4) / patch)
+            )
+
     def _clear_denoise_step_metadata(self) -> None:
         if getattr(self.transformer, "_attention_strategy_runner", None) is not None:
             set_forward_context_denoise_step_idx(None)
             set_forward_context_denoise_total_steps(None)
+            set_forward_context_generation_tokens(None)
+        self._generation_tokens = None
         self._current_step_index = None
         self._current_sigma = None
 
@@ -3183,6 +3196,7 @@ class Cosmos3OmniDiffusersPipeline(
         Outside the interval the cond/uncond delta is zeroed so all ranks
         continue to execute identical control flow (CFG-Parallel safe).
         """
+        self._set_generation_tokens(latents)
         do_cfg = guidance_scale > 1.0
         cfg_parallel = self._cfg_parallel_active() and do_cfg
         pp_active = self._pp_parallel_active()
@@ -3724,6 +3738,7 @@ class Cosmos3OmniDiffusersPipeline(
             lo, hi = interval
             return lo < t_scalar < hi if open_guidance_interval else lo <= t_scalar <= hi
 
+        self._set_generation_tokens(latents)
         self.transformer.reset_cache()
         self._cosmos3_branch_caches = {}
         try:

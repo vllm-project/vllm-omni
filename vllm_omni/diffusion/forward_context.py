@@ -89,6 +89,8 @@ class ForwardContext:
     # every scheduled layer in one step reads it instead of selecting again.
     _attention_profile_key: tuple[AttentionSchedule, int, int] | tuple[AttentionSigmaSchedule, float] | None = None
     _attention_profile: str | None = None
+    # Global generation-token count before sequence-parallel sharding.
+    generation_tokens: int | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
     # Per-request projected direct-VLM condition (e.g., Ming-Image). For now for bsz 1.
@@ -589,6 +591,11 @@ def set_forward_context_denoise_total_steps(total_steps: int | None) -> None:
     """
     if _forward_context is not None:
         _forward_context.total_denoise_steps = total_steps
+
+
+def set_forward_context_generation_tokens(tokens: int | None) -> None:
+    if _forward_context is not None:
+        _forward_context.generation_tokens = tokens
 
 
 class DenoiseProgressMixin:

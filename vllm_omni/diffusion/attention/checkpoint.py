@@ -46,7 +46,7 @@ def resolve_checkpoint_attention_config(
     if type(policy["schema_version"]) is not int or policy["schema_version"] != 1:
         raise ValueError("Checkpoint attention_strategy.schema_version must be the integer 1")
     config = policy["config"]
-    if not isinstance(config, Mapping) or config.keys() - {"presets", "layout", "layouts", "schedule"}:
+    if not isinstance(config, Mapping) or config.keys() - {"presets", "layout", "layouts", "schedule", "small_request"}:
         raise ValueError("Checkpoint attention strategy config requires presets and layout or layouts/schedule")
     effective = AttentionConfig(**deepcopy(dict(config)))
     if effective.strategy is None:

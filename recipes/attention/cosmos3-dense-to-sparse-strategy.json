@@ -17,6 +17,10 @@
       "overrides": [{"attention_role": "cosmos3.gen", "use": "fa4_subblock"}]
     }
   },
+  "small_request": {
+    "below_tokens": 20000,
+    "layout": "dense"
+  },
   "schedule": {
     "coordinate": "step_index",
     "phases": [

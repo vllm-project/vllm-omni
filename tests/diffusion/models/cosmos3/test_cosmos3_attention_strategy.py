@@ -82,3 +82,28 @@ def test_cosmos3_forward_capture_and_reuse(monkeypatch, model_name, device, comp
         torch.testing.assert_close(model(**changed), expected, **tolerances)
     assert len(graphs) == compiled_count
     torch._dynamo.reset()
+
+
+@pytest.mark.cpu
+def test_cosmos3_pipeline_selects_layout_by_generation_tokens():
+    from vllm_omni.diffusion.attention.strategy import ForwardStrategyPlan
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    plan = ForwardStrategyPlan(("dense", "mixed"), "step_index", ((10, 0), (None, 1)), small_request=(1000, 0))
+    pipeline = object.__new__(Cosmos3OmniDiffusersPipeline)
+    pipeline.transformer = SimpleNamespace(_attention_strategy_runner=SimpleNamespace(plan=plan), latent_patch_size=2)
+    timesteps = torch.arange(35)
+
+    def layout_at_step(latents):
+        pipeline._set_generation_tokens(latents)
+        with override_forward_context(ForwardContext()):
+            pipeline._set_denoise_step_metadata(20, timesteps, None)
+            layout = plan.layout_names[plan.current_layout()]
+            pipeline._clear_denoise_step_metadata()
+        assert pipeline._generation_tokens is None
+        return layout
+
+    large = torch.empty(1, 16, 24, 60, 104)  # 24 * 30 * 52 = 37440 generation tokens
+    small = torch.empty(1, 16, 7, 16, 16)  # 7 * 8 * 8 = 448 generation tokens
+    assert layout_at_step(small) == "dense"
+    assert layout_at_step(large) == "mixed"
