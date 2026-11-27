@@ -124,11 +124,12 @@ steps:
     # in about 31 minutes on H100; MI300 also pays cold AITER compilation.
     # test_livekit_client_vad_replay_without_runtime_jit stays CUDA-only: on MI300
     # the Triton kernel_unified_attention JIT-compiles mid-request (AMD #17564).
+    # Blocking after 23 consecutive green main runs.
     - label: "MERGE · Qwen3-Omni Realtime and Duplex Entrypoints · 2-GPU"
       agent_pool: mi300_2
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 90
       source_file_dependencies: omni_qwen3_omni_duplex_playback_function
       artifact_paths:
