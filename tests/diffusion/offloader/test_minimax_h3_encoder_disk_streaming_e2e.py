@@ -11,6 +11,18 @@ It asserts the PR3 acceptance contract: the loader produces a checkpoint-mmap
 plan that includes the text encoder (with fused ``qkv_proj``/``gate_up_proj``
 bindings), the backend streams it in bounded staging slots, and one encoder
 forward returns ``[seq, 5120]`` BF16 finite states.
+
+Those assertions cannot detect a permuted fused source mapping (for example
+swapped K/V slices), so an optional golden comparison pins the model-specific
+checkpoint mapping: set ``VLLM_TEST_MINIMAX_H3_ENCODER_REFERENCE`` to a file
+holding the hidden states for this test's fixed token IDs. The reference must
+come from the ordinary (non-streaming) loader on the same device kind, since
+streamed and ordinary forwards are bit-identical only on the same device. Set
+``VLLM_TEST_MINIMAX_H3_ENCODER_REFERENCE_RECORD`` instead to record the
+reference: that run loads the ordinary pipeline, releases the DiT/VAE, moves
+the encoder to the device, and saves one forward. Recording needs a device
+with room for the whole 63 GiB encoder, which is exactly the memory the
+streaming path avoids.
 """
 
 import gc
@@ -28,7 +40,10 @@ pytestmark = [
 ]
 
 MODEL_ENV = "VLLM_TEST_MINIMAX_H3_FL2VA_MODEL"
+REFERENCE_ENV = "VLLM_TEST_MINIMAX_H3_ENCODER_REFERENCE"
+RECORD_ENV = "VLLM_TEST_MINIMAX_H3_ENCODER_REFERENCE_RECORD"
 PORT = "29514"
+IDS = (100, 132)
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
@@ -63,7 +78,9 @@ def test_text_encoder_streams_from_disk() -> None:
         model_class_name="MiniMaxH3Pipeline",
         dtype=torch.bfloat16,
         parallel_config=DiffusionParallelConfig(ulysses_degree=1),
-        diffusion_offload_config={
+        diffusion_offload_config=None
+        if os.environ.get(RECORD_ENV)
+        else {
             "mode": "layer",
             "components": ["dit", "text_encoder"],
             "layer_options": {"dit": {"resident_layers": 1}},
@@ -92,6 +109,10 @@ def test_text_encoder_streams_from_disk() -> None:
         )
         loader = DiffusersPipelineLoader(LoadConfig(), od_config=od_config)
         pipeline = loader.load_model(load_device="cpu", device=device)
+        record_path = os.environ.get(RECORD_ENV)
+        if record_path:
+            _record_reference(pipeline, device, record_path)
+            return
         pipeline, backend = enable_offload_backend(od_config, pipeline, device=device)
         plan = loader.host_weight_plan
         assert plan is not None, "loader did not produce a checkpoint-mmap plan"
@@ -116,7 +137,7 @@ def test_text_encoder_streams_from_disk() -> None:
 
         encoder = pipeline.text_encoder
         encoder.load_to_device()
-        ids = torch.arange(100, 132, dtype=torch.long, device=device)
+        ids = torch.arange(*IDS, dtype=torch.long, device=device)
 
         import threading
         import time
@@ -145,6 +166,40 @@ def test_text_encoder_streams_from_disk() -> None:
         # Bounded staging: the forward must not materialize the 48 GiB encoder.
         host_delta = max(samples) - samples[0]
         assert host_delta < 4.0, f"encoder forward grew host RSS by {host_delta:.2f} GiB"
+
+        # The golden comparison pins the fused source mapping: equal shapes and
+        # finite states still pass if K/V slices are swapped, but the ordinary
+        # loader's hidden states for these token IDs do not.
+        reference_path = os.environ.get(REFERENCE_ENV)
+        if reference_path:
+            expected = torch.load(reference_path, map_location=device, weights_only=True)
+            assert torch.equal(hidden, expected), "streamed encoder states diverge from the ordinary-loader reference"
+
+
+def _record_reference(pipeline, device: torch.device, path: str) -> None:
+    """Record the ordinary-loader hidden states for the fixed token IDs.
+
+    The ordinary path has no component isolation, so every non-encoder
+    reference is dropped before the move. Recording needs a device with room
+    for the whole 63 GiB encoder, which is exactly the memory the streaming
+    path avoids; the host must still hold the full pipeline during the load.
+    """
+    pipeline.transformer = None
+    pipeline.video_vae = None
+    pipeline.audio_vae = None
+    pipeline.vae = None
+    pipeline._vae_modules = []
+    pipeline._model_cpu_offload_modules = []
+    gc.collect()
+    torch.accelerator.empty_cache()
+
+    encoder = pipeline.text_encoder
+    encoder.to(device)
+    ids = torch.arange(*IDS, dtype=torch.long, device=device)
+    with torch.no_grad():
+        hidden = encoder(ids)
+    torch.accelerator.synchronize()
+    torch.save(hidden.cpu(), path)
 
 
 def _current_rss_gib() -> float:
