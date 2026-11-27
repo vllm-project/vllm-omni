@@ -45,32 +45,38 @@ def _request_initial_chunk_frames(request: Any, default: int) -> int:
 
 
 def extract_last_frame(multimodal_output: Mapping[str, Any]) -> torch.Tensor | None:
-    """Return the newest frame of codec codes, or ``None`` if this step had none.
-
-    Prefill steps emit an all-zero placeholder frame, which must not be
-    forwarded to the decoder.
-    """
-    audio_codes = multimodal_output.get("audio_codes")
+    """Return the newest valid frame, if this step produced one."""
+    codes = multimodal_output.get("codes")
+    meta = multimodal_output.get("meta")
+    if isinstance(codes, Mapping) and "audio" in codes:
+        audio_codes = codes["audio"]
+        valid = meta.get("codec_frame_valid") if isinstance(meta, Mapping) else None
+    else:
+        audio_codes = multimodal_output.get("audio_codes")
+        valid = multimodal_output.get("audio_code_valid")
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
         return None
-    if audio_codes.ndim == 1:
-        return audio_codes.to(device="cpu", dtype=torch.long).reshape(-1)
-    if audio_codes.ndim != 2:
+    if audio_codes.ndim not in (1, 2):
         raise ValueError(f"Invalid audio_codes shape for Audio8 TTS async_chunk: {tuple(audio_codes.shape)}")
 
-    frame = audio_codes[-1]
-    if frame.numel() == 0:
-        return None
-    valid = multimodal_output.get("audio_code_valid")
-    if isinstance(valid, torch.Tensor) and valid.numel() > 0:
-        is_valid = bool(valid.reshape(-1)[-1].item())
+    frame = audio_codes if audio_codes.ndim == 1 else audio_codes[-1]
+    if isinstance(valid, torch.Tensor):
+        is_valid = valid.numel() > 0 and bool(valid.reshape(-1)[-1].item())
     elif valid is not None:
         is_valid = bool(valid)
     else:
-        is_valid = bool(frame.any().item())
+        # Legacy producers with token-major output use zero rows for prefill.
+        is_valid = audio_codes.ndim == 1 or bool(frame.any().item())
     if not is_valid:
         return None
     return frame.to(device="cpu", dtype=torch.long).reshape(-1)
+
+
+def _terminal_payload() -> OmniPayloadStruct:
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+        meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+    )
 
 
 def slow_ar_to_codec_decoder_async_chunk(
@@ -96,7 +102,7 @@ def slow_ar_to_codec_decoder_async_chunk(
         if frame is not None:
             transfer_manager.code_prompt_token_ids[request_id].append(frame.detach())
             appended_this_call = True
-    elif not finished:
+    if not appended_this_call and not finished:
         return None
 
     chunk_frames = _cfg_int(cfg, "codec_chunk_frames", DEFAULT_CHUNK_FRAMES)
@@ -115,10 +121,7 @@ def slow_ar_to_codec_decoder_async_chunk(
     if length <= 0:
         if finished:
             # Still emit a terminal payload so the decoder can close the stream.
-            return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
-            )
+            return _terminal_payload()
         return None
 
     # A smaller first chunk trades a little quality for time-to-first-audio.
@@ -126,7 +129,7 @@ def slow_ar_to_codec_decoder_async_chunk(
         already_sent = transfer_manager.put_req_chunk[request_id] * initial_chunk_frames
         pending = length - already_sent
         if pending <= 0:
-            return None
+            return _terminal_payload() if finished else None
         if pending < initial_chunk_frames and not finished:
             return None
         new_frames = min(pending, initial_chunk_frames)
@@ -144,10 +147,7 @@ def slow_ar_to_codec_decoder_async_chunk(
             # reached it; a terminal call carrying no new frame must close the
             # stream, not re-send that window (otherwise the last chunk_frames
             # frames ship twice).
-            return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
-            )
+            return _terminal_payload()
         new_frames = pending if pending != 0 else chunk_frames
         end_index = min(length, left_context_frames + new_frames)
         left_context_size = max(0, end_index - new_frames)

@@ -83,6 +83,8 @@ class FinalLayer(nn.Module):
 
 
 class DiT(torch.nn.Module):
+    _supports_precomputed_cond = True
+
     def __init__(self, args):
         super().__init__()
         self.time_as_token = getattr(args.DiT, "time_as_token", False)
@@ -174,6 +176,7 @@ class DiT(torch.nn.Module):
         mask_content=False,
         pre_mask=None,
         unpad_data: tuple[torch.Tensor, torch.Tensor] | None = None,
+        precomputed_cond: torch.Tensor | None = None,
     ):
         """
         x (torch.Tensor): random noise
@@ -200,7 +203,8 @@ class DiT(torch.nn.Module):
         B, _, T = x.size()
 
         t1 = self.t_embedder(t)  # (N, D) # t1 [2, 512]
-        cond = cond_in_module(cond)  # cond [2,1863,512]->[2,1863,512]
+        # cond: [B, T, D]
+        cond = precomputed_cond if precomputed_cond is not None else cond_in_module(cond)
 
         x = x.transpose(1, 2)  # [2,1863,80]
         prompt_x = prompt_x.transpose(1, 2)  # [2,1863,80]

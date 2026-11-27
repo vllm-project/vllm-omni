@@ -111,13 +111,21 @@ def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: An
     return False
 
 
+def _release_runner_session_window(worker: Any, session_id: str) -> None:
+    worker = getattr(worker, "worker", worker)
+    model = worker.model_runner.get_model()
+    release = getattr(model, "release_session_window", None)
+    if release is not None:
+        release(session_id)
+
+
 def _release_runner_shm_resources(worker: Any, request_ids: list[str]) -> int:
     worker = getattr(worker, "worker", worker)
     release = getattr(getattr(worker, "model_runner", None), "release_omni_shm_resources", None)
     return 0 if release is None else release(request_ids)
 
 
-def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> bool:
+def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any, input_queue: Any = None) -> bool:
     """Bind the TP1 in-process runner control plane directly to its scheduler."""
     if not isinstance(model_executor, UniProcExecutor):
         return False
@@ -131,7 +139,18 @@ def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> b
     sink = getattr(scheduler, "enqueue_omni_connector_output", None)
     if data_plane is None or not callable(sink):
         return False
-    data_plane.set_omni_connector_output_sink(sink)
+
+    def sink_and_wake(output: Any) -> None:
+        sink(output)
+        # WAKEUP only unblocks the idle wait. has_requests() stays true while
+        # the inbox holds this failure, so the next step emits it.
+        if input_queue is not None:
+            try:
+                input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+            except Exception:
+                logger.debug("Failed to wake engine core for connector output", exc_info=True)
+
+    data_plane.set_omni_connector_output_sink(sink_and_wake)
     return True
 
 
@@ -161,7 +180,7 @@ class StageEngineCoreProc(EngineCoreProc):
         model_cls, _ = config.registry.resolve_model_cls(config.architectures, config)
         self._input_stream_factory = getattr(model_cls, "create_input_stream", None)
         _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
-        if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
+        if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler, self.input_queue):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
 
     def add_request(self, request: Any, request_wave: int = 0) -> None:
@@ -209,6 +228,12 @@ class StageEngineCoreProc(EngineCoreProc):
             release_overflowed = getattr(self.scheduler, "release_overflowed_requests", None)
             if release_overflowed is not None:
                 release_overflowed(request)
+
+    def omni_release_session_window(self, session_id: str) -> None:
+        policy = getattr(self.scheduler, "_window_policy", None)
+        if policy is not None:
+            policy.release_session(session_id)
+            self.model_executor.collective_rpc(_release_runner_session_window, args=(session_id,))
 
     def omni_append_text(self, update: TextInputUpdate | dict[str, object]) -> dict[str, object]:
         """Accept an append on the engine loop, ordered with ADD and ABORT."""
