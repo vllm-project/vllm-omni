@@ -7,6 +7,7 @@ from typing import Any
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
+from vllm_omni.core.sched.window_policy import WindowOperation
 from vllm_omni.engine import AdditionalInformationPayload, PayloadSenderInfo
 
 
@@ -162,3 +163,5 @@ class OmniSchedulerOutput(SchedulerOutput):
     # must be dropped instead of flushed. Empty unless the scheduler recorded
     # one of those terminal statuses.
     discarded_req_ids: set[str] = field(default_factory=set)
+    #: Apply in list order before worker cleanup, including steps with no scheduled tokens.
+    duplex_carry_ops: list[WindowOperation] = field(default_factory=list)

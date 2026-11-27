@@ -334,6 +334,11 @@ class TestThinkerOnlyPipeline:
         assert pipeline.stages[0].final_output is True
         assert pipeline.stages[0].final_output_type == "text"
 
+    def test_uses_the_same_scheduler_window_policy_as_the_voice_pipeline(self) -> None:
+        thinker = OMNI_PIPELINES[_THINKER_ONLY_KEY].stages[0]
+        assert thinker.scheduler_window_policy is not None
+        assert thinker.scheduler_window_policy == MINICPMO_4_5_PIPELINE.stages[0].scheduler_window_policy
+
     def test_final_stage0_sampling_stops_only_on_unit_terminators(self) -> None:
         ids = {"<|tts_eos|>": 151704, "<|listen|>": 151705, "<|chunk_eos|>": 151718, "<|chunk_tts_eos|>": 151721}
         tokenizer = SimpleNamespace(convert_tokens_to_ids=lambda token: ids.get(token), unk_token_id=0)

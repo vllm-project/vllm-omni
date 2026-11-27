@@ -20,6 +20,9 @@ def main() -> int:
     parser.add_argument("--artifact-name", required=True)
     parser.add_argument("--expect-results", nargs=2, action="append", metavar=("MODEL", "COUNT"), required=True)
     parser.add_argument("--cases", nargs="+", required=True)
+    # "collect" compares against an MI300 baseline when one exists; use it
+    # until a new case has nightly MI300 measurements to set its baseline.
+    parser.add_argument("--baseline", choices=("require", "collect"), default="require")
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9-]+", args.artifact_name):
         parser.error("invalid artifact name")
@@ -42,7 +45,7 @@ def main() -> int:
             *nodes,
             "--test-config-file",
             "tests/dfx/perf/tests/test_tts.json",
-            "--require-baseline",
+            "--require-baseline" if args.baseline == "require" else "--assert-baseline",
             "-m",
             f"full_model and tts and rocm and MI325 and cards_{args.gpus}",
         ],
