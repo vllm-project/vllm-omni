@@ -113,6 +113,7 @@ class MiniMaxH3Encoder(MiniMaxH3TextEncoderBackbone):
                 device=device,
                 encode_only=True,
                 trust_remote_code=vllm_config.model_config.trust_remote_code,
+                additional_config=vllm_config.additional_config,
             )
             if self.component_config.video_parallel_mode == "patch":
                 if tp_group is None:

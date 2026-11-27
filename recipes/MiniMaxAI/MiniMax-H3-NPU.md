@@ -698,8 +698,10 @@ gather without running the encoder. The batch size caps tile samples per
 forward; short batches do not use dummy samples. Single clips, keyframe splits
 and a padded tail keep their existing path. Encoder tile size and overlap must
 be integers divisible by the checkpoint's spatial compression ratio and satisfy
-`0 < overlap < tile size`. Changing geometry may change conditioning latents;
-validate it separately. Decoder tiling is unaffected.
+`0 < overlap < tile size`. Changing geometry may change reference-video latents;
+validate it separately. The override applies only during reference-video encode,
+not to image or control conditioning or the decoder. The same options apply on
+both the monolithic diffusion pipeline and the split MiniMax H3 encoder stage.
 
 ## Additional resources
 

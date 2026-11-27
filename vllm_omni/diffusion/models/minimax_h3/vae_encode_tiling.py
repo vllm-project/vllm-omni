@@ -4,6 +4,7 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import partial
 
 import torch
 import torch.distributed as dist
@@ -11,6 +12,8 @@ from torch import nn
 
 encode_tile_batch_size: ContextVar[int] = ContextVar("minimax_h3_encode_tile_batch_size", default=1)
 _encode_tile_group: ContextVar[dist.ProcessGroup | None] = ContextVar("minimax_h3_encode_tile_group", default=None)
+_clip_count: ContextVar[int] = ContextVar("minimax_h3_encode_clip_count", default=1)
+_TileLayout = tuple[torch.Size, torch.dtype]
 
 
 @contextmanager
@@ -24,28 +27,33 @@ def reference_video_tile_batching(batch_size: int, group: dist.ProcessGroup | No
         encode_tile_batch_size.reset(batch_token)
 
 
+@contextmanager
+def reference_video_tile_geometry(model: nn.Module, geometry: tuple[int, int] | None) -> Iterator[None]:
+    """Apply the configured encoder tile size and overlap to reference video encoding only."""
+    if geometry is None:
+        yield
+        return
+    checkpoint_geometry = model.tile_size, model.tile_overlap_min
+    model.tile_size, model.tile_overlap_min = geometry
+    try:
+        yield
+    finally:
+        model.tile_size, model.tile_overlap_min = checkpoint_geometry
+
+
 def _gather_clip_tiles(
     local: list[torch.Tensor],
+    layout: _TileLayout,
     tile_count: int,
     clip_count: int,
     group: dist.ProcessGroup,
     device: torch.device,
 ) -> list[torch.Tensor]:
-    """Gather round-robin tasks and restore the checkpoint's spatial-tile order."""
+    """Gather clip-major tasks and restore sample-major batches per spatial tile."""
     world_size = dist.get_world_size(group)
     task_count = tile_count * clip_count
     rank_capacity = (task_count + world_size - 1) // world_size
-    metadata = (local[0].shape, local[0].dtype) if local else None
-    if task_count < world_size:
-        # Rank 0 owns task 0. Empty ranks learn the format without encoding a
-        # dummy tile; all ranks still use the same non-empty HCCL payload.
-        header = [metadata]
-        dist.broadcast_object_list(header, group=group, group_src=0, device=device)
-        metadata = header[0]
-    if metadata is None:  # The checkpoint emitted no CLS tokens.
-        return []
-
-    shape, dtype = metadata
+    shape, dtype = layout
     send = torch.empty((rank_capacity, *shape), dtype=dtype, device=device)
     if local:
         torch.stack(local, out=send[: len(local)])
@@ -53,9 +61,6 @@ def _gather_clip_tiles(
     received = send.new_empty((world_size * rank_capacity, *shape))
     dist.all_gather_into_tensor(received, send, group=group)
     received = received.unflatten(0, (world_size, rank_capacity))
-
-    # Native blending and CLS aggregation expect one tensor per spatial tile
-    # with the (sample, clip) axes flattened together, not clip-major tasks.
     return [
         torch.stack(
             [received[task % world_size, task // world_size] for task in range(tile, task_count, tile_count)], dim=1
@@ -64,49 +69,84 @@ def _gather_clip_tiles(
     ]
 
 
+def _gather_clip_results(
+    moments: list[torch.Tensor],
+    cls_tokens: list[torch.Tensor],
+    tile_count: int,
+    clip_count: int,
+    group: dist.ProcessGroup,
+    device: torch.device,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Gather moments and CLS tokens with a layout every rank takes from rank 0."""
+    layouts = [(values[0].shape, values[0].dtype) if values else None for values in (moments, cls_tokens)]
+    header = [tuple(layouts)]
+    dist.broadcast_object_list(header, group=group, group_src=0, device=device)
+    for values, layout in zip((moments, cls_tokens), header[0]):
+        if values and (values[0].shape, values[0].dtype) != layout:
+            raise ValueError("MiniMax H3 encoder tile ranks returned different per-task tensor layouts")
+    moment_layout, cls_layout = header[0]
+    return (
+        _gather_clip_tiles(moments, moment_layout, tile_count, clip_count, group, device),
+        _gather_clip_tiles(cls_tokens, cls_layout, tile_count, clip_count, group, device) if cls_layout else [],
+    )
+
+
 def encode_clip_group(model: nn.Module, clips: torch.Tensor, clip_count: int) -> torch.Tensor:
-    group = _encode_tile_group.get()
-    if group is None:
+    """Encode independent clips as one checkpoint tile pass, grouped when a tile group is set."""
+    if _encode_tile_group.get() is None:
         return model._adaptive_encode(clips)
-
-    rank = dist.get_rank(group)
-    world_size = dist.get_world_size(group)
-    run_tile_tasks = model._run_tile_tasks
-
-    def run_clip_tiles(tiles, _tile_indices, forward_fn, stack_tiling, cls_agg):
-        tile_count = len(tiles)
-        by_clip = [tile.unflatten(0, (-1, clip_count)) for tile in tiles]
-        local_tiles = []
-        for task in range(rank, clip_count * tile_count, world_size):
-            clip, tile = divmod(task, tile_count)
-            local_tiles.append(by_clip[tile][:, clip])
-        local = (
-            run_tile_tasks(local_tiles, range(len(local_tiles)), forward_fn, stack_tiling, cls_agg)
-            if local_tiles
-            else []
-        )
-        encoded = _gather_clip_tiles(local, tile_count, clip_count, group, clips.device)
-        cls_agg.cls_tokens = _gather_clip_tiles(cls_agg.cls_tokens, tile_count, clip_count, group, clips.device)
-        return encoded
-
-    # Let the checkpoint build and blend its spatial grid, but replace its
-    # spatial-only dispatch/gather for this window. Don't change group state.
     parallel_tiling = model.parallel_tiling
+    token = _clip_count.set(clip_count)
     model.parallel_tiling = False
-    model._run_tile_tasks = run_clip_tiles
     try:
         return model._adaptive_encode(clips)
     finally:
-        model._run_tile_tasks = run_tile_tasks
         model.parallel_tiling = parallel_tiling
+        _clip_count.reset(token)
+
+
+def _run_batched_tiles(run_tile_tasks, tiles, indices, forward_fn, cls_agg, sample_limit):
+    tiles_per_forward = max(1, sample_limit // tiles[0].shape[0])
+    results = []
+    for start in range(0, len(indices), tiles_per_forward):
+        batch = indices[start : start + tiles_per_forward]
+        results.extend(run_tile_tasks(tiles, batch, forward_fn, len(batch) > 1, cls_agg))
+    return results
+
+
+def _run_encode_tile_tasks(model, run_tile_tasks, tiles, indices, forward_fn, stack_tiling, cls_agg=None):
+    sample_limit = encode_tile_batch_size.get()
+    if sample_limit == 1 or forward_fn != model.encode:
+        return run_tile_tasks(tiles, indices, forward_fn, stack_tiling, cls_agg)
+    group = _encode_tile_group.get()
+    clip_count = _clip_count.get()
+    if group is None or clip_count == 1:
+        return _run_batched_tiles(run_tile_tasks, tiles, indices, forward_fn, cls_agg, sample_limit)
+
+    tile_count = len(tiles)
+    by_clip = [tile.unflatten(0, (-1, clip_count)) for tile in tiles]
+    local_tiles = []
+    for task in range(dist.get_rank(group), clip_count * tile_count, dist.get_world_size(group)):
+        clip, tile = divmod(task, tile_count)
+        local_tiles.append(by_clip[tile][:, clip])
+    local = (
+        _run_batched_tiles(run_tile_tasks, local_tiles, range(len(local_tiles)), forward_fn, cls_agg, sample_limit)
+        if local_tiles
+        else []
+    )
+    encoded, cls_agg.cls_tokens = _gather_clip_results(
+        local, cls_agg.cls_tokens, tile_count, clip_count, group, tiles[0].device
+    )
+    return encoded
 
 
 def configure_video_encode_tiling(
     model: nn.Module, *, batch_size: int, tile_size: int | None, tile_overlap: int | None
-) -> None:
-    """Tune the encoder grid and bound the checkpoint's rank-local tile batch."""
+) -> tuple[int, int] | None:
+    """Validate video-only geometry and install the bounded encode task runner."""
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError("video_vae_encode_tile_batch_size must be a positive integer")
+    geometry = None
     if tile_size is not None or tile_overlap is not None:
         size = model.tile_size if tile_size is None else tile_size
         overlap = model.tile_overlap_min if tile_overlap is None else tile_overlap
@@ -119,23 +159,7 @@ def configure_video_encode_tiling(
             or overlap % ratio
         ):
             raise ValueError(f"Video VAE encoder needs integer 0 < overlap < tile size, both divisible by {ratio}")
-        model.tile_size, model.tile_overlap_min = size, overlap
-    if batch_size == 1 or model.encoder_parallel:
-        return
-
-    run_tile_tasks = model._run_tile_tasks
-
-    def run_encode_tile_tasks(tiles, tile_indices, forward_fn, stack_tiling, cls_agg=None):
-        sample_limit = encode_tile_batch_size.get()
-        if sample_limit == 1 or forward_fn != model.encode:
-            return run_tile_tasks(tiles, tile_indices, forward_fn, stack_tiling, cls_agg)
-        # Each spatial tile may already contain several temporal clips on its
-        # sample axis. Count those samples against the same forward budget.
-        tiles_per_forward = max(1, sample_limit // tiles[0].shape[0])
-        results = []
-        for start in range(0, len(tile_indices), tiles_per_forward):
-            indices = tile_indices[start : start + tiles_per_forward]
-            results.extend(run_tile_tasks(tiles, indices, forward_fn, len(indices) > 1, cls_agg))
-        return results
-
-    model._run_tile_tasks = run_encode_tile_tasks
+        geometry = size, overlap
+    if batch_size > 1 and not model.encoder_parallel:
+        model._run_tile_tasks = partial(_run_encode_tile_tasks, model, model._run_tile_tasks)
+    return geometry

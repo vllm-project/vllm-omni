@@ -132,11 +132,12 @@ def _patch_encoder_constructors(monkeypatch, *, rank: int):
     group = SimpleNamespace(rank_in_group=rank, world_size=2, device_group=object())
 
     class FakeVideoVAE(torch.nn.Module):
-        def __init__(self, path, *, device, encode_only, trust_remote_code):
+        def __init__(self, path, *, device, encode_only, trust_remote_code, additional_config):
             super().__init__()
             self.path = path
             self.parallel_args = None
             self.trust_remote_code = trust_remote_code
+            self.additional_config = additional_config
 
         def set_parallel_size(self, size, *, process_group):
             self.parallel_args = (size, process_group)
@@ -180,7 +181,8 @@ def _encoder_config(root, *, video_mode="patch", roles=None, trust_remote_code=T
             model=str(root / "text_encoder"),
             hf_config=SimpleNamespace(minimax_h3_encoder_components=components),
             trust_remote_code=trust_remote_code,
-        )
+        ),
+        additional_config={},
     )
 
 
@@ -207,8 +209,15 @@ def test_encoder_uses_tp_patch_and_leader_on_the_same_rank_set(
     encoder_module, group = _patch_encoder_constructors(monkeypatch, rank=rank)
     root = _component_root(tmp_path)
     config = _encoder_config(root, trust_remote_code=trust_remote_code)
+    config.additional_config = {
+        "video_vae_encode_tile_batch_size": 4,
+        "video_vae_encode_tile_size": 288,
+        "video_vae_encode_tile_overlap": 16,
+    }
 
     model = encoder_module.MiniMaxH3Encoder(vllm_config=config)
+
+    assert model.video_vae.additional_config is config.additional_config
 
     assert model.component_config.text_parallel_mode == "tp"
     assert model.component_config.video_parallel_mode == "patch"

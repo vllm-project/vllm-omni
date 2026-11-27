@@ -68,7 +68,6 @@ def _encode_temporal_tail_pad(self, x):
     z_list = []
     clip = 0
     while clip < num_chunks:
-        # Keep any padded tail on its original one-clip path.
         full_clips = num_chunks - clip - bool(pad_size)
         count = max(1, min(clips_per_forward, full_clips))
         start_idx = clip * self.clip_length + offset_frame
@@ -95,14 +94,11 @@ def _encode_temporal_tail_pad(self, x):
             else:
                 z = z_key
         elif count > 1:
-            # Keep clips independent; the checkpoint still owns the spatial
-            # tile grid and blending for each sample.
             clips = clip_x.unflatten(2, (count, self.clip_length)).transpose(1, 2).flatten(0, 1)
             encoded = encode_clip_group(self, clips, count)
             z = encoded.unflatten(0, (sample_batch, count)).transpose(1, 2).flatten(2, 3)
             loss_info = getattr(self.encoder, "loss_info", {})
             if "cls_token" in loss_info:
-                # The serial loop leaves only the last clip's CLS state.
                 loss_info["cls_token"] = loss_info["cls_token"].unflatten(0, (sample_batch, count))[:, -1].contiguous()
         else:
             z = self._adaptive_encode(clip_x)
