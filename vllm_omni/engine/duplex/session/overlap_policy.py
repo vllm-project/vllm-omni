@@ -315,7 +315,7 @@ def merge_audio_payloads(first: dict[str, object], second: dict[str, object]) ->
     if first.get("video_frames") and not first.get("audio"):
         # Coalesce the response, not its committed visual history. A camera
         # payload has no PCM format; the audio fallback below would drop it.
-        return {**second, "video_frames": merged_frames}
+        return {**second, "video_frames": merged_frames, "coalesced_input": True}
     if (
         first.get("format") == "pcm_f32le"
         and first.get("audio")
@@ -324,7 +324,7 @@ def merge_audio_payloads(first: dict[str, object], second: dict[str, object]) ->
     ):
         # Keep retained speech and its transcript owner. Frames accumulate in
         # capture order; each model applies its own visual-window policy.
-        return {**first, "video_frames": merged_frames}
+        return {**first, "video_frames": merged_frames, "coalesced_input": True}
     if first.get("format") != "pcm_f32le" or second.get("format") != "pcm_f32le":
         return second
     first_rate = first.get("sample_rate_hz")
@@ -341,6 +341,7 @@ def merge_audio_payloads(first: dict[str, object], second: dict[str, object]) ->
     except (binascii.Error, ValueError):
         return second
     merged = dict(second)
+    merged["coalesced_input"] = True
     merged["audio"] = base64.b64encode(first_raw + second_raw).decode("ascii")
     merged["sample_rate_hz"] = first_rate
     merged.pop("committed_audio_segments", None)

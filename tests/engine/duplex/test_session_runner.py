@@ -62,7 +62,7 @@ from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import REPLAY_CONTEXT_KEY
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import CHECKPOINT_KEY, REPLAY_CONTEXT_KEY
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1539,8 +1539,8 @@ async def test_playback_barge_in_replays_committed_input_after_response_done(mon
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reuse_cancelled_id", [False, True], ids=["delete-completed", "recreate-cancelled"])
-async def test_barge_in_replay_respects_live_conversation_sources(monkeypatch, reuse_cancelled_id) -> None:
+@pytest.mark.parametrize("edit", ["delete-completed-user", "delete-completed-assistant", "recreate-cancelled-user"])
+async def test_barge_in_replay_respects_live_conversation_sources(monkeypatch, edit) -> None:
     _stub_tokenizer(monkeypatch)
     h = await open_harness()
     try:
@@ -1562,9 +1562,14 @@ async def test_barge_in_replay_respects_live_conversation_sources(monkeypatch, r
         assert h.session.active_response_id is not None
         assert find(await h.run(commands.BargeIn()), "response.done").status == "cancelled"
 
-        deleted_id = cancelled.item_id if reuse_cancelled_id else first.item_id
+        assistant_id = f"item_{response_id}"
+        deleted_id = {
+            "delete-completed-user": first.item_id,
+            "delete-completed-assistant": assistant_id,
+            "recreate-cancelled-user": cancelled.item_id,
+        }[edit]
         find(await h.run(commands.DeleteItem(item_id=deleted_id)), "conversation.item.deleted")
-        if reuse_cancelled_id:
+        if edit == "recreate-cancelled-user":
             find(
                 await h.run(
                     commands.CreateItem(
@@ -1578,20 +1583,59 @@ async def test_barge_in_replay_respects_live_conversation_sources(monkeypatch, r
                 ),
                 "conversation.item.created",
             )
-        retrieved = await h.run(
-            commands.SignalTurn(event="conversation.item.retrieve", signal_payload={"item_id": f"item_{response_id}"})
-        )
-        find(retrieved, "conversation.item.retrieved")
+        if edit != "delete-completed-assistant":
+            retrieved = await h.run(
+                commands.SignalTurn(event="conversation.item.retrieve", signal_payload={"item_id": assistant_id})
+            )
+            find(retrieved, "conversation.item.retrieved")
         await h.run(append_audio(value=0.15))
 
         duplex = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
         assert duplex["epoch"] == 1 and duplex["seq"] == 1
         assert duplex["session_window_replay"] is False
-        [turn] = duplex[REPLAY_CONTEXT_KEY]
-        [unit] = turn["inputs"]
-        assert unit["video_frames"] == [first_frame if reuse_cancelled_id else cancelled_frame]
-        assert unit["audio"] == b64(pcm_f32(16000, value=0.05 if reuse_cancelled_id else 0.1))
-        assert turn["response_token_ids"] == (list(map(ord, "completed")) if reuse_cancelled_id else [])
+        expected_by_edit: dict[str, list[tuple[str, float, list[int], bool]]] = {
+            "delete-completed-user": [(cancelled_frame, 0.1, [], True)],
+            "delete-completed-assistant": [(first_frame, 0.05, [], False), (cancelled_frame, 0.1, [], True)],
+            "recreate-cancelled-user": [(first_frame, 0.05, list(map(ord, "completed")), False)],
+        }
+        expected = expected_by_edit[edit]
+        assert len(duplex[REPLAY_CONTEXT_KEY]) == len(expected)
+        for turn, (frame, value, response_ids, resumes_audio) in zip(duplex[REPLAY_CONTEXT_KEY], expected):
+            [unit] = turn["inputs"]
+            assert unit["video_frames"] == [frame]
+            assert unit["audio"] == b64(pcm_f32(16000, value=value))
+            assert turn["response_token_ids"] == response_ids
+            assert turn["user_only"] is (not response_ids)
+            assert turn["resumes_audio_window"] is resumes_audio
+        if edit == "delete-completed-assistant":
+            assert not duplex.get(CHECKPOINT_KEY)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_barge_in_does_not_replay_coalesced_commits_under_one_item(monkeypatch) -> None:
+    _stub_tokenizer(monkeypatch)
+    h = await open_harness(auto_response=False)
+    try:
+        items = []
+        for value in (0.05, 0.1):
+            await h.run(append_audio(samples=8000, value=value))
+            committed = await h.run(commands.Commit(create_response=False))
+            items.append(find(committed, "input_audio_buffer.committed").item_id)
+        await h.run(commands.CreateResponse())
+        submitted = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
+        assert [segment["item_id"] for segment in submitted["committed_audio_segments"]] == items
+        await h.deliver_and_settle(tts_output(h.stage0_request_id(), text="counting"))
+        assert find(await h.run(commands.BargeIn()), "response.done").status == "cancelled"
+        find(await h.run(commands.DeleteItem(item_id=items[0])), "conversation.item.deleted")
+
+        await h.run(append_audio(samples=8000, value=0.15))
+        await h.run(commands.Commit(create_response=True))
+        duplex = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert duplex["epoch"] == 1 and duplex["seq"] == 1
+        assert duplex["session_window_replay"] is False
+        assert not duplex.get(REPLAY_CONTEXT_KEY)
     finally:
         await close_harness(h)
 

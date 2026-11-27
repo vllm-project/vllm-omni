@@ -119,6 +119,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
 from vllm_omni.model_executor.common.duplex.payload import payload_audio
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     APPEND_TEXT_TOKEN_IDS_KEY,
+    REPLAY_CONTEXT_KEY,
     MiniCPMO45TurnState,
     record_turn_sample,
 )
@@ -947,7 +948,7 @@ class MiniCPMO45SchedulerWindowPolicy:
         if not duplex_window_replay_enabled(info):
             duplex = info["duplex"]
             cfg = duplex["runtime_config"]
-            if duplex.get("seq") == 1 and "duplex_first_append_context_tokens" in cfg:
+            if REPLAY_CONTEXT_KEY in duplex and duplex.get("seq") == 1 and "duplex_first_append_context_tokens" in cfg:
                 duplex["open_input_start"] = cfg["duplex_first_append_context_tokens"]
                 if self.committed_kv is not None and self.carry is not None:
                     window = self.carry.latest_window(sid)
@@ -1077,9 +1078,13 @@ class MiniCPMO45SchedulerWindowPolicy:
             segment_output_ids=segment_output_ids,
             completed_terminator=completed_terminator,
         )
-        if reanchored is not None or replaced:
+        if replay_enabled and (reanchored is not None or replaced):
             request._minicpmo45_checkpoint_rebased = True
-        if isinstance(duplex, dict) and (start := getattr(request, "_minicpmo45_window_open_start", None)) is not None:
+        if (
+            isinstance(duplex, dict)
+            and (replay_enabled or REPLAY_CONTEXT_KEY in duplex)
+            and (start := getattr(request, "_minicpmo45_window_open_start", None)) is not None
+        ):
             duplex["open_input_start"] = start
         if replaced:
             return len(update.prompt_token_ids)

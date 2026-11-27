@@ -675,6 +675,9 @@ Once a MiniCPM-o user input has a committed history item, replacement
 requests restore media from current committed user items and text from
 completed replies. This path excludes the cancelled reply and honours
 history deletion, including deletion followed by reuse of the public item ID.
+Deleting only a reply preserves its retained user input. Media coalesced from
+multiple commits into one model append is skipped during recovery because it
+has no single conversation source.
 
 On a locally managed Stage-0 replica in `"basic"` mode, the first replacement
 can reuse full KV blocks from the settled prefix before the interrupted turn.
@@ -684,10 +687,10 @@ optimization unavailable. The replacement can still prefill the selected
 history without the checkpoint. An admitted replacement keeps the actual input
 rows available for recompute if it is preempted later.
 
-An independently hosted Stage-0 replica uses the bounded handoff in `"basic"`
-and `"context"`: the same replica can offer completed units for 10 seconds
-from the abort, subject to a limit of 32 waiting windows. In `"off"` mode this
-deployment starts the replacement from the system turn and reference audio.
+Without committed history, an independently hosted Stage-0 replica can hand
+off completed units in `"basic"` and `"context"` for up to 10 seconds after
+the abort, with at most 32 waiting windows. In `"off"` mode the replacement
+starts from the system turn and reference audio.
 
 Constructor options: `reconnect` (a `ReconnectPolicy`, default five
 attempts with 0.25–4 s jittered backoff; `None` disables auto-resume),

@@ -455,6 +455,7 @@ def test_sage_window_preserves_append_boundaries_without_cross_epoch_replay(mode
     update = append(request_id, fence, 2)
     policy = MiniCPMO45SchedulerWindowPolicy()
     assert policy.prepare_admission(request, max_prompt_len=100) is None
+    assert "open_input_start" not in request.model_intermediate_buffer["duplex"]
     policy.observe_progress(request)
     terminator = runtime["duplex_boundary_token_ids"]["listen_token_id"]
     replacement = policy.prepare_append(

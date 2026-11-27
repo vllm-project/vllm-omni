@@ -359,6 +359,7 @@ async def test_add_request_attaches_payload_once_and_streaming_update_does_not(m
 async def test_duplex_session_submit_does_not_request_payload(mocker) -> None:
     orchestrator = _orchestrator(cls=DuplexOrchestrator)
     orchestrator.replica_placement = None
+    orchestrator._window_replicas = {}
     # The default plugin answer: a Stage0 request prewarms its downstream stages.
     plugin = mocker.create_autospec(DuplexModelPlugin, instance=True)
     plugin.prewarms_downstream_stages.return_value = True

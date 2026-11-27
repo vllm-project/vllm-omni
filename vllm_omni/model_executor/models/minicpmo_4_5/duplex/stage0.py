@@ -185,6 +185,12 @@ class _MiniCPMO45Stage0SessionState(MiniCPMO45TurnState):
     replay_samples: dict[int, tuple[list[int], list[tuple[int, int | None]]]] = field(default_factory=dict)
     last_raw_draw: int | None = None
 
+    def set_context(self, prefix: _MiniCPMO45WindowUnit, suffix: _MiniCPMO45WindowUnit) -> None:
+        self.context_prefix_embeds, self.context_prefix_token_ids = prefix.embeds, prefix.token_ids
+        self.context_suffix_embeds, self.context_suffix_token_ids = suffix.embeds, suffix.token_ids
+        self.context_embeds = [*prefix.embeds, *suffix.embeds]
+        self.context_token_ids = [*prefix.token_ids, *suffix.token_ids]
+
     def accepted_sampling_history(self, seq: int, accepted) -> list[int] | None:
         base, draws = self.replay_samples.get(seq, ([], []))
         prefix = draws[: len(accepted)]
@@ -534,27 +540,19 @@ class MiniCPMO45Stage0DuplexRuntime:
             ref_audio is not None,
             initial_user_text,
         )
-        for token_id in self._encode_text(prefix):
-            embed = self._embed_token(token_id)
-            state.context_embeds.append(embed)
-            state.context_token_ids.append(token_id)
-            state.context_prefix_embeds.append(embed)
-            state.context_prefix_token_ids.append(token_id)
+        prefix_ids = self._encode_text(prefix)
+        prefix_embeds = [self._embed_token(token_id) for token_id in prefix_ids]
         if ref_audio is not None:
             ref_audio_embeds = self._stage_ref_audio_embeddings(ref_audio, state=state)
             if ref_audio_embeds is not None:
                 ref_audio_embeds = self._as_2d_tensor(ref_audio_embeds)
-                placeholder_ids = [self.unit_token_id] * int(ref_audio_embeds.shape[0])
-                state.context_embeds.append(ref_audio_embeds)
-                state.context_token_ids.extend(placeholder_ids)
-                state.context_prefix_embeds.append(ref_audio_embeds)
-                state.context_prefix_token_ids.extend(placeholder_ids)
-        for token_id in self._encode_text(suffix):
-            embed = self._embed_token(token_id)
-            state.context_embeds.append(embed)
-            state.context_token_ids.append(token_id)
-            state.context_suffix_embeds.append(embed)
-            state.context_suffix_token_ids.append(token_id)
+                prefix_embeds.append(ref_audio_embeds)
+                prefix_ids.extend([self.unit_token_id] * ref_audio_embeds.shape[0])
+        suffix_ids = self._encode_text(suffix)
+        state.set_context(
+            _MiniCPMO45WindowUnit(prefix_embeds, prefix_ids),
+            _MiniCPMO45WindowUnit([self._embed_token(token_id) for token_id in suffix_ids], suffix_ids),
+        )
         if isinstance(initial_user_text, str) and initial_user_text:
             # Seeded text is pending user content just like a speech append.
             # Otherwise the turn-ended latch forces its silent input clock to
@@ -570,11 +568,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         source = self._replay_windows.get(checkpoint["source"])
         if source is None or source.header is None:
             raise _UnrecoverableWindowError("Missing accepted MiniCPM-o checkpoint rows")
-        header = source.header.unpack()
-        state.context_prefix_embeds, state.context_prefix_token_ids = header[0].embeds, header[0].token_ids
-        state.context_suffix_embeds, state.context_suffix_token_ids = header[1].embeds, header[1].token_ids
-        state.context_embeds = [*state.context_prefix_embeds, *state.context_suffix_embeds]
-        state.context_token_ids = [*state.context_prefix_token_ids, *state.context_suffix_token_ids]
+        prefix, suffix = source.header.unpack()
+        state.set_context(prefix, suffix)
         rows = checkpoint["rows"] - len(state.context_token_ids)
         if rows <= 0:
             raise _UnrecoverableWindowError("Invalid accepted MiniCPM-o checkpoint length")
@@ -1208,10 +1203,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             carried = record.unpack()
             if record.header is not None:
                 prefix, suffix = record.header.unpack()
-                state.context_prefix_embeds, state.context_prefix_token_ids = prefix.embeds, prefix.token_ids
-                state.context_suffix_embeds, state.context_suffix_token_ids = suffix.embeds, suffix.token_ids
-                state.context_embeds = [*prefix.embeds, *suffix.embeds]
-                state.context_token_ids = [*prefix.token_ids, *suffix.token_ids]
+                state.set_context(prefix, suffix)
             state.generated_tokens = list(record.sampling_history)
             state.explicit_response_awaiting_content = False
             state.current_turn_ended = True

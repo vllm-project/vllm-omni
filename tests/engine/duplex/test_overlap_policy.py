@@ -225,7 +225,7 @@ def test_committed_camera_frames_survive_coalescing(with_speech: bool) -> None:
     if with_speech:
         second.update(format="pcm_f32le", sample_rate_hz=16000, audio="AAAAAA==", is_speech=True)
     merged = overlap_policy.merge_audio_payloads(first, second)
-    assert merged == {**second, "video_frames": ["frame-a", "frame-b"]}
+    assert merged == {**second, "video_frames": ["frame-a", "frame-b"], "coalesced_input": True}
     # The newest commit decides whether the coalesced response may speak.
     assert merged["force_listen"] is False
     assert first["video_frames"] == ["frame-a"]

@@ -284,84 +284,31 @@ def test_final_exact_chunk_append_reserves_one_unit_not_two(seq):
     assert _budget(seq=seq, final=True) == _budget(seq=seq, final=False)
 
 
-@pytest.mark.asyncio
-async def test_replacement_reserves_history_only_on_its_first_append(monkeypatch):
-    _stub_tokenizer(monkeypatch)
-    plugin = _plugin()
-    state = plugin.create_session_state()
-    runtime = await plugin.prepare_runtime_config(DuplexSessionConfig(modalities=("text",)), model_config=None)
+def test_replacement_reserves_history_only_on_its_first_append():
+    history = [{"token_budget": 12, "resumes_audio_window": False}]
+    payload = {"type": "audio", "video_frames": ["live frame"]}
+    runtime = {"duplex_first_append_context_tokens": 8}
 
-    async def plan(fence, seq, payload, config=None):
-        return await plugin.prepare_append_plan(
+    def plan(seq, replay=None):
+        config = {module.REPLAY_CONTEXT_KEY: replay} if replay is not None else {}
+        prompt = module.build_duplex_data_plane_prompt(
             request_id="request",
-            fence=fence,
-            session_config=config or {},
+            fence=DuplexFence("session", epoch=1),
+            session_config=config,
             runtime_config=runtime,
             seq=seq,
             turn_seq=1,
             payload=payload,
             final=False,
-            sampling_params=None,
         )
+        return len(prompt["prompt_token_ids"]), prompt["model_intermediate_buffer"]["duplex"]
 
-    blue = DuplexFence("session", epoch=0, turn_id=1)
-    cancelled = DuplexFence("session", epoch=0, turn_id=2)
-    recovery = DuplexFence("session", epoch=1, turn_id=3)
-    first = {
-        "type": "audio",
-        "audio": base64.b64encode(np.zeros(32000, dtype=np.float32).tobytes()).decode(),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "video_frames": ["blue-frame"],
-    }
-    old = {"type": "audio", "video_frames": ["old-frame"]}
-    new = {"type": "audio", "video_frames": ["new-frame"]}
-
-    first_plan = await plan(blue, 1, first)
-    plugin.observe_submitted_append(state=state, fence=blue, prompt=first_plan.prompt, input_commit_seq=1)
-    plugin.observe_committed_input(state=state, fence=blue, item_id="user_blue", source_id=1, input_commit_seq=1)
-    plugin.observe_response_end(state=state, fence=blue, response_id="blue", completed=True)
-    old_plan = await plan(cancelled, 2, old)
-    plugin.observe_submitted_append(state=state, fence=cancelled, prompt=old_plan.prompt, input_commit_seq=2)
-    plugin.observe_committed_input(state=state, fence=cancelled, item_id="user_old", source_id=2, input_commit_seq=2)
-    plugin.observe_response_end(state=state, fence=cancelled, response_id="old", completed=False)
-    config = plugin.prepare_prompt_config(
-        {
-            "conversation": [
-                {"role": "user", "content": "What color is this?"},
-                {"role": "assistant", "content": "Blue."},
-                {"role": "user", "content": "Please count."},
-                {"role": "assistant", "content": "One"},
-            ],
-            "conversation_item_ids": ("user_blue", "item_blue", "user_old", "item_old"),
-            "conversation_user_source_ids": {"user_blue": 1, "user_old": 2},
-        },
-        state=state,
-        payload=new,
-    )
-    baseline = await plan(recovery, 1, new)
-    recovered = await plan(recovery, 1, new, config)
-    envelope = recovered.prompt["model_intermediate_buffer"]["duplex"]
-    turn, interrupted = envelope[module.REPLAY_CONTEXT_KEY]
-    assert turn["inputs"] == [{key: first[key] for key in ("audio", "format", "sample_rate_hz", "video_frames")}]
-    assert turn["response_token_ids"] == list(map(ord, "Blue."))
-    assert interrupted["user_only"] is True
-    assert interrupted["inputs"] == [{"video_frames": ["old-frame"]}]
-    assert interrupted["response_token_ids"] == []
-    assert envelope["payload"] == new
-    assert len(recovered.prompt["prompt_token_ids"]) == (
-        len(baseline.prompt["prompt_token_ids"]) + turn["token_budget"] + interrupted["token_budget"]
-    )
-    assert envelope["session_window_replay"] is False
-    assert "session_window_replay" not in baseline.prompt["model_intermediate_buffer"]["duplex"]
-
-    removed = {**config, "conversation_user_source_ids": {}}
-    result = await plan(recovery, 1, new, removed)
-    duplex = result.prompt["model_intermediate_buffer"]["duplex"]
-    assert module.REPLAY_CONTEXT_KEY not in duplex
-    assert duplex["session_window_replay"] is False
-    for fence, seq in ((blue, 1), (recovery, 2)):
-        continued = await plan(fence, seq, new, config)
-        duplex = continued.prompt["model_intermediate_buffer"]["duplex"]
-        assert module.REPLAY_CONTEXT_KEY not in duplex
-        assert duplex.get("session_window_replay", True) is (fence.epoch == 0)
+    for seq, replay in ((1, []), (1, history), (2, history)):
+        baseline, native = plan(seq)
+        length, recovery = plan(seq, replay)
+        expected = replay if seq == 1 else []
+        assert length == baseline + sum(turn["token_budget"] for turn in expected)
+        assert recovery[module.REPLAY_CONTEXT_KEY] == expected
+        assert recovery["payload"] == payload
+        assert recovery["session_window_replay"] is False
+        assert "session_window_replay" not in native

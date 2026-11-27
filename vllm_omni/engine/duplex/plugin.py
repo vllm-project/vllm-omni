@@ -782,10 +782,9 @@ class DuplexModelPlugin(ABC):
         state: DuplexModelSessionState,
         fence: DuplexFence,
         response_id: str,
-        completed: bool,
-        assistant_text: str = "",
+        completed_text: str | None,
     ) -> None:
-        """Observe cancellation or a normal response end eligible for history."""
+        """Observe a history-eligible response end. None denotes cancellation."""
 
     @abstractmethod
     def plan_append(

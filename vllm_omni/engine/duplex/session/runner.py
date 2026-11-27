@@ -2891,7 +2891,7 @@ class DuplexSessionRunner:
             turn_id = session.active_response_turn_id
             fence = session.fence if turn_id is None else DuplexFence(session.session_id, old_epoch, turn_id)
             self.plugin.observe_response_end(
-                state=self.ctx.model_state, fence=fence, response_id=old_response_id, completed=False
+                state=self.ctx.model_state, fence=fence, response_id=old_response_id, completed_text=None
             )
         should_commit = self.model.should_commit_response_to_history(session, old_response_id)
         committed_message = session.end_response(

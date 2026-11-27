@@ -401,17 +401,20 @@ def build_duplex_data_plane_prompt(
     if isinstance(append_text_ids, list):
         token_budget += len(append_text_ids)
     model_fields: dict[str, object] = {}
-    checkpoint = session_config.pop(CHECKPOINT_KEY, None) if CHECKPOINT_KEY in session_config else None
+    checkpoint = session_config.get(CHECKPOINT_KEY)
+    if REPLAY_CONTEXT_KEY in session_config or CHECKPOINT_KEY in session_config:
+        session_config = {
+            key: value for key, value in session_config.items() if key not in (REPLAY_CONTEXT_KEY, CHECKPOINT_KEY)
+        }
     if isinstance(checkpoint, dict):
         model_fields[CHECKPOINT_KEY] = checkpoint
     if fence.epoch > 0 and isinstance(replay, list):
-        # An authoritative history and a retained native window must never both be applied.
+        # An empty list still marks recovery from committed history.
         model_fields["session_window_replay"] = False
-        session_config = {key: value for key, value in session_config.items() if key != REPLAY_CONTEXT_KEY}
+        model_fields[REPLAY_CONTEXT_KEY] = replay if seq == 1 else []
         if seq == 1 and replay:
             replay_budget = sum(turn["token_budget"] for turn in replay)
             token_budget += replay_budget
-            model_fields[REPLAY_CONTEXT_KEY] = replay
             model_fields["duplex_replay_token_budget"] = replay_budget
     extra_body = session_config.get("extra_body")
     raw_token_id = runtime_config.get("duplex_scheduler_token_id")
@@ -855,6 +858,10 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         self._open_replay_epoch(state, fence.epoch)
         if not isinstance(payload, dict):
             return
+        if payload.get("coalesced_input") is True:
+            # This append has no single conversation source for its combined media.
+            state.checkpoint_eligible = False
+            return
         fields = ("audio", "data", "format", "sample_rate_hz", "video_frames", "text_token_ids")
         media = {key: payload[key] for key in fields if key in payload}
         frames = _duplex_frames(media)
@@ -932,8 +939,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         state: DuplexModelSessionState,
         fence: DuplexFence,
         response_id: str,
-        completed: bool,
-        assistant_text: str = "",
+        completed_text: str | None,
     ) -> None:
         assert isinstance(state, MiniCPMO45ServingSessionState)
         if state.replay_epoch != fence.epoch:
@@ -943,7 +949,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         state.replay_pending = [unit for unit in state.replay_pending if unit.turn_id > fence.turn_id]
         commit_seq = self._input_commit_seq(inputs)
         source = state.replay_commits.get(commit_seq) if commit_seq is not None else None
-        if not completed:
+        if completed_text is None:
             # A generated reply can still be cancelled while the client plays it.
             for index, turn in enumerate(state.replay_completed):
                 if turn.item_id == item_id:
@@ -954,7 +960,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             if source is not None and inputs:
                 state.replay_completed.append(_ReplayTurn(None, inputs, fence.epoch, source))
         elif inputs and (state.replay_overflow_turn is None or fence.turn_id > state.replay_overflow_turn):
-            state.replay_completed.append(_ReplayTurn(item_id, inputs, fence.epoch, source, assistant_text.strip()))
+            state.replay_completed.append(_ReplayTurn(item_id, inputs, fence.epoch, source, completed_text.strip()))
         while (
             sum(unit.num_bytes for turn in state.replay_completed for unit in turn.inputs) > _REPLAY_MAX_BYTES
             or sum(unit.token_budget for turn in state.replay_completed for unit in turn.inputs) > _REPLAY_MAX_TOKENS
@@ -1020,26 +1026,29 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         for turn in reversed(turns):
             if not self._source_is_current(turn, messages, sources):
                 continue
-            user_only = turn.item_id is None
-            if turn.item_id is None:
-                token_ids: list[int] = []
-                delimiters = 0 if turn.inputs[0].preceding_closure else 2
-            else:
-                text = self._assistant_text(messages, turn.item_id)
-                if text is None:
+            text = self._assistant_text(messages, turn.item_id) if turn.item_id is not None else None
+            user_only = text is None
+            inputs = turn.inputs
+            if user_only:
+                inputs = [unit for unit in inputs if unit.user_media]
+                if not inputs:
                     continue
+                token_ids: list[int] = []
+                delimiters = 0 if inputs[0].preceding_closure else 2
+            else:
                 token_ids = tokenizer.encode(text, add_special_tokens=False)
                 delimiters = 4
-            budget = sum(unit.token_budget for unit in turn.inputs) + len(token_ids) + delimiters
+            budget = sum(unit.token_budget for unit in inputs) + len(token_ids) + delimiters
             if budget > remaining:
                 break
             selected.append(
                 {
                     "epoch": turn.epoch,
-                    "inputs": [unit.payload for unit in turn.inputs],
+                    "inputs": [unit.payload for unit in inputs],
                     "response_token_ids": token_ids,
                     "user_only": user_only,
-                    "resumes_audio_window": user_only and any(payload_audio(unit.payload) for unit in turn.inputs),
+                    "resumes_audio_window": turn.item_id is None
+                    and any(payload_audio(unit.payload) for unit in inputs),
                     "token_budget": budget,
                 }
             )
