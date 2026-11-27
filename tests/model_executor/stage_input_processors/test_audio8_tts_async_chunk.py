@@ -156,6 +156,43 @@ def test_explicit_validity_flag_overrides_the_all_zero_heuristic():
     assert out is not None and out.tolist() == [0] * NUM_CODEBOOKS
 
 
+def _current_step(codes: torch.Tensor, valid: list[bool]) -> dict:
+    return {"codes": {"audio": codes}, "meta": {"codec_frame_valid": torch.tensor(valid)}}
+
+
+def test_current_step_validity_controls_frame_emission():
+    codes = torch.stack((_frame(1), _frame(0)))
+
+    valid_frame = extract_last_frame(_current_step(codes, [False, True]))
+    assert valid_frame is not None and valid_frame.tolist() == [0] * NUM_CODEBOOKS
+    assert extract_last_frame(_current_step(codes.flip(0), [True, False])) is None
+
+
+def test_invalid_step_does_not_resend_a_regular_chunk():
+    transfer_manager = _make_transfer_manager(chunk_frames=2, left_context=1)
+    request = _make_request()
+    _step(transfer_manager, request, 1)
+    assert _step(transfer_manager, request, 2) is not None
+
+    invalid = _current_step(_frame(99).unsqueeze(0), [False])
+    assert slow_ar_to_codec_decoder_async_chunk(transfer_manager, invalid, request) is None
+    assert len(transfer_manager.code_prompt_token_ids["req"]) == 2
+
+
+def test_eos_after_an_emitted_initial_chunk_sends_only_the_terminal_payload():
+    transfer_manager = _make_transfer_manager(chunk_frames=4, left_context=2, initial_chunk_frames=2)
+    request = _make_request()
+    assert _step(transfer_manager, request, 1) is None
+    assert _step(transfer_manager, request, 2) is not None
+    transfer_manager.put_req_chunk["req"] = 1
+
+    eos = _current_step(_frame(99).unsqueeze(0), [False])
+    payload = slow_ar_to_codec_decoder_async_chunk(transfer_manager, eos, request, is_finished=True)
+    assert payload is not None
+    assert payload.codes.audio.numel() == 0
+    assert bool(payload.meta.finished) is True
+
+
 def test_invalid_chunk_config_fails_loudly():
     transfer_manager = _make_transfer_manager(chunk_frames=0)
     request = _make_request()

@@ -288,6 +288,16 @@ def test_compute_hash_is_stable_across_launches(stage_id):
     assert first_hash == second_hash
 
 
+def test_scheduler_window_policy_preserves_the_model_compile_key():
+    config = OmniEngineArgs(worker_cls=AR_WORKER_CLS).create_engine_config()
+    assert "scheduler_window_policy" not in config.model_config.compile_factors()
+    original = hash_config(config)
+    config.model_config.scheduler_window_policy = (
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
+    )
+    assert hash_config(config) == original
+
+
 def test_compute_hash_keeps_stage_connector_settings():
     """Ensure connector settings that models read (e.g. codec chunk size) still change the hash."""
 
@@ -903,8 +913,8 @@ def test_native_mrv2_worker_provides_connector_without_legacy_mixin(worker_cls):
 DIFFUSION_PARALLEL_KNBS = [
     ("ulysses_degree", 4),
     ("ulysses_mode", "advanced_uaa"),
-    ("ulysses_a2a_permute", True),
     ("ulysses_overlap_chunks", 2),
+    ("ulysses_a2a_backend", "copy_engine"),
     ("ring_degree", 2),
     ("allgather_degree", 8),
     ("use_hsdp", True),
@@ -941,7 +951,7 @@ def test_from_cli_args_applies_diffusion_parallel_knobs():
             factory_kwargs["hsdp_shard_size"] = 2048
         if knob == "ulysses_overlap_chunks":
             # The overlap runs on the copy-engine exchange.
-            factory_kwargs["ulysses_a2a_permute"] = True
+            factory_kwargs["ulysses_a2a_backend"] = "copy_engine"
         stage_cfg = StageConfigFactory.create_default_diffusion(factory_kwargs)[0]
         parallel_config = stage_cfg["engine_args"]["parallel_config"]
         assert parallel_config[knob] == value, f"{knob} did not reach parallel_config"
