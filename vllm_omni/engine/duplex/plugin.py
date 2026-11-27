@@ -16,7 +16,7 @@ import asyncio
 import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Hashable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from importlib import import_module
 from typing import TYPE_CHECKING
@@ -34,6 +34,7 @@ from vllm_omni.engine.duplex.config import (
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
     DuplexFence,
+    DuplexOutputContext,
     DuplexOutputDecision,
     ToolCallAbandonReason,
     abandoned_tool_call_notice,
@@ -158,6 +159,14 @@ class PcmAppendBuffer(ABC):
     @abstractmethod
     def has_pending(self) -> bool: ...
 
+    def has_ready_unit(self, *, chunk_period_ms: int) -> bool:
+        """Whether buffered input can precede a text response's continuation.
+
+        Buffers that distinguish incomplete media from ready units may override
+        this; otherwise every pending input keeps priority over generated silence.
+        """
+        return self.has_pending()
+
     @abstractmethod
     def has_reserved(self) -> bool: ...
 
@@ -198,6 +207,19 @@ class PcmAppendBuffer(ABC):
 
     @abstractmethod
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None: ...
+
+    def prepare_backlog(self, *, operation_id: str, chunk_period_ms: int) -> PcmAppendReservation | None:
+        """Reserve one more complete buffered media unit, leaving partial PCM.
+
+        After an append emitted its unit, an input-clocked session calls this
+        until it returns ``None``, so an append longer than one unit submits
+        every whole unit it completed and is acknowledged after all of them.
+        Text appends also drain these units first, preserving media/text order.
+        Default: ``None`` (one unit per append; the rest waits for later
+        appends).
+        """
+        del operation_id, chunk_period_ms
+        return None
 
 
 class DuplexModelSessionState(ABC):
@@ -355,6 +377,43 @@ class DuplexDataPlaneContext:
     response_format: str = "wav"
     speed: float | None = None
     modalities: tuple[str, ...] = ()
+    # Producer turn captured at interception, when available (Stage0).
+    model_turn_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexUnitDecision:
+    """How a plugin decision taken at a stage segment end affects the model unit (input-clocked sessions)."""
+
+    #: Reported in ``input_audio_buffer.processed.units[].decision`` (e.g. ``"listen"``).
+    label: str
+    #: False when the decision is a side channel and the unit still produces
+    #: final-stage output (the unit then completes through ``unit_output_complete``).
+    ends_unit: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexUnitOutputs:
+    """What the engine knows about the oldest model unit still producing final-stage output."""
+
+    #: 0-based index of the unit among all units of the session (the order they were
+    #: created in): a stable key, not a position in the output stream (units that
+    #: never reached Stage 0, or whose epoch was cancelled, have indices too).
+    index: int
+    #: Whether the stage just before the final stage reported its segment end for this unit.
+    upstream_segment_finished: bool
+    #: Whether this unit's final-stage segment end arrived: the final stage's segment ends go,
+    #: in order, to the speaking units that reach the final stage (held until that unit speaks),
+    #: even while an older unit still waits for its upstream segment end. With a stage between
+    #: Stage 0 and the final stage, an end is credited to a unit only once the stage before the
+    #: final stage reported that unit's segment end, since a decision there can still end the unit.
+    final_segment_finished: bool
+    #: Session epoch the unit was submitted in (a cancel starts a new one).
+    epoch: int = 0
+    #: 1-based position of the unit among the Stage-0 submissions its epoch accepted
+    #: (the n-th Stage-0 segment end of the epoch decided it), counting units whose
+    #: decision ended them; units that never reached Stage 0 take none.
+    ordinal: int = 0
 
 
 class DuplexDataPlane(ABC):
@@ -490,6 +549,37 @@ class DuplexModelPlugin(ABC):
 
     projects_intermediate_outputs: bool = False
     supports_auxiliary_requests: bool = False
+    #: Whether sessions of this model may set ``extra_body.clock == "input"``;
+    #: otherwise such a session is refused (``input_clock_unsupported``).
+    #: MiniCPM-o 4.5 opts in. A plugin opts in once ``unit_decision`` /
+    #: ``unit_output_complete`` match its real unit boundaries, and only if
+    #: Stage 0 ends every accepted submission with exactly one segment end, in
+    #: submission order, with the unit's decision taken on that segment-ending
+    #: output: the n-th Stage-0 segment end of an epoch decides the n-th
+    #: accepted unit. An extra or missing segment end (e.g. a prefill-only
+    #: append that ends no segment) shifts the epoch's later units onto the
+    #: wrong segment ends: an acknowledgement may then arrive before its unit's
+    #: output, or wait for the timeouts, until the next cancel starts a new
+    #: epoch; the timeouts keep acknowledgements coming but do not resynchronise.
+    #: Paths that submit to Stage 0 for something other than a model unit break
+    #: that count too, so a plugin that routes committed input through an input
+    #: transcription request, or resumes the model on a tool result, does not
+    #: opt in until those submissions are accounted for. Likewise a submission
+    #: no client input makes (the remainder of a split committed input, a held
+    #: listen-only prefix, an item command's internal payload) is created after
+    #: its input's acknowledgement was fixed and is reported with the next
+    #: client input; a plugin that relies on those paths does not opt in yet.
+    supports_input_clock: bool = False
+    #: Input modalities an input-clocked session of this model accepts, or
+    #: ``None`` for the model's usual ones. A model whose committed turn can
+    #: split into several Stage-0 submissions for some modality (vision units
+    #: it replays separately, ``PcmAppendBuffer.prepare_commit_prefix``) is
+    #: not accounted for by the clock when that commit is deferred behind a
+    #: response, so it names the other modalities here: the session is created
+    #: without the rest (``apply_input_clock_capabilities``) and an append
+    #: carrying one of them is refused (``invalid_input_modality``) and
+    #: acknowledged as rejected.
+    input_clock_input_modalities: frozenset[str] | None = None
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
     #: Reasons this model can show a notice for. The notice goes through the
@@ -501,6 +591,7 @@ class DuplexModelPlugin(ABC):
     #: exactly like client audio, so it must be a unit the model accepts.
     silence_continuation_sample_rate_hz: int = 16000
     data_plane: DuplexDataPlane
+    _pipeline_config: PipelineConfig | None = None
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         # Constructor-only: concrete plugins hand the encoder to their data plane.
@@ -508,6 +599,31 @@ class DuplexModelPlugin(ABC):
 
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
         """Bind model policy to the resolved deployment topology before admission."""
+        self._pipeline_config = pipeline_config
+
+    def deployment_capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
+        """Resolve model capabilities against the topology bound at startup.
+
+        A single final text stage has no audio output or downstream transport.
+        Other topologies retain their plugin's contract, including transcripts
+        emitted alongside audio by a final speech stage.
+        """
+        capabilities = self.capabilities(max_sessions=max_sessions)
+        pipeline = self._pipeline_config
+        if pipeline is None or len(pipeline.stages) != 1:
+            return capabilities
+        stage = pipeline.stages[0]
+        if stage.final_output and stage.final_output_type == "text":
+            return replace(
+                capabilities,
+                supported_output_modalities=frozenset({"text"}) & capabilities.supported_output_modalities,
+                default_output_modalities=("text",),
+                supports_playback_ack=False,
+                supports_audio_truncate=False,
+                supports_stage_connector_handoff=False,
+                stage_handoff_transport=None,
+            )
+        return capabilities
 
     def configure_async_chunk(self, *, enabled: bool) -> None:
         """Receive the deploy-resolved ``async_chunk`` flag before admission.
@@ -549,6 +665,19 @@ class DuplexModelPlugin(ABC):
             "format": "pcm_f32le",
             "sample_rate_hz": int(self.silence_continuation_sample_rate_hz),
         }
+
+    def startup_warmup_turn(self) -> dict[str, object] | None:
+        """One spoken warmup append, or None to keep the shared probe.
+
+        The shared video-turn probe sends a short tone plus one frame. A model
+        that treats an empty transcript as silence never reaches its later
+        stages on that input. Override this with the same fields as an
+        ``input_audio_buffer.append`` (base64 ``audio``, ``format``,
+        ``sample_rate_hz``, and optionally ``is_speech`` and ``video_frames``)
+        plus ``instructions`` when the shared warmup prompt is wrong for the
+        model. None leaves the shared probe unchanged.
+        """
+        return None
 
     # ---- engine policy (was DuplexRuntimeExtension) ----
 
@@ -672,6 +801,7 @@ class DuplexModelPlugin(ABC):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None: ...
 
     def project_intermediate_output(
@@ -748,6 +878,7 @@ class DuplexModelPlugin(ABC):
         segment_finished: bool,
         output: object,
         context: object,
+        streaming_context: object | None = None,
     ) -> bool:
         """Return True when the next user commit may start while prior TTS drains.
 
@@ -771,6 +902,112 @@ class DuplexModelPlugin(ABC):
         """
         del stage_count
         return frozenset()
+
+    def prewarms_downstream_stages(self, request_id: str) -> bool:
+        """Whether a new Stage0 request pre-submits its downstream stages.
+
+        In async-chunk mode the orchestrator pre-submits every connector-fed
+        stage after Stage0 when the request is first sent. Return False when
+        this request can never reach those stages (for example, a turn whose
+        response modalities have no audio), so no placeholder is created only
+        to be aborted when the turn ends. Called after ``plan_append`` bound
+        the request. Default is True.
+        """
+        del request_id
+        return True
+
+    # ---- input-clocked sessions (extra_body.clock == "input") ----
+
+    def unit_decision(
+        self,
+        *,
+        stage_id: int,
+        decision: DuplexOutputDecision | None,
+        output: object = None,
+        context: DuplexOutputContext | None = None,
+        runtime_config: Mapping[str, object] | None = None,
+    ) -> DuplexUnitDecision | None:
+        """Classify a stage segment end for the input clock.
+
+        The input clock tracks every model unit (one Stage-0 submission) until
+        all of its output has been emitted, so it can acknowledge the client
+        input that caused it. Called when a stage output arrives (so it reads
+        the live output at that moment): for a Stage-0 segment end (the one
+        output of a submission the clock consults, ``supports_input_clock``),
+        and for every output of a later stage before the final one that
+        carries a decision or ends a segment (``decision is None`` for a
+        segment end without one; ``output`` and ``context`` are that stage
+        output). ``runtime_config`` is the
+        session's runtime configuration (passed by the engine; the default
+        only keeps direct calls short). Decisions taken on the final stage are
+        not consulted. Default: no classification without a decision;
+        otherwise the label is ``"listen"`` when the decision metadata sets
+        ``model_listen`` (the framework key several models' data planes set),
+        else the action, and any decision ends the unit (``ends_unit=True``);
+        a plugin whose decisions do not all end the unit overrides this. A
+        plugin whose stage can end a segment that hands the next stage nothing
+        (so the unit would wait for a segment end that never comes) returns a
+        decision with ``ends_unit=True`` for it.
+        """
+        del stage_id, output, context, runtime_config
+        if decision is None:
+            return None
+        metadata = decision.metadata
+        if metadata.get("model_listen") is True:
+            label = "listen"
+        else:
+            label = str(getattr(decision.action, "value", decision.action))
+        return DuplexUnitDecision(label=label, ends_unit=True)
+
+    def unit_output_complete(
+        self,
+        *,
+        unit: DuplexUnitOutputs,
+        final_stage_id: int,
+        new_output: object | None,
+        new_context: DuplexOutputContext | None,
+        state: dict[str, object],
+        runtime_config: Mapping[str, object],
+    ) -> bool:
+        """Input clock: is the final-stage output of ``unit`` (the oldest speaking unit) complete?
+
+        Called after every final-stage output (``new_output`` / ``new_context``,
+        credited to ``unit``; a final-stage segment end sets
+        ``final_segment_finished`` on the unit it belongs to, which may be a
+        later speaking unit), after the segment end of the stage just before
+        the final stage, and, once a unit completed, again for the next one
+        with no new output (so one output may complete several units). The
+        engine only calls it with a speaking unit.
+
+        The engine keeps no output history: a plugin that needs more than the
+        flags of ``unit`` keeps it in ``state``, a dict it owns for the current
+        epoch: the engine hands it a new, empty one whenever a cancel starts a
+        new epoch, since the cancelled epoch's outputs are dropped and its
+        units settled. For example, ``state["flagged_unit"] = unit.index``
+        when ``new_output`` carries an end-of-unit flag; or, for a final stage
+        that emits one frame per Stage-0 submission, a count of the epoch's
+        frames compared with ``unit.ordinal`` (not ``unit.index``, which also
+        counts units that never reached Stage 0 and those of earlier epochs).
+        Output of a later stage that reaches the session before the Stage-0
+        segment end that makes its unit speaking (the orchestrator may deliver
+        different stages' outputs in either order) is held by the engine and
+        handed to the hook, in arrival order, once that unit is speaking.
+        ``runtime_config`` is the session's runtime configuration.
+
+        A hook that raises is logged (once per session) and its call counts
+        as "not complete": the unit is then settled by the timeouts. The same
+        holds for ``unit_decision`` ("no decision").
+
+        Default: the final stage marks one streaming segment end per unit, and
+        final-stage outputs of different units do not interleave. A model whose
+        final stage streams across unit boundaries must override this. Turns
+        never overlap in an input-clocked session (it does not open the
+        concurrent-turn gate, ``supports_concurrent_turn_requests``), because
+        the clock credits outputs to the speaking units in order; crediting by
+        request instead is future work.
+        """
+        del final_stage_id, new_output, new_context, state, runtime_config
+        return unit.final_segment_finished
 
     # ---- session policy (was ServingRuntimeAdapter) ----
 
@@ -866,6 +1103,19 @@ class DuplexModelPlugin(ABC):
         """
         del model_result
         return None
+
+    def function_call_releases_turn(self, model_result: Mapping[str, object]) -> bool:
+        """Whether publishing this call finishes a non-resumable turn.
+
+        The function-call branch returns before the normal end-of-turn path.
+        A call that still has speech, or a model that emits its own terminal
+        event afterwards, must keep the default: releasing here would abort
+        that speech. A model whose call has nothing left to speak overrides
+        this so the request is free before the client sends the tool result
+        and ``response.create``.
+        """
+        del model_result
+        return False
 
     def runtime_config_for_function_output(
         self,
@@ -1180,6 +1430,8 @@ __all__ = [
     "DefaultDuplexModelSessionState",
     "DuplexDataPlane",
     "DuplexDataPlaneContext",
+    "DuplexUnitDecision",
+    "DuplexUnitOutputs",
     "DuplexModelPlugin",
     "DuplexModelSessionState",
     "DuplexRuntimeConfigError",

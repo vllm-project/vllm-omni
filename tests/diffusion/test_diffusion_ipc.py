@@ -10,6 +10,7 @@ import time
 from collections import OrderedDict
 from multiprocessing import shared_memory
 from multiprocessing.connection import Connection
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -23,6 +24,8 @@ from vllm_omni.diffusion.ipc import (
     _SHM_TENSOR_THRESHOLD,
     DIFFUSION_RPC_RESULT_ENVELOPE,
     _pack_value_if_large,
+    _tensor_from_shm,
+    _tensor_to_shm,
     _unpack_if_shm_handle,
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
@@ -594,3 +597,99 @@ def test_pack_value_packs_non_contiguous_large_tensor_values() -> None:
         torch.testing.assert_close(unpacked, tensor)
     finally:
         _cleanup_shm_handle(packed)
+
+
+class _DeviceTensorDouble:
+    """Test double for a device tensor inside the cpu-marked suite.
+
+    ``_tensor_to_shm`` stages only non-CPU tensors (#9487), so the d2h tests
+    wrap a real host tensor and report a non-CPU device instead; ``detach()``
+    still yields host storage the staging ``copy_`` can read.
+    """
+
+    def __init__(self, values: torch.Tensor):
+        self._values = values
+        self.dtype = values.dtype
+        self.device = SimpleNamespace(type="npu")
+
+    def detach(self) -> torch.Tensor:
+        return self._values
+
+
+def _drive_d2h(monkeypatch: pytest.MonkeyPatch, *, pin_error: Exception | None = None):
+    """Run _tensor_to_shm's non-CPU d2h staging branch with the accelerator
+    stream faked out (this suite is cpu-marked; no real device exists).
+
+    Returns (attempts, fake_stream) where attempts records the pin_memory
+    flag of every staging allocation the branch made, in call order.
+    """
+
+    class FakeStream:
+        def __init__(self) -> None:
+            self.active = False
+
+        def __enter__(self) -> None:
+            self.active = True
+
+        def __exit__(self, *_exc_info: object) -> None:
+            self.active = False
+
+        def synchronize(self) -> None:
+            assert not self.active
+
+    stream = FakeStream()
+    attempts: list[bool] = []
+    real_empty = torch.empty
+
+    def fake_empty(shape, dtype=None, pin_memory=False, **kwargs):
+        assert stream.active
+        attempts.append(pin_memory)
+        if pin_memory and pin_error is not None:
+            raise pin_error
+        return real_empty(shape, dtype=dtype)
+
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    monkeypatch.setattr(diffusion_ipc, "PIN_MEMORY", True)
+    return attempts, stream
+
+
+def test_d2h_pinned_failure_falls_back_to_pageable(monkeypatch):
+    """A host-page OOM on the pinned staging buffer degrades to a pageable
+    copy with identical bytes and dtype (the #9957 fallback)."""
+    x = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+    attempts, stream = _drive_d2h(
+        monkeypatch,
+        pin_error=torch.OutOfMemoryError("aclrtMallocHostWithCfg failed: MallocHost out of memory"),
+    )
+
+    handle = _tensor_to_shm(_DeviceTensorDouble(x), stream, created=[])
+
+    assert attempts == [True, False]
+    # _tensor_from_shm consumes the segment (opens, reads and unlinks it), so
+    # no separate unlink is needed here.
+    restored = _tensor_from_shm(handle)
+    assert restored.dtype == x.dtype
+    assert torch.equal(restored, x)
+
+
+def test_d2h_re_raises_unrelated_pinned_allocation_errors(monkeypatch):
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    attempts, stream = _drive_d2h(monkeypatch, pin_error=RuntimeError("nvme controller wedged"))
+
+    with pytest.raises(RuntimeError, match="nvme controller wedged"):
+        _tensor_to_shm(_DeviceTensorDouble(x), stream, created=[])
+
+    assert attempts == [True]
+    assert not stream.active
+
+
+def test_d2h_uses_pinned_buffer_when_available(monkeypatch):
+    x = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+    attempts, stream = _drive_d2h(monkeypatch)
+
+    handle = _tensor_to_shm(_DeviceTensorDouble(x), stream, created=[])
+
+    assert attempts == [True]
+    restored = _tensor_from_shm(handle)
+    assert restored.dtype == x.dtype
+    assert torch.equal(restored, x)

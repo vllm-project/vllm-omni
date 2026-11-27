@@ -28,8 +28,12 @@ from typing import TYPE_CHECKING
 from opentelemetry import trace
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.commands import AppendAudio, Commit, DuplexCommand
-from vllm_omni.engine.duplex.config import apply_session_stats_capability
+from vllm_omni.engine.duplex.commands import AppendAudio, AppendText, Commit, DuplexCommand
+from vllm_omni.engine.duplex.config import (
+    DuplexConfigError,
+    apply_input_clock_capabilities,
+    apply_session_stats_capability,
+)
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexStagePort,
@@ -65,6 +69,7 @@ from vllm_omni.engine.duplex.plugin import (
     validate_session_tools,
 )
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
+from vllm_omni.engine.duplex.session.input_clock import check_input_clock_supported
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.session.perf_ledger import SessionPerfLedger
 from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider, SmartTurnBackendProvider
@@ -303,6 +308,11 @@ class DuplexSessionManager:
         holds its admitted byte reservation through decoding and VAD. The
         runner then replaces it with the decoded PCM reservation without an
         intervening await, keeping pending audio charged while it is busy.
+
+        A command refused here is answered with an ``error``. The modality and
+        backpressure refusals also call ``runner.input_refused``, which gives
+        an input-clocked session's refused input its acknowledgement in input
+        order; a refusal because the session is closing does not.
         """
         runner = self.runners.get(message.session_id)
         command = message.command
@@ -328,7 +338,24 @@ class DuplexSessionManager:
                     )
                 ],
             )
+            # Not ``input_refused``: an input-clocked session acknowledges only
+            # inputs that arrived before it began closing (its teardown
+            # acknowledgement covers them).
             return
+        if isinstance(command, AppendText):
+            if not session.capabilities.accepts_input_modality("text"):
+                self.emit(
+                    session,
+                    [
+                        self._error_event(
+                            "native_text_append_unsupported", "This model does not accept text appends", command=command
+                        )
+                    ],
+                )
+                return
+            if not command.text:
+                self.emit(session, [self._error_event("bad_event", "Text must be non-empty", command=command)])
+                return
         if isinstance(command, AppendAudio):
             has_audio = bool(command.audio)
             has_video = bool(command.video_frames)
@@ -338,9 +365,19 @@ class DuplexSessionManager:
                     session,
                     [self._error_event("invalid_input_modality", modality_error, command=command)],
                 )
+                runner.input_refused(command, "invalid_input_modality")
                 return
+        if isinstance(command, AppendAudio | AppendText):
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
-            pending_bytes = len(command.audio) + sum(len(frame) for frame in command.video_frames)
+            try:
+                pending_bytes = (
+                    len(command.text.encode("utf-8"))
+                    if isinstance(command, AppendText)
+                    else len(command.audio) + sum(len(frame) for frame in command.video_frames)
+                )
+            except UnicodeEncodeError:
+                self.emit(session, [self._error_event("bad_event", "Text must be valid UTF-8", command=command)])
+                return
             if not session.reserve_input_bytes(pending_bytes, limit=limit, queued=True):
                 self.emit(
                     session,
@@ -352,6 +389,7 @@ class DuplexSessionManager:
                         )
                     ],
                 )
+                runner.input_refused(command, "input_backpressure")
                 return
         elif isinstance(command, Commit):
             if not session.reserve_pending_turn(limit=int(self.runtime_config.max_pending_turns_per_session)):
@@ -365,6 +403,7 @@ class DuplexSessionManager:
                         )
                     ],
                 )
+                runner.input_refused(command, "input_backpressure")
                 return
         runner.submit(command)
 
@@ -470,10 +509,20 @@ class DuplexSessionManager:
         ok: bool,
         session: DuplexEngineSession | None = None,
         error: BaseException | None = None,
+        input_index: int | None = None,
     ) -> None:
+        """Answer a control message on the result sink.
+
+        A successful answer carries the session's capabilities and public
+        session object; ``input_index`` (a resume of an input-clocked session)
+        is added to that object as ``session.input_index``.
+        """
         error_code, error_message, error_retryable = (
             self._control_error(error) if error is not None else (None, None, False)
         )
+        public_session = session.as_public_dict() if session is not None and ok else None
+        if public_session is not None and input_index is not None:
+            public_session["input_index"] = input_index
         result = DuplexControlResultMessage(
             control_id=message.control_id,
             operation=operation,
@@ -481,7 +530,7 @@ class DuplexSessionManager:
             ok=ok,
             lease_generation=session.lease_generation if session is not None else None,
             capabilities=session.capabilities if session is not None and ok else None,
-            public_session=session.as_public_dict() if session is not None and ok else None,
+            public_session=public_session,
             error_code=error_code,
             error_message=error_message,
             error_retryable=error_retryable,
@@ -496,7 +545,7 @@ class DuplexSessionManager:
         if isinstance(error, DuplexSessionError):
             code = error.code
             retryable = error.retryable
-        elif isinstance(error, DuplexRuntimeConfigError):
+        elif isinstance(error, DuplexRuntimeConfigError | DuplexConfigError):
             code = error.code
         elif isinstance(error, DuplexFenceMismatchError):
             code = "stale_fence"
@@ -603,7 +652,17 @@ class DuplexSessionManager:
             if session_id in self.runners or session_id in self._closing or session_id in self._admitting:
                 raise DuplexSessionError(f"Duplex session already exists: {session_id}", code="session_exists")
             max_sessions = self.admission_limit
+            collect_stats = bool(getattr(self.runtime_config, "collect_stats", False))
+            capabilities = apply_input_clock_capabilities(
+                apply_session_stats_capability(
+                    self.plugin.deployment_capabilities(max_sessions=max_sessions), collect_stats
+                ),
+                message.session_config.extra_body,
+                input_modalities=self.plugin.input_clock_input_modalities,
+            )
+            config = message.session_config.with_output_capabilities(capabilities)
             if self._admission_count() >= max_sessions:
+                self.stage_port.check_session_availability(session_id)
                 self.stage_port.reject_session("global_capacity_exhausted")
                 raise DuplexSessionError(
                     f"duplex_session_capacity_exhausted: limit={max_sessions}",
@@ -618,18 +677,14 @@ class DuplexSessionManager:
                 self.session_traces[session_id] = SessionTrace(self.tracer, session_id, message.trace_headers)
             self.stage_port.reserve_session(session_id)
             holds_replica_reservation = True
-            config = message.session_config
             self.plugin.validate_client_extra_body(config.extra_body)
+            check_input_clock_supported(self.plugin, config.extra_body)
             try:
                 runtime_config = await self.plugin.prepare_runtime_config(config, model_config=self.model_config)
             except DuplexRuntimeConfigError:
                 raise
             except ValueError as exc:
                 raise DuplexRuntimeConfigError(str(exc)) from exc
-            collect_stats = bool(getattr(self.runtime_config, "collect_stats", False))
-            capabilities = apply_session_stats_capability(
-                self.plugin.capabilities(max_sessions=max_sessions), collect_stats
-            )
             validate_session_tools(capabilities, config.extra_body)
             session = DuplexEngineSession(
                 session_id=session_id,
@@ -681,7 +736,9 @@ class DuplexSessionManager:
             error_code, _, _ = self._control_error(exc)
             if holds_admission_slot and (session_trace := self.session_traces.pop(session_id, None)) is not None:
                 session_trace.end("error", error_code)
-            if error_code in {"resource_exhausted", "session_exists"}:
+            if error_code == "replica_unavailable":
+                self.stage_port.reject_session(error_code)
+            if error_code in {"replica_unavailable", "resource_exhausted", "session_exists"}:
                 logger.info("open_duplex_session rejected: %s", exc)
             else:
                 logger.exception("open_duplex_session failed: %s", exc)
@@ -881,6 +938,9 @@ class DuplexSessionManager:
             return
         self._unregister_session_requests(pending.session_id)
         if self._closing.get(pending.session_id) is pending:
+            await self._release_session_window(pending.session_id)
+            if self._closing.get(pending.session_id) is not pending:
+                return
             self.stage_port.release_session(pending.session_id)
             self._closing.pop(pending.session_id, None)
         self._session_snapshots.pop(pending.session_id, None)
@@ -900,7 +960,16 @@ class DuplexSessionManager:
                 )
             except ValueError as exc:
                 raise DuplexSessionError(str(exc), code="session_resume_conflict") from exc
-            await self._put_result(message, operation="resume", ok=True, session=session)
+            # An input-clocked client learns how many of its inputs reached the
+            # session (``input_index`` of the latest), so it can resend exactly
+            # those lost with the old connection.
+            await self._put_result(
+                message,
+                operation="resume",
+                ok=True,
+                session=session,
+                input_index=runner.admitted_inputs,
+            )
         except Exception as exc:
             logger.exception("resume_duplex_session failed: %s", exc)
             await self._put_result(message, operation="resume", ok=False, session=session, error=exc)
@@ -1060,22 +1129,30 @@ class DuplexSessionManager:
         active_keys = {key for key in self._request_cleanups_in_progress if key[0] in session_id_set}
         self._request_cleanups_in_progress.difference_update(active_keys)
 
-    def finalize_closed_sessions(self, session_ids: Iterable[str]) -> None:
-        session_id_set = set(session_ids)
-        for key in list(self._pending_request_cleanups):
-            if key[0] not in session_id_set:
-                continue
-            self._pending_request_cleanups.pop(key, None)
-            self._request_cleanups_in_progress.discard(key)
-        for session_id in session_id_set:
+    async def finalize_closed_sessions(self, session_ids: Iterable[str]) -> None:
+        for session_id in set(session_ids):
+            closing = self._closing.get(session_id)
+            if closing is not None:
+                await self._release_session_window(session_id)
+                if self._closing.get(session_id) is not closing:
+                    continue
+            for key in list(self._pending_request_cleanups):
+                if key[0] == session_id:
+                    self._pending_request_cleanups.pop(key, None)
+                    self._request_cleanups_in_progress.discard(key)
             session = self._session_snapshots.pop(session_id, None)
             if session is not None and session.lease.terminal_reason is not None:
                 session.release_all_requests()
                 session.close()
-            if session_id in self._closing:
+            if closing is not None:
                 self.stage_port.release_session(session_id)
                 self._closing.pop(session_id, None)
             self._unregister_session_requests(session_id)
+
+    async def _release_session_window(self, session_id: str) -> None:
+        release = getattr(self.stage_port, "release_session_window", None)
+        if release is not None:
+            await release(session_id)
 
     async def _complete_request_cleanup(
         self,
@@ -1103,16 +1180,16 @@ class DuplexSessionManager:
     async def _run_request_cleanup(self, key: tuple[str, int], pending: _PendingRequestCleanup) -> None:
         await self.stage_port.cleanup(list(pending.request_ids), abort=pending.abort)
         is_current = self._pending_request_cleanups.get(key) is pending
-        if is_current:
-            self._pending_request_cleanups.pop(key, None)
-            self._request_cleanups_in_progress.discard(key)
         # An open rollback has no closing owner. Its cleanup can finish after
         # the same id is admitted again, even with the same lease generation.
         # Preserve legacy finalization; only placement owners require this fence.
         if self.runtime_config.replica_policy == "legacy" or (
             is_current and pending.closing is not None and self._closing.get(pending.session_id) is pending.closing
         ):
-            self.finalize_closed_sessions([pending.session_id])
+            await self.finalize_closed_sessions([pending.session_id])
+        elif is_current:
+            self._pending_request_cleanups.pop(key, None)
+            self._request_cleanups_in_progress.discard(key)
 
     # ------------------------------------------------------------------ #
     # Shutdown                                                           #

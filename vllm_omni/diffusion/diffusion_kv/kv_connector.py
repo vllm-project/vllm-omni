@@ -20,6 +20,8 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 
+from vllm_omni.diffusion.diffusion_kv.layout import adopt_kv_cache_layout
+
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
     from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -239,6 +241,8 @@ def init_worker_kv_connector(vllm_config: VllmConfig, kv_cache_config: KVCacheCo
 
     if vllm_config.kv_transfer_config is None:
         return
+    # Native connectors read the layout before the runner allocates KV pages.
+    adopt_kv_cache_layout(vllm_config, kv_cache_config)
     import vllm.distributed.parallel_state as parallel_state
 
     from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
@@ -276,8 +280,10 @@ def shutdown_kv_connector(*, scheduler_connector: KVConnectorBase_V1 | None = No
 def prepare_kv_requests(requests: tuple[DiffusionKVRequest, ...], params: Mapping[str, Any]) -> None:
     for request in requests:
         request.kv_transfer_params = dict(params)
-        num_tokens = min(len(request.prompt_token_ids), params["num_transfer_tokens"])
-        request.prompt_token_ids = request.prompt_token_ids[:num_tokens]
+        token_ids = request.prompt_token_ids
+        assert token_ids is not None, "Native KV transfer requires prompt token IDs"
+        num_tokens = min(len(token_ids), params["num_transfer_tokens"])
+        request.prompt_token_ids = token_ids[:num_tokens]
         request.num_prompt_tokens = num_tokens
 
 
@@ -410,7 +416,8 @@ def wait_for_kv_load(
             raise RuntimeError("Diffusion KV connector reported invalid remote pages")
         return output
 
-    received, sent = set(), set()
+    received: set[str] = set()
+    sent: set[str] = set()
     deadline = time.monotonic() + timeout
     while True:
         finished_sending, finished_recving = connector.get_finished(finished_ids)

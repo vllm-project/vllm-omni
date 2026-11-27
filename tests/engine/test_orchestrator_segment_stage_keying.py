@@ -33,6 +33,7 @@ TALKER_STAGE = 1
 @dataclass
 class _StageMetrics:
     pipeline_timings: dict[str, float] = field(default_factory=dict)
+    scheduler_queue_wait_ms: float | None = None
 
 
 @dataclass

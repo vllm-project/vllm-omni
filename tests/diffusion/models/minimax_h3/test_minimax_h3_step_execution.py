@@ -199,7 +199,7 @@ def test_pdd_step_execution_keeps_request_steps_without_backend_warning(steps, m
     warning.assert_not_called()
 
 
-@pytest.mark.parametrize("sampler", ["euler", "res_multistep", "heun"])
+@pytest.mark.parametrize("sampler", ["euler", "res_multistep", "heun", "dpmpp_2m"])
 @pytest.mark.parametrize("num_steps", [1, 8, 50])
 def test_step_execution_matches_request_mode_denoise_loop(num_steps, sampler, mocker):
     """Stepping through the contract must reproduce the request-mode loop."""
@@ -411,7 +411,7 @@ def test_timeline_guides_request_step_batch_parity_and_target_only_unpack(mixed_
         assert target_audio.shape == (2, 32, audio_t)
 
 
-@pytest.mark.parametrize("sampler", ["euler", "res_multistep", "heun"])
+@pytest.mark.parametrize("sampler", ["euler", "res_multistep", "heun", "dpmpp_2m"])
 def test_step_execution_matches_request_mode_with_latent_edits(sampler):
     """Masked model rows, row timesteps, and scheduler math match both paths."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
@@ -487,6 +487,8 @@ def test_step_execution_matches_request_mode_with_latent_edits(sampler):
         ("heun", "heun"),
         ("euler", "heun"),
         ("res_multistep", "heun"),
+        ("dpmpp_2m", "dpmpp_2m"),
+        ("res_multistep", "dpmpp_2m"),
     ],
 )
 @pytest.mark.parametrize("lock_audio", [False, True])
@@ -856,7 +858,7 @@ def test_sigma_windows_select_the_latent_refine_pass_by_its_own_tail_sigma():
     assert seen == [(step, total, pytest.approx(tail_video[step]), expected_profiles[step]) for step in range(total)]
 
 
-@pytest.mark.parametrize("sampler", ["euler", "res_multistep", "heun"])
+@pytest.mark.parametrize("sampler", ["euler", "res_multistep", "heun", "dpmpp_2m"])
 @pytest.mark.parametrize("batch_frames", [1, 33])
 def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames, sampler):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
@@ -947,7 +949,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames, sa
 
 
 def test_prepare_encode_rejects_request_mode_only_features():
-    """Multi-output and DLO have no representation in the step contract."""
+    """Multi-output and distributed/submodule offload have no representation
+    in the step contract."""
     from vllm_omni.diffusion.worker.utils import StepRequestState
     from vllm_omni.errors import OmniClientError
 
@@ -970,6 +973,17 @@ def test_prepare_encode_rejects_request_mode_only_features():
     dlo_pipeline._dlo_residency_controller = object()
     with pytest.raises(ValueError, match="distributed layerwise offload"):
         dlo_pipeline.prepare_encode(single_output)
+
+    # SUBMODULE is rejected from the resolved strategy even when no resident
+    # layers were requested and the backend therefore published no controller.
+    submodule_pipeline = _step_pipeline(_SegmentMeanModel())
+    submodule_pipeline.od_config = SimpleNamespace(
+        enable_submodule_offload=True,
+        dlo_resident_layers=0,
+    )
+    assert getattr(submodule_pipeline, "_dlo_residency_controller", None) is None
+    with pytest.raises(ValueError, match="submodule offload"):
+        submodule_pipeline.prepare_encode(single_output)
 
 
 def test_prepare_encode_rejects_high_quality_cache_dit():
@@ -1283,7 +1297,7 @@ def test_heun_rejects_prediction_cache_before_model_evaluation():
     assert not model.calls
 
 
-@pytest.mark.parametrize("sampler", ["euler", "res_multistep", "heun"])
+@pytest.mark.parametrize("sampler", ["euler", "res_multistep", "heun", "dpmpp_2m"])
 def test_steps_reuse_request_buffers_and_write_into_original_rows(sampler, monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.models.minimax_h3.sampling import MiniMaxH3Model

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
@@ -23,9 +25,10 @@ from vllm_omni.lora.layers import (
 
 MOE_LORA_UNAVAILABLE_ERROR = (
     "MoE LoRA is unavailable because its token capacity was not configured. "
-    "Online MXFP4 disables MoE LoRA when no startup `lora_path` is set so it can "
-    "use the native expert kernel. Set `lora_path` at startup to enable MoE "
-    "adapters; request-time MoE adapters cannot use the native MXFP4 path."
+    "Online MXFP4 and ModelOpt NVFP4 disable MoE LoRA when no startup `lora_path` "
+    "is set so they can use the native expert kernel. Set `lora_path` at startup, "
+    "or `moe_backend: marlin` on CUDA, to enable MoE adapters; "
+    "request-time MoE adapters cannot use the native path."
 )
 
 
@@ -125,6 +128,65 @@ def _match_target_modules(module_name: str, target_modules: list[str]) -> bool:
         re.match(rf".*\.{target_module}$", module_name) or target_module == module_name
         for target_module in target_modules
     )
+
+
+def normalize_target_modules(
+    target_modules: object,
+    *,
+    allow_none: bool = False,
+) -> list[str] | str | None:
+    """Validate and normalize PEFT ``target_modules`` fail-closed.
+
+    Diverges deliberately from upstream's pass-through ``PEFTHelper``: file
+    checkpoints always decode JSON lists/strings, whereas in-memory tensor
+    producers (e.g. PEFT >= 0.14 ``to_dict()``) can emit sets. Sets,
+    frozensets, and tuples are normalized to sorted lists; empty values and
+    unsupported types raise ``ValueError`` naming the received type.
+    """
+    if target_modules is None:
+        if allow_none:
+            return None
+        raise ValueError("PEFT target_modules must be a non-empty str or sequence/set of str, got NoneType")
+    if isinstance(target_modules, str):
+        if not target_modules:
+            raise ValueError("PEFT target_modules cannot be an empty str")
+        return target_modules
+    if isinstance(target_modules, (list, tuple, set, frozenset)):
+        if not target_modules:
+            raise ValueError(f"PEFT target_modules cannot be an empty {type(target_modules).__name__}")
+        for entry in target_modules:
+            if not isinstance(entry, str) or not entry:
+                raise ValueError(
+                    f"PEFT target_modules entries must be non-empty str, got {type(entry).__name__}: {entry!r}"
+                )
+        if isinstance(target_modules, (set, frozenset, tuple)):
+            return sorted(target_modules)
+        return list(target_modules)
+    raise ValueError(
+        f"Unsupported PEFT target_modules type {type(target_modules).__name__}; "
+        "expected str, list, tuple, set, or frozenset"
+    )
+
+
+def build_target_module_matcher(
+    target_modules: object,
+    *,
+    allow_none: bool = False,
+) -> tuple[Callable[[str], bool], bool]:
+    """Build a module-name predicate from ``target_modules``.
+
+    Returns ``(matches, is_filtered)``. Any unrecognized or empty value raises
+    via :func:`normalize_target_modules` instead of failing open.
+    """
+    normalized = normalize_target_modules(target_modules, allow_none=allow_none)
+    if normalized is None:
+        return (lambda _module_name: True), False
+    if isinstance(normalized, str):
+        import regex as re
+
+        pattern = re.compile(normalized)
+        return (lambda module_name: pattern.search(module_name) is not None), True
+    return (lambda module_name: _match_target_modules(module_name, normalized)), True
 
 
 def _expand_expected_modules_for_packed_layers(

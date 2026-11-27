@@ -23,6 +23,8 @@ class SchedulingMetadataUpdate:
     input_terminal: bool = False
     # Native MRv2 receive: the producing step's duplex chunk id from payload meta.
     duplex_perf_chunk: tuple[int, int] | None = None
+    segment_finished: bool = False
+    replace_prompt: bool = False
 
 
 @dataclass
@@ -51,6 +53,11 @@ class OmniConnectorOutput:
             completed KV transfers that the scheduler should account for.
         stage_payloads: Serialized stage payloads of run requests keyed by
             request ID, returned to the scheduler instead of sent on the connector.
+        permanent_send_failures: Requests whose connector send exhausted
+            retries. Values are ``(client_index, reason)``. The request may
+            already have left the producer scheduler.
+        permanent_recv_failures: Requests whose connector receive cannot
+            succeed. Values are ``(client_index, reason)``.
     """
 
     chunk_ready_req_ids: set[str] = field(default_factory=set)
@@ -60,6 +67,8 @@ class OmniConnectorOutput:
     stage_recv_req_ids: set[str] = field(default_factory=set)
     has_pending_kv_work: bool = False
     stage_payloads: dict[str, bytes] = field(default_factory=dict)
+    permanent_send_failures: dict[str, tuple[int, str]] = field(default_factory=dict)
+    permanent_recv_failures: dict[str, tuple[int, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -96,6 +105,12 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     invalid_logits_req_ids: set[str] = field(default_factory=set)
     # Request-local model failures, materialized after asynchronous D2H.
     request_errors: dict[str, str] | None = None
+    # AR full-payload steps: executed input-token range [start, end) per request.
+    # Absent for one-shot generation, which keeps append/replace accumulation.
+    full_payload_token_ranges: dict[str, tuple[int, int]] | None = None
+    # Keys replaced by the prefix-cache merge for each request. Only those
+    # tensors may contain rows from before this step.
+    full_payload_prefix_cache_keys: dict[str, frozenset[str]] | None = None
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":

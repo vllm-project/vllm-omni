@@ -69,14 +69,22 @@ class PrefixCacheRewrite:
             for payloads in (output.inter_stage_outputs, output.pooler_output, output.multimodal_outputs)
             if payloads
         }
+        replaced_keys: dict[str, set[str]] = {}
         for row, req_id in self.rows:
             payloads = {id(p[row]): p[row] for p in payload_lists.values() if row < len(p) and p[row]}
             for payload in payloads.values():
                 if outs.hidden_states is not None and "hidden" in payload:
                     payload["hidden"] = outs.hidden_states[req_id]
+                    replaced_keys.setdefault(req_id, set()).add("hidden")
                 for key, per_req in outs.mm_outputs.items():
                     if key in payload:
                         payload[key] = per_req[req_id]
+                        replaced_keys.setdefault(req_id, set()).add(key)
+        if replaced_keys:
+            stamped = dict(getattr(output, "full_payload_prefix_cache_keys", None) or {})
+            for req_id, keys in replaced_keys.items():
+                stamped[req_id] = frozenset(keys) | frozenset(stamped.get(req_id, ()))
+            output.full_payload_prefix_cache_keys = stamped
 
 
 class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):

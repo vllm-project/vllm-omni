@@ -5,8 +5,8 @@
 End-to-end test for SenseNova-U1 img2img generation.
 
 Weekly smoke coverage checks that image editing succeeds with the expected size.
-Pixel accuracy runs in a separate process in the weekly H100 job with a pinned
-model revision and reviewed references. Run it explicitly:
+Pixel accuracy runs in a separate process in each platform's weekly job with a
+pinned model revision and a reviewed platform-specific reference. Run it explicitly:
 
     pytest -sv tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py::test_sensenova_u1_img2img_pixel_accuracy \
         -m "slow and diffusion and cuda and H100 and cards_1" --run-level full_model
@@ -131,7 +131,7 @@ def _generate_sensenova_u1_img2img(
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_sensenova_u1_img2img():
     """Smoke-test think-mode image editing and output dimensions."""
     input_image = _load_input_image()
@@ -141,9 +141,9 @@ def test_sensenova_u1_img2img():
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_sensenova_u1_img2img_pixel_accuracy():
-    """Compare pinned H100 output with reviewed goldens in the weekly job."""
+    """Compare pinned output with the platform's reviewed weekly golden."""
     input_image = _load_input_image()
     with OmniRunner(accuracy.accuracy_model_path()) as runner:
         generated_image = _generate_sensenova_u1_img2img(runner.omni, input_image)
@@ -161,7 +161,7 @@ def test_sensenova_u1_img2img_pixel_accuracy():
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.cache
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_sensenova_u1_img2img_cache_dit():
     """Test SenseNova-U1 img2img with Cache-DiT enabled."""
     input_image = _load_input_image()

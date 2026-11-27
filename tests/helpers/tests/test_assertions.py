@@ -41,6 +41,24 @@ def test_short_transcript_unrelated_text_still_fails():
         )
 
 
+def test_streamed_chat_audio_mismatch_preserves_failure_and_asr_input(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(tmp_path))
+    response = OmniResponse(
+        success=True,
+        text_content="The lighthouse stood on the far side of the island.",
+        audio_content="A different sentence about horses running in a field.",
+        audio_bytes=b"streamed audio",
+    )
+    with pytest.raises(AssertionError, match=assertions.AUDIO_MISMATCH_MESSAGE):
+        assertions.assert_omni_response(response, {"stream": True}, "full_model")
+
+    (clip,) = tmp_path.glob("*.wav")
+    assert clip.read_bytes() == response.audio_bytes
+    evidence = json.loads(clip.with_suffix(".json").read_text(encoding="utf-8"))
+    assert evidence["transcript"] == response.audio_content
+    assert evidence["expected_text"] == response.text_content
+
+
 def _capture_transcribe(monkeypatch) -> dict:
     captured: dict = {}
 
@@ -405,6 +423,37 @@ def test_pcm_voiced_signal_passes_the_default_speech_hnr_gate():
         {"response_format": "pcm"},
         "advanced_model",
     )
+
+
+@pytest.mark.parametrize("sample_rate", [16_000, 24_000, 48_000])
+@pytest.mark.parametrize("frequency", [80, 100, 200, 400])
+@pytest.mark.parametrize("snr_db", [10, 20])
+def test_pcm_hnr_recovers_known_noise_ratio_across_pitch(sample_rate, frequency, snr_db):
+    time = np.arange(sample_rate) / sample_rate
+    tone = 0.4 * np.sin(2 * np.pi * frequency * time + 0.31)
+    noise_std = 0.4 / np.sqrt(2) * 10 ** (-snr_db / 20)
+    signal = tone + np.random.default_rng(0).normal(0, noise_std, sample_rate)
+
+    # The ratio is set by the signal powers, independently of the estimator.
+    # Finite-window normalization must not penalize low-pitched voices.
+    measured = assertions._compute_pcm_hnr_db(signal, sr=sample_rate)
+    assert measured == pytest.approx(snr_db, abs=1.0)
+
+
+@pytest.mark.parametrize("corruption", ["noise_dominant", "shuffled"])
+def test_pcm_hnr_rejects_corrupted_periodic_audio(corruption):
+    sample_rate = 24_000
+    time = np.arange(sample_rate) / sample_rate
+    signal = 0.1 * np.sin(2 * np.pi * 100 * time)
+    rng = np.random.default_rng(0)
+    if corruption == "noise_dominant":
+        signal += rng.normal(0, 0.1 / np.sqrt(2) * 10 ** (6 / 20), sample_rate)
+    else:
+        rng.shuffle(signal)
+    pcm = (signal * 32767).astype("<i2").tobytes()
+
+    with pytest.raises(AssertionError, match="HNR"):
+        assertions._assert_pcm_int16_speech_hnr(pcm, min_hnr_db=-2.0, sr=sample_rate)
 
 
 @pytest.mark.parametrize("sample_rate", [None, 0, -1, True, 24000.5, "not-a-rate"])

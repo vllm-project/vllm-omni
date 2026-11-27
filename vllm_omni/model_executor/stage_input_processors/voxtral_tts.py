@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Mapping
 from typing import Any
 
@@ -48,13 +51,18 @@ def generator2tokenizer_async_chunk(
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
 
+    added_frame = False
     if isinstance(multimodal_output, Mapping):
         frame = _extract_last_frame(multimodal_output)
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            added_frame = True
     elif not finished:
         # Some steps may not produce multimodal_output. Only flush on finish.
+        return None
+
+    if not added_frame and not finished:
         return None
 
     connector = getattr(transfer_manager, "connector", None)
@@ -69,15 +77,19 @@ def generator2tokenizer_async_chunk(
             f"codec_left_context_frames={left_context_size}"
         )
     length = len(transfer_manager.code_prompt_token_ids[request_id])
+    state = transfer_manager.request_payload.setdefault(request_id, {})
+    pending_frames = length - int(state.get("voxtral_frames_sent", 0))
 
     # Avoid emitting empty chunks during normal streaming. If the request is
     # finished and nothing was produced, emit an EOF marker.
-    if length <= 0:
+    if pending_frames <= 0:
         if finished:
-            return OmniPayloadStruct(
+            payload = OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
                 meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
             )
+            transfer_manager.code_prompt_token_ids.pop(request_id, None)
+            return payload
         return None
 
     # Use a small chunk size at begin
@@ -86,18 +98,32 @@ def generator2tokenizer_async_chunk(
 
     chunk_length = length % chunk_size
 
+    # A request can finish on a step with no new codec frame after its last
+    # complete chunk was already emitted. Send only EOF in that case instead
+    # of replaying the last chunk to the tokenizer.
+    if finished and not added_frame and chunk_length == 0:
+        payload = OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+            meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+        )
+        transfer_manager.code_prompt_token_ids.pop(request_id, None)
+        return payload
+
     if chunk_length != 0 and not finished:
         return None
 
-    context_length = chunk_length if chunk_length != 0 else chunk_size
+    # Count only unsent frames; a standalone EOF must not replay the last
+    # initial or steady-state chunk as new audio.
+    context_length = pending_frames
     end_index = min(length, left_context_size + context_length)
     ctx_frames = max(0, int(end_index - context_length))
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
     # Pack context + chunk into codebook-major flat codes for adapter.
     code_predictor_codes = torch.tensor(window_frames).reshape(-1).tolist()
+    state["voxtral_frames_sent"] = length
 
-    return OmniPayloadStruct(
+    payload = OmniPayloadStruct(
         codes=CodesStruct(
             audio=torch.tensor(
                 [int(ctx_frames), int(context_length)] + code_predictor_codes,
@@ -106,3 +132,6 @@ def generator2tokenizer_async_chunk(
         ),
         meta=MetaStruct(finished=torch.tensor(finished, dtype=torch.bool)),
     )
+    if finished:
+        transfer_manager.code_prompt_token_ids.pop(request_id, None)
+    return payload

@@ -36,7 +36,8 @@ aenum==3.1.16
 pyzmq>=25.0.0
 janus>=1.0.0
 msgpack>=1.0.0
-msgspec
+# structs.replace must run SamplingParams.__post_init__ for sampling validation.
+msgspec>=0.21.1
 # Confirm worker exit before releasing cross-process shared allocations.
 psutil>=5.9.0
 pydantic>=2.12.0

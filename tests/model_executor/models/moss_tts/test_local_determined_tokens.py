@@ -15,6 +15,7 @@ from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.states import RequestState
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 from tests.model_executor.models.moss_tts.test_local_model_state import _batch, _state
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
@@ -24,13 +25,13 @@ from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 pytestmark = pytest.mark.core_model
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("seed", [None, 17])
 @pytest.mark.parametrize("temperature", [0.0, 1.7])
 def test_matches_real_sampler_for_mixed_prefill_decode_stop_and_reordering(seed, temperature):
-    if not torch.cuda.is_available():
+    if not DEVICE_MODULE.is_available():
         pytest.skip("CUDA required")
-    device = torch.device("cuda")
+    device = torch.device(DEVICE_TYPE)
     reqs = RequestState(5, 32, 16, 0, 8, device)
     sampler = Sampler(VllmConfig(), 5, 8, device, reqs)
     for i, length in enumerate([4, 1, 3]):
@@ -65,7 +66,7 @@ def test_matches_real_sampler_for_mixed_prefill_decode_stop_and_reordering(seed,
     torch.testing.assert_close(actual.sampled_token_ids, snapshot, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize(
     "constraint",
     [
@@ -75,9 +76,9 @@ def test_matches_real_sampler_for_mixed_prefill_decode_stop_and_reordering(seed,
     ],
 )
 def test_real_sampler_constraints_disable_determined_tokens(constraint):
-    if not torch.cuda.is_available():
+    if not DEVICE_MODULE.is_available():
         pytest.skip("CUDA required")
-    device = torch.device("cuda")
+    device = torch.device(DEVICE_TYPE)
     reqs = RequestState(5, 32, 16, 0, 8, device)
     sampler = Sampler(VllmConfig(), 5, 8, device, reqs)
     reqs.add_request("constrained", 1, [2], 0, 8)
