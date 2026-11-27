@@ -28,6 +28,7 @@ from vllm_omni.engine.duplex.process_engine import (
     _DuplexProcessWorker,
     _MessageSocket,
 )
+from vllm_omni.protocol.duplex.events import InputProcessed
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -73,7 +74,17 @@ class FakeEngine:
         import pybase64 as base64
 
         buffer = self.buffers[session_id]
-        if isinstance(command, AppendAudio):
+        if isinstance(command, AppendAudio) and command.event_id == "acknowledged-input":
+            buffer.put(
+                InputProcessed(
+                    input_index=1,
+                    trigger=command.wire_type,
+                    audio_end_ms=1000,
+                    unit_end_ms=1000,
+                    units=({"end_ms": 1000, "decision": "listen"},),
+                )
+            )
+        elif isinstance(command, AppendAudio):
             buffer.put(
                 AudioDelta(
                     session_id=session_id, response_id="r", epoch=0, delta=base64.b64encode(command.audio).decode()
@@ -297,6 +308,28 @@ def test_native_values_survive_msgpack():
         )
         decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(result))
         assert msgspec.convert(decoded, type=DuplexControlResultMessage) == result
+
+
+def test_spawned_client_delivers_input_processed_event():
+    async def run():
+        client = make_client()
+        buffer = DuplexOutputBuffer(max_bytes=1024, max_events=8)
+        try:
+            await client.open_session_async("s", DuplexSessionConfig(), output_buffer=buffer)
+            assert isinstance(await asyncio.wait_for(buffer.get(), 5), SessionCreated)
+            await client.submit_command_async("s", AppendAudio(audio=b"pcm", event_id="acknowledged-input"))
+
+            ack = await asyncio.wait_for(buffer.get(), 5)
+            assert isinstance(ack, InputProcessed)
+            assert ack.input_index == 1
+            assert ack.trigger == AppendAudio.wire_type
+            assert ack.audio_end_ms == ack.unit_end_ms == 1000
+            assert ack.units == ({"end_ms": 1000, "decision": "listen"},)
+            await client.check_health_async()
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("operation", ["check_health_async", "get_outputs_async"])
