@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Exercise the real comparison control flow without importing GPU runtimes."""
+"""Exercise the Wan2.2 nightly comparison job's artifact preservation without importing GPU runtimes."""
 
 import os
 import subprocess

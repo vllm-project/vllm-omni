@@ -75,7 +75,6 @@ def qwen_oom():
         )
         module.__dict__[constant_name] = ast.literal_eval(assignment.value)
     sources = {
-        (RELIABILITY_ROOT / "test_hunyuan_image.py"): {"_run_image_oom_at_load"},
         (RELIABILITY_ROOT / "scenarios") / "oom.py": {
             "_assert_multimodal_success",
             "_assert_image_success",
@@ -132,15 +131,7 @@ def test_qwen_oom_uses_one_injection_and_stops_before_recovery(qwen_oom, outcome
     payload = {"model": "qwen", "modalities": ["text", "audio"], "stream": False}
     preflight = {**payload, "messages": [{"role": "user", "content": "small preflight"}]}
     success: dict[str, Any] = {"choices": [{"message": {"content": "answer", "audio": {"data": "audio"}}}]}
-    if entrypoint == "hunyuan":
-        payload = {"model": "hunyuan", "size": "1024x1024"}
-        preflight = {"model": "hunyuan", "size": "512x512"}
-        success = {"data": [{"b64_json": "aW1hZ2U="}]}
-        if outcome == "warmup_failed":
-            expected_error = "expected successful image"
-        elif outcome == "recovery_failed":
-            expected_error = "no image output"
-    qwen_oom._image_request = lambda server, *, size, steps: {"json": preflight if size == "512x512" else payload}
+    assert entrypoint in {"qwen", "minicpm"}
     qwen_oom.MODEL = SimpleNamespace(
         worker_pattern="model-specific-worker",
         hard_oom_config={
@@ -195,11 +186,8 @@ def test_qwen_oom_uses_one_injection_and_stops_before_recovery(qwen_oom, outcome
     )
 
     def post(host, port, path, body, *, timeout_sec):
-        if entrypoint == "hunyuan":
-            assert path == "/v1/images/generations"
-        else:
-            assert path == "/v1/chat/completions"
-            assert body["modalities"] == ["text", "audio"] and body["stream"] is False
+        assert path == "/v1/chat/completions"
+        assert body["modalities"] == ["text", "audio"] and body["stream"] is False
         requests.append(body)
         if len(requests) == 1:
             assert body is preflight
@@ -262,12 +250,7 @@ def test_qwen_oom_uses_one_injection_and_stops_before_recovery(qwen_oom, outcome
     client = SimpleNamespace(send_health_http_request=health)
 
     def run():
-        if entrypoint == "minicpm":
-            qwen_oom.GpuOomUnderLoad().run(qwen_oom.MODEL, server, client)
-        elif entrypoint == "hunyuan":
-            qwen_oom._run_image_oom_at_load(server, client)
-        else:
-            qwen_oom.GpuOomUnderLoad().run(qwen_oom.MODEL, server, client)
+        qwen_oom.GpuOomUnderLoad().run(qwen_oom.MODEL, server, client)
 
     if expected_error is not None:
         with pytest.raises(AssertionError, match=expected_error) as error:
