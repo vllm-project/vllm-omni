@@ -5,9 +5,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import (
     VDNAttentionBackend,
+    VDNAttentionImpl,
     VDNLayout,
     window_plan,
     windowed_attention,
@@ -42,6 +44,7 @@ def _sdpa(q, k, v, mask=None):
 def test_vdn_backend_is_registered():
     assert DiffusionAttentionBackendEnum.VDNH3_ATTN.get_path().endswith("vdnh3_attn.VDNAttentionBackend")
     assert DiffusionAttentionBackendEnum.VDNH3_ATTN.get_class().supports_multi_doc_packed_varlen() is False
+    assert "xpu" in VDNAttentionBackend.supported_platforms
 
 
 @pytest.mark.parametrize("anchor_frames", ["none", "columns", "rows", "both"])
@@ -88,3 +91,32 @@ def test_vdnh3_attn_does_not_inherit_flash_attn_capabilities():
     result = VDNAttentionBackend.resolve_capabilities(context)
     assert result.backend == "VDNH3_ATTN"
     assert result.support.status is SupportStatus.UNMIGRATED
+
+
+def test_vdn_forward_xpu_uses_window(monkeypatch):
+    window = VDNLayout(
+        used=20, text_len=2, video_start=4, num_frames=4, frame_height=2, frame_width=2, chunk=0, radius=1
+    )
+    impl = VDNAttentionImpl(num_heads=2, head_size=8, softmax_scale=8**-0.5)
+    calls = []
+
+    def dense(q, k, v):
+        calls.append(tuple(q.shape))
+        return q
+
+    monkeypatch.setattr(impl, "_dense_window_xpu", dense)
+    q = torch.randn(1, 20, 2, 8)
+    out = impl.forward_xpu(q, q, q, AttentionMetadata(extra={"vdn_window": window}))
+
+    assert out.shape == q.shape
+    assert len(calls) > 1
+    assert torch.isfinite(out).all()
+
+
+def test_vdn_forward_xpu_without_window_delegates(monkeypatch):
+    impl = VDNAttentionImpl(num_heads=2, head_size=8, softmax_scale=8**-0.5)
+    q = torch.randn(1, 20, 2, 8)
+    expected = torch.empty_like(q)
+    monkeypatch.setattr(impl, "_dense_xpu", lambda q, k, v, metadata: expected)
+
+    assert impl.forward_xpu(q, q, q, AttentionMetadata()) is expected

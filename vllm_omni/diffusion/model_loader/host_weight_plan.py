@@ -331,6 +331,11 @@ def build_checkpoint_binding_plan(
         return HostWeightPlanResult(None, "online quantization requires the ordinary loader")
     if has_distilled_lora:
         return HostWeightPlanResult(None, "distilled LoRA requires the ordinary loader")
+    if getattr(pipeline, "lora_is_fused", False):
+        # Load-time adapters (for example FastH3 or VDN-H3) mutate the base
+        # tensors while load_weights() streams them. A direct-mmap plan would
+        # install the base checkpoint and silently skip that fusion.
+        return HostWeightPlanResult(None, "load-time weight fusion requires the ordinary loader")
 
     remap_fn = getattr(type(pipeline), "_remap_ckpt_key", None)
     if not callable(remap_fn) and use_pipeline_key_remap:
