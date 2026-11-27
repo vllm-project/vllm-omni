@@ -359,6 +359,7 @@ x-gpu-v1-workers: &gpu_v1_workers
   - vllm_omni/worker/memory_utils.py
   - vllm_omni/worker/moe_prefill_warmup.py
   - vllm_omni/worker/sampler_warmup.py
+  - vllm_omni/worker/triton_attention_warmup.py
   - tools/build_gradio_pillow13.py
 
 x-cosyvoice3: &cosyvoice3
