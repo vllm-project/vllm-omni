@@ -372,6 +372,7 @@ class DuplexOmni(AsyncOmni):
             self.endpoint_restrictions += tuple(
                 EndpointRestriction(capability, "The process duplex backend serves sessions only")
                 for capability in OmniServingCapability
+                if capability.runs_inference
             )
             self._weak_finalizer = weakref.finalize(self, self.engine.shutdown)
         else:

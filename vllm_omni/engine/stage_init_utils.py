@@ -95,6 +95,17 @@ class LogicalStageInitPlan:
     stage_idx: int
     stage_id: int
     replicas: list[ReplicaInitPlan]
+    # Both default to the first replica's, so only plans without replicas must pass them.
+    metadata: StageMetadata = None  # type: ignore[assignment]  # set in __post_init__
+    stage_vllm_config: VllmConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.metadata is None:
+            if not self.replicas:
+                raise ValueError(f"Stage {self.stage_id} has no replicas, so its plan must be given metadata")
+            self.metadata = self.replicas[0].metadata
+        if self.stage_vllm_config is None and self.replicas:
+            self.stage_vllm_config = self.replicas[0].stage_vllm_config
 
 
 def _missing_stage_subdirs(base: str, subdirs: Sequence[str]) -> list[str]:
@@ -946,18 +957,14 @@ def get_stage_devices_per_replica(stage_cfg: Any, engine_args: Any | None = None
 def compute_replica_layout(
     stage_configs: Sequence[Any],
     *,
-    allow_zero: bool = False,
     local_replica_counts: Mapping[int, int] | None = None,
 ) -> tuple[list[int], dict[int, list[str | None]]]:
     """Compute per-stage replica counts and device assignments.
 
     Args:
         stage_configs: per-stage config objects with a ``runtime`` sub-config
-            exposing ``num_replicas`` and ``devices``.
-        allow_zero: when True, ``num_replicas == 0`` is honored (used by
-            single-stage / head-distributed mode for non-self stages that
-            will be filled dynamically by remote registrations); when False
-            (default), the count is clamped to at least 1.
+            exposing ``num_replicas`` and ``devices``. A stage with
+            ``num_replicas == 0`` gets no replicas.
         local_replica_counts: optional stage-index overrides for the number of
             replicas using this host's device pool. Cluster totals are preserved;
             remote slots receive no local device assignment.
@@ -977,7 +984,7 @@ def compute_replica_layout(
         )
         if num_replicas < 0:
             raise ValueError(f"num_replicas must be >= 0, got {num_replicas}")
-        replicas_per_stage.append(num_replicas if allow_zero else max(1, num_replicas))
+        replicas_per_stage.append(num_replicas)
 
     replica_devices_map: dict[int, list[str | None]] = {}
     for stage_id, stage_cfg in enumerate(stage_configs):
@@ -1681,7 +1688,7 @@ def build_llm_stage_output_processor(
     --log-stats CLI flag plumbed through AsyncOmniEngine.
     """
 
-    metadata = plan.replicas[0].metadata
+    metadata = plan.metadata
     if stage_vllm_config.model_config.skip_tokenizer_init:
         tokenizer = None
     else:

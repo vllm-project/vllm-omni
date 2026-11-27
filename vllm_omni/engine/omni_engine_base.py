@@ -69,6 +69,7 @@ from vllm_omni.entrypoints.utils import prepare_stage_config_inputs
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.inputs.preprocess import build_omni_renderer
 from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 
 logger = init_logger(__name__)
 
@@ -207,16 +208,19 @@ class OmniEngineBase:
         # ------------------------------------------------------------------ #
         # Single-stage mode detection                                        #
         # ------------------------------------------------------------------ #
-        # Single-stage mode is enabled when the caller explicitly passes      #
-        # single_stage_mode=True, or when a stage_id is provided in the args. #
-        if self._single_stage_id_filter is not None and not single_stage_mode:
+        # single_stage_mode means distributed mode, where each process runs one
+        # stage and registers with the master server. A stage_id without a master
+        # runs only that stage in this process instead.
+        # TODO (Alex): Rename single stage mode vars throughout the code
+        self._omni_master_address: str | None = kwargs.get("omni_master_address")
+        self._omni_master_port: int | None = kwargs.get("omni_master_port")
+        if self._single_stage_id_filter is not None and (
+            self._omni_master_address is not None or is_frontend_only(self._single_stage_id_filter)
+        ):
             single_stage_mode = True
         if client_config is not None and int(client_config.get("client_count", 1)) > 1 and single_stage_mode:
             raise ValueError("Multiple API servers cannot be combined with single-stage distributed mode")
         self.single_stage_mode: bool = single_stage_mode
-
-        self._omni_master_address: str | None = kwargs.get("omni_master_address")
-        self._omni_master_port: int | None = kwargs.get("omni_master_port")
 
         # New omni-coordinator flags. Consumed only in single_stage_mode.
         # ``omni_dp_size_local`` is process-local: each invocation (head and
@@ -313,8 +317,33 @@ class OmniEngineBase:
         ):
             raise ValueError("weight sharing requires local two-stage ownership and sequential initialization")
 
+        self.async_chunk = any(
+            bool(
+                getattr(
+                    getattr(stage, "connector_config", None),
+                    "async_chunk",
+                    getattr(getattr(stage, "engine_args", None), "async_chunk", False),
+                )
+            )
+            for stage in self.stage_configs
+        )
+
         if self._single_stage_id_filter is not None:
             self._validate_single_stage_choice(self._single_stage_id_filter, self.stage_configs)
+
+            # If a stage is being served by itself (i.e., no master server, and only
+            # taking Run requests), 0 out replicas of the nonselected stages. We also
+            # clear their devices, since they'd be sized for replicas that won't run here.
+            if not self.single_stage_mode:
+                if self.async_chunk:
+                    raise ValueError(
+                        "--stage-id without a master serves only /v1/run, which does not support async_chunk; "
+                        "pass --no-async-chunk"
+                    )
+                for stage_cfg in self.stage_configs:
+                    if stage_cfg.stage_id != self._single_stage_id_filter:
+                        stage_cfg.runtime_config.num_replicas = 0
+                        stage_cfg.runtime_config.devices = None
 
         if self._config_resolution is None:
             # Same model, trust_remote_code and deploy path as the resolution
@@ -327,16 +356,6 @@ class OmniEngineBase:
             )
 
         self.num_stages = len(self.stage_configs)
-        self.async_chunk = any(
-            bool(
-                getattr(
-                    getattr(stage, "connector_config", None),
-                    "async_chunk",
-                    getattr(getattr(stage, "engine_args", None), "async_chunk", False),
-                )
-            )
-            for stage in self.stage_configs
-        )
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
@@ -484,26 +503,22 @@ class OmniEngineBase:
             # Chat requests that bypass stage 0 are rendered for stage 1; the
             # orchestrator runs their multimodal processing.
             self._entry_stage_renderers[1] = build_omni_renderer(self.stage_vllm_configs[1])
-        self.prompt_transform_func = (
-            getattr(self.stage_clients[0], "prompt_transform_func", None) if self.stage_clients else None
-        )
+        # Per-stage lists come from stage metadata, which still exists with no client
+        metadata_by_stage = self._runtime.stage_metadata
+        self.prompt_transform_func = metadata_by_stage[0].prompt_transform_func
         self.prompt_expand_func = next(
-            (
-                getattr(client, "prompt_expand_func", None)
-                for client in self.stage_clients
-                if getattr(client, "prompt_expand_func", None) is not None
-            ),
+            (metadata.prompt_expand_func for metadata in metadata_by_stage if metadata.prompt_expand_func is not None),
             None,
         )
-        self.default_sampling_params_list = [client.default_sampling_params for client in self.stage_clients]
+        self.default_sampling_params_list = [metadata.default_sampling_params for metadata in metadata_by_stage]
         self.stage_metadata = [
             StageRuntimeInfo(
-                final_output=client.final_output,
-                final_output_type=client.final_output_type,
-                stage_type=client.stage_type,
-                model_stage=getattr(client, "model_stage", None),
+                final_output=metadata.final_output,
+                final_output_type=cast(FinalOutputModalityType | None, metadata.final_output_type),
+                stage_type=metadata.stage_type,
+                model_stage=metadata.model_stage,
             )
-            for client in self.stage_clients
+            for metadata in metadata_by_stage
         ]
         self.supported_tasks = _derive_supported_tasks(self.stage_configs)
 
@@ -532,6 +547,7 @@ class OmniEngineBase:
                 output_async_queue=self._output_sink,
                 rpc_async_queue=self.rpc_output_queue.async_q,
                 stage_pools=self.stage_pools,
+                stage_metadata=self._runtime.stage_metadata,
                 async_chunk=self.async_chunk,
                 pd_config=pd_config,
                 membership_controller=membership_controller,

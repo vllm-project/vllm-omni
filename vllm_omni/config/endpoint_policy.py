@@ -8,6 +8,8 @@ from typing import NamedTuple
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
+from starlette.routing import Route, WebSocketRoute
 from vllm.entrypoints.serve.exception_handling.error_response import create_error_response
 
 from vllm_omni.entrypoints.serve.utils.routes import remove_route_from_app
@@ -18,11 +20,18 @@ class RouteTarget(NamedTuple):
 
     path: str
     methods: frozenset[str]
+    # Indicates an endpoint should be rejected if we are only serving part of the pipeline
+    requires_full_pipeline: bool = True
+    # False for server infrastructure endpoints that never run model inference.
+    # Server capabilities that set this to True are shut down in the duplex omni serving case.
+    runs_inference: bool = True
 
 
 class OmniServingCapability(Enum):
-    """Serving capabilities that pipelines can shut down."""
+    """Server routes that endpoint policies keep or shut down."""
 
+    HEALTH = RouteTarget("/health", frozenset({"GET"}), requires_full_pipeline=False, runs_inference=False)
+    METRICS = RouteTarget("/metrics", frozenset({"GET"}), requires_full_pipeline=False, runs_inference=False)
     COMPLETIONS = RouteTarget("/v1/completions", frozenset({"POST"}))
     CHAT_COMPLETIONS = RouteTarget("/v1/chat/completions", frozenset({"POST"}))
     CHAT_COMPLETIONS_BATCH = RouteTarget("/v1/chat/completions/batch", frozenset({"POST"}))
@@ -32,7 +41,7 @@ class OmniServingCapability(Enum):
     GENERATE_TOKENS = RouteTarget("/inference/v1/generate", frozenset({"POST"}))
     AUDIO_GENERATE = RouteTarget("/v1/audio/generate", frozenset({"POST"}))
     IMAGE_EDITS = RouteTarget("/v1/images/edits", frozenset({"POST"}))
-    RUN = RouteTarget("/v1/run", frozenset({"POST"}))
+    RUN = RouteTarget("/v1/run", frozenset({"POST"}), requires_full_pipeline=False)
 
     @property
     def path(self) -> str:
@@ -41,6 +50,14 @@ class OmniServingCapability(Enum):
     @property
     def methods(self) -> frozenset[str]:
         return self.value.methods
+
+    @property
+    def requires_full_pipeline(self) -> bool:
+        return self.value.requires_full_pipeline
+
+    @property
+    def runs_inference(self) -> bool:
+        return self.value.runs_inference
 
 
 @dataclass(frozen=True)
@@ -84,6 +101,23 @@ def build_rejection_handler(reason: str):
         )
 
     return rejection_handler
+
+
+def shutdown_full_pipeline_routes(app: FastAPI, reason: str) -> None:
+    """Reject HTTP routes that need the full pipeline and remove WebSocket routes.
+
+    This is useful for putting an API server in front of a single stage in a multistage
+    pipeline.
+    """
+    keep_paths = {capability.path for capability in OmniServingCapability if not capability.requires_full_pipeline}
+    rejection_handler = build_rejection_handler(reason)
+    routes = []
+    for route in app.router.routes:
+        if isinstance(route, Route) and route.path not in keep_paths:
+            routes.append(APIRoute(route.path, rejection_handler, methods=route.methods))
+        elif not (isinstance(route, WebSocketRoute) and route.path not in keep_paths):
+            routes.append(route)
+    app.router.routes = routes
 
 
 def shutdown_unsupported_routes(

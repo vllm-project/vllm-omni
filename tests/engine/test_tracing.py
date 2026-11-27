@@ -32,6 +32,7 @@ from tests.engine.test_orchestrator import (
     _build_stage_pools,
     _sampling_params,
 )
+from tests.helpers.stage_metadata import make_stage_metadata, stage_metadata_for_client
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import ErrorMessage, StageSubmissionMessage
@@ -121,6 +122,7 @@ async def test_orchestrator_closes_diffusion_request_and_stage(recording, outcom
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=_build_stage_pools([[client]]),
+        stage_metadata=[stage_metadata_for_client(0, client)],
         tracer=tracer,
     )
     for index in range(2):
@@ -187,6 +189,7 @@ async def test_raw_stage_error_trace_matches_frontend_classification(recording, 
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=pools,
+        stage_metadata=[stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(pools)],
         tracer=tracer,
     )
     request_trace = RequestTrace(tracer, "failed", HEADERS)
@@ -232,6 +235,7 @@ async def test_stage_error_preserves_trace_error_type(recording, error_type):
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=_build_stage_pools([[FakeStageClient(final_output=True)]]),
+        stage_metadata=[make_stage_metadata(final_output=True)],
         tracer=tracer,
     )
     request_trace = RequestTrace(tracer, "failed", HEADERS)
@@ -257,6 +261,7 @@ async def test_client_error_trace_uses_default_for_missing_type(recording, error
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=_build_stage_pools([[FakeStageClient(final_output=True)]]),
+        stage_metadata=[make_stage_metadata(final_output=True)],
         tracer=tracer,
     )
     request_trace = RequestTrace(tracer, "failed", HEADERS)
@@ -285,6 +290,7 @@ async def test_first_output_check_stops_after_nonempty_output(recording, mocker)
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[stage_metadata_for_client(0, pool.stage_client)],
         tracer=tracer,
     )
     request_trace = RequestTrace(tracer, "stream", HEADERS)
@@ -517,14 +523,18 @@ async def test_raw_terminal_stage_trace_survives_downstream_failure(recording, s
     tracer, exporter = recording
     request_id = "raw-terminal"
     processed = [_build_request_output(request_id)] if has_processed_output else []
+    stage_pools = _build_stage_pools(
+        [[FakeStageClient()], [FakeStageClient(final_output=True)]],
+        output_processors=[FakeOutputProcessor(request_outputs=processed), FakeOutputProcessor()],
+    )
     orch = Orchestrator(
         request_async_queue=asyncio.Queue(),
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
-        stage_pools=_build_stage_pools(
-            [[FakeStageClient()], [FakeStageClient(final_output=True)]],
-            output_processors=[FakeOutputProcessor(request_outputs=processed), FakeOutputProcessor()],
-        ),
+        stage_pools=stage_pools,
+        stage_metadata=[
+            stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(stage_pools)
+        ],
         tracer=tracer,
     )
     request_trace = RequestTrace(tracer, request_id, HEADERS)
