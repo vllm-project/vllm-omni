@@ -247,7 +247,7 @@ Canonical layout (prefer these paths for new changes):
 
     **Upload:** `buildkite-agent pipeline upload` (no `upload_pipeline.py` mirror expansion).
 
-    **Hardware in YAML:** inline `agents.queue` (for example `intel-gpu-omni`) on each step.
+    **Hardware in YAML:** inline `agents.queue` (for example `intel-gpu-omni`) on each step; the pr steps also pin `agents.cards` (`"1"` or `"2"`, matching the agents' `cards=N` tag).
 
     **Adding a job**
 

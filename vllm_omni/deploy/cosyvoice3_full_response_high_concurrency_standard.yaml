@@ -1,6 +1,6 @@
 # Standard (non-RAS) sampling variant of the C64 throughput profile, used for
 # SGLang-parity validation. Launch with
-# --hf-overrides '{"cosyvoice3_sampling_mode": "standard"}'.
+# --stage-overrides '{"0": {"hf_overrides": {"cosyvoice3_sampling_mode": "standard"}}}'.
 # Standard sampling needs a real repetition penalty (RAS handles repetition
 # itself); these defaults match the SGLang reference.
 base_config: cosyvoice3_full_response_high_concurrency.yaml

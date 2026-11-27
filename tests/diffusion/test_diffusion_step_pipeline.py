@@ -17,6 +17,7 @@ from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import get_open_port
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.diffusion.attention import schedule as schedule_module
 from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, AttentionSigmaWindow
@@ -336,15 +337,18 @@ class _AutoDenoiseProfilerPipeline(DiffusionPipelineProfilerMixin):
     def forward(self):
         return None
 
-    def denoise_step(self):
+    # Signature matches the pipeline protocol so the override type-checks; the
+    # profiler calls it without arguments.
+    def denoise_step(self, input_batch=None, **kwargs):
+        del input_batch, kwargs
         return "ok"
 
 
 class _InterruptingStepPipeline(_StepPipeline):
     interrupt = True
 
-    def denoise_step(self, state, **kwargs):
-        del state, kwargs
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
         self.denoise_calls += 1
         return None
 
@@ -1458,6 +1462,8 @@ class TestRunner:
         kv_payload = object()
 
         class _CapturingStepPipeline(_StepPipeline):
+            device: torch.device
+
             def prepare_encode(self, state, **kwargs):
                 captured["past_key_values"] = getattr(state.sampling, "past_key_values", None)
                 return super().prepare_encode(state, **kwargs)
@@ -1920,7 +1926,7 @@ class TestSupportedPipelines:
 
 
 @hardware_test(
-    res={"cuda": "L4"},
+    res={"cuda": "L4", "xpu": "B60"},
     num_cards=2,
 )
 def test_execute_stepwise_with_ulysses_parallel():
@@ -1930,13 +1936,13 @@ def test_execute_stepwise_with_ulysses_parallel():
 
     torch.multiprocessing.spawn(
         _distributed_step_worker,
-        args=(world_size, "ulysses", "29540"),
+        args=(world_size, "ulysses", str(get_open_port())),
         nprocs=world_size,
     )
 
 
 @hardware_test(
-    res={"cuda": "L4"},
+    res={"cuda": "L4", "xpu": "B60"},
     num_cards=2,
 )
 def test_execute_stepwise_with_ring_parallel():
@@ -1946,13 +1952,13 @@ def test_execute_stepwise_with_ring_parallel():
 
     torch.multiprocessing.spawn(
         _distributed_step_worker,
-        args=(world_size, "ring", "29541"),
+        args=(world_size, "ring", str(get_open_port())),
         nprocs=world_size,
     )
 
 
 @hardware_test(
-    res={"cuda": "L4"},
+    res={"cuda": "L4", "xpu": "B60"},
     num_cards=2,
 )
 def test_execute_stepwise_with_cfg_parallel():
@@ -1962,6 +1968,6 @@ def test_execute_stepwise_with_cfg_parallel():
 
     torch.multiprocessing.spawn(
         _distributed_step_worker,
-        args=(world_size, "cfg", "29542"),
+        args=(world_size, "cfg", str(get_open_port())),
         nprocs=world_size,
     )

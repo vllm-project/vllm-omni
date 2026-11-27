@@ -10,6 +10,59 @@
 #
 # YAML anchors are nested lists; the loader flattens them.
 
+x-kimi-audio: &kimi_audio
+  - vllm_omni/engine/async_omni_engine.py
+  - vllm_omni/entrypoints/omni_base.py
+  - vllm_omni/worker_v2/
+  - vllm_omni/model_executor/models/kimi_audio/
+  - vllm_omni/model_executor/stage_input_processors/kimi_audio.py
+  - vllm_omni/deploy/kimi_audio.yaml
+  - vllm_omni/deploy/kimi_audio_async_chunk.yaml
+  - vllm_omni/entrypoints/openai/tts_adapters/kimi_audio.py
+  - vllm_omni/entrypoints/openai/serving_speech.py
+  - vllm_omni/outputs/output_processor.py
+  - vllm_omni/data_entry_keys.py
+
+x-chatterbox: &chatterbox
+  - vllm_omni/engine/async_omni_engine.py
+  - vllm_omni/engine/arg_utils.py
+  - vllm_omni/entrypoints/omni_base.py
+  - vllm_omni/entrypoints/openai/serving_speech.py
+  - vllm_omni/entrypoints/openai/serving_speech_stream.py
+  - vllm_omni/utils/speaker_cache.py
+  - vllm_omni/config/speech_cache.py
+  - vllm_omni/entrypoints/openai/tts_adapters/
+  - vllm_omni/worker_v2/
+  - vllm_omni/core/sched/
+  - vllm_omni/config/stage_config.py
+  - vllm_omni/config/omni_config.py
+  - vllm_omni/engine/stage_runtime.py
+  - vllm_omni/engine/stage_init_utils.py
+  - vllm_omni/engine/cuda_mps.py
+  - vllm_omni/engine/orchestrator.py
+  - vllm_omni/engine/serialization.py
+  - vllm_omni/engine/stage_engine_core_proc.py
+  - vllm_omni/distributed/omni_connectors/
+  - vllm_omni/worker/gpu_model_runner.py
+  - vllm_omni/worker/gpu_ar_model_runner.py
+  - vllm_omni/worker/gpu_generation_model_runner.py
+  - vllm_omni/data_entry_keys.py
+  - vllm_omni/utils/audio.py
+  - vllm_omni/model_executor/models/chatterbox/
+  - vllm_omni/model_executor/models/registry.py
+  - vllm_omni/model_executor/models/common/snake_activation.py
+  - vllm_omni/model_executor/models/cosyvoice3/code2wav_core/
+  - vllm_omni/model_executor/models/cosyvoice3/utils.py
+  - vllm_omni/model_executor/models/glm_tts/vocoder.py
+  - vllm_omni/model_executor/models/indextts2/
+  - vllm_omni/model_executor/models/step_audio2/step_audio2_thinker.py
+  - vllm_omni/model_executor/stage_input_processors/bagel.py
+  - vllm_omni/model_executor/stage_input_processors/chatterbox.py
+  - vllm_omni/transformers_utils/configs/__init__.py
+  - vllm_omni/transformers_utils/configs/chatterbox.py
+  - vllm_omni/deploy/chatterbox.yaml
+  - vllm_omni/deploy/chatterbox_turbo.yaml
+
 x-qwen3-tts: &qwen3_tts
   - vllm_omni/engine/async_omni_engine.py
   - vllm_omni/entrypoints/omni_base.py
@@ -335,6 +388,7 @@ x-cosmos3: &cosmos3
   - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_wan.py
   - vllm_omni/experimental/world_models/
   - vllm_omni/model_extras/cosmos3.py
+  - vllm_omni/model_extras/cosmos3_lidar.py
 
 x-qwen-image: &qwen_image
   - vllm_omni/diffusion/models/qwen_image/
@@ -378,6 +432,18 @@ x-hunyuan-image3: &hunyuan_image3
 x-minimax-h3: &minimax_h3
   - vllm_omni/diffusion/models/minimax_h3/
   - vllm_omni/diffusion/layers/indexed_modulation.py
+
+x-minimax-h3-image: &minimax_h3_image
+  - *minimax_h3
+  - vllm_omni/model_executor/models/minimax_h3/
+  - vllm_omni/diffusion/registry.py
+  - vllm_omni/diffusion/model_metadata.py
+
+x-minimax-h3-image-functional-runtime: &minimax_h3_image_functional_runtime
+  - vllm_omni/diffusion/offloader/
+  - vllm_omni/diffusion/distributed/
+  - vllm_omni/diffusion/attention/
+  - vllm_omni/entrypoints/openai/
 
 x-flux3: &flux3
   - vllm_omni/diffusion/models/flux3/
@@ -518,6 +584,18 @@ source_file_dependencies:
     - tests/diffusion/ar_diffusion/
     - vllm_omni/experimental/ar_diffusion/
 
+  diffusion_pipeline_parallel_parity:
+    - tests/diffusion/distributed/test_pipeline_parallel.py
+    - tests/helpers/distributed.py
+    - tests/helpers/mark.py
+    - tests/conftest.py
+    - vllm_omni/diffusion/distributed/pipeline_parallel.py
+    - vllm_omni/diffusion/distributed/cfg_parallel.py
+    - vllm_omni/diffusion/distributed/parallel_state.py
+    - vllm_omni/diffusion/distributed/group_coordinator.py
+    - vllm_omni/diffusion/distributed/comm.py
+    - vllm_omni/platforms/
+
   diffusion_distributed_attention:
     - tests/diffusion/distributed/
     - tests/diffusion/test_mossimage_rope.py
@@ -528,6 +606,25 @@ source_file_dependencies:
     - vllm_omni/diffusion/data.py
     - vllm_omni/diffusion/hooks/sequence_parallel.py
     - vllm_omni/diffusion/models/
+
+  diffusion_flux_mossimage_parallel:
+    - tests/diffusion/distributed/test_merged_row_parallel_tp2.py
+    - tests/diffusion/distributed/test_mossimage_sp.py
+    - tests/diffusion/test_mossimage_rope.py
+    - tests/helpers/distributed.py
+    - tests/helpers/mark.py
+    - tests/conftest.py
+    - vllm_omni/diffusion/models/flux/
+    - vllm_omni/diffusion/models/flux2/
+    - vllm_omni/diffusion/models/mossimage/
+    - vllm_omni/diffusion/layers/linear.py
+    - vllm_omni/diffusion/attention/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/hooks/sequence_parallel.py
+    - vllm_omni/diffusion/config.py
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/forward_context.py
+    - vllm_omni/platforms/
 
   custom_pipeline:
     - tests/e2e/features/custom_pipeline/
@@ -540,13 +637,27 @@ source_file_dependencies:
 
   rlhf_verl_omni:
     - tests/e2e/features/rlhf_test/test_verl_omni_e2e.py
+    - tests/e2e/features/rlhf_test/test_verl_omni_ar_e2e.py
     - tests/e2e/features/helpers/verl_omni_server.py
+    - tests/e2e/features/helpers/verl_omni_ar_server.py
+    - tests/e2e/features/helpers/verl_omni_ar_worker.py
     - tests/e2e/features/helpers/custom_pipeline.py
     - vllm_omni/diffusion/
     - vllm_omni/engine/
     - vllm_omni/entrypoints/
     - vllm_omni/inputs/
     - vllm_omni/outputs/
+    - vllm_omni/model_executor/models/qwen3_omni/
+    - vllm_omni/worker_v2/
+
+  rocm_diffusion_nightly_runner:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+
+  rocm_tts_perf_runner:
+    - .buildkite/amd/scripts/run_rocm_tts_perf.py
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
 
   # Tiny-model diffusion jobs (shared across many model trees under models/).
   diffusion_tiny_model:
@@ -593,6 +704,7 @@ source_file_dependencies:
 
   omni_qwen3_omni_function:
     - *qwen3_omni
+    - tests/helpers/assertions.py
     - vllm_omni/lora/
     - tests/e2e/features/rlhf_test/test_qwen3_omni_merged_lora.py
     - tests/e2e/features/rlhf_test/qwen3_omni_merge_probe.py
@@ -652,6 +764,8 @@ source_file_dependencies:
   diffusion_bagel_weekly:
     - *bagel
     - tests/e2e/online_serving/test_bagel.py
+    - tests/e2e/online_serving/test_bagel_expansion.py
+    - tests/e2e/online_serving/test_bagel_multi_replicas.py
     - tests/conftest.py
     - tests/helpers/client.py
     - tests/helpers/fixtures/runtime.py
@@ -686,6 +800,8 @@ source_file_dependencies:
     - tests/e2e/accuracy/qwen3_omni/
     - tests/e2e/accuracy/conftest.py
     - tests/e2e/accuracy/helpers.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/benchmarks/validation.py
     - vllm_omni/benchmarks/data_modules/daily_omni_dataset.py
     - vllm_omni/benchmarks/data_modules/daily_omni_eval.py
     - vllm_omni/benchmarks/data_modules/seed_tts_dataset.py
@@ -694,6 +810,9 @@ source_file_dependencies:
 
   omni_qwen3_omni_perf:
     - *qwen3_omni_evaluation
+    - vllm_omni/benchmarks/data_modules/__init__.py
+    - tests/e2e/accuracy/qwen3_omni/
+    - vllm_omni/benchmarks/validation.py
     - .buildkite/amd/scripts/assert-pytest-collection.sh
     - .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
     - tests/dfx/conftest.py
@@ -701,6 +820,7 @@ source_file_dependencies:
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
     - tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
+    - tests/dfx/perf/tests/test_qwen3_omni_non_full_duplex.json
 
   omni_qwen3_omni_duplex_perf:
     - *qwen3_omni_evaluation
@@ -717,8 +837,7 @@ source_file_dependencies:
     - tests/dfx/perf/tests/test_qwen3_omni_duplex_omniinteract.json
     - tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json
 
-  # Reusable V2/prefix-cache runtime dependencies. Currently composed only by
-  # Qwen CUDA nightly jobs; NPU/ROCm still use V1.
+  # Shared by Qwen CUDA nightly jobs and the A3 DuplexEval job.
   omni_v2_runtime:
     - vllm_omni/core/prefix_cache/
     - vllm_omni/worker_v2/__init__.py
@@ -810,12 +929,8 @@ source_file_dependencies:
     - examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py
     - tests/examples/qwen3_omni_audio_artifacts.py
     - tests/examples/online_serving/test_qwen3_omni.py
-
-  omni_qwen2_5_omni_doc:
-    - *qwen2_5_omni
-    - examples/online_serving/qwen2_5_omni/
-    - examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py
-    - tests/examples/online_serving/test_qwen2_5_omni.py
+    - tests/examples/helpers.py
+    - tests/examples/conftest.py
 
   omni_qwen2_5_omni_expansion:
     - *qwen2_5_omni
@@ -931,8 +1046,14 @@ source_file_dependencies:
     - *minicpmo_4_5
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/conftest.py
+    - tests/e2e/accuracy/helpers.py
     - tests/dfx/perf/tests/test_minicpmo_4_5_ready.json
     - tests/dfx/perf/tests/test_minicpmo_4_5.json
+    - vllm_omni/benchmarks/data_modules/daily_omni_dataset.py
+    - vllm_omni/benchmarks/data_modules/daily_omni_eval.py
+    - vllm_omni/benchmarks/data_modules/seed_tts_dataset.py
+    - vllm_omni/benchmarks/data_modules/seed_tts_eval.py
+    - vllm_omni/deploy/minicpmo_4_5_turn.yaml
 
   omni_minicpmo_4_5_a3_2card_perf:
     - *minicpmo_4_5
@@ -940,7 +1061,7 @@ source_file_dependencies:
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_minicpmo_4_5_a3_2card.json
     - vllm_omni/core/sched/omni_ar_scheduler.py
-    - vllm_omni/deploy/minicpmo_4_5_npu_2card.yaml
+    - vllm_omni/deploy/minicpmo_4_5_2gpu.yaml
     - vllm_omni/patch.py
     - vllm_omni/platforms/npu/worker/npu_omni_v2_model_runner.py
     - vllm_omni/worker_v2/ngram_adapter.py
@@ -989,6 +1110,18 @@ source_file_dependencies:
     - vllm_omni/outputs/
     - tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py
     - tests/worker_v2/
+
+  tts_kimi_audio_function:
+    - *kimi_audio
+    - pyproject.toml
+    - tests/e2e/online_serving/test_kimi_audio.py
+
+  tts_chatterbox_function:
+    - *chatterbox
+    - tests/e2e/offline_inference/test_chatterbox.py
+    - tests/e2e/online_serving/test_chatterbox.py
+    - tests/e2e/online_serving/test_chatterbox_expansion.py
+    - tests/model_executor/models/chatterbox/test_chatterbox_gpu.py
 
   tts_qwen3_tts_function:
     - tests/helpers/assertions.py
@@ -1156,6 +1289,8 @@ source_file_dependencies:
     - tests/helpers/stage_config.py
     - vllm_omni/config/
     - vllm_omni/deploy/higgs_multimodal_qwen3.yaml
+    - vllm_omni/deploy/higgs_multimodal_qwen3_high_throughput.yaml
+    - vllm_omni/deploy/higgs_multimodal_qwen3_low_latency.yaml
     - vllm_omni/engine/
     - vllm_omni/entrypoints/omni_base.py
     - vllm_omni/entrypoints/openai/tts_adapters/higgs_audio_v3.py
@@ -1326,7 +1461,7 @@ source_file_dependencies:
     - vllm_omni/outputs/
     - vllm_omni/transformers_utils/configs/minimax_music3.py
 
-  tts_yue2_weekly:
+  tts_yue2_weekly: &tts_yue2_weekly
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - tests/assets/yue2/
     - tests/e2e/features/yue2/
@@ -1346,6 +1481,14 @@ source_file_dependencies:
     - vllm_omni/tokenizers/yue2_prompt.py
     - vllm_omni/tokenizers/yue2_tokenizer.py
     - vllm_omni/transformers_utils/configs/yue2.py
+    - vllm_omni/worker_v2/omni_ar_model_runner.py
+    - vllm_omni/worker_v2/omni_model_runner.py
+    - vllm_omni/worker_v2/model_states/omni_model_state.py
+
+  tts_yue2_function:
+    - *tts_yue2_weekly
+    - tests/e2e/offline_inference/test_yue2.py
+    - examples/offline_inference/yue2/end2end.py
 
   tts_cosyvoice3_function:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
@@ -1412,6 +1555,7 @@ source_file_dependencies:
 
   tts_qwen3_tts_perf:
     - *qwen3_tts
+    - *chatterbox
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/conftest.py
     - tests/dfx/perf/tests/test_tts.json
@@ -1473,6 +1617,37 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_wan22_t2v.py
     - tests/e2e/online_serving/test_wan22_expansion.py
 
+  diffusion_wan22_device_postprocess:
+    - *wan22
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - tests/e2e/offline_inference/test_device_postprocess_equivalence.py
+    - tests/helpers/mark.py
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/postprocess/
+    - vllm_omni/diffusion/worker/
+    - vllm_omni/diffusion/stage_diffusion_client.py
+    - vllm_omni/diffusion/stage_diffusion_proc.py
+    - vllm_omni/entrypoints/omni.py
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/inputs/
+    - vllm_omni/outputs/
+
+  diffusion_wan2_1_vace_weekly:
+    - *wan22
+    - tests/e2e/online_serving/test_wan_2_1_vace_expansion.py
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - tests/conftest.py
+    - tests/helpers/mark.py
+    - tests/helpers/runtime.py
+    - tests/helpers/fixtures/
+    - vllm_omni/diffusion/cache/cachedit/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/model_extras/vace.py
+    - vllm_omni/model_extras/registry.py
+
   diffusion_wan22_accuracy:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - .buildkite/amd/scripts/assert-pytest-collection.sh
@@ -1501,15 +1676,15 @@ source_file_dependencies:
   diffusion_image_to_video_doc:
     - *wan22
     - *hunyuan_video
-    - *ltx2
-    - *sana_video
-    - *lingbot_video
+    - tests/examples/helpers.py
+    - tests/examples/conftest.py
     - examples/offline_inference/image_to_video/
     - tests/examples/offline_inference/test_image_to_video.py
 
   diffusion_cosmos3_function:
     - *cosmos3
     - tests/e2e/online_serving/test_cosmos3.py
+    - tests/e2e/online_serving/test_cosmos3_transfer_auto.py
 
   diffusion_qwen_image_function:
     - *qwen_image
@@ -1519,12 +1694,258 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_qwen_image_expansion.py
     - tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py
 
+  diffusion_vae_patch_decode:
+    - *wan22
+    - *qwen_image
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/distributed/
+    - vllm_omni/platforms/
+    - tests/diffusion/distributed/test_vae_decode_parallelism.py
+    - tests/helpers/
+    - tests/conftest.py
+
   diffusion_qwen_image_accuracy:
     - *qwen_image
     - tests/e2e/accuracy/test_qwen_image.py
     - tests/e2e/accuracy/test_diffusers_backend_similarity.py
 
+  diffusion_qwen_image_edit_weekly:
+    - *qwen_image
+    - vllm_omni/config/
+    - vllm_omni/diffusion/cache/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/offloader/
+    - tests/e2e/online_serving/test_qwen_image_edit.py
+    - tests/e2e/online_serving/test_qwen_image_edit_expansion.py
+    - tests/e2e/online_serving/test_qwen_image_layered.py
+    - tests/e2e/online_serving/test_qwen_image_layered_expansion.py
+    - tests/e2e/accuracy/test_qwen_image_edit.py
+    - tests/e2e/accuracy/test_qwen_image_layered.py
+    - tests/e2e/accuracy/helpers.py
+    - tests/e2e/accuracy/conftest.py
+    - tests/assets/qwen_image_edit/
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_qwen_image_autoround_weekly:
+    - *qwen_image
+    - vllm_omni/config/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/model_loader/
+    - vllm_omni/diffusion/worker/
+    - vllm_omni/engine/stage_init_utils.py
+    - vllm_omni/quantization/
+    - tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_longcat_weekly:
+    - vllm_omni/config/
+    - vllm_omni/diffusion/cache/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/models/longcat_image/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/entrypoints/openai/
+    - tests/e2e/online_serving/test_longcat_image_expansion.py
+    - tests/e2e/online_serving/test_longcat_image_edit_expansion.py
+
+  diffusion_boogu_weekly:
+    - vllm_omni/config/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/models/boogu_image/
+    - vllm_omni/entrypoints/openai/
+    - tests/e2e/online_serving/test_boogu_image.py
+    - tests/e2e/online_serving/test_boogu_image_edit.py
+    - tests/e2e/online_serving/test_boogu_image_expansion.py
+    - tests/e2e/online_serving/test_boogu_image_edit_expansion.py
+
+  diffusion_flux_weekly:
+    - vllm_omni/config/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/models/flux/
+    - vllm_omni/diffusion/models/flux2/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/entrypoints/openai/
+    - tests/e2e/online_serving/test_flux_2_dev_expansion.py
+    - tests/e2e/offline_inference/test_flux1_schnell_expansion.py
+    - tests/e2e/offline_inference/test_flux1_kontext_expansion.py
+
+  diffusion_krea2_weekly:
+    - vllm_omni/config/
+    - vllm_omni/diffusion/cache/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/lora/
+    - vllm_omni/diffusion/models/krea2/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/entrypoints/openai/
+    - vllm_omni/lora/
+    - tests/e2e/online_serving/test_krea2_expansion.py
+    - tests/e2e/offline_inference/test_krea2_expansion.py
+
+  diffusion_ltx_weekly:
+    - *ltx2
+    - vllm_omni/config/
+    - vllm_omni/diffusion/attention/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/model_loader/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/entrypoints/openai/
+    - tests/e2e/online_serving/test_ltx.py
+    - tests/e2e/online_serving/test_ltx25.py
+    - tests/e2e/online_serving/test_ltx25_audio.py
+    - tests/e2e/offline_inference/test_ltx25_audio.py
+    - tests/e2e/accuracy/ltx/
+    - tests/diffusion/models/ltx2/
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_sana_video_weekly:
+    - *sana_video
+    - vllm_omni/config/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/model_loader/
+    - vllm_omni/diffusion/worker/
+    - vllm_omni/entrypoints/openai/
+    - tests/e2e/online_serving/test_sana_video_expansion.py
+    - tests/e2e/accuracy/sana_video/test_sana_video_pipeline_alignment.py
+    - tests/e2e/accuracy/sana_video/test_sana_video_i2v_alignment.py
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_sensenova_u1_weekly:
+    - vllm_omni/config/
+    - vllm_omni/diffusion/cache/
+    - vllm_omni/diffusion/lora/
+    - vllm_omni/diffusion/models/sensenova_u1/
+    - vllm_omni/lora/
+    - vllm_omni/model_executor/models/sensenova_u1/
+    - tests/e2e/offline_inference/test_sensenova_u1_expansion.py
+    - tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py
+    - tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py
+    - tests/e2e/accuracy/sensenova_u1.py
+    - tests/e2e/accuracy/sensenova_u1_reference.json
+    - tests/e2e/accuracy/sensenova_u1_reference_mi300.json
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_mammoth_moda2_weekly:
+    - vllm_omni/config/
+    - vllm_omni/deploy/mammoth_moda2.yaml
+    - vllm_omni/diffusion/models/mammoth_moda2/
+    - vllm_omni/model_executor/models/mammoth_moda2/
+    - vllm_omni/model_executor/stage_input_processors/mammoth_moda2.py
+    - tests/e2e/offline_inference/test_mammoth_moda2_expansion.py
+    - tests/diffusion/models/mammoth_moda2/test_mammoth_moda2_dit_quantization_quality.py
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_helios_weekly:
+    - vllm_omni/config/
+    - vllm_omni/diffusion/models/helios/
+    - vllm_omni/entrypoints/openai/
+    - tests/e2e/accuracy/helpers.py
+    - tests/e2e/accuracy/conftest.py
+    - tests/e2e/accuracy/test_video_streaming_output_similarity.py
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_glm_image_weekly:
+    - vllm_omni/config/
+    - vllm_omni/deploy/glm_image.yaml
+    - vllm_omni/diffusion/cache/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/model_loader/
+    - vllm_omni/diffusion/models/glm_image/
+    - vllm_omni/entrypoints/openai/
+    - vllm_omni/model_executor/models/glm_image/
+    - vllm_omni/quantization/
+    - tests/e2e/online_serving/test_glm_image_expansion.py
+    - tests/e2e/offline_inference/test_glm_image_autoround_w4a16_expansion.py
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_dreamzero_weekly:
+    - vllm_omni/config/
+    - vllm_omni/deploy/dreamzero_tp1_cfg2.yaml
+    - vllm_omni/diffusion/models/dreamzero/
+    - vllm_omni/entrypoints/openpi/
+    - tests/e2e/online_serving/test_dreamzero_expansion.py
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_hidream_o1_weekly:
+    - vllm_omni/config/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/models/hidream_o1_image/
+    - tests/assets/hidream_o1/
+    - tests/e2e/accuracy/helpers.py
+    - tests/e2e/accuracy/conftest.py
+    - tests/e2e/accuracy/test_hidream_o1_image.py
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_magi2_weekly:
+    - vllm_omni/config/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/models/magi2/
+    - vllm_omni/entrypoints/openai/
+    - tests/e2e/online_serving/test_magi2.py
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_portable_1gpu_weekly:
+    - *stable_audio
+    - *z_image
+    - vllm_omni/config/
+    - vllm_omni/diffusion/cache/
+    - vllm_omni/diffusion/models/flux/
+    - vllm_omni/diffusion/models/flux2/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/entrypoints/openai/
+    - vllm_omni/watermarking/
+    - tests/e2e/offline_inference/test_flux2_klein.py
+    - tests/e2e/offline_inference/test_stable_audio_expansion.py
+    - tests/e2e/online_serving/test_stable_audio_online_expansion.py
+    - tests/e2e/offline_inference/test_z_image.py
+    - tests/e2e/online_serving/test_flux_kontext_expansion.py
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_portable_2gpu_weekly:
+    - vllm_omni/config/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/models/ernie_image/
+    - vllm_omni/diffusion/models/nextstep_1_1/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/entrypoints/openai/
+    - tests/e2e/offline_inference/test_ernie_image_expansion.py
+    - tests/e2e/online_serving/test_ernie_image_expansion.py
+    - tests/e2e/online_serving/test_nextstep_expansion.py
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_portable_4gpu_weekly:
+    - *z_image
+    - vllm_omni/config/
+    - vllm_omni/diffusion/cache/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/models/flux2/
+    - vllm_omni/diffusion/models/sd3/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/diffusion/quantization/
+    - vllm_omni/entrypoints/openai/
+    - tests/e2e/online_serving/test_flux2_expansion.py
+    - tests/e2e/online_serving/test_sd3_expansion.py
+    - tests/e2e/online_serving/test_z_image.py
+    - tests/e2e/online_serving/test_zimage_expansion.py
+    - tests/helpers/
+    - tests/conftest.py
+
   diffusion_qwen_image_21_accuracy:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *qwen_image_21
     - tests/e2e/accuracy/qwen_image_21/
     - tests/e2e/accuracy/helpers.py
@@ -1532,6 +1953,17 @@ source_file_dependencies:
     - tests/assets/qwen_image_edit/
     - tests/helpers/
     - tests/conftest.py
+
+  diffusion_wan_vae_spatial_shard:
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/distributed/
+    - vllm_omni/experimental/ar_diffusion/streaming_decode.py
+    - vllm_omni/platforms/
+    - tests/diffusion/distributed/test_wan_spatial_shard.py
+    - tests/helpers/mark.py
+    - tests/conftest.py
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
 
   diffusion_collective_parity:
     - vllm_omni/diffusion/distributed/
@@ -1555,55 +1987,39 @@ source_file_dependencies:
     - tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json
 
   diffusion_text_to_image_doc:
-    - *qwen_image
-    - *z_image
+    - *qwen_image_21
     - examples/offline_inference/text_to_image/
     - examples/online_serving/text_to_image/
     - tests/examples/offline_inference/test_text_to_image.py
     - tests/examples/online_serving/test_text_to_image.py
-    - vllm_omni/diffusion/models/nextstep_1_1/
-    - vllm_omni/diffusion/models/longcat_image/
-    - vllm_omni/diffusion/models/ovis_image/
-    - vllm_omni/diffusion/models/omnigen2/
-    - vllm_omni/diffusion/models/sd3/
-    - vllm_omni/diffusion/models/flux/
-    - vllm_omni/diffusion/models/flux2/
-    - vllm_omni/diffusion/models/flux2_klein/
-    - vllm_omni/diffusion/models/krea2/
-    - vllm_omni/diffusion/models/lingbot_video/
+    - tests/examples/helpers.py
+    - tests/examples/conftest.py
 
   diffusion_hunyuan_image3_function:
     - *hunyuan_image3
     - tests/e2e/offline_inference/test_hunyuanimage3_i2t_expansion.py
 
-  diffusion_hunyuan_image3_weight_sharing:
-    - *hunyuan_image3
-    - vllm_omni/distributed/weight_sharing/
-    - vllm_omni/config/
-    - vllm_omni/engine/
-    - vllm_omni/worker/gpu_ar_worker.py
-    - vllm_omni/worker_v2/
-    - vllm_omni/diffusion/worker/
-    - vllm_omni/diffusion/stage_diffusion_proc.py
-    - vllm_omni/deploy/hunyuan-image-3-weight-sharing.yaml
-    - vllm_omni/deploy/hunyuan-image-3-mooncakeconnector.yaml
-    - tests/e2e/offline_inference/test_hunyuanimage3.py
-    - tests/helpers/
-    - tests/e2e/accuracy/helpers.py
-
   diffusion_hunyuan_image3_accuracy:
     - *hunyuan_image3
-    - tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py
+    - tests/e2e/accuracy/test_hunyuan_image3.py
+    - tests/assets/hunyuan_image3/
     - tests/e2e/accuracy/test_hunyuan_image3_lora.py
     - vllm_omni/diffusion/lora/
 
   diffusion_hunyuan_image3_perf:
     - *hunyuan_image3
-    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/conftest.py
+    - tests/assets/hunyuan_image3/
+    - tests/dfx/perf/tests/test_hunyuan_image3_it2i.json
+    - tests/dfx/perf/tests/test_hunyuan_image3_ar_tp2_dit_sp2.json
+    - tests/dfx/perf/tests/test_hunyuan_image3_dit_sp4.json
     - tests/dfx/perf/tests/test_hunyuan_image_tp2_cfgp2.json
     - tests/dfx/perf/tests/test_hunyuan_image_tp2_sp2.json
     - tests/dfx/perf/tests/test_hunyuan_image_tp4.json
+    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - vllm_omni/deploy/hunyuan_image_3_moe.yaml
+    - vllm_omni/deploy/hunyuan_image3_dit.yaml
 
   diffusion_hunyuan_image3_reliability:
     - *hunyuan_image3
@@ -1616,7 +2032,39 @@ source_file_dependencies:
     - tests/helpers/stage_config.py
     - tests/helpers/runtime.py
 
+  diffusion_minimax_h3_image_function:
+    - *minimax_h3_image
+    - *minimax_h3_image_functional_runtime
+    - tests/diffusion/models/minimax_h3/test_minimax_h3_image.py
+    - tests/diffusion/models/minimax_h3/test_minimax_h3_image_vae_cuda.py
+    - tests/e2e/online_serving/test_minimax_h3_image.py
+    - tests/assets/qwen_image_edit/
+
+  diffusion_minimax_h3_image_npu_function:
+    - *minimax_h3_image
+    - *minimax_h3_image_functional_runtime
+    - tests/e2e/online_serving/test_minimax_h3_image.py
+    - tests/assets/qwen_image_edit/
+    - vllm_omni/platforms/npu/
+    - .buildkite/npu/test-npu-ready.yml
+
+  diffusion_minimax_h3_image_diffusers_accuracy:
+    - *minimax_h3_image
+    - tests/e2e/accuracy/minimax_h3_image/
+    - tests/e2e/accuracy/helpers.py
+    - tests/e2e/accuracy/conftest.py
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_minimax_h3_image_perf:
+    - *minimax_h3_image
+    - tests/dfx/conftest.py
+    - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/perf/tests/test_minimax_h3_image_vllm_omni.json
+
   diffusion_minimax_h3_function:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *minimax_h3
     - tests/helpers/assertions.py
     - tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py
@@ -1696,8 +2144,11 @@ source_file_dependencies:
     - tests/diffusion/models/pi05/test_pi05_units.py
 
   diffusion_lingbot_function:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *lingbot_video
     - *lingbot_world
+    - vllm_omni/diffusion/model_metadata.py
     - vllm_omni/diffusion/offloader/
     - tests/e2e/online_serving/test_lingbot_video.py
     - tests/e2e/online_serving/test_lingbot_video_expansion.py

@@ -50,7 +50,9 @@ Committers have write access and merge rights. They typically have deep expertis
 - [@timzsu](https://github.com/timzsu): Diffusion model integration / LoRA (BAGEL, GR00T), TTS streaming (CosyVoice)
 - [@tzhouam](https://github.com/tzhouam): Engine and New Model Support
 - [@wtomin](https://github.com/wtomin): Diffusion models, parallel, and docs
+- [@wtz2333](https://github.com/wtz2333): World model integration and streaming
 - [@xuechendi](https://github.com/xuechendi): Diffusion and Intel GPU Support
+- [@yeahdongcn](https://github.com/yeahdongcn): MUSA backend and model support
 - [@ZeldaHuang](https://github.com/ZeldaHuang): Omni Support
 - [@ZhengWG](https://github.com/ZhengWG): Omni prefix cache, AR/omni engine core, multimodal serving
 - [@ZJY0516](https://github.com/ZJY0516): Diffusion attention backend, kernel fusion, and CustomOp

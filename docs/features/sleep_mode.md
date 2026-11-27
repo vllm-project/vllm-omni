@@ -118,33 +118,16 @@ if __name__ == "__main__":
 
 ```
 
-### server command Example
+### Server command example
 
-Start the server with sleep mode enabled:
+Enable sleep mode and set the GPU memory utilization for both BAGEL stages.
 
-The first method
-
-```
-
-vllm serve ByteDance-Seed/BAGEL-7B-MoT \
---omni \
---enable-sleep-mode \
---trust-remote-code \
---gpu-memory-utilization 0.7
-
-```
-
-The second method
-
-```
-
-python3 -m vllm_omni.entrypoints.openai.api_server \
-    --model ByteDance-Seed/BAGEL-7B-MoT \
-    --omni \
-    --enable-sleep-mode \
-    --trust-remote-code \
---gpu-memory-utilization 0.7
-
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --trust-remote-code \
+  --stage-overrides '{
+    "0": {"enable_sleep_mode": true, "gpu_memory_utilization": 0.7},
+    "1": {"enable_sleep_mode": true, "gpu_memory_utilization": 0.7}
+  }'
 ```
 
 ### Test Scenarios & Commands
@@ -155,7 +138,7 @@ Objective: Verify VRAM reclamation for Stage 0 (Thinker).
 
 Trigger sleep (Level 1 or Level 2) via client:
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/sleep \
      -H "Content-Type: application/json" \
@@ -171,7 +154,7 @@ Objective: Verify VRAM reclamation for Stage 1 (Diffusion).
 
 Trigger sleep (Level 1 or Level 2) via client:
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/sleep \
      -H "Content-Type: application/json" \
@@ -185,7 +168,7 @@ Objective: Test concurrent sleep and rapid wake-up across multiple stages.
 
 Concurrent Sleep (Stage 0 & 1):
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/sleep \
      -H "Content-Type: application/json" \
@@ -195,7 +178,7 @@ curl -X POST http://localhost:8000/v1/omni/sleep \
 
 Rapid Wake-up:
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/wakeup \
      -H "Content-Type: application/json" \
@@ -211,7 +194,7 @@ Check Initial State: Observe baseline VRAM usage.
 
 Trigger Deep Sleep (Level 2):
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/sleep \
      -H "Content-Type: application/json" \
@@ -221,7 +204,7 @@ curl -X POST http://localhost:8000/v1/omni/sleep \
 
 Wake-up Model:
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/wakeup \
      -H "Content-Type: application/json" \
@@ -232,7 +215,7 @@ curl -X POST http://localhost:8000/v1/omni/wakeup \
 Verify Functional Integrity (Inference):
 Ensure the model still generates valid output after reloading weights.
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/images/generations \
      -H "Content-Type: application/json" \
@@ -270,7 +253,7 @@ curl -X POST http://localhost:8000/v1/images/generations \
 Metadata Field Analysis
 The metadata field is a dynamic dictionary containing hardware-specific telemetry and audit data, primarily used for verifying memory reclamation on various backends (e.g., AMD ROCm, NVIDIA CUDA).
 
-```
+```text
 "metadata": {
     "source": "Platform_AMD_Instinct_MI300X",
     "total_freed_gib": "78.57",

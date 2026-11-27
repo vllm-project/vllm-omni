@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from tests.helpers.mark import hardware_marks
-from vllm_omni.model_executor.models.minicpmo_4_5.cfm_attention import cfm_attention
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.cfm_attention import cfm_attention
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
 

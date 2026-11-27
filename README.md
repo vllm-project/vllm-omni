@@ -9,7 +9,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 </h3>
 
 <p align="center">
-| <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://deepwiki.com/vllm-project/vllm-omni"><b>DeepWiki</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> | <a href="docs/assets/WeChat.jpg"><b>WeChat</b></a> | <a href="https://arxiv.org/abs/2610.09307"><b>Technical Report</b></a> | <a href="https://arxiv.org/abs/2602.02204"><b>Paper</b></a> | <a href="https://docs.google.com/presentation/d/1SV7-4AoSrnK25syLG9XmnEgC0D4lcjP7/edit?usp=sharing"><b>Slides</b></a> |
+| <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://deepwiki.com/vllm-project/vllm-omni"><b>DeepWiki</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> | <a href="docs/assets/WeChat.jpg"><b>WeChat</b></a> | <a href="https://arxiv.org/abs/2610.09307"><b>Technical Report</b></a> | <a href="https://arxiv.org/abs/2602.02204"><b>Paper</b></a> | <a href="https://docs.google.com/presentation/d/1lhmoYPJUOu_Qrd2F27ghQ4LAw3gjrNOv/edit"><b>Slides</b></a> |
 </p>
 
 ---
@@ -47,7 +47,7 @@ vLLM-Omni is fast with:
 
 - State-of-the-art AR support by leveraging efficient KV cache management from vLLM
 - Pipelined stage execution overlapping for high throughput performance
-- Fully disaggregation based on OmniConnector and dynamic resource allocation across stages
+- Full disaggregation based on OmniConnector and dynamic resource allocation across stages
 
 vLLM-Omni is flexible and easy to use with:
 
@@ -61,7 +61,7 @@ vLLM-Omni is flexible and easy to use with:
 vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
 
 - **Omni-modality models** (e.g. Qwen3-Omni, MiniCPM-o 4.5, Cosmos3, HunyuanImage, BAGEL)
-- **TTS models** (e.g. Qwen3-TTS, Tencent AuK, Breeze-TTS-2, CosyVoice3)
+- **TTS models** (e.g. Qwen3-TTS, Tencent AuK, Breeze-TTS-2, CosyVoice3, Chatterbox)
 - **Diffusion models** — image, video, and audio generation (e.g. MiniMax H3, LingBot World, MAGI-2, LTX-2.5, Wan2.2)
 - **Robot-policy and action models** (e.g. π0.5, GR00T-N1.7, DreamZero-DROID, InternVLA-A1)
 

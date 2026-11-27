@@ -30,6 +30,7 @@ from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError, validate_se
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter, session_auto_responds
+from vllm_omni.engine.duplex.session.input_clock import check_input_clock_supported, check_input_clock_unchanged
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallRejection, ToolCallState
@@ -47,6 +48,10 @@ from vllm_omni.engine.duplex.turn_detection import (
 from vllm_omni.protocol.duplex.events import error_event
 
 logger = init_logger(__name__)
+
+
+class TurnDetectionAudioError(ValueError):
+    """Turn detection could not read an append's audio: the runner refuses the append (``bad_audio``)."""
 
 
 class SessionControl:
@@ -145,8 +150,10 @@ class SessionControl:
             self._detector = None
             return [(event, None)]
         except ValueError as exc:
-            self._out.emit_error("bad_audio", str(exc))
-            return []
+            # The runner refuses the append (error ``bad_audio`` with the
+            # client's event id; an input-clocked session also acknowledges it
+            # as rejected), like audio that failed to decode.
+            raise TurnDetectionAudioError(str(exc)) from exc
         detected: list[tuple[dict[str, object], TurnDetectionResult | None]] = []
         for index, segment in enumerate(segments):
             payload = dict(event, audio=segment.audio, format="pcm_f32le", sample_rate_hz=16000)
@@ -188,6 +195,15 @@ class SessionControl:
     # Control events                                                     #
     # ------------------------------------------------------------------ #
 
+    def check_audio_truncate_support(self, *, event_id: object | None = None) -> bool:
+        """Use the same capability gate for native and typed truncation commands."""
+        if self._ctx.session.capabilities.supports_audio_truncate:
+            return True
+        self._out.emit_error(
+            "unsupported_operation", "This deployment does not support audio truncation", event_id=event_id
+        )
+        return False
+
     async def on_turn_signal(self, event: dict[str, object]) -> None:
         session = self._ctx.session
         turn_event = event.get("event")
@@ -227,6 +243,8 @@ class SessionControl:
             )
             return
         if turn_event == "conversation.item.truncate":
+            if not self.check_audio_truncate_support(event_id=realtime_event_id):
+                return
             payload = event.get("payload")
             item_id = payload.get("item_id") if isinstance(payload, dict) else None
             audio_end_ms = payload.get("audio_end_ms") if isinstance(payload, dict) else None
@@ -317,6 +335,7 @@ class SessionControl:
                 session_id=session.session_id,
                 audio_started=audio_started,
             )
+            candidate_config = candidate_config.with_output_capabilities(session.capabilities)
         except DuplexConfigError as exc:
             self._out.emit_error(exc.code, str(exc) or "session.update was rejected", event_id=realtime_event_id)
             return
@@ -340,6 +359,14 @@ class SessionControl:
         if unsupported is not None:
             self._out.emit_error("unsupported_turn_detection", unsupported, event_id=realtime_event_id)
             return
+        try:
+            check_input_clock_supported(self._ctx.plugin, candidate_config.extra_body)
+            # The clock mode and its timeouts are fixed at creation, like the
+            # acknowledgements they decide.
+            check_input_clock_unchanged(session.config.extra_body, candidate_config.extra_body)
+        except DuplexRuntimeConfigError as exc:
+            self._out.emit_error(exc.code, str(exc), event_id=realtime_event_id)
+            return
         if candidate_config.instructions != session.config.instructions and model_state.context_locked:
             self._out.emit_error(
                 "instructions_update_unsupported",
@@ -347,7 +374,7 @@ class SessionControl:
                 event_id=realtime_event_id,
             )
             return
-        requests_audio = any(str(modality).lower() == "audio" for modality in candidate_config.modalities)
+        requests_audio = "audio" in candidate_config.resolved_modalities
         if (
             requests_audio
             and "ref_audio_data" not in session.runtime_config

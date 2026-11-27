@@ -17,6 +17,7 @@ from typing import Any, TypeGuard
 import numpy as np
 import torch
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import PIN_MEMORY
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.media import (
@@ -217,6 +218,23 @@ def _unlink_shm_handles(handles: list[dict[str, Any]]) -> None:
             pass
 
 
+def _allocate_d2h_buffer(tensor: torch.Tensor) -> torch.Tensor:
+    try:
+        return torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=PIN_MEMORY)
+    except RuntimeError as exc:
+        # Ascend can run out of free pages for pinned host allocations.
+        # A pageable buffer can still carry the same data.
+        message = str(exc)
+        if "MallocHost" not in message and "out of memory" not in message.lower():
+            raise
+        logger.warning_once(
+            "Pinned host buffer unavailable for shape=%s dtype=%s; copying through pageable memory.",
+            tuple(tensor.shape),
+            tensor.dtype,
+        )
+        return torch.empty(tensor.shape, dtype=tensor.dtype)
+
+
 def _tensor_to_shm(
     tensor: torch.Tensor,
     d2h_stream: torch.Stream | None = None,
@@ -229,10 +247,10 @@ def _tensor_to_shm(
     The shared memory segment remains alive after this call (the local fd is
     closed, but the segment persists until ``_tensor_from_shm`` unlinks it).
 
-    If *d2h_stream* is provided, the D2H copy uses ``copy_()`` with
-    ``pin_memory=True`` on that stream instead of the synchronous ``.cpu()``
-    path.  The caller must synchronize *d2h_stream* after all tensors are
-    packed.
+    If *d2h_stream* is provided, the D2H copy uses ``copy_()`` into host
+    memory pinned per the platform flag ``PIN_MEMORY`` on that stream instead
+    of the synchronous ``.cpu()`` path.  The caller must synchronize
+    *d2h_stream* after all tensors are packed.
     """
     original_dtype = tensor.dtype
     if (
@@ -247,16 +265,10 @@ def _tensor_to_shm(
             created.append(handle)
         return handle
     if d2h_stream is not None and tensor.device.type != "cpu":
-        # Non-blocking D2H: copy on side stream to pinned CPU memory. Host
-        # tensors skip this staging copy; they are copied into SHM directly.
-        old_stream = torch.accelerator.current_stream()
-        torch.accelerator.set_stream(d2h_stream)
-        try:
-            t = tensor.detach()
-            cpu = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
-            cpu.copy_(t, non_blocking=True)
-        finally:
-            torch.accelerator.set_stream(old_stream)
+        with d2h_stream:
+            source = tensor.detach()
+            cpu = _allocate_d2h_buffer(source)
+            cpu.copy_(source, non_blocking=True)
         d2h_stream.synchronize()
         tensor = cpu
     else:
@@ -305,6 +317,11 @@ def _pack_tensor_if_large(
     Pickle serializes a view's whole storage, so a batch of small views costs
     the full batch tensor once per request. Size the decision on the storage
     to keep those views off the wire; packing copies just the view.
+
+    Tensors below the threshold are pickled inline. On platforms whose
+    ``supports_device_tensor_ipc()`` is False, device tensors are moved to CPU
+    first, so the receiver gets CPU tensors for every size, as it does for SHM
+    handles, and never unpickles onto the accelerator.
     """
     view_bytes = val.nelement() * val.element_size()
     try:
@@ -313,6 +330,11 @@ def _pack_tensor_if_large(
         storage_bytes = view_bytes
     if max(view_bytes, storage_bytes) > _SHM_TENSOR_THRESHOLD:
         return _tensor_to_shm(val, d2h_stream=d2h_stream, created=created, enable_registered_shm=enable_registered_shm)
+    if val.device.type != "cpu":
+        from vllm_omni.platforms import current_omni_platform
+
+        if not current_omni_platform.supports_device_tensor_ipc():
+            return val.detach().cpu().contiguous()
     return val
 
 

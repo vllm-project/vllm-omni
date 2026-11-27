@@ -56,6 +56,7 @@ th {
 | `LingBotWorldCausalDMDPipeline` | LingBot-World 2.0 v1 (experimental) | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | Experimental | | | | — |
 | `ABotWorldCausalPipeline` | ABot-World (experimental) | `acvlab/ABot-World-0-5B-LF` | Experimental | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ACVLab/ABot-World.md) |
 | `Cosmos3OmniDiffusersPipeline` | Cosmos3 T2I, T2V, I2V, V2V, T2V with sound, action policy | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
+| `Cosmos3MultiviewPipeline` | Cosmos3 multiview T2V, I2V, WSM transfer, view completion, optional joint LiDAR | `Cosmos3-Nano-Transfer-Auto` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Nano-Transfer-Auto-GB200.md) |
 | `Flux3Pipeline` | Flux3 — T2I, I2I | — | ✅︎ | | | | — |
 | `SanaWmPipeline` | SANA-WM | `BBBBruce/SANA-WM_bidirectional-stage1-diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/SANA-WM.md) |
 | `HyNomasModularPipeline` | Hy-Nomas distilled (Diffusers-format weights, reference runtime adapter) | `tencent/Hy-Nomas-Diffusers` | ✅︎ (H200 tested) | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/Hy-Nomas.md) |
@@ -114,10 +115,13 @@ th {
 | `StableAudio3Pipeline` | Stable-Audio-3 | `stabilityai/stable-audio-3-medium` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/StabilityAI/Stable-Audio-3-Medium.md) |
 | `MiniMaxMusic3ForConditionalGeneration` | MiniMax Music 3 (text-to-music) | `MiniMaxAI/MiniMax-Music3` | ✅︎ | | | ✅︎ | — |
 | `Yue2ForCausalLM` | YuE2-3B (text-to-music with ABC plan) | `m-a-p/YuE2-3B` | ✅︎ | | | ✅︎ | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/m-a-p/YuE2-3B.md) / [Audio-to-score](https://github.com/vllm-project/vllm-omni/blob/main/recipes/m-a-p/SheetSage2-H200.md) |
-| `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-CustomVoice | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) |
-| `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-VoiceDesign | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
-| `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-Base | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
+| `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-CustomVoice | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice), [Ascend 910B3 (v0.28.0)](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-TTS-Ascend910B3.md) |
+| `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-VoiceDesign | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | [Ascend 910B3 (v0.28.0)](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-TTS-Ascend910B3.md) |
+| `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-Base | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | [Ascend 910B3 (v0.28.0)](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-TTS-Ascend910B3.md) |
+| `ChatterboxForConditionalGeneration` | Chatterbox Turbo and Original (English, built-in voice and voice cloning) | `ResembleAI/chatterbox-turbo`, `ResembleAI/chatterbox` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ResembleAI/Chatterbox-H100.md) |
+| `Confucius4TTSTalkerForConditionalGeneration` | Confucius4-TTS | `netease-youdao/Confucius4-TTS` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NetEase-Youdao/Confucius4-TTS-H200.md) |
 | `MingTTSForConditionalGeneration` | Ming-omni-tts dense 0.5B | `inclusionAI/Ming-omni-tts-0.5B` | ✅︎ | | | ✅︎ | — |
+| `MingTTSForConditionalGeneration` | Ming-3.0-TTS dense 0.5B | `inclusionAI/Ming-3.0-tts-0.5b` | ✅︎ | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/inclusionAI/Ming-omni-tts.md) |
 | `Ming3TTSForConditionalGeneration` | Ming-3.0-TTS Tiny (Ling V3 MoE) | `inclusionAI/Ming-3.0-tts-tiny` | ✅︎ | | | ✅︎ | — |
 | `GLMTTSForConditionalGeneration` | GLM-TTS | `zai-org/GLM-TTS` | ✅︎ | | | | — |
 | `MossTTSNanoForCausalLM` | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✅︎ | | ✅︎ | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/OpenMOSS/MOSS-TTS-Nano-NPU.md) |
@@ -145,12 +149,17 @@ th {
 | `VoxtralTTSForConditionalGeneration` | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✅︎ | ✅︎ | | | — |
 | `CovoAudioForConditionalGeneration` | Covo-Audio-Chat | `tencent/Covo-Audio-Chat` | ✅︎ | | | ✅︎ | — |
 | `MiniCPMO45OmniForConditionalGeneration` | MiniCPM-o 4.5 | `openbmb/MiniCPM-o-4_5` | ✅︎ | | ✅︎ | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/OpenBMB/MiniCPM-o-4_5.md) |
+| `MiniCPMO45OmniForConditionalGeneration` | Sage-Interaction (full duplex with native `<\|delegate\|>` over `/v1/realtime?duplex=1`) | `internlm/Sage-Interaction` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/InternLM/Sage-Interaction.md) |
+| `RealtimeVenusOmni` (MiniCPM-o 4.5 pipeline) | Realtime-Venus Omni | `inclusionAI/Realtime-Venus` (Omni subdirectory) | ✅︎ | | | | [Recipe](gh-file:recipes/inclusionAI/Realtime-Venus.md) |
 | `PersonaPlexTalkerForConditionalGeneration` | PersonaPlex (full duplex, 24 kHz speech in/out over `/v1/realtime?duplex=1`) | `nvidia/personaplex-7b-v1` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/PersonaPlex.md) |
 | `HaruForConditionalGeneration` | Haru-4B (full duplex, 24 kHz speech in/out over `/v1/realtime?duplex=1`) | `higurashi-ai/Haru-4B` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/higurashi-ai/Haru-4B-H200.md) |
+| `AuraQwen3VLForConditionalGeneration` | AURA (speech + video in, speech out over `/v1/realtime?duplex=1`) | `aurateam/AURA` | ✅︎ | | | | — |
+| `AuraQwen3_5ForConditionalGeneration` | AURA_v2 (proactive speech + video assistant over `/v1/realtime?duplex=1`) | `aurateam/AURA_2` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/AURA/AURA_v2-H200.md) |
 | `ErnieImagePipeline` | ERNIE-Image | `baidu/ERNIE-Image`, `baidu/ERNIE-Image-Turbo` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `GepardTalkerForConditionalGeneration` | Gepard-1.0 | `nineninesix/gepard-1.0` | ✅︎ | | | ✅︎ | — |
 | `HiDreamO1ImagePipeline` | HiDream-O1-Image | `HiDream-ai/HiDream-O1-Image` | ✅︎ | | | | — |
 | `AnimaPipeline` | Anima | `circlestone-labs/Anima` | ✅︎ | ✅︎ | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/circlestone-labs/Anima.md) |
+| `PhononTalkerForConditionalGeneration` | Phonon 31M EN (B=1, TP=1) | `gradium/phonon-31m-en` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Gradium/Phonon-31M-EN-RTX3090.md) |
 
 The `Recipe` column links the corresponding deployment recipe. `Published` is
 preferred when a corresponding `recipes.vllm.ai` page exists; otherwise the

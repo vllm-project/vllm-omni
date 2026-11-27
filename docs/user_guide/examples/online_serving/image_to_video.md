@@ -23,9 +23,7 @@ bash run_server.sh
 
 The script allows overriding:
 - `MODEL` (default: `Wan-AI/Wan2.2-I2V-A14B-Diffusers`)
-- `PORT` (default: `8091`)
-- `BOUNDARY_RATIO` (default: `0.875`)
-- `FLOW_SHIFT` (default: `12.0`)
+- `PORT` (default: `8099`)
 - `CACHE_BACKEND` (default: `none`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
 

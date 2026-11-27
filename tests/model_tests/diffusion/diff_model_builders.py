@@ -397,3 +397,46 @@ def tiny_krea2_builder() -> str:
             "vae": _shrink_krea2_vae,
         },
     )
+
+
+_WAN_TEXT_DIM = 128
+
+
+def _shrink_wan_umt5_text_encoder(config: dict) -> dict:
+    config["num_layers"] = 2
+    config["num_decoder_layers"] = 2
+    config["d_model"] = _WAN_TEXT_DIM
+    config["d_ff"] = 64
+    config["num_heads"] = 4
+    return config
+
+
+def _shrink_wan_vae(config: dict) -> dict:
+    config["base_dim"] = 12
+    config["num_res_blocks"] = 1
+    if "decoder_base_dim" in config:
+        config["decoder_base_dim"] = 12
+    return config
+
+
+def _shrink_wan_transformer(config: dict) -> dict:
+    config["num_layers"] = 4
+    config["attention_head_dim"] = 32
+    config["num_attention_heads"] = 4
+    config["ffn_dim"] = 64
+    config["freq_dim"] = 32
+    config["text_dim"] = _WAN_TEXT_DIM
+    return config
+
+
+def tiny_wan_builder() -> str:
+    """Build a tiny Wan2.2 TI2V model with random weights."""
+    return build_tiny_from_configs(
+        "WanPipeline",
+        "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        transform={
+            "text_encoder": _shrink_wan_umt5_text_encoder,
+            "vae": _shrink_wan_vae,
+            "transformer": _shrink_wan_transformer,
+        },
+    )

@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 from vllm_omni.utils import seeded_exponential
 
@@ -40,7 +42,7 @@ def test_shared_generator_keeps_ordered_torch_draws(monkeypatch) -> None:
     assert not seeded_exponential.batched_seeded_exponential_supported(q, {0: shared, 1: shared})
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("seeded_rows", [(0, 1, 2), (0, 2)], ids=["all_seeded", "mixed"])
 @pytest.mark.parametrize("use_fp64_gumbel", [False, True])
 def test_torch_fallback_preserves_samples_and_generator_state(monkeypatch, seeded_rows, use_fp64_gumbel) -> None:
@@ -58,31 +60,31 @@ def test_torch_fallback_preserves_samples_and_generator_state(monkeypatch, seede
         raise AssertionError("the CUDA distribution kernel must not run on the fallback path")
 
     monkeypatch.setattr(seeded_exponential, "fill_exponential_rows", reject_kernel)
-    probs = torch.arange(1, 258, device="cuda", dtype=torch.float32).expand(3, -1).contiguous()
+    probs = torch.arange(1, 258, device=DEVICE_TYPE, dtype=torch.float32).expand(3, -1).contiguous()
     probs /= probs.sum(dim=-1, keepdim=True)
-    expected_gens = {row: torch.Generator(device="cuda").manual_seed(42 + row) for row in seeded_rows}
-    actual_gens = {row: torch.Generator(device="cuda").manual_seed(42 + row) for row in seeded_rows}
-    expected_default = torch.cuda.get_rng_state()
+    expected_gens = {row: torch.Generator(device=DEVICE_TYPE).manual_seed(42 + row) for row in seeded_rows}
+    actual_gens = {row: torch.Generator(device=DEVICE_TYPE).manual_seed(42 + row) for row in seeded_rows}
+    expected_default = DEVICE_MODULE.get_rng_state()
     actual_default = expected_default.clone()
     try:
         for _ in range(5):
-            torch.cuda.set_rng_state(expected_default)
+            DEVICE_MODULE.set_rng_state(expected_default)
             # FP32 sampling divides probabilities in place. Give both paths
             # the same untouched input on every step.
             expected = reference(probs.clone(), expected_gens, use_fp64_gumbel)
-            expected_default = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(actual_default)
+            expected_default = DEVICE_MODULE.get_rng_state()
+            DEVICE_MODULE.set_rng_state(actual_default)
             actual = seeded_exponential.categorical_sample(probs.clone(), actual_gens, use_fp64_gumbel)
-            actual_default = torch.cuda.get_rng_state()
+            actual_default = DEVICE_MODULE.get_rng_state()
             assert torch.equal(actual, expected)
             assert torch.equal(actual_default, expected_default)
             for row in seeded_rows:
                 assert torch.equal(actual_gens[row].get_state(), expected_gens[row].get_state())
     finally:
-        torch.cuda.set_rng_state(expected_default)
+        DEVICE_MODULE.set_rng_state(expected_default)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("rows", [None, [0, 2, 4]], ids=["grouped_codebooks", "selected_rows"])
 def test_direct_fill_fallback_preserves_ordered_draws(monkeypatch, rows) -> None:
     monkeypatch.setattr(seeded_exponential.current_platform, "is_cuda", lambda: False)
@@ -91,32 +93,32 @@ def test_direct_fill_fallback_preserves_ordered_draws(monkeypatch, rows) -> None
         raise AssertionError("the NVIDIA kernel must not run for direct fallback callers")
 
     monkeypatch.setattr(seeded_exponential, "torch_exponential_policy", reject_kernel)
-    expected = torch.ones(6, 257, device="cuda")
+    expected = torch.ones(6, 257, device=DEVICE_TYPE)
     actual = expected.clone()
-    expected_gen = torch.Generator(device="cuda").manual_seed(71)
-    actual_gen = torch.Generator(device="cuda").manual_seed(71)
+    expected_gen = torch.Generator(device=DEVICE_TYPE).manual_seed(71)
+    actual_gen = torch.Generator(device=DEVICE_TYPE).manual_seed(71)
     # A shared seeded generator and an unseeded request make loop order and
     # default-state advancement observable, including grouped codebooks.
     expected_gens = [expected_gen, None, expected_gen]
     actual_gens = [actual_gen, None, actual_gen]
-    original_default = torch.cuda.get_rng_state()
+    original_default = DEVICE_MODULE.get_rng_state()
     expected_default = original_default.clone()
     actual_default = original_default.clone()
     try:
         for _ in range(5):
-            torch.cuda.set_rng_state(expected_default)
+            DEVICE_MODULE.set_rng_state(expected_default)
             targets = expected.reshape(3, -1) if rows is None else [expected[row] for row in rows]
             for target, generator in zip(targets, expected_gens):
                 target.exponential_(generator=generator)
-            expected_default = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(actual_default)
+            expected_default = DEVICE_MODULE.get_rng_state()
+            DEVICE_MODULE.set_rng_state(actual_default)
             assert seeded_exponential.fill_exponential_rows(actual, actual_gens, rows) is actual
-            actual_default = torch.cuda.get_rng_state()
+            actual_default = DEVICE_MODULE.get_rng_state()
             assert torch.equal(actual, expected)
             assert torch.equal(actual_gen.get_state(), expected_gen.get_state())
             assert torch.equal(actual_default, expected_default)
     finally:
-        torch.cuda.set_rng_state(original_default)
+        DEVICE_MODULE.set_rng_state(original_default)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -138,6 +140,38 @@ def test_batched_steps_match_torch_noise_at_each_request_offset(vocab):
             expected[frame, row].exponential_(generator=reference)
             assert reference.get_offset() == offsets[row] + (frame + 1) * increment
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_higgs_noise_preview_follows_committed_positions_after_batch_reorder():
+    from vllm_omni.model_executor.models.higgs_audio_v3.spec_decode import HiggsAudioSpeculator
+
+    device = torch.device("cuda")
+    state = SimpleNamespace(
+        generators={
+            name: torch.Generator(device=device).manual_seed(seed) for name, seed in (("a", 7), ("b", 2**63 + 5))
+        },
+        model=SimpleNamespace(num_codebooks=8, multimodal_embedding=SimpleNamespace(vocab_size=1026)),
+    )
+    state.generators["b"].set_offset(12)
+    references = {name: gen.clone_state() for name, gen in state.generators.items()}
+    spec = object.__new__(HiggsAudioSpeculator)
+    spec.device_rng = {}
+
+    noise, offsets, increment = spec.preview_noise(state, ["a", "b"], device)
+    expected = torch.stack(
+        [
+            torch.stack([torch.empty(8208, device=device).exponential_(generator=gen) for gen in references.values()])
+            for _ in range(2)
+        ]
+    )
+    torch.testing.assert_close(noise, expected, rtol=0, atol=0)
+    spec.update_offsets(["a", "b"], offsets + torch.tensor([2, 1], device=device) * increment)
+    reordered, _, _ = spec.preview_noise(state, ["b", "a"], device)
+    torch.testing.assert_close(reordered[0, 0], expected[1, 1], rtol=0, atol=0)
+    next_a = torch.empty(8208, device=device).exponential_(generator=references["a"])
+    torch.testing.assert_close(reordered[0, 1], next_a, rtol=0, atol=0)
+    assert [gen.get_offset() for gen in state.generators.values()] == [0, 12]
 
 
 @pytest.mark.cpu

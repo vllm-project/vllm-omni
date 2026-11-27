@@ -1195,6 +1195,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         ],
     }
 
+    def merged_lora_spec(self):
+        """Expose merged-LoRA capability derived from upstream SupportsLoRA declarations."""
+        from vllm_omni.lora.capability import merged_lora_spec_from_ar_model
+
+        return merged_lora_spec_from_ar_model(self)
+
     supported_languages = ISO639_1_SUPPORTED_LANGS
 
     @classmethod

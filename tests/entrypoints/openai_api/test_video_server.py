@@ -38,7 +38,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoParams,
     VideoResponse,
 )
-from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
+from vllm_omni.entrypoints.openai.serving_video import EncodedVideoResult, OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager, LocalStorageTTLManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
 from vllm_omni.entrypoints.openai.video.generation import helpers as video_generation_helpers
@@ -211,18 +211,110 @@ def test_remote_diffusion_stage_enables_borrowed_frames_for_both_video_responses
         handler.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("model_class_name", "preencode_flag"),
+    [("WanPipeline", {"preencode_mp4": True}), ("MiniMaxH3Pipeline", {})],
+    ids=["explicit-flag", "model-default"],
+)
 @pytest.mark.parametrize("batch_frames", [0, -1, True, 1.5, "17", None])
-def test_preencode_rejects_invalid_batch_frames_before_generation(batch_frames):
+def test_preencode_rejects_invalid_batch_frames_before_generation(batch_frames, model_class_name, preencode_flag):
     engine = FakeAsyncOmni()
+    engine.model_class_name = model_class_name
     handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
     request = VideoGenerationRequest(
-        prompt="test", extra_params={"preencode_mp4": True, "preencode_batch_frames": batch_frames}
+        prompt="test", extra_params={**preencode_flag, "preencode_batch_frames": batch_frames}
     )
     try:
         with pytest.raises(HTTPException, match="preencode_batch_frames") as exc:
             asyncio.run(handler.generate_video_bytes(request, "invalid-batch"))
         assert exc.value.status_code == 400
         assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
+def test_preencode_opt_out_skips_batch_frame_validation(mocker: MockerFixture):
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"fake-video")
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(prompt="test", extra_params={"preencode_mp4": False, "preencode_batch_frames": 0})
+    try:
+        asyncio.run(handler.generate_video_bytes(request, "opt-out"))
+        assert engine.captured_sampling_params_list[0].extra_args["preencode_mp4"] is False
+    finally:
+        handler.shutdown()
+
+
+def test_preencode_rejects_frame_interpolation_before_generation():
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(
+        prompt="test", enable_frame_interpolation=True, extra_params={"preencode_mp4": True}
+    )
+    try:
+        with pytest.raises(HTTPException, match="enable_frame_interpolation") as exc:
+            asyncio.run(handler.generate_video_bytes(request, "interpolated"))
+        assert exc.value.status_code == 400
+        assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("request_fields", "expect_worker_mp4", "expected_fps"),
+    [
+        ({}, True, 24),
+        ({"fps": 24}, True, 24),
+        ({"fps": 12}, False, 12),
+        ({"fps": 12, "extra_params": {"preencode_mp4": False}}, False, 12),
+        ({"extra_params": {"preencode_mp4": False}}, False, 24),
+    ],
+)
+def test_h3_default_preencode_keeps_the_requested_frame_rate(
+    mocker: MockerFixture, request_fields, expect_worker_mp4, expected_fps
+):
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    frames = np.zeros((6, 24, 32, 3), dtype=np.uint8)
+    captured = {}
+
+    async def fake_run_generation(prompt, gen_params, request_id, **kwargs):
+        captured["extra_args"] = dict(gen_params.extra_args)
+        # Like the H3 worker, a pre-encoded MP4 is always muxed at the model's native 24 fps.
+        if gen_params.extra_args.get("preencode_mp4"):
+            video = mux_video_audio_bytes(frames, fps=24, video_codec_options={"preset": "ultrafast"})
+        else:
+            video = frames
+        return MockVideoResult([video], multimodal_output={"video": [video], "metadata": {"video": {"fps": 24.0}}})
+
+    mocker.patch.object(handler, "_run_generation", side_effect=fake_run_generation)
+    try:
+        result = asyncio.run(
+            handler.generate_video_bytes(VideoGenerationRequest(prompt="test", **request_fields), "fps")
+        )
+        assert bool(captured["extra_args"].get("preencode_mp4")) is expect_worker_mp4
+        with av.open(io.BytesIO(result.video_bytes)) as container:
+            stream_fps = float(container.streams.video[0].average_rate)
+        assert stream_fps == expected_fps
+        assert result.video_metadata["fps"] == expected_fps
+    finally:
+        handler.shutdown()
+
+
+@pytest.mark.parametrize("interpolate", [False, True])
+def test_h3_default_preencode_skips_frame_interpolation_requests(mocker: MockerFixture, interpolate):
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"fake-video")
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(prompt="test", enable_frame_interpolation=interpolate)
+    try:
+        asyncio.run(handler.generate_video_bytes(request, "interp"))
+        assert engine.captured_sampling_params_list[0].extra_args.get("preencode_mp4") is (
+            None if interpolate else True
+        )
     finally:
         handler.shutdown()
 
@@ -248,18 +340,19 @@ def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
     encoder = mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes")
     try:
         result = asyncio.run(handler.generate_video_bytes(VideoGenerationRequest(prompt="test"), "preencoded"))
-        assert result == (
-            preencoded,
-            {"decode": 0.5},
-            123.0,
-            None,
-            {
+        assert result == EncodedVideoResult(
+            video_bytes=preencoded,
+            stage_durations={"decode": 0.5},
+            peak_memory_mb=123.0,
+            action=None,
+            video_metadata={
                 "fps": 24.0,
                 "num_frames": 7,
                 "duration_s": 7 / 24.0,
                 "metrics": {"generation_time": 1.25},
             },
         )
+        assert result.lidar_bytes is None
         encoder.assert_not_called()
     finally:
         handler.shutdown()
@@ -284,8 +377,8 @@ def test_preencoded_worker_frame_counts_avoid_reopening_mp4(mocker: MockerFixtur
         output = asyncio.run(
             handler.generate_video_bytes(VideoGenerationRequest(prompt="test", num_frames=99), "known-count")
         )
-        assert output[0] == b"already-encoded"
-        assert output[4] == {"fps": 24.0, "num_frames": 7, "duration_s": 7 / 24.0}
+        assert output.video_bytes == b"already-encoded"
+        assert output.video_metadata == {"fps": 24.0, "num_frames": 7, "duration_s": 7 / 24.0}
     finally:
         handler.shutdown()
 
@@ -306,8 +399,8 @@ def test_invalid_worker_frame_counts_fall_back_without_losing_video(mocker: Mock
         output = asyncio.run(
             handler.generate_video_bytes(VideoGenerationRequest(prompt="test", num_frames=99), "fallback-count")
         )
-        assert output[0] == b"already-encoded"
-        assert output[4] == {"fps": 24.0, "num_frames": 7, "duration_s": 7 / 24.0}
+        assert output.video_bytes == b"already-encoded"
+        assert output.video_metadata == {"fps": 24.0, "num_frames": 7, "duration_s": 7 / 24.0}
         count_frames.assert_called_once_with(b"already-encoded")
     finally:
         handler.shutdown()
@@ -339,6 +432,7 @@ def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
 
 class BlockingVideoHandler:
     supports_mixed_reference_inputs = False
+    supports_multiview_reference_inputs = False
     supports_latent_mask_editing = False
     supported_control_upload_types: frozenset[str] = frozenset()
     is_minimax_h3 = False
@@ -409,7 +503,7 @@ class CompletingDuringAbortHandler(BlockingVideoHandler):
             await on_started()
         self.started.set()
         await self._finish.wait()
-        return b"late-complete", {}, 0.0, None
+        return EncodedVideoResult(video_bytes=b"late-complete", stage_durations={}, peak_memory_mb=0.0)
 
     async def abort_request(self, request_id):
         self._finish.set()
@@ -685,10 +779,10 @@ def _cosmos3_stage_configs():
     ]
 
 
-def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 2.0):
-    deadline = time.time() + timeout_s
+def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 30.0):
+    deadline = time.monotonic() + timeout_s
     last_payload = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         response = client.get(f"/v1/videos/{video_id}")
         last_payload = response.json()
         if last_payload["status"] == status:
@@ -697,9 +791,9 @@ def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: 
     raise AssertionError(f"Timed out waiting for status={status}. Last payload: {last_payload}")
 
 
-def _wait_until(predicate, timeout_s: float = 2.0, interval_s: float = 0.02):
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
+def _wait_until(predicate, timeout_s: float = 30.0, interval_s: float = 0.02):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
         if predicate():
             return
         time.sleep(interval_s)
@@ -994,6 +1088,36 @@ def test_i2v_minimax_h3_preserves_reference_geometry():
     assert (sampling_params.width, sampling_params.height) == (96, 64)
 
 
+@pytest.mark.parametrize(
+    ("model_class_name", "expected_size"),
+    [
+        ("Cosmos3OmniDiffusersPipeline", (480, 800)),
+        ("Cosmos3OmniPipeline", (480, 800)),
+        ("Cosmos3NanoSimBimanualPipeline", (320, 192)),
+    ],
+)
+def test_i2v_cosmos3_reference_geometry_reaches_pipeline(model_class_name, expected_size):
+    engine = FakeAsyncOmni()
+    engine.model_class_name = model_class_name
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="nvidia/Cosmos3-Nano",
+    )
+
+    asyncio.run(
+        handler._run_and_extract(
+            VideoGenerationRequest(prompt="A robot arm picks up a cup.", width=320, height=192),
+            "cosmos3-reference-geometry",
+            reference_image=ReferenceImage(Image.new("RGB", (480, 800))),
+        )
+    )
+
+    assert engine.captured_prompt is not None
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == expected_size
+
+
 def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, mocker: MockerFixture):
     image_bytes = _make_test_image_bytes((48, 48))
     mocker.patch(
@@ -1239,6 +1363,37 @@ def test_i2v_video_generation_with_image_reference_form(test_client, mocker: Moc
     assert input_image.size == (40, 24)
 
 
+def test_i2v_video_generation_rejects_oversized_image_url(test_client, monkeypatch):
+    async_client = httpx.AsyncClient
+
+    def _client_factory(*args, **kwargs):
+        return async_client(
+            *args,
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-length": "5"},
+                    content=b"12345",
+                )
+            ),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(video_api_utils, "MAX_IMAGE_INPUT_BYTES", 4)
+    monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _client_factory)
+
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "reject oversized reference",
+            "image_reference": json.dumps({"image_url": "https://93.184.216.34/large.png"}),
+        },
+    )
+
+    assert response.status_code == 400
+    assert "exceeds" in response.json()["detail"]
+
+
 def test_i2v_video_generation_follows_allowed_image_redirect(test_client, mocker: MockerFixture, monkeypatch):
     requested_paths = []
     async_client = httpx.AsyncClient
@@ -1263,7 +1418,7 @@ def test_i2v_video_generation_follows_allowed_image_redirect(test_client, mocker
         "/v1/videos",
         data={
             "prompt": "A fox running through snow.",
-            "image_reference": json.dumps({"image_url": "https://example.com/redirect.png"}),
+            "image_reference": json.dumps({"image_url": "https://93.184.216.34/redirect.png"}),
         },
     )
 
@@ -1590,6 +1745,34 @@ def test_h3_regenerate_forwards_a_maskless_draft(test_client, mocker: MockerFixt
     assert "video_noise_mask" not in multi_modal_data and "audio_noise_mask" not in multi_modal_data
     # A 2K regenerate is never continued, so its job is not tagged for the latent cache.
     assert "latent_cache_key" not in engine.captured_sampling_params_list[0].extra_args
+
+
+@pytest.mark.parametrize(
+    ("model_class_name", "extra_params", "expected"),
+    [
+        ("MiniMaxH3Pipeline", None, True),
+        ("MiniMaxH3Pipeline", {"preencode_mp4": False}, False),
+        (None, None, None),
+    ],
+)
+def test_complete_mp4_requests_preencode_by_model_default(
+    test_client, mocker: MockerFixture, model_class_name, extra_params, expected
+):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    if model_class_name is not None:
+        engine.model_class_name = model_class_name
+    data = {"prompt": "A red fox in fresh snow."}
+    if extra_params is not None:
+        data["extra_params"] = json.dumps(extra_params)
+
+    response = test_client.post("/v1/videos/sync", data=data)
+
+    assert response.status_code == 200
+    assert engine.captured_sampling_params_list[0].extra_args.get("preencode_mp4") is expected
 
 
 def test_latent_edit_fields_are_rejected_for_models_without_capability(test_client):
@@ -2712,6 +2895,250 @@ def test_h3_multipart_maps_pillow_pixel_limit_error(field, test_client, monkeypa
     assert "decoder pixel limit" in response.json()["detail"]
 
 
+def _cosmos3_single_view_extra_params() -> dict:
+    """WSM transfer manifest for one camera whose control is ``input_references[0]``."""
+    return {
+        "multiview": {
+            "views": [
+                {"camera_key": "camera_front_wide_120fov", "prompt": "A car drives.", "control_reference_index": 0}
+            ]
+        },
+        "wsm": {},
+    }
+
+
+def test_cosmos3_multiview_upload_rejects_shared_negative_prompt(test_client):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    extra_params = _cosmos3_single_view_extra_params()
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Driving.", "negative_prompt": "Blurry.", "extra_params": json.dumps(extra_params)},
+        files=[("input_references", ("front.mp4", b"front-control", "video/mp4"))],
+    )
+
+    assert response.status_code == 400
+    assert "does not support request.negative_prompt" in response.json()["detail"]
+
+
+def test_sync_rejects_lidar_output_before_generation(test_client, mocker: MockerFixture):
+    generate = mocker.patch.object(OmniOpenAIServingVideo, "generate_video_bytes")
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Driving.", "extra_params": json.dumps({"lidar": {"return_output": True}})},
+    )
+
+    assert response.status_code == 400
+    assert "requires asynchronous POST /v1/videos" in response.json()["detail"]
+    generate.assert_not_called()
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos/sync", "/v1/videos"])
+def test_cosmos3_multiview_uploads_resolve_to_request_files_and_clean_up(test_client, mocker: MockerFixture, endpoint):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    # Views reference uploads out of order, so paths must be resolved by index, not position.
+    extra_params = {
+        "multiview": {
+            "views": [
+                {"camera_key": "camera_front_wide_120fov", "prompt": "A car drives.", "control_reference_index": 1},
+                {"camera_key": "camera_cross_right_120fov", "prompt": "A car turns.", "control_reference_index": 0},
+            ]
+        },
+        "wsm": {},
+    }
+    seen_views: list[dict] = []
+    seen_controls: list[bytes] = []
+    reference_kwargs: dict = {}
+
+    async def capture_generation(request, _request_id, **kwargs):
+        views = request.extra_params["multiview"]["views"]
+        seen_views.extend(views)
+        # The pipeline reads the uploads during generation, so they must still exist here.
+        seen_controls.extend(Path(view["control_path"]).read_bytes() for view in views)
+        reference_kwargs.update(kwargs)
+        return EncodedVideoResult(video_bytes=b"mp4", stage_durations={}, peak_memory_mb=0.0)
+
+    mocker.patch.object(handler, "generate_video_bytes", side_effect=capture_generation)
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "Driving.", "extra_params": json.dumps(extra_params)},
+        files=[
+            ("input_references", ("right.mp4", b"right-control", "video/mp4")),
+            ("input_references", ("front.mp4", b"front-control", "video/mp4")),
+        ],
+    )
+
+    assert response.status_code == 200
+    if endpoint == "/v1/videos":
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+    else:
+        assert response.content == b"mp4"
+    assert [view["camera_key"] for view in seen_views] == ["camera_front_wide_120fov", "camera_cross_right_120fov"]
+    assert all("control_reference_index" not in view for view in seen_views)
+    assert seen_controls == [b"front-control", b"right-control"]
+    # Multiview uploads reach the pipeline only through the manifest.
+    for key in ("reference_image", "reference_video", "reference_audio", "latent_edit_input"):
+        assert reference_kwargs[key] is None
+    _wait_until(lambda: not any(Path(view["control_path"]).exists() for view in seen_views))
+
+
+def test_cosmos3_multiview_rejected_manifest_cleans_persisted_uploads(test_client, monkeypatch, mocker: MockerFixture):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    generate = mocker.patch.object(handler, "generate_video_bytes")
+    persisted: list[str] = []
+    original_persist = video_generation_helpers._persist_uploaded_reference
+
+    async def recording_persist(upload, **kwargs):
+        path = await original_persist(upload, **kwargs)
+        persisted.append(path)
+        return path
+
+    monkeypatch.setattr(video_generation_helpers, "_persist_uploaded_reference", recording_persist)
+    extra_params = _cosmos3_single_view_extra_params()
+
+    # The manifest is resolved only after every upload is stored, so the unreferenced upload fails late.
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "Driving.", "extra_params": json.dumps(extra_params)},
+        files=[
+            ("input_references", ("front.mp4", b"front-control", "video/mp4")),
+            ("input_references", ("unused.mp4", b"unused-control", "video/mp4")),
+        ],
+    )
+
+    assert response.status_code == 400
+    assert "referenced exactly once" in response.json()["detail"]
+    assert len(persisted) == 2
+    assert not any(Path(path).exists() for path in persisted)
+    generate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("model_class_name", "data", "files", "message"),
+    [
+        pytest.param(
+            "WanPipeline",
+            {},
+            [],
+            "does not support multiview uploaded references",
+            id="model-without-multiview",
+        ),
+        pytest.param(
+            "Cosmos3MultiviewPipeline",
+            {"control_type": "wsm"},
+            [("input_references", ("front.mp4", b"front-control", "video/mp4"))],
+            "cannot be combined with generic reference fields",
+            id="generic-control-field",
+        ),
+    ],
+)
+def test_cosmos3_multiview_upload_guards(test_client, mocker: MockerFixture, model_class_name, data, files, message):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = model_class_name
+    generate = mocker.patch.object(handler, "generate_video_bytes")
+    extra_params = _cosmos3_single_view_extra_params()
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Driving.", "extra_params": json.dumps(extra_params), **data},
+        files=files,
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+    generate.assert_not_called()
+
+
+_COSMOS3_T2V_VIEW = {"camera_key": "camera_front_wide_120fov", "prompt": "A car drives."}
+
+
+@pytest.mark.parametrize(
+    ("extra_params", "data", "files", "message"),
+    [
+        pytest.param(
+            {"multiview": {"views": [_COSMOS3_T2V_VIEW]}, "resolved_frame_rate": 12},
+            {"fps": "24"},
+            [],
+            "frame rates disagree",
+            id="conflicting-fps-without-uploads",
+        ),
+        pytest.param(
+            {**_cosmos3_single_view_extra_params(), "resolved_frame_rate": 12},
+            {"fps": "24"},
+            [("input_references", ("front.mp4", b"front-control", "video/mp4"))],
+            "frame rates disagree",
+            id="conflicting-fps-with-uploads",
+        ),
+        pytest.param(
+            {"multiview": {"views": [{"camera_key": "camera_front_wide_120fov"}]}},
+            {},
+            [],
+            "requires one prompt per camera",
+            id="missing-caption-without-uploads",
+        ),
+    ],
+)
+def test_cosmos3_multiview_admission_rejects_before_generation(
+    test_client, mocker: MockerFixture, extra_params, data, files, message
+):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    generate = mocker.patch.object(handler, "generate_video_bytes")
+
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "Driving.", "extra_params": json.dumps(extra_params), **data},
+        files=files,
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+    generate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("allowed", "inside", "message"),
+    [
+        (False, True, "require the server's --allowed-local-media-path"),
+        (True, False, "outside --allowed-local-media-path"),
+        (True, True, None),
+    ],
+    ids=["no-allowlist", "outside-allowlist", "inside-allowlist"],
+)
+def test_cosmos3_multiview_local_paths_require_allowlist(
+    test_client, mocker: MockerFixture, tmp_path, allowed, inside, message
+):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    media = tmp_path / "media"
+    media.mkdir()
+    if allowed:
+        handler.allowed_local_media_path = str(media)
+    control_path = str((media if inside else tmp_path) / "front.mp4")
+    generate = mocker.patch.object(
+        handler,
+        "generate_video_bytes",
+        return_value=EncodedVideoResult(video_bytes=b"mp4", stage_durations={}, peak_memory_mb=0.0),
+    )
+    extra_params = {"multiview": {"views": [{**_COSMOS3_T2V_VIEW, "control_path": control_path}]}, "wsm": {}}
+
+    response = test_client.post(
+        "/v1/videos/sync", data={"prompt": "Driving.", "extra_params": json.dumps(extra_params)}
+    )
+
+    if message is None:
+        assert response.status_code == 200
+        request = generate.call_args.args[0]
+        assert request.extra_params["multiview"]["views"][0]["control_path"] == control_path
+    else:
+        assert response.status_code == 400
+        assert message in response.json()["detail"]
+        generate.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_h3_upload_limit_checks_declared_size_before_read():
     class OversizedUpload:
@@ -2733,6 +3160,22 @@ def test_invalid_seconds_returns_422(test_client):
         data={"prompt": "bad seconds", "seconds": "abc"},
     )
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize("flow_shift", ["nan", "inf", "-inf", "0", "-2"])
+def test_invalid_flow_shift_returns_422(test_client, flow_shift: str):
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "bad flow shift", "flow_shift": flow_shift},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "flow_shift"]
+
+
+@pytest.mark.parametrize("flow_shift", [float("nan"), float("inf"), float("-inf"), 0.0, -2.0])
+def test_video_request_rejects_invalid_flow_shift(flow_shift: float):
+    with pytest.raises(ValueError, match="flow_shift"):
+        VideoGenerationRequest(prompt="test", flow_shift=flow_shift)
 
 
 def test_negative_prompt_and_seed_pass_through(test_client, mocker: MockerFixture):
@@ -2796,7 +3239,8 @@ def test_failed_generation_awaits_storage_cleanup(test_client, isolated_video_ba
     failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
     assert failed["error"]["code"] == 500
     assert "GPU exploded" in failed["error"]["message"]
-    delete_spy.assert_called_once_with(video_id)
+    # The LiDAR sidecar key is removed too, whether or not the job produced one.
+    assert [c.args for c in delete_spy.call_args_list] == [(video_id,), (f"{video_id}.lidar.safetensors",)]
 
 
 def test_failed_async_latent_edit_cleans_source_upload(test_client, mocker: MockerFixture):
@@ -3118,6 +3562,61 @@ def test_download_completed_job_uses_storage_open_and_download_name(test_client,
     assert file_name in response.headers["content-disposition"]
 
 
+def test_download_variant_serves_lidar_sidecar_and_delete_removes_it(
+    test_client, isolated_video_backends, mocker: MockerFixture
+):
+    _store, _tasks, storage = isolated_video_backends
+    lidar_metadata = {
+        "shape": [3, 2, 128, 1800],
+        "fps": 10.0,
+        "num_frames": 2,
+        "channels": ["range", "intensity", "validity"],
+        "units": ["metres", "unit", "binary"],
+        "apply_validity_mask": True,
+        "validity_threshold": 0.5,
+        "range_projection": {"min_range_m": 0.0, "max_range_m": 80.0},
+    }
+    mocker.patch.object(
+        OmniOpenAIServingVideo,
+        "generate_video_bytes",
+        return_value=EncodedVideoResult(
+            video_bytes=b"mp4",
+            stage_durations={},
+            peak_memory_mb=0.0,
+            lidar_bytes=b"LIDAR",
+            lidar_metadata=lidar_metadata,
+        ),
+    )
+
+    video_id = test_client.post("/v1/videos", data={"prompt": "Joint drive."}).json()["id"]
+    final = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    assert final["lidar"]["url"] == f"/v1/videos/{video_id}/content?variant=lidar"
+    assert final["lidar"]["file_name"] == f"{video_id}.lidar.safetensors"
+
+    lidar = test_client.get(final["lidar"]["url"])
+    assert lidar.status_code == 200
+    assert lidar.content == b"LIDAR"
+    assert lidar.headers["content-type"] == "application/octet-stream"
+    assert final["lidar"]["file_name"] in lidar.headers["content-disposition"]
+    assert test_client.get(f"/v1/videos/{video_id}/content").content == b"mp4"
+    assert test_client.get(f"/v1/videos/{video_id}/content?variant=thumbnail").status_code == 422
+
+    assert test_client.delete(f"/v1/videos/{video_id}").status_code == 200
+    assert not os.path.exists(os.path.join(storage.storage_path, video_id))
+    assert not os.path.exists(os.path.join(storage.storage_path, f"{video_id}.lidar.safetensors"))
+
+
+def test_download_lidar_variant_requires_lidar_output(test_client, mocker: MockerFixture):
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"mp4")
+    video_id = test_client.post("/v1/videos", data={"prompt": "Camera only."}).json()["id"]
+    final = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    assert final["lidar"] is None
+
+    response = test_client.get(f"/v1/videos/{video_id}/content?variant=lidar")
+    assert response.status_code == 404
+    assert "no LiDAR output" in response.json()["detail"]
+
+
 def test_delete_in_progress_job_cancels_task_and_removes_metadata(test_client):
     handler = BlockingVideoHandler()
     test_client.app.state.openai_serving_video = handler
@@ -3220,7 +3719,9 @@ def test_create_video_rolls_back_job_when_task_registration_fails(test_client, m
     handler = BlockingVideoHandler()
     test_client.app.state.openai_serving_video = handler
     cleanups = []
-    monkeypatch.setattr(api_server, "_cleanup_video_references", lambda *args: cleanups.append(args))
+    monkeypatch.setattr(
+        video_generation_helpers.VideoRequestResources, "cleanup", lambda resources: cleanups.append(resources)
+    )
 
     async def failing_upsert(video_id, task):
         del video_id, task
@@ -3240,7 +3741,9 @@ def test_create_video_cleans_references_when_task_cancelled_before_start(test_cl
     handler = BlockingVideoHandler()
     test_client.app.state.openai_serving_video = handler
     cleanups = []
-    monkeypatch.setattr(api_server, "_cleanup_video_references", lambda *args: cleanups.append(args))
+    monkeypatch.setattr(
+        video_generation_helpers.VideoRequestResources, "cleanup", lambda resources: cleanups.append(resources)
+    )
     original_upsert = api_server.VIDEO_TASKS.upsert
 
     async def cancelling_upsert(video_id, task):
@@ -4199,6 +4702,33 @@ def test_h3_control_rejects_before_job_creation(endpoint, fields, roles, message
     persist.assert_not_called()
     assert engine.captured_prompt is None
     assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
+
+
+@pytest.mark.parametrize(("task", "accepted"), [("ref2va", True), ("t2va", False), (None, False)])
+def test_h3_control_accepts_references_only_for_ref2va(task, accepted, test_client, mocker):
+    """FastH3 Omni takes control as Ref2VA, which needs a reference; other tasks keep refusing references."""
+    _mock_encode_video_bytes(mocker, b"controlled")
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    engine.controlnet_model_path = "/configured/control.safetensors"
+    extra = {"canny": {"control_context_scale": 1.0}}
+    if task is not None:
+        extra["task"] = task
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Controlled scene.", "control_type": "canny", "extra_params": json.dumps(extra)},
+        files=[
+            ("control_reference", ("hint.mp4", _make_test_video_bytes(), "video/mp4")),
+            ("input_reference", ("ref.png", _make_test_image_bytes(), "image/png")),
+        ],
+    )
+    if accepted:
+        assert response.status_code == 200, response.text
+        assert "control_path" in engine.captured_prompt["multi_modal_data"]["minimax_h3_control"]
+    else:
+        assert response.status_code == 400
+        assert "outside task=ref2va" in response.json()["detail"]
+        assert engine.captured_prompt is None
 
 
 @pytest.mark.parametrize("strength", [-1, float("nan"), float("inf"), 10**1000, "1", True])

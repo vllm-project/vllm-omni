@@ -40,6 +40,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.cuda_graph import GraphedForward
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.ulysses_transport import require_default_ulysses_transport
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.taomate_h3_prompt import sync_prompt_length
 from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
@@ -174,8 +175,7 @@ def _validate_parallel_config(od_config: OmniDiffusionConfig) -> None:
         )
     if str(getattr(parallel, "ulysses_mode", "strict") or "strict") != "strict":
         raise ValueError("TaoMate-H3 supports ulysses_mode='strict' only.")
-    if bool(getattr(parallel, "ulysses_a2a_permute", False)):
-        raise ValueError("TaoMate-H3 does not support ulysses_a2a_permute.")
+    require_default_ulysses_transport(parallel, "TaoMate-H3")
     if int(getattr(parallel, "cfg_parallel_size", 1) or 1) != 1:
         raise ValueError("TaoMate-H3 is CFG-distilled; cfg_parallel_size must be 1.")
     if int(getattr(parallel, "pipeline_parallel_size", 1) or 1) != 1:
@@ -956,6 +956,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         return bank
 
     def _bind_diffusion_lora_manager(self, manager: DiffusionLoRAManager | None) -> None:
+        super()._bind_diffusion_lora_manager(manager)
         self._tm_lora_manager = manager
         if self._tm_teacher is not None:
             self._tm_teacher.manager = manager
