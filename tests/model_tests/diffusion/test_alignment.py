@@ -32,6 +32,8 @@ EXCLUDED_MODELS = [
     # Covered by tests/diffusion/test_mossimage_*.py and
     # test_mossimage_registry.py.
     "MOSSImagePipeline",
+    # Motubrain uses a robot observation and has its own tiny native reference-parity test.
+    "Motubrain2Pipeline",
     "GlmImagePipeline",
     "ZImagePipeline",
     "OvisImagePipeline",
@@ -133,9 +135,6 @@ EXCLUDED_MODELS = [
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
     "Pi05Pipeline",
-    # Robot action arrays use an OpenPI observation and an external policy
-    # runtime. Dedicated tiny action parity and OpenPI serving tests cover it.
-    "Motubrain2Pipeline",
     "SanaWmPipeline",
     # Audio pipeline conditioned by a separate Qwen2.5-Omni encoder stage;
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and
