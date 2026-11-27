@@ -27,7 +27,11 @@ from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
     CAUSVID_DEFAULT_SHIFT,
     CausVidWanPipeline,
 )
-from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer, stage_layer_range
+from vllm_omni.diffusion.models.causvid_wan.transformer import (
+    StageWanTransformer,
+    _wan_self_attn_with_kv,
+    stage_layer_range,
+)
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -305,6 +309,38 @@ def test_cell_schedule_accepts_known_values(name, step_replicas):
     assert plan.schedule.ordering.value == name
 
 
+@pytest.mark.parametrize("capture_sink", [False, True])
+def test_wan_attention_preserves_raw_sink_key_after_rotated_forward(monkeypatch, capture_sink):
+    hidden = torch.arange(8, dtype=torch.float32).view(1, 2, 4)
+    ctx = SimpleNamespace(
+        write_raw_sink_key=capture_sink,
+        key_pool=torch.zeros(2, 1, 4),
+        video_slots=torch.arange(2),
+    )
+    attn = SimpleNamespace(
+        num_heads=1,
+        num_kv_heads=1,
+        head_dim=4,
+        to_qkv=lambda x: (torch.cat((x, x + 1, x + 2), dim=-1), None),
+        norm_q=torch.nn.Identity(),
+        norm_k=torch.nn.Identity(),
+        rotary_embedding=lambda x, *_: -x,
+        to_out=torch.nn.Identity(),
+        dropout=torch.nn.Identity(),
+    )
+
+    def paged_attention(inputs, query, key, value, *_):
+        torch.testing.assert_close(key.flatten(1), -(hidden[0] + 1))
+        torch.testing.assert_close(value.flatten(1), hidden[0] + 2)
+        inputs.key_pool.copy_(key)
+        return query
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.causvid_wan.transformer.paged_write_attn", paged_attention)
+    actual = _wan_self_attn_with_kv(attn, hidden, (torch.empty(0), torch.empty(0)), ctx)
+    torch.testing.assert_close(actual, -hidden)
+    torch.testing.assert_close(ctx.key_pool.flatten(1), (1 if capture_sink else -1) * (hidden[0] + 1))
+
+
 @pytest.mark.parametrize("persistent", [False, True])
 def test_same_step_pipeline_single_chunk_sink_runs_as_separate_session_phase(persistent):
     pipeline = _bare_pipeline(step_replicas=3, history=2)
@@ -330,13 +366,14 @@ def test_standalone_sink_survives_session_continuation(chunks):
     pipeline = _bare_pipeline(history=2)
     device = torch.device("cpu")
     cache = NoisyKVCache(
-        ARDiffusionNoisyKVSpec(1, 1, 1, 3, 3, 2),
+        ARDiffusionNoisyKVSpec(1, 1, 1, 3, 3, 2, materialize_sink_key=True),
         dtype=torch.float32,
         device=device,
         layer_groups=1,
         max_batch_size=1,
     )
     ctx = ARDiffusionCellContext(CellRunSpec(CellTopology(1, 1)), NoisyKVState(cache))
+    ctx.kv.set_sink_key_transform("session", torch.neg)
     adapter = WanCell(
         _GroupTransformer(is_layer_group_first=True, is_layer_group_last=True),
         sampler=FlowEuler(1, shift=1.0),

@@ -305,6 +305,7 @@ class CausVidWanPipeline(nn.Module):
             max_chunk_tokens=self.max_chunk_tokens,
             max_history_chunks=max(1, self.max_history_chunks),
             max_history_versions=max(1, max(1, self.max_history_chunks) * versions_per_chunk),
+            materialize_sink_key=True,
         )
 
     @contextmanager
@@ -635,8 +636,14 @@ class CausVidWanPipeline(nn.Module):
         plan, extra, denoise = self._plan_for(req, chunk_base=binding.chunk_base, same_step_session=persist)
         bootstrap = plan if isinstance(plan, SameStepBootstrap) else None
         schedule = plan.schedule
+        shape = tuple(int(x) for x in (extra.get("latent_shape") or _DEFAULT_LATENT_SHAPE))
+        if len(shape) != 5 or shape[0] != 1 or any(dim <= 0 for dim in shape):
+            raise ValueError(f"latent_shape must be positive 1,C,T,H,W; got {shape}")
         if persist:
-            ctx.kv.cache.bind_session_structure(kv_id, schedule.structural_key())
+            structural_key = schedule.structural_key()
+            if schedule.same_step_has_sink:
+                structural_key += (shape,)
+            ctx.kv.cache.bind_session_structure(kv_id, structural_key)
             # Fail-closed only for cells this rank owns; remotes arrive via prep handoff.
             logical = expected_prior_cells(schedule)
             missing_owned = [
@@ -651,9 +658,6 @@ class CausVidWanPipeline(nn.Module):
                     f"prior cells {sorted(missing_owned)!r} on rank {pp_rank}; "
                     "restart with chunk_base=0 or fix retain/release"
                 )
-        shape = tuple(int(x) for x in (extra.get("latent_shape") or _DEFAULT_LATENT_SHAPE))
-        if len(shape) != 5 or shape[0] != 1 or any(dim <= 0 for dim in shape):
-            raise ValueError(f"latent_shape must be positive 1,C,T,H,W; got {shape}")
         shift = float(extra.get("shift", self._default_shift))
         seed = int(extra.get("seed", getattr(req.sampling_params, "seed", 0) or 0))
         chunk_tokens = self.transformer.seq_len_for_latent(shape)
@@ -696,6 +700,8 @@ class CausVidWanPipeline(nn.Module):
             serial_key = ("remote_stream", kv_id)
         else:
             serial_key = None
+        if schedule.same_step_has_sink:
+            ctx.kv.set_sink_key_transform(kv_id, self.transformer.sink_key_transform(shape, device=device, dtype=dtype))
         adapter, stream_job = self._start_chunk_decode_and_wan_cell(
             kv_id=kv_id,
             n_chunks=plan.schedule.chunks,

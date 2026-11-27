@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import socket
+from collections.abc import Callable
 from datetime import timedelta
 
 import pytest
@@ -118,7 +119,8 @@ class _SinkAdapter(CellAdapter):
         table = context.block_table[0, :n].long()
         past = context.key_pool[table].sum() if n else torch.tensor(0.0, device=self.device)
         slot = context.video_slots.long()
-        context.key_pool[slot] = value.reshape(1, 1, 1)
+        key = value - 3 if context.write_raw_sink_key else value
+        context.key_pool[slot] = key.reshape(1, 1, 1)
         context.value_pool[slot] = value.reshape(1, 1, 1)
         result = value + past * 0.01 + 0.1 * (block + 1)
         torch.testing.assert_close(result, torch.tensor([self.outputs[cell]], device=self.device), rtol=1e-5, atol=1e-5)
@@ -318,6 +320,7 @@ def _sink_pipeline_worker(
             block_size=1,
             max_chunk_tokens=1,
             max_history_chunks=max(1, history),
+            materialize_sink_key=standalone,
         )
         cache = NoisyKVCache(
             spec,
@@ -364,6 +367,8 @@ def _sink_pipeline_worker(
         )
         if standalone:
             from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
+
+            state.set_sink_key_transform("A", lambda key: key + 3)
 
             bootstrap = build_same_step_bootstrap(schedule)
             assert bootstrap is not None
@@ -430,3 +435,86 @@ def test_causvid_standalone_sink_distributed_pipeline_matches_serial():
         nprocs=4,
         join=True,
     )
+
+
+class _PhysisSinkTransformer(torch.nn.Module):
+    def __init__(self, group: int):
+        super().__init__()
+        self.start_layer = 2 * group
+        self.end_layer = self.start_layer + 2
+        self.capture_sink: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None
+        self.seen: list[int] = []
+
+    @staticmethod
+    def embed(latent):
+        return latent
+
+    @staticmethod
+    def seq_len_for_latent(shape):
+        return shape[2]
+
+    def block(self, index, hidden, **kwargs):
+        self.seen.append(index)
+        key = hidden.flatten().view(3, 1, 1)
+        assert self.capture_sink is not None
+        self.capture_sink(index, key, -key)
+        return hidden + 1
+
+
+def _physis_sink_worker(rank, init_method):
+    from vllm_omni.diffusion.models.physis.wan.pipeline_physis_wan import PhysisWanPipeline
+
+    world, groups = 4, 2
+    torch.distributed.init_process_group(
+        backend="gloo", init_method=init_method, rank=rank, world_size=world, timeout=timedelta(seconds=90)
+    )
+    pp = GroupCoordinator([list(range(world))], local_rank=rank, torch_distributed_backend="gloo")
+    pipeline = PhysisWanPipeline.__new__(PhysisWanPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.pp_rank, pipeline.step_replicas, pipeline.layer_groups = rank, world // groups, groups
+    group = rank % groups
+    pipeline.transformer = _PhysisSinkTransformer(group)
+    spec = ARDiffusionNoisyKVSpec(2, 1, 1, 1, 1, 2, max_external_sink_tokens=3)
+    cache = NoisyKVCache(
+        spec,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        layer_groups=groups,
+        max_batch_size=1,
+        step_replicas=2,
+        layer_offset=2 * group,
+    )
+    state = NoisyKVState(cache)
+    latent = torch.arange(3, dtype=torch.float32).reshape(1, 1, 3, 1, 1)
+    pipeline._prepare_clean_sink("A", latent, pp=pp, kv=state)
+    assert pipeline.transformer.seen == (list(range(2 * group, 2 * group + 2)) if rank >= groups else [])
+    assert pipeline.transformer.capture_sink is None
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=1,
+            num_denoise_steps=2,
+            step_replicas=2,
+            layer_groups=groups,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=1,
+            blocks=4,
+            same_step_external_sink=True,
+        )
+    )
+    state.bind_rank(rank, pp)
+    state.begin_request("A", plan, chunk_tokens=1)
+    for block in range(2 * group, 2 * group + 2):
+        task = (0, rank // groups, block)
+        view = state.prepare((("A", task),))[0][0]
+        assert view.external_sink is not None
+        key, value = view.external_sink
+        expected = latent.reshape(3, 1, 1) + block
+        torch.testing.assert_close(key, expected)
+        torch.testing.assert_close(value, -expected)
+    state.finish_request("A")
+    pp.destroy()
+    torch.distributed.destroy_process_group()
+
+
+def test_physis_last_step_replica_produces_and_distributes_raw_sink():
+    torch.multiprocessing.spawn(_physis_sink_worker, args=(f"tcp://127.0.0.1:{get_open_port()}",), nprocs=4, join=True)

@@ -237,9 +237,10 @@ Physis pipelines run chunk 0's denoising and clean pass before scheduling
 the remaining chunks. Their tail plans set the internal
 `same_step_external_sink=True`, so the plan's local chunk 0 is the first tail
 chunk and follows the same rolling history policy as the other tail chunks.
-Physis Wan registers the clean sink with Noisy KV as per-layer pre-RoPE K/V.
-The KV budget includes the three latent frames of sink K/V separately from
-ordinary one-frame version slots. Attention applies RoPE after assembling the
+Physis Wan runs the clean pass on the final step replica and sends each
+layer's pre-RoPE K/V to the other replicas that read that layer. Noisy KV
+keeps the three latent frames of sink K/V separately from ordinary
+one-frame version slots. Attention applies RoPE after assembling the
 sink and rolling window. Physis LTX and H3 keep their transformer-local sink
 storage.
 
@@ -250,9 +251,10 @@ persistent single-chunk bootstrap requests.
 The topology stays `S=D`. The CausVid pipeline completes chunk 0's denoising
 schedule, then runs a separate clean pass on the last replica using chunk 0's
 final latent. When the replica spans layer groups, the last group sends that
-latent back to the first group for the clean pass. Noisy KV stores the sink
-keys after RoPE and hands the retained pages to the tail before its denoising
-steps start.
+latent back to the first group for the clean pass. Noisy KV publishes and
+transfers the raw sink keys. On first read, each local layer materializes
+a request-scoped paged view with CausVid's original absolute chunk-zero
+RoPE. The raw pages are the versions retained across sessions.
 An ephemeral single-chunk request skips the unused clean pass. A persistent
 single-chunk request retains the sink for continuation.
 

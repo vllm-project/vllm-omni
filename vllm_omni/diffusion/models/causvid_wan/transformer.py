@@ -8,7 +8,7 @@ Layer split uses stage group ``G`` via ``layer_pp_rank`` / ``layer_pp_world``.
 from __future__ import annotations
 
 import math
-from collections.abc import Hashable, Iterable, Sequence
+from collections.abc import Callable, Hashable, Iterable, Sequence
 from typing import Any
 
 import torch
@@ -62,6 +62,7 @@ def _wan_self_attn_with_kv(
     query = query.unflatten(2, (attn.num_heads, attn.head_dim))
     key = key.unflatten(2, (attn.num_kv_heads, attn.head_dim))
     value = value.unflatten(2, (attn.num_kv_heads, attn.head_dim))
+    raw_key = key
     if rotary_emb is not None:
         freqs_cos, freqs_sin = rotary_emb
         query = attn.rotary_embedding(query, freqs_cos, freqs_sin)
@@ -81,6 +82,10 @@ def _wan_self_attn_with_kv(
             ctx_i = contexts[i]
             inputs = ctx_i.to_layer_inputs() if hasattr(ctx_i, "to_layer_inputs") else ctx_i
             outs.append(paged_write_attn(inputs, query[i], key[i], value[i], None, None, scale))
+            if getattr(ctx_i, "write_raw_sink_key", False):
+                # The clean forward reads the rotated key, then publishes the
+                # original key for transport and later Same-Step consumers.
+                inputs.key_pool.index_copy_(0, inputs.video_slots, raw_key[i])
         hidden_states = torch.stack(outs, dim=0).flatten(2, 3).type_as(query)
     else:
         hidden_states = attn.attn(query, key, value, None)
@@ -348,6 +353,20 @@ class StageWanTransformer(nn.Module):
         while len(self._rotary) > capacity:
             self._rotary.pop(next(iter(self._rotary)))
         return rotary
+
+    def sink_key_transform(
+        self, latent_shape: tuple[int, ...], *, device: torch.device, dtype: torch.dtype
+    ) -> Callable[[torch.Tensor], torch.Tensor]:
+        """Materialize CausVid's absolute chunk-zero RoPE for a local paged read view."""
+        latent = torch.empty(latent_shape, device=device, dtype=dtype)
+        freqs = self._rotary_emb(0, latent)
+        assert self._wan is not None
+        rotary = self._wan.blocks[self.start_layer].attn1.rotary_embedding
+
+        def rotate(key: torch.Tensor) -> torch.Tensor:
+            return rotary(key.unsqueeze(0), *freqs)[0]
+
+        return rotate
 
     def _rotary_emb_for_batch(self, chunks: Sequence[int], latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-member chunk RoPE, concatenated on the batch axis."""

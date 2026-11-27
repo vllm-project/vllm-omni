@@ -30,7 +30,7 @@ from vllm_omni.diffusion.models.physis.common import (
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_post_process_func as get_wan22_post_process_func,
 )
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVState
 
 from .sampler import WAN21_1_3B, WAN21_14B, WAN22_5B, WanFourStepSampler
 
@@ -248,6 +248,7 @@ class PhysisWanPipeline(CausVidWanPipeline):
             super().ar_diffusion_noisy_kv_spec(),
             max_history_versions=self.max_history_chunks,
             max_external_sink_tokens=self.transformer.seq_len_for_latent(self._sink_latent_shape()),
+            materialize_sink_key=False,
         )
 
     def _sink_latent_shape(self):
@@ -270,6 +271,31 @@ class PhysisWanPipeline(CausVidWanPipeline):
         if pp is not None and pp.world_size > 1:
             pp.broadcast(result, src=self.layer_groups - 1)
         return result
+
+    def _prepare_clean_sink(self, request_id: str, latent: torch.Tensor, *, pp, kv: NoisyKVState) -> None:
+        tf = self.transformer
+        group = self.pp_rank % self.layer_groups
+        readers = tuple(range(group, self.step_replicas * self.layer_groups, self.layer_groups))
+        source = readers[-1]
+        if self.pp_rank == source:
+            hidden = tf.embed(latent) if group == 0 else pp.recv_tensor_dict(src=source - 1)["hidden_states"]
+            timestep = torch.zeros((), dtype=torch.float32)
+            tf.capture_sink = partial(kv.store_external_sink, request_id)
+            try:
+                for block in range(tf.start_layer, tf.end_layer):
+                    hidden = tf.block(block, hidden, chunk=0, step=4, latent=latent, timestep=timestep)
+            finally:
+                tf.capture_sink = None
+            if group < self.layer_groups - 1:
+                pp.send_tensor_dict({"hidden_states": hidden}, dst=source + 1)
+        kv.distribute_external_sink(
+            request_id,
+            rank=self.pp_rank,
+            source=source,
+            readers=readers,
+            tokens=tf.seq_len_for_latent(tuple(latent.shape)),
+            pp_group=pp,
+        )
 
     def forward(self, req):
         ctx = self._execution_context()
@@ -297,11 +323,7 @@ class PhysisWanPipeline(CausVidWanPipeline):
                 latent = sampler.advance(latent, prediction, step=step, seed=seed, chunk=0)
             sink_latent = latent
             timing.mark(0)
-            tf.capture_sink = partial(kv.store_external_sink, request_id)
-            try:
-                self._sink_forward(latent, torch.zeros((), dtype=torch.float32), step=4, pp=pp)
-            finally:
-                tf.capture_sink = None
+            self._prepare_clean_sink(request_id, latent, pp=pp, kv=kv)
             ctx.enqueue(request_id, plan, chunk_tokens=self.block_size)
             adapter = PhysisWanCell(
                 tf,
