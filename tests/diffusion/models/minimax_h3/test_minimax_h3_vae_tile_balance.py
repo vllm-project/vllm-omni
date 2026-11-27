@@ -209,8 +209,16 @@ def test_install_is_npu_only_idempotent_and_context_scoped():
         assert torch.equal(model.encode_temporal(unsupported), unsupported + 1)
 
 
-def test_active_context_falls_back_when_parallel_tiling_is_disabled():
+@pytest.mark.parametrize(
+    ("parallel_tiling", "shape"),
+    [
+        pytest.param(False, (1, 1, 8, 4, 4), id="parallel-tiling-disabled"),
+        pytest.param(True, (1, 1, 4, 4), id="non-5d-input"),
+    ],
+)
+def test_active_context_falls_back_before_querying_parallel_state(parallel_tiling, shape):
     model = Model()
+    model.parallel_tiling = parallel_tiling
     adapter = SimpleNamespace(
         _device_target=Device("npu"),
         decode_only=False,
@@ -218,7 +226,8 @@ def test_active_context_falls_back_when_parallel_tiling_is_disabled():
         _native_parallel_state=lambda: pytest.fail("parallel state must not be queried"),
     )
     assert balance.install_video_tile_balance(adapter, 8) is True
-    x = torch.zeros(1, 1, 8, 4, 4)
+    # Synthetic inputs keep each fallback guard independently testable.
+    x = torch.zeros(shape, dtype=torch.float32)
 
     with balance.video_encode_tile_balance_context():
         assert torch.equal(model.encode_temporal(x), x + 1)
