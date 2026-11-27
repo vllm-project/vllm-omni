@@ -256,7 +256,7 @@ def _make_step_sd3_pipeline():
     return pipeline
 
 
-def _make_step_sd3_requests(guidance_scale):
+def _make_step_sd3_requests(guidance_scale, num_outputs=1):
     requests = []
     for index in range(2):
         sampling = OmniDiffusionSamplingParams(
@@ -265,7 +265,9 @@ def _make_step_sd3_requests(guidance_scale):
             num_inference_steps=3,
             guidance_scale=guidance_scale,
             output_type="latent",
-            latents=torch.full((1, 1, 2, 2), float(index)),
+            num_outputs_per_prompt=num_outputs,
+            latents=torch.arange(num_outputs, dtype=torch.float32).view(-1, 1, 1, 1).expand(-1, 1, 2, 2)
+            + index * num_outputs,
         )
         requests.append(
             OmniDiffusionRequest(
@@ -283,11 +285,16 @@ def _make_step_sd3_requests(guidance_scale):
 
 
 @pytest.mark.parametrize("guidance_scale", [1.0, 4.0])
-def test_step_execution_matches_full_loop_with_reordered_requests(monkeypatch, guidance_scale):
+@pytest.mark.parametrize("num_outputs", [1, 2])
+def test_step_execution_matches_full_loop_with_reordered_requests(monkeypatch, guidance_scale, num_outputs):
     pipeline = _make_step_sd3_pipeline()
     monkeypatch.setattr("vllm_omni.diffusion.models.sd3.pipeline_sd3.set_separate_cfg", lambda *args: None)
-    requests = _make_step_sd3_requests(guidance_scale)
+    requests = _make_step_sd3_requests(guidance_scale, num_outputs)
     expected = pipeline.forward(DiffusionRequestBatch(requests=copy.deepcopy(requests)))
+    for request, output in zip(requests, expected, strict=True):
+        (isolated,) = pipeline.forward(DiffusionRequestBatch(requests=[copy.deepcopy(request)]))
+        assert output.output.shape[0] == num_outputs
+        torch.testing.assert_close(output.output, isolated.output, rtol=0, atol=0)
     states = [
         StepRequestState(request_id=req.request_id, sampling=req.sampling_params, prompt=req.prompt)
         for req in copy.deepcopy(requests)
@@ -297,7 +304,7 @@ def test_step_execution_matches_full_loop_with_reordered_requests(monkeypatch, g
         order = torch.arange(len(step_states) - 1, -1, -1)
         batch = InputBatch.make_batch(step_states, idx_mapping=order)
         predictions = pipeline.denoise_step(batch)
-        for state, prediction in zip(batch.states, predictions.split(1), strict=True):
+        for state, prediction in zip(batch.states, predictions.split(num_outputs), strict=True):
             pipeline.step_scheduler(state, prediction)
 
     pipeline.prepare_encode(states[0])
