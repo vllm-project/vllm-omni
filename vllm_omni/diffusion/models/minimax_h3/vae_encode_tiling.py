@@ -1,7 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 from torch import nn
+
+encode_tile_batch_size: ContextVar[int] = ContextVar("minimax_h3_encode_tile_batch_size", default=1)
+
+
+@contextmanager
+def reference_video_tile_batching(batch_size: int) -> Iterator[None]:
+    token = encode_tile_batch_size.set(batch_size)
+    try:
+        yield
+    finally:
+        encode_tile_batch_size.reset(token)
 
 
 def configure_video_encode_tiling(
@@ -29,11 +44,15 @@ def configure_video_encode_tiling(
     run_tile_tasks = model._run_tile_tasks
 
     def run_encode_tile_tasks(tiles, tile_indices, forward_fn, stack_tiling, cls_agg=None):
-        if forward_fn != model.encode:
+        sample_limit = encode_tile_batch_size.get()
+        if sample_limit == 1 or forward_fn != model.encode:
             return run_tile_tasks(tiles, tile_indices, forward_fn, stack_tiling, cls_agg)
+        # Each spatial tile may already contain several temporal clips on its
+        # sample axis. Count those samples against the same forward budget.
+        tiles_per_forward = max(1, sample_limit // tiles[0].shape[0])
         results = []
-        for start in range(0, len(tile_indices), batch_size):
-            indices = tile_indices[start : start + batch_size]
+        for start in range(0, len(tile_indices), tiles_per_forward):
+            indices = tile_indices[start : start + tiles_per_forward]
             results.extend(run_tile_tasks(tiles, indices, forward_fn, len(indices) > 1, cls_agg))
         return results
 

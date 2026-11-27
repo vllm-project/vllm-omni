@@ -36,6 +36,7 @@ from vllm_omni.platforms import current_omni_platform
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .vae_encode_tiling import configure_video_encode_tiling, reference_video_tile_batching
 from .vae_temporal import install_temporal_stream_patches
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
@@ -371,10 +372,14 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         lightvae_decoder_path: str | None = None,
         allow_decoder_compile: bool = False,
         stack_decode_tiles: bool = True,
+        encode_tile_batch_size: int = 1,
+        encode_tile_size: int | None = None,
+        encode_tile_overlap: int | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
         self.stack_decode_tiles = bool(stack_decode_tiles)
+        self.encode_tile_batch_size = encode_tile_batch_size
         self.encode_only = bool(encode_only)
         self.decode_only = bool(decode_only)
         if self.encode_only and self.decode_only:
@@ -429,6 +434,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 device=device,
             )
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
+        if not self.decode_only:
+            configure_video_encode_tiling(
+                self.remote.model,
+                batch_size=encode_tile_batch_size,
+                tile_size=encode_tile_size,
+                tile_overlap=encode_tile_overlap,
+            )
         # The three decoder fast paths below are XPU-only: they were written
         # against the XPU kernels/compile stack and validated there. CUDA keeps
         # its own fused-operator path (install_h3_vae_optimizations above); on
@@ -1147,7 +1159,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         else:
             tiling_context = nullcontext()
         try:
-            with tiling_context, torch.random.fork_rng(devices=devices, device_type=parameter.device.type):
+            with (
+                tiling_context,
+                reference_video_tile_batching(self.encode_tile_batch_size),
+                torch.random.fork_rng(devices=devices, device_type=parameter.device.type),
+            ):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 for device in devices:
                     with self.device_module.device(device):

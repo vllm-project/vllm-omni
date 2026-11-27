@@ -1515,16 +1515,10 @@ class MiniMaxH3Pipeline(
                     bool(od_config.enforce_eager),
                     current_omni_platform,
                 ),
+                encode_tile_batch_size=additional_config.get("video_vae_encode_tile_batch_size", 1),
+                encode_tile_size=additional_config.get("video_vae_encode_tile_size"),
+                encode_tile_overlap=additional_config.get("video_vae_encode_tile_overlap"),
             )
-            if self.load_vae_encoder:
-                from .vae_encode_tiling import configure_video_encode_tiling
-
-                configure_video_encode_tiling(
-                    self.video_vae.model,
-                    batch_size=additional_config.get("video_vae_encode_tile_batch_size", 1),
-                    tile_size=additional_config.get("video_vae_encode_tile_size"),
-                    tile_overlap=additional_config.get("video_vae_encode_tile_overlap"),
-                )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),
                 device=self.device,

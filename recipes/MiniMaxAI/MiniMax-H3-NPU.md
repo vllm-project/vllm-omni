@@ -689,8 +689,12 @@ For reference video encoding, merge these parameters into the server's
 ```
 
 The default batch size is `1`; omitted geometry uses the checkpoint values.
-Only encoder tiles are affected. The last group is not padded. Changing tile
-geometry can change conditioning latents, so validate it for your input size.
+For reference video encoding, equal-length temporal clips can share a tile
+forward as independent samples, without changing the checkpoint's spatial
+rank assignment. The batch size caps the total tile samples per forward.
+Keyframe splits and a padded tail retain their original temporal boundaries.
+Changing encoder tile geometry can change conditioning latents, so validate it
+for your input size. Decoder tiling is unaffected.
 
 ## Additional resources
 
