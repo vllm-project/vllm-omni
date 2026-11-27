@@ -401,6 +401,23 @@ def test_finish_consolidates_hidden_states():
     assert isinstance(hs, torch.Tensor) and hs.shape[0] == 8
 
 
+def test_delta_drains_nemotron_per_frame_function_fields():
+    """Each DELTA completion carries one frame's function token and no stale acknowledgement."""
+    s = _make_state(RequestOutputKind.DELTA)
+    s.add_multimodal_tensor(
+        {"nvc_function_token": torch.tensor([20]), "nvc_function_response_consumed_generation": torch.tensor([3])},
+        mm_type=LATENT,
+    )
+    first = s._new_completion_output([1], None, None).multimodal_output
+    assert first["nvc_function_token"].tolist() == [20]
+    assert first["nvc_function_response_consumed_generation"].tolist() == [3]
+
+    s.add_multimodal_tensor({"nvc_function_token": torch.tensor([7])}, mm_type=LATENT)
+    second = s._new_completion_output([2], None, None).multimodal_output
+    assert second["nvc_function_token"].tolist() == [7]
+    assert "nvc_function_response_consumed_generation" not in second
+
+
 def test_finish_consolidation_for_hs_delta():
     """Ensure finish doesn't drop the accumulated hidden states."""
     s = _make_state(RequestOutputKind.DELTA)

@@ -74,6 +74,20 @@ _NEMOTRON_SNAPSHOT_KEYS = frozenset(
 )
 
 
+# NemotronVoiceChat thinker per-frame client keys (its
+# ``omni_client_multimodal_output_keys``): each step carries that frame's
+# function-channel token and, while a tool result is queued, its consumed
+# generation. Neither is a stream to concatenate, so a DELTA emission drains
+# them; otherwise every completion would repeat the session's history and a
+# stale acknowledgement.
+_NEMOTRON_PER_FRAME_KEYS = frozenset(
+    {
+        "nvc_function_token",
+        "nvc_function_response_consumed_generation",
+    }
+)
+
+
 def _has_meta_marker(payload: MultimodalPayload, marker: str) -> bool:
     """Whether *payload* carries *marker* in nested or flattened form."""
     if marker in payload or f"meta.{marker}" in payload:
@@ -103,8 +117,7 @@ def replace_nemotron_snapshot_keys(
 
 def drain_delta_payload(payload: MultimodalPayload) -> None:
     """Remove client-facing delta data while retaining request-level state."""
-    for modality_key in DRAINABLE_MODALITIES:
-        key = str(modality_key)
+    for key in (*map(str, DRAINABLE_MODALITIES), *_NEMOTRON_PER_FRAME_KEYS):
         payload.tensors.pop(key, None)
         payload.metadata.pop(key, None)
 

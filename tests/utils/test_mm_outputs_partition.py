@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 
@@ -70,6 +73,33 @@ def test_partition_duplex_audio_transcript_metadata_to_client_mm():
     assert "meta.turn_end" in client
     assert "meta.native_duplex_segment_text" not in client
     assert "meta.native_duplex_segment_text" in inter
+
+
+def test_partition_model_declared_client_keys_reach_both_channels():
+    payload = {
+        "hidden_states.layer_0": torch.zeros(1, 2),
+        "nvc_function_token": torch.tensor([20]),
+        "nvc_function_response_consumed_generation": torch.tensor([3]),
+    }
+    declared = ("nvc_function_token", "nvc_function_response_consumed_generation")
+
+    # The fixed allowlist alone keeps these keys off the client (#11146).
+    assert partition_flat_payload(payload)[1] == {}
+
+    inter, client = partition_flat_payload(payload, declared)
+    assert inter == payload
+    assert client == {key: payload[key] for key in declared}
+
+
+def test_partition_model_declared_client_keys_match_exact_flattened_key():
+    payload = {"codes.audio": torch.zeros(2, 4), "codes.ref": torch.zeros(1, 4)}
+    baseline_inter, _ = partition_flat_payload(payload)
+
+    inter, client = partition_flat_payload(payload, ("codes.audio",))
+    assert client == {"codes.audio": payload["codes.audio"]}
+    assert inter == baseline_inter == payload  # Client opt-in leaves inter-stage routing unchanged.
+    # A declaration names a key, not a root: "codes" matches neither sibling.
+    assert partition_flat_payload(payload, ("codes",)) == (payload, {})
 
 
 def test_snapshot_mm_payload_coalesces_compatible_tensor_list(monkeypatch):
