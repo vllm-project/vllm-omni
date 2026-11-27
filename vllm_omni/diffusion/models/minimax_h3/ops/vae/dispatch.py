@@ -111,8 +111,14 @@ def resolve_h3_vae_operators(device: torch.device) -> H3VAEOperatorSet | None:
     return None
 
 
+def supports_h3_vae_npu_fia(device: torch.device) -> bool:
+    """Return whether FIA applies to this device type."""
+    return device.type == "npu"
+
+
 __all__ = [
     "H3VAEOperatorSet",
     "H3_VAE_OPERATOR_TABLE",
     "resolve_h3_vae_operators",
+    "supports_h3_vae_npu_fia",
 ]

@@ -693,26 +693,39 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
 
-## Independent VAE optimization validation
+## Optional Video VAE fused infer attention
 
-Route supported unmasked, non-causal FP16/BF16 decoder self-attention through Ascend FIA. Fix the CPU BSND head-count fixture (BSND [1,2,3,4] has three heads), register the model control, and add a portable full-checkpoint benchmark. Unsupported calls retain the original attention implementation. No new production attention change was needed during this validation.
+To opt in to Ascend FIA for MiniMax-H3 Video VAE decode, add this option to the existing `vllm serve` command:
 
 ```bash
-# MAIN and CANDIDATE are the source checkouts; MODEL is the Ref2VA task partition.
-# LATENTS contains torch.save((video_z, audio_z)); use the same nightly software/driver.
-BENCHMARK="$CANDIDATE/benchmarks/diffusion/minimax_h3_vae_decode.py"
-H3_VIDEO_DECODER_FUSED_INFER_ATTENTION=0 H3_VAE_OPERATOR_FIR_C16_INSTALL=0 \
-H3_VAE_OPERATOR_FIR_C16=0 H3_VIDEO_DECODER_CROSS_CHUNK=0 H3_COMPONENT_CACHE_REUSE=0 \
-PYTHONPATH="$MAIN" python3 -m torch.distributed.run --nproc_per_node=8 \
-  "$BENCHMARK" --arm baseline --model "$MODEL" --inputs "$LATENTS" \
-  --output-dir baseline-results --warmups 3 --formals 5 --precision
-H3_VIDEO_DECODER_FUSED_INFER_ATTENTION=1 PYTHONPATH="$CANDIDATE" python3 -m torch.distributed.run --nproc_per_node=8 \
-  "$BENCHMARK" --arm candidate --model "$MODEL" --inputs "$LATENTS" \
-  --output-dir candidate-results --warmups 3 --formals 5 --precision
-python3 -m pytest -q tests/diffusion/models/minimax_h3/test_minimax_h3_vae_npu_fia.py tests/config/test_environment_variables.py
+--additional-config '{"video_vae_fused_infer_attention": true}'
 ```
 
-Measured scope: **resident Video VAE decode, max of eight ranks**.
+The option is a JSON boolean. Omitting it or passing `false` keeps the checkpoint's original attention. FIA applies to non-causal, unmasked FP16/BF16 self-attention with matching, nonempty Q/K/V shapes. Unsupported inputs keep the original attention; errors from a selected FIA operator propagate. Validate the workload on the target SoC and CANN version before enabling it.
+
+### VAE decode ablation
+
+Use separate Python environments containing editable installs of the baseline and candidate sources on the same vLLM and CANN stack. Run the arms serially on the same cards with the same checkpoint, input latents and unrelated optimization settings.
+
+```bash
+# MAIN_PYTHON and CANDIDATE_PYTHON select the two editable installs.
+# MODEL is the Ref2VA partition; LATENTS contains torch.save((video_z, audio_z)).
+BENCHMARK="$CANDIDATE/benchmarks/diffusion/minimax_h3_vae_decode.py"
+"$MAIN_PYTHON" -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm main --model "$MODEL" --inputs "$LATENTS" \
+  --output-dir main-results --warmups 3 --formals 5 --precision
+"$CANDIDATE_PYTHON" -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm pr-off --model "$MODEL" --inputs "$LATENTS" \
+  --output-dir pr-off-results --warmups 3 --formals 5 --precision
+"$CANDIDATE_PYTHON" -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm pr-on --model "$MODEL" --inputs "$LATENTS" \
+  --additional-config '{"video_vae_fused_infer_attention": true}' \
+  --output-dir pr-on-results --warmups 3 --formals 5 --precision
+```
+
+### Historical results (pre-rebase)
+
+The following data is from the original FIA change on vLLM 0.33 and CANN 9.2.1, not a comparison against the current main. Scope: **resident Video VAE decode, max of eight ranks**.
 
 | Arm | Mean ± sample std (s) | Min–max (s) | Independent round means (s) |
 | --- | ---: | ---: | --- |

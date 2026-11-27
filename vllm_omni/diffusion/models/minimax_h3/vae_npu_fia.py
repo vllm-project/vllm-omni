@@ -1,33 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""NPU fused-infer attention fast path for the MiniMax-H3 VAE decoder.
+"""Opt-in NPU fused-infer attention for the MiniMax-H3 Video VAE decoder.
 
-``install_vae_npu_fia(decoder, device, logger)`` rebinds each decoder
-block's ``attn.perform_attention`` to
-``torch_npu.npu_fused_infer_attention_score`` for calls inside the
-validated envelope: inference, non-causal, no mask, no varlen, FP16 or
-BF16 on NPU. Anything else falls back to the original implementation and
-logs the reason once per reason. Controlled by
-``H3_VIDEO_DECODER_FUSED_INFER_ATTENTION`` (default on).
-
-The installer only rebinds Python methods; it adds no parameters or
-buffers, so the checkpoint's state dict and the residency stagers are
-unchanged. Call it after ``install_h3_vae_optimizations()`` and before
-the stagers take their snapshot.
+Use ``video_vae_fused_infer_attention`` in the model's additional config.
+FIA requires nonempty, equal-shape BSND Q/K/V in FP16 or BF16 and unmasked,
+non-causal inference. Other calls keep the original attention.
 """
 
-import os
+from collections.abc import Mapping
 from types import MethodType
 
 import torch
 
+from .ops.vae.dispatch import supports_h3_vae_npu_fia
+
+_CONFIG_KEY = "video_vae_fused_infer_attention"
 _STATS_LOG_INTERVAL = 1000
-_ENV_NAME = "H3_VIDEO_DECODER_FUSED_INFER_ATTENTION"
 
 
-def _env_flag(name: str, default: str = "0") -> bool:
-    value = os.environ.get(name, default)
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
+def resolve_video_vae_fused_infer_attention(additional_config: Mapping[str, object] | None) -> bool:
+    """Read the MiniMax-H3 launch option without coercing non-boolean values."""
+    enabled = (additional_config or {}).get(_CONFIG_KEY, False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"additional_config.{_CONFIG_KEY} must be a boolean")
+    return enabled
+
+
+def _shape_fallback_reason(query, key, value) -> str | None:
+    if query.ndim != 4 or query.shape != key.shape or query.shape != value.shape:
+        return "expected matching BSND Q/K/V shapes"
+    if 0 in query.shape:
+        return "empty Q/K/V"
+    return None
 
 
 def _fallback_reason(attn, query, key, value, pack_info):
@@ -42,8 +46,9 @@ def _fallback_reason(attn, query, key, value, pack_info):
         return f"dtype outside the FP16/BF16 envelope ({query.dtype})"
     if key.dtype != query.dtype or value.dtype != query.dtype:
         return "mismatched Q/K/V dtypes"
-    if query.ndim != 4:
-        return f"expected BSND input, got {query.ndim} dimensions"
+    shape_reason = _shape_fallback_reason(query, key, value)
+    if shape_reason is not None:
+        return shape_reason
     if pack_info.get("cu_seqlens") is not None:
         return "varlen attention"
     if pack_info.get("mask_mod") is not None:
@@ -77,13 +82,9 @@ def _fused_infer_attention(query, key, value):
     return hidden_states.transpose(1, 2).nan_to_num(0.0)
 
 
-def install_vae_npu_fia(decoder, device, logger):
-    """Install the NPU fused-infer attention path on a decoded VAE."""
-    if not _env_flag(_ENV_NAME, "1"):
-        return
-    if device.type != "npu" or decoder is None:
-        # Every non-NPU platform takes this path on every VAE load; this is
-        # simply "the fast path does not apply", not an error.
+def install_vae_npu_fia(decoder, device: torch.device, logger, *, enabled: bool) -> None:
+    """Install the opted-in NPU attention path before the VAE stagers are built."""
+    if not enabled or not supports_h3_vae_npu_fia(device) or decoder is None:
         return
     if getattr(decoder, "_h3_npu_fia_stats", None) is not None:
         return
@@ -137,4 +138,4 @@ def install_vae_npu_fia(decoder, device, logger):
     logger.info("[H3_VAE_NPU_FIA] installed on %d blocks", installed)
 
 
-__all__ = ["install_vae_npu_fia"]
+__all__ = ["install_vae_npu_fia", "resolve_video_vae_fused_infer_attention"]

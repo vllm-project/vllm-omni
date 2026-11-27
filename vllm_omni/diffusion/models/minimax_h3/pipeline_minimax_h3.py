@@ -228,6 +228,7 @@ from .vae import (
     _VideoVAEPartProxy,
     vae_compile_allowed,
 )
+from .vae_npu_fia import resolve_video_vae_fused_infer_attention
 from .variant import BASE_H3, FASTH3_PREVIEW, H3Variant, control_task
 from .vdnh3 import VDNCheckpoint
 
@@ -1511,6 +1512,7 @@ class MiniMaxH3Pipeline(
                 ),
                 lightvae_decoder_path=lightvae_decoder_path,
                 stack_decode_tiles=od_config.vae_stack_tiles,
+                use_fused_infer_attention=resolve_video_vae_fused_infer_attention(od_config.additional_config),
                 allow_decoder_compile=vae_compile_allowed(
                     bool(od_config.enforce_eager),
                     current_omni_platform,

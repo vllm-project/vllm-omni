@@ -12,7 +12,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import torch_npu  # noqa: F401 -- register the NPU device backend
+import torch_npu
 
 from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
 from vllm_omni.diffusion.utils.chunked_video import quantize_chunk
@@ -26,10 +26,18 @@ parser.add_argument("--precision", action="store_true")
 parser.add_argument("--model", type=Path, required=True, help="Task partition containing video_vae and audio_vae")
 parser.add_argument("--inputs", type=Path, required=True, help="torch.save((video_latent, audio_latent))")
 parser.add_argument("--output-dir", type=Path, required=True)
+parser.add_argument("--additional-config", type=json.loads, help="JSON object with MiniMax-H3 Video VAE options")
 args = parser.parse_args()
+video_options = {}
+if args.additional_config is not None:
+    if not isinstance(args.additional_config, dict):
+        parser.error("--additional-config must be a JSON object")
+    from vllm_omni.diffusion.models.minimax_h3.vae_npu_fia import resolve_video_vae_fused_infer_attention
+
+    video_options["use_fused_infer_attention"] = resolve_video_vae_fused_infer_attention(args.additional_config)
 rank = int(os.environ.get("RANK", "0"))
 world = int(os.environ.get("WORLD_SIZE", "1"))
-torch.npu.set_device(rank)
+torch_npu.npu.set_device(rank)
 device = torch.device("npu", rank)
 if world > 1:
     dist.init_process_group("hccl", timeout=timedelta(minutes=10))
@@ -62,6 +70,7 @@ save(
         "device": str(device),
         "world_size": world,
         "precision": args.precision,
+        "additional_config": args.additional_config,
     },
 )
 video = MiniMaxH3VideoVAE(
@@ -70,6 +79,7 @@ video = MiniMaxH3VideoVAE(
     load_device=torch.device("cpu"),
     decode_only=True,
     trust_remote_code=True,
+    **video_options,
 )
 if world > 1:
     video.set_parallel_size(world, process_group=dist.group.WORLD)
@@ -79,13 +89,13 @@ loaded = {
     "decoder_class": video.model.decoder.__class__.__name__,
     "component_group_marker": getattr(video.model, "_h3_component_group_supported", False),
     "native_stack_tiling": getattr(video.model, "stack_tiling", None),
+    "stack_decode_tiles": video.stack_decode_tiles,
     "reshape_installed": getattr(video, "_h3_vae_reshape_installed", False),
     "fia_installed": hasattr(video.model.decoder, "_h3_npu_fia_stats"),
 }
 save(f"video-loaded-rank{rank}.json", loaded)
 video_input = video_input.to(device)
 times = []
-output = None
 for i in range(args.warmups + args.formals + int(args.precision)):
     synchronize()
     torch.npu.reset_peak_memory_stats()

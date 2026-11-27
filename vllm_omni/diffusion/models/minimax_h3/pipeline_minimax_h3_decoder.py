@@ -27,6 +27,7 @@ from .pipeline_minimax_h3 import (
     get_minimax_h3_post_process_func,
 )
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
+from .vae_npu_fia import resolve_video_vae_fused_infer_attention
 
 
 def resolve_minimax_h3_decoder_model_path(
@@ -87,6 +88,7 @@ class MiniMaxH3DecoderPipeline(
             trust_remote_code=od_config.trust_remote_code,
             lightvae_decoder_path=resolve_h3_lightvae_decoder_path(od_config.additional_config),
             stack_decode_tiles=od_config.vae_stack_tiles,
+            use_fused_infer_attention=resolve_video_vae_fused_infer_attention(od_config.additional_config),
         )
         self.audio_vae = MiniMaxH3AudioVAE(
             str(model_path / "audio_vae"),
