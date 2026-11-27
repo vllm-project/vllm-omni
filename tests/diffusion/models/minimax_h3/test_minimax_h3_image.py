@@ -7,14 +7,20 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
+from PIL import Image
 
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.models.minimax_h3 import image_vae
 from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3_image as h3i
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3DiTArchConfig
 from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.errors import OmniClientError
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -219,6 +225,33 @@ def test_post_process_truncates_like_the_released_writer():
     array = post(pixels, output_type="np")
     assert array.dtype.name == "uint8"
     assert array[0, 0, :, 0].tolist() == [0, 127, 254, 255]
+
+
+def test_post_process_honors_request_output_type():
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig(model_class_name="MiniMaxH3ImagePipeline")
+    engine._init_process_hooks(engine.od_config)
+
+    latent = torch.full((1, h3i._LATENT_CHANNELS, 1, 4, 6), 0.25)
+    latent_request = OmniDiffusionRequest("a bicycle", OmniDiffusionSamplingParams(output_type="latent"), "latent")
+    result = engine.postprocess_output(latent_request, DiffusionOutput(output=latent))[0]
+    assert len(result.images) == 1
+    assert result.images[0] is latent
+
+    pixels = torch.tensor([17, 32, 255], dtype=torch.uint8).view(1, 1, 1, 3)
+    pil_request = OmniDiffusionRequest("a bicycle", OmniDiffusionSamplingParams(), "pil")
+    result = engine.postprocess_output(pil_request, DiffusionOutput(output=pixels))[0]
+    assert len(result.images) == 1
+    image = result.images[0]
+    assert isinstance(image, Image.Image)
+    assert image.getpixel((0, 0)) == (17, 32, 255)
+
+    np_request = OmniDiffusionRequest("a bicycle", OmniDiffusionSamplingParams(output_type="np"), "np")
+    result = engine.postprocess_output(np_request, DiffusionOutput(output=pixels))[0]
+    assert len(result.images) == 1
+    array = result.images[0]
+    assert isinstance(array, np.ndarray)
+    np.testing.assert_array_equal(array, pixels.numpy())
 
 
 @pytest.mark.parametrize(
