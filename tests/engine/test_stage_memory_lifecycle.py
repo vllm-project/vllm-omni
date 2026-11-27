@@ -27,17 +27,28 @@ class MemoryClient:
     def __init__(self, address, allocated=11, reserved=13, *, supported=True):
         self.client_addresses = {"input_address": address}
         self.snapshot = {"allocated_bytes": allocated, "reserved_bytes": reserved} if supported else None
+        self.budget_snapshots: list[dict[str, object]] = []
         self.calls = 0
+        self.budget_calls = 0
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.release.set()
 
-    async def collective_rpc_async(self, *, method, **kwargs):
-        assert method == "get_stage_post_warmup_memory_stats"
-        self.calls += 1
+    async def collective_rpc_async(self, *, method, timeout=None, **kwargs):
+        if method == "get_stage_post_warmup_memory_stats":
+            result = [self.snapshot]
+            self.calls += 1
+        elif method == "get_gpu_memory_budget_snapshot":
+            result = self.budget_snapshots
+            self.budget_calls += 1
+        else:
+            raise AssertionError(f"unexpected RPC method: {method}")
         self.started.set()
-        await self.release.wait()
-        return [self.snapshot]
+        if timeout is None:
+            await self.release.wait()
+        else:
+            await asyncio.wait_for(self.release.wait(), timeout=timeout)
+        return result
 
     def shutdown(self):
         pass
@@ -249,6 +260,59 @@ async def test_disabled_stats_skip_startup_and_join_rpcs(lifecycle):
         assert env.values(4) == (None, None)
 
     await env.run(scenario)
+
+
+@pytest.mark.asyncio
+async def test_budget_snapshot_logs_all_ranks_when_stats_are_enabled(lifecycle, caplog):
+    env = lifecycle
+    env.orchestrator.log_stats = True
+    env.clients[0].budget_snapshots = [
+        {"stage_id": 0, "rank": 0, "available_kv_cache_memory_bytes": 7, "accounting_mode": "automatic"},
+        {"stage_id": 0, "rank": 1, "available_kv_cache_memory_bytes": 5, "accounting_mode": "automatic"},
+    ]
+
+    with caplog.at_level("INFO"):
+        await env.orchestrator.publish_stage_gpu_memory_budget()
+
+    assert env.clients[0].budget_calls == 1
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "stage=0 replica=0 rank=0" in messages
+    assert "stage=0 replica=0 rank=1" in messages
+
+
+@pytest.mark.asyncio
+async def test_budget_snapshot_skips_rpc_when_stats_are_disabled(lifecycle):
+    env = lifecycle
+
+    await env.orchestrator.publish_stage_gpu_memory_budget()
+
+    assert all(client.budget_calls == 0 for client in env.clients)
+
+
+@pytest.mark.asyncio
+async def test_budget_snapshot_timeout_does_not_block_orchestrator_run(lifecycle):
+    env = lifecycle
+    env.orchestrator.log_stats = True
+    env.orchestrator.GPU_MEMORY_BUDGET_RPC_TIMEOUT_S = 0.01
+    env.clients[0].release.clear()
+
+    async def scenario():
+        await asyncio.sleep(0.03)
+        assert env.clients[0].budget_calls == 1
+
+    await env.run(scenario)
+
+
+@pytest.mark.asyncio
+async def test_budget_snapshot_skips_diffusion_replica_attach(lifecycle):
+    env = lifecycle
+    env.orchestrator.log_stats = True
+    for client in env.clients:
+        client.stage_type = "diffusion"
+
+    await env.orchestrator._publish_replica_memory_diagnostics(0, 0, env.clients[0])
+
+    assert env.clients[0].budget_calls == 0
 
 
 @pytest.mark.asyncio

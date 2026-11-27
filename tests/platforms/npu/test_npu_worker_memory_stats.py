@@ -39,3 +39,4 @@ def test_npu_worker_memory_probe_is_unsupported(monkeypatch, is_310p):
     # RPC dispatch resolves a method on the worker. Unsupported optional stats
     # should return None, without requiring a runner or touching device memory.
     assert getattr(worker, "get_stage_post_warmup_memory_stats")() is None
+    assert getattr(worker, "get_gpu_memory_budget_snapshot")() is None

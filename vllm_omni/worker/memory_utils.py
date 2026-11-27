@@ -11,6 +11,7 @@ upstream request_memory() validation instead of assigning all free RAM.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, fields
 
 from vllm.config import CacheConfig
 from vllm.logger import init_logger
@@ -19,6 +20,47 @@ from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.v1.worker.utils import request_memory
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class GPUMemoryBudgetSnapshot:
+    """Immutable startup accounting for one Omni worker rank.
+
+    The profile fields describe the same components used by
+    ``OmniGPUWorkerBase.determine_available_memory``. ``activation_peak_bytes``
+    is the profiling-window ``torch_peak_increase`` used in the budget; the
+    separate ``transient_peak_headroom_bytes`` field preserves the upstream
+    warm-up recommendation value without making the accounting ambiguous.
+
+    ``shortfall_bytes`` is positive when profiled usage exceeds the requested
+    budget. In that case ``available_kv_cache_memory_bytes`` is zero and the
+    shortfall keeps the snapshot's accounting explicit.
+    """
+
+    stage_id: int | None = None
+    rank: int | None = None
+    device: str | None = None
+    total_memory_bytes: int | None = None
+    free_memory_bytes: int | None = None
+    uncapped_requested_memory_bytes: int | None = None
+    requested_memory_bytes: int | None = None
+    budget_was_capped: bool | None = None
+    weights_memory_bytes: int | None = None
+    preprofile_buffers_bytes: int | None = None
+    activation_peak_bytes: int | None = None
+    transient_peak_headroom_bytes: int | None = None
+    non_torch_memory_bytes: int | None = None
+    cuda_graph_memory_bytes: int | None = None
+    auxiliary_graph_memory_bytes: int | None = None
+    profiled_usage_bytes: int | None = None
+    available_kv_cache_memory_bytes: int | None = None
+    shortfall_bytes: int | None = None
+    accounting_mode: str = "unavailable"
+    reason: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        """Return a transport-safe mapping containing only scalar fields."""
+        return {field.name: getattr(self, field.name) for field in fields(self)}
 
 
 def request_memory_tolerant(

@@ -64,6 +64,35 @@ Graphs a model captures on its own outside these paths, or on a stage without a 
 cache, are not part of it, and stages using them need those pools free on top of
 their utilization.
 
+### Startup Budget Snapshot
+
+With `--log-stats`, each GPU worker logs one immutable startup budget snapshot
+at stage readiness and when a remote replica attaches. The record includes the
+stage, rank, device, total/free memory, requested budget, weights, pre-profile
+buffers, the profiling-window activation component, non-Torch memory, CUDA and
+auxiliary graph reserves, profiled usage, available KV bytes, and any shortfall.
+
+The activation component in this record is the profiling `torch_peak_increase`
+used by the KV calculation. The separate transient peak headroom used by the
+upstream warm-up recommendation is retained as a distinct diagnostic field.
+Automatic sizing also records the uncapped `total_memory *
+gpu_memory_utilization` target and whether the effective requested budget was
+capped below it, which makes co-located-stage compression distinguishable from
+the configured target.
+
+For automatic sizing, the record satisfies:
+
+```text
+requested_memory + shortfall = profiled_usage + available_kv_cache_memory
+```
+
+When `kv_cache_memory_bytes` is set explicitly, it is reported as an explicit
+override and profile-derived fields may be `None`. Generation stages without a
+KV cache and unsupported platform probes use an explicit mode or `None`. NVML
+process accounting is optional and is not used to replace the device-level
+budget calculation when NVML is unavailable. A snapshot captured before a
+later initialization failure is retained in the worker diagnostics.
+
 ### Example Calculation
 
 For a GPU with 80GB total memory:

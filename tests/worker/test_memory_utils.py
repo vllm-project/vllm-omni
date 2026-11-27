@@ -3,17 +3,27 @@
 """Stage memory budgets for discrete and integrated GPUs, without GPU / NVML."""
 
 import math
+from dataclasses import FrozenInstanceError
 
 import pytest
 from vllm.config import CacheConfig
 from vllm.platforms import current_platform
 from vllm.utils.mem_utils import MemorySnapshot
 
-from vllm_omni.worker.memory_utils import request_memory_tolerant
+from vllm_omni.worker.memory_utils import GPUMemoryBudgetSnapshot, request_memory_tolerant
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 GIB = 1024**3
+
+
+def test_gpu_memory_budget_snapshot_is_immutable_and_transport_safe():
+    snapshot = GPUMemoryBudgetSnapshot(stage_id=1, rank=2, available_kv_cache_memory_bytes=3)
+
+    assert snapshot.as_dict()["stage_id"] == 1
+    assert snapshot.as_dict()["rank"] == 2
+    with pytest.raises(FrozenInstanceError):
+        snapshot.rank = 3
 
 
 @pytest.fixture(autouse=True)

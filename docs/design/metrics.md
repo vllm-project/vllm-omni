@@ -116,6 +116,13 @@ from the ordinary process-local registry. See
 [post-warmup memory](#generation-stage-post-warmup-memory-2) for measurement
 scope and the separate Prometheus multiprocess storage limitation.
 
+When `log_stats` is enabled, the same readiness and replica-attachment points
+also request each GPU worker's immutable budget snapshot. The orchestrator logs
+one scalar snapshot per stage, replica and worker rank. This diagnostic payload
+is not added to Prometheus labels and is not sampled during requests or model
+steps. Unsupported workers, unavailable device measurements and explicit KV
+overrides retain their documented `None` or mode fields.
+
 ### Shared State Between Threads
 
 The Orchestrator runs in a background thread. The API server (OmniBase) runs in the asyncio event loop thread. `OmniRequestCounter` bridges them — a plain Python object with an `int` field. The Orchestrator increments/decrements it; the entrypoint reads it for gauge updates. No lock is needed because the counter is advisory (a stale read by one Prometheus scrape interval is acceptable). It is created by `AsyncOmniEngine.__init__()` and passed to the Orchestrator at construction time.
@@ -171,7 +178,9 @@ Behavior with `log_stats=False` (the Python-interface default, or API serving wi
 - `OmniPrometheusStatLogger` is not constructed in `_init_metrics_state`, so the ~65 upstream `vllm:*` wrap families are not registered in the default registry at all.
 - The engine core's `Scheduler.make_stats()` also short-circuits inside upstream (`if not self.log_stats: return None`), so no `SchedulerStats` is produced per step — the per-iteration cost is bounded by the existing upstream gate.
 
-Behavior with `log_stats=True`: the post-warmup memory snapshot is published at readiness and on remote replica attachment. Request-time metric paths fire normally, as described below.
+Behavior with `log_stats=True`: the post-warmup allocator snapshot and the GPU
+budget snapshot are published at readiness and on remote replica attachment.
+Request-time metric paths fire normally, as described below.
 
 The overhead with the flag on is small enough that an A/B benchmark on Qwen3-Omni-30B single replica (30 sequential audio requests) showed a mean latency delta of +0.6% (Welch's t = 0.318, n=30, not statistically significant at α=0.05); the `/metrics` line count drops from 1358 to 124 lines when the flag is off.
 

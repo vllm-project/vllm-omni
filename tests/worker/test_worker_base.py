@@ -110,6 +110,118 @@ def test_determine_available_memory_profiling_path(monkeypatch):
     assert out == 30 * GIB - profiled
 
 
+def test_determine_available_memory_records_budget_snapshot(monkeypatch):
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker.rank = 2
+    worker.device = "cuda:1"
+    worker.vllm_config.model_config = SimpleNamespace(stage_id=4)
+    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+
+    assert worker.determine_available_memory() == 17 * GIB
+
+    snapshot = worker.get_gpu_memory_budget_snapshot()
+    assert snapshot is not None
+    assert snapshot["stage_id"] == 4
+    assert snapshot["rank"] == 2
+    assert snapshot["device"] == "cuda:1"
+    assert snapshot["uncapped_requested_memory_bytes"] == 32 * GIB
+    assert snapshot["budget_was_capped"] is True
+    assert snapshot["weights_memory_bytes"] == 10 * GIB
+    assert snapshot["preprofile_buffers_bytes"] == 0
+    assert snapshot["activation_peak_bytes"] == 2 * GIB
+    assert snapshot["non_torch_memory_bytes"] == 1 * GIB
+    assert snapshot["profiled_usage_bytes"] == 13 * GIB
+    assert snapshot["available_kv_cache_memory_bytes"] == 17 * GIB
+    assert snapshot["shortfall_bytes"] == 0
+    assert (
+        snapshot["requested_memory_bytes"]
+        == snapshot["profiled_usage_bytes"] + snapshot["available_kv_cache_memory_bytes"]
+    )
+
+
+def test_determine_available_memory_records_explicit_kv_snapshot(monkeypatch):
+    worker = _make_worker(requested_memory=30 * GIB, kv_cache_memory_bytes=7 * GIB)
+    monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_rocm=lambda: False))
+
+    assert worker.determine_available_memory() == 7 * GIB
+
+    snapshot = worker.get_gpu_memory_budget_snapshot()
+    assert snapshot is not None
+    assert snapshot["accounting_mode"] == "explicit"
+    assert snapshot["available_kv_cache_memory_bytes"] == 7 * GIB
+    assert snapshot["budget_was_capped"] is False
+    assert snapshot["profiled_usage_bytes"] is None
+    assert snapshot["weights_memory_bytes"] is None
+
+
+def test_budget_snapshot_exposes_shortfall_when_kv_is_clamped(monkeypatch):
+    worker = _make_worker(requested_memory=15 * GIB, model_memory_usage=10 * GIB)
+    worker.vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    worker.model_runner.profile_cudagraph_memory = lambda: 4 * GIB
+    monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_cuda_alike=lambda: True))
+    monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
+    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+
+    assert worker.determine_available_memory() == 0
+
+    snapshot = worker.get_gpu_memory_budget_snapshot()
+    assert snapshot is not None
+    assert snapshot["profiled_usage_bytes"] == 17 * GIB
+    assert snapshot["available_kv_cache_memory_bytes"] == 0
+    assert snapshot["shortfall_bytes"] == 2 * GIB
+    assert (
+        snapshot["requested_memory_bytes"] + snapshot["shortfall_bytes"]
+        == snapshot["profiled_usage_bytes"] + snapshot["available_kv_cache_memory_bytes"]
+    )
+
+
+def test_partial_budget_snapshot_survives_profile_failure(monkeypatch):
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker._record_initial_gpu_memory_budget_snapshot()
+
+    @contextmanager
+    def failing_profile(snapshot, weights_memory):
+        raise RuntimeError("profile failed")
+        yield snapshot, weights_memory  # pragma: no cover
+
+    monkeypatch.setattr(base, "memory_profiling", failing_profile)
+
+    with pytest.raises(RuntimeError, match="profile failed"):
+        worker.determine_available_memory()
+
+    snapshot = worker.get_gpu_memory_budget_snapshot()
+    assert snapshot is not None
+    assert snapshot["accounting_mode"] == "initialization_failed"
+    assert snapshot["requested_memory_bytes"] == 30 * GIB
+    assert snapshot["profiled_usage_bytes"] is None
+
+
+def test_no_kv_cache_snapshot_is_explicit():
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker._record_initial_gpu_memory_budget_snapshot()
+    worker._record_no_kv_cache_snapshot()
+
+    snapshot = worker.get_gpu_memory_budget_snapshot()
+    assert snapshot is not None
+    assert snapshot["accounting_mode"] == "no_kv_cache"
+    assert snapshot["reason"] == "stage has no KV cache"
+    assert snapshot["weights_memory_bytes"] == 10 * GIB
+    assert snapshot["available_kv_cache_memory_bytes"] is None
+
+
+def test_initial_memory_failure_marks_partial_snapshot():
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker._record_initial_gpu_memory_budget_snapshot()
+    worker._record_gpu_memory_budget_failure("initial memory budget calculation failed: ValueError")
+
+    snapshot = worker.get_gpu_memory_budget_snapshot()
+    assert snapshot is not None
+    assert snapshot["accounting_mode"] == "initialization_failed"
+    assert snapshot["reason"].endswith("ValueError")
+    assert snapshot["total_memory_bytes"] == 40 * GIB
+    assert snapshot["requested_memory_bytes"] == 30 * GIB
+
+
 def test_determine_available_memory_populates_total_consumed(monkeypatch):
     """total_consumed mirrors upstream's MemoryProfilingResult field."""
     worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
@@ -174,6 +286,12 @@ def test_determine_available_memory_clamps_to_zero(monkeypatch):
     out = OmniGPUWorkerBase.determine_available_memory(worker)
 
     assert out == 0
+    snapshot = worker.get_gpu_memory_budget_snapshot()
+    assert snapshot is not None
+    assert snapshot["activation_peak_bytes"] == 0
+    assert snapshot["non_torch_memory_bytes"] == 0
+    assert snapshot["profiled_usage_bytes"] == 8 * GIB
+    assert snapshot["available_kv_cache_memory_bytes"] == 0
 
 
 @pytest.mark.parametrize("apply_estimate", [True, False])
