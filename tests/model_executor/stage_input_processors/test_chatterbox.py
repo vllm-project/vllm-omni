@@ -141,7 +141,10 @@ def test_an_utterance_with_no_speech_tokens_gets_no_stage_1_request() -> None:
 def stage_configs(tmp_path_factory: pytest.TempPathFactory) -> list:
     """Both stages' engine configs, from the deploy file, for a model directory of their own."""
     model_dir = write_model_dir(tmp_path_factory.mktemp("chatterbox"))
-    return [stage_vllm_config(model_dir, DEPLOY["turbo"], stage_id) for stage_id in (0, 1)]
+    # One deployment shares one scope. Two loads without it mint two, and
+    # stage 0 then refuses the put because stage 1 is not in its directory.
+    scope = uuid.uuid4().hex
+    return [stage_vllm_config(model_dir, DEPLOY["turbo"], stage_id, deployment_scope=scope) for stage_id in (0, 1)]
 
 
 @pytest.fixture(scope="module")

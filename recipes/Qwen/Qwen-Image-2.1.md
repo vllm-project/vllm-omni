@@ -94,7 +94,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen-Image-2.1-Turbo \
 
 The default communication backend remains the reference all-to-all. On a
 qualified CUDA installation, opt into symmetric-memory exchange with
-`--ulysses-a2a-permute`. This requires a working CUDA compiler/toolkit and
+`--ulysses-a2a-backend copy_engine`. This requires a working CUDA compiler/toolkit and
 NCCL 2.28 or later with symmetric-memory device support, including the wheel
 library/header layout required by the current extension builder. Missing
 requirements fail explicitly at initialization when opted in. No rank-local
