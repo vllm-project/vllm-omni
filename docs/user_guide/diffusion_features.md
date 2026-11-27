@@ -48,6 +48,8 @@ option to `false` or omit it to restore the original decoder. Audio encoding,
 video generation, and the output sample rate are unchanged. The optimized
 waveform is not guaranteed to be bit-identical to the reference.
 
+#### Experimental MiniMax-H3 Reference Isolation
+
 `--kv-isolate` changes MiniMax-H3's bidirectional attention: visual-reference
 queries read only visual-reference K/V, while other valid queries can read all
 valid K/V. A fixed reference condition timestep allows one reference-KV capture
