@@ -23,6 +23,7 @@ from typing import Any
 
 import torch
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
 
@@ -41,6 +42,19 @@ def _is_triton_attention(backend: Any) -> bool:
         return False
 
 
+def _dummy_runs_fit_after_warmup(runner: Any) -> bool:
+    """Whether later dummy runs stay within ``max_model_len`` after this warmup.
+
+    vLLM's dummy runs reuse request slots without resetting them, so a dummy
+    request in a slot a warmup request used continues from that request's
+    computed tokens. The largest dummy runs (compile warmup, FlashInfer
+    autotuning) follow this warmup, and their RoPE positions would then index
+    past the cos/sin cache. With one request slot, dummy runs already launch
+    the lone-prefill kernel.
+    """
+    return cdiv(runner.max_num_tokens, runner.max_num_reqs) + _WARMUP_TOKENS <= runner.max_model_len
+
+
 def warm_up_triton_attention_prefill(worker: Any) -> bool:
     """Run lone and mixed prefill steps if any attention group uses ``TRITON_ATTN``.
 
@@ -54,6 +68,7 @@ def warm_up_triton_attention_prefill(worker: Any) -> bool:
     eligible = int(
         not runner.is_pooling_model
         and any(_is_triton_attention(group.backend) for groups in runner.attn_groups for group in groups)
+        and _dummy_runs_fit_after_warmup(runner)
     )
     # The step goes through worker.execute_model, which joins pipeline-parallel
     # send/recv, so every PP rank must make the same decision.

@@ -23,9 +23,16 @@ class _Backend:
         return self._name
 
 
-def _worker(*backend_names, pooling=False):
+def _worker(*backend_names, pooling=False, max_num_reqs=64, max_num_tokens=32768, max_model_len=32768):
     groups = [[SimpleNamespace(backend=_Backend(name)) for name in backend_names]]
-    return SimpleNamespace(model_runner=SimpleNamespace(is_pooling_model=pooling, attn_groups=groups))
+    runner = SimpleNamespace(
+        is_pooling_model=pooling,
+        attn_groups=groups,
+        max_num_reqs=max_num_reqs,
+        max_num_tokens=max_num_tokens,
+        max_model_len=max_model_len,
+    )
+    return SimpleNamespace(model_runner=runner)
 
 
 @pytest.fixture
@@ -58,6 +65,19 @@ def test_runs_lone_then_mixed_prefill_only_for_triton_attention(steps, backends,
     # The lone prefill (num_seqs == 1) and the mixed step (num_seqs > 1) both
     # exceed the 8-token query limit of the 3D kernel path.
     assert steps == ([("lone", 16), ("mixed", 16)] if expected else [])
+
+
+@pytest.mark.parametrize(
+    ("max_num_reqs", "max_num_tokens", "expected"),
+    [(64, 32768, True), (3, 32768, True), (2, 32768, True), (2, 65536, False), (1, 32768, False), (1, 8192, True)],
+)
+def test_skips_when_a_full_budget_dummy_request_could_pass_max_model_len(steps, max_num_reqs, max_num_tokens, expected):
+    # Dummy runs reuse the warmup requests' slots and continue from their
+    # computed tokens (BAGEL stage 0 with max_num_seqs=1 indexed RoPE position
+    # 32783 of 32768 on a 32768-token dummy run).
+    worker = _worker("TRITON_ATTN", max_num_reqs=max_num_reqs, max_num_tokens=max_num_tokens, max_model_len=32768)
+    assert warm_up_triton_attention_prefill(worker) is expected
+    assert bool(steps) is expected
 
 
 def test_lone_prefill_request_is_an_omni_warmup_request():
