@@ -19,10 +19,10 @@ from tests.helpers.runtime import (
 
 pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
-# L4: 4 GPUs + TP=4; XPU B60: 2 cards (use num_cards={"cuda": 4, "xpu": 4} if needed)
+# CUDA, ROCm, and XPU weekly owners use two cards with TP=2.
 FOUR_CARD_MARKS = hardware_marks(
-    res={"cuda": "L4", "xpu": "B60"},
-    num_cards={"cuda": 2, "xpu": 2},
+    res={"cuda": "L4", "rocm": "MI300", "xpu": "B60"},
+    num_cards={"cuda": 2, "rocm": 2, "xpu": 2},
 )
 
 POSITIVE_PROMPT = "A small red barn in a snowy field, simple illustration."

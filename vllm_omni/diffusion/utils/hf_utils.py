@@ -37,17 +37,17 @@ def get_diffusion_model_index(
     return None
 
 
-def load_diffusers_config(model_name) -> dict:
+def load_diffusers_config(model_name: str, *, revision: str | None = None) -> dict:
     from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
-    config = DiffusionPipeline.load_config(model_name)
+    config = DiffusionPipeline.load_config(model_name, revision=revision)
     return config
 
 
-def _looks_like_bagel(model_name: str) -> bool:
+def _looks_like_bagel(model_name: str, *, revision: str | None = None) -> bool:
     """Best-effort detection for Bagel (non-diffusers) diffusion models."""
     try:
-        cfg = get_hf_file_to_dict("config.json", model_name)
+        cfg = get_hf_file_to_dict("config.json", model_name, revision=revision)
         model_type = cfg.get("model_type")
         if model_type == "bagel":
             return True
@@ -71,21 +71,21 @@ def _looks_like_magi2(model_name: str) -> bool:
     )
 
 
-def _looks_like_praxis1(model_name: str) -> bool:
+def _looks_like_praxis1(model_name: str, *, revision: str | None = None) -> bool:
     """Recognize a native Praxis-1 checkpoint (``model_type: praxis``) without importing its runtime."""
     try:
-        cfg = get_hf_file_to_dict("config.json", model_name)
+        cfg = get_hf_file_to_dict("config.json", model_name, revision=revision)
     except (OSError, ValueError):
         return False
     return isinstance(cfg, Mapping) and cfg.get("model_type") == "praxis"
 
 
-def _looks_like_flux3(model_name: str, config: Mapping | None = None) -> bool:
+def _looks_like_flux3(model_name: str, config: Mapping | None = None, *, revision: str | None = None) -> bool:
     """Detect the Flux3 package schema."""
     from vllm_omni.diffusion.utils.flux3_package import _is_flux3_package_config
 
     try:
-        cfg = config if config is not None else get_hf_file_to_dict("config.json", model_name)
+        cfg = config if config is not None else get_hf_file_to_dict("config.json", model_name, revision=revision)
     except Exception:
         return False
     if not isinstance(cfg, Mapping):
@@ -104,10 +104,10 @@ def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     return None
 
 
-def _looks_like_dreamzero(model_name: str) -> bool:
+def _looks_like_dreamzero(model_name: str, *, revision: str | None = None) -> bool:
     """Best-effort detection for DreamZero-style VLA diffusion checkpoints."""
     try:
-        cfg = get_hf_file_to_dict("config.json", model_name)
+        cfg = get_hf_file_to_dict("config.json", model_name, revision=revision)
         if cfg.get("model_type") != "vla":
             return False
         action_head_cfg = cfg.get("action_head_cfg") or {}
@@ -135,14 +135,14 @@ HIDREAM_O1_SIGNATURE_WEIGHTS = (
 )
 
 
-def _looks_like_hidream_o1(model_name: str, config: Mapping | None = None) -> bool:
+def _looks_like_hidream_o1(model_name: str, config: Mapping | None = None, *, revision: str | None = None) -> bool:
     """Detect HiDream-O1 without matching regular Qwen3-VL checkpoints."""
     try:
-        cfg = config if config is not None else get_hf_file_to_dict("config.json", model_name)
+        cfg = config if config is not None else get_hf_file_to_dict("config.json", model_name, revision=revision)
         if not isinstance(cfg, Mapping) or cfg.get("model_type") != "qwen3_vl":
             return False
 
-        index = get_hf_file_to_dict("model.safetensors.index.json", model_name)
+        index = get_hf_file_to_dict("model.safetensors.index.json", model_name, revision=revision)
         if not isinstance(index, Mapping):
             return False
         weight_map = index.get("weight_map")
@@ -154,7 +154,7 @@ def _looks_like_hidream_o1(model_name: str, config: Mapping | None = None) -> bo
 
 
 @lru_cache
-def is_diffusion_model(model_name: str) -> bool:
+def is_diffusion_model(model_name: str, *, revision: str | None = None) -> bool:
     """Check if a model is a diffusion model.
 
     Uses multiple fallback strategies to detect diffusion models:
@@ -188,7 +188,7 @@ def is_diffusion_model(model_name: str) -> bool:
     # get_hf_file_to_dict can raise for local paths that don't resolve to a Hub
     # repo id (see resolve_model_class_name's identical guard for the same call).
     try:
-        config_dict = get_diffusion_model_index(model_name)
+        config_dict = get_diffusion_model_index(model_name, revision=revision)
     except Exception as e:
         logger.debug("Failed to fetch diffusion model index via vllm utility: %s", e)
         config_dict = None
@@ -200,7 +200,7 @@ def is_diffusion_model(model_name: str) -> bool:
     # This is last because it requires importing diffusers/xformers/flash_attn
     # which may have compatibility issues
     try:
-        load_diffusers_config(model_name)
+        load_diffusers_config(model_name, revision=revision)
         return True
     except (ImportError, ModuleNotFoundError) as e:
         logger.debug("Failed to import diffusers dependencies: %s", e)
@@ -209,8 +209,8 @@ def is_diffusion_model(model_name: str) -> bool:
         logger.debug("Failed to load diffusers config via DiffusionPipeline: %s", e)
 
     return (
-        _looks_like_praxis1(model_name)
-        or _looks_like_bagel(model_name)
-        or _looks_like_dreamzero(model_name)
-        or _looks_like_hidream_o1(model_name)
+        _looks_like_praxis1(model_name, revision=revision)
+        or _looks_like_bagel(model_name, revision=revision)
+        or _looks_like_dreamzero(model_name, revision=revision)
+        or _looks_like_hidream_o1(model_name, revision=revision)
     )

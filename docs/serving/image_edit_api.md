@@ -107,6 +107,15 @@ Content-Type: multipart/form-data
 | `reference_image` | string or array | null | Reference image for inpainting |
 | `mask_image` | string or array | null | Mask for inpainting (white areas will be inpainted) |
 
+URL and base64 data-URL inputs are bounded before image decoding. Image inputs
+use vLLM's `VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB` limit, which defaults to 256 MiB;
+set that environment variable before starting the server to change it. A
+non-positive value disables this general image limit.
+Oversized or continuously streamed HTTP responses are rejected with a client
+error. Remote URLs must resolve to a public IP address and are fetched directly
+with a 60-second total time limit. For private media, use an upload or a data
+URL. Responses with non-identity `Content-Encoding` are rejected before decoding.
+
 ### Response Format
 
 When `stream=false` or omitted, the endpoint returns the standard image edit response:

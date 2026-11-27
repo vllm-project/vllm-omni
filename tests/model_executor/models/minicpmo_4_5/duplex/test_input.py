@@ -50,7 +50,9 @@ def test_commit_flushes_only_an_actual_residual_after_incremental_audio(tail_sam
         )
         assert buffer.append(tail.payload(), chunk_period_ms=1_000) is None
         assert buffer.pending_byte_count == tail_samples * 4
-    committed = buffer.commit(chunk_period_ms=1_000)
+    reservation = buffer.prepare_commit(operation_id="commit", chunk_period_ms=1_000)
+    reservation.commit()
+    committed = reservation.payload
 
     assert emitted is not None
     assert not buffer.has_pending()
@@ -60,7 +62,9 @@ def test_commit_flushes_only_an_actual_residual_after_incremental_audio(tail_sam
         assert _b64_audio(committed) == bytes(16_000 * 4)
     else:
         assert committed is None
-    assert buffer.commit(chunk_period_ms=1_000) is None
+    empty = buffer.prepare_commit(operation_id="empty-commit", chunk_period_ms=1_000)
+    empty.commit()
+    assert empty.payload is None
 
 
 def test_append_emits_one_model_unit_when_multiple_units_are_buffered():
@@ -125,19 +129,10 @@ def test_commit_without_speech_does_not_synthesize_terminal_audio():
     buffer = MiniCPMO45PcmAppendBuffer()
     buffer.append(pcm_payload(8_000, speech=False), chunk_period_ms=1_000)
 
-    committed = buffer.commit(chunk_period_ms=1_000)
+    reservation = buffer.prepare_commit(operation_id="silent-commit", chunk_period_ms=1_000)
+    reservation.commit()
 
-    assert committed is None
-
-
-def test_commit_resets_cumulative_turn_accounting():
-    buffer = MiniCPMO45PcmAppendBuffer()
-    buffer.append(pcm_payload(16_000), chunk_period_ms=1_000)
-    buffer.commit(chunk_period_ms=1_000)
-
-    empty = buffer.commit(chunk_period_ms=1_000)
-
-    assert empty is None
+    assert reservation.payload is None
 
 
 def test_pcm_append_reservation_rollback_restores_emitted_audio():
@@ -215,21 +210,9 @@ def _frame_payload(samples: int, frames: list[str]) -> dict[str, object]:
     return payload
 
 
-def test_append_attaches_every_frame_of_the_unit_closing_append():
-    """A base frame and its stacked composite arrive on one append and must
-    enter the same model unit (official ``frame_list``), not one per unit."""
-    buffer = MiniCPMO45PcmAppendBuffer()
-
-    emitted = buffer.append(_frame_payload(16_000, ["base-0", "stack-0"]), chunk_period_ms=1_000)
-
-    assert emitted is not None
-    assert emitted["video_frames"] == ["base-0", "stack-0"]
-    assert buffer._frame_queue == []
-
-
 def test_stacked_frames_do_not_accumulate_across_units():
+    """Each closing append's base frame and composite belong to the same unit."""
     buffer = MiniCPMO45PcmAppendBuffer()
-    attached: list[list[str]] = []
 
     for unit in range(64):
         emitted = buffer.append(
@@ -237,11 +220,8 @@ def test_stacked_frames_do_not_accumulate_across_units():
             chunk_period_ms=1_000,
         )
         assert emitted is not None
-        attached.append(list(emitted["video_frames"]))
-
-    assert attached[0] == ["base-0", "stack-0"]
-    assert attached[-1] == ["base-63", "stack-63"]
-    assert buffer._frame_queue == []
+        assert emitted["video_frames"] == [f"base-{unit}", f"stack-{unit}"]
+        assert buffer._frame_queue == []
 
 
 def test_frames_from_partial_appends_ride_the_unit_they_close():
@@ -406,7 +386,9 @@ def test_vision_only_append_emits_without_audio_and_survives_rollback():
     assert retried["video_frames"] == ["base", "stack"]
     assert retried["audio"] == ""
     assert not buffer.has_pending()
-    assert buffer.commit(chunk_period_ms=1000) is None
+    empty = buffer.prepare_commit(operation_id="vision-commit", chunk_period_ms=1000)
+    empty.commit()
+    assert empty.payload is None
 
 
 def test_video_only_bypasses_partial_microphone_audio_and_restores_on_rollback():
@@ -427,6 +409,36 @@ def test_video_only_bypasses_partial_microphone_audio_and_restores_on_rollback()
     assert len(_b64_audio(resumed)) == 16000 * 4
     assert resumed["video_frames"] == ["audio-frame"]
     assert not buffer.has_pending()
+
+
+def test_backlog_preserves_vision_order_and_partial_pcm_across_rollback():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    partial = pcm_payload(8000)
+    buffer.prepare_append(partial, operation_id="speech", chunk_period_ms=1000, allow_emit=False)
+    for frame in ("first", "second"):
+        hold = buffer.prepare_append(
+            dict(pcm_payload(0, speech=False), video_frames=[frame], force_listen=True),
+            operation_id=frame,
+            chunk_period_ms=1000,
+            allow_emit=False,
+        )
+        hold.commit()
+    first = buffer.prepare_backlog(operation_id="rollback", chunk_period_ms=1000)
+    assert first is not None and first.payload["video_frames"] == ["first"]
+    first.rollback()
+    for frame in ("first", "second"):
+        unit = buffer.prepare_backlog(operation_id=frame, chunk_period_ms=1000)
+        assert unit is not None
+        assert unit.payload["video_frames"] == [frame]
+        assert not unit.payload["audio"]
+        assert unit.payload["force_listen"] is True
+        unit.commit()
+    assert buffer.prepare_backlog(operation_id="partial", chunk_period_ms=1000) is None
+    assert buffer.pending_byte_count == 8000 * 4
+    tail = pcm_payload(8000)
+    payload = buffer.append(tail, chunk_period_ms=1000)
+    assert _b64_audio(payload) == _b64_audio(partial) + _b64_audio(tail)
+    assert not buffer.has_pending() and not buffer.has_reserved()
 
 
 def test_commit_prefix_rollback_preserves_frames_and_speech_tail():

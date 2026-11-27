@@ -31,8 +31,7 @@ _NATIVE_CHAT_TEMPLATE = (
 
 
 class MiniCPMO45Replica(MiniCPMO45):
-    # Replica fault coverage is intentionally CUDA-only.
-    res = {"cuda": "H100"}
+    res = {"cuda": "H100", "rocm": "MI325"}
     num_cards = 3
     deploy_dir = _DEPLOY_DIR
     scenarios = [

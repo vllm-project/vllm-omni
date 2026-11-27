@@ -23,6 +23,17 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _OUTPUTS_DIR = Path(__file__).resolve().parents[2] / "vllm_omni" / "outputs"
 
 
+_PRIVATE_MODULE_NAMES = (
+    "vllm_omni.outputs.output_modality",
+    "vllm_omni.outputs.utils",
+    "vllm_omni.outputs.mm_outputs",
+    "vllm_omni.outputs.multimodal_accumulation",
+)
+# The private copies below must not replace the real modules for other test
+# files, which are collected into the same session before any test runs.
+_ORIGINAL_MODULES = {name: sys.modules.get(name) for name in _PRIVATE_MODULE_NAMES}
+
+
 def _load_module(name: str, filepath: Path):
     spec = importlib.util.spec_from_file_location(name, filepath)
     assert spec is not None and spec.loader is not None
@@ -48,6 +59,12 @@ _accumulation_mod = _load_module(
     "vllm_omni.outputs.multimodal_accumulation",
     _OUTPUTS_DIR / "multimodal_accumulation.py",
 )
+
+for _name, _original in _ORIGINAL_MODULES.items():
+    if _original is None:
+        sys.modules.pop(_name, None)
+    else:
+        sys.modules[_name] = _original
 
 OutputModality = _om_mod.OutputModality
 TensorAccumulationStrategy = _om_mod.TensorAccumulationStrategy

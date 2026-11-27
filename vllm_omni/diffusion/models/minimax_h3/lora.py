@@ -107,6 +107,35 @@ def parse_turbo_filename(name: str) -> TurboSpec | None:
     )
 
 
+# ``pika_h3_flex_turbo_<n>step[_draft|_hd]_<task>[_lite_r32]``: Pika's Flex adapter fused with a few-step
+# distill into one native-layout LoRA. The file carries no metadata, so the name is the contract here too.
+_PIKA_TURBO_NAME_RE = re.compile(
+    r"^pika_h3_flex_turbo_(?P<steps>\d+)step(?:_draft|_hd)?_(?P<task>fl2va|ref2va)(?:_lite_r\d+)?\.safetensors$"
+)
+# The release's sampling note: video shift 6 on the FL2VA files, 12 on the Ref2VA ones.
+_PIKA_TURBO_VIDEO_SHIFT = {"fl2va": 6.0, "ref2va": 12.0}
+
+
+def parse_pika_turbo_filename(name: str) -> TurboSpec | None:
+    """Return the sampling contract a Pika Flex Turbo filename encodes, or ``None``.
+
+    The adapter itself loads as an ordinary native LoRA, so ``rank`` and
+    ``alpha`` are placeholders: every pair stores its own.
+    """
+    match = _PIKA_TURBO_NAME_RE.match(name)
+    if match is None or int(match["steps"]) <= 0:
+        return None
+    return TurboSpec(
+        filename=name,
+        task_family="ref2v" if match["task"] == "ref2va" else "fl2v",
+        denoise_steps=int(match["steps"]),
+        video_shift=_PIKA_TURBO_VIDEO_SHIFT[match["task"]],
+        audio_shift=_TURBO_AUDIO_SHIFT,
+        rank=0,
+        alpha=0.0,
+    )
+
+
 _LORA_A_SUFFIX = ".lora_A.default.weight"
 _LORA_B_SUFFIX = ".lora_B.default.weight"
 # ``8step_v1.2`` stores one scalar alpha per target next to the metadata value.

@@ -380,6 +380,20 @@ def _validate_seed_tts(
     if setup:
         errs.append(f"Seed-TTS eval setup failed: {setup}")
         return errs
+    # --no-oversample can yield fewer requests than --num-prompts, and each
+    # Realtime request can contain multiple turns. Compare successful requests
+    # with the sampled session count, independently of scorer coverage below.
+    sessions = int(result.get("seed_tts_session_count", 0) or 0)
+    completed = int(result.get("completed", 0) or 0)
+    failed = int(result.get("failed", 0) or 0)
+    failed_turns = int(result.get("seed_tts_request_failed", 0) or 0)
+    if sessions <= 0 or completed != sessions or failed or failed_turns:
+        errs.append(
+            "Seed-TTS request coverage is incomplete: "
+            f"seed_tts_session_count={sessions}, completed={completed}, "
+            f"failed={failed}, seed_tts_request_failed={failed_turns}; "
+            "every sampled request must succeed before accuracy metrics can pass."
+        )
     timed_out = int(result.get("timed_out_requests", 0) or 0)
     cancelled = int(result.get("cancelled_after_timeout_requests", 0) or 0)
     if timed_out or cancelled:
@@ -421,6 +435,49 @@ def _validate_seed_tts(
         )
     )
     return errs
+
+
+def dataset_accuracy_errors(
+    result: dict[str, object],
+    dataset: str,
+    expected: int,
+    baseline: Mapping[str, float],
+    *,
+    enforce_thresholds: bool = True,
+) -> list[str]:
+    """Check dataset scoring coverage independently of the model and concurrency."""
+    failures = ["timed_out_requests", "cancelled_after_timeout_requests"]
+    if dataset == "daily-omni":
+        counts = ["daily_omni_evaluated_ok"]
+        scores = ["daily_omni_accuracy"]
+        failures += ["daily_omni_request_failed", "daily_omni_no_gold"]
+    elif dataset == "seed-tts":
+        counts = ["seed_tts_content_evaluated"]
+        scores = ["seed_tts_content_error_mean"]
+        failures += ["seed_tts_request_failed", "seed_tts_no_pcm", "seed_tts_asr_failed", "seed_tts_empty_audio"]
+        if baseline.get("min_seed_tts_mean_sim") is not None:
+            counts.append("seed_tts_sim_evaluated")
+            scores.append("seed_tts_sim_mean")
+            failures += ["seed_tts_sim_failed", "seed_tts_sim_skipped_no_ref"]
+    else:
+        raise ValueError(f"No dataset accuracy contract for {dataset}")
+    errors = [f"{key}={result.get(key)!r}, expected {expected}" for key in counts if result.get(key) != expected]
+    errors += [f"{key}={result[key]}; workload coverage is incomplete" for key in failures if result.get(key, 0)]
+    for key in scores:
+        value = result.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            errors.append(f"{key} must be a finite score: {value!r}")
+    limits = baseline if enforce_thresholds else {}
+    if dataset == "daily-omni":
+        errors += _validate_daily_omni(result, min_accuracy=limits.get("min_daily_omni_accuracy"))
+    else:
+        errors += _validate_seed_tts(
+            result,
+            max_mean_wer=limits.get("max_seed_tts_mean_wer"),
+            min_mean_sim=limits.get("min_seed_tts_mean_sim"),
+            min_mean_utmos=None,
+        )
+    return errors
 
 
 def validate_seed_tts(
@@ -1148,7 +1205,8 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
                 print(
                     f"[Seed-TTS] mean_wer={data.get('seed_tts_content_error_mean')} "
                     f"mean_sim={data.get('seed_tts_sim_mean')} mean_utmos={data.get('seed_tts_utmos_mean')} "
-                    f"evaluated={data.get('seed_tts_content_evaluated')}",
+                    f"evaluated={data.get('seed_tts_content_evaluated')} "
+                    f"completed={data.get('completed')}/{data.get('seed_tts_session_count')}",
                     flush=True,
                 )
 

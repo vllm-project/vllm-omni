@@ -241,3 +241,56 @@ def test_batched_history_recording_preserves_ragged_reordered_requests():
         history = state._talker_inputs[rid]
         assert history.length == want.shape[0]
         torch.testing.assert_close(history.embeds[: history.length], want, rtol=0, atol=0)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_eager_mtp_kernels_compile_once_for_every_batch_size(monkeypatch):
+    # Batches of one or of a multiple of 16 rows, and a first_audio view that
+    # starts n bytes into a shared buffer, must reuse the kernels compiled for
+    # the first batch: a compile mid-serving stalls every stream.
+    from triton import knobs
+
+    from vllm_omni.worker_v2.model_states import eager_mtp_kernels as kernels
+    from vllm_omni.worker_v2.model_states.eager_mtp_kernels import (
+        eager_post,
+        eager_pre,
+        record_history,
+        settled_frames,
+    )
+
+    # Earlier tests may have compiled kernels for other batch sizes already.
+    for kernel in (kernels._pre_kernel, kernels._post_kernel, kernels._settled_kernel, kernels._history_kernel):
+        kernel.device_caches.clear()
+    device = torch.device(DEVICE_TYPE, 0)
+    # Request slots cover the largest batch below (33 rows).
+    hidden, nq, vocab, slots_total = 128, 16, 64, 64
+
+    def step(n):
+        meta = torch.stack([torch.arange(n, device=device)] * 2 + [torch.zeros(n, device=device)] * 3).long()
+        qsl = torch.arange(n + 1, device=device, dtype=torch.int32)
+        sampled = torch.randint(0, vocab, (n, 1), device=device)
+        text_hidden = torch.randn(n, hidden, device=device, dtype=torch.bfloat16)
+        emb_w = torch.randn(vocab, hidden, device=device, dtype=torch.bfloat16)
+        buffers = [torch.empty(n, hidden, device=device, dtype=torch.bfloat16) for _ in range(3)]
+        last, layer0 = eager_pre(meta, n, qsl, sampled, text_hidden, emb_w, sampled.new_empty(n), *buffers)
+        eager = torch.empty(slots_total, hidden, device=device, dtype=torch.bfloat16)
+        codes = torch.randint(0, vocab, (n, nq), device=device)
+        shared = torch.zeros(2 * n, device=device, dtype=torch.int8)
+        eager_post(
+            meta, n, last, layer0, buffers[0], eager, codes, torch.empty_like(codes),
+            torch.zeros(n, device=device, dtype=torch.long), shared[:n],
+            shared[n:], torch.ones(slots_total, device=device, dtype=torch.bool), vocab,
+        )  # fmt: skip
+        settled_frames(meta[:2].contiguous(), n, eager, torch.randn(1, hidden, device=device), text_hidden)
+        # One input row per request into its own history; the fused profile packs from 32 requests.
+        history = torch.empty(n, 2, hidden, device=device, dtype=torch.bfloat16)
+        rows = torch.arange(n, device=device)
+        addresses = torch.full((n,), history.data_ptr(), device=device) + rows * history[0].nbytes
+        record_history(torch.cat((addresses, rows, rows * 0, rows, rows)), text_hidden, n, n)
+
+    step(3)
+    compiles = []
+    monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", lambda **kw: compiles.append(kw["fn"].name))
+    for n in (1, 16, 5, 32, 33):
+        step(n)
+    assert compiles == []

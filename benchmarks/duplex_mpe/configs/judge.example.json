@@ -1,0 +1,16 @@
+{
+  "model": "Qwen/Qwen3.8-27B",
+  "model_revision": null,
+  "base_url": "http://127.0.0.1:30000/v1",
+  "api_key_env": null,
+  "max_concurrency": 8,
+  "enable_thinking": false,
+  "answer_decoding": {
+    "temperature": 0.0,
+    "max_tokens": 4096
+  },
+  "silence_decoding": {
+    "temperature": 0.0,
+    "max_tokens": 4096
+  }
+}
