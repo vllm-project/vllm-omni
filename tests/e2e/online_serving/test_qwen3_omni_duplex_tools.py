@@ -26,7 +26,7 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.omni]
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 SERVER_PARAMS = [
     pytest.param(
-        OmniServerParams(model=MODEL, stage_config_path=get_deploy_config_path("qwen3_omni_duplex.yaml")),
+        OmniServerParams(model=MODEL, stage_config_path=get_deploy_config_path("qwen3_omni_duplex_mrv2.yaml")),
         id="qwen3-omni-duplex",
     )
 ]

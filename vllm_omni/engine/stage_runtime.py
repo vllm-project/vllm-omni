@@ -10,6 +10,7 @@ import contextlib
 import copy
 import os
 import threading
+import uuid as _uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
@@ -47,6 +48,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.stage_client import StageClient, StagePoolClient
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
+    LocalReplicaStartupError,
     OmniMasterServer,
     StageReplicaResources,
     connect_remote_diffusion_proc,
@@ -732,7 +734,15 @@ class StageRuntime:
             self._stage_configs, local_replica_counts=self._get_local_replica_counts()
         )
         prepare_engine_environment()
-        omni_transfer_config = load_omni_transfer_config_for_model(self._model, self._config_path)
+        # DistStageRuntime sets one id before this call and the master echoes
+        # it to --headless. A local launch has neither and keeps one UUID for
+        # the stages this call creates.
+        deployment_scope = getattr(self, "_deployment_id", None) or None
+        omni_transfer_config = load_omni_transfer_config_for_model(
+            self._model,
+            self._config_path,
+            deployment_scope=deployment_scope,
+        )
         stage_plans = self._build_logical_stage_init_plans(
             omni_transfer_config,
             replicas_per_stage,
@@ -1049,6 +1059,7 @@ class StageRuntime:
         initialized_clients_by_stage: dict[int, list[StagePoolClient | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
         }
+        replicas_left = {plan.stage_idx: len(plan.replicas) for plan in stage_plans}
         primary_exc: Exception | None = None
         init_state_lock = threading.Lock()
         self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
@@ -1091,6 +1102,11 @@ class StageRuntime:
                     )
                 except Exception as exc:
                     with init_state_lock:
+                        if isinstance(exc, LocalReplicaStartupError):
+                            replicas_left[stage_idx] -= 1
+                            if replicas_left[stage_idx] > 0:
+                                logger.warning("[StageRuntime] %s", exc)
+                                continue
                         if primary_exc is None:
                             primary_exc = exc
                     return
@@ -1122,6 +1138,8 @@ class StageRuntime:
                             if primary_exc is None:
                                 primary_exc = exc
 
+        if primary_exc is None and self._init_cancelled.is_set():
+            primary_exc = RuntimeError("Stage initialization was cancelled")
         if primary_exc is not None:
             setattr(primary_exc, "_initialized_clients_by_stage", initialized_clients_by_stage)
             raise primary_exc
@@ -1485,11 +1503,9 @@ class StageRuntime:
 
         for plan in stage_plans:
             replica_clients = initialized_clients_by_stage[plan.stage_idx]
-            first_client = replica_clients[0] if replica_clients else None
-            if first_client is None:
+            if all(client is None for client in replica_clients):
                 raise RuntimeError(f"Stage {plan.stage_idx} initialization completed with a missing client")
 
-            clients: list[StagePoolClient] = [client for client in replica_clients if client is not None]
             stage_vllm_config = None
             output_processor = None
             metadata = plan.replicas[0].metadata
@@ -1508,7 +1524,7 @@ class StageRuntime:
             stage_pools.append(
                 StagePool(
                     plan.stage_idx,
-                    clients,
+                    replica_clients,
                     output_processor=output_processor,
                     stage_vllm_config=stage_vllm_config,
                     watermarkers=watermarkers,
@@ -1602,6 +1618,8 @@ class DistStageRuntime(StageRuntime):
 
     def _prepare_stage_plans(self) -> list[LogicalStageInitPlan]:
         self._validate_single_stage_mode_replica_constraints()
+        if not getattr(self, "_deployment_id", None):
+            self._deployment_id = _uuid.uuid4().hex
         stage_plans = super()._prepare_stage_plans()
         if all(replica.launch_mode == "remote" for plan in stage_plans for replica in plan.replicas):
             logger.info("All stage replicas are remote; running only the frontend (API server + orchestrator)")
@@ -1771,6 +1789,8 @@ class DistStageRuntime(StageRuntime):
             heartbeat_timeout=self._omni_heartbeat_timeout,
         )
 
+        if not getattr(self, "_deployment_id", None):
+            self._deployment_id = _uuid.uuid4().hex
         self._omni_master_server = OmniMasterServer(
             master_address=self._omni_master_address,
             master_port=self._omni_master_port,
@@ -1779,6 +1799,7 @@ class DistStageRuntime(StageRuntime):
             coordinator_router_address=self._coordinator_runtime.router_address,
             on_register=self._dispatch_master_register,
             head_local_replicas=head_local_replicas,
+            deployment_id=self._deployment_id,
         )
         self._omni_master_server.start()
         logger.info("[DistStageRuntime] OmniMasterServer started for stages %s", all_stage_ids)

@@ -140,6 +140,19 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             self.model, "_last_captured_layers"
         )
 
+    def _shares_drafter_aux_output(self) -> bool:
+        return (
+            self.use_aux_hidden_state_outputs
+            and getattr(self.model, "supports_speculative_payload", False) is True
+            and callable(getattr(self.model, "extract_aux_hidden_states", None))
+        )
+
+    def _shared_drafter_aux(self, hidden_states, payload):
+        _, layers = self.model.extract_aux_hidden_states(
+            OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=payload)
+        )
+        return layers
+
     def _aux_hidden_state_contract_conflicts(self) -> bool:
         """Whether a target-hidden-layer drafter conflicts with the model output.
 
@@ -311,6 +324,14 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         with self._staged_writes.deferred() if static_staged_writes else nullcontext():
             super().add_requests(scheduler_output)
 
+        apply_update = getattr(self.model, "apply_text_input_update", None)
+        if callable(apply_update):
+            for data in scheduler_output.scheduled_new_reqs:
+                payload = getattr(data, "model_intermediate_buffer", None)
+                if payload:
+                    req_idx = self.req_states.req_id_to_index[data.req_id]
+                    apply_update(self.model_state.intermediate_buffer.buffers[req_idx], payload, replace=True)
+
     def shutdown(self) -> None:
         if self._mm_rng_state is not None:
             self._mm_rng_state.clear()
@@ -337,6 +358,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         plane = getattr(self, "_omni_data_plane", None)
         if plane is None:
             return
+        commits = getattr(scheduler_output, "chunk_commits", ())
+        if commits:
+            plane.commit_resumable_outputs(commits)
+        receivers = getattr(scheduler_output, "resume_chunk_receivers", ())
+        if receivers:
+            plane.resume_chunk_receivers(receivers)
         for request_data in getattr(scheduler_output, "scheduled_new_reqs", []):
             if is_warmup_request(request_data.req_id):
                 continue
@@ -458,7 +485,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         self._last_aux_output = None
         self._last_multimodal_outputs = None
         self._configure_cudagraph_output_contract()
-        if self._aux_hidden_state_contract_conflicts():
+        if self._aux_hidden_state_contract_conflicts() and not self._shares_drafter_aux_output():
             # Both would use the forward's tuple output slot.
             raise NotImplementedError(
                 f"{type(self.model).__name__} returns its own auxiliary output; a drafter that "
@@ -1153,9 +1180,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     self._last_multimodal_outputs = cast(dict[str, Any], stepped.multimodal_outputs)
             else:
                 replayed = self.cudagraph_manager.run_fullgraph(batch_desc)
-                if self.use_aux_hidden_state_outputs:
+                shared_aux = self._shares_drafter_aux_output()
+                if self.use_aux_hidden_state_outputs and not shared_aux:
                     replayed, draft_aux_hidden_states = replayed
                 hidden_states, self._last_aux_output = self._split_fullgraph_output(replayed)
+                if shared_aux:
+                    draft_aux_hidden_states = self._shared_drafter_aux(hidden_states, self._last_aux_output)
                 if hasattr(self.model, "_last_captured_layers"):
                     self.model._last_captured_layers = self._last_aux_output
         else:
@@ -1205,7 +1235,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             # Extract hidden_states from model output.
             self._last_aux_output = None
             self._last_multimodal_outputs = None
-            if self.use_aux_hidden_state_outputs:
+            shared_aux = self._shares_drafter_aux_output()
+            if self.use_aux_hidden_state_outputs and not shared_aux:
                 model_output, draft_aux_hidden_states = model_output
             if isinstance(model_output, OmniOutput):
                 hidden_states = model_output.text_hidden_states
@@ -1217,6 +1248,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     self.model._last_captured_layers = self._last_aux_output
             else:
                 hidden_states = model_output
+            if shared_aux:
+                payload = self._last_multimodal_outputs or self._last_aux_output
+                draft_aux_hidden_states = self._shared_drafter_aux(hidden_states, payload)
         if kstep_extra and kstep_frames == 0 and isinstance(hidden_states, torch.Tensor):
             kstep_extra["request_sample_eligible"] = [
                 int(input_batch.num_computed_prefill_tokens_np[i]) + int(input_batch.num_scheduled_tokens[i])
@@ -1274,6 +1308,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         """
         super().update_requests(scheduler_output)
 
+        apply_update = getattr(self.model, "apply_text_input_update", None)
         cached = scheduler_output.scheduled_cached_reqs
         addl_info = getattr(cached, "additional_information", None)
         if not addl_info:
@@ -1286,6 +1321,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 continue
             resolved = _resolve_additional_information(info)
             if resolved:
+                if callable(apply_update):
+                    apply_update(self.model_state.intermediate_buffer.buffers[req_idx], resolved, replace=False)
                 gpu_keys: set[tuple[str, str]] = getattr(self.model, "gpu_resident_buffer_keys", set())
                 self.model_state.intermediate_buffer.update(req_idx, resolved, gpu_keys)
 
@@ -1294,10 +1331,23 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     # ------------------------------------------------------------------
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
+        lifecycle_hook = getattr(type(self.model_state), "get_request_lifecycle", None)
+        lifecycle = lifecycle_hook(self.model_state, scheduler_output) if lifecycle_hook is not None else None
+        if lifecycle is not None and lifecycle.reset_req_ids:
+            # Keep scheduler-owned completion metadata unchanged. Only the
+            # worker resets the old phase before add_requests admits its reuse.
+            scheduler_output = replace(
+                scheduler_output,
+                finished_req_ids=scheduler_output.finished_req_ids | lifecycle.reset_req_ids,
+            )
         # IMPORTANT: Must query req_id_to_index BEFORE super().finish_requests()
         # because super() calls req_states.remove_request(req_id) which pops the
         # mapping and returns the slot index to free_indices.
         finished = scheduler_output.finished_req_ids
+        # Scheduler decisions the model follows this step, before it frees finished requests' state.
+        on_scheduled = getattr(self.model, "on_scheduler_output", None)
+        if callable(on_scheduled):
+            on_scheduled(scheduler_output)
         if self._mm_rng_state is not None:
             for req_id in finished:
                 self._mm_rng_state.discard(req_id)
@@ -1322,3 +1372,6 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             if idx is not None:
                 self.model_state.remove_request(idx)
         super().finish_requests(scheduler_output)
+        if lifecycle is not None:
+            for req_id in sorted(lifecycle.release_req_ids - all_done):
+                self._remove_request(req_id)

@@ -38,7 +38,9 @@ loading, adapters, shared layers, and model-specific processing.
 ### DIFF-MODEL-INV-001: Pipelines implement one runtime contract
 
 **Rule:** A pipeline MUST declare its supported modalities, configuration,
-inputs, outputs, loading path, and runtime capabilities.
+inputs, outputs, loading path, and runtime capabilities (including its
+merged-LoRA capability via `SupportsMergedLoRA` or an explicit registry entry in
+`vllm_omni/lora/capability.py`).
 
 ### DIFF-MODEL-INV-002: Registration is the selection boundary
 
@@ -69,6 +71,11 @@ HunyuanImage3 uses `OmniDiffusionConfig.revision` for model configuration,
 generation configuration, tokenizer, and weight loading, including preprocessing.
 The shared-weight runtime pins remote loads to the commit resolved by AR;
 local checkpoint directories must remain immutable throughout the session.
+
+MiniMax-H3-Image resolves all requested release assets from the Hub, including
+the PDD configuration and fused heads, tokenizer, processor, and VAE. Finding
+`model_index.json` in a cold or partially populated cache does not establish
+that these other required assets are available.
 
 ## HunyuanImage3 AR KV token identity
 

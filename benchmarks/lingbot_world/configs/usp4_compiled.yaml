@@ -7,7 +7,7 @@
 #                     pipeline validates this: LingBot requires
 #                     sequence_parallel_size == ulysses_degree, ring_degree and
 #                     allgather_degree of 1, ulysses_mode "strict", and
-#                     ulysses_a2a_permute disabled. Pipeline, CFG, and VAE
+#                     ulysses_a2a_backend "nccl" (the default "auto" is pinned to it). Pipeline, CFG, and VAE
 #                     parallel sizes above 1 are rejected. This config uses
 #                     TP=1; the validator does not reject larger TP sizes.
 #   enforce_eager     false puts LingBotDMDBlockRunner on the compiled path

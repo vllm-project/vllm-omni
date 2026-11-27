@@ -24,6 +24,7 @@ class ClientRequestState:
         self.queue = queue if queue is not None else asyncio.Queue()
         self.metrics: OrchestratorAggregator | None = None
         self.input_stream_task: asyncio.Task | None = None
+        self.first_chunk_submitted: asyncio.Future[None] | None = None
         # Request-scoped idempotency guard for Prometheus failure counters.
         self.failure_recorded = False
         # Wall-clock time at which the user's request arrived in the engine

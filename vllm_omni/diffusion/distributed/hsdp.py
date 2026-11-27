@@ -179,7 +179,9 @@ def prepare_hsdp_shard_context(
     # keep the original storage dtype on all-gather instead of casting to
     # hsdp_config.param_dtype (typically bfloat16). FP8 GEMM kernels expect
     # FP8 inputs; an implicit FP8 -> bf16 cast would silently break them.
-    has_fp8_params = any(p.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for p in model.parameters())
+    # ROCm gfx942 stores FP8 weights as the FNUZ variants.
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
+    has_fp8_params = any(p.dtype in fp8_dtypes for p in model.parameters())
     preserve_parameter_dtypes = bool(getattr(model, "_hsdp_preserve_parameter_dtypes", False))
     mp_policy = MixedPrecisionPolicy(
         param_dtype=None if has_fp8_params or preserve_parameter_dtypes else hsdp_config.param_dtype,

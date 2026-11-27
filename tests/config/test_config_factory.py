@@ -599,6 +599,42 @@ class TestStageResolutionHelpers:
 class TestPipelineDiscovery:
     """Tests for the central pipeline registry (``OMNI_PIPELINES``)."""
 
+    def test_pipeline_discovery_keeps_revision_configs_separate(self, mocker):
+        model = "revision-test/omni"
+        get_config = mocker.patch(
+            "vllm_omni.config.config_factory.get_config",
+            side_effect=[Q3_OMNI_THINKER_HF_CONFIG, Q3_OMNI_ALL_STAGES_HF_CONFIG],
+        )
+        thinker = StageConfigFactory.get_pipeline_config(model, trust_remote_code=False, revision="text")
+        full = StageConfigFactory.get_pipeline_config(model, trust_remote_code=False, revision="audio")
+        assert StageConfigFactory.get_pipeline_config(model, trust_remote_code=False, revision="text") == thinker
+
+        assert thinker is not None and len(thinker.stages) == 1
+        assert full is not None and len(full.stages) == 3
+        assert [call.kwargs["revision"] for call in get_config.call_args_list] == ["text", "audio"]
+
+    @pytest.mark.parametrize(
+        "filename,metadata,expected",
+        [
+            ("config.json", {"model_type": "qwen3_tts"}, "qwen3_tts"),
+            ("model_index.json", {"_class_name": "GlmImagePipeline"}, "glm_image"),
+        ],
+    )
+    def test_pipeline_discovery_reads_pinned_fallback_metadata(self, mocker, filename, metadata, expected):
+        pinned_revision = "release"
+
+        def read_config_file(name, _model, *, revision):
+            return metadata if name == filename and revision == pinned_revision else None
+
+        mocker.patch.object(config_factory_module, "get_config", return_value=None)
+        read_metadata = mocker.patch.object(config_factory_module, "get_hf_file_to_dict", side_effect=read_config_file)
+
+        model = "revision-test/checkpoint"
+        pipeline = StageConfigFactory.get_pipeline_config(model, trust_remote_code=False, revision=pinned_revision)
+
+        assert pipeline is not None and pipeline.model_type == expected
+        read_metadata.assert_any_call(filename, model, revision=pinned_revision)
+
     def test_registry_has_known_models(self):
         """Check that specific models are in OMNI_PIPELINES."""
         assert "qwen2_5_omni" in OMNI_PIPELINES
@@ -1345,7 +1381,7 @@ class TestPipelineRegistration:
                 "trust_remote_code": True,
                 "model": "fake/model",
             }
-            mock_get_config.assert_called_once_with("fake/model", trust_remote_code=True)
+            mock_get_config.assert_called_once_with("fake/model", trust_remote_code=True, revision=None)
 
         with patch.object(StageConfigFactory, "_create_legacy_from_registry", return_value=([], None)) as mock_legacy:
             StageConfigFactory.create_legacy_stage_configs_from_model(
@@ -1550,8 +1586,8 @@ class TestDeployConfigLoading:
         ("filename", "max_sessions"),
         [
             ("minicpmo_4_5.yaml", 16),
-            ("minicpmo_4_5_2gpu.yaml", 4),
-            ("minicpmo_4_5_3gpu.yaml", 4),
+            ("minicpmo_4_5_2gpu.yaml", 16),
+            ("minicpmo_4_5_3gpu.yaml", 16),
             ("minicpmo_4_5_8x4090.yaml", 1),
             ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 16),
             ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 16),
@@ -1629,42 +1665,18 @@ class TestDeployConfigLoading:
         deploy_stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
         stages = merge_pipeline_deploy(resolve_pipeline_config("minicpmo_4_5"), deploy)
 
-        if platform == "npu":
-            assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
-            # The armed head ends on 1; the union keeps the codec EOS inert
-            # (the collapsed head cannot sample it).
-            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
-            # The duplex KV-window contract requires prefix caching off, and the
-            # NPU overlay states that explicitly so a stage-level value can
-            # never turn it back on for this stage.
-            assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
-            assert stages[1].yaml_engine_args["speculative_config"] == {
-                "method": "ngram",
-                "num_speculative_tokens": 7,
-                "prompt_lookup_min": 1,
-                "prompt_lookup_max": 1,
-            }
-            assert stages[1].yaml_engine_args["async_scheduling"] is False
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [8, 8, 8]
-        else:
-            # CUDA arms the same block: the runner injects the constant
-            # continue drafts, so the deploy stop id is the two-wide
-            # continue/stop marker and the head stays collapsed.
-            assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
-            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
-            # Either absent (falls back to the top-level false) or explicitly
-            # false; the regression this guards against is true.
-            assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
-            assert stages[1].yaml_engine_args["speculative_config"] == {
-                "method": "ngram",
-                "num_speculative_tokens": 15,
-                "prompt_lookup_min": 1,
-                "prompt_lookup_max": 1,
-            }
-            # K-step books its span with the synchronous runner contract.
-            assert stages[1].yaml_engine_args["async_scheduling"] is False
-            # CUDA Code2Wav uses two replicas with eight slots each.
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 8]
+        assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
+        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
+        assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
+        assert stages[1].yaml_engine_args["speculative_config"] == {
+            "method": "ngram",
+            "num_speculative_tokens": 15,
+            "prompt_lookup_min": 1,
+            "prompt_lookup_max": 1,
+        }
+        assert stages[1].yaml_engine_args["async_scheduling"] is False
+        expected_seqs = [8, 8, 8] if platform == "npu" else [16, 16, 8]
+        assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == expected_seqs
 
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
@@ -1816,6 +1828,30 @@ stages:
         assert thinker.yaml_engine_args["async_chunk"] is False
         assert thinker.yaml_extras["default_sampling_params"]["detokenize"] is True
 
+    @pytest.mark.parametrize(
+        ("deploy_name", "expected_pipeline", "expected_stage_ids"),
+        [
+            (None, "minicpmo_4_5", [0, 1, 2]),
+            ("minicpmo_4_5_duplex_thinker_only.yaml", "minicpmo_4_5_thinker_only", [0]),
+        ],
+        ids=["auto_detect", "thinker_only_deploy"],
+    )
+    def test_minicpmo_thinker_only_is_selected_only_by_deploy_config(
+        self, deploy_name, expected_pipeline, expected_stage_ids
+    ):
+        hf_config = PretrainedConfig(model_type="minicpmo", architectures=["MiniCPMO"], version="4.5")
+        deploy_path = str(Path(get_deploy_config_path(deploy_name))) if deploy_name else None
+        with patch("vllm_omni.config.config_factory.get_config", return_value=hf_config):
+            pipeline = StageConfigFactory.get_pipeline_config(
+                "openbmb/MiniCPM-o-4_5",
+                trust_remote_code=True,
+                deploy_config_path=deploy_path,
+            )
+
+        assert pipeline is not None
+        assert pipeline.model_type == expected_pipeline
+        assert [stage.stage_id for stage in pipeline.stages] == expected_stage_ids
+
     def test_load_voxtral_tts_deploy_config_schema_fields(self):
         deploy_path = Path(get_deploy_config_path("voxtral_tts.yaml"))
         deploy = load_deploy_config(deploy_path)
@@ -1831,6 +1867,14 @@ stages:
         deploy = load_deploy_config(deploy_path)
         assert deploy.stages[0].compilation_config == {"pass_config": {"fuse_allreduce_rms": False}}
         assert "compilation_config" not in deploy.stages[0].engine_extras
+
+    def test_glm_tts_stage_zero_scopes_eager_quality_contract_to_rocm(self):
+        deploy_path = Path(get_deploy_config_path("glm_tts.yaml"))
+        cuda_deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        rocm_deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
+
+        assert cuda_deploy.stages[0].enforce_eager is False
+        assert rocm_deploy.stages[0].enforce_eager is True
 
     def test_load_voxcpm2_deploy_config_preserves_engine_extras(self):
         deploy_path = get_deploy_config_path("voxcpm2.yaml")
@@ -3334,9 +3378,10 @@ class TestPlatformOverrides:
         """The only stochastic Qwen3-Omni stage must stay reproducible.
 
         Dropping this seed (as #4986 did) leaves the talker sampling codec
-        tokens unseeded at temperature 0.9, which reopened the audio-vs-text
-        nightly failures in #6090. Pin it so a cleanup cannot remove it again
-        without failing here.
+        tokens unseeded at temperature 0.9, including both codebook 0 and the
+        residual codebooks. That reopened the audio-vs-text nightly failures
+        in #6090. Pin it so a cleanup cannot remove it again without failing
+        here.
         """
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         pipeline = resolve_pipeline_config(
@@ -3380,6 +3425,23 @@ class TestPlatformOverrides:
         assert structured.stage_by_id(0).cache_config.enable_prefix_caching is False
         assert structured.stage_by_id(2).model_config.enforce_eager is True
 
+    def test_qwen3_omni_npu_uses_mrv2(self):
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+
+        npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert npu.model_runner == "v2"
+
+        legacy = merge_pipeline_deploy(pipeline, npu)
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in legacy] == [True, True, True]
+
+        structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=npu)
+        assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [True, True, True]
+
     @pytest.mark.parametrize("platform", ["cuda", "npu"])
     def test_minicpmo_4_5_caps_talker_kv_cache(self, platform):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
@@ -3419,9 +3481,13 @@ class TestPlatformOverrides:
         [
             ("qwen3_tts.yaml", "qwen3_tts", "v2", ()),
             ("moss_tts_local.yaml", "moss_tts_local", "v2", ()),
+            ("chatterbox_turbo.yaml", "chatterbox_turbo", "v2", ()),
+            ("chatterbox.yaml", "chatterbox", "v2", ()),
             ("moss_tts_nano.yaml", "moss_tts_nano", "v2", ()),
             ("moss_tts_realtime.yaml", "moss_tts_realtime", "v2", ()),
             ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
+            ("minimax_music3.yaml", "minimax_music3", "v2", ()),
+            ("minimax_music3_2gpu.yaml", "minimax_music3", "v2", ()),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
@@ -3430,9 +3496,10 @@ class TestPlatformOverrides:
     ):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        # MOSS realtime and Nano inherit V2 on every platform; other profiles
-        # retain their explicit platform overrides.
+        # MOSS realtime, MOSS Nano and Music3 inherit V2 on every platform.
         all_platforms_mrv2 = filename in (
+            "minimax_music3.yaml",
+            "minimax_music3_2gpu.yaml",
             "moss_tts_nano.yaml",
             "moss_tts_realtime.yaml",
         )
@@ -3443,8 +3510,19 @@ class TestPlatformOverrides:
             "minicpmo_4_5_duplex_h200.yaml",
         )
         # XPU has no V1 fallback: vLLM 0.34 removed Model Runner V1.
-        xpu_full_mrv2 = platform == "xpu" and filename in ("qwen3_tts.yaml", "moss_tts_nano.yaml")
-        rocm_full_mrv2 = platform == "rocm" and filename in ("qwen3_tts.yaml", "minicpmo_4_5.yaml")
+        xpu_full_mrv2 = platform == "xpu" and filename in (
+            "qwen3_tts.yaml",
+            "moss_tts_nano.yaml",
+            "chatterbox_turbo.yaml",
+            "chatterbox.yaml",
+            "minicpmo_4_5.yaml",
+        )
+        rocm_full_mrv2 = platform == "rocm" and filename in (
+            "qwen3_tts.yaml",
+            "minicpmo_4_5.yaml",
+            "chatterbox_turbo.yaml",
+            "chatterbox.yaml",
+        )
         if platform == "cuda":
             expected_runner = cuda_default_runner
         elif all_platforms_mrv2 or npu_full_mrv2 or xpu_full_mrv2 or rocm_full_mrv2:

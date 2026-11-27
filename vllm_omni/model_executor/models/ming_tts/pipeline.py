@@ -36,6 +36,9 @@ MING_TTS_PIPELINE = PipelineConfig(
                 "max_tokens": 512,
                 "detokenize": True,
             },
+            # Decode feeds flow-head embeddings and latent history that are not in
+            # the token stream; a recompute would restart the audio at frame 0.
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,
