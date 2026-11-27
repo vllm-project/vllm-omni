@@ -32,7 +32,9 @@ def _assert_complete(result, *, require_audio=False):
 @hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.advanced_model
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-@pytest.mark.parametrize("mode,reference", [("basic", False), ("context", False), ("context", True)])
+@pytest.mark.parametrize(
+    "mode,reference", [("basic", False), ("uniform", False), ("context", False), ("context", True)]
+)
 def test_window_rebuild_and_next_session(omni_server, mode, reference):
     # Two independent sessions exercise admission after final-unit execution.
     for _ in range(2):
@@ -51,7 +53,7 @@ def test_window_rebuild_and_next_session(omni_server, mode, reference):
 @hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.full_model
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-@pytest.mark.parametrize("mode,camera", [("basic", False), ("context", False), ("context", True)])
+@pytest.mark.parametrize("mode,camera", [("basic", False), ("uniform", False), ("context", False), ("context", True)])
 def test_window_continuous_input(omni_server, tmp_path, mode, camera):
     # 24 repeats cover over two minutes and many canonical KV replacements.
     frames = duplex_camera_frames(seconds=4, cache_dir=tmp_path / "camera") if camera else None
@@ -75,7 +77,7 @@ def test_window_continuous_input(omni_server, tmp_path, mode, camera):
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.advanced_model
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-@pytest.mark.parametrize("mode", ["off", "basic", "context"])
+@pytest.mark.parametrize("mode", ["off", "basic", "uniform", "context"])
 def test_window_buffered_flush(omni_server, mode):
     # Burst appends cross processor chunk boundaries and leave a final tail.
     result = asyncio.run(

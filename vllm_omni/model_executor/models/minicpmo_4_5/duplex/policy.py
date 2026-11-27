@@ -80,6 +80,11 @@ class MiniCPMO45DuplexWindowConfig:
     basic_window_low_tokens: int = 6000
     context_previous_max_tokens: int = 500
     context_max_units: int = 24
+    # ``uniform`` mode: same watermarks as ``basic``; every stride-th evicted
+    # unit is retained in place instead of dropped, bounded by the retained
+    # budget, so a few older observations stay visible at the same cost.
+    uniform_retain_stride: int = 4
+    uniform_retain_max_tokens: int = 1000
 
     @classmethod
     def from_mapping(cls, value: object) -> MiniCPMO45DuplexWindowConfig:
@@ -97,18 +102,35 @@ class MiniCPMO45DuplexWindowConfig:
                 raise ValueError(f"{name} must be greater than zero")
             return parsed
 
+        def non_negative(name: str, default: int) -> int:
+            raw = source.get(name, default)
+            try:
+                parsed = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be an integer") from exc
+            if parsed < 0:
+                raise ValueError(f"{name} must be non-negative")
+            return parsed
+
         mode = source.get("sliding_window_mode", "basic")
-        if mode not in {"off", "basic", "context"}:
-            raise ValueError("sliding_window_mode must be one of: off, basic, context")
+        if mode not in {"off", "basic", "context", "uniform"}:
+            raise ValueError("sliding_window_mode must be one of: off, basic, context, uniform")
         config = cls(
             sliding_window_mode=str(mode),
             basic_window_high_tokens=integer("basic_window_high_tokens", 8000),
             basic_window_low_tokens=integer("basic_window_low_tokens", 6000),
             context_previous_max_tokens=integer("context_previous_max_tokens", 500),
             context_max_units=integer("context_max_units", 24),
+            uniform_retain_stride=integer("uniform_retain_stride", 4),
+            # 0 is a valid retained budget: it disables retention entirely.
+            uniform_retain_max_tokens=non_negative("uniform_retain_max_tokens", 1000),
         )
         if config.basic_window_low_tokens >= config.basic_window_high_tokens:
             raise ValueError("basic_window_low_tokens must be less than basic_window_high_tokens")
+        if config.uniform_retain_stride < 1:
+            raise ValueError("uniform_retain_stride must be at least 1")
+        if config.uniform_retain_max_tokens < 0:
+            raise ValueError("uniform_retain_max_tokens must be non-negative")
         return config
 
     def as_dict(self) -> dict[str, int | str]:
@@ -118,6 +140,8 @@ class MiniCPMO45DuplexWindowConfig:
             "basic_window_low_tokens": self.basic_window_low_tokens,
             "context_previous_max_tokens": self.context_previous_max_tokens,
             "context_max_units": self.context_max_units,
+            "uniform_retain_stride": self.uniform_retain_stride,
+            "uniform_retain_max_tokens": self.uniform_retain_max_tokens,
         }
 
 
