@@ -11,7 +11,7 @@ import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel import factory, ulysses
-from vllm_omni.diffusion.distributed import a2a_permute
+from vllm_omni.diffusion.distributed import a2a_permute, ulysses_transport
 from vllm_omni.diffusion.forward_context import set_forward_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -221,7 +221,7 @@ def test_qkv_views_survive_gate_exchange_and_output_is_copied_out(monkeypatch):
     ],
 )
 def test_npu_backend_rejects_unsupported_config(monkeypatch, overrides, message):
-    values = dict(ulysses_a2a_permute=True, ulysses_degree=2, ring_degree=1, ulysses_mode="strict")
+    values = dict(ulysses_a2a_backend="copy_engine", ulysses_degree=2, ring_degree=1, ulysses_mode="strict")
     values.update(overrides)
     enforce_eager = values.pop("enforce_eager", True)
     scatter_idx = values.pop("scatter_idx", 2)
@@ -268,13 +268,14 @@ def test_direct_npu_strategy_validates_initialized_groups(
 
 def test_npu_strategy_checks_each_forward_context_mode(monkeypatch):
     monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
+    monkeypatch.setattr(ulysses_transport, "_is_nvidia_cuda", lambda: False)
     monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: None)
     group = SimpleNamespace(ulysses_group=object(), ulysses_world_size=2, ring_world_size=1, allgather_world_size=1)
     monkeypatch.setattr(factory, "get_sp_group", lambda: group)
     monkeypatch.setattr(factory, "get_sequence_parallel_world_size", lambda: 2)
     config = SimpleNamespace(
         enforce_eager=True,
-        parallel_config=SimpleNamespace(ulysses_a2a_permute=True, ulysses_degree=2, ulysses_mode="strict"),
+        parallel_config=SimpleNamespace(ulysses_a2a_backend="copy_engine", ulysses_degree=2, ulysses_mode="strict"),
     )
     with set_forward_context(omni_diffusion_config=config):
         strategy = factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
@@ -287,12 +288,15 @@ def test_npu_strategy_checks_each_forward_context_mode(monkeypatch):
 
 def test_cuda_backend_does_not_require_eager(monkeypatch):
     config = SimpleNamespace(
-        parallel_config=SimpleNamespace(ulysses_a2a_permute=True, ulysses_degree=2), enforce_eager=False
+        parallel_config=SimpleNamespace(ulysses_a2a_backend="copy_engine", ulysses_degree=2), enforce_eager=False
     )
     monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: False))
+    # The GPUs support the copy engine; this test is about the eager requirement only.
+    monkeypatch.setattr(ulysses_transport, "copy_engine_unsupported_reason", lambda *args, **kwargs: None)
     monkeypatch.setattr(factory, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(factory, "get_forward_context", lambda: SimpleNamespace(omni_diffusion_config=config))
-    monkeypatch.setattr(factory, "get_sp_group", lambda: object())
+    sp_group = SimpleNamespace(ulysses_group=SimpleNamespace(group_name="sp"), ulysses_world_size=2)
+    monkeypatch.setattr(factory, "get_sp_group", lambda: sp_group)
     monkeypatch.setattr(factory, "get_sequence_parallel_world_size", lambda: 2)
     monkeypatch.setattr(factory, "UlyssesParallelAttention", lambda **kwargs: kwargs)
     result = factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)

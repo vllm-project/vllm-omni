@@ -7,7 +7,7 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from enum import Enum
-from typing import Protocol, get_args
+from typing import Any, Protocol, get_args
 
 import torch
 import torch.nn as nn
@@ -120,8 +120,13 @@ class LoRAManager:
     Pipeline-specific module selection and packing are supplied by hooks.
     """
 
-    # Valid max allowed ranks for LoRA in vLLM
-    _VALID_MAX_RANKS: list[int] = sorted(get_args(MaxLoRARanks))
+    # vLLM types ``max_lora_rank`` as a closed Literal that stops at 512. The
+    # rank only sizes the per-layer A/B buffers, so diffusion adapters may go
+    # higher: a fused few-step adapter concatenates its sources' factors (Pika
+    # Flex Turbo is rank 768 on H3's packed QKV), and so does request stacking.
+    _EXTENDED_MAX_RANKS: tuple[int, ...] = (768, 1024)
+    # Buffer ranks an adapter's rank is rounded up to.
+    _VALID_MAX_RANKS: list[int] = sorted({*get_args(MaxLoRARanks), *_EXTENDED_MAX_RANKS})
 
     # Adapter whose weights are still uploaded while gated off. Class-level so
     # a manager built without __init__ (some tests use object.__new__) reads as
@@ -601,7 +606,13 @@ class LoRAManager:
         self._evict_for_new_adapter()
         self._registered_adapters[composed_id] = composed_model
         self._touch_adapter_info(composed_id)
-        self._replace_layers_with_lora(peft_helper)
+        try:
+            self._replace_layers_with_lora(peft_helper)
+        except Exception:
+            # As in add_adapter: a stack the layers cannot hold must not stay cached.
+            self._registered_adapters.pop(composed_id, None)
+            self._adapter_access_order.pop(composed_id, None)
+            raise
 
         self._composed_adapters[key] = composed_id
         self._composed_adapters.move_to_end(key)
@@ -838,7 +849,7 @@ class LoRAManager:
             )
             peft_helper = PEFTHelper.from_dict(normalized_peft_config)
             peft_helper.validate_legal(
-                LoRAConfig(max_lora_rank=self._get_smallest_valid_max_rank(peft_helper.r), lora_dtype=self.dtype)
+                self._lora_config(self._get_smallest_valid_max_rank(peft_helper.r), lora_dtype=self.dtype)
             )
             if peft_helper.modules_to_save:
                 raise ValueError("Merged LoRA supports A/B adapters only, without modules_to_save")
@@ -1000,22 +1011,40 @@ class LoRAManager:
                     raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
 
     def _replace_layers_with_lora(self, peft_helper: PEFTHelper) -> None:
-        self._validate_adapter_targets(peft_helper)
-        self._ensure_max_lora_rank(peft_helper.r)
+        """Wrap the layers ``peft_helper`` targets, growing the buffers to its rank first.
 
+        All or nothing: when a wrapper cannot be built (its buffers are
+        allocated at the maximum rank, and rank 768 or 1024 can run out of
+        memory partway), the wrappers this call installed are removed and the
+        previous rank is restored. Otherwise the next adapter, whatever its
+        rank, would allocate the remaining layers at the rank that just failed.
+        """
+        self._validate_adapter_targets(peft_helper)
+        previous_rank = self._max_lora_rank
+        installed: list[tuple[str, nn.Module, str]] = []
+        try:
+            self._ensure_max_lora_rank(peft_helper.r)
+            self._install_lora_layers(peft_helper, installed)
+        except Exception:
+            for full_module_name, component, module_name in reversed(installed):
+                lora_layer = self._lora_modules.pop(full_module_name)
+                if self.lora_application == "runtime":
+                    replace_submodule(component, module_name, lora_layer.base_layer)
+            if self._max_lora_rank != previous_rank:
+                self._restore_max_lora_rank(previous_rank)
+            elif installed:
+                invalidate_denoise_graphs("LoRA layer installation failed")
+            raise
+
+    def _install_lora_layers(self, peft_helper: PEFTHelper, installed: list[tuple[str, nn.Module, str]]) -> None:
+        """Wrap every target layer not wrapped yet, recording each new wrapper in ``installed``."""
         _matches_target, is_filtered = build_target_module_matcher(
             getattr(peft_helper, "target_modules", None),
             allow_none=self.lora_application != "merged",
         )
 
         # dummy lora config
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
+        lora_config = self._buffer_lora_config()
 
         for component_name, component in self._iter_lora_components():
             # Collect replacements first to avoid mutating the module tree
@@ -1108,6 +1137,7 @@ class LoRAManager:
                     if self.lora_application == "runtime":
                         replace_submodule(component, module_name, lora_layer)
                     self._lora_modules[full_module_name] = lora_layer
+                    installed.append((full_module_name, component, module_name))
                     logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
 
     def _ensure_moe_lora_context(self) -> None:
@@ -1133,13 +1163,7 @@ class LoRAManager:
         """Replace every MoE runner so LoRA-capable kernels get a mapping."""
         from vllm.model_executor.layers.fused_moe import MoERunner
 
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
+        lora_config = self._buffer_lora_config()
         for component_name, component in self._iter_lora_components():
             pending: list[tuple[str, str, nn.Module]] = []
             runner_names: set[str] = set()
@@ -1172,6 +1196,30 @@ class LoRAManager:
                     self._lora_modules[full_module_name] = lora_layer
                     logger.debug("Replaced MoE runner: %s -> %s", full_module_name, type(lora_layer).__name__)
 
+    @staticmethod
+    def _lora_config(max_lora_rank: int, **fields: Any) -> LoRAConfig:
+        """A vLLM ``LoRAConfig`` whose rank may be one of ``_EXTENDED_MAX_RANKS``.
+
+        The config validates its rank against vLLM's Literal on construction
+        only, so an extended rank is assigned afterwards; every consumer reads
+        it as a plain buffer size.
+        """
+        vllm_max_rank = max(get_args(MaxLoRARanks))
+        config = LoRAConfig(max_lora_rank=min(max_lora_rank, vllm_max_rank), **fields)
+        if max_lora_rank > vllm_max_rank:
+            config.max_lora_rank = max_lora_rank
+        return config
+
+    def _buffer_lora_config(self) -> LoRAConfig:
+        """The config per-layer LoRA buffers are allocated from: one slot at the current maximum rank."""
+        return self._lora_config(
+            self._max_lora_rank,
+            max_loras=1,
+            max_cpu_loras=self.max_cached_adapters,
+            lora_dtype=self.dtype,
+            fully_sharded_loras=False,
+        )
+
     def _ensure_max_lora_rank(self, min_rank: int) -> None:
         """Ensure LoRA buffers can accommodate adapters up to `min_rank`.
 
@@ -1185,24 +1233,24 @@ class LoRAManager:
         valid_max_rank = self._get_smallest_valid_max_rank(min_rank)
 
         logger.info("Increasing max LoRA rank: %d -> %d", self._max_lora_rank, valid_max_rank)
+        previous_rank = self._max_lora_rank
         self._max_lora_rank = valid_max_rank
         self._moe_punica_wrapper = None
 
         if not self._lora_modules:
             return
 
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
-
         # Recreate per-layer buffers with the new maximum rank. The previous
         # upload is gone, so nothing may be re-armed afterwards.
-        for lora_layer in self._lora_modules.values():
-            lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+        try:
+            lora_config = self._buffer_lora_config()
+            for lora_layer in self._lora_modules.values():
+                lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+        except Exception:
+            # A growth that fails partway (an allocation at rank 768 or 1024 can)
+            # leaves layers at two ranks.
+            self._restore_max_lora_rank(previous_rank)
+            raise
         self._suspended_adapter_id = None
         invalidate_denoise_graphs("LoRA buffers reallocated")
 
@@ -1214,6 +1262,22 @@ class LoRAManager:
             self._activate_adapter(active_id, active_scale)
         else:
             self._publish_moe_lora_context()
+
+    def _restore_max_lora_rank(self, previous_rank: int) -> None:
+        """Put every wrapped layer back at ``previous_rank`` with nothing uploaded.
+
+        A retry then grows again from a consistent state instead of binding
+        into buffers of another rank.
+        """
+        self._max_lora_rank = previous_rank
+        self._moe_punica_wrapper = None
+        self._suspended_adapter_id = None
+        self._active_adapter_id = None
+        if previous_rank > 0:
+            lora_config = self._buffer_lora_config()
+            for lora_layer in self._lora_modules.values():
+                lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+        invalidate_denoise_graphs("LoRA buffer growth failed")
 
     @classmethod
     def _get_smallest_valid_max_rank(cls, min_rank: int) -> int:
@@ -1674,13 +1738,7 @@ class LoRAManager:
         if max_tokens is None:
             raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
         # GPU Punica requires LoRAConfig; also pass it to NPU.
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
+        lora_config = self._buffer_lora_config()
         punica = get_punica_wrapper(max_tokens, max_batches=1, device=self.device, lora_config=lora_config)
         mapping, lora_index_to_id = self._moe_token_lora_mapping()
         punica.update_metadata(mapping, lora_index_to_id, 1, 0)
@@ -1852,7 +1910,14 @@ class LoRAManager:
 
         self._registered_adapters[adapter_id] = lora_model
 
-        self._replace_layers_with_lora(peft_helper)
+        try:
+            self._replace_layers_with_lora(peft_helper)
+        except Exception:
+            # An adapter the buffers cannot hold must not stay cached: a retry
+            # would skip loading and fail while binding instead.
+            self._registered_adapters.pop(adapter_id, None)
+            self._adapter_access_order.pop(adapter_id, None)
+            raise
 
         logger.debug(
             "Adapter %d added, cache size: %d/%d", adapter_id, len(self._registered_adapters), self.max_cached_adapters

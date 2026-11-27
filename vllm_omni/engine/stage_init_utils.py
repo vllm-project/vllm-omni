@@ -1228,6 +1228,8 @@ def _project_omni_stage_engine_args(
     engine_args["model_arch"] = copy.deepcopy(stage_config.model_config.model_arch)
     # Preserve the legacy adapter key even when the topology leaves it unset.
     engine_args["scheduling_metadata_adapter"] = stage_config.model_config.scheduling_metadata_adapter
+    if stage_config.model_config.scheduler_window_policy is not None:
+        engine_args["scheduler_window_policy"] = stage_config.model_config.scheduler_window_policy
     _maybe_set_qwen3_omni_moe_backend(
         engine_args,
         moe_backend_is_explicit="moe_backend" in getattr(stage_config.model_config, "_omni_explicit_fields", ()),
@@ -2020,7 +2022,11 @@ def release_device_locks(lock_fds: list[int]) -> None:
             pass
 
 
-def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:
+def load_omni_transfer_config_for_model(
+    model: str,
+    config_path: str | None,
+    deployment_scope: str | None = None,
+) -> Any:
     """Load omni transfer config from the resolver-selected deploy config.
 
     Resolves ``base_config`` inheritance (CI overlay → base deploy YAML) so
@@ -2035,7 +2041,7 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
         from vllm_omni.config.stage_config import resolve_deploy_yaml
 
         resolved_dict = resolve_deploy_yaml(config_path)
-        return load_omni_transfer_config(config_dict=resolved_dict)
+        return load_omni_transfer_config(config_dict=resolved_dict, deployment_scope=deployment_scope)
     except Exception as e:
         logger.warning("[stage_init] Failed to load transfer config: %s", e)
         return None

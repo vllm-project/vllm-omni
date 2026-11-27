@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni as omni
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -390,7 +391,7 @@ def test_mrv2_staged_duplex_prefill_preserves_explicit_reply(mocker, final, expl
     model = _model(mocker, session="duplex")
     embeds = torch.randn(1, 4)
     model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(
-        sessions={"s1": object()},
+        sessions={"s1": _MiniCPMO45Stage0SessionState(session_id="s1")},
         take_staged_prefill=lambda *_: {"success": True, "inputs_embeds": embeds, "input_token_ids": [1]},
         stage_padding_token_id=lambda: 0,
     )
