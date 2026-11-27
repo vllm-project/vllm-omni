@@ -1,5 +1,9 @@
 # Higgs-audio v2 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
 #
+# vLLM 0.34 selects Model Runner V2 by default. The talker delegates LM token
+# sampling to the native staged sampler, so the full request surface —
+# penalties included — keeps working.
+#
 # Phase-1 scope is plain text -> 24 kHz speech only; voice cloning, multi-speaker,
 # ChatML rich messages, and music/sound-event prompts are rejected by the
 # request validator with explicit 4xx (see

@@ -37,6 +37,11 @@ SERVER_ARGS = ["--trust-remote-code", "--disable-log-stats"]
 # test driver; the engine subprocesses inherit through env_dict).
 SERVER_ENV = {"VLLM_USE_DEEP_GEMM": "0", "VLLM_MOE_USE_DEEP_GEMM": "0"}
 
+# The default profile runs both stages on model_runner v2 and has no
+# platforms section, so this one param covers the only supported runner.
+# Under v2 the talker delegates LM token sampling to the native staged
+# sampler, so penalties and logprobs stay in the request surface — unlike
+# Higgs v3, whose owned sampler narrows it.
 TEST_PARAMS = [
     pytest.param(
         OmniServerParams(
@@ -46,7 +51,7 @@ TEST_PARAMS = [
             env_dict=SERVER_ENV,
         ),
         id="higgs_audio_v2_plain_text",
-    )
+    ),
 ]
 
 DEFAULT_SPEECH_TIMEOUT_S = 180.0
@@ -78,6 +83,71 @@ class TestHiggsAudioV2OnlineHappyPath:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+            }
+        )
+
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_pcm_streaming_client_abort(self, omni_server, online_client) -> None:
+        """A client aborting mid-stream must not wedge the server.
+
+        Exiting the streaming context mid-iteration closes the connection
+        (client-side cancel). Guards request cleanup on the MRV2 sampling
+        hook. A follow-up request proves the server survived.
+        """
+        long_text = (
+            "This sentence is intentionally long so the stream has plenty of chunks to outlive the reader. " * 20
+        )
+        with online_client.client.audio.speech.with_streaming_response.create(
+            model=omni_server.model,
+            input=long_text,
+            voice=None,
+            response_format="pcm",
+            extra_body={"stream_format": "audio"},
+            timeout=DEFAULT_SPEECH_TIMEOUT_S,
+        ) as resp:
+            chunks = resp.iter_bytes()
+            first = next(chunks)
+            assert first, "stream produced no audio before abort"
+        online_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": "Server still healthy after abort.",
+                "stream": False,
+                "response_format": "wav",
+                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                "min_audio_bytes": _MIN_AUDIO_BYTES,
+                # This follow-up only checks that abort cleanup left the
+                # server usable; do not make it depend on an exact transcript.
+                "transcript_expected_text": None,
+            }
+        )
+
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_long_input_text(self, omni_server, online_client) -> None:
+        """A long input must complete with audio.
+
+        Stage 0 caps generation at 1024 audio frames (~41 s at 25 fps) under
+        a 4096-token context, and 40 repeats of the pair take several minutes
+        of speech, so the input cannot be synthesized in full. The transcript
+        check is therefore off for this request. The audio length is not
+        asserted either: the talker samples the audio codes, including the
+        end-of-stream token, on the worker's global RNG, so where generation
+        stops varies between runs.
+        """
+        long_input = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. " * 40
+        online_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": long_input,
+                "stream": False,
+                "response_format": "wav",
+                "timeout": 300.0,
+                # Pin the generation cap below Stage-0's max_tokens (1024).
+                "max_new_tokens": 1000,
+                "transcript_expected_text": None,
+                # Presence only: a real-weight run returned 3,884 bytes, so a
+                # duration-based floor does not hold.
+                "min_audio_bytes": 1_000,
             }
         )
 
