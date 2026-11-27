@@ -28,13 +28,10 @@ class Device:
     type: str = "npu"
 
 
-def test_non_npu_keeps_original_modules():
-    model = nn.Module()
-    model.encoder = nn.Conv3d(4, 8, 1)
-    model.quant_conv = nn.Conv3d(8, 8, 1)
-    model.decoder = nn.Conv3d(8, 4, 1)
+def test_non_npu_keeps_original_modules(monkeypatch):
+    model = _checkpoint_model(monkeypatch)
     assert ops.install_npu_image_conv(model, device=torch.device("cpu")) == 0
-    assert not hasattr(model.encoder, "_omni_image_conv_forward")
+    assert not hasattr(model.encoder.conv, "_omni_image_conv_forward")
 
 
 def test_scope_resets_after_exception():
@@ -48,10 +45,6 @@ def test_scope_resets_after_exception():
         assert ops._IMAGE_ENCODE.get() is outer
         raise ValueError("expected")
     assert ops._IMAGE_ENCODE.get() is None
-
-
-def test_unsupported_conv_contract():
-    assert not ops._supported_layout(nn.Conv3d(4, 8, 3, padding=1))
 
 
 def _checkpoint_model(monkeypatch):
@@ -77,10 +70,10 @@ def _checkpoint_model(monkeypatch):
 def test_checkpoint_type_identity_rejects_same_name_subclass(monkeypatch):
     model = _checkpoint_model(monkeypatch)
     impostor = type("SpatialParallelConv3d", (type(model.encoder.conv),), {})
-    model.quant_conv = impostor()
+    model.encoder.impostor = impostor()
     assert ops.install_npu_image_conv(model, device=Device()) == 1
     assert hasattr(model.encoder.conv, "_omni_image_conv_forward")
-    assert not hasattr(model.quant_conv, "_omni_image_conv_forward")
+    assert not hasattr(model.encoder.impostor, "_omni_image_conv_forward")
 
 
 @pytest.mark.parametrize("attribute", ["causal", "pad_mode_t", "pad_mode"])
@@ -93,36 +86,30 @@ def test_missing_checkpoint_attribute_keeps_original_forward(monkeypatch, attrib
     assert conv.forward == original
 
 
-@pytest.mark.parametrize("padding_mode", ["reflect", "replicate", "circular"])
-def test_nonzero_padding_mode_keeps_original_forward(monkeypatch, padding_mode):
-    model = nn.Module()
-    model.encoder = nn.Conv3d(4, 8, 1, padding_mode=padding_mode).eval()
-    original = model.encoder.forward
-    assert ops.install_npu_image_conv(model, device=Device()) == 0
-    assert model.encoder.forward == original
-
-
 def test_installer_is_scoped_and_preserves_overrides(monkeypatch):
-    model = nn.Module()
-    model.encoder = nn.Sequential(nn.Conv3d(4, 8, 1), nn.Conv3d(8, 8, 1)).eval()
+    model = _checkpoint_model(monkeypatch).eval()
+    model.encoder.overridden = type(model.encoder.conv)()
+    model.encoder.ordinary = nn.Conv3d(4, 8, 1)
     model.quant_conv = nn.Conv3d(8, 8, 1).eval()
-    model.decoder = nn.Conv3d(8, 4, 1).eval()
+    model.decoder = type(model.encoder.conv)().eval()
 
     def custom(x):
         return x
 
-    model.encoder[1].forward = custom
+    model.encoder.overridden.forward = custom
     device = Device()
-    assert ops.install_npu_image_conv(model, device=device) == 2
-    original = model.encoder[0]._omni_image_conv_forward
-    assert ops.install_npu_image_conv(model, device=device) == 2
-    assert model.encoder[0]._omni_image_conv_forward is original
-    assert model.encoder[1].forward is custom
+    assert ops.install_npu_image_conv(model, device=device) == 1
+    original = model.encoder.conv._omni_image_conv_forward
+    assert ops.install_npu_image_conv(model, device=device) == 1
+    assert model.encoder.conv._omni_image_conv_forward is original
+    assert model.encoder.overridden.forward is custom
+    assert "forward" not in model.encoder.ordinary.__dict__
+    assert "forward" not in model.quant_conv.__dict__
     assert "forward" not in model.decoder.__dict__
     x = torch.randn(1, 4, 2, 3, 5)
     # CPU and multi-frame inputs retain the original forward even in scope.
     with torch.inference_mode(), ops.image_encode_context():
-        assert torch.equal(model.encoder[0](x), original(x))
+        assert torch.equal(model.encoder.conv(x), original(x))
 
 
 def _checkpoint_causal_conv(conv: nn.Conv3d, x: torch.Tensor) -> torch.Tensor:

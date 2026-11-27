@@ -20,8 +20,6 @@ _IMAGE_ENCODE: ContextVar[dict[int, tuple[int | None, torch.Tensor]] | None] = C
 
 
 def _supported_layout(module: nn.Conv3d) -> bool:
-    if type(module) is nn.Conv3d:
-        return module.kernel_size[0] == 1 and module.padding == (0, 0, 0) and module.padding_mode == "zeros"
     return (
         getattr(module, "causal", False)
         and getattr(module, "pad_mode_t", None) == "constant"
@@ -63,13 +61,6 @@ def _eligible(module: nn.Conv3d, x: torch.Tensor) -> bool:
     )
 
 
-def _encoder_modules(model: nn.Module) -> Iterator[nn.Module]:
-    for part in ("encoder", "quant_conv"):
-        root = getattr(model, part, None)
-        if isinstance(root, nn.Module):
-            yield from root.modules()
-
-
 def _weight(module: nn.Conv3d) -> torch.Tensor:
     source = module.weight
     cache = _IMAGE_ENCODE.get()
@@ -87,7 +78,7 @@ def _weight(module: nn.Conv3d) -> torch.Tensor:
         return cached[1]
     # The checkpoint keeps its parameters fixed throughout encode_images.
     # Repack on stream changes so the copy and convolution share a stream.
-    packed = source[:, :, -1, :, :].contiguous().unsqueeze(2)
+    packed = source[:, :, -1].contiguous().unsqueeze(2)
     cache[module_id] = (stream, packed)
     return packed
 
@@ -106,20 +97,24 @@ def _forward(self: nn.Conv3d, x: torch.Tensor) -> torch.Tensor:
 
 
 def install_npu_image_conv(model: nn.Module, *, device: torch.device) -> int:
-    """Install once on supported NPU encoder/quant_conv modules."""
+    """Install once on supported checkpoint encoder convolutions."""
     if device.type != "npu":
         return 0
     encoder = getattr(model, "encoder", None)
-    namespace = vars(sys.modules[type(encoder).__module__]) if encoder is not None else {}
+    if not isinstance(encoder, nn.Module):
+        return 0
+    namespace = vars(sys.modules[type(encoder).__module__])
     # Bind the loaded H3 CNN's concrete convolution class, not an arbitrary
     # subclass with the same name. This adapter follows the checkpoint ABI:
     # causal constant temporal padding and ordinary non-parallel Conv3D.
-    conv_type = namespace.get("SpatialParallelConv3d") if namespace.get("EncoderFCN3D") is type(encoder) else None
+    if namespace.get("EncoderFCN3D") is not type(encoder):
+        return 0
+    conv_type = namespace.get("SpatialParallelConv3d")
     if not isinstance(conv_type, type) or not issubclass(conv_type, nn.Conv3d):
-        conv_type = None
+        return 0
     installed = 0
-    for module in _encoder_modules(model):
-        if type(module) not in (nn.Conv3d, conv_type) or not _supported_layout(module):
+    for module in encoder.modules():
+        if type(module) is not conv_type or not _supported_layout(module):
             continue
         if not hasattr(module, "_omni_image_conv_forward"):
             if "forward" in module.__dict__:
