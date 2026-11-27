@@ -302,6 +302,21 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 f"Diffusion KV metadata request mismatch: expected={request_id!r}, got={metadata.request_id!r}"
             )
 
+    def _compile_pipeline_transformers(self) -> None:
+        """Compile the pipeline's transformer attributes when it has no ``setup_compile()`` hook."""
+        transformer_attrs = getattr(self.pipeline, "_dit_modules", None)
+        if not transformer_attrs:
+            transformer_attrs = ("transformer", "transformer_2")
+        if all(getattr(self.pipeline, attr_name, None) is None for attr_name in transformer_attrs):
+            logger.debug(
+                "Model runner: %s has no setup_compile(), _dit_modules or transformer attribute; "
+                "torch.compile is not applied.",
+                type(self.pipeline).__name__,
+            )
+            return
+        for attr_name in transformer_attrs:
+            self._compile_transformer(attr_name)
+
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
         model = getattr(self.pipeline, attr_name, None)
@@ -485,11 +500,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             exc,
                         )
                 else:
-                    transformer_attrs = getattr(self.pipeline, "_dit_modules", None)
-                    if not transformer_attrs:
-                        transformer_attrs = ("transformer", "transformer_2")
-                    for attr_name in transformer_attrs:
-                        self._compile_transformer(attr_name)
+                    self._compile_pipeline_transformers()
             else:
                 logger.warning(
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
@@ -942,7 +953,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         # better perf. HSDP2's fully_shard pre-forward hooks need tensor version
         # counters, which inference tensors do not track.
         use_hsdp = od_config.parallel_config.use_hsdp
-        use_distributed_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+        use_distributed_offload = resolve_offload_strategy(self.od_config) in (
+            OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            OffloadStrategy.SUBMODULE,
+        )
         grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
         with grad_context:
             for req in reqs:

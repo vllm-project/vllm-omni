@@ -39,28 +39,37 @@ logger = init_logger(__name__)
 # First-request compiles (Triton mRoPE, vision pos-embed, Talker torch.compile,
 # Code2Wav) landed ~30–40 s after the socket was already "ready" on a cold
 # process, then the short reply still has to be spoken. Hold clients past that.
+# The probe sends one commit and then only receives, so the throwaway session's
+# idle timeout must cover this same wait or the server drops the socket first.
 DUPLEX_WARMUP_CLIENT_WAIT_S = 180
 DUPLEX_WARMUP_AUDIO_WAIT_S = 150
 
-#: Outcomes of the warmup's audio wait. They stay distinct: a timeout is not a
-#: listen, and neither of them is a first audio delta.
+#: Outcomes of the warmup's audio/text wait. They stay distinct: a timeout is not a
+#: listen, and neither of them is a first audio delta or completed text response.
 WARMUP_OUTCOME_AUDIO = "audio"
+WARMUP_OUTCOME_TEXT = "text"
 WARMUP_OUTCOME_LISTEN = "listen"
 WARMUP_OUTCOME_TIMEOUT = "timeout"
 
 
-def classify_warmup_outcome(event_type: object, *, kind: str | None) -> str | None:
+def classify_warmup_outcome(
+    event_type: object, *, kind: str | None, text_only: bool = False, response: object = None
+) -> str | None:
     """Map a wire event to a warmup outcome, or ``None`` to keep waiting.
 
-    First audio always ends the wait. ``response.listen`` ends it only for the
-    silent-frames probe: that model refused the unit because it heard no turn,
-    and there is then no audio path to warm. The video probe forces a spoken
-    reply on purpose (it needs speech to warm Talker/Code2Wav), so a listen
-    there is not success and the wait continues.
+    First audio ends the wait outside text-only mode; text-only mode waits for
+    a completed ``response.done`` with text, since a listen can precede that
+    reply. Otherwise ``response.listen`` ends it only for the silent-frames
+    probe: that model refused the unit because it heard no turn, and there is
+    then no audio path to warm. The video probe forces a spoken reply on
+    purpose (it needs speech to warm Talker/Code2Wav), so a listen there is not
+    success and the wait continues.
     """
-    if event_type == "response.output_audio.delta":
+    if text_only and event_type == "response.done" and _completed_text_response(response):
+        return WARMUP_OUTCOME_TEXT
+    if event_type == "response.output_audio.delta" and not text_only:
         return WARMUP_OUTCOME_AUDIO
-    if event_type == "response.listen" and kind != "video_turn":
+    if event_type == "response.listen" and kind != "video_turn" and not text_only:
         return WARMUP_OUTCOME_LISTEN
     return None
 
@@ -70,8 +79,9 @@ async def wait_for_warmup_outcome(
     timeout_s: float,
     *,
     kind: str | None,
+    text_only: bool = False,
 ) -> str:
-    """Wait for the warmup to finish and report audio, listen or timeout."""
+    """Wait for the warmup to finish and report audio, text, listen or timeout."""
     deadline = time.monotonic() + timeout_s
     while True:
         remaining = deadline - time.monotonic()
@@ -81,7 +91,9 @@ async def wait_for_warmup_outcome(
             event = await asyncio.wait_for(recv(), timeout=remaining)
         except (TimeoutError, asyncio.TimeoutError):
             return WARMUP_OUTCOME_TIMEOUT
-        outcome = classify_warmup_outcome(event.get("type"), kind=kind)
+        outcome = classify_warmup_outcome(
+            event.get("type"), kind=kind, text_only=text_only, response=event.get("response")
+        )
         if outcome is not None:
             return outcome
 
@@ -115,6 +127,15 @@ class _ProcessWarmupProfile:
     def silence_unit_payload(self) -> dict[str, object]:
         return dict(self.engine.metadata.warmup_audio)
 
+    def startup_warmup_turn(self) -> dict[str, object] | None:
+        """The spoken clip captured in the worker, or None when the plugin has none.
+
+        The API process never loads the model plugin, so this is the same
+        metadata channel ``warmup_audio`` already uses.
+        """
+        turn = getattr(self.engine.metadata, "warmup_turn", None)
+        return dict(turn) if isinstance(turn, dict) and turn else None
+
 
 def lookup_duplex_plugin(engine_client: object) -> object | None:
     from vllm_omni.engine.duplex.process_engine import ProcessDuplexEngineClient
@@ -126,6 +147,38 @@ def lookup_duplex_plugin(engine_client: object) -> object | None:
     if plugin is None:
         plugin = getattr(engine_client, "plugin", None)
     return plugin
+
+
+def _warmup_modalities(engine_client: object) -> list[str]:
+    capabilities = getattr(engine_client, "duplex_capabilities", None)
+    return list(getattr(capabilities, "default_output_modalities", ("audio", "text")))
+
+
+def _warmup_timeout_reason(kind: str | None, text_only: bool) -> str:
+    """What a timed-out warmup waited for; only the silent-frames audio probe ends on a listen."""
+    if text_only:
+        return "no completed text reply"
+    if kind == "video_turn":
+        return "no audio"
+    return "neither audio nor a listen event"
+
+
+def _completed_text_response(response: object) -> bool:
+    """A terminal response includes text only after the projector completes it."""
+    if not isinstance(response, dict) or response.get("status") != "completed":
+        return False
+    output = response.get("output")
+    if not isinstance(output, list):
+        return False
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if isinstance(content, list) and any(
+            isinstance(part, dict) and part.get("type") == "output_text" and bool(part.get("text")) for part in content
+        ):
+            return True
+    return False
 
 
 def startup_warmup_kind(plugin: object | None, warmup_frames: int) -> str | None:
@@ -175,6 +228,45 @@ def _warmup_jpeg_b64() -> str:
 
 _DEFAULT_SILENCE_SAMPLES = 16000
 _DEFAULT_SILENCE_SAMPLE_RATE_HZ = 16000
+
+
+def video_warmup_turn(plugin: object | None) -> dict[str, object]:
+    """The one append a video-required warmup sends.
+
+    ``audio`` is base64. A plugin ``startup_warmup_turn`` replaces the shared
+    tone when it returns audio and a format; anything incomplete keeps the tone.
+    The shared frame and instructions fill keys the plugin leaves out.
+    """
+    factory = getattr(plugin, "startup_warmup_turn", None)
+    candidate = factory() if callable(factory) else None
+    if (
+        isinstance(candidate, dict)
+        and isinstance(candidate.get("audio"), str)
+        and candidate["audio"]
+        and isinstance(candidate.get("format"), str)
+        and candidate["format"]
+    ):
+        rate = candidate.get("sample_rate_hz", _WARMUP_SAMPLE_RATE_HZ)
+        frames = candidate.get("video_frames")
+        instructions = candidate.get("instructions")
+        return {
+            "audio": candidate["audio"],
+            "format": candidate["format"],
+            "sample_rate_hz": int(rate) if isinstance(rate, int) else _WARMUP_SAMPLE_RATE_HZ,
+            "is_speech": candidate.get("is_speech", True) is not False,
+            "video_frames": frames if isinstance(frames, list) and frames else [_warmup_jpeg_b64()],
+            "instructions": (
+                instructions if isinstance(instructions, str) and instructions.strip() else _WARMUP_INSTRUCTIONS
+            ),
+        }
+    return {
+        "audio": _short_pcm_f32le_b64(),
+        "format": "pcm_f32le",
+        "sample_rate_hz": _WARMUP_SAMPLE_RATE_HZ,
+        "is_speech": True,
+        "video_frames": [_warmup_jpeg_b64()],
+        "instructions": _WARMUP_INSTRUCTIONS,
+    }
 
 
 def warmup_silence_unit(plugin: object | None) -> dict[str, object]:
@@ -242,12 +334,12 @@ async def _warmup_local_duplex(engine_client: DuplexOmni, plugin: object | None,
         bool(capabilities(max_sessions=1).supports_core_resumable_request) if callable(capabilities) else True
     )
     session: dict[str, object] = {
-        "modalities": ["audio", "text"],
+        "modalities": _warmup_modalities(engine_client),
         "input_audio_format": unit["format"],
         "output_audio_format": "pcm16",
         "sample_rate_hz": unit["sample_rate_hz"],
         "audio": {"input": {"sample_rate_hz": unit["sample_rate_hz"]}},
-        "idle_timeout_s": 60,
+        "idle_timeout_s": DUPLEX_WARMUP_CLIENT_WAIT_S,
         "turn_detection": None,
         "extra_body": {"auto_response": native_append},
     }
@@ -257,38 +349,49 @@ async def _warmup_local_duplex(engine_client: DuplexOmni, plugin: object | None,
         "sample_rate_hz": int(cast(int, unit["sample_rate_hz"])),
     }
     if kind == "video_turn":
+        turn = video_warmup_turn(plugin)
+        sample_rate_hz = int(cast(int, turn["sample_rate_hz"]))
         session.update(
-            input_audio_format="pcm_f32le",
-            sample_rate_hz=_WARMUP_SAMPLE_RATE_HZ,
-            audio={"input": {"sample_rate_hz": _WARMUP_SAMPLE_RATE_HZ}},
-            instructions=_WARMUP_INSTRUCTIONS,
+            input_audio_format=str(turn["format"]),
+            sample_rate_hz=sample_rate_hz,
+            audio={"input": {"sample_rate_hz": sample_rate_hz}},
+            instructions=str(turn["instructions"]),
             extra_body={"auto_response": True},
         )
-        audio = base64.b64decode(_short_pcm_f32le_b64())
+        audio = base64.b64decode(str(turn["audio"]))
         append_kwargs = {
-            "format": "pcm_f32le",
-            "sample_rate_hz": _WARMUP_SAMPLE_RATE_HZ,
-            "is_speech": True,
-            "video_frames": [_warmup_jpeg_b64()],
+            "format": str(turn["format"]),
+            "sample_rate_hz": sample_rate_hz,
+            "is_speech": bool(turn["is_speech"]),
+            "video_frames": cast(list[str], turn["video_frames"]),
         }
+    text_only = "audio" not in _warmup_modalities(engine_client)
+    if text_only:
+        session["initial_user_text"] = "Reply briefly with ready."
+        warmup_frames = max(warmup_frames, engine_client.duplex_capabilities.text_turn_priming_units, 1)
     for group_number in range(group_count):
         handle = await engine_client.open_session(session, timeout=30)
         saw_audio = asyncio.Event()
+        saw_text = asyncio.Event()
         saw_listen = asyncio.Event()
 
         async def drain_events() -> None:
             async for event in handle.events():
                 if event.type == "error":
                     raise RuntimeError(f"Duplex local warmup rejected: {event}")
-                if event.type == "response.output_audio.delta":
+                outcome = classify_warmup_outcome(
+                    event.type, kind=kind, text_only=text_only, response=getattr(event, "response", None)
+                )
+                if outcome == WARMUP_OUTCOME_TEXT:
+                    saw_text.set()
+                elif outcome == WARMUP_OUTCOME_AUDIO:
                     saw_audio.set()
-                elif event.type == "response.listen" and kind != "video_turn":
-                    # Nothing to warm: the model decided the unit was not a turn.
-                    # The video probe needs real audio, so a listen is not success.
+                elif outcome == WARMUP_OUTCOME_LISTEN:
                     saw_listen.set()
 
         pump = asyncio.create_task(drain_events())
         audio_ready = asyncio.create_task(saw_audio.wait())
+        text_ready = asyncio.create_task(saw_text.wait())
         listen_ready = asyncio.create_task(saw_listen.wait())
         try:
             for _ in range(1 if kind == "video_turn" else warmup_frames):
@@ -302,7 +405,7 @@ async def _warmup_local_duplex(engine_client: DuplexOmni, plugin: object | None,
                     handle.commit(final=True, create_response=True if kind == "video_turn" else None), timeout=30
                 )
             done, _ = await asyncio.wait(
-                (pump, audio_ready, listen_ready),
+                (pump, audio_ready, text_ready, listen_ready),
                 timeout=DUPLEX_WARMUP_AUDIO_WAIT_S,
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -310,6 +413,8 @@ async def _warmup_local_duplex(engine_client: DuplexOmni, plugin: object | None,
                 pump.result()
             if saw_audio.is_set():
                 outcome = WARMUP_OUTCOME_AUDIO
+            elif saw_text.is_set():
+                outcome = WARMUP_OUTCOME_TEXT
             elif saw_listen.is_set():
                 outcome = WARMUP_OUTCOME_LISTEN
             else:
@@ -322,16 +427,21 @@ async def _warmup_local_duplex(engine_client: DuplexOmni, plugin: object | None,
                 )
             elif outcome == WARMUP_OUTCOME_TIMEOUT:
                 logger.warning(
-                    "Duplex local warmup group %d/%d: neither audio nor a listen event within %.0f s; nothing warmed.",
+                    "Duplex local warmup group %d/%d: %s within %.0f s; nothing warmed.",
                     group_number + 1,
                     group_count,
+                    _warmup_timeout_reason(kind, text_only),
                     DUPLEX_WARMUP_AUDIO_WAIT_S,
                 )
             else:
                 logger.info(
-                    "Duplex local warmup group %d/%d: first audio received.",
+                    "Duplex local warmup group %d/%d: %s.",
                     group_number + 1,
                     group_count,
+                    {
+                        WARMUP_OUTCOME_AUDIO: "first audio received",
+                        WARMUP_OUTCOME_TEXT: "text response completed",
+                    }[outcome],
                 )
         finally:
             try:
@@ -339,8 +449,9 @@ async def _warmup_local_duplex(engine_client: DuplexOmni, plugin: object | None,
             finally:
                 pump.cancel()
                 audio_ready.cancel()
+                text_ready.cancel()
                 listen_ready.cancel()
-                await asyncio.gather(pump, audio_ready, listen_ready, return_exceptions=True)
+                await asyncio.gather(pump, audio_ready, text_ready, listen_ready, return_exceptions=True)
 
 
 async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
@@ -420,10 +531,10 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
         session: dict[str, object] = {
             "session_id": f"warmup-{uuid.uuid4().hex[:8]}",
             "model": model_name,
-            "modalities": ["audio", "text"],
+            "modalities": _warmup_modalities(engine_client),
             "input_audio_format": "pcm_f32le",
             "output_audio_format": "pcm16",
-            "idle_timeout_s": 60,
+            "idle_timeout_s": DUPLEX_WARMUP_CLIENT_WAIT_S,
             "turn_detection": None,
             "extra_body": {"auto_response": native_append},
         }
@@ -431,13 +542,18 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
             session["input_audio_format"] = unit["format"]
             session["sample_rate_hz"] = unit["sample_rate_hz"]
             session["audio"] = {"input": {"sample_rate_hz": unit["sample_rate_hz"]}}
-        if kind == "video_turn":
-            # The default AURA prompt answers with <|silent|> unless the user
-            # asked for something. This session is thrown away; force one short
-            # spoken reply so Talker and Code2Wav compile too. auto_response
-            # matches the web demo: a commit must actually start a turn.
-            session["instructions"] = _WARMUP_INSTRUCTIONS
+        spoken_turn = video_warmup_turn(plugin) if kind == "video_turn" else None
+        if spoken_turn is not None:
+            # auto_response matches the web demo: a commit must actually start a turn.
+            session["input_audio_format"] = spoken_turn["format"]
+            session["sample_rate_hz"] = spoken_turn["sample_rate_hz"]
+            session["audio"] = {"input": {"sample_rate_hz": spoken_turn["sample_rate_hz"]}}
+            session["instructions"] = spoken_turn["instructions"]
             session["extra_body"] = {"auto_response": True}
+        text_only = "audio" not in _warmup_modalities(engine_client)
+        if text_only:
+            session["initial_user_text"] = "Reply briefly with ready."
+            warmup_frames = max(warmup_frames, engine_client.duplex_capabilities.text_turn_priming_units, 1)
         async with websockets.connect(url, max_size=64 * 1024 * 1024, open_timeout=10) as ws:
             await ws.send(json.dumps({"type": "session.update", "session": session}))
             sent = 0
@@ -457,16 +573,16 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
             if not await _recv_until(lambda e: e.get("type") == "session.created", 30):
                 logger.warning("Duplex warmup: no session.created within 30 s; aborting warmup.")
                 return
-            if kind == "video_turn":
+            if spoken_turn is not None:
                 await ws.send(
                     json.dumps(
                         {
                             "type": "input_audio_buffer.append",
-                            "audio": _short_pcm_f32le_b64(),
-                            "format": "pcm_f32le",
-                            "sample_rate_hz": _WARMUP_SAMPLE_RATE_HZ,
-                            "is_speech": True,
-                            "video_frames": [_warmup_jpeg_b64()],
+                            "audio": spoken_turn["audio"],
+                            "format": spoken_turn["format"],
+                            "sample_rate_hz": spoken_turn["sample_rate_hz"],
+                            "is_speech": spoken_turn["is_speech"],
+                            "video_frames": spoken_turn["video_frames"],
                         }
                     )
                 )
@@ -500,6 +616,7 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
                 _recv_event,
                 DUPLEX_WARMUP_AUDIO_WAIT_S,
                 kind=kind,
+                text_only=text_only,
             )
             if outcome == WARMUP_OUTCOME_LISTEN:
                 logger.info(
@@ -508,7 +625,8 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
                 )
             elif outcome == WARMUP_OUTCOME_TIMEOUT:
                 logger.warning(
-                    "Duplex warmup: neither audio nor a listen event within %.0f s; nothing warmed.",
+                    "Duplex warmup: %s within %.0f s; nothing warmed.",
+                    _warmup_timeout_reason(kind, text_only),
                     DUPLEX_WARMUP_AUDIO_WAIT_S,
                 )
             # Close the session EXPLICITLY: a bare websocket close parks the
@@ -518,9 +636,14 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
             await _recv_until(lambda e: e.get("type") == "session.closed", 10)
         if kind == "video_turn":
             logger.info(
-                "Duplex warmup finished in %.1f s (one audio+frame turn, first audio %s).",
+                "Duplex warmup finished in %.1f s (one audio+frame turn, output %s).",
                 time.time() - start,
-                "received" if outcome == WARMUP_OUTCOME_AUDIO else "NOT received",
+                {
+                    WARMUP_OUTCOME_AUDIO: "received",
+                    WARMUP_OUTCOME_TEXT: "text response completed",
+                    WARMUP_OUTCOME_LISTEN: "NOT received",
+                    WARMUP_OUTCOME_TIMEOUT: "NOT received",
+                }[outcome],
             )
         else:
             logger.info(
@@ -529,8 +652,11 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
                 sent,
                 {
                     WARMUP_OUTCOME_AUDIO: "first audio received",
+                    WARMUP_OUTCOME_TEXT: "text response completed",
                     WARMUP_OUTCOME_LISTEN: "model listened; no audio warmed",
-                    WARMUP_OUTCOME_TIMEOUT: "no audio or listen within the wait; nothing warmed",
+                    WARMUP_OUTCOME_TIMEOUT: (
+                        f"{_warmup_timeout_reason(kind, text_only)} within the wait; nothing warmed"
+                    ),
                 }[outcome],
             )
     except Exception:

@@ -714,13 +714,20 @@ class _FakeEngineClient:
     config_path: str | None = None
 
     def __init__(
-        self, *, stage_configs=None, endpoint_restrictions=None, vllm_config=None, supported_tasks=None
+        self,
+        *,
+        stage_configs=None,
+        endpoint_restrictions=None,
+        vllm_config=None,
+        supported_tasks=None,
+        session_only=False,
     ) -> None:
         self.engine = object.__new__(OmniEngineBase)
         self.engine.tracer_provider = None
         self.stage_configs = stage_configs if stage_configs is not None else []
         self.endpoint_restrictions = endpoint_restrictions if endpoint_restrictions is not None else {}
-        self.model_config = SimpleNamespace()
+        self.session_only = session_only
+        self.model_config = None if session_only else SimpleNamespace()
         self.input_processor = object()
         self.renderer = object()
         self.errored = False
@@ -1037,6 +1044,26 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     assert "/v1/chat/completions" in openapi_paths
     assert "/v1/models" in openapi_paths
     assert "/health" in openapi_paths
+
+
+@pytest.mark.asyncio
+async def test_session_only_frontend_starts_without_prefill_generation(monkeypatch) -> None:
+    @asynccontextmanager
+    async def build_engine(*_args, **_kwargs):
+        yield _FakeEngineClient(session_only=True)
+
+    async def serve_http(_app, **_kwargs):
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setenv("MINICPMO_NPU_THINKER_PREFILL_STARTUP", "thinker")
+    monkeypatch.setenv("MINICPMO_NPU_TALKER_PREFILL_STARTUP", "talker")
+    monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: FastAPI())
+    monkeypatch.setattr(api_server, "build_async_omni", build_engine)
+    monkeypatch.setattr(api_server, "omni_init_app_state", lambda *_args: asyncio.sleep(0))
+    monkeypatch.setattr(api_server, "serve_http", serve_http)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", lambda **_kwargs: asyncio.sleep(0))
+
+    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
 
 
 @pytest.mark.asyncio

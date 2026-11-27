@@ -37,7 +37,10 @@ class TestOmniBaseProfiler:
         # ``AsyncOmni`` / ``DuplexOmni`` implement; there is no module-level
         # engine class to patch any more.
         mocker.patch.object(OmniBase, "_create_engine", return_value=mock_engine)
-        mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", side_effect=lambda x: x)
+        mocker.patch(
+            "vllm_omni.entrypoints.omni_base.omni_snapshot_download",
+            side_effect=lambda model, *, revision=None: model,
+        )
         mocker.patch("vllm_omni.entrypoints.omni_base.weakref.finalize")
 
         instance = OmniBase(model="test-model")
@@ -61,7 +64,10 @@ class TestOmniBaseProfiler:
         # ``AsyncOmni`` / ``DuplexOmni`` implement; there is no module-level
         # engine class to patch any more.
         mocker.patch.object(OmniBase, "_create_engine", return_value=mock_engine)
-        mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", side_effect=lambda x: x)
+        mocker.patch(
+            "vllm_omni.entrypoints.omni_base.omni_snapshot_download",
+            side_effect=lambda model, *, revision=None: model,
+        )
         mocker.patch("vllm_omni.entrypoints.omni_base.weakref.finalize")
 
         with pytest.raises(TypeError, match="diffusion_batch_size.*max_num_seqs"):
