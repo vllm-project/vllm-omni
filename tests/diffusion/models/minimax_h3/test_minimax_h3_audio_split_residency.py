@@ -25,6 +25,8 @@ class _AudioModel(nn.Module):
             self.pre_block = nn.Linear(4, 4)
             self.pre_block.register_buffer("scale", torch.ones(4))
         self.mean_proj = nn.Linear(4, 4)
+        # A synthetic checkpoint child used by preprocessing.
+        self.preprocess_proj = nn.Linear(4, 4)
         self.logs_proj = nn.Linear(4, 4)
         self.dec_in_proj = nn.Linear(4, 4)
         self.decoder = nn.Linear(8, 8)
@@ -78,15 +80,18 @@ def test_encoder_load_preserves_all_decoder_storage(projection):
     pointers = [_pointer(tensor) for tensor in decoder]
     encoder_pointer = _pointer(vae.model.encoder.weight)
     mean_pointer = _pointer(vae.model.mean_proj.weight)
+    preprocess_pointer = _pointer(vae.model.preprocess_proj.weight)
     vae.encoder_component.load_to_device()
     assert vae._encoder_stager.loaded
     assert not vae._decoder_stager.loaded
     assert _pointer(vae.model.encoder.weight) != encoder_pointer
     assert _pointer(vae.model.mean_proj.weight) != mean_pointer
+    assert _pointer(vae.model.preprocess_proj.weight) != preprocess_pointer
     assert [_pointer(tensor) for tensor in decoder] == pointers
     vae.encoder_component.offload_to_cpu()
     assert _pointer(vae.model.encoder.weight) == encoder_pointer
     assert _pointer(vae.model.mean_proj.weight) == mean_pointer
+    assert _pointer(vae.model.preprocess_proj.weight) == preprocess_pointer
 
 
 def test_whole_component_retains_full_load_contract_and_values():

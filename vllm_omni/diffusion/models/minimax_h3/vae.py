@@ -41,6 +41,7 @@ from .vae_temporal import install_temporal_stream_patches
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_AUDIO_CHANNELS = 2
+_AUDIO_VAE_DECODER_MODULES = ("decoder", "dec_in_proj", "logs_proj")
 
 # Escape hatch back to the checkpoint's whole-video numpy preparation path.
 _VAE_ENCODE_LEGACY_PREP_ENV = "VLLM_OMNI_VAE_ENCODE_LEGACY_PREP"
@@ -235,9 +236,10 @@ def _load_audio_vae_encoder(
             vae_latent_channels=audio_config["model_config"]["vae_latent_channels"],
             sample_rate=metadata["sample_rate"],
         )
-    _remove_modules(model, ("decoder", "dec_in_proj", "logs_proj"))
+    _remove_modules(model, _AUDIO_VAE_DECODER_MODULES)
     weights_path = component_dir / str(config["source_safetensors_path"])
-    _load_selected_state_dict(model, weights_path, ("encoder.", "pre_block.", "mean_proj."))
+    encoder_prefixes = tuple(f"{name}." for name, _ in model.named_children())
+    _load_selected_state_dict(model, weights_path, encoder_prefixes)
     model.eval()
     return component_cls(model)
 
@@ -1401,13 +1403,10 @@ class MiniMaxH3AudioVAE(nn.Module):
         self.sample_rate = int(self.config_dict["sample_rate"])
 
     def _build_residency_stagers(self, device: torch.device) -> None:
-        """Partition the native waveform encoder from every remaining module.
+        """Stage the same encoding children retained by the encode-only loader.
 
-        Encoding touches encoder, optional pre_block and mean_proj. Keep all
-        other children in the second group, including the unused logs_proj.
         Partial adapters and checkpoints with root state retain whole staging.
         """
-        encoder_names = {"encoder", "pre_block", "mean_proj"}
         children = dict(self.model.named_children())
         roots = (self.remote, self.model)
         root_state = any(list(root.parameters(recurse=False)) or list(root.buffers(recurse=False)) for root in roots)
@@ -1418,8 +1417,8 @@ class MiniMaxH3AudioVAE(nn.Module):
         elif root_state:
             reason = "parameters or buffers at the root"
         else:
-            encoder = [module for name, module in children.items() if name in encoder_names]
-            decoder = [module for name, module in children.items() if name not in encoder_names]
+            encoder = [module for name, module in children.items() if name not in _AUDIO_VAE_DECODER_MODULES]
+            decoder = [module for name, module in children.items() if name in _AUDIO_VAE_DECODER_MODULES]
             # Distinct empty storages all report address zero. Still guard
             # tensors registered in both groups, even when they have no storage.
             storage_keys = [

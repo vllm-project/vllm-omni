@@ -666,8 +666,7 @@ logs. A successful HTTP response alone does not prove the cache was used.
 
 ### Reference-audio encoder residency
 
-The full pipeline stages only the native Audio VAE encoder, optional
-attention projection and mean projection during reference encoding in the
-manual component-offload path. Resident and model-level sequential-offload
-placement retain their existing behavior; encoder-only stage adapters and
-unrecognized checkpoint layouts keep their existing whole-component scope.
+In the manual component-offload path, the full pipeline stages the Audio VAE's
+encoding children together during reference encoding and leaves `decoder`,
+`dec_in_proj`, and `logs_proj` off-device. Encoder-only stage adapters and
+unrecognized checkpoint layouts use whole-component staging.
