@@ -18,7 +18,8 @@ from vllm_omni.diffusion.models.abot_world.abot_world_transformer import (
     ABotWorldCausalTransformer3DModel,
 )
 from vllm_omni.diffusion.models.abot_world.actions import parse_abot_camera_action_script
-from vllm_omni.diffusion.models.abot_world.interaction import ABotCameraSession
+from vllm_omni.diffusion.models.abot_world.interaction import ABotCameraSession, ABotPromptSession
+from vllm_omni.diffusion.models.abot_world.iris_text import IrisText
 from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import (
     ABotWorldCausalPipeline,
     _ABotRequestInputs,
@@ -663,7 +664,7 @@ def test_unfilled_reference_slots_are_zero_and_masked() -> None:
 _REF_TOKENS = 2 * 4  # two 4x4-latent reference slots, 2x2 patches
 
 
-def _relative_kv_state(model: ABotWorldCausalTransformer3DModel) -> ARDiffusionKVState:
+def _relative_kv_state(model: ABotWorldCausalTransformer3DModel, *, text_tokens: int = 5) -> ARDiffusionKVState:
     kv = ARDiffusionKVCache(
         ARDiffusionKVConfig(enable=True, chunk_size=4, window_chunks=7, sink_chunks=0),
         num_layers=1,
@@ -677,7 +678,7 @@ def _relative_kv_state(model: ABotWorldCausalTransformer3DModel) -> ARDiffusionK
         session_capacity=1,
         frames_per_block=3,
         max_scratch_tokens_per_branch=3 * 4,
-        cross_attention_lengths={"text": 5, "ref": _REF_TOKENS},
+        cross_attention_lengths={"text": text_tokens, "ref": _REF_TOKENS},
         device=torch.device("cpu"),
     )
     return ARDiffusionKVState(kv, "s", {"main": kv.begin_request("s")}, num_layers=1)
@@ -790,6 +791,7 @@ def test_stepwise_publishes_reference_kv_beside_text_and_runs_the_first_chunk() 
             "schedule": _build_shifted_flow_schedule(flow_shift=5.0),
             "first_frame_latent": torch.randn(1, 4, 1, 4, 4, generator=generator),
             "ref_kwargs": ref_kwargs,
+            "iris_text": IrisText(global_prompt="p"),
         },
     )
 
@@ -832,3 +834,102 @@ def test_stepwise_publishes_reference_kv_beside_text_and_runs_the_first_chunk() 
     assert torch.equal(pipeline._ar_reference_caches()[0].key, published.key)
     state.close()
     assert not state.kv_cache.is_cross_attention_populated("s", "ref", "main")
+
+
+def _iris_step(model, *, chunk_index: int, script=None) -> StepRequestState:
+    generator = torch.Generator().manual_seed(1)
+    inputs = _ABotRequestInputs(
+        prompt="p",
+        image=torch.zeros(3, 64, 64),
+        reference_images=None,
+        camera_action_script=script,
+        height=64,
+        width=64,
+        num_frames=25,
+        num_latent_frames=7,
+        num_frame_per_block=3,
+        output_type="latent",
+        max_sequence_length=512,
+        flow_shift=5.0,
+        generator=generator,
+    )
+    return StepRequestState(
+        request_id="s",
+        sampling=OmniDiffusionSamplingParams(),
+        prompt_embeds=torch.randn(1, 512, 16, generator=generator),
+        chunk_index=chunk_index,
+        total_chunks=2,
+        chunk_num_steps=4,
+        extra={
+            "inputs": inputs,
+            "dtype": torch.float32,
+            "schedule": _build_shifted_flow_schedule(flow_shift=5.0),
+            "iris_text": IrisText(global_prompt="p"),
+        },
+    )
+
+
+def test_prompt_switch_rebuilds_only_the_text_cache_from_the_new_global_row() -> None:
+    model = _relative_transformer()
+    state = _relative_kv_state(model, text_tokens=512)
+    pipeline = _bare_pipeline(
+        transformer=model,
+        device=torch.device("cpu"),
+        vae_scale_factor_spatial=16,
+        _ar_diffusion_kv_state=state,
+        _module_offload=False,
+    )
+    pipeline._build_action_tensor = lambda *args: None
+    generator = torch.Generator().manual_seed(0)
+    reference = torch.randn(1, _REF_TOKENS, 1, 8, generator=generator)
+    state.populate_cross_attention("main", "ref", [(reference, -reference)])
+    new_global = torch.randn(1, 384, 16, generator=generator)
+    encoded: list = []
+
+    def encode_text(prompt, *, max_sequence_length, dtype):
+        encoded.append((prompt, max_sequence_length))
+        return new_global
+
+    pipeline._encode_text = encode_text
+    step = _iris_step(model, chunk_index=0)
+
+    with torch.no_grad():
+        pipeline.prepare_next_chunk(step)
+        before = step.extra["ar_cross_attention"][0].key.clone()
+        old_local = step.prompt_embeds[:, 384:].clone()
+        step.interaction_sessions["prompt"] = ABotPromptSession(prompt="new")
+        step.chunk_index = 1
+        pipeline.prepare_next_chunk(step)
+        after = step.extra["ar_cross_attention"][0].key
+        attention = model.blocks[0].cross_attn
+        new_embeds = torch.cat([new_global, old_local], dim=1)
+        expected = attention.norm_k(attention.k(model.text_embedding(new_embeds)))
+
+    assert encoded == [("new", 384)]
+    assert not torch.equal(before, after)
+    torch.testing.assert_close(step.prompt_embeds, new_embeds)
+    torch.testing.assert_close(after, expected.unflatten(2, (attention.num_local_heads, attention.head_dim)))
+    kept = pipeline._ar_reference_caches()[0]
+    assert torch.equal(kept.key, reference) and torch.equal(kept.value, -reference)
+    state.close()
+
+
+def test_prompt_switch_keeps_the_scripted_actions() -> None:
+    seen: list = []
+    encoded: list = []
+    pipeline = _stepwise_pipeline(seen)
+    pipeline.transformer = _relative_transformer()
+    pipeline._ar_reference_caches = lambda: []
+
+    def encode_text(prompt, *, max_sequence_length, dtype):
+        encoded.append((prompt, max_sequence_length))
+        return torch.zeros(1, max_sequence_length, 16)
+
+    pipeline._encode_text = encode_text
+    step = _iris_step(pipeline.transformer, chunk_index=1, script=_SCRIPT)
+    step.interaction_sessions["prompt"] = ABotPromptSession(prompt="dusk")
+
+    pipeline.prepare_next_chunk(step)
+
+    assert seen == [_SCRIPT[1]]
+    assert encoded == [("dusk", 384)]

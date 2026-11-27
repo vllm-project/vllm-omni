@@ -144,8 +144,7 @@ replaced before any chunk used it is reported in `coalesced_event_ids`.
 `acvlab/ABot-World-0-5-5B-Iris` runs on the same pipeline. Its `config.json`
 sets `use_relative_rope`, which switches on relative RoPE, up to five
 512 px reference-image slots, and Iris's prompt layout: a 384-token global
-prompt row plus a 128-token local row, left empty for now. Iris is validated on
-AMD MI300X only.
+prompt row plus a 128-token local row. Iris is validated on AMD MI300X only.
 
 Iris uses 704x1280 (880 tokens per latent frame). It commits the source frame
 first, so every chunk adds 12 frames and a rollout has `1 + 12k` frames (13 for
@@ -161,8 +160,32 @@ vllm serve /path/to/ABot-World-0-5-5B-Iris \
 
 `session.start` takes `width: 1280`, `height: 704` and `num_frames: 12k + 1`.
 `image_reference` carries the first frame only, so reference slots stay empty
-over WebSocket. Camera keys work as above. Prompt switch and local event
-prompts are not wired yet.
+over WebSocket. Camera keys work as above.
+
+Iris also changes its text mid-generation; ABot-World-0 rejects these updates.
+All three apply at the next chunk boundary, re-encode only the changed row and
+rebuild the text cross-attention cache while the video and reference KV stay:
+
+- `event.prompt` replaces the global row (Prompt Switch); the latest prompt
+  before a boundary wins.
+- `event.multi_modal_data.skill` with `{"prompt": ...}` fills the local row for
+  four chunks. A second skill is rejected with `interaction_failed` while one
+  is pending or active, and a tap of any key below cancels the active skill.
+- `state` camera transitions may also carry `Ctrl`, `Shift`, `Space`,
+  `MouseLeft`, `MouseRight` and `Alt`. They never reach the action latent:
+  when no skill is active, the held or tapped keys select the caption in the
+  local row, as the official client does. A tap of `Space` captions one chunk
+  and a tap of `Alt` or `MouseLeft` two; `Shift`+`Space`, `MouseRight`+`MouseLeft`
+  and `Ctrl`+`Shift` have their own captions.
+
+```json
+{"type": "session.interaction",
+ "interaction": {"event_id": "sprint-jump",
+                 "event": {"multi_modal_data": {"camera": {
+                   "mode": "state",
+                   "transitions": [{"actions": ["w", "Shift", "Space"]},
+                                   {"actions": ["w", "Shift"]}]}}}}}
+```
 
 ## Reproduce review evidence
 
@@ -336,8 +359,8 @@ by the existing Buildkite `tests/diffusion -m 'core_model and cpu'` sweep.
 
 - Only the `ABot-World-0-5B-LF` and `ABot-World-0-5-5B-Iris` causal student
   checkpoints are supported; the Iris-BiT teacher and FantasyDecoder are not.
-- Mid-generation updates cover camera keys only; prompt updates are not wired
-  on the stepwise path.
+- Mid-generation prompt, skill and text-action updates need an Iris
+  checkpoint; ABot-World-0 takes camera keys only.
 - AR-Diffusion stages require one replica.
 - Stepwise mode emits multiple blocks from one request, and `max_num_seqs`
   must be one.

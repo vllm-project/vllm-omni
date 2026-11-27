@@ -8,21 +8,34 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from .iris_text import IRIS_ACTION_KEYS
+
 _ACTION_ORDER = ("w", "a", "s", "d", "i", "j", "k", "l")
 CAMERA_ACTION_SCRIPT_KEY = "camera_action_script"
 PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY = "_abot_camera_action_script"
 _VALID_ACTIONS = frozenset(_ACTION_ORDER)
+_IRIS_ACTIONS = frozenset(IRIS_ACTION_KEYS)
 
 
-def _normalize_actions(value: object, *, field: str) -> tuple[str, ...]:
+def _normalize_actions(value: object, *, field: str, iris_actions: bool = False) -> tuple[str, ...]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise ValueError(f"{field} must be a sequence of ABot action keys.")
+    valid = _VALID_ACTIONS | _IRIS_ACTIONS if iris_actions else _VALID_ACTIONS
     actions: set[str] = set()
     for item in value:
-        if not isinstance(item, str) or item.lower() not in _VALID_ACTIONS:
+        if not isinstance(item, str) or item.lower() not in valid:
+            if iris_actions:
+                raise ValueError(
+                    f"{field} supports only W/A/S/D/I/J/K/L and Ctrl/Shift/Space/MouseLeft/MouseRight/Alt keys."
+                )
             raise ValueError(f"{field} supports only W/A/S/D/I/J/K/L action keys.")
         actions.add(item.lower())
-    return tuple(action for action in _ACTION_ORDER if action in actions)
+    return tuple(action for action in (*_ACTION_ORDER, *IRIS_ACTION_KEYS) if action in actions)
+
+
+def split_iris_actions(actions: tuple[str, ...]) -> tuple[tuple[str, ...], frozenset[str]]:
+    """Split normalized keys into camera keys and Iris text-action keys."""
+    return tuple(a for a in actions if a in _VALID_ACTIONS), frozenset(a for a in actions if a in _IRIS_ACTIONS)
 
 
 def _normalize_frames(value: object, *, field: str) -> tuple[tuple[str, ...], ...]:
@@ -31,7 +44,7 @@ def _normalize_frames(value: object, *, field: str) -> tuple[tuple[str, ...], ..
     return tuple(_normalize_actions(actions, field=f"{field}[{index}]") for index, actions in enumerate(value))
 
 
-def _normalize_state_transitions(value: object) -> tuple[tuple[str, ...], ...]:
+def _normalize_state_transitions(value: object, *, iris_actions: bool) -> tuple[tuple[str, ...], ...]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or not value:
         raise ValueError("ABot state-mode camera actions require non-empty transitions.")
     normalized: list[tuple[str, ...]] = []
@@ -50,6 +63,7 @@ def _normalize_state_transitions(value: object) -> tuple[tuple[str, ...], ...]:
             _normalize_actions(
                 transition.get("actions"),
                 field=f"camera state transitions[{index}].actions",
+                iris_actions=iris_actions,
             )
         )
     return tuple(normalized)
@@ -79,21 +93,28 @@ class ABotCameraUpdate:
     """One validated mid-generation camera update.
 
     ``actions`` holds key-state transitions in ``state`` mode and one action
-    list per latent frame in ``script`` mode.
+    list per latent frame in ``script`` mode. Only ``state`` transitions may
+    carry Iris text-action keys.
     """
 
     mode: Literal["state", "script"]
     actions: tuple[tuple[str, ...], ...]
 
 
-def parse_abot_camera_update(payload: Mapping[str, object]) -> ABotCameraUpdate:
-    """Validate an ABot ``multi_modal_data.camera`` interaction payload."""
+def parse_abot_camera_update(payload: Mapping[str, object], *, iris_actions: bool = False) -> ABotCameraUpdate:
+    """Validate an ABot ``multi_modal_data.camera`` interaction payload.
+
+    ``iris_actions`` admits the Iris text-action keys in ``state`` mode.
+    """
 
     mode = payload.get("mode")
     if mode == "state":
         if set(payload) != {"mode", "transitions"}:
             raise ValueError("ABot state-mode camera updates take exactly mode and transitions.")
-        return ABotCameraUpdate(mode="state", actions=_normalize_state_transitions(payload["transitions"]))
+        return ABotCameraUpdate(
+            mode="state",
+            actions=_normalize_state_transitions(payload["transitions"], iris_actions=iris_actions),
+        )
     if mode == "script":
         if set(payload) != {"mode", "frames"}:
             raise ValueError("ABot script-mode camera updates take exactly mode and frames.")

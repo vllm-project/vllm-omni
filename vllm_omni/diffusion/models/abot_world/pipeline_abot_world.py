@@ -53,7 +53,8 @@ from .abot_world_transformer import (
     ABotWorldCausalTransformer3DModel,
 )
 from .actions import CAMERA_ACTION_SCRIPT_KEY, PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY
-from .interaction import ABotCameraSession
+from .interaction import ABotCameraSession, ABotPromptSession, ABotSkillSession
+from .iris_text import IrisText
 from .taew2_2 import TAEW2Decoder
 
 if TYPE_CHECKING:
@@ -936,7 +937,10 @@ class ABotWorldCausalPipeline(
         embeds = embeds.to(device=self.device, dtype=dtype)
         return embeds * attention_mask.unsqueeze(-1).to(dtype=embeds.dtype)
 
-    # ── Generation ───────────────────────────────────────────────────────
+    @property
+    def iris_text_conditioning(self) -> bool:
+        """Iris (relative RoPE) changes its global and local text rows mid-generation; ABot-World-0 does not."""
+        return bool(self.transformer.config.use_relative_rope)
 
     def _ar_text_caches(
         self,
@@ -1158,6 +1162,8 @@ class ABotWorldCausalPipeline(
             "dtype": dtype,
             "ref_kwargs": self._encode_references(inputs.reference_images, dtype) if relative else {},
         }
+        if relative:
+            state.extra["iris_text"] = IrisText(global_prompt=inputs.prompt)
         text_caches = self._ar_text_caches(prompt_embeds, invalidate=False)
         if relative:
             self._prefill_source_frame(state, text_caches)
@@ -1194,6 +1200,60 @@ class ABotWorldCausalPipeline(
         )
         kv_state.commit_paged_context(self._AR_BRANCH)
 
+    def _update_iris_text(self, state: StepRequestState) -> bool:
+        """Select this chunk's Iris global and local rows; return whether they changed.
+
+        The local row is the active skill, else the caption of the text-action
+        keys the camera handler resolved at this boundary. A tapped key
+        cancels the skill. Only a changed row is re-encoded, and the caller
+        rebuilds the text cross-attention cache; earlier chunks stay committed
+        to the video KV under their own text.
+        """
+        text: IrisText = state.extra["iris_text"]
+        camera = state.interaction_sessions.get("camera")
+        held: frozenset[str] = frozenset()
+        tapped: frozenset[str] = frozenset()
+        if isinstance(camera, ABotCameraSession):
+            with camera.lock:
+                held, tapped = camera.text_actions_held, camera.text_actions_tapped
+        global_prompt = text.global_prompt
+        prompt = state.interaction_sessions.get("prompt")
+        if isinstance(prompt, ABotPromptSession):
+            with prompt.lock:
+                global_prompt = prompt.prompt if prompt.prompt is not None else global_prompt
+        skill = ""
+        skills = state.interaction_sessions.get("skill")
+        if isinstance(skills, ABotSkillSession):
+            with skills.lock:
+                if tapped:
+                    skills.prompt, skills.chunks = "", 0
+                skill = skills.prompt if skills.chunks else ""
+        _, caption = text.captions.step(held, tapped)
+        local_prompt = skill or caption
+        text.skill_in_chunk = bool(skill)
+        if (global_prompt, local_prompt) == (text.global_prompt, text.local_prompt):
+            return False
+        dtype = state.extra["dtype"]
+        embeds = cast(torch.Tensor, state.prompt_embeds)
+        global_row = embeds[:, :_IRIS_GLOBAL_TOKENS]
+        local_row = embeds[:, _IRIS_GLOBAL_TOKENS:]
+        if global_prompt != text.global_prompt:
+            global_row = self._encode_text(global_prompt, max_sequence_length=_IRIS_GLOBAL_TOKENS, dtype=dtype)
+        if local_prompt != text.local_prompt:
+            local_row = self._encode_text(
+                local_prompt, max_sequence_length=_MAX_SEQUENCE_LENGTH - _IRIS_GLOBAL_TOKENS, dtype=dtype
+            )
+        state.prompt_embeds = torch.cat([global_row, local_row], dim=1)
+        text.global_prompt, text.local_prompt = global_prompt, local_prompt
+        return True
+
+    def _consume_iris_skill_chunk(self, state: StepRequestState) -> None:
+        text = state.extra.get("iris_text")
+        skills = state.interaction_sessions.get("skill")
+        if isinstance(text, IrisText) and text.skill_in_chunk and isinstance(skills, ABotSkillSession):
+            with skills.lock:
+                skills.chunks = max(0, skills.chunks - 1)
+
     def _prepare_next_chunk(self, state: StepRequestState) -> None:
         inputs: _ABotRequestInputs = state.extra["inputs"]
         block_frames = inputs.num_frame_per_block
@@ -1211,9 +1271,10 @@ class ABotWorldCausalPipeline(
         state.extra["action_condition"] = self._build_action_tensor(
             actions, block_frames, inputs.height, inputs.width, state.extra["dtype"]
         )
+        text_changed = self._update_iris_text(state) if relative else False
         state.extra["ar_cross_attention"] = self._ar_text_caches(
             cast(torch.Tensor, state.prompt_embeds),
-            invalidate=False,
+            invalidate=text_changed,
         )
         state.extra["ar_reference"] = self._ar_reference_caches() if relative else None
         latent_h = inputs.height // self.vae_scale_factor_spatial
@@ -1306,6 +1367,7 @@ class ABotWorldCausalPipeline(
         if start_frame == 0:
             latents[:, :, 0] = extra["first_frame_latent"][:, :, 0]
         self._commit_stepwise_kv(state, latents)
+        self._consume_iris_skill_chunk(state)
         if state.chunk_index == 0 and self.transformer.config.use_relative_rope:
             latents = torch.cat((extra["first_frame_latent"].to(dtype=latents.dtype), latents), dim=2)
 

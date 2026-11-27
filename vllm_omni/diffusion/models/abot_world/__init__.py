@@ -9,6 +9,8 @@ from typing import Any
 
 __all__ = [
     "ABotCameraInteractionHandler",
+    "ABotPromptInteractionHandler",
+    "ABotSkillInteractionHandler",
     "ABotWorldCausalPipeline",
     "get_abot_world_post_process_func",
     "get_abot_world_pre_process_func",
@@ -16,10 +18,18 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
-    if name == "ABotCameraInteractionHandler":
-        from .interaction import ABotCameraInteractionHandler
+    if name in ("ABotCameraInteractionHandler", "ABotPromptInteractionHandler", "ABotSkillInteractionHandler"):
+        from .interaction import (
+            ABotCameraInteractionHandler,
+            ABotPromptInteractionHandler,
+            ABotSkillInteractionHandler,
+        )
 
-        return ABotCameraInteractionHandler
+        return {
+            "ABotCameraInteractionHandler": ABotCameraInteractionHandler,
+            "ABotPromptInteractionHandler": ABotPromptInteractionHandler,
+            "ABotSkillInteractionHandler": ABotSkillInteractionHandler,
+        }[name]
     if name in (
         "ABotWorldCausalPipeline",
         "get_abot_world_post_process_func",
