@@ -317,6 +317,45 @@ async def test_read_loop_stays_live_during_asr_and_abort_on_disconnect() -> None
 
 
 @pytest.mark.asyncio
+async def test_vad_committed_turn_transcribes_without_create_response() -> None:
+    """A VAD turn committed under create_response=false still reaches ASR.
+
+    The knob only gates the conversation response a transcription session
+    never creates; without this routing the committed audio would be
+    dropped from ASR with nothing but input_audio_buffer.committed sent.
+    """
+    websocket = _FakeWebSocket()
+    connection = _make_connection(websocket, _TranscribingEngine(["hello"]))
+    connection._absorb_transcription_session(_transcription_update())
+    connection._commit_transcription_session()
+    connection._turn_detector = _FakeTurnDetector(
+        [
+            TurnDetectionResult(
+                is_speech=False,
+                speech_active=False,
+                speech_stopped=True,
+                should_commit=True,
+                create_response=False,
+            )
+        ]
+    )
+
+    await connection._handle_audio_append(
+        types.InputAudioBufferAppendEvent(
+            type="input_audio_buffer.append",
+            audio=base64.b64encode(b"\x01\x02" * 100).decode("ascii"),
+        )
+    )
+    await asyncio.wait_for(connection._transcription_queue.join(), timeout=5.0)
+    await connection._cancel_active_transcription()
+
+    events = _sent_events(websocket)
+    completed = [e for e in events if e["type"] == "conversation.item.input_audio_transcription.completed"]
+    assert len(completed) == 1
+    assert completed[0]["transcript"] == "hello"
+
+
+@pytest.mark.asyncio
 async def test_server_vad_committed_turn_transcribes() -> None:
     """A VAD end-of-speech commit routes to ASR, not response.create."""
     websocket = _FakeWebSocket()

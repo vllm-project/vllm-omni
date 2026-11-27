@@ -629,10 +629,14 @@ class OpenAIFullDuplexConnection:
         item = await self._commit_audio_buffer(item_id=item_id)
         if item is None:
             return
+        if self._transcription_mode:
+            # #11074: a committed turn always transcribes — create_response
+            # only gates the conversation response a transcription session
+            # never creates, so a VAD turn committed under
+            # create_response=false must still reach ASR.
+            self._enqueue_transcription(item)
+            return
         if result.create_response:
-            if self._transcription_mode:
-                self._enqueue_transcription(item)
-                return
             if self.session.active_response is not None and not detector.config.interrupt_response:
                 await self._send_error(
                     "Cannot create an automatic response while another response is still in progress",
