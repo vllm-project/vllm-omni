@@ -287,9 +287,12 @@ def translate_realtime_command(
 
     if event_type in {"input.text.append", "input_text.append", "push_text"}:
         text = payload.get("text")
-        if not isinstance(text, str):
-            raise DuplexCommandError("input.text.append requires text", code="bad_event", event_id=event_id)
-        return AppendText(event_id=event_id, text=text)
+        if not isinstance(text, str) or not text:
+            raise DuplexCommandError("input.text.append requires non-empty text", code="bad_event", event_id=event_id)
+        force_listen = payload.get("force_listen")
+        if force_listen is not None and not isinstance(force_listen, bool):
+            raise DuplexCommandError("force_listen must be a boolean", code="bad_event", event_id=event_id)
+        return AppendText(event_id=event_id, text=text, force_listen=force_listen)
 
     if event_type == "input.cancel":
         return CancelInput(event_id=event_id)

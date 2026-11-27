@@ -75,6 +75,9 @@ COPY tools/gradio_pillow13/ tools/gradio_pillow13/
 # Scope the override to Omni; dependency source builds need their own versions.
 ENV VLLM_OMNI_VERSION_OVERRIDE=0.0.0
 
+# The dev extra pins CUDA onnxruntime and the CUDA Mooncake wheel. The latter
+# overwrites the base image's ROCm build of the same ``mooncake`` package and
+# fails to import (libcudart.so.13); restore the ROCm builds.
 RUN python3 tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13 && \
     uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
         --no-cache-dir /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl \
@@ -83,6 +86,10 @@ RUN python3 tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13 && 
     python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
         "onnxruntime-rocm>=1.22.2" && \
     python3 -c "import importlib.metadata as m; import onnxruntime as ort; assert 'ROCMExecutionProvider' in ort.get_available_providers(), ort.get_available_providers(); assert m.version('onnxruntime-rocm'); assert not any(d.metadata['Name'] == 'onnxruntime' for d in m.distributions())" && \
+    python3 -m pip uninstall -y mooncake-transfer-engine-cuda13 && \
+    python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
+        "mooncake-transfer-engine-rocm==0.3.14" && \
+    python3 -c "import importlib.metadata as m; from mooncake.engine import TransferEngine; assert not any(d.metadata['Name'] == 'mooncake-transfer-engine-cuda13' for d in m.distributions())" && \
     python3 -c "from torchcodec.decoders import VideoDecoder"
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python

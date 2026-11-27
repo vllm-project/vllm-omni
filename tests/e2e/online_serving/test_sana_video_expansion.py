@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """SANA-Video 2B online smoke tests for the native and Diffusers backends."""
 
@@ -26,7 +26,7 @@ MODEL_720P = os.environ.get(
 PROMPT = "A cat walking on grass toward the camera. motion score: 30."
 NEGATIVE_PROMPT = "blurry, low quality, temporal artifacts"
 
-SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
+SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI300"})
 
 
 def _t2v_backend_cases():

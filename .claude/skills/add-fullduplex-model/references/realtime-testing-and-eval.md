@@ -77,7 +77,7 @@ Repo pre-commit gotchas on new duplex files (`pre-commit run --files ...`, `git 
 
 ### L2–L4: Live GPU E2E (`pytest.mark.omni` + `@hardware_test`)
 
-References: `tests/e2e/online_serving/test_haru_duplex.py`, `test_personaplex_duplex.py`, `test_nemotron_voicechat_duplex.py`, `test_minicpmo_4_5_duplex.py`, `test_qwen3_omni_duplex_tools.py`.
+References: `tests/e2e/online_serving/test_haru_duplex.py`, `test_personaplex_duplex.py`, `test_nemotron_voicechat_duplex.py`, `test_minicpmo_4_5_duplex.py`, `tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py`.
 
 - **L2 (`core_model` + `omni` + `@hardware_test`)**: WebSocket `/v1/realtime?duplex=1` protocol smoke (`session.created` -> `session.updated` -> `session.closed`, zero errors).
 - **L3 (`advanced_model` + `omni` + `@hardware_test`)**: Staggered live paced streaming up to the deploy config's `max_sessions` (assert finite non-silent audio amplitude + non-empty transcript, zero errors), continuous overlap during playback, admission rejection (`resource_exhausted`) at `max_sessions + 1`, and replacement admission after close without state leakage.

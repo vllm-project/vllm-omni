@@ -62,6 +62,14 @@ Startup / model-loading benchmark for the two-stage MammothModa2 (AR → DiT) de
 - **Layout**: `mammoth_moda2/bench_startup.py` (single-process startup and first/steady request timing), `mammoth_moda2/parse_startup_log.py` (per-stage breakdown from engine logs), `mammoth_moda2/bench_storage_scenarios.sh` (cold/warm page cache on local disk vs. network storage), `mammoth_moda2/raw_load_bench.py` (safetensors → GPU without vLLM)
 - **Key metrics**: time to engine ready, per-stage spawn/init/weight-load/profile time, first vs. steady-state request latency
 
+### [Duplex-MPE](duplex_mpe/README.md) — Multi-Party Full-Duplex Selective Participation
+
+Closed-loop, audio-clocked interaction benchmark (`mpeval.unified.v3`) for spoken full-duplex models served over `/v1/realtime?duplex=1` (and turn-based `/v1/realtime` probes).
+
+- **Layout**: `duplex_mpe/evaluate.py` (`python -m benchmarks.duplex_mpe`), `duplex_mpe/realtime_session.py` (reactive WebSocket session driver), `duplex_mpe/configs/judge.example.json`
+- **Dataset**: Pinned [`ChengqianMa/Duplex-MPE`](https://huggingface.co/datasets/ChengqianMa/Duplex-MPE) (`2,000` explicit/implicit pairs; `--mini` `20`-pair smoke subset)
+- **Key metrics**: target response rate (`TR`), conditional/unconditional answer accuracy (`AA`), bystander silence preservation (`SP`), answering-window yield (`AY`)
+
 ### Common serving metrics framework
 
 `vllm_omni/benchmarks/` extends `vllm bench serve --omni` with Omni-specific datasets, backends, and multimodal metrics. Key metrics include:

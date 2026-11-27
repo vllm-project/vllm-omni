@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -52,6 +53,19 @@ def test_rocm_base_tracks_cuda_release() -> None:
         "${VLLM_VERSION}", _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_VERSION")
     )
     assert image_tag == cuda_release_tag == cuda_ci_tag.split("@")[0]
+
+
+def test_rocm_restores_the_rocm_mooncake_build_at_the_dev_pin() -> None:
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    (cuda_version,) = re.findall(r'"mooncake-transfer-engine-cuda13==([^"]+)"', pyproject)
+    dockerfile = ROCM_DOCKERFILE.read_text(encoding="utf-8")
+
+    install = dockerfile.index('-e ".[dev]"')
+    uninstall = dockerfile.index("pip uninstall -y mooncake-transfer-engine-cuda13")
+    reinstall = dockerfile.index(f'"mooncake-transfer-engine-rocm=={cuda_version}"')
+    check = dockerfile.index("from mooncake.engine import TransferEngine")
+    assert install < uninstall < reinstall < check
+    assert dockerfile.count("--force-reinstall --no-deps") >= 2
 
 
 def test_rocm_defaults_to_the_published_runtime() -> None:

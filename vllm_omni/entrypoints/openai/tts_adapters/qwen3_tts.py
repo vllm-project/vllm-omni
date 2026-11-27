@@ -18,11 +18,21 @@ from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     DEFAULT_TTS_LANGUAGES,
     ARTTSAdapter,
+    IncrementalInputNotReadyError,
+    IncrementalTTSInput,
     PreparedRequest,
     TextCommitmentCapabilities,
     conditioning_cache_salt,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
+from vllm_omni.model_executor.models.qwen3_tts.sampling_policy import (
+    SUBTALKER_SAMPLING_PARAMS_KEY,
+    validate_subtalker_sampling_params,
+)
+from vllm_omni.model_executor.models.qwen3_tts.streaming_tokenizer import (
+    Qwen3TTSStreamingTokenizer,
+    Qwen3TTSStreamingTokenizerSpec,
+)
 from vllm_omni.utils.speaker_cache import validate_qwen3_tts_profile
 
 if TYPE_CHECKING:
@@ -136,10 +146,93 @@ def _ref_audio_wire_waveform(waveform: np.ndarray) -> dict[str, Any]:
     return {"__ndarray__": True, "data": wav.tobytes(), "dtype": "float32", "shape": [int(wav.size)]}
 
 
+@dataclass
+class _InitialTextEncoding:
+    text: str
+    final: bool
+    encoder: Qwen3TTSStreamingTokenizer
+    token_ids: list[int]
+
+
+class _Qwen3TTSIncrementalInput:
+    """Exact online tokenization for one interleaved model request."""
+
+    def __init__(
+        self,
+        adapter: "Qwen3TTSAdapter",
+        request: "OpenAICreateSpeechRequest",
+        spec: Qwen3TTSStreamingTokenizerSpec,
+    ) -> None:
+        self.adapter = adapter
+        self.request = request
+        self._encoder = spec.create_stream()
+        self._candidate: _InitialTextEncoding | None = None
+        self._built = False
+
+    def _encode_initial_text(self, text: str, *, final: bool) -> _InitialTextEncoding:
+        if self._built:
+            raise RuntimeError("Incremental input has already been built")
+        if not isinstance(text, str) or type(final) is not bool:
+            raise TypeError("Incremental input requires string text and boolean final")
+        if self.request.non_streaming_mode is True:
+            raise ValueError("Incremental text input requires interleaved prompt construction")
+        if not text.strip():
+            if final:
+                raise ValueError("Initial text input cannot be empty or whitespace-only at EOF")
+            raise IncrementalInputNotReadyError("Initial text has no stable Qwen3-TTS body token yet")
+
+        previous = self._candidate
+        if previous is not None and text.startswith(previous.text):
+            encoder = previous.encoder.copy()
+            tokens = previous.token_ids + encoder.feed(text[len(previous.text) :], final=final)
+        else:
+            encoder = self._encoder.copy()
+            tokens = encoder.feed("<|im_start|>assistant\n" + text, final=final)
+        self._candidate = _InitialTextEncoding(text, final, encoder, tokens)
+        return self._candidate
+
+    async def build(self, text: str, *, final: bool) -> PreparedRequest:
+        encoding = await make_async(
+            self._encode_initial_text, executor=getattr(self.adapter.ctx.server, "_tts_executor", None)
+        )(text, final=final)
+        header_len = len(self._encoder.spec.header_ids)
+        if len(encoding.token_ids) <= header_len:
+            if final:
+                raise ValueError("Initial text has no Qwen3-TTS body token at EOF")
+            raise IncrementalInputNotReadyError("Initial text has no stable Qwen3-TTS body token yet")
+
+        from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY
+
+        tokens = encoding.token_ids[header_len:]
+        params = self.adapter._build_tts_params(self.request)
+        params["text"] = [text]  # Interleaved prefill has one text row, regardless of the unreleased suffix.
+        params["non_streaming_mode"] = [False]
+        params["input_stream"] = {"token_ids": tokens, "final": final}
+        prompt_len = await self.adapter._estimate_prompt_len_async(params)
+        params[PRECOMPUTED_TEXT_IDS_KEY] = [encoding.token_ids + self._encoder.spec.footer_ids]
+        prompt = tokens_input(prompt_token_ids=[1] * prompt_len)
+        prompt["additional_information"] = params
+        self._encoder = encoding.encoder
+        self._candidate = None
+        self._built = True
+        return PreparedRequest(prompt=prompt, tts_params=params, model_type="CustomVoice")
+
+    async def append(self, request_id: str, text: str, *, final: bool) -> None:
+        if not self._built:
+            raise RuntimeError("Incremental input must be built before appending text")
+        tokens = await make_async(self._encoder.feed, executor=getattr(self.adapter.ctx.server, "_tts_executor", None))(
+            text, final=final
+        )
+        if tokens or final:
+            assert self.adapter.ctx.engine_client is not None
+            await self.adapter.ctx.engine_client.append_text(request_id, tokens, final=final)
+
+
 @register_tts_adapter
 class Qwen3TTSAdapter(ARTTSAdapter):
     """Adapter for Qwen3-TTS (AR ``engine_client`` backend)."""
 
+    supports_incremental_input = True
     # Length limits return the generated audio with a truncation signal.
     reports_length_truncation = True
     stage_keys = frozenset({"qwen3_tts"})
@@ -157,6 +250,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
+        self._streaming_tokenizer_spec: Qwen3TTSStreamingTokenizerSpec | None = None
         self._estimate_prompt_len_async = make_async(
             self._estimate_prompt_len, executor=getattr(ctx.server, "_tts_executor", None)
         )
@@ -252,6 +346,13 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         # Validate input is not empty
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
+
+        extras = request.extra_params or {}
+        if SUBTALKER_SAMPLING_PARAMS_KEY in extras:
+            try:
+                validate_subtalker_sampling_params(extras[SUBTALKER_SAMPLING_PARAMS_KEY])
+            except ValueError as exc:
+                return str(exc)
 
         # Validate language (case-insensitive; normalized to the title-cased config form)
         if request.language is not None:
@@ -559,6 +660,17 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
             return 2048
 
+    async def create_incremental_input(self, request: "OpenAICreateSpeechRequest") -> IncrementalTTSInput:
+        def create() -> _Qwen3TTSIncrementalInput:
+            self._load_text_tokenizer()
+            if self._streaming_tokenizer_spec is None:
+                self._streaming_tokenizer_spec = Qwen3TTSStreamingTokenizerSpec(
+                    self.ctx.server._tts_tokenizer.backend_tokenizer
+                )
+            return _Qwen3TTSIncrementalInput(self, request, self._streaming_tokenizer_spec)
+
+        return await make_async(create, executor=getattr(self.ctx.server, "_tts_executor", None))()
+
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
@@ -689,6 +801,8 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         if request.max_new_tokens is not None:
             # An explicit request budget opts out of the automatic ceiling.
             effective_cap = int(request.max_new_tokens)
+        elif additional_information is not None and "input_stream" in additional_information:
+            effective_cap = int(configured_cap) if configured_cap is not None else None
         elif budget is not None and budget.enabled:
             counted_text_tokens = server._count_usage_text_tokens(request.input)
             if counted_text_tokens > 0:
