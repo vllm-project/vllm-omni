@@ -1,11 +1,11 @@
-# Motubrain 2.0 robot policy on NVIDIA B200
+# Motubrain 2.0 robot policy
 
 Motubrain predicts a chunk of controller actions from synchronized RGB views,
 a language instruction and the current robot pose. vLLM-Omni runs the external
 Motubrain policy in a single diffusion worker and serves its decoded actions
-through the [OpenPI WebSocket API](../../docs/serving/openpi_api.md).
+through the [OpenPI WebSocket API](../../serving/openpi_api.md).
 The single-GPU BF16 configuration is the starting point for the Astribot S1
-and RoboTwin profiles in the [model support table](../../docs/models/supported_models.md).
+and RoboTwin profiles in the [model support table](../supported_models.md).
 
 ## Model and controller contract
 
@@ -121,7 +121,7 @@ Leave the Omni `cache_backend` at its default. These thresholds select
 approximate reuse inside the native denoising loop. Compare cached and
 uncached controller outputs on the same observations and seeds.
 
-## Prepare and serve
+## Prepare and serve on NVIDIA B200
 
 This example serves Astribot. It assumes the native checkpoint has been
 downloaded into `/models/Motubrain2.0-Distill` and its robot-specific

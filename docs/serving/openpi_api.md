@@ -133,9 +133,8 @@ frames are not observation messages.
   seed, so unseeded inferences are independent of each other. The API layer
   consumes `seed`; it is not forwarded inside the observation.
 - Deployments that opt into `openpi_session_rng` can manage an unseeded
-  random stream per rollout. Motubrain starts each named session from the
-  deployment seed, advances it on successful unseeded calls and restarts it
-  on reset. Its explicit per-request seed leaves that stream in place.
+  random stream per rollout. The model controls how its stream advances on
+  unseeded calls and how explicit seeds and resets affect it.
 
 ## Limits and Errors
 
@@ -275,11 +274,9 @@ failures use the existing generic inference error response.
 
 Policies may also supply a typed `native_outputs` mapping. Clients can
 request it with `"return_native_outputs": true` in the observation. The
-response contains the arrays with their original dtypes. Motubrain supplies
-video latents, model actions, decoded actions and a boolean validity mask.
-Ordinary requests keep the action shape and float32 validation described
-above. See the [Motubrain recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ShengShu/Motubrain2-B200.md)
-for its tensor and session contract.
+response contains the arrays with their original dtypes. The policy defines
+the keys and shapes. Ordinary requests keep the action shape and float32
+validation described above.
 
 ### Compatibility and validation limits
 

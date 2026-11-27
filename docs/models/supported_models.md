@@ -53,6 +53,7 @@ th {
 | `MOSSImagePipeline` | MOSS-Image-Base | `OpenMOSS-Team/MOSS-Image-Base` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MOSS-Image/MOSS-Image-Base.md) |
 | `WanPipeline` | Wan2.1-T2V, Wan2.2-T2V, Wan2.2-TI2V | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`, `Wan-AI/Wan2.1-T2V-14B-Diffusers`, `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Wan-AI/Wan2.2-T2V.md) |
 | `WanImageToVideoPipeline` | Wan2.2-I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
+| `Motubrain2Pipeline` | Motubrain 2.0 world-action policy | `GensPI/Motubrain2.0-Base`, `GensPI/Motubrain2.0-Distill`, `Motubrain/Motubrain2.0-robotwin2.0` (prepared serving directories, external runtime) | ✅︎ | | | | [Deployment guide](motubrain2/deployment.md) |
 | `LingBotWorldCausalDMDPipeline` | LingBot-World 2.0 v1 (experimental) | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | Experimental | | | | — |
 | `ABotWorldCausalPipeline` | ABot-World (experimental) | `acvlab/ABot-World-0-5B-LF` | Experimental | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ACVLab/ABot-World.md) |
 | `Cosmos3OmniDiffusersPipeline` | Cosmos3 T2I, T2V, I2V, V2V, T2V with sound, action policy | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
@@ -87,7 +88,6 @@ th {
 | `DreamZeroPipeline` | DreamZero-DROID | `GEAR-Dreams/DreamZero-DROID` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `Pi0Pipeline` | π0 (Pi-Zero) VLA | `lerobot/pi0_base` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi0.md) |
 | `Pi05Pipeline` | π0.5 VLA | `lerobot/pi05_base` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi05.md) |
-| `Motubrain2Pipeline` | Motubrain 2.0 world-action policy | `GensPI/Motubrain2.0-Base`, `GensPI/Motubrain2.0-Distill`, `Motubrain/Motubrain2.0-robotwin2.0` (prepared serving directories, external runtime) | ✅︎ | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ShengShu/Motubrain2-B200.md) |
 | `Sam3Pipeline` | SAM 3 / SAM 3.1 promptable image segmentation; SAM 3 video concept segmentation and tracking | `facebook/sam3.1`, `facebook/sam3` | ✅︎ | | | | [Image](https://github.com/vllm-project/vllm-omni/blob/main/recipes/facebook/SAM3.1-H200.md), [Video](https://github.com/vllm-project/vllm-omni/blob/main/recipes/facebook/SAM3-Video-H200.md) |
 | `VideoDepthAnythingPipeline` | Video Depth Anything relative and metric video depth estimation | `depth-anything/Video-Depth-Anything-Small`, `depth-anything/Metric-Video-Depth-Anything-Small` (and Base/Large) | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/depth-anything/Video-Depth-Anything-H200.md) |
 | `HeliosPipeline`, `HeliosPyramidPipeline` | Helios | `BestWishYsh/Helios-Base`, `BestWishYsh/Helios-Mid`, `BestWishYsh/Helios-Distilled` | ✅︎ | ✅︎ | ✅︎ | | — |
