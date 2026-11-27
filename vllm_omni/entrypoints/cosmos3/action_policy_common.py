@@ -1,14 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
 """Policy image decoding and action transforms shared by local and remote serving."""
 
-import pybase64 as base64
 import io
 import json
 from pathlib import Path
 
 import numpy as np
+import pybase64 as base64
 import torch
 from PIL import Image
 
