@@ -39,8 +39,8 @@ from vllm_omni.engine import (
     OmniEngineCoreOutputs,
     PayloadSenderInfo,
 )
-from vllm_omni.engine.messages import TextInputUpdate
 from vllm_omni.engine.dit_load_state import DitLoadSnapshot
+from vllm_omni.engine.messages import TextInputUpdate
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     DiffusionSubmitKwargs,

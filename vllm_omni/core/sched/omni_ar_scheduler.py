@@ -45,8 +45,8 @@ from vllm_omni.core.sched.utils import (
 from vllm_omni.core.sched.window_policy import SchedulerWindowPolicy
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.engine import CONTEXT_LENGTH_EXCEEDED, AdditionalInformationPayload, OmniEngineCoreOutput
-from vllm_omni.engine.messages import TextInputUpdate
 from vllm_omni.engine.dit_load_state import DitLoadSnapshot
+from vllm_omni.engine.messages import TextInputUpdate
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import CONTINUE_TOKEN_ID
 from vllm_omni.worker_v2.ngram_adapter import is_thinker_ngram, use_scheduler_ngram
