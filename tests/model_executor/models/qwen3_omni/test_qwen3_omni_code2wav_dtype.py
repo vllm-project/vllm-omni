@@ -119,9 +119,14 @@ def test_invalid_fallback_option_fails_before_model_construction(mocker, value):
         _codec(mocker, torch.float32, device="cpu", connector={"extra": {"codec_cudnn_fp32_fallback": value}})
 
 
-@pytest.mark.parametrize("profile", ["qwen3_omni_moe.yaml", "qwen3_omni_moe_codec.yaml"])
+@pytest.mark.parametrize(
+    ("profile", "first_frame_enabled"),
+    [("qwen3_omni_moe.yaml", False), ("qwen3_omni_moe_codec.yaml", True), ("qwen3_omni_moe_mrv2.yaml", True)],
+)
 @pytest.mark.parametrize("fallback", [False, True])
-def test_deploy_option_reaches_both_decoder_placements(mocker, blackwell_cudnn, tmp_path, profile, fallback):
+def test_deploy_option_reaches_both_decoder_placements(
+    mocker, blackwell_cudnn, tmp_path, profile, first_frame_enabled, fallback
+):
     from tests.helpers.stage_config import get_deploy_config_path
     from vllm_omni.config.stage_config import resolve_deploy_yaml
     from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
@@ -174,7 +179,7 @@ def test_deploy_option_reaches_both_decoder_placements(mocker, blackwell_cudnn, 
                 first = Qwen3OmniMoeForConditionalGeneration._build_first_frame_decoder(
                     vllm_config, config.code2wav_config, ""
                 )
-                assert (first is not None) == profile.endswith("mrv2.yaml")
+                assert (first is not None) == first_frame_enabled
                 if first is not None:
                     decoders.append(first.code2wav)
             else:
