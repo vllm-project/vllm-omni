@@ -161,8 +161,6 @@ vllm serve /models/robotwin-serving --omni \
 ```
 
 The Astribot split deployment uses one worker that can see two CUDA devices.
-Both profiles were exercised on NVIDIA B200 devices with 183,359 MiB of
-device memory per GPU and a single concurrent observation.
 Use `/opt/vllm-omni/vllm_omni/deploy/motubrain2-astribot-2gpu.yaml` to put
 the denoiser on local GPU 0 and the encoders on local GPU 1. Keep model
 parallelism at one. Both deployments use BF16 denoiser weights by default.
@@ -219,23 +217,6 @@ with connect(uri, compression=None, max_size=None) as ws:
 ```
 
 ## Verification
-
-Earlier worker qualification used vLLM 0.34.0, PyTorch 2.14.0, CUDA 13.0 and BF16
-denoiser weights on NVIDIA B200. Two requests
-with seed 42 for one recorded Astribot observation reproduced all 600 native
-action values on each tested deployment. Distill used its four-step consistency
-schedule on one GPU and with split encoders on two GPUs. Base used its 30-step
-Euler schedule on one GPU. Both sides used the same calibration and FP32 matmul
-settings. For Distill in eager mode, the client measured the first and
-second requests at 2.25 s and 0.52 s on one GPU and 2.36 s and 0.50 s on
-two GPUs. These are two sequential WebSocket round-trips at seed 42 and
-concurrency one. Post-inference device memory snapshots showed 58,940 MiB
-for the one-GPU profile and 38,036/21,626 MiB for the split profile.
-Peak device and host memory were not measured.
-
-A separate RoboTwin WebSocket test exercised the released DMD
-checkpoint with synthetic inputs and checked the 24 × 16 reply, unit pose
-quaternions and reset.
 
 The CPU suite exercises the Motubrain WebSocket and compares four outputs of
 a small policy with the native CLI. The checkpoint-gated WebSocket test
