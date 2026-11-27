@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Lifecycle wrapper around :class:`OmniCoordinator`.
 
@@ -18,12 +18,12 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import multiprocessing.connection
-import os
 import signal
 import weakref
-from typing import Any
+from typing import Any, cast
 
 from vllm.utils.network_utils import get_open_ports_list
+from vllm.utils.system_utils import get_mp_context
 
 from vllm_omni.distributed.omni_coordinator.omni_coordinator import OmniCoordinator
 
@@ -52,23 +52,13 @@ def run_omni_coordinator_proc(
 
 
 def _get_coordinator_mp_context() -> multiprocessing.context.BaseContext:
-    """Return the multiprocessing context used for OmniCoordinator.
+    """Use vLLM's process context, the same one ``DPCoordinator`` uses.
 
-    For the current vllm-omni startup path, ``spawn`` is too expensive: the
-    child re-imports a heavy CLI / model stack before it can acknowledge the
-    ready pipe, which can exceed the coordinator startup timeout. Prefer
-    ``fork`` on platforms that support it.
-
-    ``fork`` must happen before the parent initializes CUDA or owns long-lived
-    ZMQ sockets; otherwise the child inherits unsafe state. If coordinator
-    startup moves later, switch this to ``spawn``/``forkserver``.
-
-    TODO: make the coordinator child entry cheap and spawn-safe, then revisit
-    whether ``spawn`` is still needed here.
+    Inside a Ray actor vLLM forces ``spawn``. Fork copies the parent's ZMQ
+    context, and the colocated weight-sync socket bound in that process
+    then fails its next ``bind`` with ``EADDRINUSE``.
     """
-    if os.name != "nt" and "fork" in multiprocessing.get_all_start_methods():
-        return multiprocessing.get_context("fork")
-    return multiprocessing.get_context("spawn")
+    return get_mp_context()
 
 
 def _shutdown_proc(proc: multiprocessing.Process) -> None:
@@ -107,7 +97,7 @@ class OmniCoordinatorRuntime:
 
         self._closed = False
 
-        ctx = _get_coordinator_mp_context()
+        ctx = cast(Any, _get_coordinator_mp_context())
         parent_conn, child_conn = ctx.Pipe(duplex=False)
 
         self._proc: multiprocessing.Process = ctx.Process(
@@ -124,11 +114,13 @@ class OmniCoordinatorRuntime:
         self._proc.start()
         child_conn.close()
 
-        ready = multiprocessing.connection.wait([parent_conn, self._proc.sentinel], timeout=30)
+        # Spawn re-imports the engine stack, so its ready wait is longer than fork.
+        ready_timeout = 180.0 if ctx.get_start_method() == "spawn" else 30.0
+        ready = multiprocessing.connection.wait([parent_conn, self._proc.sentinel], timeout=ready_timeout)
         if not ready:
             self._proc.terminate()
             self._proc.join(timeout=5)
-            raise RuntimeError("OmniCoordinator process failed to start within 30s")
+            raise RuntimeError(f"OmniCoordinator process failed to start within {ready_timeout:.0f}s")
 
         try:
             status = parent_conn.recv()

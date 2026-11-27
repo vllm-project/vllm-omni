@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import threading
@@ -18,6 +18,14 @@ from vllm_omni.distributed.omni_coordinator import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_coordinator_context_follows_vllm_spawn(monkeypatch):
+    """A Ray actor forces spawn. The coordinator must not keep its own fork."""
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    from vllm_omni.distributed.omni_coordinator.runtime import _get_coordinator_mp_context
+
+    assert _get_coordinator_mp_context().get_start_method() == "spawn"
 
 
 class _CoordEnv:
