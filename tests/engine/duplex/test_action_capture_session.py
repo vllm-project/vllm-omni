@@ -17,6 +17,7 @@ mid-response returns the partial set sealed.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -525,6 +526,46 @@ async def test_close_mid_response_returns_partial_set_via_terminal_cache() -> No
         while h.manager.take_terminal_action_records(SESSION_ID) is not None:
             pass
         assert h.manager.take_terminal_action_records(SESSION_ID) is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_abandoned_terminal_records_expire_in_one_error_line(caplog: pytest.LogCaptureFixture) -> None:
+    """An abandoned session logs one ERROR naming the dropped set count."""
+    h = await open_capture_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            capture_payload=_unit_payload(seq=1),
+        )
+        h.session.begin_response(turn_id=h.session.turn_id)
+        await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            capture_payload=_unit_payload(seq=2, token_ids=(12, LISTEN_TOKEN_ID)),
+        )
+        await h.manager.shutdown()
+        with h.manager._terminal_action_records_lock:
+            deadline, sets = h.manager._terminal_action_records[SESSION_ID]
+            assert sets
+            h.manager._terminal_action_records[SESSION_ID] = (h.manager._clock() - 1.0, sets)
+            retained = len(sets)
+        with caplog.at_level(logging.ERROR):
+            assert h.manager.take_terminal_action_records(SESSION_ID) is None
+        matching = [
+            record
+            for record in caplog.records
+            if (
+                SESSION_ID in record.getMessage() and f"expired with {retained} uncollected sets" in record.getMessage()
+            )
+        ]
+        assert len(matching) == 1
     finally:
         await close_harness(h)
 

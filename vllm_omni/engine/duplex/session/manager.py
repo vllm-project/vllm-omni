@@ -87,6 +87,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # How long sealed action records of a closed session stay collectable.
+# The training driver drains within seconds of close; this is the bound for a client that never does.
 TERMINAL_ACTION_RECORDS_TTL_S = 300.0
 
 #: Every correlated control RPC the manager routes. ``accepts`` and the handler
@@ -969,7 +970,7 @@ class DuplexSessionManager:
             deadline, sets = entry
             if self._clock() > deadline:
                 self._terminal_action_records.pop(session_id, None)
-                logger.error("duplex terminal action records for session %s expired uncollected", session_id)
+                self._log_expired_terminal_records(session_id, sets)
                 return None
             if not sets:
                 self._terminal_action_records.pop(session_id, None)
@@ -990,11 +991,19 @@ class DuplexSessionManager:
         """Drop past-deadline terminal records loudly (called by the reaper)."""
         now = self._clock()
         with self._terminal_action_records_lock:
-            expired = [sid for sid, (deadline, _) in self._terminal_action_records.items() if now > deadline]
-            for sid in expired:
+            expired = [(sid, sets) for sid, (deadline, sets) in self._terminal_action_records.items() if now > deadline]
+            for sid, _sets in expired:
                 self._terminal_action_records.pop(sid, None)
-        for sid in expired:
-            logger.error("duplex terminal action records for session %s expired uncollected", sid)
+        for sid, sets in expired:
+            self._log_expired_terminal_records(sid, sets)
+
+    def _log_expired_terminal_records(self, session_id: str, sets: list[DuplexActionRecordSet]) -> None:
+        """One ERROR for an abandoned terminal cache entry, with the dropped count."""
+        logger.error(
+            "duplex terminal action records for session %s expired with %d uncollected sets",
+            session_id,
+            len(sets),
+        )
 
     async def _finalize_pending_cleanup(
         self,
