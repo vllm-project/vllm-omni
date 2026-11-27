@@ -8,6 +8,7 @@ GPU or vLLM runtime.
 
 from __future__ import annotations
 
+import sys
 import time
 import unittest
 from copy import deepcopy
@@ -18,6 +19,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
@@ -26,10 +29,12 @@ from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_connector_spec,
 )
-from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
 )
+from vllm_omni.worker.scheduling_metadata_adapter import resolve_scheduling_metadata_adapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -76,12 +81,14 @@ def _make_model_config(
     async_chunk: bool = False,
     worker_type: str = "ar",
     custom_func: str | None = None,
+    scheduling_metadata_adapter: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         stage_connector_config=None,
         async_chunk=async_chunk,
         worker_type=worker_type,
         custom_process_next_stage_input_func=custom_func,
+        scheduling_metadata_adapter=scheduling_metadata_adapter,
     )
 
 
@@ -89,6 +96,7 @@ def _make_request(req_id: str, external_req_id: str | None = None):
     r = SimpleNamespace(
         request_id=req_id,
         external_req_id=external_req_id or req_id,
+        payload_sender_info=None,
         additional_information=None,
         prompt_token_ids=[],
         num_computed_tokens=0,
@@ -153,6 +161,26 @@ class _FakeTPGroup:
         if self.rank_in_group == src:
             return obj
         return self.follower_result
+
+
+class _EchoSchedulingMetadataAdapter:
+    """Dummy adapter resolved from a dotted path in mixin integration tests."""
+
+    def extract(self, payload: Any, *, model_mode: str) -> SchedulingMetadataUpdate:
+        del payload, model_mode
+        return SchedulingMetadataUpdate(resize_prompt_to=7)
+
+
+class _FailingSchedulingMetadataAdapter:
+    def extract(self, payload: Any, *, model_mode: str) -> SchedulingMetadataUpdate | None:
+        del payload, model_mode
+        raise ValueError("invalid scheduling metadata")
+
+
+class _WrongReturnSchedulingMetadataAdapter:
+    def extract(self, payload: Any, *, model_mode: str) -> dict[str, Any]:
+        del payload, model_mode
+        return {}
 
 
 # ------------------------------------------------------------------ #
@@ -233,7 +261,11 @@ def test_split_request_endpoint_retry_completion_and_cleanup(async_chunk, rank, 
             host.register_chunk_recv(replacement)
             assert not host._poll_single_request("r1")
             if rank == 0:
-                get.assert_called_once_with("0", "1", "external-new_0_0")
+                if async_chunk:
+                    get.assert_called_once_with("0", "1", "external-new_0_0")
+                else:
+                    # Full payload takes the deadline-aware get, which forwards metadata (None here).
+                    get.assert_called_once_with("0", "1", "external-new_0_0", None)
             else:
                 get.assert_not_called()
             assert connector.sender_host == "configured-host"
@@ -481,14 +513,14 @@ class TestOmniConnectorOutput(unittest.TestCase):
 
         host._chunk_ready_req_ids.add("req-1")
         host._chunk_finished_req_ids.add("req-2")
-        host._local_request_metadata["req-1"] = {"next_stage_prompt_len": 10}
+        host._local_request_metadata["req-1"] = SchedulingMetadataUpdate(resize_prompt_to=10)
         host._stage_recv_req_ids.add("req-3")
 
         output = host.get_omni_connector_output()
         self.assertIsInstance(output, OmniConnectorOutput)
         self.assertEqual(output.chunk_ready_req_ids, {"req-1"})
         self.assertEqual(output.chunk_finished_req_ids, {"req-2"})
-        self.assertEqual(output.request_metadata, {"req-1": {"next_stage_prompt_len": 10}})
+        self.assertEqual(output.request_metadata, {"req-1": SchedulingMetadataUpdate(resize_prompt_to=10)})
         self.assertEqual(output.stage_recv_req_ids, {"req-3"})
 
         output2 = host.get_omni_connector_output()
@@ -793,7 +825,7 @@ class TestChunkStreamCompletedGuard(unittest.TestCase):
             host._chunk_finished_req_ids.add(req_id)
             host._chunk_stream_completed.add(req_id)
             host._local_stage_payload_cache[req_id] = {"finished": True}
-            host._local_request_metadata[req_id] = {}
+            host._local_request_metadata[req_id] = SchedulingMetadataUpdate()
             host._finished_load_reqs.add(req_id)
             host._pending_load_reqs.pop(req_id, None)
 
@@ -860,7 +892,7 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         host._chunk_stream_completed.add(req_id)
         host._stage_recv_req_ids.add(req_id)
         host._local_stage_payload_cache[req_id] = {"engine_inputs": {}}
-        host._local_request_metadata[req_id] = {"prompt_len": 10}
+        host._local_request_metadata[req_id] = SchedulingMetadataUpdate(resize_prompt_to=10)
 
         # Cleanup
         host.cleanup_finished_request(req_id)
@@ -986,7 +1018,7 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         host._request_ids_mapping[req_id] = ext_id
         host._put_req_chunk[ext_id] = 1
         host._local_stage_payload_cache[req_id] = {"engine_inputs": {"ids": [1, 2, 3]}}
-        host._local_request_metadata[req_id] = {"next_stage_prompt_len": 3}
+        host._local_request_metadata[req_id] = SchedulingMetadataUpdate(resize_prompt_to=3)
         host._stage_recv_req_ids.add(req_id)
 
         pruned = host.prune_inactive_requests(set())
@@ -1088,6 +1120,7 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         host._local_rank = 0
         host._request_ids_mapping["r1"] = "ext-r1"
         host._get_req_chunk["r1"] = 0
+        host._pending_load_reqs["r1"] = object()
         payload = {"tok": [10], "finished": torch.tensor(True)}
         connector_result = (payload, 123)
         host._omni_connector.get.return_value = connector_result
@@ -1129,7 +1162,7 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         host._stage_id = 2
         host._local_rank = 1
         host._pending_load_reqs["r1"] = object()
-        payload = {"tok": [10], "finished": torch.tensor(True)}
+        payload = {"tok": [10], "meta": {"finished": torch.tensor(True)}}
         tp_group = _FakeTPGroup(world_size=2, rank_in_group=1, follower_result={"r1": payload})
 
         with patch.object(host, "_get_local_tp_group", return_value=tp_group):
@@ -1137,10 +1170,121 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
 
         self.assertEqual(results, {"r1": payload})
         self.assertEqual(host.get_local_stage_payload("r1"), payload)
-        self.assertEqual(host.get_local_request_metadata("r1"), {})
+        self.assertEqual(host.get_local_request_metadata("r1"), SchedulingMetadataUpdate(input_terminal=True))
         self.assertEqual(host._stage_recv_req_ids, {"r1"})
         self.assertNotIn("r1", host._pending_load_reqs)
         self.assertEqual(tp_group.broadcast_inputs, [None])
+        host.shutdown_omni_connectors()
+
+    def test_tp_follower_leaves_inline_payload_to_leader_broadcast(self):
+        """Ensure a TP follower doesn't stage an inline payload (e.g., for run requests) since it gets it
+        from the leader's broadcast."""
+        host = self._make_host()
+        host._stage_id = 1
+        host._local_rank = 1
+        handle = OmniChunkRecvHandle(request_id="r1", payload_sender_info=OmniSerializer.serialize(OmniPayload()))
+
+        with patch.object(host, "_get_local_tp_group", return_value=_FakeTPGroup(world_size=2, rank_in_group=1)):
+            host.register_chunk_recv(handle)
+
+        self.assertNotIn("r1", host._pending_load_reqs)
+        self.assertNotIn("r1", host._local_stage_payload_cache)
+        host.shutdown_omni_connectors()
+
+
+class TestCustomSchedulingMetadataAdapterResolution(unittest.TestCase):
+    """Runner-side resolution of a configured scheduling metadata adapter."""
+
+    @staticmethod
+    def _dotted_path() -> str:
+        return f"{__name__}._EchoSchedulingMetadataAdapter"
+
+    @staticmethod
+    def _resolve_import_module_patch():
+        """Return a context manager that resolves the local dummy class by path.
+
+        pytest may import this module under different fully qualified names
+        (``tests.worker.test_omni_connector_mixin`` vs ``test_omni_connector_mixin``),
+        so vendor the module lookup through ``sys.modules`` instead of relying
+        on the importable dotted name.
+        """
+        return patch(
+            "vllm_omni.worker.scheduling_metadata_adapter.importlib.import_module",
+            return_value=sys.modules[__name__],
+        )
+
+    def test_recv_full_payload_uses_configured_adapter(self):
+        """A dotted-path adapter is resolved at init and drives extraction.
+
+        Covering init resolution implicitly: the recv path can only return the
+        custom effect if ``init_omni_connectors`` loaded the dummy class.
+        """
+        with self._resolve_import_module_patch():
+            host = MixinHost()
+            host.init_omni_connectors(
+                model_config=_make_model_config(
+                    stage_id=2,
+                    worker_type="generation",
+                    scheduling_metadata_adapter=self._dotted_path(),
+                )
+            )
+        host._omni_connector = MagicMock()
+        host._stage_id = 2
+        host._local_rank = 0
+        payload = {"meta": {"next_stage_prompt_len": 9}}
+        host._local_stage_payload_cache["r1"] = payload
+        host._full_payload_pending_broadcast_req_ids.add("r1")
+        tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
+
+        with patch.object(host, "_get_local_tp_group", return_value=tp_group):
+            results = host.recv_full_payload_inputs(scheduler_output=None)
+
+        self.assertEqual(results, {"r1": payload})
+        self.assertEqual(
+            host.get_local_request_metadata("r1"),
+            SchedulingMetadataUpdate(resize_prompt_to=7),
+        )
+        self.assertNotIn("r1", host._full_payload_pending_broadcast_req_ids)
+        host.shutdown_omni_connectors()
+
+    def test_adapter_exception_preserves_full_payload_receive_transition(self):
+        host = MixinHost()
+        host.init_omni_connectors(model_config=_make_model_config(stage_id=2, worker_type="generation"))
+        host._scheduling_metadata_adapter = resolve_scheduling_metadata_adapter(_FailingSchedulingMetadataAdapter())
+        host._local_stage_payload_cache["r1"] = {"meta": {"next_stage_prompt_len": 9}}
+        host._full_payload_pending_broadcast_req_ids.add("r1")
+
+        with self.assertRaisesRegex(ValueError, "invalid scheduling metadata"):
+            host.recv_full_payload_inputs(scheduler_output=None)
+
+        self.assertIn("r1", host._full_payload_pending_broadcast_req_ids)
+        self.assertNotIn("r1", host._stage_recv_req_ids)
+        self.assertIsNone(host.get_local_request_metadata("r1"))
+
+        host._scheduling_metadata_adapter = resolve_scheduling_metadata_adapter(_EchoSchedulingMetadataAdapter())
+        results = host.recv_full_payload_inputs(scheduler_output=None)
+        self.assertEqual(results, {"r1": {"meta": {"next_stage_prompt_len": 9}}})
+        self.assertNotIn("r1", host._full_payload_pending_broadcast_req_ids)
+        self.assertIn("r1", host._stage_recv_req_ids)
+        self.assertEqual(
+            host.get_local_request_metadata("r1"),
+            SchedulingMetadataUpdate(resize_prompt_to=7),
+        )
+        host.shutdown_omni_connectors()
+
+    def test_wrong_adapter_return_preserves_full_payload_receive_transition(self):
+        host = MixinHost()
+        host.init_omni_connectors(model_config=_make_model_config(stage_id=2, worker_type="generation"))
+        host._scheduling_metadata_adapter = resolve_scheduling_metadata_adapter(_WrongReturnSchedulingMetadataAdapter())
+        host._local_stage_payload_cache["r1"] = {"meta": {"next_stage_prompt_len": 9}}
+        host._full_payload_pending_broadcast_req_ids.add("r1")
+
+        with self.assertRaisesRegex(TypeError, "must return None or SchedulingMetadataUpdate"):
+            host.recv_full_payload_inputs(scheduler_output=None)
+
+        self.assertIn("r1", host._full_payload_pending_broadcast_req_ids)
+        self.assertNotIn("r1", host._stage_recv_req_ids)
+        self.assertIsNone(host.get_local_request_metadata("r1"))
         host.shutdown_omni_connectors()
 
 
@@ -1161,6 +1305,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
 
     def test_rank0_only_polls_connector_for_tp_async_chunk(self):
         host = self._make_host(rank=0)
+        host._pending_load_reqs["r1"] = object()
         payload = {
             "codes": {"audio": [10, 11]},
             "meta": {"left_context_size": 0, "finished": torch.tensor(False)},
@@ -1177,6 +1322,52 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         self.assertIn("r1", host._finished_load_reqs)
         self.assertIn("r1", host._async_chunk_updated_req_ids)
         self.assertEqual(tp_group.broadcast_inputs, [])
+        host.shutdown_omni_connectors()
+
+    def test_poll_single_request_accepts_tensor_audio_codes(self):
+        host = self._make_host(rank=0)
+        host._scheduling_metadata_adapter = MagicMock()
+        host._pending_load_reqs["r1"] = object()
+        audio_codes = torch.tensor([[10, 11, 12]], dtype=torch.long)
+        payload = {
+            "codes": {"audio": audio_codes},
+            "meta": {"finished": torch.tensor(False)},
+        }
+        host._omni_connector.get.return_value = (payload, 123)
+
+        with patch.object(host, "_get_local_tp_group", return_value=None):
+            made_progress = host._poll_single_request("r1")
+
+        self.assertTrue(made_progress)
+        self.assertEqual(host._get_req_chunk["r1"], 1)
+        cached_payload = host.get_local_stage_payload("r1")
+        self.assertIsNotNone(cached_payload)
+        self.assertTrue(torch.equal(cached_payload["codes"]["audio"], audio_codes))
+        self.assertIn("r1", host._finished_load_reqs)
+        self.assertIn("r1", host._async_chunk_updated_req_ids)
+        self.assertEqual(
+            host.get_omni_connector_output().request_metadata,
+            {"r1": SchedulingMetadataUpdate(prompt_token_ids=(10, 11, 12))},
+        )
+        host._scheduling_metadata_adapter.extract.assert_not_called()
+        host.shutdown_omni_connectors()
+
+    def test_finish_only_chunk_publishes_terminal_metadata_to_sink(self):
+        host = self._make_host(rank=0)
+        host._pending_load_reqs["r1"] = object()
+        host._omni_connector.get.return_value = ({"meta": {"finished": torch.tensor(True)}}, 1)
+        sink = MagicMock()
+        host.set_omni_connector_output_sink(sink)
+
+        with patch.object(host, "_get_local_tp_group", return_value=None):
+            self.assertTrue(host._poll_single_request("r1"))
+
+        sink.assert_called_once()
+        output = sink.call_args.args[0]
+        self.assertEqual(output.chunk_ready_req_ids, {"r1"})
+        self.assertEqual(output.chunk_finished_req_ids, {"r1"})
+        self.assertEqual(output.request_metadata, {"r1": SchedulingMetadataUpdate(input_terminal=True)})
+        self.assertEqual(host.get_omni_connector_output().request_metadata, {})
         host.shutdown_omni_connectors()
 
     def test_tp_follower_skips_connector_poll_for_async_chunk(self):
@@ -1202,7 +1393,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         }
         packet = {
             "staged_payloads": {"r1": payload},
-            "request_metadata": {"r1": {"code_predictor_codes": [10, 11], "left_context_size": 0}},
+            "request_metadata": {"r1": SchedulingMetadataUpdate(prompt_token_ids=(10, 11))},
             "newly_finished": {"r1"},
             "chunk_finished": {"r1"},
         }
@@ -1215,7 +1406,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         self.assertEqual(output.chunk_finished_req_ids, {"r1"})
         self.assertEqual(
             output.request_metadata,
-            {"r1": {"code_predictor_codes": [10, 11], "left_context_size": 0}},
+            {"r1": SchedulingMetadataUpdate(prompt_token_ids=(10, 11))},
         )
         self.assertEqual(host.get_local_stage_payload("r1"), payload)
         self.assertNotIn("r1", host._pending_load_reqs)
@@ -1376,17 +1567,19 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         self.assertTrue(host._payload_is_consumable(payload))
         host.shutdown_omni_connectors()
 
-    def test_ar_metadata_only_followup_chunk_does_not_rewake_request(self):
+    def test_ar_metadata_only_followup_chunk_uses_builtin_adapter(self):
         host = MixinHost()
         host.init_omni_connectors(
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
+        host._scheduling_metadata_adapter = MagicMock()
         host._omni_connector = MagicMock()
         host._stage_id = 1
         host._async_chunk = True
         host._model_mode = "ar"
         host._request_ids_mapping["r1"] = "ext-r1"
         host._get_req_chunk["r1"] = 0
+        host._pending_load_reqs["r1"] = object()
 
         host._omni_connector.get.side_effect = [
             (
@@ -1411,7 +1604,8 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host._poll_single_request("r1")
         output2 = host.get_omni_connector_output()
         self.assertEqual(output2.chunk_ready_req_ids, set())
-        self.assertEqual(output2.request_metadata, {"r1": {"next_stage_prompt_len": 7}})
+        self.assertEqual(output2.request_metadata, {"r1": SchedulingMetadataUpdate(resize_prompt_to=7)})
+        host._scheduling_metadata_adapter.extract.assert_not_called()
 
         host.shutdown_omni_connectors()
 
@@ -1451,10 +1645,8 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host._model_mode = "gen"
         host._request_ids_mapping["r1"] = "ext-r1"
         host._get_req_chunk["r1"] = 1
-        host._local_request_metadata["r1"] = {
-            "code_predictor_codes": [10, 11, 12],
-            "left_context_size": 0,
-        }
+        host._pending_load_reqs["r1"] = object()
+        host._local_request_metadata["r1"] = SchedulingMetadataUpdate(prompt_token_ids=(10, 11, 12))
         host._finished_load_reqs.add("r1")
 
         made_progress = host._poll_single_request("r1")
@@ -1464,7 +1656,7 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         self.assertEqual(host._get_req_chunk["r1"], 1)
 
         output = host.get_omni_connector_output()
-        self.assertEqual(output.request_metadata["r1"]["code_predictor_codes"], [10, 11, 12])
+        self.assertEqual(output.request_metadata["r1"], SchedulingMetadataUpdate(prompt_token_ids=(10, 11, 12)))
         self.assertEqual(output.chunk_ready_req_ids, {"r1"})
 
         host._omni_connector.get.return_value = (
@@ -1850,6 +2042,9 @@ class TestSendRetry(unittest.TestCase):
         sender = self._make_sender(MockConnector(stage_id=0))
         sender._pending_save_counts["r1"] = 1
         task = self._make_task()
+        task["client_index"] = 4
+        task["put_key"] = "r1_0_0"
+        task["_last_send_error"] = ConnectionError("put rejected")
         task["_retry_count"] = sender._MAX_SEND_RETRIES  # already at max
 
         sender._requeue_or_drop_failed_send(task)
@@ -1858,6 +2053,13 @@ class TestSendRetry(unittest.TestCase):
             dq = sender._pending_save_reqs.get("r1")
         self.assertTrue(dq is None or len(dq) == 0, "task should NOT be re-enqueued after max retries")
         self.assertNotIn("r1", sender._pending_save_counts, "pending count should be cleaned up on final drop")
+        output = sender.get_omni_connector_output()
+        client_index, reason = output.permanent_send_failures["r1"]
+        self.assertEqual(client_index, 4)
+        self.assertIn("Stage-0", reason)
+        self.assertIn("r1_0_0", reason)
+        self.assertIn("put rejected", reason)
+        self.assertEqual(sender.get_omni_connector_output().permanent_send_failures, {})
         sender.shutdown_omni_connectors()
 
     def test_save_loop_retries_on_exception(self):
@@ -1910,6 +2112,55 @@ class TestSendRetry(unittest.TestCase):
         self.assertTrue(success)
         sender.shutdown_omni_connectors()
 
+    def test_in_flight_ticket_retries_until_send_give_up(self):
+        """A failed put must not look finished just because the ticket is in flight."""
+
+        class _Ticket:
+            def __init__(self):
+                self._state = "QUEUED"
+                self.errors = []
+
+            @property
+            def state(self):
+                return type("State", (), {"name": self._state})()
+
+            def mark_in_flight(self):
+                if self._state != "QUEUED":
+                    return False
+                self._state = "IN_FLIGHT"
+                return True
+
+            def set_error(self, error):
+                self.errors.append(error)
+                self._state = "FAILED"
+
+            def set_result(self):
+                self._state = "DELIVERED"
+
+        connector = _FailingConnector(fail_count=999)
+        sender = self._make_sender(connector)
+        ticket = _Ticket()
+        task = self._make_task()
+        task["completion"] = ticket
+        task["put_key"] = "r1_0_0"
+        task["client_index"] = 4
+        sender._pending_save_counts["r1"] = 1
+        stage_fatal: list[BaseException] = []
+        sender._connector_send_error_sink = stage_fatal.append
+
+        for _ in range(sender._MAX_SEND_RETRIES + 1):
+            success = sender._send_single_request(task)
+            self.assertFalse(success)
+            sender._requeue_or_drop_failed_send(task, error=RuntimeError("put rejected"))
+
+        self.assertEqual(ticket.state.name, "DELIVERED")
+        self.assertFalse(ticket.errors)
+        self.assertEqual(stage_fatal, [])
+        output = sender.get_omni_connector_output()
+        self.assertIn("r1", output.permanent_send_failures)
+        self.assertIn("put rejected", output.permanent_send_failures["r1"][1])
+        sender.shutdown_omni_connectors()
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -1949,3 +2200,255 @@ def test_full_payload_replace_overrides_codec_validity_accumulation(legacy_entry
         output, actual_request = host._materialize_full_payload_entry(host._pending_full_payload_send["r"])
         assert output["meta.codec_frame_valid"].tolist() == valid
         assert actual_request is request
+
+
+def test_first_stage_output_drain_does_not_broadcast_to_non_reply_tp_rank():
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=0, async_chunk=True))
+    tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
+    try:
+        with (
+            patch.object(host, "_get_local_tp_group", return_value=tp_group),
+            patch.object(tp_group, "broadcast_object", side_effect=AssertionError("no receiving rank")),
+        ):
+            for index in range(32):
+                req_id = f"request-{index}"
+                host._kv_sent_req_ids.append(req_id)
+                output = host.get_omni_connector_output()
+                assert output.kv_sent_req_ids == [req_id]
+                assert host.get_omni_connector_output().kv_sent_req_ids == []
+    finally:
+        host.shutdown_omni_connectors()
+
+
+def test_recv_deadline_fails_request_and_stops_polling(monkeypatch):
+    from vllm_omni.core.sched import omni_scheduler_mixin as sched
+    from vllm_omni.distributed.omni_connectors.model_runner import omni_connector_payload_transport as transport
+
+    monkeypatch.setattr(sched, "DEFAULT_INPUT_WAIT_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(transport, "_INPUT_WAIT_TIMEOUT_MODULE", sched)
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=1, async_chunk=False))
+    connector = MagicMock()
+    connector.get.return_value = None
+    host._omni_connector = connector
+    host._stage_id = 1
+    host._async_chunk = False
+    request = _make_request("req-wait")
+    request.client_index = 6
+    try:
+        host.register_chunk_recv(request)
+        time.sleep(0.02)
+        host._poll_pending_requests_once(list(host._pending_load_reqs))
+        assert "req-wait" not in host._pending_load_reqs
+        client_index, reason = host.get_omni_connector_output().permanent_recv_failures["req-wait"]
+        assert client_index == 6
+        assert reason.startswith("Stage-1")
+        assert "timed out" in reason
+    finally:
+        host.shutdown_omni_connectors()
+
+
+def test_expired_poll_abandons_claim_left_by_an_early_empty_get(monkeypatch):
+    """A lost handshake returns before the deadline and leaves the claim for the next poll."""
+    from vllm_omni.core.sched import omni_scheduler_mixin as sched
+    from vllm_omni.distributed.omni_connectors.model_runner import omni_connector_payload_transport as transport
+
+    monkeypatch.setattr(sched, "DEFAULT_INPUT_WAIT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(transport, "_INPUT_WAIT_TIMEOUT_MODULE", sched)
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=1, async_chunk=False))
+    abandoned: list[str] = []
+
+    class _EarlyNone:
+        def get(self, *args, **kwargs):
+            raise AssertionError("full-payload poll used get() without a deadline")
+
+        def get_with_deadline(self, from_stage, to_stage, key, metadata=None, *, deadline):
+            return None
+
+        def abandon_get(self, key):
+            abandoned.append(key)
+
+    host._omni_connector = _EarlyNone()
+    host._stage_id = 1
+    host._async_chunk = False
+    request = _make_request("req-claim")
+    try:
+        host.register_chunk_recv(request)
+        host._poll_pending_requests_once(["req-claim"])
+        assert abandoned == []
+        assert "req-claim" in host._pending_load_reqs
+        time.sleep(0.06)
+        host._poll_pending_requests_once(["req-claim"])
+        assert abandoned == ["req-claim_0_0"]
+        assert "req-claim" not in host._pending_load_reqs
+    finally:
+        host.shutdown_omni_connectors()
+
+
+def test_cancel_pending_receive_abandons_claim_left_by_empty_get():
+    """Runner cleanup must queue the retained key for the receive thread."""
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=1, async_chunk=False))
+    abandoned: list[str] = []
+
+    class _EarlyNone:
+        def get(self, *args, **kwargs):
+            raise AssertionError("full-payload poll used get() without a deadline")
+
+        def get_with_deadline(self, from_stage, to_stage, key, metadata=None, *, deadline):
+            return None
+
+        def abandon_get(self, key):
+            abandoned.append(key)
+
+    host._omni_connector = _EarlyNone()
+    host._stage_id = 1
+    host._async_chunk = False
+    request = _make_request("req-cancel")
+    try:
+        host.register_chunk_recv(request)
+        host._poll_pending_requests_once(["req-cancel"])
+        assert abandoned == []
+        assert host._active_recv_claim_keys["req-cancel"] == "req-cancel_0_0"
+        host.cleanup_finished_request("req-cancel")
+        assert "req-cancel" not in host._pending_load_reqs
+        assert abandoned == []
+        assert list(host._recv_claim_abandons) == ["req-cancel_0_0"]
+        host._drain_recv_claim_abandons()
+        assert abandoned == ["req-cancel_0_0"]
+        assert list(host._recv_claim_abandons) == []
+    finally:
+        host.shutdown_omni_connectors()
+
+
+def test_poll_skips_get_when_receive_canceled_before_claim_key():
+    """Cleanup between key derivation and remember must not enter the connector."""
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=1, async_chunk=False))
+    gets: list[str] = []
+
+    class _MustNotGet:
+        def get(self, *args, **kwargs):
+            gets.append("get")
+            raise AssertionError("canceled receive must not call get")
+
+        def get_with_deadline(self, from_stage, to_stage, key, metadata=None, *, deadline):
+            gets.append("get_with_deadline")
+            raise AssertionError("canceled receive must not call get_with_deadline")
+
+        def abandon_get(self, key):
+            raise AssertionError("no claim key should have been retained")
+
+    host._omni_connector = _MustNotGet()
+    host._stage_id = 1
+    host._async_chunk = False
+    request = _make_request("req-race")
+    remember = type(host)._remember_recv_claim_key
+
+    def cancel_then_remember(req_id, connector_get_key):
+        # Runner cleanup wins the window after the poll derived the key and
+        # before it registers that key under the lock.
+        host.cleanup_finished_request(req_id)
+        return remember(host, req_id, connector_get_key)
+
+    host._remember_recv_claim_key = cancel_then_remember
+    try:
+        host.register_chunk_recv(request)
+        assert host._poll_single_request("req-race") is False
+        assert gets == []
+        assert "req-race" not in host._pending_load_reqs
+        assert "req-race" not in host._active_recv_claim_keys
+        assert list(host._recv_claim_abandons) == []
+    finally:
+        host.shutdown_omni_connectors()
+
+
+def test_permanent_recv_error_fails_on_first_get():
+    from vllm_omni.distributed.omni_connectors.connectors.base import PermanentTransferError
+
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=2, async_chunk=False))
+    connector = MagicMock()
+    connector.get.side_effect = PermanentTransferError("NixlConnector get has invalid metadata for req-bad_1_0")
+    host._omni_connector = connector
+    host._stage_id = 2
+    host._async_chunk = False
+    request = _make_request("req-bad")
+    request.client_index = 4
+    try:
+        host.register_chunk_recv(request)
+        host._poll_pending_requests_once(list(host._pending_load_reqs))
+        assert connector.get.call_count == 1
+        assert "req-bad" not in host._pending_load_reqs
+        _, reason = host.get_omni_connector_output().permanent_recv_failures["req-bad"]
+        assert "Stage-2" in reason
+        assert "invalid metadata" in reason
+    finally:
+        host.shutdown_omni_connectors()
+
+
+def test_async_chunk_recv_is_not_expired_by_the_full_payload_clock(monkeypatch):
+    from vllm_omni.core.sched import omni_scheduler_mixin as sched
+    from vllm_omni.distributed.omni_connectors.model_runner import omni_connector_payload_transport as transport
+
+    monkeypatch.setattr(sched, "DEFAULT_INPUT_WAIT_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(transport, "_INPUT_WAIT_TIMEOUT_MODULE", sched)
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=1, async_chunk=True))
+    connector = MagicMock()
+    connector.get.return_value = None
+    host._omni_connector = connector
+    host._stage_id = 1
+    host._async_chunk = True
+    request = _make_request("req-chunk")
+    try:
+        host.register_chunk_recv(request)
+        time.sleep(0.02)
+        host._poll_pending_requests_once(list(host._pending_load_reqs))
+        assert "req-chunk" in host._pending_load_reqs
+        assert not host.get_omni_connector_output().permanent_recv_failures
+    finally:
+        host.shutdown_omni_connectors()
+
+
+def test_full_payload_poll_uses_recv_deadline_for_every_pending_request(monkeypatch):
+    from vllm_omni.core.sched import omni_scheduler_mixin as sched
+    from vllm_omni.distributed.omni_connectors.model_runner import omni_connector_payload_transport as transport
+
+    monkeypatch.setattr(sched, "DEFAULT_INPUT_WAIT_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(transport, "_INPUT_WAIT_TIMEOUT_MODULE", sched)
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=1, async_chunk=False))
+    calls: list[float] = []
+
+    class _DeadlineConnector:
+        def get(self, *args, **kwargs):
+            raise AssertionError("full-payload poll used get() without a deadline")
+
+        def get_with_deadline(self, from_stage, to_stage, key, metadata=None, *, deadline):
+            calls.append(deadline)
+            time.sleep(0.02)
+            return None
+
+        def abandon_get(self, key):
+            return None
+
+    host._omni_connector = _DeadlineConnector()
+    host._stage_id = 1
+    host._async_chunk = False
+    first = _make_request("req-a")
+    second = _make_request("req-b")
+    try:
+        host.register_chunk_recv(first)
+        host.register_chunk_recv(second)
+        started = time.monotonic()
+        host._poll_pending_requests_once(["req-a", "req-b"])
+        elapsed = time.monotonic() - started
+        assert len(calls) == 2
+        assert elapsed < 0.5
+        assert calls[0] - started < 1.5
+        assert not host.get_omni_connector_output().permanent_recv_failures
+    finally:
+        host.shutdown_omni_connectors()

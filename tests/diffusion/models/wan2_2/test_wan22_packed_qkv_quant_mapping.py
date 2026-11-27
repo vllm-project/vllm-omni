@@ -11,13 +11,12 @@ The registry calls vLLM's ``configure_quant_config`` with the pipeline class
 All tests are pure-CPU and do not load model weights.
 """
 
-import os
-
 import pytest
 import torch
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.utils.network_utils import get_file_store_init_method
 
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 
@@ -71,13 +70,20 @@ def tp1_group():
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29503")
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
-    initialize_model_parallel(backend="gloo")
-    yield
-    destroy_model_parallel()
-    destroy_distributed_env()
+    # A fresh file store avoids the free-port probe/bind race of env://.
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=get_file_store_init_method(),
+        backend="gloo",
+    )
+    try:
+        initialize_model_parallel(backend="gloo")
+        yield
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_env()
 
 
 # T2V (no image branch) and I2V (added K/V projections for the image tokens).

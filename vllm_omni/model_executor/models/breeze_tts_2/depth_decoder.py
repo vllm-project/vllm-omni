@@ -17,10 +17,10 @@ from vllm_omni.platforms import current_omni_platform
 
 
 def _depth_layer_compile_options() -> dict[str, bool]:
-    """Keep ROCm away from the unstable Triton GEMM autotune path."""
+    """Keep ROCm and XPU away from the unstable Triton GEMM autotune path."""
     return {
         "epilogue_fusion": False,
-        "max_autotune": not current_platform.is_rocm(),
+        "max_autotune": not (current_platform.is_rocm() or current_platform.is_xpu()),
     }
 
 

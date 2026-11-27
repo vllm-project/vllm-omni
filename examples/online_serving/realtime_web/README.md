@@ -89,8 +89,10 @@ frame while idle. **Send observation** also submits the current frame. During
 generation and playback, newer frames replace the pending observation; the
 next turn starts after both `response.done` and local playback finish.
 
-Replies appear as text and play through the existing speaker component, which
-sends `playback.ack`. This profile uses camera input and text instructions;
+Replies stream as assistant text (`response.output_audio_transcript.delta` /
+`response.output_text.delta`) while JoyAI is still generating, then play through
+the existing speaker component, which sends `playback.ack`. This profile uses
+camera input and text instructions;
 the default does not request microphone access. The browser only requests camera
 permission when **Camera** is enabled. Use localhost or HTTPS for browser capture.
 
@@ -342,6 +344,11 @@ This Qwen3 UI profile requires the server-VAD deployment above.
 - `--ref-audio`: optional MiniCPM assistant voice override; the server uses the
   model-bundled `assets/HT_ref_audio.wav` when it is omitted. Rejected for
   Qwen3 and AURA.
+
+WebFetch stays off unless `VLLM_REALTIME_WEB_TOOL_WEBFETCH=1` and the tool
+profile is `safe`. The private-address check resolves the host once, then the
+HTTP client resolves it again, so a DNS rebinding answer can still reach a
+private address. Treat that check as best effort.
 
 Microphone and camera access require `localhost` or HTTPS. For a remote backend,
 use an SSH tunnel to the UI host or an HTTPS reverse proxy with WebSocket support.

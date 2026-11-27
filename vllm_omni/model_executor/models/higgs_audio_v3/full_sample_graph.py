@@ -13,7 +13,6 @@ import time
 
 import torch
 from vllm.logger import init_logger
-from vllm.v1.outputs import SamplerOutput
 
 logger = init_logger(__name__)
 
@@ -42,7 +41,7 @@ def _graph_key(model, batch, hidden, force_audio_inputs, metadata):
     )
 
 
-def _replay_captured(model, hidden, metadata, force_audio_inputs):
+def _replay_captured(model, hidden, metadata, force_audio_inputs, audio_noise=None):
     """Replay an already captured (bucket) graph writing inputs in place.
 
     The capture path below pads through temporaries on every call. Once a
@@ -71,7 +70,9 @@ def _replay_captured(model, hidden, metadata, force_audio_inputs):
         static_input_ids[:batch].copy_(model._last_step_input_ids)
         if batch < bucket:
             static_input_ids[batch:].fill_(model._audio_continuation_id)
-    if metadata.generators:
+    if audio_noise is not None:
+        static_noise[: batch * books].copy_(audio_noise)
+    elif metadata.generators:
         from vllm_omni.utils.seeded_exponential import fill_exponential_rows
 
         fill_exponential_rows(static_noise[: batch * books], [metadata.generators.get(i) for i in range(batch)])
@@ -88,13 +89,13 @@ def _replay_captured(model, hidden, metadata, force_audio_inputs):
         sources[key] = metadata
     graph.replay()
     model._finish_audio_staging(staging[:batch], batch, hidden.device, batch)
-    return SamplerOutput(sampled_token_ids=output.sampled_token_ids[:batch].clone(), logprobs_tensors=None)
+    return output[:batch].clone()
 
 
-def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, active_batch=None):
+def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, active_batch=None, audio_noise=None):
     batch = hidden.shape[0]
     if active_batch is None:
-        replayed = _replay_captured(model, hidden, metadata, force_audio_inputs)
+        replayed = _replay_captured(model, hidden, metadata, force_audio_inputs, audio_noise)
         if replayed is not None:
             return replayed
     # Serving never captures a new shape. Unsupported shapes/metadata use the
@@ -132,7 +133,7 @@ def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, 
                 )
             finally:
                 model._last_step_input_ids = original_ids
-            return SamplerOutput(sampled_token_ids=output.sampled_token_ids[:batch], logprobs_tensors=None)
+            return output[:batch]
     actual = batch if active_batch is None else active_batch
     effective_ids = (
         torch.full((batch,), model._audio_continuation_id, dtype=model._last_step_input_ids.dtype, device=hidden.device)
@@ -197,7 +198,7 @@ def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, 
             model._last_step_query_start_loc = static_qsl
             model._last_logits_hidden = static_hidden
             reference = model.sample(logits, static_metadata)
-            expected_ids = reference.sampled_token_ids.clone()
+            expected_ids = reference.clone()
             expected_staging = staging.clone()
             expected_state = {name: getattr(model, name).clone() for name in _STATE}
             restore()
@@ -209,7 +210,7 @@ def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, 
             # Validate only after replay from the preserved initial state.
             restore()
             graph.replay()
-            torch.testing.assert_close(output.sampled_token_ids, expected_ids, atol=0, rtol=0)
+            torch.testing.assert_close(output, expected_ids, atol=0, rtol=0)
             torch.testing.assert_close(staging, expected_staging, atol=0, rtol=0)
             for name, expected in expected_state.items():
                 torch.testing.assert_close(getattr(model, name), expected, atol=0, rtol=0)
@@ -242,7 +243,7 @@ def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, 
             getattr(static_metadata, name).copy_(value)
     graph.replay()
     model._finish_audio_staging(staging[:actual], actual, hidden.device, actual)
-    return SamplerOutput(sampled_token_ids=output.sampled_token_ids.clone(), logprobs_tensors=None)
+    return output.clone()
 
 
 def release_sample_graphs(model):
@@ -257,8 +258,7 @@ def capture_sample_graphs(model, max_num_reqs):
     """Warm the MRv2 sampler without consuming request RNG or decode state."""
     if not model._sample_graph_enabled or getattr(model, "_sample_graphs_ready", False):
         return
-    from vllm.v1.sample.logits_processor import LogitsProcessors
-    from vllm.v1.sample.metadata import SamplingMetadata
+    from .higgs_audio_v3_talker import HiggsAudioSamplingParams
 
     device = model.model.embed_tokens.weight.device
     if device.type != "cuda":
@@ -272,6 +272,13 @@ def capture_sample_graphs(model, max_num_reqs):
         if getattr(model.config, "audio_mrv2_sample_graph_buckets", False)
         else range(1, max_num_reqs + 1)
     )
+    if model.vllm_config.speculative_config is not None:
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+
+        rows = max(buckets) * model.num_codebooks
+        logits = torch.zeros((rows, model.modality_head.vocab_size), dtype=torch.float32, device=device)
+        top_k = torch.ones(rows, dtype=torch.int32, device=device)
+        apply_top_k_top_p(logits, top_k, None)
     model._ensure_decode_state_capacity(max(buckets), device)
     model._get_audio_gpu_staging_buffer(max(buckets), device)
     saved_state = {name: getattr(model, name).clone() for name in _STATE}
@@ -297,23 +304,12 @@ def capture_sample_graphs(model, max_num_reqs):
                 ones = torch.ones(batch, device=device)
                 zeros = torch.zeros_like(ones)
                 for greedy in (False, True):
-                    metadata = SamplingMetadata(
+                    metadata = HiggsAudioSamplingParams(
                         temperature=zeros if greedy else ones,
                         all_greedy=greedy,
-                        all_random=not greedy,
                         top_p=ones,
                         top_k=torch.full((batch,), -1, device=device, dtype=torch.long),
                         generators={},
-                        max_num_logprobs=None,
-                        no_penalties=True,
-                        prompt_token_ids=None,
-                        frequency_penalties=zeros,
-                        presence_penalties=zeros,
-                        repetition_penalties=ones,
-                        output_token_ids=[[] for _ in range(batch)],
-                        allowed_token_ids_mask=None,
-                        bad_words_token_ids={},
-                        logitsprocs=LogitsProcessors(),
                     )
                     for forced in (False, True):
                         run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=forced)

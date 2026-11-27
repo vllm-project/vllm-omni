@@ -12,6 +12,9 @@ from tests.diffusion.models.magi2.test_native_preview import _initialize_tiny_mo
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.magi2 import attention
 from vllm_omni.diffusion.models.magi2.attention import VarlenHandler
+from vllm_omni.diffusion.models.magi2.layers.cuda import attention_ops as cuda_attention
+from vllm_omni.diffusion.models.magi2.layers.musa import attention_ops as musa_attention
+from vllm_omni.diffusion.models.magi2.layers.native.attention_ops import torch_varlen_attention_with_sink
 from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2PreviewTransformer, Modality
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
@@ -30,7 +33,7 @@ def _inputs(dtype=torch.bfloat16, head_dim=64, kv_heads=2):
 def _platform(monkeypatch, kind="musa", tensor_device="cpu"):
     # CPU dispatch tests emulate the active backend without pretending to run GPU kernels.
     monkeypatch.setattr(
-        attention,
+        musa_attention,
         "current_omni_platform",
         SimpleNamespace(
             is_cuda=lambda: kind == "cuda",
@@ -38,11 +41,14 @@ def _platform(monkeypatch, kind="musa", tensor_device="cpu"):
             device_type=tensor_device,
         ),
     )
+    monkeypatch.setattr(cuda_attention, "current_omni_platform", musa_attention.current_omni_platform)
+    backend = cuda_attention if kind == "cuda" else musa_attention
+    monkeypatch.setattr(attention, "varlen_attention_with_sink", backend.varlen_attention_with_sink)
     monkeypatch.delenv("MAGI2_FLASH_ATTN_VERSION", raising=False)
     monkeypatch.delenv("MAGI2_DETERMINISTIC", raising=False)
     # These CPU tests emulate provider dispatch with nine packed tokens and an available provider.
-    monkeypatch.setattr(attention, "_MUSA_FA3_MIN_TOKENS", 0)
-    monkeypatch.setattr(attention, "flash_attn_3_varlen_unsupported", lambda softcap, return_softmax_lse: None)
+    monkeypatch.setattr(musa_attention, "_MUSA_FA3_MIN_TOKENS", 0)
+    monkeypatch.setattr(musa_attention, "flash_attn_3_varlen_unsupported", lambda softcap, return_softmax_lse: None)
 
 
 @pytest.mark.cpu
@@ -55,12 +61,12 @@ def test_musa_dispatch_reuses_fp32_sink_correction(monkeypatch, sink_count):
     sink = None if not sink_count else torch.linspace(-0.98765, 0.12345, sink_count * 4).reshape(sink_count, 4)
     original_sink = None if sink is None else sink.clone()
     provider = Mock(return_value=(out, lse))
-    monkeypatch.setattr(attention, "flash_attn_3_varlen", provider)
+    monkeypatch.setattr(musa_attention, "flash_attn_3_varlen", provider)
     monkeypatch.setattr(
-        attention, "_resolve_flash_attn_version", Mock(side_effect=AssertionError("CUDA resolver used"))
+        cuda_attention, "_resolve_flash_attn_version", Mock(side_effect=AssertionError("CUDA resolver used"))
     )
     monkeypatch.setattr(
-        attention, "torch_varlen_attention_with_sink", Mock(side_effect=AssertionError("fallback used"))
+        musa_attention, "torch_varlen_attention_with_sink", Mock(side_effect=AssertionError("fallback used"))
     )
     actual = attention.packed_attention_with_sink(q, k, v, varlen, softcap=2.0, sink=sink)
     expected = (
@@ -90,9 +96,9 @@ def test_musa_cuda_alias_does_not_select_cuda_resolver(monkeypatch):
     q, k, v, varlen = _inputs()
     alias_q = SimpleNamespace(shape=q.shape, dtype=q.dtype, device=q.device, is_cuda=True)
     provider = Mock(return_value=(q, torch.zeros(4, 9)))
-    monkeypatch.setattr(attention, "flash_attn_3_varlen", provider)
+    monkeypatch.setattr(musa_attention, "flash_attn_3_varlen", provider)
     monkeypatch.setattr(
-        attention, "_resolve_flash_attn_version", Mock(side_effect=AssertionError("CUDA resolver used"))
+        cuda_attention, "_resolve_flash_attn_version", Mock(side_effect=AssertionError("CUDA resolver used"))
     )
     assert attention.packed_attention_with_sink(alias_q, k, v, varlen) is q
     provider.assert_called_once()
@@ -105,12 +111,12 @@ def test_unavailable_fa3_falls_back_and_logs_a_stable_reason(monkeypatch):
     expected = torch.empty_like(q)
     fallback = Mock(return_value=expected)
     logger = Mock()
-    monkeypatch.setattr(attention, "flash_attn_3_varlen_unsupported", Mock(return_value="provider missing"))
+    monkeypatch.setattr(musa_attention, "flash_attn_3_varlen_unsupported", Mock(return_value="provider missing"))
     monkeypatch.setattr(
-        attention, "flash_attn_3_varlen", Mock(side_effect=AssertionError("unavailable provider called"))
+        musa_attention, "flash_attn_3_varlen", Mock(side_effect=AssertionError("unavailable provider called"))
     )
-    monkeypatch.setattr(attention, "torch_varlen_attention_with_sink", fallback)
-    monkeypatch.setattr(attention, "logger", logger)
+    monkeypatch.setattr(musa_attention, "torch_varlen_attention_with_sink", fallback)
+    monkeypatch.setattr(musa_attention, "logger", logger)
     for _ in range(2):
         assert attention.packed_attention_with_sink(q, k, v, varlen) is expected
     assert fallback.call_count == 2
@@ -131,8 +137,8 @@ def test_reference_fallback_reads_host_sequence_bounds(monkeypatch):
         seen.append((cu_seqlens_q.device.type, cu_seqlens_k.device.type, cu_seqlens_q.tolist(), cu_seqlens_k.tolist()))
         return q
 
-    monkeypatch.setattr(attention, "flash_attn_3_varlen_unsupported", Mock(return_value="provider missing"))
-    monkeypatch.setattr(attention, "torch_varlen_attention_with_sink", fallback)
+    monkeypatch.setattr(musa_attention, "flash_attn_3_varlen_unsupported", Mock(return_value="provider missing"))
+    monkeypatch.setattr(musa_attention, "torch_varlen_attention_with_sink", fallback)
     attention.packed_attention_with_sink(q, k, v, varlen)
     assert seen == [("cpu", "cpu", [0, 3, 9], [0, 4, 11])]
 
@@ -141,7 +147,7 @@ def test_reference_fallback_reads_host_sequence_bounds(monkeypatch):
 @pytest.mark.parametrize("cu,max_q,uses_fa3", [([0, 20, 40], 20, False), ([0, 40], 40, True), ([0, 8, 40], 32, True)])
 def test_short_sequence_threshold_uses_the_longest_query_sequence(monkeypatch, cu, max_q, uses_fa3):
     _platform(monkeypatch)
-    monkeypatch.setattr(attention, "_MUSA_FA3_MIN_TOKENS", 32)
+    monkeypatch.setattr(musa_attention, "_MUSA_FA3_MIN_TOKENS", 32)
     generator = torch.Generator().manual_seed(3)
     q = torch.randn(40, 4, 64, generator=generator).to(torch.bfloat16)
     k = torch.randn(40, 2, 64, generator=generator).to(torch.bfloat16)
@@ -149,8 +155,8 @@ def test_short_sequence_threshold_uses_the_longest_query_sequence(monkeypatch, c
     cu_seqlens = torch.tensor(cu, dtype=torch.int64)
     provider = Mock(return_value=(q, torch.zeros(4, 40)))
     fallback = Mock(return_value=q)
-    monkeypatch.setattr(attention, "flash_attn_3_varlen", provider)
-    monkeypatch.setattr(attention, "torch_varlen_attention_with_sink", fallback)
+    monkeypatch.setattr(musa_attention, "flash_attn_3_varlen", provider)
+    monkeypatch.setattr(musa_attention, "torch_varlen_attention_with_sink", fallback)
     attention.packed_attention_with_sink(q, k, v, VarlenHandler(cu_seqlens, cu_seqlens, max_q, max_q))
     assert provider.called is uses_fa3
     assert fallback.called is not uses_fa3
@@ -171,8 +177,8 @@ def test_provider_failures_are_not_hidden(monkeypatch, exception):
     _platform(monkeypatch)
     q, k, v, varlen = _inputs()
     fallback = Mock()
-    monkeypatch.setattr(attention, "flash_attn_3_varlen", Mock(side_effect=exception))
-    monkeypatch.setattr(attention, "torch_varlen_attention_with_sink", fallback)
+    monkeypatch.setattr(musa_attention, "flash_attn_3_varlen", Mock(side_effect=exception))
+    monkeypatch.setattr(musa_attention, "torch_varlen_attention_with_sink", fallback)
     with pytest.raises(type(exception), match=str(exception)):
         attention.packed_attention_with_sink(q, k, v, varlen)
     fallback.assert_not_called()
@@ -184,7 +190,7 @@ def test_musa_ignores_cuda_flash_attn_version(monkeypatch, version):
     _platform(monkeypatch)
     q, k, v, varlen = _inputs()
     provider = Mock(return_value=(q, torch.zeros(4, 9)))
-    monkeypatch.setattr(attention, "flash_attn_3_varlen", provider)
+    monkeypatch.setattr(musa_attention, "flash_attn_3_varlen", provider)
     monkeypatch.setenv("MAGI2_FLASH_ATTN_VERSION", version)
     assert attention.packed_attention_with_sink(q, k, v, varlen) is q
     provider.assert_called_once()
@@ -198,8 +204,8 @@ def test_ineligible_inputs_keep_reference_path(monkeypatch, case):
     q = q[:0] if case == "empty_query" else q
     k = k[:0] if case == "empty_key" else k
     provider, fallback = Mock(), Mock(return_value=q)
-    monkeypatch.setattr(attention, "flash_attn_3_varlen", provider)
-    monkeypatch.setattr(attention, "torch_varlen_attention_with_sink", fallback)
+    monkeypatch.setattr(musa_attention, "flash_attn_3_varlen", provider)
+    monkeypatch.setattr(musa_attention, "torch_varlen_attention_with_sink", fallback)
     assert attention.packed_attention_with_sink(q, k, v, varlen) is q
     provider.assert_not_called()
     fallback.assert_called_once()
@@ -211,9 +217,9 @@ def test_cuda_still_uses_bundled_version_selection(monkeypatch):
     q, k, v, varlen = _inputs()
     cuda_q = SimpleNamespace(shape=q.shape, dtype=q.dtype, device=q.device, is_cuda=True)
     resolver, bundled = Mock(return_value=2), Mock(return_value=(q, torch.zeros(4, 9)))
-    monkeypatch.setattr(attention, "_resolve_flash_attn_version", resolver)
-    monkeypatch.setattr(attention, "vllm_flash_attn_varlen_with_lse", bundled)
-    monkeypatch.setattr(attention, "flash_attn_3_varlen", Mock(side_effect=AssertionError("standalone path used")))
+    monkeypatch.setattr(cuda_attention, "_resolve_flash_attn_version", resolver)
+    monkeypatch.setattr(cuda_attention, "vllm_flash_attn_varlen_with_lse", bundled)
+    monkeypatch.setattr(musa_attention, "flash_attn_3_varlen", Mock(side_effect=AssertionError("standalone path used")))
     assert attention.packed_attention_with_sink(cuda_q, k, v, varlen, softcap=2) is q
     resolver.assert_called_once_with()
     assert bundled.call_args.kwargs["fa_version"] == 2
@@ -225,14 +231,14 @@ def test_cuda_still_uses_bundled_version_selection(monkeypatch):
 def test_real_musa_fa3_matches_sink_oracle(monkeypatch, dtype, head_dim, kv_heads, sink_count, softcap):
     if not hasattr(torch, "musa") or not torch.musa.is_available():
         pytest.skip("requires a MUSA device")
-    if attention.flash_attn_3_varlen_unsupported(softcap > 0, True) is not None:
+    if musa_attention.flash_attn_3_varlen_unsupported(softcap > 0, True) is not None:
         pytest.skip("standalone FA3 provider with LSE is not installed")
     # Force FA3 for operator coverage; the production short-sequence policy is
     # exercised separately by the tiny-transformer test below.
-    monkeypatch.setattr(attention, "_MUSA_FA3_MIN_TOKENS", 0)
+    monkeypatch.setattr(musa_attention, "_MUSA_FA3_MIN_TOKENS", 0)
     q, k, v, varlen = _inputs(dtype, head_dim, kv_heads)
     sink = None if not sink_count else torch.linspace(-1.98765, 2.12345, sink_count * 4).reshape(sink_count, 4)
-    expected = attention.torch_varlen_attention_with_sink(
+    expected = torch_varlen_attention_with_sink(
         q,
         k,
         v,
@@ -241,10 +247,12 @@ def test_real_musa_fa3_matches_sink_oracle(monkeypatch, dtype, head_dim, kv_head
         sink=sink,
         softcap=softcap,
     )
-    provider = Mock(wraps=attention.flash_attn_3_varlen)
-    monkeypatch.setattr(attention, "flash_attn_3_varlen", provider)
+    provider = Mock(wraps=musa_attention.flash_attn_3_varlen)
+    monkeypatch.setattr(musa_attention, "flash_attn_3_varlen", provider)
     monkeypatch.setattr(
-        attention, "torch_varlen_attention_with_sink", Mock(side_effect=AssertionError("fallback is not validation"))
+        musa_attention,
+        "torch_varlen_attention_with_sink",
+        Mock(side_effect=AssertionError("fallback is not validation")),
     )
     actual = attention.packed_attention_with_sink(
         q.to("musa"),
@@ -268,7 +276,7 @@ def test_real_musa_fa3_matches_sink_oracle_across_tiles(monkeypatch, dtype, sink
     """Uneven sequences longer than one tile, at the default short-sequence threshold."""
     if not hasattr(torch, "musa") or not torch.musa.is_available():
         pytest.skip("requires a MUSA device")
-    if attention.flash_attn_3_varlen_unsupported(False, True) is not None:
+    if musa_attention.flash_attn_3_varlen_unsupported(False, True) is not None:
         pytest.skip("standalone FA3 provider with LSE is not installed")
     generator = torch.Generator().manual_seed(23)
     q = torch.randn(300, 6, 128, generator=generator).to(dtype)
@@ -277,9 +285,9 @@ def test_real_musa_fa3_matches_sink_oracle_across_tiles(monkeypatch, dtype, sink
     cu_q = torch.tensor([0, 37, 300], dtype=torch.int64)
     cu_k = torch.tensor([0, 41, 330], dtype=torch.int64)
     sink = torch.linspace(-1.5, 2.5, sink_count * 6).reshape(sink_count, 6)
-    expected = attention.torch_varlen_attention_with_sink(q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, sink=sink)
-    provider = Mock(wraps=attention.flash_attn_3_varlen)
-    monkeypatch.setattr(attention, "flash_attn_3_varlen", provider)
+    expected = torch_varlen_attention_with_sink(q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, sink=sink)
+    provider = Mock(wraps=musa_attention.flash_attn_3_varlen)
+    monkeypatch.setattr(musa_attention, "flash_attn_3_varlen", provider)
     actual = attention.packed_attention_with_sink(
         q.to("musa"), k.to("musa"), v.to("musa"), VarlenHandler(cu_q, cu_k, 263, 289), sink=sink.to("musa")
     )
@@ -292,7 +300,7 @@ def test_real_musa_fa3_matches_sink_oracle_across_tiles(monkeypatch, dtype, sink
 def test_real_musa_tiny_transformer_uses_exact_short_sequence_fallback(monkeypatch):
     if not hasattr(torch, "musa") or not torch.musa.is_available():
         pytest.skip("requires a MUSA device")
-    if attention.flash_attn_3_varlen_unsupported(False, True) is not None:
+    if musa_attention.flash_attn_3_varlen_unsupported(False, True) is not None:
         pytest.skip("standalone FA3 provider with LSE is not installed")
     config = replace(_tiny_config(torch.bfloat16, num_layers=2), hidden_size=128, head_dim=64)
     model = Magi2PreviewTransformer(config).eval()
@@ -306,8 +314,8 @@ def test_real_musa_tiny_transformer_uses_exact_short_sequence_fallback(monkeypat
     )
     cu = torch.tensor([0, 6], dtype=torch.int32, device="musa")
     varlen = VarlenHandler(cu, cu, 6, 6)
-    provider = Mock(wraps=attention.flash_attn_3_varlen)
-    monkeypatch.setattr(attention, "flash_attn_3_varlen", provider)
+    provider = Mock(wraps=musa_attention.flash_attn_3_varlen)
+    monkeypatch.setattr(musa_attention, "flash_attn_3_varlen", provider)
     with torch.no_grad():
         actual = model(packed, coords, modalities, varlen)
     assert provider.call_count == 0

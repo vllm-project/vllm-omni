@@ -130,15 +130,6 @@ class Ming3AudioDummyInputsBuilder(BaseDummyInputsBuilder[Ming3AudioProcessingIn
 
 
 class Ming3AudioMultiModalProcessor(OmniMultiModalProcessor[Ming3AudioProcessingInfo]):
-    def _hf_processor_applies_updates(
-        self,
-        prompt_text: str,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ) -> bool:
-        return False
-
     def _call_hf_processor(
         self,
         prompt: str | list[int],
@@ -182,7 +173,9 @@ class Ming3AudioMultiModalProcessor(OmniMultiModalProcessor[Ming3AudioProcessing
         del hf_processor_mm_kwargs
         return {
             "audio_feats": MultiModalFieldConfig.batched("audio"),
-            "audio_feats_lengths": MultiModalFieldConfig.batched("audio"),
+            # Read as Python ints by the encoder: on the device, every read
+            # would be a host synchronization in the prefill step.
+            "audio_feats_lengths": MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
         }
 
     def _get_prompt_updates(

@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "base_version": "6.31.0",
+  "version": "6.31.0+omni.pillow13",
+  "wheel": "gradio-6.31.0+omni.pillow13-py3-none-any.whl",
+  "expected_wheel_sha256": "1c80d33042642f5ad61d4f82b6634893a4830e5c4b047025380b97d61da25778",
+  "base_commit": "07341609c68bb98701e7db9ba9e2ad6c0fb2acb4",
+  "upstream_patch_commit": "d6972ed9d1185634cea083e0263839543d5ceb8d",
+  "upstream_patch_url": "https://github.com/gradio-app/gradio/pull/14005",
+  "license": "Apache-2.0; preserve bundled third-party notices",
+  "inputs": {
+    "gradio-6.31.0.tar.gz": {
+      "url": "https://files.pythonhosted.org/packages/68/98/a76721a95bebc678b8a89c174d72292b3e99b2e4b387b77965d2797a1b52/gradio-6.31.0.tar.gz",
+      "sha256": "40cf094fe8ea1b8ada0fc4c10b685c4c5f09c4061d34c073be25bab342e14e22"
+    },
+    "requirements-mcp.txt": {
+      "url": "https://raw.githubusercontent.com/gradio-app/gradio/07341609c68bb98701e7db9ba9e2ad6c0fb2acb4/requirements-mcp.txt",
+      "sha256": "21951cbe1c5714b99b47a81a968d84c0ed342cfd0a7528ac368318decab49e88"
+    }
+  },
+  "local_inputs": {
+    "backport.patch": "3d6691ad0ddc9b4ba95e9ddf677661be1525baf18f2628255273813eb28fab40",
+    "build-constraints.txt": "35498847b65225c90c83f4ace3f2676f7155f1d33b5e20652a6a941a1237f77d",
+    "NOTICE.md": "4c450fa5b01628255717a87f8fdcd362d6a0b56cf8a6766e8fb97ad2469d5f1f"
+  }
+}

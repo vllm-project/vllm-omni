@@ -127,10 +127,12 @@ if not hasattr(torch.ops.vllm_omni, "fastvideo_block_sparse_attn_bshd"):
             except (ImportError, RuntimeError) as exc:
                 if block_size == 128:
                     raise RuntimeError("FastH3 Omni requires a supported Blackwell sparse attention kernel") from exc
+                # warning_once caches its arguments. An exception retains traceback
+                # frames, including this forward's query/key/value tensors.
                 logger.warning_once(
                     "FASTVIDEO_VSA_SM100A=1 requested but the native Blackwell forward is "
                     "unavailable (%s); using the Triton block-sparse route instead.",
-                    exc,
+                    str(exc),
                 )
 
         from fastvideo_kernel.block_sparse_attn import block_sparse_attn
@@ -155,6 +157,16 @@ if not hasattr(torch.ops.vllm_omni, "fastvideo_block_sparse_attn_bshd"):
 
 
 fastvideo_block_sparse_attn_bshd = torch.ops.vllm_omni.fastvideo_block_sparse_attn_bshd
+
+
+def require_fastvideo_sparse() -> None:
+    """Fail before launch when fastvideo-kernel lacks the tile64 block-sparse kernel."""
+    try:
+        kernel = importlib.import_module("fastvideo_kernel.block_sparse_attn").block_sparse_attn
+    except (ImportError, AttributeError) as exc:
+        raise ImportError("FastVideo tile64 requires fastvideo-kernel; install vllm-omni[vsa]") from exc
+    if not callable(kernel):
+        raise ImportError("FastVideo block_sparse_attn is unavailable")
 
 
 @functools.lru_cache(maxsize=32)
@@ -250,10 +262,8 @@ def resolve_block_sparse_provider(
     elif precision == "sage":
         raise ValueError(reason)
     try:
-        kernel = importlib.import_module("fastvideo_kernel.block_sparse_attn").block_sparse_attn
-        if not callable(kernel):
-            raise ImportError("FastVideo block_sparse_attn is unavailable")
-    except (ImportError, AttributeError) as exc:
+        require_fastvideo_sparse()
+    except ImportError as exc:
         raise ImportError(
             f"VSA auto cannot use FlashInfer ({reason}) and fastvideo-kernel is unavailable. "
             "Install vllm-omni[vsa] for the FastVideo provider."

@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from vllm_omni.diffusion import diffusion_engine as diffusion_engine_module
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
@@ -36,9 +36,10 @@ def _make_request(request_id: str) -> OmniDiffusionRequest:
 
 def _make_engine() -> DiffusionEngine:
     engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     engine.od_config = SimpleNamespace(distributed_executor_backend=None)
     engine.scheduler = RequestScheduler()
-    engine.scheduler.initialize(SimpleNamespace())
+    engine.scheduler.initialize(OmniDiffusionConfig(diffusion_attention_schedule=None))
     engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
     engine.executor = SimpleNamespace(
         collective_rpc=Mock(),
@@ -704,9 +705,15 @@ def test_init_accepts_custom_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
         custom_pipeline_args=None,
         model_class_name="CustomSchedulerPipeline",
         streaming_output=False,
+        stage_role=None,
+        model_stage=None,
+        max_num_seqs=1,
+        omni_kv_config=None,
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
     )
     custom_scheduler = RequestScheduler()
     fake_executor = SimpleNamespace(
+        register_chunk_ready_handler=Mock(),
         execute_request=Mock(),
         execute_batch=Mock(),
         execute_step=Mock(),
@@ -746,6 +753,7 @@ def test_scheduler_initialization_failure_closes_scheduler_and_executor(monkeypa
         close=Mock(),
     )
     fake_executor = SimpleNamespace(
+        register_chunk_ready_handler=Mock(),
         shutdown=Mock(),
     )
 

@@ -11,11 +11,18 @@ from vllm_omni.outputs.output_modality import DRAINABLE_MODALITIES
 CHUNK_METADATA_KEYS: frozenset[str] = frozenset(
     {
         "audio_text_total_chars",
+        "duplex_audio_cache_epoch",
+        "duplex_audio_chunk_seq",
         "duplex_epoch",
+        "duplex_explicit_reply",
+        "duplex_text_input",
         "duplex_turn_id",
         "finished",
         "llm_output_text_utf8",
         "segment_end",
+        "speech_flush",
+        "text_without_audio",
+        "streaming_condition_seq",
         "tts_is_last_chunk",
         "turn_end",
     }

@@ -20,10 +20,11 @@ from types import SimpleNamespace
 
 import pytest
 from vllm import SamplingParams
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.request import Request
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.outputs import OmniConnectorOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -43,6 +44,7 @@ class _FakeScheduler(OmniSchedulerMixin):
         self.requests = requests
         self.input_coordinator = coordinator
         self.finish_calls = []
+        self._outputs_awaiting_stage_payload = {}
 
     def finish_requests(self, req_ids, status):
         self.finish_calls.append((set(req_ids), status))
@@ -127,6 +129,7 @@ class _FakeChunkScheduler(OmniSchedulerMixin):
         self.requests = requests
         self.chunk_transfer_adapter = adapter
         self.finish_calls = []
+        self._outputs_awaiting_stage_payload = {}
 
     def finish_requests(self, req_ids, status):
         self.finish_calls.append((set(req_ids), status))
@@ -417,6 +420,117 @@ def test_a_rejected_value_does_not_outlive_its_test(monkeypatch):
     monkeypatch.undo()
     importlib.reload(mod)
     assert mod.DEFAULT_INPUT_WAIT_TIMEOUT_S == ambient
+
+
+class _PermanentSendScheduler(OmniSchedulerMixin):
+    def __init__(self, requests):
+        self.requests = requests
+        self.input_coordinator = None
+        self.chunk_transfer_adapter = None
+        self._outputs_awaiting_stage_payload = {}
+        self._latest_omni_connector_output = None
+        self.finished_req_ids_dict = {}
+        self.finish_calls = []
+
+    def finish_requests(self, req_ids, status):
+        self.finish_calls.append((set(req_ids), status))
+        for req_id in req_ids:
+            self.requests.pop(req_id, None)
+
+
+def test_permanent_send_failure_emits_error_after_request_left_scheduler():
+    """A full-payload give-up still fails the request after the producer finished."""
+    reason = "Stage-1 connector send failed permanently for request 'req-gone'"
+    scheduler = _PermanentSendScheduler({})
+    scheduler._latest_omni_connector_output = OmniConnectorOutput(
+        permanent_send_failures={"req-gone": (3, reason)},
+    )
+
+    scheduler._process_pending_omni_inputs("ar")
+
+    assert scheduler.finish_calls == []
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    assert list(outputs) == [3]
+    eco = outputs[3].outputs[0]
+    assert eco.request_id == "req-gone"
+    assert eco.finish_reason == FinishReason.ERROR
+    assert eco.stop_reason.startswith("Stage-1")
+
+
+def test_permanent_recv_failure_emits_error_for_waiting_request():
+    reason = "Stage-2 connector receive failed for request 'req-wait'"
+    request = SimpleNamespace(request_id="req-wait", client_index=5, stop_reason=None)
+    scheduler = _PermanentSendScheduler({"req-wait": request})
+    scheduler._latest_omni_connector_output = OmniConnectorOutput(
+        permanent_recv_failures={"req-wait": (5, reason)},
+    )
+
+    scheduler._process_pending_omni_inputs("ar")
+
+    assert scheduler.finish_calls
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    eco = outputs[5].outputs[0]
+    assert eco.finish_reason == FinishReason.ERROR
+    assert eco.stop_reason.startswith("Stage-2")
+
+
+def test_permanent_send_failure_finishes_request_still_scheduled():
+    request = SimpleNamespace(request_id="req-live", client_index=2, stop_reason=None)
+    scheduler = _PermanentSendScheduler({"req-live": request})
+    scheduler._latest_omni_connector_output = OmniConnectorOutput(
+        permanent_send_failures={"req-live": (9, "Stage-0 connector send failed")},
+    )
+
+    scheduler._process_pending_omni_inputs("ar")
+
+    assert len(scheduler.finish_calls) == 1
+    finished_ids, status = scheduler.finish_calls[0]
+    assert finished_ids == {"req-live"}
+    assert getattr(status, "name", str(status)).endswith("FINISHED_ERROR")
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    eco = outputs[2].outputs[0]
+    assert eco.request_id == "req-live"
+    assert eco.finish_reason == FinishReason.ERROR
+    assert "Stage-0" in eco.stop_reason
+
+
+def test_idle_producer_stays_runnable_until_send_failure_is_emitted():
+    """A give-up stashed on the last runner output must still reach the client."""
+    reason = "Stage-0 connector send failed permanently for request 'req-idle'"
+    scheduler = _PermanentSendScheduler({})
+    scheduler._latest_omni_connector_output = OmniConnectorOutput(
+        permanent_send_failures={"req-idle": (7, reason)},
+    )
+
+    assert scheduler.has_requests() is True
+    scheduler._process_pending_omni_inputs("ar")
+    # The ERROR stays in _pending_input_timeout_outputs until attach emits it.
+    assert scheduler.has_requests() is True
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    assert scheduler.has_requests() is False
+    eco = outputs[7].outputs[0]
+    assert eco.finish_reason == FinishReason.ERROR
+    assert eco.stop_reason == reason
+
+
+def test_give_up_enqueued_from_the_runner_keeps_idle_producer_runnable():
+    """The runner thread can fail a send after the producer request has left."""
+    scheduler = _PermanentSendScheduler({})
+    scheduler._init_omni_connector_output_inbox()
+    reason = "Stage-0 connector send failed permanently for request 'req-late'"
+    assert scheduler.has_requests() is False
+    scheduler.enqueue_omni_connector_output(OmniConnectorOutput(permanent_send_failures={"req-late": (4, reason)}))
+    assert scheduler.has_requests() is True
+    scheduler._process_pending_omni_inputs("ar")
+    assert scheduler.has_requests() is True
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    assert scheduler.has_requests() is False
+    assert outputs[4].outputs[0].stop_reason == reason
 
 
 if __name__ == "__main__":

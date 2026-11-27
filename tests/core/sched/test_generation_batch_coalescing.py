@@ -10,7 +10,9 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
-from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
+from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -47,6 +49,25 @@ def test_idle_wait_preserves_completion_and_control_progress(monkeypatch, pendin
     assert not s._omni_connector_output_inbox.waits
 
 
+@pytest.mark.parametrize(
+    "pending",
+    [
+        "finished_req_ids",
+        "_pending_chunk_commits",
+        "_resume_chunk_receivers",
+        "_pending_request_prewarms",
+        "_pending_input_timeout_outputs",
+    ],
+)
+def test_idle_wait_does_not_delay_pending_v2_control_work(monkeypatch, pending):
+    s, clock = scheduler(monkeypatch)
+    s._generation_coalescing_policy = "idle_wait"
+    setattr(s, pending, {"0"})
+    assert s._drain_omni_connector_outputs() == []
+    assert clock[0] == 10
+    assert not s._omni_connector_output_inbox.waits
+
+
 def test_idle_wait_without_arrivals_is_bounded(monkeypatch):
     s, clock = scheduler(monkeypatch)
     s._generation_coalescing_policy = "idle_wait"
@@ -58,6 +79,20 @@ def test_idle_wait_without_arrivals_is_bounded(monkeypatch):
 
 def notification(*ids, terminal=()):
     return OmniConnectorOutput(chunk_ready_req_ids=set(ids), chunk_finished_req_ids=set(terminal))
+
+
+@pytest.mark.parametrize("live,ready,release", [(8, 3, False), (8, 4, True), (3, 1, True), (4, 1, False)])
+def test_batch_release_preserves_threshold_and_low_concurrency(monkeypatch, live, ready, release):
+    s, _ = scheduler(monkeypatch)
+    s.requests = dict(list(s.requests.items())[:live])
+    assert s._generation_batch_ready({str(i) for i in range(ready)}) is release
+
+
+def test_runnable_streams_exclude_stale_finished_and_in_flight_requests(monkeypatch):
+    s, _ = scheduler(monkeypatch)
+    s.requests["1"].is_finished = lambda: True
+    s.requests["2"].num_in_flight_tokens = 1
+    assert s._generation_runnable_ids({"0", "1", "2", "gone"}) == {"0"}
 
 
 class Inbox:
@@ -86,23 +121,33 @@ def scheduler(monkeypatch, initial=(), delayed=()):
     clock = [10.0]
     monkeypatch.setattr("vllm_omni.core.sched.omni_generation_scheduler.time.monotonic", lambda: clock[0])
     s = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
+    s._native_data_plane = True
     s._generation_max_wait_s = 0.012
     s._generation_min_batch_size = 4
     s._pause_state = PauseState.UNPAUSED
     s.requests = {
-        str(i): SimpleNamespace(request_id=str(i), num_in_flight_tokens=0, is_finished=lambda: False) for i in range(8)
+        str(i): SimpleNamespace(
+            request_id=str(i),
+            status=RequestStatus.WAITING_FOR_CHUNK,
+            num_in_flight_tokens=0,
+            is_finished=lambda: False,
+        )
+        for i in range(8)
     }
     s.running = list(s.requests.values())
-    s.input_coordinator = SimpleNamespace(
-        requests_with_ready_chunks=set(), finished_requests=set(), input_terminal_req_ids=set()
-    )
+    s.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
+    s.chunk_transfer_adapter = None
     s._latest_omni_connector_output = None
-    s._omni_connector_output_inbox = Inbox(clock, initial, delayed)
+    s._outputs_awaiting_stage_payload = {}
+    monkeypatch.setattr(s, "_omni_connector_output_inbox", Inbox(clock, initial, delayed), raising=False)
     return s, clock
 
 
-def test_arrivals_form_target_batch_in_order(monkeypatch):
+@pytest.mark.parametrize("terminal_metadata", [False, True])
+def test_arrivals_form_target_batch_in_order(monkeypatch, terminal_metadata):
     events = [notification("0"), notification("1", "2"), notification("3")]
+    if terminal_metadata:
+        events[-1] = OmniConnectorOutput(request_metadata={"3": SchedulingMetadataUpdate(input_terminal=True)})
     s, clock = scheduler(monkeypatch, events[:1], [(0.002, events[1]), (0.003, events[2])])
     assert s._drain_omni_connector_outputs() == events
     assert clock[0] == pytest.approx(10.005)
@@ -167,7 +212,10 @@ def test_deadline_is_new_for_each_batch_not_extended_by_arrivals(monkeypatch):
 
 def test_cancelled_notification_is_filtered_before_coordinator(monkeypatch, mocker):
     event = notification("0", "cancelled")
-    event.request_metadata = {"0": {"code_predictor_codes": [7]}, "cancelled": {"code_predictor_codes": [9]}}
+    event.request_metadata = {
+        "0": SchedulingMetadataUpdate(prompt_token_ids=(7,)),
+        "cancelled": SchedulingMetadataUpdate(prompt_token_ids=(9,)),
+    }
     s, _ = scheduler(monkeypatch, [event])
     s._generation_max_wait_s = 0
     s.waiting = []
@@ -177,7 +225,7 @@ def test_cancelled_notification_is_filtered_before_coordinator(monkeypatch, mock
     s.input_coordinator.process_pending_chunks = mocker.Mock()
     s._consume_pending_connector_output("generation")
     s.input_coordinator.update_request_metadata.assert_called_once_with(
-        s.requests, {"0": {"code_predictor_codes": [7]}}, model_mode="generation"
+        s.requests, {"0": SchedulingMetadataUpdate(prompt_token_ids=(7,))}
     )
     s.input_coordinator.process_pending_chunks.assert_called_once()
     waiting, running, ready, finished = s.input_coordinator.process_pending_chunks.call_args.args
@@ -233,6 +281,47 @@ def test_retire_in_flight_output_before_waiting_without_resetting_deadline(monke
     assert s._generation_batch_deadline is None
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_native_reduced_target_waits_only_when_enabled(monkeypatch, enabled):
+    s, clock = scheduler(monkeypatch, [notification("0")])
+    s.requests = {key: s.requests[key] for key in ("0", "1", "2")}
+    s._generation_always_wait_target_batch = enabled
+    assert s._drain_omni_connector_outputs() == [notification("0")]
+    assert clock[0] == pytest.approx(10.012 if enabled else 10)
+
+
+def test_native_reduced_target_releases_when_all_registered_streams_arrive(monkeypatch):
+    events = [notification("0"), notification("1", "2")]
+    s, clock = scheduler(monkeypatch, events[:1], [(0.003, events[1])])
+    s.requests = {key: s.requests[key] for key in ("0", "1", "2")}
+    s._generation_always_wait_target_batch = True
+    assert s._drain_omni_connector_outputs() == events
+    assert clock[0] == pytest.approx(10.003)
+
+
+def test_native_registered_population_keeps_non_runnable_requests_until_deadline(monkeypatch):
+    s, clock = scheduler(monkeypatch, [notification("0", terminal=["1"])])
+    s._generation_min_batch_size = 8
+    s._generation_always_wait_target_batch = True
+    s.input_coordinator.finished_requests.add("2")
+    s.input_coordinator.input_terminal_req_ids.add("3")
+    s.input_coordinator.pending_chunk_registrations = [OmniChunkRecvHandle(request_id="4", external_req_id="4")]
+    s.requests["5"].status = RequestStatus.WAITING_FOR_INPUT
+    s.requests["6"].is_finished = lambda: True
+    s.requests.pop("7")
+    assert s._drain_omni_connector_outputs() == [notification("0", terminal=["1"])]
+    assert clock[0] == pytest.approx(10.012)
+
+
+def test_ready_terminal_counts_toward_reduced_target(monkeypatch):
+    event = notification("0", "1", terminal=["1"])
+    s, clock = scheduler(monkeypatch, [event])
+    s.requests = {key: s.requests[key] for key in ("0", "1")}
+    s._generation_always_wait_target_batch = True
+    assert s._drain_omni_connector_outputs() == [event]
+    assert clock[0] == 10
+
+
 def test_expired_deadline_dispatches_even_with_other_requests_in_flight(monkeypatch):
     s, clock = scheduler(monkeypatch, [notification("0")])
     s.requests["7"].num_in_flight_tokens = 1
@@ -256,3 +345,11 @@ def test_deferred_schedule_keeps_pending_request_and_allocates_nothing(monkeypat
     assert list(s.waiting) == [request]
     assert request.num_computed_tokens == request.num_in_flight_tokens == 0
     assert s.chunk_transfer_adapter.restore_called
+
+
+def test_native_lone_registered_stream_dispatches_without_waiting(monkeypatch):
+    s, clock = scheduler(monkeypatch, [notification("0")])
+    s.requests = {"0": s.requests["0"]}
+    s._generation_always_wait_target_batch = True
+    assert s._drain_omni_connector_outputs() == [notification("0")]
+    assert clock[0] == 10

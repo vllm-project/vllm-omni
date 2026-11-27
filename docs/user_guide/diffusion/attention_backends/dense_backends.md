@@ -18,6 +18,16 @@ conservative reference when validating another backend.
 vllm-omni serve <model> --diffusion-attention-backend TORCH_SDPA
 ```
 
+For Qwen-Image transformers, CUDA BF16 with `--enforce-eager` and the resolved
+`TORCH_SDPA` backend also uses the Diffusers normalization and FP32 complex
+rotary rounding order. Its dense text QKV projections use three GEMMs while
+retaining packed checkpoint weights, tensor-parallel sharding, and LoRA routing.
+Quantized projection methods and an explicitly configured batch-invariant GEMM
+policy keep their existing dispatch. This reference path uses more kernel
+launches than the fused path; benchmark it separately when choosing a backend.
+Compiled execution, other attention backends, CPU, FP16, and ROCm retain the
+existing fused or activation-dtype rotary paths.
+
 ## `FLASH_ATTN`
 
 `FLASH_ATTN` uses the installed FlashAttention implementation. On Blackwell it
@@ -67,6 +77,10 @@ for mask-heavy DiTs and is automatically preferred on Blackwell when cuDNN
 9.5 or newer is available and the higher-priority TRTLLM route is not
 compatible.
 
+For this checkout's vLLM 0.34 / Torch 2.14 CUDA environment, use the pinned
+cuDNN 9.25.1 runtime in the [CUDA source installation instructions](../../../getting_started/installation/gpu.md).
+The CUDA Docker and CI images configure that runtime at process startup.
+
 ```bash
 vllm-omni serve <model> --diffusion-attention-backend CUDNN_ATTN
 ```
@@ -92,8 +106,8 @@ DIFFUSION_ATTENTION_BACKEND=FLASHINFER_ATTN \
 option on CUDA platforms and an automatic Blackwell fallback when FlashInfer
 is installed but cuDNN is too old for `CUDNN_ATTN`.
 
-On Blackwell, `auto` resolves to FlashInfer cute-dsl, which cannot run a
-nontrivial custom mask. Automatic selection may fall back to SDPA for those
+On SM 10.x/11.x Blackwell, `auto` resolves to FlashInfer cute-dsl, which cannot
+run a nontrivial custom mask; SM 12.x resolves to `fa2`, Hopper to `fa3`. Automatic selection may fall back to SDPA for those
 masks. An explicit `FLASHINFER_ATTN` selection does not: sequence-parallel
 auto-padding that would create a padding mask is rejected at capability
 preflight. Use `TORCH_SDPA`, pin `quant.flashinfer_backend` to `fa2`/`fa3`

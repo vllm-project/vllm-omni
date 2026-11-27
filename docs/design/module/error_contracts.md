@@ -75,6 +75,15 @@ with code 503 in HTTP and SSE responses. Cache feedback for cancelled requests
 is applied without failing an unrelated request; other engine errors keep their
 existing classification.
 
+When tracing is enabled, pipeline and stage error spans use that same resolved
+classification, including upstream `RequestError.code` and cache-miss
+`ServiceUnavailableError`. Unclassified stage failures use `stage_error`.
+
+Offline generation discards non-fatal request-scoped errors whose requests
+are no longer registered, including queued errors from an aborted batch.
+Global errors and fatal errors still propagate, even when a fatal error
+names a request that has already been removed.
+
 `engine/messages.py` remains primarily owned by the I/O contract; this page
 owns the semantics of its error fields. Route and serving files remain
 primarily owned by `entrypoints.md`; this page owns their rendering

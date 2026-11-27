@@ -3,13 +3,18 @@
 
 """Fault scenarios. Each class owns one fault's steps; model tests call ``run``."""
 
+from tests.dfx.reliability.scenarios.launch import (
+    FullCrashAtLaunch,
+    GpuOomAtLaunch,
+    PartialCrashAtLaunch,
+    ServeRootCrashAtLaunch,
+)
 from tests.dfx.reliability.scenarios.oom import (
-    GpuOomConcurrent,
-    GpuOomErrorContract,
-    GpuOomLarge,
-    GpuOomRecovery,
+    GpuOomUnderLoad,
 )
 from tests.dfx.reliability.scenarios.process_kill import (
+    GracefulShutdown,
+    PartialCrashAtExit,
     PartialStageIsolation,
     ProcessKillServeRootNoLoad,
     ProcessKillServeRootWithLoad,
@@ -17,13 +22,24 @@ from tests.dfx.reliability.scenarios.process_kill import (
     ProcessKillTreeWithLoad,
     ProcessKillWorkerNoLoad,
     ProcessKillWorkerWithLoad,
+    ReplicaGracefulShutdown,
+)
+from tests.dfx.reliability.scenarios.replica import (
+    ReplicaCrashAtExit,
+    ReplicaCrashAtLaunch,
+    ReplicaCrashIdle,
+    ReplicaCrashWithLoad,
 )
 
 __all__ = [
-    "GpuOomConcurrent",
-    "GpuOomErrorContract",
-    "GpuOomLarge",
-    "GpuOomRecovery",
+    "FullCrashAtLaunch",
+    "ServeRootCrashAtLaunch",
+    "GracefulShutdown",
+    "ReplicaGracefulShutdown",
+    "GpuOomAtLaunch",
+    "GpuOomUnderLoad",
+    "PartialCrashAtExit",
+    "PartialCrashAtLaunch",
     "PartialStageIsolation",
     "ProcessKillServeRootNoLoad",
     "ProcessKillServeRootWithLoad",
@@ -31,4 +47,8 @@ __all__ = [
     "ProcessKillTreeWithLoad",
     "ProcessKillWorkerNoLoad",
     "ProcessKillWorkerWithLoad",
+    "ReplicaCrashAtExit",
+    "ReplicaCrashAtLaunch",
+    "ReplicaCrashIdle",
+    "ReplicaCrashWithLoad",
 ]

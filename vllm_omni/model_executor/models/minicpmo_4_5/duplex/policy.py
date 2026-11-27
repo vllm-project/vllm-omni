@@ -11,6 +11,60 @@ if TYPE_CHECKING:
 
     from transformers import PreTrainedTokenizerBase
 
+# Server-owned token IDs appended after the media in one native input unit.
+APPEND_TEXT_TOKEN_IDS_KEY = "duplex_append_text_token_ids"
+
+
+@dataclass(kw_only=True)
+class MiniCPMO45TurnState:
+    """The native turn latches needed both while decoding and when cutting a replay."""
+
+    current_turn_ended: bool = True
+    pending_speech_context: bool = False
+    pending_speech_response_open: bool = False
+    explicit_response_awaiting_content: bool = False
+
+    def observe_text_prefill(self, *, force_listen: bool, backend_result: bool) -> None:
+        """Apply the newly accepted client text or delegated result before sampling."""
+        self.pending_speech_context = True
+        if backend_result or (self.current_turn_ended and not force_listen):
+            self.current_turn_ended = False
+            self.pending_speech_response_open = True
+
+
+def record_turn_sample(
+    state: MiniCPMO45TurnState, sampled: int, token_ids: dict[str, int], payload: dict, *, terminator: bool
+) -> None:
+    if terminator:
+        opening = getattr(state, "explicit_response_awaiting_content", False)
+        if sampled == token_ids.get("listen_token_id") and (
+            payload.get("force_listen") is True or opening or getattr(state, "allow_speech_interruption", False)
+        ):
+            state.current_turn_ended = True
+            state.explicit_response_awaiting_content = False
+            state.pending_speech_response_open = False
+    elif sampled == token_ids.get("turn_eos_token_id"):
+        state.current_turn_ended = True
+        state.explicit_response_awaiting_content = False
+        state.pending_speech_response_open = False
+    else:
+        # A seeded prefix can open a response before tts_bos. Its pending
+        # input stays available until the first content token is accepted.
+        opening = getattr(state, "pending_speech_response_open", False)
+        ended = getattr(state, "current_turn_ended", True)
+        if (
+            sampled == token_ids.get("tts_bos_token_id")
+            and (ended or opening)
+            and getattr(state, "pending_speech_context", False)
+        ):
+            state.pending_speech_response_open = True
+        elif opening or ended:
+            state.pending_speech_response_open = False
+            state.pending_speech_context = False
+        if sampled != token_ids.get("tts_bos_token_id"):
+            state.explicit_response_awaiting_content = False
+        state.current_turn_ended = False
+
 
 @dataclass(frozen=True, slots=True)
 class MiniCPMO45DuplexWindowConfig:
@@ -96,8 +150,24 @@ class MiniCPMO45DuplexPolicy:
     VISION_EMBEDS_PER_FRAME = 64
     VISION_TOKENS_PER_FRAME = VISION_EMBEDS_PER_FRAME + 2  # <image> + embeds + </image>
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 20
-    DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 28
+    # Official streaming_generate uses this token budget as its length limit;
+    # sampled terminators can close the chunk earlier.
+    # A 28-character cap fired earlier (16 tokens into "……数字") and the next
+    # unit then sampled <|turn_eos|>, so the number never followed. 0 disables
+    # the character cap; a positive max_speak_chars_per_chunk still opts in.
+    DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 0
     REPETITION_HISTORY_SIZE = 512
+    # Talker handoff. A tail that still ends with one of these, after closing
+    # quotes and brackets, has finished a sentence.
+    SENTENCE_END_PUNCTUATION = "。！？.!?…"
+    CLOSING_PUNCTUATION = "\"'”’」』）)】"
+    TURN_TEXT_TAIL_CHARS = 16
+
+    @staticmethod
+    def turn_text_ends_sentence(text: str) -> bool:
+        """Whether ``text`` ends a sentence, ignoring trailing closing punctuation."""
+        tail = text.rstrip().rstrip(MiniCPMO45DuplexPolicy.CLOSING_PUNCTUATION)
+        return bool(tail) and tail[-1] in MiniCPMO45DuplexPolicy.SENTENCE_END_PUNCTUATION
 
     @staticmethod
     def speech_unit_closed_by_listen(token_ids: Sequence[int], special_token_ids: Mapping[str, int]) -> bool:
@@ -130,11 +200,14 @@ class MiniCPMO45DuplexPolicy:
     def audio_token_count(cls, sample_count: int) -> int:
         """Audio embedding count for a clip of ``sample_count`` samples.
 
-        Matches the whole-clip encoder math (hop 160 mel frames -> CNN stride 2
-        -> avg-pool 5) for any multiple of ``SAMPLES_PER_AUDIO_TOKEN``; serving
-        normalizes clips to that boundary before this is used for budgets.
+        The feature extractor's attention mask counts a partial 160-sample
+        frame. The stride-2 CNN rounds up again, then stride-5 pooling rounds
+        down. Keeping these boundaries avoids cropping reference audio just
+        to make the scheduler's token budget exact.
         """
-        return max(0, int(sample_count) // cls.SAMPLES_PER_AUDIO_TOKEN)
+        mel_frames = (max(0, int(sample_count)) + 159) // 160
+        cnn_frames = (mel_frames + 1) // 2
+        return cnn_frames // 5
 
     @staticmethod
     def session_context_texts(
@@ -168,7 +241,12 @@ class MiniCPMO45DuplexPolicy:
         "turn_eos_token_id": "<|turn_eos|>",
     }
     OPTIONAL_TOKEN_FIELDS: dict[str, str] = {
+        "delegate_open_token_id": "<delegate>",
+        "delegate_close_token_id": "</delegate>",
         "audio_placeholder_token_id": "<|audio|>",
+        "audio_start_token_id": "<|audio_start|>",
+        "audio_end_token_id": "<|audio_end|>",
+        "delegate_token_id": "<|delegate|>",
         "image_start_token_id": "<image>",
         "image_end_token_id": "</image>",
         "slice_start_token_id": "<slice>",

@@ -43,6 +43,7 @@ def get_test_group_marks(
     model_marks: list | None,
     model_type_marker: ModelTypeMarker,
     rocm_multigpu: bool = True,
+    rocm_base: bool = True,
 ) -> list:
     """Build the full set of pytest marks for a test group.
 
@@ -60,14 +61,16 @@ def get_test_group_marks(
             f"but the max CI device count is {MAX_CI_DEVICES}. "
         )
 
-    # hardware_marks only adds skipif for num_cards > 1, so we currently handle the single-device case
-    # directly here. This should probably be handled in a more common way later on.
+    # hardware_marks only adds skipif for num_cards > 1, so the one-card
+    # resources are set here. CUDA and ROCm both use one card, so the node id
+    # stays unsuffixed. Multi-GPU groups keep the branch above.
     assert current_omni_platform is not None and current_omni_platform.device_count is not None
     device_count = current_omni_platform.device_count()
     if current_omni_platform.is_cuda() and device_count < required_devices:
         marks.append(pytest.mark.skip(reason=f"Need {required_devices} devices, got {device_count}"))
+    hardware_resources: dict[str, str | list[str]]
     if required_devices > 1:
-        hardware_resources: dict[str, str | list[str]] = {"cuda": ["L4", "B200"]}
+        hardware_resources = {"cuda": ["L4", "B200"]}
         if rocm_multigpu:
             hardware_resources["rocm"] = "MI325"
         marks.extend(
@@ -78,7 +81,10 @@ def get_test_group_marks(
         )
         marks.append(pytest.mark.full_model)
     else:
-        marks.extend(hardware_marks(res={"cuda": "L4"}, num_cards=1))
+        hardware_resources = {"cuda": "L4"}
+        if rocm_base:
+            hardware_resources["rocm"] = "MI325"
+        marks.extend(hardware_marks(res=hardware_resources, num_cards=1))
         marks.append(pytest.mark.core_model)
     return marks
 
@@ -109,6 +115,7 @@ def get_model_parametrization(model_name: str, test_info: DiffusionModelTestOpts
                 test_info.marks,
                 model_type_marker=test_info.model_type_marker,
                 rocm_multigpu=test_info.rocm_multigpu,
+                rocm_base=test_info.rocm_base,
             ),
         )
         for test_group in test_groups

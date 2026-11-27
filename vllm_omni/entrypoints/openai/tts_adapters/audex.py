@@ -38,9 +38,10 @@ class AudexAdapter(ARTTSAdapter):
     def _get_tokenizer(self):
         """Load and cache the tokenizer used only by the Audex TTS adapter."""
         if self._tokenizer is None:
-            from transformers import AutoTokenizer
-
-            from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+            from vllm_omni.model_executor.models.audex.checkpoint import (
+                ensure_audex_snapshot,
+                load_audex_tokenizer,
+            )
 
             stage_config = self.ctx.server._tts_stage
             topology = getattr(stage_config, "stage_pipeline_config", None)
@@ -50,13 +51,15 @@ class AudexAdapter(ARTTSAdapter):
             profile, folder = (
                 ("full", "checkpoint_folder_full") if stage == "audex_omni" else ("tts", "checkpoint_folder_audiogen")
             )
-            model_path = os.path.normpath(self.ctx.engine_client.model_config.model)
+            engine_client = self.ctx.engine_client
+            assert engine_client is not None
+            model_path = os.path.normpath(engine_client.model_config.model)
             root = (
                 os.path.dirname(model_path)
                 if os.path.basename(model_path).startswith("checkpoint_folder")
                 else ensure_audex_snapshot(model_path, profile=profile)
             )
-            self._tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, folder))
+            self._tokenizer = load_audex_tokenizer(os.path.join(root, folder))
         return self._tokenizer
 
     @classmethod
@@ -116,11 +119,18 @@ class AudexAdapter(ARTTSAdapter):
             raise ValueError("Audex CFG requires a request id")
         stage0_params = sampling_params_list[0]
         sampling_params_list[0] = self._inject_audex_cfg_pair_args(
-            request_id=request_id, prompt=prompt, stage0_params=stage0_params
+            request_id=request_id,
+            prompt=prompt,
+            stage0_params=stage0_params,
+            explicit_temperature=(
+                request.temperature is not None or (request.extra_params or {}).get("temperature") is not None
+            ),
         )
         return apply_max_new_tokens(sampling_params_list, request)
 
-    def _inject_audex_cfg_pair_args(self, request_id: str, prompt: Any, stage0_params: Any) -> Any:
+    def _inject_audex_cfg_pair_args(
+        self, request_id: str, prompt: Any, stage0_params: Any, *, explicit_temperature: bool = False
+    ) -> Any:
         """Complete the Audex CFG contract on a CLONE of the stage-0 params.
 
         The adapter validated ``cfg_scale``; here (where the final request id
@@ -162,6 +172,8 @@ class AudexAdapter(ARTTSAdapter):
         # Guided decoding sharpens the distribution; the unguided default
         # temperature (0.1) adds excess sampling noise under CFG. Measured
         # on the en-24 gate corpus at cfg 1.5: temp 0.1 -> CER 7.31%,
-        # temp 0.05 -> CER 6.87% (unguided baseline 7.24%).
-        stage0_params.temperature = 0.05
+        # temp 0.05 -> CER 6.87% (unguided baseline 7.24%). A caller-supplied
+        # temperature wins over this tuned default.
+        if not explicit_temperature:
+            stage0_params.temperature = 0.05
         return stage0_params

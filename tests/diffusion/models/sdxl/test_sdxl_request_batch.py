@@ -67,6 +67,7 @@ def _make_pipeline(recorder: dict) -> StableDiffusionXLPipeline:
     def _diffuse(latents, **kwargs):
         recorder["diffuse_batch"] = latents.shape[0]
         recorder["diffuse_latents"] = latents.clone()
+        recorder["diffuse_kwargs"] = kwargs
         return latents
 
     pipeline.encode_prompt = _encode_prompt
@@ -74,14 +75,18 @@ def _make_pipeline(recorder: dict) -> StableDiffusionXLPipeline:
     return pipeline
 
 
-def _make_batch(prompts: list[str], latents: list[torch.Tensor] | None = None) -> DiffusionRequestBatch:
+def _make_batch(
+    prompts: list[str],
+    latents: list[torch.Tensor] | None = None,
+    guidance_scale: float | None = 1.0,
+) -> DiffusionRequestBatch:
     requests = []
     for idx, prompt in enumerate(prompts):
         sampling = OmniDiffusionSamplingParams(
             height=HEIGHT,
             width=WIDTH,
             num_inference_steps=2,
-            guidance_scale=1.0,
+            guidance_scale=guidance_scale,
         )
         if latents is not None:
             sampling.latents = latents[idx]
@@ -152,3 +157,36 @@ def test_forward_single_request_still_returns_list() -> None:
 
     assert len(outputs) == 1
     assert recorder["diffuse_batch"] == 1
+
+
+def test_omitted_guidance_scale_falls_back_to_model_default() -> None:
+    """An omitted guidance_scale must use the diffusers default (5.0), not the 1.0 placeholder."""
+    recorder: dict = {}
+    pipeline = _make_pipeline(recorder)
+
+    pipeline.forward(_make_batch(["a cat"], guidance_scale=None))
+
+    assert pipeline.guidance_scale == 5.0
+    assert recorder["diffuse_kwargs"]["do_cfg"] is True
+    assert recorder["diffuse_kwargs"]["guidance_scale"] == 5.0
+
+
+def test_explicit_guidance_scale_of_one_disables_cfg() -> None:
+    recorder: dict = {}
+    pipeline = _make_pipeline(recorder)
+
+    pipeline.forward(_make_batch(["a cat"], guidance_scale=1.0))
+
+    assert pipeline.guidance_scale == 1.0
+    assert recorder["diffuse_kwargs"]["do_cfg"] is False
+
+
+def test_explicit_guidance_scale_is_preserved() -> None:
+    recorder: dict = {}
+    pipeline = _make_pipeline(recorder)
+
+    pipeline.forward(_make_batch(["a cat"], guidance_scale=7.5))
+
+    assert pipeline.guidance_scale == 7.5
+    assert recorder["diffuse_kwargs"]["do_cfg"] is True
+    assert recorder["diffuse_kwargs"]["guidance_scale"] == 7.5

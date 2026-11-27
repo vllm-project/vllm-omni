@@ -46,7 +46,9 @@ class MemoryClient:
 async def _wait_until(predicate):
     async def poll():
         while not predicate():
-            await asyncio.sleep(0)
+            # Registration uses asyncio.to_thread. A zero-delay busy loop can
+            # starve that worker of the GIL while polling Prometheus samples.
+            await asyncio.sleep(0.001)
 
     await asyncio.wait_for(poll(), timeout=2)
 

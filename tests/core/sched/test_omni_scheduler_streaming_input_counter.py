@@ -62,6 +62,7 @@ def _make_scheduler(scheduler_cls, *, requests, running, waiting, counter, skipp
     scheduler.kv_holding_waiting = skipped if skipped is not None else []
     scheduler.deferred_waiting = set()
     scheduler.num_waiting_for_streaming_input = counter
+    scheduler._outputs_awaiting_stage_payload = {}
     return scheduler
 
 
@@ -124,6 +125,7 @@ def test_ar_schedule_resyncs_before_delegating_upstream(monkeypatch: pytest.Monk
     real queue."""
     parked = _StubRequest("req-resumed", RequestStatus.RUNNING)
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler._model_input_streams = {}
     scheduler.chunk_transfer_adapter = None
     scheduler.input_coordinator = None
     scheduler.requests = {parked.request_id: parked}

@@ -67,7 +67,7 @@ _REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know w
 class TestHiggsAudioV2OnlineHappyPath:
     """Plain-text -> audio happy paths against the live HTTP server."""
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_plain_text_wav(self, omni_server, online_client) -> None:
         """Single non-streaming WAV request — covers the canonical TTS happy path."""
         online_client.send_audio_speech_request(
@@ -81,7 +81,7 @@ class TestHiggsAudioV2OnlineHappyPath:
             }
         )
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_plain_text_pcm_streaming(self, omni_server, online_client) -> None:
         """Streaming PCM via the shared-memory connector's codec_streaming path.
 
@@ -111,7 +111,7 @@ class TestHiggsAudioV2OnlineHappyPath:
             }
         )
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_plain_text_with_max_new_tokens(self, omni_server, online_client) -> None:
         """max_new_tokens is one of the few extra fields the higgs validator accepts."""
         online_client.send_audio_speech_request(
@@ -126,7 +126,7 @@ class TestHiggsAudioV2OnlineHappyPath:
             }
         )
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_concurrent_plain_text(self, omni_server, online_client) -> None:
         """Three concurrent non-streaming requests — guards the per-slot audio state."""
         online_client.send_audio_speech_request(
@@ -137,6 +137,11 @@ class TestHiggsAudioV2OnlineHappyPath:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                # Concurrent Higgs samples can leave a brief tail that
+                # whisper-small mishears as extra words. Confirm a weak fast
+                # transcript with the stronger ASR model before treating it
+                # as a semantic regression, matching the Higgs v3 gate.
+                "transcript_escalation_model": "large-v3",
             },
             request_num=3,
         )
@@ -153,7 +158,7 @@ class TestHiggsAudioV2OnlineVoiceClone:
     :meth:`HiggsAudioV2TalkerForConditionalGeneration._maybe_apply_ref_audio_substitution`.
     """
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_voice_clone_basic(self, omni_server, online_client) -> None:
         """Single non-streaming WAV request driven by the qwen3_tts ref clip."""
         online_client.send_audio_speech_request(
@@ -166,10 +171,14 @@ class TestHiggsAudioV2OnlineVoiceClone:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                # whisper-small can mishear this short clip; only after a weak
+                # match, re-verify it with the stronger ASR before failing.
+                # Local-only key (not forwarded to the server).
+                "transcript_escalation_model": "large-v3",
             }
         )
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_voice_clone_pcm_streaming(self, omni_server, online_client) -> None:
         """Voice clone over the streaming PCM path."""
         online_client.send_audio_speech_request(

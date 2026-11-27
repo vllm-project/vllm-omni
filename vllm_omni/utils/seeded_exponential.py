@@ -16,6 +16,23 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
+def categorical_sample(
+    probs: torch.Tensor, generators: dict[int, torch.Generator], use_fp64_gumbel: bool = False
+) -> torch.Tensor:
+    """Draw model tokens with ordered Torch generators, including mixed seeds.
+
+    The default generator draws the whole matrix before seeded rows overwrite
+    their noise. Same-dtype scores reuse ``probs``; fp64 noise leaves it intact.
+    """
+    noise = torch.empty(probs.shape, dtype=torch.float64 if use_fp64_gumbel else probs.dtype, device=probs.device)
+    if len(generators) != probs.shape[0]:
+        noise.exponential_()
+    for row, generator in generators.items():
+        noise[row].exponential_(generator=generator)
+    scores = probs.div_(noise) if noise.dtype == probs.dtype else noise.reciprocal_().mul_(probs)
+    return scores.argmax(dim=-1).view(-1)
+
+
 @triton.jit
 def torch_exponential_noise(seed, offset, elements, threads):
     # torch's grid-stride kernel: thread t draws curand_uniform4 once per grid
@@ -51,14 +68,17 @@ def _generator_exponential_kernel(
     threads,
     HAS_ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
+    STEP_INCREMENT: tl.constexpr = 0,
 ):
     request = tl.program_id(0)
     elements = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = elements < numel
     seed = tl.load(seed_ptr + request).to(tl.uint64)
-    offset = tl.load(offset_ptr + request).to(tl.uint64)
+    step = tl.program_id(2)
+    offset = tl.load(offset_ptr + request).to(tl.uint64) + step * STEP_INCREMENT
     noise = torch_exponential_noise(seed, offset, elements, threads)
     row = tl.load(rows_ptr + request).to(tl.int64) if HAS_ROWS else request.to(tl.int64)
+    row += step * tl.num_programs(0)
     tl.store(out_ptr + row * numel + elements, noise, mask=mask)
 
 
@@ -121,6 +141,29 @@ def fill_exponential_rows(out: torch.Tensor, generators: list, rows: list[int] |
         BLOCK=block,
     )
     return out
+
+
+def fill_exponential_steps(out: torch.Tensor, generators: tuple[torch.Generator, ...]) -> int:
+    """Fill [steps, requests, vocab] with per-request draws without advancing RNG."""
+    steps, rows, vocab = out.shape
+    threads, increment = torch_exponential_policy(vocab, out.device)
+    seeds = [generator.initial_seed() for generator in generators]
+    seeds = [seed - (1 << 64) if seed >= 1 << 63 else seed for seed in seeds]
+    offsets = [generator.get_offset() for generator in generators]
+    state = torch.tensor([seeds, offsets], dtype=torch.int64, pin_memory=True).to(out.device, non_blocking=True)
+    block = 1024
+    _generator_exponential_kernel[(rows, triton.cdiv(vocab, block), steps)](
+        out,
+        state[0],
+        state[0],
+        state[1],
+        vocab,
+        threads,
+        HAS_ROWS=False,
+        BLOCK=block,
+        STEP_INCREMENT=increment,
+    )
+    return increment
 
 
 def batched_seeded_exponential_supported(q: torch.Tensor, generators: dict) -> bool:

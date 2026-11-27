@@ -4,15 +4,20 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
+import torch
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
+from tests.helpers.mark import hardware_test
 
+pytestmark = [pytest.mark.core_model]
 
-torch = pytest.importorskip("torch")
+torch = pytest.importorskip("torch")  # noqa: F811 — guard import for optional torch envs
 
 
 @functools.lru_cache(maxsize=1)
@@ -42,6 +47,9 @@ def _make_bare_talker():
     talker._enable_profiling = False
     talker._audio_emit_every = 1
     talker._vae_decode_every = 1
+    # __new__ bypasses __init__, which normally derives this from the
+    # deployment dtype; collect/decode paths read it unconditionally.
+    talker._vae_dtype = torch.float32
     talker._enable_delayed_audio_copy = False
     talker._delayed_audio_copy_use_events = False
     talker._coalesce_audio_d2h = False
@@ -71,7 +79,83 @@ def _seed_cached_decode(talker, req_id: str):
     return state
 
 
+class _FakeStream:
+    def __init__(self, device=None) -> None:
+        self.waited: list[Any] = []
+
+    def wait_event(self, event) -> None:
+        self.waited.append(event)
+
+    def wait_stream(self, stream) -> None:
+        self.waited.append(stream)
+
+    def query(self) -> bool:
+        return True
+
+    def synchronize(self) -> None:
+        pass
+
+
+class _FakeEvent:
+    def __init__(self) -> None:
+        self.recorded_on: Any = "unrecorded"
+
+    def record(self, stream=None) -> None:
+        self.recorded_on = stream
+
+    def query(self) -> bool:
+        return True
+
+    def synchronize(self) -> None:
+        pass
+
+
+class _FakeDeviceModule:
+    """Stands in for ``torch.cuda`` / ``torch.npu`` so the async host-copy paths run on CPU tensors."""
+
+    Stream = _FakeStream
+    Event = _FakeEvent
+
+    def __init__(self) -> None:
+        self.current = _FakeStream()
+        self.entered: list[_FakeStream] = []
+
+    def current_stream(self, device=None) -> _FakeStream:
+        return self.current
+
+    @contextlib.contextmanager
+    def stream(self, stream: _FakeStream):
+        self.entered.append(stream)
+        yield
+
+
+def _use_async_host_copies(monkeypatch):
+    """Report an NPU platform whose device is the CPU, and record how host copies are made."""
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_type", "cpu")
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    device_module = _FakeDeviceModule()
+    monkeypatch.setattr(torch, "get_device_module", lambda device=None: device_module)
+    calls = SimpleNamespace(pinned=[], non_blocking=[], record_stream=[])
+    empty, copy_ = torch.empty, torch.Tensor.copy_
+
+    def recording_empty(*args, pin_memory=False, **kwargs):
+        calls.pinned.append(pin_memory)
+        return empty(*args, **kwargs)
+
+    def recording_copy(self, src, non_blocking=False):
+        calls.non_blocking.append(non_blocking)
+        return copy_(self, src, non_blocking)
+
+    monkeypatch.setattr(torch, "empty", recording_empty)
+    monkeypatch.setattr(torch.Tensor, "copy_", recording_copy)
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: calls.record_stream.append(stream))
+    return device_module, calls
+
+
 class TestStateEvictionContract:
+    @pytest.mark.cpu
     def test_eager_optimizations_do_not_require_torch_inductor(self, monkeypatch) -> None:
         from vllm_omni.model_executor.models.voxcpm2 import voxcpm2_talker as tk
 
@@ -130,6 +214,7 @@ class TestStateEvictionContract:
         assert talker._eager_optimizations_applied is True
         assert not hasattr(estimator, "_compiled")
 
+    @pytest.mark.cpu
     def test_profiler_drops_invalid_accelerator_graph_events(self, monkeypatch) -> None:
         from vllm_omni.model_executor.models.voxcpm2 import voxcpm2_talker as tk
 
@@ -146,6 +231,7 @@ class TestStateEvictionContract:
         assert timer.breakdown() == ""
         assert timer._pairs == []
 
+    @pytest.mark.cpu
     def test_profiler_disables_device_without_timing_events(self, monkeypatch) -> None:
         from vllm_omni.model_executor.models.voxcpm2 import voxcpm2_talker as tk
 
@@ -165,6 +251,7 @@ class TestStateEvictionContract:
         assert timer._device_module is None
         assert timer._starts == {}
 
+    @pytest.mark.cpu
     def test_runtime_config_normalizes_mutually_exclusive_paths(self) -> None:
         _, _, RuntimeConfig = _voxcpm2_talker_mod()
 
@@ -179,9 +266,13 @@ class TestStateEvictionContract:
         assert cfg.enable_batched_cfm is True
         assert cfg.enable_cfm_cuda_graph is False
         assert cfg.enable_cfm_prealloc_output is False
-        assert cfg.enable_batched_vae_decode is False
+        # The legacy batched VAE decoder is resolved by the talker against the
+        # actual graph condition and the delayed-copy incompatibility, so the
+        # config keeps the configured value (see the talker wiring tests).
+        assert cfg.enable_batched_vae_decode is True
         assert cfg.enable_delayed_audio_copy is True
 
+    @pytest.mark.cpu
     def test_pending_requests_is_not_used_for_eviction(self) -> None:
         talker = _make_bare_talker()
 
@@ -196,6 +287,7 @@ class TestStateEvictionContract:
             assert rid in talker._active_states
             assert talker._active_states[rid].prefill_completed is True
 
+    @pytest.mark.cpu
     def test_compute_logits_does_not_sync_stop_bool_on_default_path(self) -> None:
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
@@ -212,6 +304,7 @@ class TestStateEvictionContract:
         assert state.precomputed_stop_logits is None
         assert state.precomputed_is_stopping is None
 
+    @pytest.mark.cpu
     def test_compute_logits_reuses_cached_stop_bool_from_sparse_audio_path(self) -> None:
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
@@ -232,25 +325,214 @@ class TestStateEvictionContract:
         assert state.precomputed_stop_logits is None
         assert state.precomputed_is_stopping is None
 
+    @pytest.mark.cpu
+    def test_stop_precompute_reads_synchronously_without_cuda_or_npu(self, monkeypatch) -> None:
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "device_type", "cpu")
+        monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+        _, RState, _ = _voxcpm2_talker_mod()
+        talker = _make_bare_talker()
+        talker._vae_decode_every = 3
+        states = [
+            RState(request_id="stop", precomputed_stop_logits=torch.tensor([[0.0, 1.0]])),
+            RState(request_id="keep", precomputed_stop_logits=torch.tensor([[1.0, 0.0]])),
+        ]
+
+        talker._precompute_stop_flags_for_audio_collect(states)
+
+        assert getattr(talker, "_stop_mask_stream", None) is None
+        assert [state.pending_stop_mask_event for state in states] == [None, None]
+        assert talker._should_stop_from_cached_logits(states[0]) is True
+        assert talker._should_stop_from_cached_logits(states[1]) is False
+
+    @pytest.mark.cpu
+    @pytest.mark.parametrize(
+        ("device_type", "is_npu", "expected"),
+        [("cuda", False, True), ("npu", True, True), ("mps", False, False), ("xpu", False, False)],
+    )
+    def test_only_cuda_and_npu_copy_to_host_asynchronously(self, monkeypatch, device_type, is_npu, expected) -> None:
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import _platform_copies_to_host_async
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "device_type", device_type)
+        monkeypatch.setattr(current_omni_platform, "is_npu", lambda: is_npu)
+
+        assert _platform_copies_to_host_async() is expected
+
+    @pytest.mark.cpu
+    @pytest.mark.parametrize(
+        ("device_type", "is_npu", "expected"),
+        [
+            ("cuda", False, True),
+            ("npu", True, True),
+            ("xpu", False, True),
+            ("musa", False, True),
+            ("mps", False, False),
+            ("cpu", False, False),
+        ],
+    )
+    def test_stop_mask_side_stream_platforms(self, monkeypatch, device_type, is_npu, expected) -> None:
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import _platform_uses_stop_mask_side_stream
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "device_type", device_type)
+        monkeypatch.setattr(current_omni_platform, "is_npu", lambda: is_npu)
+
+        assert _platform_uses_stop_mask_side_stream() is expected
+
+    @pytest.mark.cpu
+    def test_stop_precompute_uses_side_stream_and_pinned_copy_on_cuda_or_npu(self, monkeypatch) -> None:
+        device_module, calls = _use_async_host_copies(monkeypatch)
+        _, RState, _ = _voxcpm2_talker_mod()
+        talker = _make_bare_talker()
+        talker._vae_decode_every = 3
+        states = [
+            RState(request_id="stop", precomputed_stop_logits=torch.tensor([[0.0, 1.0]])),
+            RState(request_id="keep", precomputed_stop_logits=torch.tensor([[1.0, 0.0]])),
+        ]
+
+        talker._precompute_stop_flags_for_audio_collect(states)
+
+        side_stream = talker._stop_mask_stream
+        copy_done = states[0].pending_stop_mask_event
+        assert isinstance(side_stream, _FakeStream)
+        assert device_module.entered == [side_stream]
+        # The side stream waits on a fork event recorded on the current stream
+        # before it reads the stop logits.
+        (fork,) = side_stream.waited
+        assert isinstance(fork, _FakeEvent)
+        assert fork.recorded_on is None
+        assert fork is not copy_done
+        assert calls.record_stream == [side_stream, side_stream]
+        assert calls.pinned == [True]
+        assert calls.non_blocking == [True]
+        assert [state.pending_stop_mask_event for state in states] == [copy_done, copy_done]
+        assert copy_done.recorded_on is side_stream
+        assert talker._should_stop_from_cached_logits(states[0]) is True
+        assert talker._should_stop_from_cached_logits(states[1]) is False
+
+    @pytest.mark.cpu
+    def test_stop_precompute_uses_side_stream_with_blocking_copy_on_xpu_or_musa(self, monkeypatch) -> None:
+        from vllm_omni.model_executor.models.voxcpm2 import voxcpm2_talker
+        from vllm_omni.platforms import current_omni_platform
+
+        device_module, calls = _use_async_host_copies(monkeypatch)
+        # CPU tensors stand in for XPU/MUSA ones: side stream, no pinned copy.
+        monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+        monkeypatch.setattr(voxcpm2_talker, "_platform_uses_stop_mask_side_stream", lambda: True)
+        _, RState, _ = _voxcpm2_talker_mod()
+        talker = _make_bare_talker()
+        talker._vae_decode_every = 3
+        states = [
+            RState(request_id="stop", precomputed_stop_logits=torch.tensor([[0.0, 1.0]])),
+            RState(request_id="keep", precomputed_stop_logits=torch.tensor([[1.0, 0.0]])),
+        ]
+
+        talker._precompute_stop_flags_for_audio_collect(states)
+
+        side_stream = talker._stop_mask_stream
+        copy_done = states[0].pending_stop_mask_event
+        assert isinstance(side_stream, _FakeStream)
+        assert device_module.entered == [side_stream]
+        (fork,) = side_stream.waited
+        assert fork.recorded_on is None
+        assert fork is not copy_done
+        assert calls.pinned == [False]
+        assert calls.non_blocking == [False]
+        assert copy_done.recorded_on is side_stream
+        assert talker._should_stop_from_cached_logits(states[0]) is True
+        assert talker._should_stop_from_cached_logits(states[1]) is False
+
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_batched_stop_precompute_sets_audio_collect_cache(self) -> None:
-        if not torch.cuda.is_available():
+        if not DEVICE_MODULE.is_available():
             pytest.skip("CUDA is required to exercise batched stop D2H precompute")
 
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
         talker._audio_emit_every = 2
         states = [
-            RState(request_id="stop", precomputed_stop_logits=torch.tensor([[0.0, 1.0]], device="cuda")),
-            RState(request_id="keep", precomputed_stop_logits=torch.tensor([[1.0, 0.0]], device="cuda")),
+            RState(request_id="stop", precomputed_stop_logits=torch.tensor([[0.0, 1.0]], device=DEVICE_TYPE)),
+            RState(request_id="keep", precomputed_stop_logits=torch.tensor([[1.0, 0.0]], device=DEVICE_TYPE)),
         ]
 
         talker._precompute_stop_flags_for_audio_collect(states)
 
+        # Async contract: the comparison result is staged in pinned memory
+        # and resolved lazily through the event-synchronized latch; nothing
+        # is latched until a consumer reads it.
+        assert states[0].pending_stop_mask_cpu is not None
+        assert states[0].pending_stop_mask_event is not None
+        assert states[0].precomputed_is_stopping is None
+        assert states[1].precomputed_is_stopping is None
+
+        # Pin the synchronization semantics: wrap the recorded event in a
+        # counting proxy. If the read path ever skips event.synchronize(),
+        # the assertions below fail.
+        class _RecordingEvent:
+            def __init__(self, inner):
+                self._inner = inner
+                self.sync_calls = 0
+
+            def synchronize(self):
+                self.sync_calls += 1
+                self._inner.synchronize()
+
+        recorder = _RecordingEvent(states[0].pending_stop_mask_event)
+        states[0].pending_stop_mask_event = recorder
+        recorder_keep = states[1].pending_stop_mask_event
+        states[1].pending_stop_mask_event = _RecordingEvent(recorder_keep)
+
+        # Resolving must latch the pinned bit, which after
+        # event.synchronize() matches stop_logits[:, 1] > stop_logits[:, 0]
+        # for each request.
+        assert talker._should_stop_from_cached_logits(states[0]) is True
+        assert recorder.sync_calls >= 1, "the pinned read must synchronize the copy event first"
         assert states[0].precomputed_is_stopping is True
         assert states[0].is_stopping is True
+        assert talker._should_stop_from_cached_logits(states[1]) is False
         assert states[1].precomputed_is_stopping is False
         assert states[1].is_stopping is False
 
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+    def test_length_limit_discard_synchronizes_and_clears_pending(self) -> None:
+        if not DEVICE_MODULE.is_available():
+            pytest.skip("CUDA is required to exercise the stop-mask discard path")
+
+        _, RState, _ = _voxcpm2_talker_mod()
+        talker = _make_bare_talker()
+        talker._audio_emit_every = 2
+        states = [
+            RState(request_id="limit", precomputed_stop_logits=torch.tensor([[0.0, 1.0]], device=DEVICE_TYPE)),
+        ]
+
+        talker._precompute_stop_flags_for_audio_collect(states)
+        assert states[0].pending_stop_mask_event is not None
+
+        class _RecordingEvent:
+            def __init__(self, inner):
+                self._inner = inner
+                self.sync_calls = 0
+
+            def synchronize(self):
+                self.sync_calls += 1
+                self._inner.synchronize()
+
+        recorder = _RecordingEvent(states[0].pending_stop_mask_event)
+        states[0].pending_stop_mask_event = recorder
+
+        # The length-limit short-circuit must DISCARD (synchronize + clear)
+        # instead of resolving the pending copy: no in-flight DMA may
+        # outlive its buffer on this path either.
+        states[0].audio_length_limit_reached = True
+        assert talker._should_stop_from_cached_logits(states[0]) is True
+        assert recorder.sync_calls >= 1, "the discard must synchronize the in-flight copy first"
+        assert states[0].pending_stop_mask_cpu is None
+        assert states[0].pending_stop_mask_event is None
+        assert states[0].precomputed_is_stopping is None, "the discard path must not latch a stop decision"
+
+    @pytest.mark.cpu
     def test_on_requests_finished_defers_cleanup(self) -> None:
         talker = _make_bare_talker()
         _seed_cached_decode(talker, "req-A")
@@ -261,6 +543,7 @@ class TestStateEvictionContract:
         assert "req-A" in talker._active_states
         assert "req-A" in talker._deferred_cleanup_ids
 
+    @pytest.mark.cpu
     def test_flush_deferred_cleanup_removes_only_finished(self) -> None:
         talker = _make_bare_talker()
         _seed_cached_decode(talker, "req-A")
@@ -273,6 +556,7 @@ class TestStateEvictionContract:
         assert "req-B" in talker._active_states
         assert talker._deferred_cleanup_ids == set()
 
+    @pytest.mark.cpu
     def test_current_request_id_cleared_when_matching(self) -> None:
         talker = _make_bare_talker()
         _seed_cached_decode(talker, "req-A")
@@ -283,6 +567,7 @@ class TestStateEvictionContract:
 
         assert talker._current_request_id is None
 
+    @pytest.mark.cpu
     def test_current_request_id_preserved_when_not_finished(self) -> None:
         talker = _make_bare_talker()
         _seed_cached_decode(talker, "req-A")
@@ -296,6 +581,7 @@ class TestStateEvictionContract:
 
 
 class TestLeakWarnGuard:
+    @pytest.mark.cpu
     def test_warn_fires_once_over_threshold(self, monkeypatch) -> None:
         from vllm_omni.model_executor.models.voxcpm2 import voxcpm2_talker as tk
 
@@ -404,6 +690,7 @@ class TestChunkedPrefillContract:
         )
         return talker
 
+    @pytest.mark.cpu
     def test_preprocess_slices_full_embeddings_by_request_position(self) -> None:
         talker = self._make_talker()
 
@@ -432,6 +719,7 @@ class TestChunkedPrefillContract:
         assert state.decode_step_count == 7
         assert state.is_last_prefill_chunk is True
 
+    @pytest.mark.cpu
     def test_prefill_cache_lifecycle_across_chunks(self) -> None:
         talker = self._make_talker()
         prompt_cache = {"mode": "reference", "ref_audio_feat": torch.ones(1)}
@@ -489,6 +777,7 @@ class TestChunkedPrefillContract:
         assert state.prefill_masks is None
         assert talker._active_states["req"] is state
 
+    @pytest.mark.cpu
     def test_single_token_tail_is_still_prefill(self) -> None:
         talker = self._make_talker()
 
@@ -509,6 +798,7 @@ class TestChunkedPrefillContract:
 
 
 class TestDecodeBatchContract:
+    @pytest.mark.cpu
     def test_forward_skip_pending_prefill_keeps_audio_queue_aligned(self) -> None:
         class FakeScaffold:
             def __call__(self, input_ids, positions, intermediate_tensors, inputs_embeds):
@@ -536,7 +826,7 @@ class TestDecodeBatchContract:
         assert talker._results_queue == [("req", None)]
         assert talker._audio_queue == [("req", None)]
 
-    def _make_decode_talker(self) -> object:
+    def _make_decode_talker(self) -> Any:
         talker = _make_bare_talker()
         talker._perf = _NoopPerf()
         talker._tts = _FakeTTS()
@@ -565,6 +855,7 @@ class TestDecodeBatchContract:
         state.curr_prefix_feat_cond = torch.arange(6, dtype=torch.float32).reshape(2, 3) + offset
         return state
 
+    @pytest.mark.cpu
     def test_batched_fsq_fusion_matches_per_request_decode_prepare(self) -> None:
         seq_talker = self._make_decode_talker()
         batch_talker = self._make_decode_talker()
@@ -594,6 +885,7 @@ class TestDecodeBatchContract:
             torch.testing.assert_close(actual_meta.new_lm_hidden, expected_meta.new_lm_hidden)
         assert [state.decode_step_count for state in batch_states] == [1, 1]
 
+    @pytest.mark.cpu
     def test_batch_decode_matches_per_request_state_updates(self) -> None:
         from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
             _DecodeResidualMeta,
@@ -625,6 +917,7 @@ class TestDecodeBatchContract:
             torch.testing.assert_close(actual.curr_prefix_feat_cond, expected.curr_prefix_feat_cond)
             torch.testing.assert_close(actual.last_audio_patch_gpu, expected.last_audio_patch_gpu)
 
+    @pytest.mark.cpu
     def test_batch_decode_preserves_per_request_cfm_rng_order(self) -> None:
         from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
             _DecodeResidualMeta,
@@ -665,6 +958,7 @@ class TestDecodeBatchContract:
 
 class _FakeAudioVAE:
     decode_chunk_size = 2
+    _compiled = False
 
 
 class _FakeAudioTTS:
@@ -672,6 +966,7 @@ class _FakeAudioTTS:
 
 
 class TestAudioEmitCoalescing:
+    @pytest.mark.cpu
     def test_audio_emit_every_accumulates_gpu_chunks_without_changing_order(self) -> None:
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
@@ -700,6 +995,7 @@ class TestAudioEmitCoalescing:
         torch.testing.assert_close(audio, torch.tensor([10.0, 11.0, 20.0, 21.0]))
         assert state.pending_audio_chunks_gpu == []
 
+    @pytest.mark.cpu
     def test_audio_emit_every_flushes_on_stop(self) -> None:
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
@@ -718,6 +1014,7 @@ class TestAudioEmitCoalescing:
         torch.testing.assert_close(audio, torch.tensor([3.0, 4.0]))
         assert state.pending_audio_chunks_gpu == []
 
+    @pytest.mark.cpu
     def test_vae_decode_every_accumulates_latents_before_decode(self) -> None:
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
@@ -750,6 +1047,7 @@ class TestAudioEmitCoalescing:
         assert state.pending_vae_latents_gpu == []
         torch.testing.assert_close(seen_feats[0].reshape(-1), torch.tensor([1.0, 2.0]))
 
+    @pytest.mark.cpu
     def test_vae_decode_every_flushes_pending_latent_on_stop(self) -> None:
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
@@ -769,6 +1067,7 @@ class TestAudioEmitCoalescing:
         assert state.pending_vae_latents_gpu == []
         assert state.is_stopping is True
 
+    @pytest.mark.cpu
     def test_batched_vae_decode_collects_ready_requests_in_order(self) -> None:
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
@@ -819,6 +1118,7 @@ class TestAudioEmitCoalescing:
         assert ready0.pending_vae_latents_gpu == []
         assert ready1.pending_vae_latents_gpu == []
 
+    @pytest.mark.cpu
     def test_audio_emit_every_keeps_private_chunk_when_vae_output_storage_is_reused(self) -> None:
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
@@ -848,6 +1148,7 @@ class TestAudioEmitCoalescing:
 
         torch.testing.assert_close(audio, torch.tensor([10.0, 11.0, 20.0, 21.0]))
 
+    @pytest.mark.cpu
     def test_audio_emit_every_keeps_private_chunk_when_compiled_vae_reuses_storage(self) -> None:
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
@@ -877,6 +1178,48 @@ class TestAudioEmitCoalescing:
 
         torch.testing.assert_close(audio, torch.tensor([10.0, 11.0, 20.0, 21.0]))
 
+    @pytest.mark.cpu
+    def test_delayed_audio_copy_reads_synchronously_without_cuda_or_npu(self, monkeypatch) -> None:
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "device_type", "cpu")
+        monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+        _, RState, _ = _voxcpm2_talker_mod()
+        talker = _make_bare_talker()
+        state = RState(request_id="req")
+
+        talker._enqueue_delayed_audio_copy(state, torch.tensor([1.0, 2.0]))
+
+        (copy,) = state.pending_audio_copies
+        assert (copy.async_copy, copy.event, copy.source) == (False, None, None)
+        assert talker._audio_copy_stream is None
+        torch.testing.assert_close(copy.host, torch.tensor([1.0, 2.0]))
+
+    @pytest.mark.cpu
+    def test_delayed_audio_copy_uses_side_stream_and_pinned_copy_on_cuda_or_npu(self, monkeypatch) -> None:
+        device_module, calls = _use_async_host_copies(monkeypatch)
+        _, RState, _ = _voxcpm2_talker_mod()
+        talker = _make_bare_talker()
+        talker._tts = _FakeAudioTTS()
+        talker._delayed_audio_copy_use_events = True
+        state = RState(request_id="req")
+
+        talker._enqueue_delayed_audio_copy(state, torch.tensor([1.0, 2.0]))
+
+        (copy,) = state.pending_audio_copies
+        copy_stream = talker._audio_copy_stream
+        assert isinstance(copy_stream, _FakeStream)
+        assert copy_stream.waited == [device_module.current]
+        assert device_module.entered == [copy_stream]
+        assert calls.pinned == [True]
+        assert calls.non_blocking == [True]
+        assert calls.record_stream == [copy_stream]
+        assert copy.async_copy is True
+        assert copy.source is not None
+        assert copy.event.recorded_on is copy_stream
+        torch.testing.assert_close(copy.host, torch.tensor([1.0, 2.0]))
+
+    @pytest.mark.cpu
     def test_delayed_audio_copy_emits_previous_chunk_and_flushes_on_stop(self) -> None:
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
@@ -916,6 +1259,7 @@ class TestAudioEmitCoalescing:
         assert state.pending_audio_copies == []
         assert state.is_stopping is True
 
+    @pytest.mark.cpu
     def test_delayed_audio_copy_flushes_on_forced_stop(self) -> None:
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
@@ -948,6 +1292,7 @@ class TestAudioEmitCoalescing:
         torch.testing.assert_close(audio, torch.tensor([10.0, 11.0, 20.0, 21.0]))
         assert state.pending_audio_copies == []
 
+    @pytest.mark.cpu
     def test_make_omni_output_uses_sparse_req_ids_for_deferred_chunks(self) -> None:
         talker = _make_bare_talker()
         talker._audio_emit_every = 4
@@ -969,6 +1314,7 @@ class TestAudioEmitCoalescing:
         torch.testing.assert_close(audio[0], torch.tensor([1.0, 2.0]))
         assert int(sr[0]) == 16000
 
+    @pytest.mark.cpu
     def test_make_omni_output_emits_empty_sparse_marker_for_deferred_chunks(self) -> None:
         talker = _make_bare_talker()
         talker._audio_emit_every = 4
@@ -982,6 +1328,7 @@ class TestAudioEmitCoalescing:
         assert out.multimodal_outputs["meta"]["req_id"] == []
         assert out.multimodal_outputs["meta"]["sparse_audio"] == ["1"]
 
+    @pytest.mark.cpu
     def test_make_omni_output_uses_sparse_req_ids_for_delayed_audio_copy(self) -> None:
         talker = _make_bare_talker()
         talker._enable_delayed_audio_copy = True
@@ -999,6 +1346,7 @@ class TestAudioEmitCoalescing:
         assert len(out.multimodal_outputs["model_outputs"]) == 1
         torch.testing.assert_close(out.multimodal_outputs["model_outputs"][0], torch.tensor([1.0, 2.0]))
 
+    @pytest.mark.cpu
     def test_make_omni_output_uses_sparse_req_ids_for_deferred_vae_decode(self) -> None:
         talker = _make_bare_talker()
         talker._vae_decode_every = 2
@@ -1016,22 +1364,23 @@ class TestAudioEmitCoalescing:
         assert len(out.multimodal_outputs["model_outputs"]) == 1
         torch.testing.assert_close(out.multimodal_outputs["model_outputs"][0], torch.tensor([1.0, 2.0]))
 
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_make_omni_output_coalesces_gpu_audio_to_cpu(self) -> None:
-        if not torch.cuda.is_available():
+        if not DEVICE_MODULE.is_available():
             pytest.skip("CUDA is required to exercise D2H coalescing")
         talker = _make_bare_talker()
         talker._coalesce_audio_d2h = True
         talker._sample_rate = 16000
         talker._audio_queue = [
-            ("req-0", torch.tensor([1.0, 2.0], device="cuda")),
-            ("req-1", torch.tensor([3.0], device="cuda")),
+            ("req-0", torch.tensor([1.0, 2.0], device=DEVICE_TYPE)),
+            ("req-1", torch.tensor([3.0], device=DEVICE_TYPE)),
         ]
 
         out = talker.make_omni_output(torch.zeros(2, 1))
 
         audio = out.multimodal_outputs["model_outputs"]
         assert len(audio) == 2
-        assert all(not chunk.is_cuda for chunk in audio)
+        assert all(not chunk.device.type == DEVICE_TYPE for chunk in audio)
         torch.testing.assert_close(audio[0], torch.tensor([1.0, 2.0]))
         torch.testing.assert_close(audio[1], torch.tensor([3.0]))
 
@@ -1047,6 +1396,7 @@ class TestAudioEmitCoalescing:
         (2, True, 2, "model"),
     ],
 )
+@pytest.mark.cpu
 def test_v1_length_limit_flushes_pending_patches(tail_patches, batched, audio_emit_every, limit_source) -> None:
     _, RState, _ = _voxcpm2_talker_mod()
     talker = _make_bare_talker()

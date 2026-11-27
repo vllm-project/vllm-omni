@@ -11,15 +11,23 @@ window fills with stale entries after K completions.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import TypedDict
 from unittest.mock import MagicMock
 
 import pytest
+from vllm.config import VllmConfig
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.core.sched.window_policy import WindowOperation
 
 # Imports must run in this order: vllm_omni applies patches to vllm.v1.request before
 # Request / RequestStatus are bound in this module. Ruff isort would reorder them.
 # isort: off
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 
 # isort: on
@@ -31,6 +39,7 @@ def _make_scheduler(*, chunk_transfer_adapter=None) -> OmniARScheduler:
     """Minimal OmniARScheduler exercising _free_request()'s no-KV-transfer
     happy path."""
     sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._model_input_streams = {}
     sched._omits_kv_transfer_cache = {}
     sched._connector_finished = lambda request: (False, None)
     sched.encoder_cache_manager = MagicMock()
@@ -79,6 +88,48 @@ def test_free_request_is_safe_without_a_chunk_transfer_adapter():
     sched._free_input_coordinator_request.assert_called_once_with("req-1")
 
 
+@pytest.mark.parametrize(
+    ("num_spec_tokens", "async_chunk", "use_v2", "expected"),
+    [(3, False, False, True), (0, False, False, False), (3, True, False, False), (3, False, True, False)],
+)
+def test_finished_speculative_history_survives_request_free_and_is_sent_once(
+    num_spec_tokens, async_chunk, use_v2, expected
+):
+    sched = _make_scheduler()
+    sched.num_spec_tokens = num_spec_tokens
+    sched.use_v2_model_runner = use_v2
+    sched.vllm_config = object.__new__(VllmConfig)
+    sched.vllm_config.model_config = object.__new__(OmniModelConfig)
+    sched.vllm_config.model_config.async_chunk = async_chunk
+    sched._finished_req_output_token_ids = {}
+    sched.requests = {}
+    request = Request("req-1", [1, 2, 3], SamplingParams(max_tokens=2), pooling_params=None)
+    request.append_output_token_ids([10, 99])
+    request.status = RequestStatus.FINISHED_STOPPED
+
+    sched._free_request(request)
+    # The scheduler may release/reset the request before the next schedule.
+    # The terminal snapshot must own its history, independent of that object.
+    request.append_output_token_ids(42)
+    base = SchedulerOutput.make_empty()
+    base.finished_req_ids = sched.finished_req_ids.copy()
+    output = sched._wrap_omni_scheduler_output(base)
+    expected_ids = {"req-1": [10, 99]} if expected else {}
+    assert output.finished_req_output_token_ids == expected_ids
+    assert sched._finished_req_output_token_ids == {}
+    restored = MsgpackDecoder().decode(MsgpackEncoder().encode(output))
+    assert restored["finished_req_output_token_ids"] == expected_ids
+    assert sched._wrap_omni_scheduler_output(base).finished_req_output_token_ids == {}
+
+    if expected:
+        # Reusing an ID must not replay the previous request's terminal history.
+        replacement = Request("req-1", [4, 5], SamplingParams(max_tokens=1), pooling_params=None)
+        replacement.append_output_token_ids(77)
+        replacement.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        sched._free_request(replacement)
+        assert sched._wrap_omni_scheduler_output(base).finished_req_output_token_ids == {"req-1": [77]}
+
+
 @pytest.mark.parametrize("notify_client", [False, True])
 def test_aborted_held_tokens_are_dropped_only_without_terminal_notification(notify_client):
     from collections import defaultdict
@@ -94,6 +145,22 @@ def test_aborted_held_tokens_are_dropped_only_without_terminal_notification(noti
 
     # Notified clients retain tokens until the terminal output flush.
     assert sched._held_token_ids == ({"req-1": [11]} if notify_client else {})
+
+
+def test_window_operations_round_trip_in_order_on_a_finish_only_step():
+    class WindowFields(TypedDict):
+        discarded_req_ids: set[str]
+        duplex_carry_ops: list[WindowOperation]
+
+    base = SchedulerOutput.make_empty()
+    base.finished_req_ids = {"old"}
+    output = _make_scheduler()._wrap_omni_scheduler_output(base)
+    output.discarded_req_ids = {"old"}
+    output.duplex_carry_ops = [WindowOperation("keep", "s", "old"), WindowOperation("drop", "s")]
+    decoded = MsgpackDecoder(WindowFields).decode(MsgpackEncoder().encode(output))
+    assert decoded["discarded_req_ids"] == {"old"}
+    assert decoded["duplex_carry_ops"] == output.duplex_carry_ops
+    assert all(isinstance(op, WindowOperation) for op in decoded["duplex_carry_ops"])
 
 
 def test_native_mooncake_finish_uses_confirmed_token_boundary() -> None:

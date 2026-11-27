@@ -7,11 +7,12 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
 )
 
-_PROCESSOR = "vllm_omni.model_executor.stage_input_processors.ming3_tts"
-
+# Stage 0 decodes its latents with the AudioVAE decoder
+# and returns PCM as the final output.
 MING3_TTS_PIPELINE = PipelineConfig(
     model_type="ming3_tts",
     default_deploy_config_name="ming3_tts.yaml",
+    single_stage_async_chunk=True,
     model_arch="Ming3TTSForConditionalGeneration",
     hf_architectures=("Ming3TTSForConditionalGeneration", "LingV3TTSForConditionalGeneration"),
     stages=(
@@ -22,32 +23,16 @@ MING3_TTS_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             hf_config_name="llm_config",
-            engine_output_type="latent",
-            async_chunk_process_next_stage_input_func=(f"{_PROCESSOR}.llm2audio_vae_async_chunk"),
+            final_output=True,
+            final_output_type="audio",
+            # The API output processor tags ``model_outputs`` by this modality.
+            engine_output_type="audio",
             sampling_constraints={
                 "temperature": 0.0,
                 "top_p": 1.0,
                 "top_k": -1,
                 "max_tokens": 801,
                 "detokenize": True,
-            },
-        ),
-        StagePipelineConfig(
-            stage_id=1,
-            model_stage="audio_vae",
-            execution_type=StageExecutionType.LLM_GENERATION,
-            input_sources=(0,),
-            final_output=True,
-            final_output_type="audio",
-            hf_config_name="llm_config",
-            engine_output_type="audio",
-            sync_process_input_func=f"{_PROCESSOR}.llm2audio_vae",
-            sampling_constraints={
-                "temperature": 0.0,
-                "top_p": 1.0,
-                "top_k": -1,
-                "max_tokens": 1,
-                "detokenize": False,
             },
         ),
     ),

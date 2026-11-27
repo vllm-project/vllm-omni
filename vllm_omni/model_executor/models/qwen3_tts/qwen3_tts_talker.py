@@ -24,7 +24,8 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, 
 from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.data_entry_keys import OmniPayload, unflatten_payload
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.common.ecapa_tdnn import ECAPATimeDelayNet
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.utils.device_copy import DeviceStager, index_to_device, to_device_nonblocking
@@ -38,12 +39,15 @@ from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSTalkerConfig
 from .first_audio import talker_first_audio_enabled
+from .input_stream import Qwen3TTSTextInput
 from .prompt_embeds_builder import (
-    PRECOMPUTED_TEXT_IDS_KEY,
     Qwen3TTSPromptEmbedsBuilder,
+    has_tts_text_conditioning,
     resolve_x_vector_only,
+    text_input_is_complete,
 )
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
+from .sampling_policy import get_mtp_sampling_overrides as resolve_mtp_sampling_overrides
 from .stream_decode import stream_ref_context_frames, talker_stream_decode_enabled
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Encoder
@@ -127,19 +131,6 @@ def _ref_audio_artifact_cache_capacity(vllm_config: VllmConfig) -> int:
     return capacity
 
 
-def _has_tts_text_conditioning(info_dict: dict[str, Any], hidden_states: Any | None = None) -> bool:
-    text_list = info_dict.get("text")
-    if isinstance(text_list, list) and bool(text_list) and bool(text_list[0]):
-        return True
-    if PRECOMPUTED_TEXT_IDS_KEY in info_dict:
-        return True
-    if isinstance(hidden_states, dict):
-        tail = hidden_states.get("trailing_text")
-        if isinstance(tail, torch.Tensor):
-            return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Components ported from the HuggingFace Qwen3-TTS reference implementation.
 # Only the classes actually needed by the vLLM AR Talker are kept here.
@@ -196,8 +187,30 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     # that it never writes again, so the runner stores them without copying.
     preprocess_prefill_updates_owned = True
 
+    # forward returns backbone tensors; make_omni_output packages audio afterward.
+    mrv2_forward_returns_tensor = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        from vllm_omni.platforms import current_omni_platform
+
+        # The NPU platform must finish initialization before patching the Talker.
+        if current_omni_platform.is_npu():
+            from vllm_omni.platforms.npu.models.qwen3_tts import apply_qwen3_tts_patches
+
+            apply_qwen3_tts_patches()
+
+        if (
+            current_omni_platform.is_npu()
+            and not getattr(vllm_config.model_config, "use_v2_model_runner", False)
+            and not vllm_config.model_config.enforce_eager
+            and vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            raise ValueError(
+                "Qwen3-TTS on NPU with Model Runner V1 does not support full decode graphs. "
+                "Set stage 0 compilation_config.cudagraph_mode to PIECEWISE (or NONE), "
+                "or select model_runner: v2."
+            )
         self.vllm_config = vllm_config
         self.model_path = vllm_config.model_config.model
         self.config: Qwen3TTSConfig = vllm_config.model_config.hf_config  # type: ignore[assignment]
@@ -243,15 +256,20 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # CB0 of the step that sampled it, so MRV2 may complete the frame at
         # the end of that step instead of in the next step's preprocess.
         self.stream_decode = talker_stream_decode_enabled(vllm_config)
+
         predictor = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
         extra = predictor._stage_connector_extra_config(vllm_config)
+        if current_omni_platform.is_npu() and predictor._parse_bool_config(extra.get("code_predictor_frame_graph")):
+            # The 15 codebook steps replay their own NPU graph. An outer MTP
+            # graph would record the eager fallback and never enter that replay.
+            self.talker_mtp_graph_safe = False
         self.stream_first_audio = self.stream_decode and predictor._parse_bool_config(
             extra.get("talker_stream_first_audio")
         )
         # Model-local voice-clone priming boundary; each deployment selects
         # its reference context independently of the two-stage codec profile.
         self.stream_ref_context_frames = stream_ref_context_frames(vllm_config) if self.stream_decode else 0
-        self.mtp_eager_frames = talker_first_audio_enabled(vllm_config) or self.stream_decode
+        self.has_talker_mtp = True
         self.stream_decoder = None
         self.stream_graphs = None
         self.stream_prime_graphs = None
@@ -392,7 +410,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             torch.zeros(1, int(self.talker_config.hidden_size), dtype=model_dtype),
             persistent=False,
         )
-        self._embedding_dtype = torch.bfloat16
+        self._embedding_dtype = model_dtype
 
         tokenizer_config = Qwen3TTSTokenizerV2Config.from_pretrained(
             self.model_path,
@@ -441,6 +459,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             speaker_cache=self._speaker_cache,
             ref_audio_artifact_cache_max_entries=_ref_audio_artifact_cache_capacity(vllm_config),
         )
+        self._prompt_builder._embedding_dtype = model_dtype
         self._load_custom_voice_profiles()
 
     # -------------------- custom voice profiles --------------------
@@ -584,8 +603,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
         async_chunk = bool(getattr(model_config, "async_chunk", False))
         spans = kwargs.get("request_token_spans")
-        if async_chunk and self.eager_frames_active and spans is not None:
-            return self._make_eager_omni_output(hidden, info_dicts, spans)
+        current_codes = None
+        if self.eager_frames_active and spans is not None:
+            if async_chunk:
+                return self._make_eager_omni_output(hidden, info_dicts, spans)
+            # post_sample fills current-step frames. Request buffers may still
+            # contain prefill-sized placeholders and must not define this layout.
+            num_tokens = spans[-1][1] if spans else 0
+            current_codes = torch.zeros(
+                (num_tokens, int(self.talker_config.num_code_groups)), dtype=torch.long, device=hidden.device
+            )
         audio_codes_list: list[torch.Tensor] = []
         ref_code_len_segments: list[tuple[int | torch.Tensor, int, torch.device]] = []
         ref_code_list: list[torch.Tensor] = []
@@ -595,16 +622,20 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         codec_streaming_device: torch.device | None = None
         codec_frame_valid_device: torch.device | None = None
         codec_frame_valid_parts: list[torch.Tensor] = []
-        for info in info_dicts:
+        for req_index, info in enumerate(info_dicts):
             if not isinstance(info, dict):
                 ref_code_list.append(torch.empty(0, dtype=torch.long))
                 continue
             codes = info.get("codes", {})
             meta = info.get("meta", {})
-            ac = codes.get("audio")
+            if current_codes is None:
+                ac = codes.get("audio")
+            else:
+                start, end = spans[req_index]
+                ac = current_codes[start:end]
             if isinstance(ac, torch.Tensor):
                 audio_codes_list.append(ac)
-                frame_valid = meta.get("codec_frame_valid")
+                frame_valid = meta.get("codec_frame_valid") if current_codes is None else None
                 if isinstance(frame_valid, bool):
                     codec_frame_valid_device = ac.device
                     codec_frame_valid_parts.append(
@@ -664,12 +695,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 ref_len_val = int(ref_len)
             ref_code_len_segments.append((ref_len_val, span_len, ac.device))
 
-        if not audio_codes_list:
+        if current_codes is None and not audio_codes_list:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
 
-        audio_codes = torch.cat(audio_codes_list, dim=0)
+        audio_codes = current_codes if current_codes is not None else torch.cat(audio_codes_list, dim=0)
         span_len = int(audio_codes.shape[0])
         mm: OmniPayload = {"codes": {"audio": audio_codes}}
+        if current_codes is not None:
+            mm["meta"] = {"codec_frame_valid": torch.zeros((span_len,), dtype=torch.int8, device=hidden.device)}
         if ref_code_len_segments:
             if all(isinstance(value, int) for value, _length, _device in ref_code_len_segments):
                 ref_code_len = _materialize_span_scalars(
@@ -781,6 +814,88 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
     # -------------------- preprocess / postprocess --------------------
 
+    @staticmethod
+    def create_input_stream(request, vllm_config: VllmConfig) -> Qwen3TTSTextInput:
+        """Validate native text input before scheduler admission, without model weights."""
+        info = unflatten_payload(deserialize_additional_information(request.additional_information))
+        if request.model_intermediate_buffer:
+            for key, value in request.model_intermediate_buffer.items():
+                if isinstance(value, dict) and isinstance(info.get(key), dict):
+                    info[key] = {**info[key], **value}
+                else:
+                    info[key] = value
+        stream = info.get("input_stream")
+        if not isinstance(stream, dict):
+            raise ValueError("Qwen3-TTS input_stream requires token_ids and optional final")
+        tokens = stream.get("token_ids")
+        if not tokens:
+            raise ValueError("An input stream requires at least one initial token")
+        task = info.get("task_type", ["CustomVoice"])
+        task = task[0] if isinstance(task, list) and task else task
+        mode = info.get("non_streaming_mode", False)
+        mode = mode[0] if isinstance(mode, list) and mode else mode
+        if task != "CustomVoice" or mode is True:
+            raise ValueError("Input streaming requires interleaved CustomVoice")
+        model_config = vllm_config.model_config
+        if (
+            request.resumable
+            or not model_config.use_v2_model_runner
+            or vllm_config.num_speculative_tokens
+            or vllm_config.cache_config.enable_prefix_caching
+            or vllm_config.parallel_config.tensor_parallel_size != 1
+            or vllm_config.parallel_config.pipeline_parallel_size != 1
+            or vllm_config.parallel_config.data_parallel_size != 1
+        ):
+            raise ValueError(
+                "Input streaming requires MRv2, TP=PP=DP=1, no resumable prompt, prefix cache or speculation"
+            )
+        capacity = min(request.max_tokens - 1, model_config.max_model_len - request.num_prompt_tokens - 1)
+        return Qwen3TTSTextInput(
+            tokens,
+            capacity,
+            final=stream.get("final", False),
+            vocab_size=model_config.hf_config.talker_config.text_vocab_size,
+        )
+
+    def apply_text_input_update(self, runtime: dict, payload: dict, *, replace: bool = False) -> None:
+        """Install a full text snapshot or append a scheduler-validated delta."""
+        update = payload.pop("input_stream_update", None)
+        if update is None:
+            return
+        runtime.pop("input_stream_update", None)
+        if replace:
+            runtime["input_stream"] = stream = dict(runtime.get("input_stream", {}))
+            stream["token_ids"] = list(update["token_ids"])
+        else:
+            # MRv2 re-admits preempted requests through scheduled_new_reqs;
+            # add_requests installs a full snapshot before any cached delta.
+            # Covered by test_text_input_preemption_resends_latest_input and
+            # test_async_real_preemption_drains_inflight_output_before_readmission.
+            if "input_stream" not in runtime:
+                raise RuntimeError("Cannot apply a text input delta without an installed input_stream snapshot")
+            stream = runtime["input_stream"]
+            stream["token_ids"].extend(update["token_ids"])
+        stream["final"] = update["final"]
+
+    def _append_stream_text(self, info: dict, tail, offset: int):
+        stream = info.get("input_stream")
+        if not isinstance(stream, dict):
+            return tail, offset, {}
+        meta = info["meta"]
+        projected = meta["qwen3_tts_text_projected"]
+        new_ids = stream["token_ids"][projected:]
+        add_eos = stream["final"] and not meta["qwen3_tts_text_eos_projected"]
+        updates = {}
+        if new_ids or add_eos:
+            rows = self._prompt_builder.build_streaming_text_update(new_ids, input_complete=add_eos)
+            rows = torch.cat((tail[offset:], rows.to(device=tail.device, dtype=tail.dtype)), dim=0)
+            tail, offset = rows, 0
+            updates = {
+                "qwen3_tts_text_projected": len(stream["token_ids"]),
+                "qwen3_tts_text_eos_projected": stream["final"],
+            }
+        return tail, offset, updates
+
     def preprocess(
         self,
         input_ids: torch.Tensor,
@@ -812,7 +927,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             except Exception:
                 is_prefill = span_len > 1
 
-        if not _has_tts_text_conditioning(info_dict, hs):
+        if not has_tts_text_conditioning(info_dict, hs):
             raise ValueError("Missing Qwen3-TTS text conditioning: provide `text` or precomputed text token ids.")
 
         task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
@@ -848,6 +963,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                         "codec_frame_valid": self._false_scalar(input_ids.device),
                     },
                 }
+                stream = info_dict.get("input_stream")
+                if isinstance(stream, dict):
+                    info_update["meta"].update(
+                        qwen3_tts_text_projected=len(stream["token_ids"]),
+                        qwen3_tts_text_eos_projected=stream["final"],
+                    )
                 if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
                     ref_code_buffer = ref_code.detach()
                     if not bool(getattr(self, "_use_v2_model_runner", False)):
@@ -918,7 +1039,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         tail = hs.get("trailing_text")
         text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
-        trailing_text_update = None
+        tail, text_offset, stream_updates = self._append_stream_text(info_dict, tail, text_offset)
+        trailing_text_update = tail if stream_updates else None
         if isinstance(tail, torch.Tensor) and tail.ndim == 2:
             tail_len = int(tail.shape[0])
             if text_offset < tail_len:
@@ -966,6 +1088,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             "mtp_inputs": (past_hidden, text_step),
             "meta": {
                 "talker_text_offset": int(next_text_offset),
+                **stream_updates,
                 "codec_streaming": codec_streaming,
                 "codec_frame_valid": (
                     (input_ids.reshape(-1)[-1] >= 0) & (input_ids.reshape(-1)[-1] < self._codebook_vocab_size)
@@ -1021,7 +1144,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             hs = payload.get("hidden_states", {})
             meta = payload.get("meta", {})
 
-            if not _has_tts_text_conditioning(info_dict, hs):
+            if not has_tts_text_conditioning(info_dict, hs):
                 raise ValueError("Missing Qwen3-TTS text conditioning: provide `text` or precomputed text token ids.")
 
             task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
@@ -1037,7 +1160,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
             tail = hs.get("trailing_text")
             text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
-            trailing_text_update = None
+            tail, text_offset, stream_updates = self._append_stream_text(info_dict, tail, text_offset)
+            trailing_text_update = tail if stream_updates else None
             if isinstance(tail, torch.Tensor) and tail.ndim == 2:
                 tail_len = int(tail.shape[0])
                 if text_offset < tail_len:
@@ -1065,6 +1189,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             info_update: dict[str, Any] = {
                 "meta": {
                     "talker_text_offset": int(next_text_offset),
+                    **stream_updates,
                     "codec_streaming": codec_streaming,
                 },
             }
@@ -1236,7 +1361,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         for k, (start, span, info) in enumerate(entries):
             if span <= 0 or isinstance(info.get("additional_information"), dict):
                 continue
-            if not _has_tts_text_conditioning(info, info.get("hidden_states")):
+            if not has_tts_text_conditioning(info, info.get("hidden_states")):
                 continue
             stored = (info.get("embed") or {}).get("prefill")
             if isinstance(stored, torch.Tensor) and stored.ndim == 2:
@@ -1717,6 +1842,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     mtp = talker_mtp
     get_mtp_seed = staticmethod(get_tts_local_seed)
 
+    def get_mtp_sampling_overrides(self, sampling_params: object) -> dict[str, bool | float | int] | None:
+        overrides = resolve_mtp_sampling_overrides(sampling_params)
+        if overrides is not None and "top_k" in overrides:
+            # Request top-k may exceed a checkpoint's residual vocabulary.
+            # Keeping all entries is equivalent to disabling that cutoff.
+            overrides["top_k"] = min(int(overrides["top_k"]), int(self.code_predictor.config.vocab_size))
+        return overrides
+
     # Postprocess only stores the last hidden for the deferred decode MTP.
     eager_frames_need_postprocess = False
 
@@ -1727,6 +1860,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         text step and changes no per-request state (the non-streaming
         CustomVoice/VoiceDesign case after the first decode).
         """
+        if not text_input_is_complete(info):
+            return False
         hs = info.get("hidden_states")
         tail = hs.get("trailing_text") if isinstance(hs, dict) else None
         meta = info.get("meta")

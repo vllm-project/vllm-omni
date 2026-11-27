@@ -16,6 +16,7 @@ from vllm_omni.engine.duplex.commands import (
     AppendAudio,
     AppendText,
     BargeIn,
+    CancelFunctionCall,
     CancelInput,
     CancelResponse,
     ClearInput,
@@ -27,6 +28,7 @@ from vllm_omni.engine.duplex.commands import (
     DeleteItem,
     DuplexCommand,
     DuplexCommandError,
+    GetSessionStats,
     Heartbeat,
     SignalTurn,
     TruncateItem,
@@ -57,16 +59,30 @@ _MINIMAL_PAYLOADS: dict[str, tuple[dict[str, object], type[DuplexCommand]]] = {
     "session.update": ({"session": {"instructions": "hi"}}, UpdateSession),
     "playback.ack": ({"played_ms": 10}, AckPlayback),
     "session.heartbeat": ({}, Heartbeat),
+    "session.stats.get": ({}, GetSessionStats),
     "session.close": ({}, CloseSession),
     "turn.signal": ({"event": "user_started"}, SignalTurn),
     "input.text.append": ({"text": "hello"}, AppendText),
     "input.cancel": ({}, CancelInput),
+    "function_call.cancel": ({"call_id": "call_1"}, CancelFunctionCall),
     "barge_in": ({}, BargeIn),
 }
 
 
 def test_every_realtime_command_type_has_a_mapping_case():
     assert set(_MINIMAL_PAYLOADS) == set(REALTIME_COMMAND_TYPES)
+
+
+def test_text_append_preserves_listen_control():
+    command = command_from_realtime({"type": "input.text.append", "text": "你好", "force_listen": True})
+    assert isinstance(command, AppendText)
+    assert command.payload() == {"type": "input.text.append", "text": "你好", "force_listen": True}
+
+
+@pytest.mark.parametrize("patch", [{"text": ""}, {"force_listen": "false"}, {"force_listen": 1}])
+def test_text_append_rejects_invalid_fragments(patch):
+    with pytest.raises(DuplexCommandError, match="non-empty text|boolean"):
+        command_from_realtime({"type": "input.text.append", "text": "hello", **patch})
 
 
 @pytest.mark.parametrize("event_type", sorted(REALTIME_COMMAND_TYPES))

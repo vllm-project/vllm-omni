@@ -225,8 +225,12 @@ def _print_device_processes() -> None:
         print("=" * 80)
 
 
-def cleanup_test_environment(*, shutdown_ray: bool = False) -> None:
-    """Tear down distributed state and reset device memory for tests."""
+def cleanup_test_environment(*, shutdown_ray: bool = False, wait_for_device_memory: bool = True) -> None:
+    """Tear down distributed state and reset device memory for tests.
+
+    Disable only the free-memory wait when fault-injection sidecars intentionally
+    hold device memory; distributed teardown and cache cleanup still run.
+    """
     from vllm import envs
     from vllm.distributed.parallel_state import (
         destroy_distributed_environment,
@@ -260,7 +264,7 @@ def cleanup_test_environment(*, shutdown_ray: bool = False) -> None:
             logger.warning("torch._C._host_emptyCache() only available in Pytorch >=2.5")
 
     num_devices = current_omni_platform.device_count()
-    if num_devices > 0:
+    if num_devices > 0 and wait_for_device_memory:
         try:
             wait_for_gpu_memory_to_clear(
                 devices=list(range(num_devices)),

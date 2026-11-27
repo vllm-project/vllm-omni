@@ -10,6 +10,7 @@ import contextlib
 import copy
 import os
 import threading
+import uuid as _uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
@@ -20,6 +21,8 @@ import janus
 from vllm.logger import init_logger
 
 from vllm_omni.config.omni_config import BaseVllmOmniStageConfig, VllmOmniDiffusionStageConfig
+from vllm_omni.config.watermarking import WatermarkConfig
+from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
@@ -30,6 +33,7 @@ from vllm_omni.distributed.omni_coordinator import (
     RandomBalancer,
     RoundRobinBalancer,
 )
+from vllm_omni.distributed.weight_sharing.runtime import SharingRuntime
 from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.cuda_mps import (
     CudaMPSServer,
@@ -44,6 +48,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.stage_client import StageClient, StagePoolClient
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
+    LocalReplicaStartupError,
     OmniMasterServer,
     StageReplicaResources,
     connect_remote_diffusion_proc,
@@ -168,6 +173,31 @@ class StageRuntime:
     directly and creates StagePool with static clients.
     """
 
+    sharing: SharingRuntime | None = None
+    _init_visible_devices_baseline: str | None = None
+
+    async def initialize_shared(self, config: WeightSharingConfig) -> None:
+        """Start a sharing group with rank-local loader configuration."""
+        from vllm_omni.engine.weight_sharing_runtime import StageSharingHost, resolve_sharing_plan
+
+        if isinstance(self, DistStageRuntime):
+            raise ValueError("weight sharing currently requires local stage ownership")
+        self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
+        stage_plans = self._prepare_stage_plans()
+        plan = resolve_sharing_plan(self, config, stage_plans)
+        host = StageSharingHost(self, plan, stage_plans)
+        self.sharing = SharingRuntime(plan, host)
+        try:
+            await self.sharing.start()
+            initialized = {stage.stage_idx: [host.clients[stage.stage_id]] for stage in stage_plans}
+            self._finalize_initialized_stages(stage_plans, initialized)
+        except BaseException as exc:
+            if self.sharing.state != "FAILED":
+                self.sharing.fail(f"stage client assembly failed: {exc}")
+            await self.sharing.terminate()
+            self._cleanup_after_initialize_failure()
+            raise
+
     def __init__(
         self,
         stage_configs: list[Any],
@@ -180,6 +210,7 @@ class StageRuntime:
         parallel_stage_init: bool = False,
         log_stats: bool = False,
         client_config: OmniClientConfig | None = None,
+        watermark_config: WatermarkConfig | None = None,
     ) -> None:
         self._stage_configs = stage_configs
         self._model = model
@@ -195,6 +226,7 @@ class StageRuntime:
         # keeps the legacy per-device LOCK_EX serialization.
         self._parallel_stage_init = parallel_stage_init
         self._log_stats = log_stats
+        self._watermark_config = watermark_config
         self._num_stages = len(stage_configs)
         self._client_count = int((client_config or {}).get("client_count", 1))
         self._client_index = int((client_config or {}).get("client_index", 0))
@@ -213,7 +245,7 @@ class StageRuntime:
         # Readiness waits use per-device initialization protection so different
         # device groups can initialize concurrently.
         self._replica_launch_lock = threading.Lock()
-        self._init_visible_devices_baseline: str | None = None
+        self._init_visible_devices_baseline = None
         self._mps_servers: dict[str, CudaMPSServer] = {}
         # GPU UUID -> operator pipe (None = private) whose MPS startup failed.
         self._mps_unavailable_gpus: dict[str, str | None] = {}
@@ -672,6 +704,14 @@ class StageRuntime:
 
     def shutdown(self) -> None:
         self._init_cancelled.set()
+        if self.sharing is not None:
+            # The orchestrator must finish async, consumer-first teardown.
+            # In particular, never bypass an unconfirmed consumer exit here.
+            if not self.sharing.termination_complete:
+                logger.error("Sharing teardown incomplete; retaining stage processes")
+                return
+            self._close_mps_servers()
+            return
         for pool in self.stage_pools:
             for client in pool.clients:
                 if client is not None and hasattr(client, "shutdown"):
@@ -690,9 +730,19 @@ class StageRuntime:
 
     def _prepare_stage_plans(self) -> list[LogicalStageInitPlan]:
         """Build logical stage plans and cache prompt expansion metadata."""
-        replicas_per_stage, replica_devices_map = compute_replica_layout(self._stage_configs)
+        replicas_per_stage, replica_devices_map = compute_replica_layout(
+            self._stage_configs, local_replica_counts=self._get_local_replica_counts()
+        )
         prepare_engine_environment()
-        omni_transfer_config = load_omni_transfer_config_for_model(self._model, self._config_path)
+        # DistStageRuntime sets one id before this call and the master echoes
+        # it to --headless. A local launch has neither and keeps one UUID for
+        # the stages this call creates.
+        deployment_scope = getattr(self, "_deployment_id", None) or None
+        omni_transfer_config = load_omni_transfer_config_for_model(
+            self._model,
+            self._config_path,
+            deployment_scope=deployment_scope,
+        )
         stage_plans = self._build_logical_stage_init_plans(
             omni_transfer_config,
             replicas_per_stage,
@@ -701,6 +751,10 @@ class StageRuntime:
         self._validate_mps_topology(stage_plans)
         self._validate_native_kv_topology(stage_plans)
         return stage_plans
+
+    def _get_local_replica_counts(self) -> Mapping[int, int] | None:
+        """Use all configured replicas for local device placement by default."""
+        return None
 
     def _finalize_initialized_stages(
         self,
@@ -856,6 +910,7 @@ class StageRuntime:
     ) -> list[LogicalStageInitPlan]:
         """Build startup plans for every logical stage and replica."""
         stage_plans: list[LogicalStageInitPlan] = []
+        local_replica_counts = self._get_local_replica_counts()
 
         for stage_idx, stage_cfg in enumerate(self._stage_configs):
             base_metadata = (
@@ -879,7 +934,6 @@ class StageRuntime:
             )
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
             num_replicas = replicas_per_stage[stage_idx]
-            launch_mode = self._get_launch_mode(stage_id)
 
             replicas: list[ReplicaInitPlan] = []
             stage_vllm_config = None
@@ -918,9 +972,14 @@ class StageRuntime:
                     engine_args_dict=engine_args_dict,
                     api_process_count=self._client_count,
                     api_process_rank=self._api_process_rank,
+                    watermark_config=self._watermark_config,
+                    local_replica_count=(
+                        local_replica_counts.get(stage_idx, num_replicas) if local_replica_counts is not None else None
+                    ),
                 )
 
             for replica_id in range(num_replicas):
+                launch_mode = self._get_replica_launch_mode(stage_id, replica_id)
                 replica_cfg, native_kv = self._prepare_replica_stage_config(
                     stage_cfg,
                     stage_id=stage_id,
@@ -977,6 +1036,14 @@ class StageRuntime:
         """Determine launch mode for a stage. Overridden by DistStageRuntime."""
         return "local"
 
+    def _get_replica_launch_mode(self, stage_id: int, replica_id: int) -> str:
+        """Determine launch mode for one replica of a stage.
+
+        The distributed runtime overrides this to keep a head-owned stage's
+        cluster total while launching only its local share.
+        """
+        return self._get_launch_mode(stage_id)
+
     def _initialize_stage_replicas(
         self,
         stage_plans: Sequence[LogicalStageInitPlan],
@@ -992,6 +1059,7 @@ class StageRuntime:
         initialized_clients_by_stage: dict[int, list[StagePoolClient | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
         }
+        replicas_left = {plan.stage_idx: len(plan.replicas) for plan in stage_plans}
         primary_exc: Exception | None = None
         init_state_lock = threading.Lock()
         self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
@@ -1034,6 +1102,11 @@ class StageRuntime:
                     )
                 except Exception as exc:
                     with init_state_lock:
+                        if isinstance(exc, LocalReplicaStartupError):
+                            replicas_left[stage_idx] -= 1
+                            if replicas_left[stage_idx] > 0:
+                                logger.warning("[StageRuntime] %s", exc)
+                                continue
                         if primary_exc is None:
                             primary_exc = exc
                     return
@@ -1065,6 +1138,8 @@ class StageRuntime:
                             if primary_exc is None:
                                 primary_exc = exc
 
+        if primary_exc is None and self._init_cancelled.is_set():
+            primary_exc = RuntimeError("Stage initialization was cancelled")
         if primary_exc is not None:
             setattr(primary_exc, "_initialized_clients_by_stage", initialized_clients_by_stage)
             raise primary_exc
@@ -1428,14 +1503,15 @@ class StageRuntime:
 
         for plan in stage_plans:
             replica_clients = initialized_clients_by_stage[plan.stage_idx]
-            first_client = replica_clients[0] if replica_clients else None
-            if first_client is None:
+            if all(client is None for client in replica_clients):
                 raise RuntimeError(f"Stage {plan.stage_idx} initialization completed with a missing client")
 
-            clients: list[StagePoolClient] = [client for client in replica_clients if client is not None]
             stage_vllm_config = None
             output_processor = None
-            if plan.replicas[0].metadata.stage_type != "diffusion":
+            metadata = plan.replicas[0].metadata
+            # Initialize watermarkers based on the output type as needed
+            watermarkers = StagePool.initialize_watermarkers(metadata.final_output_type, self._watermark_config)
+            if metadata.stage_type != "diffusion":
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 if stage_vllm_config is None:
                     raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
@@ -1448,9 +1524,11 @@ class StageRuntime:
             stage_pools.append(
                 StagePool(
                     plan.stage_idx,
-                    clients,
+                    replica_clients,
                     output_processor=output_processor,
                     stage_vllm_config=stage_vllm_config,
+                    watermarkers=watermarkers,
+                    strict_watermarking=self._watermark_config is not None and self._watermark_config.strict,
                 )
             )
 
@@ -1485,6 +1563,7 @@ class DistStageRuntime(StageRuntime):
         omni_master_port: int,
         tokenizer: str | None = None,
         log_stats: bool = False,
+        watermark_config: WatermarkConfig | None = None,
         omni_dp_size_local: int = 1,
         omni_heartbeat_timeout: float = 30.0,
         omni_lb_policy: str = "random",
@@ -1500,6 +1579,7 @@ class DistStageRuntime(StageRuntime):
             tokenizer=tokenizer,
             parallel_stage_init=parallel_stage_init,
             log_stats=log_stats,
+            watermark_config=watermark_config,
         )
         self._single_stage_id_filter = single_stage_id_filter
         self._omni_master_address = omni_master_address
@@ -1526,36 +1606,77 @@ class DistStageRuntime(StageRuntime):
             remote_replica_factory=self._build_remote_replica,
         )
 
+    def _get_local_replica_counts(self) -> Mapping[int, int] | None:
+        if self._single_stage_id_filter is None:
+            return None
+        return {
+            idx: self._omni_dp_size_local
+            if int(getattr(stage_cfg, "stage_id", idx)) == self._single_stage_id_filter
+            else 0
+            for idx, stage_cfg in enumerate(self._stage_configs)
+        }
+
     def _prepare_stage_plans(self) -> list[LogicalStageInitPlan]:
         self._validate_single_stage_mode_replica_constraints()
+        if not getattr(self, "_deployment_id", None):
+            self._deployment_id = _uuid.uuid4().hex
         stage_plans = super()._prepare_stage_plans()
         if all(replica.launch_mode == "remote" for plan in stage_plans for replica in plan.replicas):
             logger.info("All stage replicas are remote; running only the frontend (API server + orchestrator)")
         return stage_plans
 
     def _validate_single_stage_mode_replica_constraints(self) -> None:
-        """Apply --omni-dp-size-local to the local stage's runtime.num_replicas."""
+        """Keep the configured total, with the CLI local count as its minimum.
+
+        ``stages[].num_replicas`` is the cluster-wide total. The head may launch
+        only a subset of that stage (the rest register from headless runtimes), so
+        the total must survive into the master pre-allocation. As before, a local
+        count above the configured default expands the total. The local count is
+        applied per replica by :meth:`_get_replica_launch_mode`.
+        """
         target_stage_id = self._single_stage_id_filter
         if target_stage_id is None or is_frontend_only(target_stage_id):
             return
 
+        local_replicas = int(self._omni_dp_size_local)
+        if local_replicas < 1:
+            raise ValueError(f"--omni-dp-size-local must be >= 1, got {local_replicas}")
+
         for idx, stage_cfg in enumerate(self._stage_configs):
             stage_id = int(getattr(stage_cfg, "stage_id", idx))
+            if stage_id != target_stage_id:
+                continue
             runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", None))
             if runtime_cfg is None:
-                continue
-            if stage_id == target_stage_id:
-                try:
-                    runtime_cfg.num_replicas = self._omni_dp_size_local
-                except (AttributeError, TypeError):
-                    if hasattr(runtime_cfg, "__setitem__"):
-                        runtime_cfg["num_replicas"] = self._omni_dp_size_local
-                        continue
-                    logger.warning(
-                        "[DistStageRuntime] Failed to apply omni_dp_size_local=%s to stage %s runtime config",
-                        self._omni_dp_size_local,
-                        stage_id,
-                    )
+                raise ValueError(f"stage {target_stage_id} has no runtime config for --omni-dp-size-local")
+            total_replicas = int(
+                runtime_cfg.get("num_replicas", 1)
+                if hasattr(runtime_cfg, "get")
+                else getattr(runtime_cfg, "num_replicas", 1)
+            )
+            if total_replicas < 1:
+                raise ValueError(
+                    f"stage {target_stage_id} must declare at least one replica, got num_replicas={total_replicas}"
+                )
+            if local_replicas > total_replicas:
+                total_replicas = local_replicas
+                if hasattr(runtime_cfg, "get"):
+                    runtime_cfg["num_replicas"] = total_replicas
+                else:
+                    runtime_cfg.num_replicas = total_replicas
+            logger.info(
+                "[DistStageRuntime] stage %s replicas: total=%s local=%s remote=%s",
+                target_stage_id,
+                total_replicas,
+                local_replicas,
+                total_replicas - local_replicas,
+            )
+            return
+
+        raise ValueError(
+            f"--stage-id={target_stage_id} is not present in the resolved stage configs; "
+            "cannot apply --omni-dp-size-local"
+        )
 
     def _before_initialize_stage_replicas(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         self._start_omni_master_server(stage_plans)
@@ -1590,6 +1711,14 @@ class DistStageRuntime(StageRuntime):
         if is_frontend_only(stage_id_filter) or (stage_id_filter is not None and stage_id != stage_id_filter):
             return "remote"
         return "local"
+
+    def _get_replica_launch_mode(self, stage_id: int, replica_id: int) -> str:
+        """Target stage: first ``--omni-dp-size-local`` replicas are local."""
+        if self._get_launch_mode(stage_id) == "remote":
+            return "remote"
+        if self._single_stage_id_filter is None:
+            return "local"
+        return "local" if replica_id < self._omni_dp_size_local else "remote"
 
     def _get_coordinator_address(self) -> str | None:
         if self._coordinator_runtime is not None:
@@ -1660,6 +1789,8 @@ class DistStageRuntime(StageRuntime):
             heartbeat_timeout=self._omni_heartbeat_timeout,
         )
 
+        if not getattr(self, "_deployment_id", None):
+            self._deployment_id = _uuid.uuid4().hex
         self._omni_master_server = OmniMasterServer(
             master_address=self._omni_master_address,
             master_port=self._omni_master_port,
@@ -1668,6 +1799,7 @@ class DistStageRuntime(StageRuntime):
             coordinator_router_address=self._coordinator_runtime.router_address,
             on_register=self._dispatch_master_register,
             head_local_replicas=head_local_replicas,
+            deployment_id=self._deployment_id,
         )
         self._omni_master_server.start()
         logger.info("[DistStageRuntime] OmniMasterServer started for stages %s", all_stage_ids)
@@ -1831,6 +1963,7 @@ def create_stage_runtime(
     request_queue: janus.Queue[EngineQueueMessage] | None = None,
     log_stats: bool = False,
     client_config: OmniClientConfig | None = None,
+    watermark_config: WatermarkConfig | None = None,
 ) -> StageRuntime:
     """Factory: select StageRuntime or DistStageRuntime."""
     if single_stage_mode:
@@ -1845,6 +1978,7 @@ def create_stage_runtime(
             tokenizer=tokenizer,
             parallel_stage_init=parallel_stage_init,
             log_stats=log_stats,
+            watermark_config=watermark_config,
             single_stage_id_filter=single_stage_id_filter,
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
@@ -1863,4 +1997,5 @@ def create_stage_runtime(
         parallel_stage_init=parallel_stage_init,
         log_stats=log_stats,
         client_config=client_config,
+        watermark_config=watermark_config,
     )

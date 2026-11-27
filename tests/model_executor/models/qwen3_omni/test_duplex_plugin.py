@@ -3,12 +3,15 @@
 import ast
 import asyncio
 import base64
+import logging
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
+from vllm.config import ModelConfig
 
 from tests.engine.duplex.test_session_runner import (
     SESSION_ID,
@@ -36,9 +39,10 @@ from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import OpenDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.session import history_calibration as history_calibration_module
 from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
-from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin
+from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.input import QwenPcmBuffer
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import MAX_PROMPT_IMAGES, Qwen3OmniDuplexPlugin
 from vllm_omni.outputs import OmniRequestOutput
@@ -98,10 +102,13 @@ def test_capabilities_advertise_image_items_not_append_frames():
 
 async def open_qwen(
     *,
+    collect_stats=False,
     calibrate=None,
     calibration_timeout_ms=1000,
     history_max_bytes=8 * 1024 * 1024,
     requires_audio=True,
+    history_policy=None,
+    clock=None,
     **config_overrides: Any,
 ):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
@@ -119,10 +126,13 @@ async def open_qwen(
         output_sink=output,
         result_sink=results,
         runtime_config=DuplexSessionRuntimeConfig(
+            model_custom_options={} if history_policy is None else {"history_policy": history_policy},
+            collect_stats=collect_stats,
             history_calibration_timeout_ms=calibration_timeout_ms,
             history_audio_max_bytes_per_session=history_max_bytes,
         ),
         model_config=None,
+        clock=clock,
     )
     config = DuplexSessionConfig(model="qwen", modalities=["text", "audio"], overlap_policy="barge_in_on_speech")
     for key, value in config_overrides.items():
@@ -300,6 +310,31 @@ async def test_note_published_failure_closes_the_unpublished_call():
         assert _published_call(events, "call_paris") == []
         assert any(event.type == "session.closed" for event in events)
         assert h.runner.tool_calls.record("call_paris") is None
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("collect_stats", "history_policy"), [(False, None), (True, None), (True, "recent")])
+async def test_session_stats_tag_the_qwen_prompt_for_stage_work(collect_stats, history_policy):
+    from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer
+
+    h = await open_qwen(collect_stats=collect_stats, history_policy=history_policy)
+    try:
+        assert h.manager.runtime_config.model_custom_options == (
+            {} if history_policy is None else {"history_policy": history_policy}
+        )
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        chunk = perf_chunk_from_buffer(prompt.get("model_intermediate_buffer"))
+        if collect_stats:
+            assert h.session.perf is not None
+            (turn,) = h.session.perf.snapshot()["turns"]
+            assert chunk == (turn["epoch"], turn["chunks"][0]["seq"])
+        else:
+            assert chunk is None
+            assert "model_intermediate_buffer" not in prompt
     finally:
         await h.manager.shutdown()
 
@@ -526,10 +561,13 @@ async def test_prepare_runtime_config_rejects_an_unknown_voice_at_open():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
     # ``prepare_runtime_config`` only loads a processor when this is unset.
     plugin.processor = SimpleNamespace()
-    model_config = SimpleNamespace(
+    model_config = Mock(
+        spec=ModelConfig,
         hf_config=SimpleNamespace(talker_config=SimpleNamespace(speaker_id={"Chelsie": 1})),
         model="qwen",
         trust_remote_code=True,
+        max_model_len=4096,
+        multimodal_config=None,
     )
 
     with pytest.raises(DuplexRuntimeConfigError, match="Invalid speaker 'nova'") as exc_info:
@@ -830,6 +868,7 @@ def test_format_history_merges_user_parts_but_preserves_empty_assistant_boundary
 
 def test_audio_byte_budget_evicts_whole_multimodal_turn():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     state = plugin.create_session_state()
     first = {"role": "user", "content": [{"type": "audio_url"}]}
     image = {"role": "user", "content": [{"type": "image_url"}]}
@@ -850,6 +889,7 @@ def test_audio_byte_budget_evicts_whole_multimodal_turn():
 
 def test_audio_history_is_bounded_and_does_not_cross_sessions():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     state, other = plugin.create_session_state(), plugin.create_session_state()
     history = []
     for i in range(6):
@@ -869,6 +909,7 @@ def test_audio_history_is_bounded_and_does_not_cross_sessions():
 @pytest.mark.parametrize("assistant_text", ["", "previous answer"])
 def test_dropped_audio_removes_its_image_and_assistant(assistant_text):
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     state = plugin.create_session_state()
     image = {"role": "user", "content": [{"type": "image_url"}]}
     history = [image]
@@ -1466,7 +1507,7 @@ async def test_multiple_commits_before_response_keep_one_combined_audio_in_histo
 async def test_multimodal_turn_is_merged_retained_and_evicted_with_its_answer(image_after_commit):
     from vllm_omni.engine.duplex.commands import CreateItem
 
-    h = await open_qwen()
+    h = await open_qwen(history_policy="recent")
     try:
         for turn in range(6):
             if turn == 0 and not image_after_commit:
@@ -1582,7 +1623,7 @@ async def test_one_item_carrying_both_speech_and_a_picture_keeps_both():
 async def test_image_limit_rejects_atomically_and_delete_reclaims_capacity():
     from vllm_omni.engine.duplex.commands import CreateItem, DeleteItem
 
-    h = await open_qwen()
+    h = await open_qwen(history_policy="recent")
     try:
         for i in range(8):
             await h.run(CreateItem(item=image_item(f"camera_{i}")))
@@ -1605,6 +1646,7 @@ def test_prompt_holds_stored_images_to_the_stage_limit():
     positionally.
     """
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: repr(messages))
     url = "data:image/jpeg;base64," + camera_frame()
     history: list[dict[str, Any]] = [
@@ -1717,6 +1759,103 @@ async def test_visual_capture_records_submitted_pixels_and_request(tmp_path, mon
             actual = submission.prompt["multi_modal_data"]["image"][0]
             assert saved.size == actual.size
             assert saved.tobytes() == actual.tobytes()
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pending_tool_result_reaches_the_prompt_after_an_intervening_turn():
+    """Keep the published call and deliver its result without judging generated answers."""
+    h = await open_qwen(
+        modalities=["text"],
+        playback_commit_policy="commit_all_on_done",
+        extra_body={"function_call_interrupt_policy": "keep"},
+    )
+    try:
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "original input"}],
+                    }
+                )
+            )
+        )
+        await h.run(CreateResponse())
+        assert len(h.port.submissions) == 1
+        request_id = h.port.submissions[-1].context.request_id
+        # Only model output is scripted: parsing, publication and registration
+        # still go through the real Qwen data plane and session runner.
+        await h.deliver_and_settle(
+            tts_output(
+                request_id,
+                samples=0,
+                text='<tool_call>{"name":"lookup","arguments":{"key":"original"}}</tool_call>',
+                finished=True,
+            ),
+            stage_id=0,
+        )
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="", finished=True), stage_id=2)
+        (published,) = [event for event in h.events if event.type == "response.function_call_arguments.done"]
+        call_id = published.call_id
+        record = h.runner.tool_calls.record(call_id)
+        assert record is not None and record.state is ToolCallState.PENDING
+        origin = record.origin
+        anchor = h.session.runtime_config["qwen_call_anchors"][call_id]
+
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "intervening input"}],
+                    }
+                )
+            )
+        )
+        await h.run(CreateResponse())
+        assert len(h.port.submissions) == 2
+        request_id = h.port.submissions[-1].context.request_id
+        await h.deliver_and_settle(
+            tts_output(request_id, samples=0, text="intervening reply", finished=True), stage_id=0
+        )
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="", finished=True), stage_id=2)
+        assert h.session.active_response_id is None
+        assert h.runner.tool_calls.record(call_id) is record
+        assert record.state is ToolCallState.PENDING and record.origin == origin
+        assert h.session.runtime_config["qwen_call_anchors"][call_id] == anchor
+
+        output = '{"marker":"result-A"}'
+        accepted = await h.run(
+            CreateItem(
+                item=normalize_conversation_item({"type": "function_call_output", "call_id": call_id, "output": output})
+            )
+        )
+        assert [event.item["call_id"] for event in accepted if event.type == "conversation.item.created"] == [call_id]
+        assert record.state is ToolCallState.ACCEPTED
+        await h.run(CreateResponse())
+        assert len(h.port.submissions) == 3
+        messages = ast.literal_eval(h.port.submissions[-1].prompt["prompt"])
+        assert messages == [
+            {"role": "user", "content": [{"type": "text", "text": "original input"}]},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": origin.name, "arguments": origin.arguments},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": call_id, "content": output},
+            {"role": "user", "content": [{"type": "text", "text": "intervening input"}]},
+            {"role": "assistant", "content": "intervening reply"},
+        ]
+        assert not any(event.type == "error" for event in h.events)
     finally:
         await h.manager.shutdown()
 
@@ -1990,7 +2129,11 @@ async def test_calibrated_tool_settlement_failure_closes_session(monkeypatch, ca
 
     h = await open_qwen(calibrate=calibrate)
     commit = None
+    # init_logger() does not propagate, so the root caplog handler never sees this warning.
+    calibration_logger = history_calibration_module.logger
+    calibration_logger.addHandler(caplog.handler)
     try:
+        caplog.set_level(logging.WARNING, logger=calibration_logger.name)
         response_id = await _interrupt_tool_answer(h)
         await asyncio.wait_for(entered.wait(), 1)
         controller = h.runner.ctx.history_calibration
@@ -2044,6 +2187,7 @@ async def test_calibrated_tool_settlement_failure_closes_session(monkeypatch, ca
             assert h.session.history_item_ids[f"item_{response_id}"]["content"] == ""
             assert "Duplex history calibration failed" in caplog.text
     finally:
+        calibration_logger.removeHandler(caplog.handler)
         release.set()
         if commit is not None:
             await asyncio.gather(commit, return_exceptions=True)

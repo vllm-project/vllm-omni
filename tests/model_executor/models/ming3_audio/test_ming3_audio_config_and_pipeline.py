@@ -12,7 +12,7 @@ from pytest_mock import MockerFixture
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
-from transformers import AutoConfig, PreTrainedTokenizerFast
+from transformers import AutoConfig, BatchFeature, PreTrainedTokenizerFast
 from vllm.config import VllmConfig
 from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.exceptions import VLLMValidationError
@@ -188,7 +188,19 @@ def tiny_model(
         "BailingMoeV3ForCausalLM",
         DummyLanguageModel,
     )
+    # The pin's _mark_tower_model imports get_pp_group from vllm.distributed
+    # inside the method (no use_v2_model_runner guard); real construction always
+    # has the group initialized. Stage 0: first and last rank.
+    monkeypatch.setattr(
+        "vllm.distributed.get_pp_group",
+        lambda: _FirstRankPPGroup(),
+    )
     return BailingMoeV3AudioForConditionalGeneration(vllm_config=VllmConfig(model_config=tiny_model_config))
+
+
+class _FirstRankPPGroup:
+    is_first_rank = True
+    is_last_rank = True
 
 
 def test_native_config_loads_without_remote_code(tiny_model_path: Path):
@@ -236,6 +248,10 @@ def test_speech_qa_uses_native_audio_preprocessing(
     assert output["prompt_token_ids"].count(tiny_model_config.hf_config.audio_token_id) == 7
     assert mm_data["audio_feats"].shape == (1, 100, 80)
     assert mm_data["audio_feats_lengths"].tolist() == [[100]]
+    # The encoder reads lengths as Python ints; device copies would sync.
+    fields = tiny_processor._get_mm_fields_config(BatchFeature({}), {})
+    assert fields["audio_feats_lengths"].field.keep_on_cpu
+    assert not fields["audio_feats"].field.keep_on_cpu
 
 
 def test_partial_dummy_model_executes_real_audio_path(

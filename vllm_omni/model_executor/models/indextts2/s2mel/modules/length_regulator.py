@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import numpy as np
 import torch
@@ -90,7 +90,7 @@ class InterpolateRegulator(nn.Module):
 
                 self.vq = VectorQuantize(channels, codebook_size, 8)
 
-    def forward(self, x, ylens=None, n_quantizers=None, f0=None):
+    def forward(self, x, ylens=None, n_quantizers=None, f0=None, max_length: int | None = None):
         # apply token drop
         if self.training:
             n_quantizers = torch.ones((x.shape[0],)) * self.n_codebooks
@@ -120,9 +120,10 @@ class InterpolateRegulator(nn.Module):
         else:
             x = self.content_in_proj(x)
         # x in (B, T, D)
-        mask = sequence_mask(ylens).unsqueeze(-1)
+        max_ylens = max_length if max_length is not None else ylens.max()
+        mask = sequence_mask(ylens, max_length=max_ylens).unsqueeze(-1)
         if self.interpolate:
-            x = F.interpolate(x.transpose(1, 2).contiguous(), size=ylens.max(), mode="nearest")
+            x = F.interpolate(x.transpose(1, 2).contiguous(), size=max_ylens, mode="nearest")
         else:
             x = x.transpose(1, 2).contiguous()
             mask = mask[:, : x.size(2), :]
@@ -135,7 +136,7 @@ class InterpolateRegulator(nn.Module):
                 quantized_f0 = f0_to_coarse(f0, self.n_f0_bins)
                 quantized_f0 = quantized_f0.clamp(0, self.n_f0_bins - 1).long()
                 f0_emb = self.f0_embedding(quantized_f0)
-                f0_emb = F.interpolate(f0_emb.transpose(1, 2).contiguous(), size=ylens.max(), mode="nearest")
+                f0_emb = F.interpolate(f0_emb.transpose(1, 2).contiguous(), size=max_ylens, mode="nearest")
                 x = x + f0_emb
         out = self.model(x).transpose(1, 2).contiguous()
         if hasattr(self, "vq"):

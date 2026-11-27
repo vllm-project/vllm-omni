@@ -541,6 +541,7 @@ def _demo_args(
         scenario=getattr(args, "scenario", "sequential"),
         silence_ms=getattr(args, "silence_ms", 500),
         require_audio=args.response_required,
+        allow_extra_responses=getattr(args, "allow_extra_responses", False),
         require_distinct_inputs=False,
         expect_empty_turn=list(getattr(args, "expect_empty_turn", []) or []),
         short_ack_ms=350,

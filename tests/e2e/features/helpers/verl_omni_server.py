@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Ray-serializable verl-omni HTTP server test double for RLHF E2E tests.
 
@@ -16,10 +16,11 @@ import os
 from enum import Enum
 from typing import Any
 
+import psutil
 import torchvision.transforms as T
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
-from vllm.entrypoints.openai.api_server import build_app
+from vllm.entrypoints.launchers.app import build_app
 
 import vllm_omni.entrypoints.cli.serve
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -32,6 +33,25 @@ logger = logging.getLogger(__name__)
 
 CUSTOM_PIPELINE_CLASS = "tests.e2e.features.helpers.custom_pipeline.QwenImagePipelineWithLogProbForTest"
 WORKER_EXTENSION_CLASS = "tests.e2e.features.helpers.custom_pipeline.vLLMOmniColocateWorkerExtensionForTest"
+
+
+def _snapshot_diffusion_workers() -> list[tuple[psutil.Process, float]]:
+    """Capture worker identities before shutdown can reparent descendants."""
+    try:
+        descendants = psutil.Process().children(recursive=True)
+    except psutil.Error:
+        return []
+
+    workers: list[tuple[psutil.Process, float]] = []
+    for proc in descendants:
+        try:
+            cmdline = proc.cmdline()
+            title = (cmdline[0] if cmdline and cmdline[0] else proc.name()).lower()
+            if title.startswith("vllm-omni::diffusionworker"):
+                workers.append((proc, proc.create_time()))
+        except psutil.Error:
+            continue
+    return workers
 
 
 class RolloutMode(Enum):
@@ -77,14 +97,36 @@ def normalize_token_ids(tokenized_output) -> list[int]:
     return out
 
 
+def _optional_bool_vllm_args() -> set[str]:
+    """Verbatim port of ``verl.workers.rollout.vllm_rollout.utils._optional_bool_vllm_args``."""
+    from dataclasses import fields
+    from typing import get_args
+
+    from vllm.engine.arg_utils import AsyncEngineArgs
+
+    return {
+        field.name
+        for field in fields(AsyncEngineArgs)
+        if set(get_args(field.type)) == {bool, type(None)}
+        or (field.type is bool and (field.default is None or field.default is True))
+    }
+
+
 def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
     cli_args: list[str] = []
+    optional_bool_args = None
     for k, v in config.items():
         if v is None:
             continue
         if isinstance(v, bool):
             if v:
                 cli_args.append(f"--{k}")
+            else:
+                if optional_bool_args is None:
+                    optional_bool_args = _optional_bool_vllm_args()
+                if k.replace("-", "_") in optional_bool_args:
+                    # Omission may preserve True or resolve a delayed None to True.
+                    cli_args.append(f"--no-{k}")
         elif isinstance(v, list):
             if not v:
                 continue
@@ -94,6 +136,21 @@ def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
             cli_args.append(f"--{k}")
             cli_args.append(json.dumps(v) if isinstance(v, dict) else str(v))
     return cli_args
+
+
+def parse_serve_args(server_args_list: list[str]) -> TrackingNamespace:
+    """Parse ``vllm serve`` arguments with the production CLI, validation included."""
+    parser = TrackingArgumentParser(description="vLLM-Omni CLI")
+    subparsers = parser.add_subparsers(required=False, dest="subparser")
+    cmds: dict[str, Any] = {}
+    for cmd in vllm_omni.entrypoints.cli.serve.cmd_init():
+        cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
+        cmds[cmd.name] = cmd
+    parsed = parser.parse_args(args=server_args_list)
+    parsed.model = parsed.model_tag
+    if parsed.subparser in cmds:
+        cmds[parsed.subparser].validate(parsed)
+    return parsed
 
 
 def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -187,18 +244,7 @@ class vLLMOmniHttpServerLocal:
         model_path = str(_cfg_get(self.model_config, "local_path", None) or _cfg_get(self.model_config, "path"))
         server_args_list = ["serve", model_path] + build_cli_args_from_config(args)
 
-        parser = TrackingArgumentParser(description="vLLM-Omni CLI")
-        subparsers = parser.add_subparsers(required=False, dest="subparser")
-        cmds: dict[str, Any] = {}
-        for cmd in vllm_omni.entrypoints.cli.serve.cmd_init():
-            cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
-            cmds[cmd.name] = cmd
-        parsed = parser.parse_args(args=server_args_list)
-        parsed.model = parsed.model_tag
-        if parsed.subparser in cmds:
-            cmds[parsed.subparser].validate(parsed)
-
-        await self.run_server(parsed)
+        await self.run_server(parse_serve_args(server_args_list))
 
     async def run_server(self, args: TrackingNamespace) -> None:
         # Match the production entrypoint: parser defaults are not user overrides.
@@ -211,6 +257,28 @@ class vLLMOmniHttpServerLocal:
         await omni_init_app_state(engine_client, app.state, args)
 
         self.engine = engine_client
+
+    async def shutdown(self) -> None:
+        """Stop the diffusion engine before Ray destroys this actor."""
+        workers = _snapshot_diffusion_workers()
+        if self.engine is not None:
+            self.engine.shutdown()
+            self.engine = None
+        identities = {proc.pid: created for proc, created in workers}
+        _, alive = psutil.wait_procs([proc for proc, _ in workers], timeout=5)
+        remaining: list[int] = []
+        for proc in alive:
+            try:
+                if (
+                    proc.create_time() == identities[proc.pid]
+                    and proc.is_running()
+                    and proc.status() != psutil.STATUS_ZOMBIE
+                ):
+                    remaining.append(proc.pid)
+            except psutil.Error:
+                continue
+        if remaining:
+            raise RuntimeError(f"engine shutdown left diffusion worker PIDs: {remaining}")
 
     async def generate(
         self,
@@ -246,7 +314,10 @@ class vLLMOmniHttpServerLocal:
         sampling_kwargs["extra_args"] = extra_args
         diffusion_sampling_params = OmniDiffusionSamplingParams(**sampling_kwargs)
 
-        generator = self.engine.generate(
+        engine = self.engine
+        if engine is None:
+            raise RuntimeError("Server must be launched before generating")
+        generator = engine.generate(
             prompt=custom_prompt,
             request_id=request_id,
             sampling_params_list=[diffusion_sampling_params],
