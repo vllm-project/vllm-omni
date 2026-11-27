@@ -47,11 +47,13 @@ class HunyuanImage3ARSampler(OmniSampler):
         )
 
     def __call__(self, logits: torch.Tensor, input_batch: InputBatch) -> SamplerOutput:
-        comprehension = self._comprehension[input_batch.idx_mapping]
         min_score = torch.finfo(logits.dtype).min
-        logits[:, self._blocked_ids] = torch.where(comprehension[:, None], min_score, logits[:, self._blocked_ids])
         if self.model._is_comprehension:
+            logits.index_fill_(1, self._blocked_ids, min_score)
             return self.base_sampler(logits, input_batch)
+
+        comprehension = self._comprehension[input_batch.idx_mapping]
+        logits[:, self._blocked_ids] = torch.where(comprehension[:, None], min_score, logits[:, self._blocked_ids])
 
         # seq_lens includes the current forward's inputs and excludes its
         # next sampled token. Keep restored output tokens separate from the
