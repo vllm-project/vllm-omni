@@ -53,6 +53,20 @@ DEFAULT_NUM_LATENT_FRAMES_PER_CHUNK = 9
 REQUEST_RESOLUTION_ALIGNMENT = 16
 
 
+def resolve_history_sizes(history_sizes: list[int], keep_first_frame: bool) -> int:
+    """Resolve the history-buffer size, growing the short window when needed.
+
+    With ``keep_first_frame=False`` the short-history window takes one extra
+    frame to replace the dropped prefix frame, so the buffer size must be
+    derived *after* that adjustment. Deriving it beforehand left the buffer
+    one frame short and crashed ``split(history_sizes, dim=2)`` on the first
+    chunk of every ``keep_first_frame=False`` request.
+    """
+    if not keep_first_frame:
+        history_sizes[-1] = history_sizes[-1] + 1
+    return sum(history_sizes)
+
+
 def calculate_shift(
     image_seq_len,
     base_seq_len: int = 256,
@@ -488,10 +502,8 @@ class HeliosPipeline(
         num_channels_latents = self.transformer.config.in_channels
         window_num_frames = (num_latent_frames_per_chunk - 1) * self.vae_scale_factor_temporal + 1
         num_latent_chunk = max(1, (num_frames + window_num_frames - 1) // window_num_frames)
-        num_history_latent_frames = sum(history_sizes)
+        num_history_latent_frames = resolve_history_sizes(history_sizes, keep_first_frame)
         total_generated_latent_frames = 0
-        if not keep_first_frame:
-            history_sizes[-1] = history_sizes[-1] + 1
 
         history_latents = torch.zeros(
             batch_size,
@@ -1207,12 +1219,9 @@ class HeliosPipeline(
         num_channels_latents = self.transformer.config.in_channels
         window_num_frames = (num_latent_frames_per_chunk - 1) * self.vae_scale_factor_temporal + 1
         num_latent_chunk = max(1, (num_frames + window_num_frames - 1) // window_num_frames)
-        num_history_latent_frames = sum(history_sizes)
+        num_history_latent_frames = resolve_history_sizes(history_sizes, keep_first_frame)
         history_video = None
         total_generated_latent_frames = 0
-
-        if not keep_first_frame:
-            history_sizes[-1] = history_sizes[-1] + 1
 
         history_latents = torch.zeros(
             batch_size,
