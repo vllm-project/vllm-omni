@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for decode_audio_url helper."""
 
 import asyncio
 import base64
 import os
+import runpy
 import tempfile
 
 import httpx
 import pytest
+from vllm import envs
 
+from vllm_omni.entrypoints.openai import media_input, video_api_utils
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url
 
@@ -23,6 +26,36 @@ def _run(coro):
 def _cleanup(path):
     if path and os.path.exists(path):
         os.unlink(path)
+
+
+def _install_http_transport(monkeypatch, handler):
+    async_client = httpx.AsyncClient
+
+    def _client_factory(*args, **kwargs):
+        return async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _client_factory)
+
+
+@pytest.mark.parametrize("general_limit_mb", [1, 0, -1])
+@pytest.mark.parametrize("url_kind", ["http", "data"])
+def test_zero_audio_limit_rejects_nonempty_audio(monkeypatch, general_limit_mb, url_kind):
+    monkeypatch.setattr(envs, "VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB", general_limit_mb)
+    monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB", 0)
+    # Read the startup configuration without reloading the imported module.
+    assert media_input.__file__ is not None
+    configured_limit = runpy.run_path(media_input.__file__)["MAX_AUDIO_INPUT_BYTES"]
+    monkeypatch.setattr(video_api_utils, "MAX_AUDIO_INPUT_BYTES", configured_limit)
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", lambda **kwargs: pytest.fail("Audio must not be written"))
+
+    if url_kind == "http":
+        _install_http_transport(monkeypatch, lambda request: httpx.Response(200, content=b"audio"))
+        url = "https://93.184.216.34/audio.wav"
+    else:
+        url = "data:audio/wav;base64,YXVkaW8="
+
+    with pytest.raises(media_input.MediaInputTooLargeError, match="0 MiB size limit"):
+        _run(decode_audio_url(url))
 
 
 class TestDecodeAudioUrlDataUrl:
@@ -89,6 +122,13 @@ class TestDecodeAudioUrlDataUrl:
         with pytest.raises(InvalidInputReferenceError, match="audio data is empty"):
             _run(decode_audio_url(url))
 
+    def test_oversized_audio_data_url_raises(self, monkeypatch):
+        monkeypatch.setattr(video_api_utils, "MAX_AUDIO_INPUT_BYTES", 4)
+        b64 = base64.b64encode(b"12345").decode()
+
+        with pytest.raises(InvalidInputReferenceError, match="exceeds"):
+            _run(decode_audio_url(f"data:audio/mp3;base64,{b64}"))
+
 
 class TestDecodeAudioUrlSuffixSanitization:
     """Tests for MIME extension sanitization (path traversal prevention)."""
@@ -145,15 +185,9 @@ class TestDecodeAudioUrlHttp:
 
     def test_valid_http_url(self, monkeypatch):
         audio_bytes = b"\xff\xfb\x90\x00" * 50
-        fake_resp = httpx.Response(200, content=audio_bytes)
+        _install_http_transport(monkeypatch, lambda request: httpx.Response(200, content=audio_bytes))
 
-        async def _mock_get(self, url):
-            return fake_resp
-
-        monkeypatch.setattr(httpx.AsyncClient, "get", _mock_get)
-        monkeypatch.setattr(httpx.Response, "raise_for_status", lambda self: None)
-
-        path = _run(decode_audio_url("https://example.com/audio.mp3"))
+        path = _run(decode_audio_url("https://93.184.216.34/audio.mp3"))
         try:
             assert os.path.isfile(path)
             assert path.endswith(".wav")
@@ -163,13 +197,28 @@ class TestDecodeAudioUrlHttp:
             _cleanup(path)
 
     def test_http_error_raises(self, monkeypatch):
-        async def _mock_get(self, url):
-            raise httpx.HTTPStatusError("Not Found", request=httpx.Request("GET", url), response=httpx.Response(404))
-
-        monkeypatch.setattr(httpx.AsyncClient, "get", _mock_get)
+        _install_http_transport(monkeypatch, lambda request: httpx.Response(404))
 
         with pytest.raises(InvalidInputReferenceError, match="failed to download audio"):
-            _run(decode_audio_url("https://example.com/missing.mp3"))
+            _run(decode_audio_url("https://93.184.216.34/missing.mp3"))
+
+    def test_declared_response_size_uses_combined_audio_limit(self, monkeypatch):
+        class FailingStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                raise AssertionError("the oversized response must be rejected before reading")
+                yield b""
+
+            async def aclose(self):
+                pass
+
+        monkeypatch.setattr(video_api_utils, "MAX_AUDIO_INPUT_BYTES", 4)
+        _install_http_transport(
+            monkeypatch,
+            lambda request: httpx.Response(200, headers={"content-length": "5"}, stream=FailingStream()),
+        )
+
+        with pytest.raises(InvalidInputReferenceError, match="exceeds"):
+            _run(decode_audio_url("https://93.184.216.34/large.mp3"))
 
 
 class TestDecodeAudioUrlInvalid:

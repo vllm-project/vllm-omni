@@ -1282,6 +1282,9 @@ class Attention(nn.Module):
             return 0
         if get_ulysses_mode(default="strict") != "strict" or not query.is_cuda or not _is_nvidia_cuda():
             return 0
+        if torch.cuda.is_current_stream_capturing():
+            # The overlap's cross-rank flags carry host-side epochs that a replayed graph would not advance.
+            return 0
         if self._has_custom_attention:
             return 0
         if query.dim() != 4 or query.shape[0] != 1 or key.shape != query.shape or value.shape != query.shape:
@@ -1359,7 +1362,7 @@ class Attention(nn.Module):
         from vllm_omni.diffusion.attention.parallel.ulysses_ce_overlap import run_ulysses_ce_overlap
 
         attn_metadata = self._with_kv_cache_dtype(attn_metadata)
-        return run_ulysses_ce_overlap(
+        output = run_ulysses_ce_overlap(
             strategy._ulysses_pg,
             query,
             key,
@@ -1367,6 +1370,8 @@ class Attention(nn.Module):
             lambda q, k, v: self._run_local_attention(q, k, v, attn_metadata),
             chunks=chunks,
         )
+        # The runner reuses its output buffer on the next call, so model code gets its own copy.
+        return output.clone()
 
     def _forward_impl(
         self,

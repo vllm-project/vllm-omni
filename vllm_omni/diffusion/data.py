@@ -60,6 +60,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+ULYSSES_A2A_BACKENDS = ("auto", "nccl", "copy_engine")
+
 # Accepted values for ``OmniDiffusionConfig.vae_fast_path``.
 VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
 
@@ -320,23 +322,25 @@ class DiffusionParallelConfig:
       sequence shapes across the ring group.
     """
 
-    ulysses_a2a_permute: bool = False
-    """Use platform symmetric memory for eligible strict Ulysses exchanges.
+    ulysses_a2a_backend: str = "auto"
+    """Transport for the strict Ulysses all-to-all: ``"auto"``, ``"nccl"`` or ``"copy_engine"``.
 
-    On CUDA, enables CE (copy engines) on a single node whose GPUs have CUDA
-    peer access (NVLink or PCIe P2P);
-    when disabled, Ulysses uses NCCL. NPU retains its eager, pure Ulysses
-    implementation over WORLD in one HCCS domain, using TorchNPU's NPUSHMEM
-    allocator, Triton-Ascend and a symmetric-memory runtime.
+    On CUDA, ``"copy_engine"`` uses CE (copy engines) on a single node whose GPUs have CUDA peer access (NVLink or PCIe
+    P2P). On NPU it selects the eager, pure Ulysses implementation over WORLD in one HCCS domain, using TorchNPU's
+    NPUSHMEM allocator, Triton-Ascend and a symmetric-memory runtime; ``"auto"`` keeps NPU on its default exchange.
+
+    ``"auto"`` uses the copy engine when the Ulysses group is on one node with CUDA peer access between every pair of
+    ranks and torch symmetric memory, and NCCL otherwise (and always with CUDA-graphed denoising).
     """
 
     ulysses_overlap_chunks: int = 0
-    """Overlap the CUDA copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
+    """Overlap the copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
 
-    Requires ``ulysses_a2a_permute`` and strict pure Ulysses. Each chunk's Q/K/V move to their head owners while
-    earlier chunks compute, and outputs return as each chunk finishes. The first call for each attention kernel and
-    shape runs the overlap and the standard path on every rank and keeps the overlap only if all ranks are
-    bit-identical, so results match the unchunked path exactly; other kernels and shapes keep the standard exchange.
+    Applies when the transport is the copy engine (ignored when ``"auto"`` resolves to NCCL) and requires strict pure
+    Ulysses. Each chunk's Q/K/V move to their head owners while earlier chunks compute, and outputs return as each
+    chunk finishes. The first call for each attention kernel and shape runs the overlap and the standard path on
+    every rank and keeps the overlap only if all ranks are bit-identical, so results match the unchunked path
+    exactly; other kernels and shapes keep the standard exchange.
     """
 
     cfg_parallel_size: int = 1
@@ -415,6 +419,10 @@ class DiffusionParallelConfig:
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
+        if self.ulysses_a2a_backend not in ULYSSES_A2A_BACKENDS:
+            raise ValueError(
+                f"ulysses_a2a_backend must be one of {ULYSSES_A2A_BACKENDS}, but got {self.ulysses_a2a_backend!r}."
+            )
         assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
             "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
@@ -441,15 +449,15 @@ class DiffusionParallelConfig:
         if self.ulysses_overlap_chunks < 0:
             raise ValueError(f"ulysses_overlap_chunks must be >= 0, but got {self.ulysses_overlap_chunks}")
         if self.ulysses_overlap_chunks > 0 and (
-            not self.ulysses_a2a_permute
+            self.ulysses_a2a_backend == "nccl"
             or self.ulysses_mode != "strict"
             or self.ring_degree != 1
             or self.allgather_degree != 1
         ):
             raise ValueError(
-                "ulysses_overlap_chunks requires ulysses_a2a_permute and strict pure Ulysses "
-                "(ulysses_mode='strict', ring_degree=1, allgather_degree=1). "
-                f"Got ulysses_a2a_permute={self.ulysses_a2a_permute}, ulysses_mode={self.ulysses_mode!r}, "
+                "ulysses_overlap_chunks requires the copy-engine transport (ulysses_a2a_backend 'auto' or "
+                "'copy_engine') and strict pure Ulysses (ulysses_mode='strict', ring_degree=1, allgather_degree=1). "
+                f"Got ulysses_a2a_backend={self.ulysses_a2a_backend!r}, ulysses_mode={self.ulysses_mode!r}, "
                 f"ring_degree={self.ring_degree}, allgather_degree={self.allgather_degree}."
             )
 
@@ -1084,6 +1092,9 @@ class OmniDiffusionConfig:
     enable_layerwise_offload: bool = False
     # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
     enable_distributed_layerwise_offload: bool = False
+    # Sub-module level offloading: stream attn/mlp/adaln weights independently
+    # within each DiT block, overlapping H2D with sub-module compute.
+    enable_submodule_offload: bool = False
     # If True: shard weights 1/dp_size + AllGather (saves CPU memory, requires
     # concurrent requests in DP mode). If False: each rank streams the standard
     # loader's rank-local tensors (including TP-local shards) via H2D only.
@@ -1574,6 +1585,7 @@ class OmniDiffusionConfig:
                         OffloadStrategy.MODEL_LEVEL: "CPU offload",
                         OffloadStrategy.LAYER_WISE: "layerwise offload",
                         OffloadStrategy.DISTRIBUTED_LAYER_WISE: "distributed layerwise offload",
+                        OffloadStrategy.SUBMODULE: "submodule offload",
                     }[offload_strategy]
                 )
             if self.diffusion_attention_schedule is not None:
@@ -1679,7 +1691,7 @@ class OmniDiffusionConfig:
         )
         self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
             limit_gib=self.dlo_host_registration_limit_gib,
-            enable_dlo=self.enable_distributed_layerwise_offload,
+            enable_dlo=(self.enable_distributed_layerwise_offload or self.enable_submodule_offload),
             use_allgather=self.dlo_use_allgather,
             hwr_mode=self.host_weight_runtime_mode,
         )

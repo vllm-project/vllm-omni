@@ -220,7 +220,7 @@ cd vllm-omni
 All hardware variants use `docker/Dockerfile.npu`, which defaults to the
 published vLLM-Ascend `v0.34.0` base. Choose the device suffix for your hardware:
 
-`requirements/npu.txt` includes `cann-shmem` for `--ulysses-a2a-permute`.
+`requirements/npu.txt` includes `cann-shmem` for `--ulysses-a2a-backend copy_engine`.
 The backend loads the wheel's native libraries automatically; no separate
 SHMEM source build is needed.
 

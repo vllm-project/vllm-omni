@@ -78,3 +78,35 @@ def test_batch_async_chunk_matches_per_request_builder():
         )
         assert [_payload_items(p) for p in got] == want
     assert single.higgs_v3_emitted_frames == batched.higgs_v3_emitted_frames == {}
+
+
+@pytest.mark.parametrize("finish_with_rows", [False, True])
+def test_multirow_commit_preserves_boundary_and_final_flush(finish_with_rows):
+    single, batched = _manager(), _manager()
+    for manager in (single, batched):
+        manager.connector.config["extra"].update(codec_chunk_frames=25, initial_codec_chunk_frames=0)
+    request = _Request("r", 100)
+    # Seven delay rows and one holdback row precede the 24 pending frames.
+    rows = torch.arange(35 * 8).view(35, 8)
+    want = []
+    for i, row in enumerate(rows):
+        output = {"codes": {"audio": row[None]}}
+        finished = finish_with_rows and i == len(rows) - 1
+        chunk = talker2code2wav_async_chunk(single, output, request, finished)
+        if chunk is not None:
+            want.append(chunk)
+        if i < 32:
+            [chunk] = talker2code2wav_async_chunk_batch(batched, [output], [request], [False])
+            assert chunk is None
+
+    [chunks] = talker2code2wav_async_chunk_batch(
+        batched, [{"codes": {"audio": rows[32:]}}], [request], [finish_with_rows]
+    )
+    if not finish_with_rows:
+        assert batched.higgs_v3_emitted_frames["r"] == 25
+        want.append(talker2code2wav_async_chunk(single, None, request, True))
+        [final] = talker2code2wav_async_chunk_batch(batched, [None], [request], [True])
+        chunks = (chunks, final)
+    assert [_payload_items(p) for p in chunks] == [_payload_items(p) for p in want]
+    assert chunks[0].codes.audio.numel() == (25 + 1) * 8
+    assert batched.higgs_v3_emitted_frames == {}

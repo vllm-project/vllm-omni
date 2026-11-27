@@ -21,6 +21,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+from vllm_omni.diffusion.distributed.ulysses_transport import require_default_ulysses_transport
 
 
 def validate_seedvr2_parallel_config(parallel: DiffusionParallelConfig) -> None:
@@ -29,13 +30,12 @@ def validate_seedvr2_parallel_config(parallel: DiffusionParallelConfig) -> None:
         or parallel.ring_degree != 1
         or parallel.allgather_degree != 1
         or parallel.ulysses_mode != "strict"
-        or parallel.ulysses_a2a_permute
     ):
         raise ValueError(
-            "SeedVR2 window SP requires pure ulysses_degree with ring_degree=allgather_degree=1, "
-            "ulysses_mode='strict', and ulysses_a2a_permute=False. "
-            "The degree selects the SP group; SeedVR2 keeps all attention heads on each rank."
+            "SeedVR2 window SP requires pure ulysses_degree with ring_degree=allgather_degree=1 and "
+            "ulysses_mode='strict'. The degree selects the SP group; SeedVR2 keeps all attention heads on each rank."
         )
+    require_default_ulysses_transport(parallel, "SeedVR2")
 
 
 # Ported from the Apache-2.0 SeedVR2 reference implementation:

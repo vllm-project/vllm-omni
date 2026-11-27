@@ -135,7 +135,9 @@ def validate_a2a_permute_config(
     if not current_omni_platform.is_npu():
         return
     if enforce_eager is False:
-        raise ValueError("NPU ulysses_a2a_permute currently requires enforce_eager=True (--enforce-eager)")
+        raise ValueError(
+            "NPU ulysses_a2a_backend='copy_engine' currently requires enforce_eager=True (--enforce-eager)"
+        )
     if (
         (ulysses_mode is not None and ulysses_mode != "strict")
         or (ulysses_degree is not None and ulysses_degree <= 1)
@@ -143,11 +145,11 @@ def validate_a2a_permute_config(
         or (allgather_degree is not None and allgather_degree != 1)
     ):
         raise ValueError(
-            "NPU ulysses_a2a_permute requires strict, pure Ulysses with "
+            "NPU ulysses_a2a_backend='copy_engine' requires strict, pure Ulysses with "
             "ulysses_mode='strict', ulysses_degree > 1, ring_degree = 1 and allgather_degree = 1"
         )
     if (scatter_idx is not None and scatter_idx != 2) or (gather_idx is not None and gather_idx != 1):
-        raise ValueError("NPU ulysses_a2a_permute requires scatter_idx=2, gather_idx=1")
+        raise ValueError("NPU ulysses_a2a_backend='copy_engine' requires scatter_idx=2, gather_idx=1")
 
 
 def ensure_a2a_permute_available() -> None:
@@ -236,6 +238,9 @@ def clear_a2a_permute_workspaces() -> None:
     ce_overlap = sys.modules.get("vllm_omni.diffusion.attention.parallel.ulysses_ce_overlap")
     if ce_overlap is not None:
         ce_overlap.clear_ulysses_ce_overlap_runners()
+    transport = sys.modules.get("vllm_omni.diffusion.distributed.ulysses_transport")
+    if transport is not None:
+        transport.clear_ulysses_transport_state()
     with _WORKSPACE_LOCK:
         if not _SYMM_WORKSPACES:
             return

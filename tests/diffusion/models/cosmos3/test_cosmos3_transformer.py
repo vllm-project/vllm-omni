@@ -6,6 +6,7 @@ from __future__ import annotations
 import weakref
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -2382,6 +2383,26 @@ def test_shared_gen_stack_preserves_control_metadata_sharding_and_wrapped_output
     output = model._run_gen_layers(inputs, gather_output=False, **kwargs)
     torch.testing.assert_close(output, torch.full_like(inputs, 4 if already_sharded else 5))
     assert len(gathered) == 1
+
+
+@pytest.mark.parametrize(("is_npu", "expected_layout"), [(True, "BSND"), (False, None)])
+def test_gen_attention_qkv_layout(monkeypatch: pytest.MonkeyPatch, is_npu: bool, expected_layout: str | None) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3 as model
+
+    attention = Mock(side_effect=lambda **kwargs: nn.Identity())
+    monkeypatch.setattr(model, "FrameworkAttention", attention)
+    monkeypatch.setattr(model, "current_omni_platform", SimpleNamespace(is_npu=lambda: is_npu))
+    options = dict(hidden_size=8, num_attention_heads=2, num_key_value_heads=1, head_dim=4, rms_norm_eps=1e-5)
+
+    model.Cosmos3CrossAttention(**options)
+    normal, multi_control = attention.call_args_list
+    assert normal.kwargs.get("qkv_layout") == expected_layout
+    assert multi_control.kwargs.get("qkv_layout") == expected_layout
+
+    attention.reset_mock()
+    model.Cosmos3CausalAttention(**options)
+    attention.assert_called_once()
+    assert attention.call_args.kwargs.get("qkv_layout") is None
 
 
 @pytest.mark.parametrize("path", ["und", "gen", "gen_without_qk_norm", "edge"])
