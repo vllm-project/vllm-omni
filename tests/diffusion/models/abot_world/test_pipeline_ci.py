@@ -525,6 +525,10 @@ def _relative_transformer() -> ABotWorldCausalTransformer3DModel:
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.1)
+    # ROCm hosts dispatch rotary to a Triton kernel that cannot read CPU tensors.
+    for block in model.blocks:
+        rope = block.self_attn.rotary_embedding
+        rope._forward_method = rope.forward_native
     return model.eval()
 
 
@@ -577,10 +581,17 @@ def test_masked_reference_slot_contributes_no_tokens() -> None:
     assert torch.count_nonzero(tokens[:, 4:]) == 0
 
 
-def _parse(pipeline: ABotWorldCausalPipeline, *, num_frames: int, refs: tuple | None) -> _ABotRequestInputs:
+def _parse(
+    pipeline: ABotWorldCausalPipeline, *, num_frames: int | None, refs: tuple | None, output_type: str = "np"
+) -> _ABotRequestInputs:
     mm_data = {"image": torch.zeros(3, 64, 64), "reference_images": refs}
     sampling = OmniDiffusionSamplingParams(
-        height=704, width=1280, num_frames=num_frames, generator=torch.Generator(), extra_args={}
+        height=704,
+        width=1280,
+        num_frames=num_frames,
+        output_type=output_type,
+        generator=torch.Generator(),
+        extra_args={},
     )
     request = OmniDiffusionRequest(
         prompt={"prompt": "p", "multi_modal_data": mm_data}, sampling_params=sampling, request_id="r"
@@ -608,7 +619,7 @@ def test_reference_images_need_a_relative_rope_checkpoint() -> None:
     assert _parse(_parsing_pipeline(relative=True), num_frames=13, refs=refs).reference_images == refs
 
 
-@pytest.mark.parametrize(("num_frames", "ok"), [(13, True), (25, True), (9, False)])
+@pytest.mark.parametrize(("num_frames", "ok"), [(13, True), (25, True), (9, False), (1, False)])
 def test_relative_rope_prefills_one_frame_then_whole_blocks(num_frames: int, ok: bool) -> None:
     pipeline = _parsing_pipeline(relative=True)
 
@@ -617,6 +628,21 @@ def test_relative_rope_prefills_one_frame_then_whole_blocks(num_frames: int, ok:
     else:
         with pytest.raises(ValueError, match="generated latent frames"):
             _parse(pipeline, num_frames=num_frames, refs=None)
+
+
+@pytest.mark.parametrize(("relative", "expected"), [(False, 9), (True, 13)])
+def test_default_frame_count_is_one_block(relative: bool, expected: int) -> None:
+    assert _parse(_parsing_pipeline(relative=relative), num_frames=None, refs=None).num_frames == expected
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_offline_frame_cap_applies_only_to_pixel_decode(relative: bool) -> None:
+    pipeline = _parsing_pipeline(relative=relative)
+    num_frames = 121 if relative else 129
+
+    assert _parse(pipeline, num_frames=num_frames, refs=None, output_type="latent").num_frames == num_frames
+    with pytest.raises(ValueError, match="when decoding to pixels"):
+        _parse(pipeline, num_frames=num_frames, refs=None)
 
 
 def test_unfilled_reference_slots_are_zero_and_masked() -> None:

@@ -708,7 +708,7 @@ class ABotWorldCausalPipeline(
             patch_width=patch_size[2],
         )
 
-        num_frames = getattr(sampling, "num_frames", None) or 9
+        num_frames = getattr(sampling, "num_frames", None) or (13 if relative else 9)
         if isinstance(num_frames, bool) or not isinstance(num_frames, int) or num_frames <= 0:
             raise ValueError(f"num_frames must be a positive integer, got {num_frames!r}.")
         if (
@@ -725,7 +725,7 @@ class ABotWorldCausalPipeline(
             raise ValueError(f"num_latent_frames must not exceed RoPE horizon {rope_max_seq_len}.")
         # Relative-RoPE checkpoints prefill the source frame, then generate whole blocks.
         generated_frames = num_latent_frames - 1 if relative else num_latent_frames
-        if generated_frames % self._num_frame_per_block:
+        if generated_frames <= 0 or generated_frames % self._num_frame_per_block:
             raise ValueError(
                 f"{generated_frames} generated latent frames must be divisible by {self._num_frame_per_block}."
             )
