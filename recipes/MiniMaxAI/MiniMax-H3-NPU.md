@@ -151,7 +151,6 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export MINDIE_SD_FA_TYPE="ascend_laser_attention"
-export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 
 vllm serve "${MODEL}" \
   --omni \
@@ -173,6 +172,16 @@ vllm serve "${MODEL}" \
 
 Notes:
 
+- The MiniMax-H3 encoder's object payloads no longer cross HCCL: they travel
+  over the gloo CPU group (issue #10645). Automatic NPU-side socket port
+  allocation (`HCCL_NPU_SOCKET_PORT_RANGE=auto`) was observed to make the
+  first request fail with `EI0006 Communication_Error_Get_Socket` on
+  `HcclBroadcast` on hosts whose NPUs sit in more than one interconnect
+  domain, such as a host with two four-NPU UB domains. The recipes keep the
+  variable unset because that split-domain case is **not verified here**: the
+  available eight-card 950PR host keeps all eight NPUs in one HCCS domain, so
+  the two-domain first request of issue #10645 was not reproduced. The
+  reporter of #10645 could validate `auto` on their two-domain host.
 - Do not add `--enforce-eager`. The first request includes regional
   compilation; warm the server once before measuring steady-state latency.
 - H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
