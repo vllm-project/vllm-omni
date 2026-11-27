@@ -865,6 +865,7 @@ class OpenAIFullDuplexConnection:
                     "type": "conversation.item.input_audio_transcription.failed",
                     "event_id": _gen_id("evt"),
                     "item_id": item_id,
+                    "content_index": 0,
                     "error": {"code": "transcription_error", "message": str(exc)},
                 }
             )
@@ -915,6 +916,7 @@ class OpenAIFullDuplexConnection:
                     "type": "conversation.item.input_audio_transcription.failed",
                     "event_id": _gen_id("evt"),
                     "item_id": item_id,
+                    "content_index": 0,
                     "error": {"code": "transcription_error", "message": str(exc)},
                 }
             )

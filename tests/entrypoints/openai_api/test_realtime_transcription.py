@@ -439,6 +439,7 @@ async def test_transcription_engine_failure_emits_failed() -> None:
 
     failed = [e for e in _sent_events(websocket) if e["type"] == "conversation.item.input_audio_transcription.failed"]
     assert len(failed) == 1
+    assert failed[0]["content_index"] == 0
     assert failed[0]["error"]["code"] == "transcription_error"
 
 
@@ -583,6 +584,7 @@ async def test_prompt_preparation_failure_is_a_per_item_event() -> None:
     failed = [e for e in _sent_events(websocket) if e["type"] == "conversation.item.input_audio_transcription.failed"]
     assert len(failed) == 1
     assert failed[0]["item_id"] == item.id
+    assert failed[0]["content_index"] == 0
     assert failed[0]["error"]["code"] == "transcription_error"
     assert "prompt rendering exploded" in failed[0]["error"]["message"]
     # No generic session-level error was sent instead.
