@@ -32,15 +32,17 @@ def test_comparison_uses_rates_and_does_not_round_a_drop_into_acceptance():
 @pytest.mark.parametrize("tolerance", [-1, 101, math.nan, math.inf])
 def test_invalid_tolerances_cannot_disable_quality_checks(tolerance):
     with pytest.raises(ValueError):
-        validate_quality_options(tolerance, 2, "observed", .95, 1000)
+        validate_quality_options(tolerance, 2, "observed", 0.95, 1000)
     with pytest.raises(ValueError):
         success_rate_check("x", 90, 100, 90, 100, tolerance)
 
 
 def summary(outcomes):
-    return {"task_results": [{"task_id": 0, "episode_results": [
-        {"episode": i, "success": s} for i, s in enumerate(outcomes)
-    ]}]}
+    return {
+        "task_results": [
+            {"task_id": 0, "episode_results": [{"episode": i, "success": s} for i, s in enumerate(outcomes)]}
+        ]
+    }
 
 
 def test_pairing_is_by_identity_not_row_order_and_marginals_are_insufficient():
@@ -65,7 +67,7 @@ def test_confidence_bounds_are_paired_reproducible_and_not_a_point_estimate_gate
     assert narrow["supported"] and not wide["supported"]
     assert wide["status"] == "not_demonstrated"
     # A non-significant difference alone would not express this distinction.
-    high = paired_success_confidence([[11, 479, 10]], 1, confidence=.99, samples=1000, seed=7)
+    high = paired_success_confidence([[11, 479, 10]], 1, confidence=0.99, samples=1000, seed=7)
     assert high["lower_bound_pp"] <= wide["lower_bound_pp"]
 
 
@@ -73,4 +75,3 @@ def test_degenerate_bootstrap_is_inconclusive_not_proof_of_equality():
     report = paired_success_confidence([[0, 500, 0]], 2, samples=1000)
     assert report["lower_bound_pp"] is None
     assert not report["supported"] and report["status"] == "inconclusive"
-

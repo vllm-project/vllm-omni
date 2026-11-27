@@ -42,7 +42,7 @@ def main():
     import numba
     from robosuite.utils.transform_utils import mat2quat
 
-    numpy.testing.assert_array_equal(mat2quat(numpy.eye(3)), numpy.array([0., 0., 0., 1.], dtype=numpy.float32))
+    numpy.testing.assert_array_equal(mat2quat(numpy.eye(3)), numpy.array([0.0, 0.0, 0.0, 1.0], dtype=numpy.float32))
     context = mujoco.GLContext(32, 32)
     context.make_current()
     from OpenGL import GL

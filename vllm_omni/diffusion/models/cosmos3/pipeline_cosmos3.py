@@ -74,6 +74,8 @@ from vllm_omni.diffusion.media import (
     VideoValueRange,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.cosmos3.execution_timing import instrument_pipeline
+from vllm_omni.diffusion.models.cosmos3.moh_timing import MOH_TIMING_CONTRACT
 from vllm_omni.diffusion.models.interface import (
     ReferenceVideoDecodeSpec,
     SupportImageInput,
@@ -91,8 +93,6 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames, is_video_file_path
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.diffusion.models.cosmos3.execution_timing import instrument_pipeline
-from vllm_omni.diffusion.models.cosmos3.moh_timing import MOH_TIMING_CONTRACT
 from vllm_omni.entrypoints.openai.video_api_utils import positive_float
 from vllm_omni.experimental.world_models.adapters.state_cosmos3_adapter import (
     Cosmos3StateAdapter,
@@ -4846,13 +4846,17 @@ class Cosmos3OmniDiffusersPipeline(
                             "raw_action_dim": raw_action_dim,
                             "action_mode": action_mode,
                             "domain_id": domain_id,
-                            **({
-                                "policy_timing": policy_timing,
-                                "timing_contract": MOH_TIMING_CONTRACT,
-                                "policy_profile": policy_profile,
-                                "early_stop_actions": early_stop_actions,
-                                **sampler_metrics,
-                            } if native_policy else {}),
+                            **(
+                                {
+                                    "policy_timing": policy_timing,
+                                    "timing_contract": MOH_TIMING_CONTRACT,
+                                    "policy_profile": policy_profile,
+                                    "early_stop_actions": early_stop_actions,
+                                    **sampler_metrics,
+                                }
+                                if native_policy
+                                else {}
+                            ),
                         },
                     },
                 },

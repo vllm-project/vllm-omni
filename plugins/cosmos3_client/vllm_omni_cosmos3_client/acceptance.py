@@ -55,14 +55,25 @@ def load_run(directory):
     return dict(directory=str(directory.resolve()), summary=summary, latency=report, evidence=proof)
 
 
-def compare(baseline_dirs, faster_dirs, *, minimum_windows=100, minimum_improvement_percent=10,
-            expected_suites=SUITES, overall_success_drop_pp=DEFAULT_OVERALL_DROP_PP,
-            suite_success_drop_pp=DEFAULT_SUITE_DROP_PP, success_policy="observed",
-            success_confidence=0.95, success_bootstrap_samples=5000, success_bootstrap_seed=0):
+def compare(
+    baseline_dirs,
+    faster_dirs,
+    *,
+    minimum_windows=100,
+    minimum_improvement_percent=10,
+    expected_suites=SUITES,
+    overall_success_drop_pp=DEFAULT_OVERALL_DROP_PP,
+    suite_success_drop_pp=DEFAULT_SUITE_DROP_PP,
+    success_policy="observed",
+    success_confidence=0.95,
+    success_bootstrap_samples=5000,
+    success_bootstrap_seed=0,
+):
     if minimum_windows < 1 or not 0 <= minimum_improvement_percent < 100:
         raise ValueError("Invalid acceptance thresholds")
-    validate_quality_options(overall_success_drop_pp, suite_success_drop_pp, success_policy,
-                             success_confidence, success_bootstrap_samples)
+    validate_quality_options(
+        overall_success_drop_pp, suite_success_drop_pp, success_policy, success_confidence, success_bootstrap_samples
+    )
     groups = []
     for paths in [baseline_dirs, faster_dirs]:
         loaded = [load_run(Path(p)) for p in paths]
@@ -139,12 +150,22 @@ def compare(baseline_dirs, faster_dirs, *, minimum_windows=100, minimum_improvem
         if any(value is None for value in p95):
             raise ValueError(f"No complete measured windows for {suite}")
         bsum, fsum = [r["summary"] for r in [base, faster]]
-        observed = success_rate_check(f"{suite}/success_rate_tolerance", bsum["total_successes"],
-                                      bsum["total_episodes"], fsum["total_successes"], fsum["total_episodes"],
-                                      suite_success_drop_pp)
+        observed = success_rate_check(
+            f"{suite}/success_rate_tolerance",
+            bsum["total_successes"],
+            bsum["total_episodes"],
+            fsum["total_successes"],
+            fsum["total_episodes"],
+            suite_success_drop_pp,
+        )
         strata = paired_task_strata(bsum, fsum)
-        confidence = paired_success_confidence(strata, suite_success_drop_pp, confidence=success_confidence,
-                                              samples=success_bootstrap_samples, seed=success_bootstrap_seed)
+        confidence = paired_success_confidence(
+            strata,
+            suite_success_drop_pp,
+            confidence=success_confidence,
+            samples=success_bootstrap_samples,
+            seed=success_bootstrap_seed,
+        )
         quality_checks.append(observed)
         if success_policy == "confidence":
             quality_checks.append(dict(check=f"{suite}/success_rate_confidence", passed=confidence["supported"]))
@@ -167,12 +188,21 @@ def compare(baseline_dirs, faster_dirs, *, minimum_windows=100, minimum_improvem
                 faster_checkpoint=configs[1]["server_info"].get("checkpoint"),
             )
         )
-    overall_observed = success_rate_check("overall/success_rate_tolerance", total_base_successes,
-                                          total_base_episodes, total_ours_successes, total_ours_episodes,
-                                          overall_success_drop_pp)
-    overall_confidence = paired_success_confidence(all_strata, overall_success_drop_pp,
-                                                  confidence=success_confidence, samples=success_bootstrap_samples,
-                                                  seed=success_bootstrap_seed)
+    overall_observed = success_rate_check(
+        "overall/success_rate_tolerance",
+        total_base_successes,
+        total_base_episodes,
+        total_ours_successes,
+        total_ours_episodes,
+        overall_success_drop_pp,
+    )
+    overall_confidence = paired_success_confidence(
+        all_strata,
+        overall_success_drop_pp,
+        confidence=success_confidence,
+        samples=success_bootstrap_samples,
+        seed=success_bootstrap_seed,
+    )
     quality_checks.append(overall_observed)
     if success_policy == "confidence":
         quality_checks.append(dict(check="overall/success_rate_confidence", passed=overall_confidence["supported"]))
@@ -193,9 +223,10 @@ def compare(baseline_dirs, faster_dirs, *, minimum_windows=100, minimum_improvem
             overall_maximum_drop_pp=overall_success_drop_pp,
             suite_maximum_drop_pp=suite_success_drop_pp,
             passed=all(c["passed"] for c in quality_checks),
-            observed_tolerance_passed=overall_observed["passed"] and all(s["observed"]["passed"] for s in quality_suites),
-            statistical_noninferiority_supported=overall_confidence["supported"] and all(
-                s["confidence"]["supported"] for s in quality_suites),
+            observed_tolerance_passed=overall_observed["passed"]
+            and all(s["observed"]["passed"] for s in quality_suites),
+            statistical_noninferiority_supported=overall_confidence["supported"]
+            and all(s["confidence"]["supported"] for s in quality_suites),
             overall=dict(observed=overall_observed, confidence=overall_confidence),
             suites=quality_suites,
             motion_continuity="not assessed by success-rate checks",
@@ -245,8 +276,13 @@ def main():
         result = dict(schema=SCHEMA, passed=False, error=f"{type(exc).__name__}: {exc}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
-    terminal = dict(passed=result["passed"], failed_checks=result.get("failed_checks", []),
-                    aggregate=result.get("aggregate"), quality=result.get("quality"), error=result.get("error"))
+    terminal = dict(
+        passed=result["passed"],
+        failed_checks=result.get("failed_checks", []),
+        aggregate=result.get("aggregate"),
+        quality=result.get("quality"),
+        error=result.get("error"),
+    )
     print(json.dumps(terminal, indent=2, ensure_ascii=False))
     raise SystemExit(0 if result["passed"] else 2)
 

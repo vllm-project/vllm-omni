@@ -216,7 +216,8 @@ def instrument_pipeline(cls):
             if isinstance(output, dict):
                 metadata = output.get("metadata", {}).get("actions")
                 if isinstance(metadata, dict) and metadata.get("policy_profile") in {
-                    "libero10_native_nonstream_v1", "libero10_native_constant_v1"
+                    "libero10_native_nonstream_v1",
+                    "libero10_native_constant_v1",
                 }:
                     metadata.setdefault("policy_timing", {}).update(timing.flattened())
             return result

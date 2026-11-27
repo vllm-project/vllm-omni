@@ -26,6 +26,24 @@ python -m vllm_omni_cosmos3_client --server_url http://127.0.0.1:8101 --help
 
 已有代码可导入 `vllm_omni_cosmos3_client.closed_loop_eval.ActionEnvironmentClient`，调用 `predict`、`predict_batch`、`predict_stream` 和 `predict_batch_stream`。原 `examples/cosmos3/closed_loop_eval.py`、`eval_metrics.py` 保留兼容入口，实际实现只有插件内的一份。
 
+### pybase64 依赖
+
+客户端与服务端使用 `import pybase64 as base64` 编解码图像，以符合仓库的 `check-forbidden-imports` 检查规则。独立安装客户端时，包依赖会安装 `pybase64>=1.5.0`；`install_client.sh` 使用 `--no-deps`，仅注册插件，因此需要先在所选 Python 环境中准备该依赖。
+
+Ascend 离线依赖清单 `ascend-py312.lock.txt` 固定 `pybase64==1.5.0`，公开安装清单 `public-runtime.lock.txt` 固定 `pybase64==1.5.1`。复用旧环境时，应按对应安装路线的版本补装；例如，在已加载 `npu.env` 的离线环境中执行：
+
+```bash
+"$COSMOS3_CLIENT_PYTHON" -m pip install --no-index --find-links /实际wheel目录 'pybase64==1.5.0'
+```
+
+离线机器需使用同版本、匹配 Python 版本和 CPU 架构的本地 wheel，并通过 `--no-index --find-links /实际wheel目录` 安装。公开安装环境使用 `pybase64==1.5.1`。安装后，用实际运行客户端的解释器检查导入和编解码：
+
+```bash
+"$COSMOS3_CLIENT_PYTHON" -c 'import pybase64 as base64; from importlib.metadata import version; assert base64.b64decode(base64.b64encode(b"cosmos3")) == b"cosmos3"; print(version("pybase64"))'
+```
+
+普通独立 client 环境可将上述解释器替换为该环境的 `python`。标准库 `base64` 的导入仍允许用于 `examples/`、`tests/` 等检查规则豁免目录，无需为这些示例和测试统一替换。
+
 ## 华为原生环境
 
 宿主环境使用 `source examples/cosmos3/env_native.sh`。默认启用 `NUMBA_DISABLE_JIT=0 NUMBA_OPT=3`，使用随离线运行包分发的 Mesa 23.2.1，与旧版 CPU 渲染环境一致。客户端在 SciPy/Torch 前加载 LLVM，避免原生环境中的优化器加载顺序崩溃；不需要全局关闭 JIT 或降低优化等级。

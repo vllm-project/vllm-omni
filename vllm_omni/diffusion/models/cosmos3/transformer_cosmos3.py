@@ -2534,9 +2534,11 @@ class Cosmos3VFMTransformer(nn.Module):
                     if action_timesteps.shape != hidden_action.shape[:2]:
                         raise ValueError("action_timesteps must have shape [B, T_action]")
                     with torch.autocast(current_omni_platform.device_type, enabled=False):
-                        action_time_embed = self.time_embedder(
-                            (action_timesteps.reshape(-1) * self.timestep_scale).float()
-                        ).reshape(*hidden_action.shape[:2], -1).to(hidden_action.dtype)
+                        action_time_embed = (
+                            self.time_embedder((action_timesteps.reshape(-1) * self.timestep_scale).float())
+                            .reshape(*hidden_action.shape[:2], -1)
+                            .to(hidden_action.dtype)
+                        )
                 if action_noisy_mask is None:
                     hidden_action = hidden_action + action_time_embed
                 else:

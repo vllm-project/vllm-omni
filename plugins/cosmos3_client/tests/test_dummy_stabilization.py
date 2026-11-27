@@ -27,11 +27,21 @@ def test_dummy_steps_advance_physics_and_have_an_independent_span(monkeypatch, t
 
     env = Environment()
     result = _run_episode(
-        env, SimpleNamespace(task_id=4, episode=2),
-        cameras=["agentview"], flip_images=False, rotate_180=True,
-        action_horizon=16, action_dim=10, action_space="frame_wise_relative",
-        rotation_space="6d", gripper_mode="zero_one", max_steps=10,
-        warmup_steps=10, initial_state=None, gif_path=None, gif_fps=20,
+        env,
+        SimpleNamespace(task_id=4, episode=2),
+        cameras=["agentview"],
+        flip_images=False,
+        rotate_180=True,
+        action_horizon=16,
+        action_dim=10,
+        action_space="frame_wise_relative",
+        rotation_space="6d",
+        gripper_mode="zero_one",
+        max_steps=10,
+        warmup_steps=10,
+        initial_state=None,
+        gif_path=None,
+        gif_fps=20,
     )
     TIMELINE.flush()
     events = [json.loads(line) for line in timeline.read_text().splitlines()]

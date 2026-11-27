@@ -45,8 +45,13 @@ def window_metrics(events):
 
 
 def build_render_free_report(
-    events, records, evaluation_interval, executed_actions, *,
-    exclude_dummy_time=False, expected_dummy_intervals=None,
+    events,
+    records,
+    evaluation_interval,
+    executed_actions,
+    *,
+    exclude_dummy_time=False,
+    expected_dummy_intervals=None,
 ):
     groups = defaultdict(list)
     rendering = []

@@ -34,7 +34,7 @@ python -m vllm_omni_cosmos3_client \
 from __future__ import annotations
 
 import argparse
-import base64
+import pybase64 as base64
 import io
 import json
 import os
@@ -445,6 +445,7 @@ class ActionEnvironmentClient:
             lines = _stream_lines(resp)
             diagnose_cpu = os.environ.get("COSMOS3_DIAG_THREAD_CPU") == "1"
             if diagnose_cpu:
+
                 def timed_lines():
                     while True:
                         try:
@@ -460,8 +461,11 @@ class ActionEnvironmentClient:
             for raw_line in incoming:
                 if not raw_line:
                     continue
-                with (TIMELINE.span("client.stream_line_decode", trace_id=self.trace_id)
-                      if diagnose_cpu else nullcontext()):
+                with (
+                    TIMELINE.span("client.stream_line_decode", trace_id=self.trace_id)
+                    if diagnose_cpu
+                    else nullcontext()
+                ):
                     event = json.loads(raw_line.decode("utf-8"))
                 event_type = event.get("type")
                 if event_type == "partial":
@@ -608,8 +612,6 @@ class ActionEnvironmentClient:
             client_preprocess_ms=(request_t0 - preprocess_start) * 1000,
         )
         return result["actions"]
-
-
 
 
 def _stream_lines(resp: requests.Response):
@@ -1150,6 +1152,7 @@ def _framewise_action_to_delta(
     delta_rotvec = SciRotation.from_matrix(rotation_delta).as_rotvec()
     return np.concatenate([delta_pos, delta_rotvec, gripper], axis=0)
 
+
 # 一个回合
 def _run_episode(
     env: Any,
@@ -1624,7 +1627,9 @@ def _run_task_vectorized(
             step = 0
 
             if warmup_steps > 0:
-                with TIMELINE.span("client.dummy_stabilization", task_id=client.task_id, episodes=wave, env_slots=slots):
+                with TIMELINE.span(
+                    "client.dummy_stabilization", task_id=client.task_id, episodes=wave, env_slots=slots
+                ):
                     for _ in range(warmup_steps):
                         act = np.stack([_get_libero_dummy_action() for _ in slots])
                         obs_arr, _, _, _ = venv.step(act, id=slots)
@@ -2150,11 +2155,7 @@ def main() -> None:
         report["accuracy"]["overall"]["executed_actions"],
         exclude_dummy_time=args.exclude_dummy_time,
         expected_dummy_intervals=(
-            sum(
-                episode["warmup_actions"] > 0
-                for task in task_results
-                for episode in task["episode_results"]
-            )
+            sum(episode["warmup_actions"] > 0 for task in task_results for episode in task["episode_results"])
             if args.exclude_dummy_time and args.num_envs == 1
             else None
         ),

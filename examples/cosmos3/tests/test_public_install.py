@@ -1,12 +1,11 @@
 """Exercise public-install guards without downloading or using accelerator devices."""
 
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
-
+from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
@@ -39,7 +38,10 @@ class PublicInstallGuards(unittest.TestCase):
     def run_stage(self, stage):
         return subprocess.run(
             ["bash", str(self.scripts / "install_public.sh"), stage],
-            env=self.environment, text=True, capture_output=True, timeout=15,
+            env=self.environment,
+            text=True,
+            capture_output=True,
+            timeout=15,
         )
 
     def test_plan_does_not_create_runtime_or_venv(self):
@@ -76,13 +78,19 @@ class PublicInstallGuards(unittest.TestCase):
         runtime.mkdir()
         cann = runtime / "cann-env.sh"
         cann.write_text("return 17\n")
-        (runtime / "public-runtime.env").write_text(
-            f"export COSMOS3_CANN_ENV='{cann}'\n"
-        )
+        (runtime / "public-runtime.env").write_text(f"export COSMOS3_CANN_ENV='{cann}'\n")
         result = subprocess.run(
-            ["bash", "-uc", 'source "$1"; status=$?; [[ $- == *u* ]] || exit 99; exit "$status"',
-             "_", str(self.scripts / "env_public.sh")],
-            env=self.environment, text=True, capture_output=True, timeout=15,
+            [
+                "bash",
+                "-uc",
+                'source "$1"; status=$?; [[ $- == *u* ]] || exit 99; exit "$status"',
+                "_",
+                str(self.scripts / "env_public.sh"),
+            ],
+            env=self.environment,
+            text=True,
+            capture_output=True,
+            timeout=15,
         )
         self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
 

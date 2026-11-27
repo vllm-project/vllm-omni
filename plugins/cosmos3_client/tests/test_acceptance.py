@@ -40,10 +40,13 @@ def create_run(path, duration, *, suite="libero_10", trials=1):
             action_normalization="quantile_rot",
         ),
     )
-    tasks = [dict(task_id=i, episode_results=[dict(episode=j, success=True, executed_actions=16)
-                                             for j in range(trials)]) for i in range(10)]
-    summary = dict(run_config=config, total_episodes=10*trials, total_successes=10*trials,
-                   task_suite=suite, task_results=tasks)
+    tasks = [
+        dict(task_id=i, episode_results=[dict(episode=j, success=True, executed_actions=16) for j in range(trials)])
+        for i in range(10)
+    ]
+    summary = dict(
+        run_config=config, total_episodes=10 * trials, total_successes=10 * trials, task_suite=suite, task_results=tasks
+    )
     config["streaming"] = path.name == "faster"
     config["server_info"]["action_time_schedule"] = "has_euler" if config["streaming"] else "constant_euler"
     (path / "summary.json").write_text(json.dumps(summary))
@@ -126,21 +129,32 @@ def test_a_normal_task_failure_is_retained_and_can_pass_the_tolerance(tmp_path):
     create_run(base, 10, trials=10)
     create_run(faster, 9, trials=10)
     fail_episodes(faster, 1)  # 1/100 = 1 pp: inclusive overall boundary
-    result = compare([base], [faster], minimum_windows=10, expected_suites=["libero_10"],
-                     success_bootstrap_samples=1000)
+    result = compare(
+        [base], [faster], minimum_windows=10, expected_suites=["libero_10"], success_bootstrap_samples=1000
+    )
     assert result["passed"]
     assert result["quality"]["overall"]["observed"]["success_rate_change_pp"] == -1
     assert result["aggregate"]["faster_windows"] == 100
     assert result["suites"][0]["faster_successes"] == 99
-    strict = compare([base], [faster], minimum_windows=10, expected_suites=["libero_10"],
-                     overall_success_drop_pp=0, suite_success_drop_pp=0, success_bootstrap_samples=1000)
+    strict = compare(
+        [base],
+        [faster],
+        minimum_windows=10,
+        expected_suites=["libero_10"],
+        overall_success_drop_pp=0,
+        suite_success_drop_pp=0,
+        success_bootstrap_samples=1000,
+    )
     assert not strict["passed"]
 
 
-@pytest.mark.parametrize("losses, failed_check", [
-    ([3, 0, 0, 0], "libero_spatial/success_rate_tolerance"),
-    ([2, 1, 1, 1], "overall/success_rate_tolerance"),
-])
+@pytest.mark.parametrize(
+    "losses, failed_check",
+    [
+        ([3, 0, 0, 0], "libero_spatial/success_rate_tolerance"),
+        ([2, 1, 1, 1], "overall/success_rate_tolerance"),
+    ],
+)
 def test_overall_and_suite_limits_are_independent(tmp_path, losses, failed_check):
     bases, faster = [], []
     for suite, failures in zip(SUITES, losses):
@@ -162,8 +176,14 @@ def test_confidence_mode_requires_evidence_not_just_equal_observed_rates(tmp_pat
     base, faster = tmp_path / "base", tmp_path / "faster"
     create_run(base, 10)
     create_run(faster, 9)
-    result = compare([base], [faster], minimum_windows=10, expected_suites=["libero_10"],
-                     success_policy="confidence", success_bootstrap_samples=1000)
+    result = compare(
+        [base],
+        [faster],
+        minimum_windows=10,
+        expected_suites=["libero_10"],
+        success_policy="confidence",
+        success_bootstrap_samples=1000,
+    )
     assert result["quality"]["observed_tolerance_passed"]
     assert not result["quality"]["statistical_noninferiority_supported"]
     assert not result["passed"]

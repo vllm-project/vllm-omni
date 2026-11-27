@@ -64,9 +64,7 @@ def test_whole_loop_excludes_dummy_and_render_but_keeps_real_warmup_and_partial_
     rows[5]["trace_id"] = "two"
     rows[6]["trace_id"] = "two"
     rows[7]["trace_id"] = "two"
-    report = build_render_free_report(
-        rows, records, (0, 20), 2, exclude_dummy_time=True, expected_dummy_intervals=2
-    )
+    report = build_render_free_report(rows, records, (0, 20), 2, exclude_dummy_time=True, expected_dummy_intervals=2)
     assert report["evaluation_no_render"]["elapsed_no_render_s"] == 17
     clean = report["evaluation_no_render_no_dummy"]
     assert clean["render_excluded_s"] == 3
@@ -92,5 +90,9 @@ def test_refuse_no_dummy_metric_when_episode_stabilization_probe_is_missing():
     with pytest.raises(ValueError, match="Expected 2 dummy stabilization intervals, got 1"):
         build_render_free_report(
             [event("client.dummy_stabilization", 0, 1, trace=None)],
-            [], (0, 10), 0, exclude_dummy_time=True, expected_dummy_intervals=2,
+            [],
+            (0, 10),
+            0,
+            exclude_dummy_time=True,
+            expected_dummy_intervals=2,
         )

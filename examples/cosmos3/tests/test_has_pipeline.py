@@ -20,9 +20,9 @@ class Harness:
         self.calls = []
         self.reset_count = 0
         self.transformer = SimpleNamespace(
-            reset_cache=lambda: None, reset_pp_step=lambda: None,
+            reset_cache=lambda: None,
+            reset_pp_step=lambda: None,
         )
-
 
     def _scheduler_step_via_pp_driver(self, noise_pred, timestep, latents, *, step_scheduler, generator):
         return step_scheduler.step(noise_pred, timestep, latents, generator=generator, return_dict=False)[0]

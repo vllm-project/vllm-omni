@@ -54,6 +54,7 @@ def success_rate_check(name, baseline_successes, baseline_episodes, ours_success
 
 def paired_task_strata(baseline_summary, ours_summary):
     """Match by task and episode ID; never pair different rows by success rank."""
+
     def outcomes(summary):
         result = {}
         for task in summary["task_results"]:
@@ -116,10 +117,12 @@ def paired_success_confidence(strata, max_drop_pp, *, confidence=0.95, samples=5
     rng = random.Random(seed)
     draws = []
     for _ in range(samples):
-        difference = sum(sum(rng.choices((-1, 0, 1), cum_weights=cumulative, k=count))
-                         for count, cumulative in prepared)
+        difference = sum(
+            sum(rng.choices((-1, 0, 1), cum_weights=cumulative, k=count)) for count, cumulative in prepared
+        )
         draws.append(100 * difference / n)
     lower = round(percentile(draws, 100 * (1 - confidence)), 12)
     supported = lower > -max_drop_pp
-    return dict(result, lower_bound_pp=lower, supported=supported,
-                status="supported" if supported else "not_demonstrated")
+    return dict(
+        result, lower_bound_pp=lower, supported=supported, status="supported" if supported else "not_demonstrated"
+    )

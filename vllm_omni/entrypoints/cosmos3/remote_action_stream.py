@@ -13,6 +13,7 @@ import numpy as np
 
 from vllm_omni.entrypoints.cosmos3.action_policy_http import ActionPolicyHandler, ActionPolicyHTTPServer
 
+
 # 接收和管理动作事件的通道
 class ActionStreamChannel:
     def __init__(self, publish: Callable[[dict[str, Any]], None], action_count: int = 16) -> None:
@@ -60,6 +61,7 @@ class ActionStreamChannel:
                 self.actions[: self.action_count], actions, rtol=0, atol=1e-6
             ):
                 raise RuntimeError("Streamed actions differ from the final action chunk")
+
 
 # 注册通道生成token
 class ActionStreamRegistry:

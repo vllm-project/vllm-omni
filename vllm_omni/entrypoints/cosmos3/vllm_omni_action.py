@@ -29,9 +29,11 @@ from vllm_omni.entrypoints.cosmos3.moh_timing import model_infer_ms
 
 logger = logging.getLogger(__name__)
 
+
 # 父类
 class VllmOmniActionTransport:
     """Transport prepared pixels/captions to vLLM and return normalized actions."""
+
     # 初始化推理客户端
     def __init__(
         self,
@@ -44,7 +46,7 @@ class VllmOmniActionTransport:
         seed: int = 0,
         timeout: float = 1800.0,
         poll_interval: float = 0.5,
-        action_time_schedule: str = "has_euler",        # ours
+        action_time_schedule: str = "has_euler",  # ours
         early_stop_actions: int | None = None,
         session: requests.Session | None = None,
     ) -> None:
@@ -85,6 +87,7 @@ class VllmOmniActionTransport:
             return response.status_code == 200
         except requests.RequestException:
             return False
+
     # 获取模型和推理配置
     def get_info(self) -> dict[str, Any]:
         response = self.session.get(f"{self.base_url}/v1/models", timeout=5)
@@ -120,6 +123,7 @@ class VllmOmniActionTransport:
             "streaming": {"supported": False},
             "batch_execution": "sequential_online_jobs",
         }
+
     # 解析模型生成的动作
     @staticmethod
     def _decode_action(payload: Any, action_count: int = 16) -> np.ndarray:
@@ -136,6 +140,7 @@ class VllmOmniActionTransport:
         if actions.shape != (action_count, 10) or not np.isfinite(actions).all():
             raise ValueError(f"Expected finite [{action_count}, 10] actions, got {actions.shape}.")
         return actions
+
     # 推理
     def predict_prepared(
         self,
@@ -189,12 +194,12 @@ class VllmOmniActionTransport:
         }
         if self.model is not None:
             data["model"] = self.model
-        if action_stream is not None:       # 流式配置
+        if action_stream is not None:  # 流式配置
             extra = json.loads(data["extra_params"])
             extra["action_stream"] = action_stream
             data["extra_params"] = json.dumps(extra)
         job_start = time.perf_counter()
-        response = self.session.post(       # 向vllm-omni提交推理任务
+        response = self.session.post(  # 向vllm-omni提交推理任务
             f"{self.base_url}/v1/videos",
             data=data,
             files={"input_reference": ("libero.png", buffer.getvalue(), "image/png")},
@@ -281,6 +286,7 @@ class VllmOmniActionTransport:
 
     def close(self) -> None:
         self.session.close()
+
 
 # 新增输入预处理和最终动作反归一化
 class VllmOmniActionClient(VllmOmniActionTransport):

@@ -3,7 +3,7 @@
 
 """Policy image decoding and action transforms shared by local and remote serving."""
 
-import base64
+import pybase64 as base64
 import io
 import json
 from pathlib import Path

@@ -3,7 +3,7 @@
 
 """Shared LIBERO frontend for a remote vLLM model or a local native model."""
 
-import base64
+import pybase64 as base64
 import io
 import json
 import logging
@@ -42,10 +42,12 @@ class RemotePolicyConfig:
 
 class LiberoRemotePolicyService:
     """Reuse the native HTTP protocol, returning physical actions exactly once."""
+
     # 判断是否使用流式
     @property
     def supports_streaming(self) -> bool:
         return self.cfg.streaming_enabled and self.transport.action_time_schedule == "has_euler"
+
     # 初始化推理服务  VllmOmniActionTransport推理后端接口
     def __init__(self, transport: VllmOmniActionTransport, cfg: RemotePolicyConfig = RemotePolicyConfig()) -> None:
         if cfg.dump_every < 1:
@@ -55,12 +57,13 @@ class LiberoRemotePolicyService:
         self.normalizer = LiberoActionNormalizer(cfg.action_stats_path)
         self._lock = threading.Lock()
         self._profile_confirmed = False
-        self.streams = ActionStreamRegistry()       # 注册并生成token
+        self.streams = ActionStreamRegistry()  # 注册并生成token
         self._warmup_results: list[dict[str, Any]] = []
 
     def check_health(self) -> bool:
         with self._lock:
             return self.transport.check_health()
+
     # 向客户端返回服务配置和推理能力
     def get_info(self) -> dict[str, Any]:
         with self._lock:
@@ -101,6 +104,7 @@ class LiberoRemotePolicyService:
                 "server_ttfa_ms": "policy_entry_to_first_physical_action_ready_for_http_delivery",
             },
         }
+
     # 预热
     def warmup(self, req: dict[str, Any]) -> dict[str, Any]:
         """Warm the selected request path without changing evaluation RNG state."""
@@ -144,6 +148,7 @@ class LiberoRemotePolicyService:
             "seed_scope": "explicit_fixed_seed_per_job; synthetic_images_use_local_rng",
             "timings": results,
         }
+
     # 把客户端请求转换为后端需要的输入格式
     def _prepare(self, req: dict[str, Any]) -> tuple[np.ndarray, str, list[int], np.ndarray]:
         if not isinstance(req, dict):
@@ -159,6 +164,7 @@ class LiberoRemotePolicyService:
         observation = decode_policy_image(req.get("image"))
         pixels, caption, frame_size = prepare_libero_policy_inputs(observation, prompt, image_size)
         return pixels, caption, frame_size, observation
+
     # 推理入口
     def predict_distributed(
         self, req: dict[str, Any], *, is_batch: bool, on_actions_ready: Any = None
@@ -180,7 +186,7 @@ class LiberoRemotePolicyService:
         }
         result["server_timing"] = {"infer_ms": policy_wall_ms}
         result["timing_ms"]["full_chunk"] = policy_wall_ms
-        if on_actions_ready is None:        # 流式和非流式
+        if on_actions_ready is None:  # 流式和非流式
             result["timing_ms"]["ttfa"] = policy_wall_ms
             for timing in result["performance"]["action_timings"]:
                 timing["ready_ms"] = policy_wall_ms
@@ -198,6 +204,7 @@ class LiberoRemotePolicyService:
             with path.open("a") as stream:
                 stream.write(json.dumps(timeline, separators=(",", ":")) + "\n")
         return result
+
     # 推理核心逻辑
     def _predict_distributed(
         self,
@@ -221,16 +228,17 @@ class LiberoRemotePolicyService:
         normalized = []
         worker_metrics = []
         action_timings = []
-        with self._lock:        # 推理锁
+        with self._lock:  # 推理锁
             backend_start = time.perf_counter()
             queue_ms = (backend_start - t0) * 1000
-            for sample_index, (pixels, caption, frame_size, _) in enumerate(prepared):      # 逐个推理请求
+            for sample_index, (pixels, caption, frame_size, _) in enumerate(prepared):  # 逐个推理请求
                 channel = None
                 token = None
                 action_stream = None
                 if on_actions_ready is not None:
                     if not self.cfg.callback_base_url:
                         raise ValueError("Streaming requires a callback URL reachable from the vLLM worker")
+
                     # 处理提前就绪动作
                     def publish(event, index=sample_index):
                         nonlocal first_ready_ms, partial_events
@@ -275,9 +283,10 @@ class LiberoRemotePolicyService:
                                 "denoise_step": event["step"],
                             }
                         )
+
                     # 流式
                     channel = ActionStreamChannel(publish, self.transport.early_stop_actions or 16)
-                    token = self.streams.add(channel)       # 生成
+                    token = self.streams.add(channel)  # 生成
                     action_stream = {
                         "version": 1,
                         "callback_url": f"{self.cfg.callback_base_url.rstrip('/')}/internal/action_events/{token}",
@@ -287,9 +296,9 @@ class LiberoRemotePolicyService:
                     sample_metrics = {"sample_index": sample_index}
                     result = self.transport.predict_prepared(
                         pixels, prompt=caption, frame_size=frame_size, metrics=sample_metrics, **arguments
-                    )   # 推理
+                    )  # 推理
                     worker_metrics.append(sample_metrics)
-                    if channel is not None:     # 校验
+                    if channel is not None:  # 校验
                         channel.verify_final(result)
                     normalized.append(result)
                 finally:
