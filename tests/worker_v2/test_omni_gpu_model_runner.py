@@ -393,6 +393,39 @@ def test_add_requests_empty_admission_and_stop_id_sanitization():
     assert sampling_params.eos_token_id == 151645
 
 
+def test_add_requests_tracks_hidden_states_opt_in():
+    runner = _make_runner()
+    runner.model = SimpleNamespace()
+    runner.sampler = Sampler.__new__(Sampler)
+    runner.sampler.logits_processors = [object.__new__(c) for c in (LogitBiasState, PenaltiesState, BadWordsState)]
+
+    def new_request(req_id: str, opted_in: bool) -> SimpleNamespace:
+        return SimpleNamespace(req_id=req_id, sampling_params=None, return_hidden_states=opted_in)
+
+    with patch.object(GPUModelRunner, "add_requests", return_value=None) as parent:
+        # Request data without the field predates the opt-in and stays untracked.
+        untagged = SimpleNamespace(req_id="untagged", sampling_params=None)
+        output = SchedulerOutput.make_empty()
+        output.scheduled_new_reqs = [new_request("opted", True), new_request("plain", False), untagged]
+        runner.add_requests(output)
+        parent.assert_called_once_with(output)
+        assert runner._hidden_state_req_ids == {"opted"}
+
+        # Bookkeeping runs on the no-new-requests fast path too, which returns
+        # before the upstream call.
+        output = SchedulerOutput.make_empty()
+        output.finished_req_ids = {"opted"}
+        runner.add_requests(output)
+        parent.assert_called_once()
+        assert runner._hidden_state_req_ids == set()
+
+        output = SchedulerOutput.make_empty()
+        output.scheduled_new_reqs = [new_request("later", True)]
+        runner.add_requests(output)
+        parent.assert_called_with(output)
+        assert runner._hidden_state_req_ids == {"later"}
+
+
 @pytest.mark.parametrize("new_request", [False, True])
 @pytest.mark.parametrize("entry_point", [False, True])
 def test_custom_processor_reads_flushed_request_state(monkeypatch, new_request, entry_point):

@@ -1797,6 +1797,8 @@ def test_lora_manager_max_rank_validation(monkeypatch, rank):
     req1 = _dummy_lora_request(1)
     with pytest.raises(ValueError):
         manager.add_adapter(req1)
+    # A rejected adapter must not stay cached: a retry would skip loading and fail while binding.
+    assert req1.lora_int_id not in manager._registered_adapters
 
 
 def test_lora_manager_discovers_bagel_component(monkeypatch):
@@ -2586,3 +2588,135 @@ def test_compose_h3_packed_and_separate_projections(scales):
             torch.testing.assert_close(weights.lora_b @ weights.lora_a, delta)
     assert set(first.loras) == set(packed_weights)
     assert first.loras["transformer.blocks.0.attn.qkv_proj"] is packed_weights["transformer.blocks.0.attn.qkv_proj"]
+
+
+@pytest.mark.parametrize(("rank", "buffer_rank"), [(513, 768), (768, 768), (769, 1024), (1024, 1024)])
+def test_lora_manager_holds_ranks_above_the_vllm_literal(monkeypatch, rank, buffer_rank):
+    """A fused few-step adapter concatenates its sources; its rank only sizes the buffers."""
+    manager = DiffusionLoRAManager(pipeline=torch.nn.Module(), device=torch.device("cpu"), dtype=torch.bfloat16)
+
+    def _fake_load(_req: LoRARequest):
+        return type("LM", (), {"id": _req.lora_int_id})(), type("PH", (), {"r": rank})()
+
+    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    manager.add_adapter(_dummy_lora_request(1))
+    assert manager._max_lora_rank == buffer_rank
+    config = manager._buffer_lora_config()
+    assert (config.max_lora_rank, config.max_loras) == (buffer_rank, 1)
+    # Ranks vLLM names are passed through unchanged.
+    assert manager._lora_config(64, lora_dtype=torch.bfloat16).max_lora_rank == 64
+
+
+def test_failed_buffer_growth_restores_the_previous_rank():
+    """A growth that fails partway must not leave layers at two ranks or the manager at the new one."""
+
+    class _Layer:
+        def __init__(self, fail_above: int | None = None):
+            self.rank, self.fail_above = 64, fail_above
+
+        def create_lora_weights(self, max_loras, lora_config, model_config=None):
+            if self.fail_above is not None and lora_config.max_lora_rank > self.fail_above:
+                raise torch.OutOfMemoryError("buffer allocation failed")
+            self.rank = lora_config.max_lora_rank
+
+    manager = DiffusionLoRAManager(pipeline=torch.nn.Module(), device=torch.device("cpu"), dtype=torch.bfloat16)
+    manager._max_lora_rank = 64
+    first, second = _Layer(), _Layer(fail_above=64)
+    manager._lora_modules = {"transformer.a": first, "transformer.b": second}
+    manager._active_adapter_id = 7
+
+    with pytest.raises(torch.OutOfMemoryError):
+        manager._ensure_max_lora_rank(768)
+    assert manager._max_lora_rank == 64
+    assert (first.rank, second.rank) == (64, 64)
+    # The buffers were reset, so nothing is uploaded any more.
+    assert manager._active_adapter_id is None
+
+    second.fail_above = None
+    manager._ensure_max_lora_rank(768)
+    assert (manager._max_lora_rank, first.rank, second.rank) == (768, 768, 768)
+
+
+def _install_harness(monkeypatch, layer_names: tuple[str, ...], fail_layer: str | None, fail_above: int = 64):
+    """A real ``_replace_layers_with_lora`` over fake layers; wrapping ``fail_layer`` above a rank runs out of memory."""
+    import vllm_omni.lora.manager as manager_mod
+
+    class _Wrapper(DummyBaseLayerWithLoRA):
+        def __init__(self, base_layer, rank):
+            super().__init__(base_layer)
+            self.rank = rank
+
+        def create_lora_weights(self, max_loras, lora_config, model_config=None):
+            self.rank = lora_config.max_lora_rank
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    layers = {name: _FakeLinearBase() for name in layer_names}
+    for name, layer in layers.items():
+        setattr(pipeline.transformer, name, layer)
+    state = {"fail_layer": fail_layer}
+
+    def _from_layer(*, layer, lora_config, **_kwargs):
+        if not isinstance(layer, _FakeLinearBase):
+            return layer
+        failing = state["fail_layer"]
+        if failing is not None and layer is layers[failing] and lora_config.max_lora_rank > fail_above:
+            raise torch.OutOfMemoryError("buffer allocation failed")
+        return _Wrapper(layer, lora_config.max_lora_rank)
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+    monkeypatch.setattr(manager_mod, "from_layer", _from_layer)
+    manager = DiffusionLoRAManager(pipeline=pipeline, device=torch.device("cpu"), dtype=torch.bfloat16)
+    return manager, pipeline, layers, state
+
+
+def test_failed_first_installation_removes_its_wrappers_and_rank(monkeypatch):
+    """A fresh worker whose first adapter runs out of memory partway is left as it started."""
+    manager, pipeline, layers, state = _install_harness(monkeypatch, ("a", "b", "c"), fail_layer="b")
+    monkeypatch.setattr(
+        manager,
+        "_load_adapter",
+        lambda request: (
+            type("LM", (), {"id": request.lora_int_id})(),
+            type("PH", (), {"r": 768 if request.lora_int_id == 1 else 16})(),
+        ),
+    )
+
+    with pytest.raises(torch.OutOfMemoryError):
+        manager.add_adapter(_dummy_lora_request(1))
+    assert manager._max_lora_rank == 0
+    assert manager._lora_modules == {}
+    assert manager.list_adapters() == []
+    # "a" was wrapped before "b" failed; its base layer is back in the module tree.
+    assert {name: getattr(pipeline.transformer, name) for name in layers} == layers
+
+    # The next adapter sizes every layer for its own rank, not for the one that failed.
+    manager.add_adapter(_dummy_lora_request(2))
+    assert manager._max_lora_rank == 16
+    assert {name: layer.rank for name, layer in manager._lora_modules.items()} == {
+        "transformer.a": 16,
+        "transformer.b": 16,
+        "transformer.c": 16,
+    }
+
+
+def test_failed_installation_keeps_earlier_wrappers_at_their_rank(monkeypatch):
+    """Growing for an adapter that targets a new layer: a failed wrap undoes the growth and the new wrappers only."""
+    manager, pipeline, layers, state = _install_harness(monkeypatch, ("a", "b"), fail_layer=None)
+    manager._replace_layers_with_lora(type("PH", (), {"r": 64, "target_modules": ["a"]})())
+    wrapped_a = manager._lora_modules["transformer.a"]
+    assert (manager._max_lora_rank, wrapped_a.rank, list(manager._lora_modules)) == (64, 64, ["transformer.a"])
+    manager._active_adapter_id = 7
+    manager._adapter_scales[7] = 1.0
+    monkeypatch.setattr(manager, "_activate_adapter", lambda adapter_id, scale: None)
+
+    state["fail_layer"] = "b"
+    with pytest.raises(torch.OutOfMemoryError):
+        manager._replace_layers_with_lora(type("PH", (), {"r": 768, "target_modules": ["a", "b"]})())
+    assert manager._max_lora_rank == 64
+    assert manager._lora_modules == {"transformer.a": wrapped_a}
+    assert wrapped_a.rank == 64
+    assert pipeline.transformer.a is wrapped_a
+    assert pipeline.transformer.b is layers["b"]
+    # The buffers were rebuilt at the previous rank, so nothing is uploaded any more.
+    assert manager._active_adapter_id is None

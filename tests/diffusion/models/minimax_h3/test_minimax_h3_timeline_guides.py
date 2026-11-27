@@ -315,6 +315,33 @@ def test_fast_v2_still_rejects_timeline_guides():
         pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
 
 
+def _lora_guided_request(*, turbo: bool):
+    """A guided Ref2VA request with one active adapter: a Turbo artifact, or an ordinary LoRA."""
+    from vllm_omni.diffusion.models.minimax_h3.lora import parse_turbo_filename
+    from vllm_omni.lora.request import LoRARequest
+
+    pipeline = _guide_pipeline()
+    pipeline.partition = "ref2va"
+    media = _media(task="ref2va", timeline_guides=_prepare([{"frame_index": 7, "image": _two_tone(96, 64)}]))
+    sampling = _sampling()
+    sampling.lora_request = LoRARequest("adapter", 1, "/models/adapter")
+    sampling.lora_scale = 1.0
+    if turbo:
+        spec = parse_turbo_filename("minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors")
+        pipeline._turbo_lora_specs = {1: spec}
+        sampling.num_inference_steps = spec.denoise_steps
+        sampling.extra_args = {**(sampling.extra_args or {}), "flow_shift": spec.video_shift}
+    return pipeline, _conditioning(media), sampling
+
+
+@pytest.mark.parametrize("turbo", [True, False])
+def test_adapters_keep_timeline_guides(turbo):
+    """Guides are clean rows ahead of the references; an adapter changes how the target is sampled, not them."""
+    pipeline, conditioning, sampling = _lora_guided_request(turbo=turbo)
+    context = pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
+    assert [block["kind"] for block in context["guide_blocks"]] == ["image"]
+
+
 def test_guides_are_rejected_across_a_separate_encoder_stage():
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
     from vllm_omni.model_executor.stage_input_processors.minimax_h3 import prepare_encoder_prompt

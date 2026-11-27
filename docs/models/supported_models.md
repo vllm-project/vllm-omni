@@ -152,6 +152,8 @@ th {
 | `RealtimeVenusOmni` (MiniCPM-o 4.5 pipeline) | Realtime-Venus Omni | `inclusionAI/Realtime-Venus` (Omni subdirectory) | ✅︎ | | | | [Recipe](gh-file:recipes/inclusionAI/Realtime-Venus.md) |
 | `PersonaPlexTalkerForConditionalGeneration` | PersonaPlex (full duplex, 24 kHz speech in/out over `/v1/realtime?duplex=1`) | `nvidia/personaplex-7b-v1` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/PersonaPlex.md) |
 | `HaruForConditionalGeneration` | Haru-4B (full duplex, 24 kHz speech in/out over `/v1/realtime?duplex=1`) | `higurashi-ai/Haru-4B` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/higurashi-ai/Haru-4B-H200.md) |
+| `AuraQwen3VLForConditionalGeneration` | AURA (speech + video in, speech out over `/v1/realtime?duplex=1`) | `aurateam/AURA` | ✅︎ | | | | — |
+| `AuraQwen3_5ForConditionalGeneration` | AURA_v2 (proactive speech + video assistant over `/v1/realtime?duplex=1`) | `aurateam/AURA_2` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/AURA/AURA_v2-H200.md) |
 | `ErnieImagePipeline` | ERNIE-Image | `baidu/ERNIE-Image`, `baidu/ERNIE-Image-Turbo` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `GepardTalkerForConditionalGeneration` | Gepard-1.0 | `nineninesix/gepard-1.0` | ✅︎ | | | ✅︎ | — |
 | `HiDreamO1ImagePipeline` | HiDream-O1-Image | `HiDream-ai/HiDream-O1-Image` | ✅︎ | | | | — |
