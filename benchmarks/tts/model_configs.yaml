@@ -62,6 +62,18 @@ models:
     task_extra_body:
       voice_clone: {}
 
+  # Bench at 44.1 kHz: export VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=44100.
+  inclusionAI/Ming-omni-tts-0.5B: &ming_tts_dense
+    supported_tasks: [default_voice, voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: false
+    task_extra_body:
+      default_voice: {}
+      voice_clone: {}
+
+  inclusionAI/Ming-3.0-tts-0.5b: *ming_tts_dense
+
   IndexTeam/IndexTTS-2.5:
     supported_tasks: [voice_clone]
     backend: openai-audio-speech
@@ -116,6 +128,16 @@ models:
     task_extra_body:
       voice_clone:
         task_type: Base
+
+  mistralai/Voxtral-4B-TTS-2603:
+    supported_tasks: [default_voice]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      default_voice:
+        voice: casual_female
+        language: English
 
   bosonai/higgs-audio-v3-tts-4b:
     supported_tasks: [default_voice, voice_clone]

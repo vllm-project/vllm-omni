@@ -67,7 +67,9 @@ def test_thinker_vision_attention_defaults_and_overrides(
         dtype=dtype,
         _attn_implementation=engine_attention,
     )
-    model = MiniCPMO45OmniLLMForConditionalGeneration(vllm_config=SimpleNamespace(model_config=model_config))
+    model = MiniCPMO45OmniLLMForConditionalGeneration(
+        vllm_config=SimpleNamespace(model_config=model_config, additional_config={})
+    )
     if expected is None:
         expected = SiglipAttention if default_attention == "eager" else SiglipSdpaAttention
     assert type(model.vpm.encoder.layers[0].self_attn) is expected

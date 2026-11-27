@@ -106,6 +106,11 @@ class OmniSchedulingCoordinator:
         """Whether this coordinator receives streamed input from upstream."""
         return self._stage_id > 0 and self._async_chunk
 
+    @property
+    def receives_full_payload(self) -> bool:
+        """Whether this coordinator waits for one complete upstream payload."""
+        return self._stage_id > 0 and not self._async_chunk
+
     # ------------------------------------------------------------------ #
     #  Core scheduling methods
     # ------------------------------------------------------------------ #

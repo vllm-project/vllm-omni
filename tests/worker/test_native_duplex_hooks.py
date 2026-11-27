@@ -580,6 +580,7 @@ def _transformers_processor_stub(auto_processor):
 def test_minicpmo_stage0_loads_processor_from_hf_id(monkeypatch):
     import sys
 
+    from vllm_omni.model_executor.models.minicpmo_4_5 import processor as processor_module
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
     )
@@ -611,6 +612,9 @@ def test_minicpmo_stage0_loads_processor_from_hf_id(monkeypatch):
         ),
     )
 
+    # Import the owner before stubbing transformers so teardown restores the
+    # real class even when this test is the module's first importer.
+    monkeypatch.setattr(processor_module, "AutoImageProcessor", _AutoImageProcessor)
     loaded = MiniCPMO45Stage0DuplexRuntime._load_processor_from_path(model_id)
 
     assert loaded is processor
@@ -793,8 +797,8 @@ def test_minicpmo_stage0_history_collection_starts_with_session_config(mode):
 @pytest.mark.parametrize("mode", ["basic", "context"])
 @pytest.mark.parametrize("buffered", [False, True])
 def test_minicpmo_stage0_multi_chunk_append_matches_scheduler_window(mode, buffered):
-    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import prepare_stage0_window
 
     runtime = _stage0_vision_runtime()
     state = _MiniCPMO45Stage0SessionState(session_id="multi-chunk-window", window_enabled=True)
@@ -826,9 +830,7 @@ def test_minicpmo_stage0_multi_chunk_append_matches_scheduler_window(mode, buffe
             }
         }
         update = SimpleNamespace(prompt_token_ids=[3, 2, 1, 11], model_intermediate_buffer=info)
-        planned = OmniARScheduler._prepare_minicpmo45_stage0_window(
-            session, update, segment_output_ids=[44], completed_terminator=3
-        )
+        planned = prepare_stage0_window(session, update, segment_output_ids=[44], completed_terminator=3)
         result = runtime._stage_prefill_embeddings_only(
             state, np.zeros(4, dtype=np.float32), seq=seq, stage0_window=info["duplex"]["stage0_window"]
         )
