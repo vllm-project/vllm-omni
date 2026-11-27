@@ -473,7 +473,9 @@ def test_turn_chunk_next_block_resumes_with_the_confirmed_penalty_window() -> No
     talker._request_audio_states["req-chunk"] = {"finished": True, "step": 40}
     talker._request_codec_device_states = {"req-chunk": object()}
     talker._request_codec_device_inputs = {"req-chunk": object()}
-    talker._request_host_codec_states = {"req-chunk": {"finished": True, "condition_seq": 0}}
+    talker._request_host_codec_states = {
+        "req-chunk": {"finished": True, "condition_seq": 0, "step": 40, "history": [5, 6], "bins": {5: 1, 6: 1}}
+    }
     token_ids = torch.tensor([2, 3])
     hidden_states = torch.ones(2, 2)
     # The scheduler kept the previous prompt and confirmed codes (40 tokens)
@@ -500,7 +502,15 @@ def test_turn_chunk_next_block_resumes_with_the_confirmed_penalty_window() -> No
     assert state["host_condition_seq"] == 1
     assert "req-chunk" not in talker._request_codec_device_states
     assert "req-chunk" not in talker._request_codec_device_inputs
-    assert talker._request_host_codec_states["req-chunk"] == {"finished": False, "condition_seq": 1}
+    # A block inside the same reply is not a new turn: the host sampler keeps
+    # its penalty history and only restarts the segment.
+    assert talker._request_host_codec_states["req-chunk"] == {
+        "finished": False,
+        "condition_seq": 1,
+        "step": 0,
+        "history": [5, 6],
+        "bins": {5: 1, 6: 1},
+    }
 
 
 def _finished_block(prompt_len: int, codes: list[int]):
