@@ -589,6 +589,8 @@ AR_MERGED_LORA_REGISTRY: dict[str, MergedLoRARegistryEntry] = {
     "CovoAudioForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "CovoAudioLLMModel": _not_capable(_PENDING_AR_MAPPING),
     "CovoAudioModel": _not_capable(_PENDING_AR_MAPPING),
+    "CsmCode2Wav": _not_capable(_NON_LLM_STAGE),
+    "CsmTalkerForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "FishOmniForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "FishSpeechDACDecoder": _not_capable(_NON_LLM_STAGE),
     "FishSpeechSlowARForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
