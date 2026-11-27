@@ -73,6 +73,18 @@ def test_every_realtime_command_type_has_a_mapping_case():
     assert set(_MINIMAL_PAYLOADS) == set(REALTIME_COMMAND_TYPES)
 
 
+def test_text_append_preserves_listen_control():
+    command = command_from_realtime({"type": "input.text.append", "text": "你好", "force_listen": True})
+    assert isinstance(command, AppendText)
+    assert command.payload() == {"type": "input.text.append", "text": "你好", "force_listen": True}
+
+
+@pytest.mark.parametrize("patch", [{"text": ""}, {"force_listen": "false"}, {"force_listen": 1}])
+def test_text_append_rejects_invalid_fragments(patch):
+    with pytest.raises(DuplexCommandError, match="non-empty text|boolean"):
+        command_from_realtime({"type": "input.text.append", "text": "hello", **patch})
+
+
 @pytest.mark.parametrize("event_type", sorted(REALTIME_COMMAND_TYPES))
 def test_command_from_realtime_maps_each_type_to_its_dataclass_and_propagates_event_id(event_type: str):
     body, expected_cls = _MINIMAL_PAYLOADS[event_type]

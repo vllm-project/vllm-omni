@@ -815,6 +815,17 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                 max_sequence_length=max_sequence_length,
             )
 
+        if num_images_per_prompt > 1:
+            prompt_embeds = prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+            if pooled_prompt_embeds is not None:
+                pooled_prompt_embeds = pooled_prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+            if do_cfg:
+                negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+                if negative_pooled_prompt_embeds is not None:
+                    negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.repeat_interleave(
+                        num_images_per_prompt, dim=0
+                    )
+
         num_channels_latents = self.transformer.in_channels
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,

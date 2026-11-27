@@ -32,9 +32,9 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.platforms import current_omni_platform
 
-_L4_TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=2)
+_TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=2)
 _L4_THREE_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=3)
-_L4_FOUR_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=4)
+_FOUR_GPU = hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=4)
 
 DeviceKind = Literal["cpu", "cuda"]
 _UNIT_MARKS = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -611,7 +611,7 @@ def test_isend_irecv_tensor_dict(pp_size: int):
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@pytest.mark.parametrize("pp_size", [pytest.param(2, marks=_L4_TWO_GPU)])
+@pytest.mark.parametrize("pp_size", [pytest.param(2, marks=_TWO_GPU)])
 def test_isend_irecv_tensor_dict_parity(pp_size: int):
     """Nightly: isend/irecv on real multi-GPU NCCL."""
     _run_isend_irecv(pp_size, device_kind="cuda", init_method=get_file_store_init_method())
@@ -781,7 +781,7 @@ _GPU_PREDICT_NOISE_CASES = [
         100,
         1e-5,
         1e-5,
-        marks=_L4_TWO_GPU,
+        marks=_TWO_GPU,
         id="pp2-no_cfg-float32",
     ),
     pytest.param(
@@ -793,7 +793,7 @@ _GPU_PREDICT_NOISE_CASES = [
         100,
         1e-2,
         1e-2,
-        marks=_L4_TWO_GPU,
+        marks=_TWO_GPU,
         id="pp2-no_cfg-bfloat16",
     ),
     pytest.param(
@@ -805,7 +805,7 @@ _GPU_PREDICT_NOISE_CASES = [
         100,
         1e-2,
         1e-2,
-        marks=_L4_TWO_GPU,
+        marks=_TWO_GPU,
         id="pp2-seq_cfg-bfloat16",
     ),
     pytest.param(
@@ -817,7 +817,7 @@ _GPU_PREDICT_NOISE_CASES = [
         100,
         1e-2,
         1e-2,
-        marks=_L4_FOUR_GPU,
+        marks=_FOUR_GPU,
         id="pp2-cfg2-bfloat16",
     ),
     pytest.param(
@@ -1036,8 +1036,8 @@ def test_scheduler_step(pp_size, cfg_size, do_true_cfg, input_seed):
 @pytest.mark.parametrize(
     "pp_size, cfg_size, do_true_cfg, input_seed",
     [
-        pytest.param(2, 1, False, 300, marks=_L4_TWO_GPU, id="pp2-no_cfg"),
-        pytest.param(2, 2, True, 600, marks=_L4_FOUR_GPU, id="pp2-cfg2-true_cfg"),
+        pytest.param(2, 1, False, 300, marks=_TWO_GPU, id="pp2-no_cfg"),
+        pytest.param(2, 2, True, 600, marks=_FOUR_GPU, id="pp2-cfg2-true_cfg"),
     ],
 )
 def test_scheduler_step_parity(pp_size, cfg_size, do_true_cfg, input_seed):

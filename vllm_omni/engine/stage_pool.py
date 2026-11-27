@@ -8,12 +8,13 @@ from __future__ import annotations
 import asyncio
 import time as _time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from vllm.logger import init_logger
+from vllm.outputs import PoolingRequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.output_processor import RequestState
@@ -38,6 +39,7 @@ from vllm_omni.engine import (
     OmniEngineCoreOutputs,
     PayloadSenderInfo,
 )
+from vllm_omni.engine.messages import TextInputUpdate
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     DiffusionSubmitKwargs,
@@ -270,24 +272,18 @@ class StagePool:
     def __init__(
         self,
         stage_id: int,
-        clients: StagePoolClient | list[StagePoolClient],
+        clients: StagePoolClient | Sequence[StagePoolClient | None],
         *,
         output_processor: Any = None,
         stage_vllm_config: Any = None,
         watermarkers: Mapping[str, Watermarker] | None = None,
         strict_watermarking: bool = False,
     ) -> None:
-        if isinstance(clients, list):
-            normalized_clients: list[StagePoolClient] = list(clients)
-        else:
-            normalized_clients = [clients]
-
-        # Allow empty pools when running in distributed head mode for a
-        # non-self stage; clients will arrive via add_client(...).
         self.stage_id = stage_id
-        # Slots can become None after a dynamic remove_client (distributed mode);
-        # iterate via live_replica_ids() to skip holes.
-        self.clients: list[StagePoolClient | None] = list(normalized_clients)
+        # A slot is empty after a startup failure or dynamic removal. Keep its
+        # index reserved so routing and metrics use the original replica IDs.
+        # Distributed heads can also start with no slots and add clients later.
+        self.clients: list[StagePoolClient | None] = list(clients) if isinstance(clients, Sequence) else [clients]
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
         self.collect_stage_metrics = True
@@ -302,6 +298,15 @@ class StagePool:
         self._strict_watermarking = strict_watermarking
         self._watermark_lock = asyncio.Lock()
         self._next_replica_id = 0
+        options = getattr(stage_vllm_config, "additional_config", None)
+        if not isinstance(options, Mapping):
+            options = {}
+        self._balance_talker_replicas = stage_id == 1 and options.get("minicpmo_talker_replica_route") == "half"
+        self._route_code2wav_by_load = (
+            stage_id == 2 and options.get("minicpmo_vocoder_replica_route") == "adaptive_secondary"
+        )
+        self._talker_route_cursor = 0
+        self._code2wav_route_cursor = 0
         self._request_bindings: dict[str, int] = {}
         # Session -> replica. Round-robin would scatter a session's follow-up
         # requests across replicas that do not hold its state. This pool is the
@@ -581,8 +586,12 @@ class StagePool:
         while True:
             candidates = self._collect_serviceable_replicas()
             if candidates:
-                # LB chose an index *into our candidates list*.
-                lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
+                preferred = self._select_talker_replica([rid for _, rid in candidates])
+                lb_idx = (
+                    self._lb.select(task, [rep for rep, _ in candidates])
+                    if preferred is None
+                    else next(i for i, (_, rid) in enumerate(candidates) if rid == preferred)
+                )
                 replica_info, replica_id = candidates[lb_idx]
                 self._affinity[request_id] = replica_info.input_addr
                 if session_id is not None:
@@ -659,7 +668,12 @@ class StagePool:
         if not candidates:
             return None
 
-        lb_idx = self._lb.select(selection_task, [rep for rep, _ in candidates])
+        preferred = self._select_talker_replica([rid for _, rid in candidates])
+        lb_idx = (
+            self._lb.select(selection_task, [rep for rep, _ in candidates])
+            if preferred is None
+            else next(i for i, (_, rid) in enumerate(candidates) if rid == preferred)
+        )
         replica_info, replica_id = candidates[lb_idx]
         self._affinity[request_id] = replica_info.input_addr
         if session_id is not None:
@@ -1067,6 +1081,45 @@ class StagePool:
     def session_binding_count(self) -> int:
         return len(self._session_bindings)
 
+    def _select_talker_replica(self, live: list[int]) -> int | None:
+        if not self._balance_talker_replicas or set(live) != {0, 1}:
+            return None
+        replica_id = self._talker_route_cursor
+        self._talker_route_cursor = 1 - replica_id
+        return replica_id
+
+    def select_code2wav_replica(self, request_id: str) -> int | None:
+        """Select a Code2Wav replica before prewarming an unpinned HTTP turn."""
+        if not self._route_code2wav_by_load or set(self.available_replica_ids()) != {0, 1}:
+            return None
+        existing = self.get_bound_replica_id(request_id)
+        if existing is not None:
+            return existing
+        if request_id in self._requested_replica_ids:
+            return None
+        self._code2wav_route_cursor = (self._code2wav_route_cursor + 1) % 4
+        return int(self._prefer_secondary_code2wav())
+
+    def _prefer_secondary_code2wav(self) -> bool:
+        """Compare live and reserved turns against each replica's capacity."""
+        bindings = {
+            **self._requested_replica_ids,
+            **{req: self._addr_to_replica_id.get(addr) for req, addr in self._affinity.items()},
+            **self._request_bindings,
+        }
+        primary = sum(replica == 0 for replica in bindings.values())
+        secondary = sum(replica == 1 for replica in bindings.values())
+        # The secondary shares its device with Thinker and Talker. Include
+        # prewarm reservations and keep headroom for their shared allocations.
+        if secondary >= 16:
+            return False
+        if primary + secondary >= 8:
+            primary_wait = (primary + 1) / 2.5
+            secondary_wait = secondary + 1
+            if abs(primary_wait - secondary_wait) >= 1:
+                return secondary_wait < primary_wait
+        return self._code2wav_route_cursor == 0
+
     def select_replica_id(
         self,
         request_id: str,
@@ -1098,13 +1151,15 @@ class StagePool:
             live = [r for r in self.live_replica_ids() if self.is_replica_available(r)]
             if not live:
                 raise StageUnavailableError(f"stage {self.stage_id} has no live replicas")
-            if len(live) == 1:
-                chosen = live[0]
-            else:
-                # Round-robin over live, available replicas only.
-                start = self._next_replica_id % len(live)
-                chosen = live[start]
-                self._next_replica_id = (self._next_replica_id + 1) % len(live)
+            chosen = self._select_talker_replica(live)
+            if chosen is None:
+                if len(live) == 1:
+                    chosen = live[0]
+                else:
+                    # Round-robin over live, available replicas only.
+                    start = self._next_replica_id % len(live)
+                    chosen = live[start]
+                    self._next_replica_id = (self._next_replica_id + 1) % len(live)
 
         self._request_bindings[request_id] = chosen
         if session_id is not None:
@@ -1426,6 +1481,8 @@ class StagePool:
         return self._has_non_empty_output(request_output)
 
     def _has_non_empty_output(self, request_output: Any) -> bool:
+        if isinstance(request_output, PoolingRequestOutput):
+            return self._is_non_empty_value(request_output.outputs.data)
         final_output_type = getattr(request_output, "final_output_type", None)
         if final_output_type is None:
             final_output_type = getattr(self.stage_client, "final_output_type", None)
@@ -1776,6 +1833,15 @@ class StagePool:
                         )
                 raise
         return replica_id
+
+    async def append_text(self, update: TextInputUpdate) -> None:
+        """Route only to the replica already owning this active request."""
+        replica_id = self.get_bound_replica_id(update.request_id)
+        if self.stage_type == "diffusion":
+            raise ValueError("Text input append requires an AR stage")
+        if replica_id is None or self.clients[replica_id] is None:
+            raise StageUnavailableError(f"No active replica binding for input append: {update.request_id}")
+        await self._llm_client(replica_id).append_text_async(update)
 
     async def submit_interaction(
         self,

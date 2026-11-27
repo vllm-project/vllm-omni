@@ -5,7 +5,7 @@
 import pytest
 
 
-@pytest.fixture(scope="class")
+@pytest.fixture(scope="module")
 def cached_smart_turn_artifact() -> str:
     """Prepare the pinned Smart Turn artifact before the serving subprocess starts."""
     from tests.entrypoints.openai_api.helpers import SEMANTIC_VAD_MODEL_PATH
@@ -23,7 +23,7 @@ def cached_smart_turn_artifact() -> str:
     return hf_hub_download(repo_id=SMART_TURN_REPO_ID, filename=SMART_TURN_FILENAME, revision=SMART_TURN_REVISION)
 
 
-@pytest.fixture(scope="class")
+@pytest.fixture(scope="module")
 def cached_silero_vad_artifact() -> str:
     """Prepare the pinned artifact before the serving subprocess starts."""
     from tests.entrypoints.openai_api.helpers import SERVER_VAD_MODEL_PATH

@@ -682,7 +682,7 @@ class DiffusionWorker:
                 )
             init_workspace_manager(self.device)
             if (
-                parallel_config.ulysses_a2a_permute
+                parallel_config.ulysses_a2a_backend == "copy_engine"
                 and parallel_config.ulysses_degree > 1
                 and parallel_config.ulysses_mode == "strict"
             ):
@@ -1167,19 +1167,42 @@ class DiffusionWorker:
         typed_init_info = engine.parse_init_info(init_info)
         engine.init_transfer_engine(typed_init_info)
 
-    def start_weight_update(self) -> None:
+    def start_weight_update(self, update_id: str | None = None) -> None:
         """Start a new weight update session for diffusion model."""
         engine = self._get_weight_transfer_engine()
         if self._weight_update_active:
             raise RuntimeError(
                 "start_weight_update called while a weight update is already active. Call finish_weight_update first."
             )
+        if update_id is not None and (not isinstance(update_id, str) or not update_id.strip()):
+            raise ValueError("update_id must be a non-empty string")
         try:
-            engine.start_weight_update()
+            if update_id is not None:
+                from vllm_omni.lora.weight_transfer import _accepts_update_id
+
+                if _accepts_update_id(engine.start_weight_update):
+                    engine.start_weight_update(update_id=update_id)
+                else:
+                    engine.start_weight_update()
+            else:
+                engine.start_weight_update()
         except BaseException:
-            engine.reset_weight_update_target()
+            try:
+                engine.reset_weight_update_target()
+            except Exception:
+                logger.warning(
+                    "Failed to reset weight update target while cleaning up a failed start_weight_update.",
+                    exc_info=True,
+                )
             raise
         self._weight_update_active = True
+        self._weight_update_id: str | None = update_id
+
+    def start_weight_update_with_id(self, update_id: str) -> None:
+        """Start a weight update session tagged with a caller-supplied ``update_id``."""
+        if not isinstance(update_id, str) or not update_id.strip():
+            raise ValueError("update_id must be a non-empty string")
+        self.start_weight_update(update_id=update_id)
 
     def update_weights(self, update_info: dict) -> None:
         """Receive one weight update chunk from the trainer.
@@ -1192,9 +1215,22 @@ class DiffusionWorker:
             raise RuntimeError("start_weight_update must be called before update_weights.")
         try:
             engine.update_weights(update_info)
-        except BaseException:
+        except BaseException as exc:
+            from vllm_omni.lora.weight_transfer import MergedLoRAUpdateIDMismatchError
+
+            if isinstance(exc, MergedLoRAUpdateIDMismatchError):
+                if hasattr(engine, "_skip_next_end_weight_update"):
+                    engine._skip_next_end_weight_update = False
+                raise
             self._weight_update_active = False
-            engine.reset_weight_update_target()
+            self._weight_update_id = None
+            try:
+                engine.reset_weight_update_target()
+            except Exception:
+                logger.warning(
+                    "Failed to reset weight update target while cleaning up a failed update_weights.",
+                    exc_info=True,
+                )
             raise
 
     def finish_weight_update(self) -> None:
@@ -1205,8 +1241,41 @@ class DiffusionWorker:
         try:
             engine.finish_weight_update()
         finally:
-            engine.reset_weight_update_target()
             self._weight_update_active = False
+            self._weight_update_id = None
+            try:
+                engine.reset_weight_update_target()
+            except Exception:
+                # Never turn an already-committed finish_weight_update into a
+                # false failure, and never mask a pre-existing finish exception.
+                logger.warning(
+                    "Failed to reset weight update target while finishing a weight update session.",
+                    exc_info=True,
+                )
+
+    def abort_weight_update(self, update_id: str | None = None) -> bool:
+        """Abort an active weight update session without committing staged tensors."""
+        engine = self._get_weight_transfer_engine()
+        if update_id is not None and (not isinstance(update_id, str) or not update_id.strip()):
+            raise ValueError("update_id must be a non-empty string")
+        if not self._weight_update_active:
+            return False
+        if update_id is not None and getattr(self, "_weight_update_id", None) != update_id:
+            return False
+        self._weight_update_active = False
+        self._weight_update_id = None
+        abort_fn = getattr(engine, "abort_weight_update", None)
+        try:
+            if callable(abort_fn):
+                abort_fn()
+            else:
+                engine.reset_weight_update_target()
+        except Exception:
+            logger.warning(
+                "Failed to clean up diffusion weight transfer engine during abort_weight_update.",
+                exc_info=True,
+            )
+        return True
 
     def execute_model(
         self,
@@ -1364,7 +1433,7 @@ class DiffusionWorker:
     def export_step_requests(
         self, request_ids: list[str], *, policy_ref: str, max_bytes: int
     ) -> list[dict[str, bytes]]:
-        """Collect every rank's quiesced state without releasing the live copy.
+        """Collect every rank's quiesced state on rank zero without releasing it.
 
         ``max_bytes`` bounds each rank's bundle. The caller owns the returned
         CPU snapshots before issuing a separate release. The worker binds the
@@ -1374,16 +1443,24 @@ class DiffusionWorker:
         runner = self.model_runner
         assert runner is not None, "Model runner not initialized"
 
-        def export_rank():
+        local_snapshot: dict[str, bytes] = {}
+
+        def export_rank() -> None:
             payloads = runner.export_step_requests(
                 request_ids,
                 policy_ref=policy_ref,
                 max_bytes=max_bytes - RUNTIME_LORA_FINGERPRINT_SIZE * len(request_ids),
             )
             fingerprints = self._step_adapter_fingerprints(request_ids, exporting=True)
-            return {key: fingerprints[key] + payload for key, payload in payloads.items()}
+            local_snapshot.update((key, fingerprints[key] + payload) for key, payload in payloads.items())
 
-        return _run_and_gather_rank_values("Step-state export", export_rank)
+        _run_and_gather_rank_values("Step-state export", export_rank)
+        if not dist.is_available() or not dist.is_initialized():
+            return [local_snapshot]
+
+        snapshots = [{} for _ in range(dist.get_world_size())] if self.rank == 0 else None
+        dist.gather_object(local_snapshot, snapshots, dst=0, group=get_world_group().cpu_group)
+        return snapshots or []
 
     def restore_step_requests(
         self,
@@ -2080,7 +2157,13 @@ class WorkerProc:
         Uses a side stream so the D2H transfer does not block the default
         stream where the next forward runs.
         """
-        device = torch.device(torch.accelerator.current_accelerator().type, self.gpu_id)
+        # init_device() already selected the worker's device. gpu_id is the
+        # worker rank, which need not be the device index on every platform.
+        # Platforms whose get_torch_device() omits the index (e.g. TPU) use
+        # the index that set_device() selected.
+        device = self.worker.device
+        if device.index is None and device.type != "cpu":
+            device = torch.device(device.type, torch.accelerator.current_device_index())
         d2h_stream = torch.Stream(device=device)
         transport_options = {}
         if self.od_config.video_output_transport.enable_registered_shm is True:

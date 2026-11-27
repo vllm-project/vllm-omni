@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.common.nucleus_ras_sampling import ras_sample_one
+from vllm_omni.model_executor.models.common.nucleus_ras_sampling import nucleus_sample_one, ras_sample_one
 from vllm_omni.model_executor.models.glm_tts import glm_tts as glm_tts_module
 from vllm_omni.model_executor.models.glm_tts.glm_tts import (
     GLMTTSForConditionalGeneration,
@@ -34,6 +34,17 @@ def test_glm_tts_ras_fallback_matches_official_random_resample() -> None:
     )
 
     assert sampled == 0
+
+
+def test_glm_tts_nucleus_normalizes_before_top_k(mocker) -> None:
+    sample = mocker.patch(
+        "vllm_omni.model_executor.models.common.nucleus_ras_sampling.multinomial_sample",
+        return_value=torch.tensor(0),
+    )
+    scores = torch.log(torch.tensor([0.4, 0.3, 0.2, 0.1]))
+
+    assert nucleus_sample_one(scores, top_p=0.8, top_k=2) == 0
+    assert sample.call_args.args[0].tolist() == pytest.approx([0.4, 0.3])
 
 
 def test_glm_tts_mrv2_allowed_vocabulary_is_audio_plus_eoa() -> None:
@@ -110,7 +121,7 @@ def test_glm_tts_mrv2_cutoffs_are_batch_composition_independent(mocker) -> None:
     assert co_batched[1].tolist() == pytest.approx([0.8, 0.9])
 
 
-def test_glm_tts_mrv2_ras_uses_generated_history_and_v1_nucleus_order(mocker) -> None:
+def test_glm_tts_mrv2_ras_uses_generated_history_and_official_nucleus_order(mocker) -> None:
     sampler = mocker.Mock()
     sampler.return_sampling_mask = False
     sampler.penalties_state.frequency_penalty.np = np.zeros(1, dtype=np.float32)
@@ -159,7 +170,7 @@ def test_glm_tts_mrv2_ras_uses_generated_history_and_v1_nucleus_order(mocker) ->
     assert sampled.tolist() == [10]
     fallback_sample.assert_not_called()
     nucleus = gumbel_sample.call_args_list[0].args[0]
-    assert torch.isfinite(nucleus).sum().item() == 1
+    assert torch.isfinite(nucleus).sum().item() == 2
 
 
 def test_glm_tts_registers_mrv2_ras_sampler(mocker) -> None:
