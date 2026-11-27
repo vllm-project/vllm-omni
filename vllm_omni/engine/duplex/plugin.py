@@ -666,6 +666,19 @@ class DuplexModelPlugin(ABC):
             "sample_rate_hz": int(self.silence_continuation_sample_rate_hz),
         }
 
+    def fast_path_active(self, request_id: str, output_metadata: Mapping[str, object]) -> bool:
+        """Whether this decoded Stage-0 frame opens a back-to-back stretch.
+
+        While it holds, the session appends the model's own silence frame as
+        soon as each frame is handled instead of waiting for the client's next
+        unit, so a model that emits several tokens per spoken frame (a tool call
+        the user never hears) is not paced by the client's 80 ms clock. The
+        plugin owns the step budget; the runner does not count these appends
+        against the response continuation limit. Default is off.
+        """
+        del request_id, output_metadata
+        return False
+
     def startup_warmup_turn(self) -> dict[str, object] | None:
         """One spoken warmup append, or None to keep the shared probe.
 
