@@ -1244,6 +1244,34 @@ def test_diffusion_ingress_defers_defaults(monkeypatch):
     ) == {"dtype": None, "cache_backend": None}
 
 
+def test_diffusion_ingress_validator_reads_both_public_getters(monkeypatch):
+    normalize = omni_config_module.normalize_and_validate_diffusion_engine_ingress_kwargs
+    real_allowed = omni_config_module.diffusion_ingress_allowed_fields()
+    real_stage_consumed = omni_config_module.diffusion_ingress_stage_consumed_fields()
+    assert real_stage_consumed <= real_allowed
+
+    kwargs = {"enable_sleep_mode": True, "omni_master_port": 30000}
+    assert normalize(kwargs, stage_id=0) == {"enable_sleep_mode": True}
+
+    # Validation follows the public allowlist: drop a field from it and the
+    # same input is rejected.
+    monkeypatch.setattr(
+        omni_config_module, "diffusion_ingress_allowed_fields", lambda: real_allowed - {"enable_sleep_mode"}
+    )
+    with pytest.raises(ValueError, match="enable_sleep_mode"):
+        normalize(kwargs, stage_id=0)
+
+    # The return filter follows the public stage-consumed set: a field that is
+    # still allowed but no longer stage-consumed is accepted and not returned.
+    monkeypatch.setattr(omni_config_module, "diffusion_ingress_allowed_fields", lambda: real_allowed)
+    monkeypatch.setattr(
+        omni_config_module,
+        "diffusion_ingress_stage_consumed_fields",
+        lambda: real_stage_consumed - {"enable_sleep_mode"},
+    )
+    assert normalize(kwargs, stage_id=0) == {}
+
+
 @pytest.mark.parametrize(
     ("model_type", "diffusion_stage_ids"),
     [

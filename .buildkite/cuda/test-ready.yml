@@ -217,7 +217,7 @@ steps:
         source_file_dependencies: rlhf_verl_omni
         timeout_in_minutes: 20
         commands:
-          - pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py
+          - pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py tests/e2e/features/rlhf_test/test_verl_omni_ar_e2e.py
         mirror_hardwares: l4_1
 
       - label: "Omni · Qwen3-Omni Test"
