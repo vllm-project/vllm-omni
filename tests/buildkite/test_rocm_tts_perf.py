@@ -24,7 +24,8 @@ RUNNER = Path(".buildkite/amd/scripts/run_rocm_tts_perf.py").resolve()
         ([], "{}", 124, 124),
     ],
 )
-def test_tts_perf_result_evidence(tmp_path, filenames, content, guard_status, expected):
+@pytest.mark.parametrize(("baseline", "flag"), [(None, "--require-baseline"), ("collect", "--assert-baseline")])
+def test_tts_perf_result_evidence(tmp_path, filenames, content, guard_status, expected, baseline, flag):
     artifact_dir = tmp_path / "artifacts" / "tts-test"
     old = artifact_dir / "benchmark-results" / "old"
     old.mkdir(parents=True)
@@ -36,7 +37,7 @@ def test_tts_perf_result_evidence(tmp_path, filenames, content, guard_status, ex
         '[[ "$1 $2 $3 $4" == "2 2 165m tts-test" ]]\n'
         '[[ "$5" == "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[case-a]" ]]\n'
         '[[ "$6" == "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[case-b]" ]]\n'
-        '[[ "$7 $8 $9" == "--test-config-file tests/dfx/perf/tests/test_tts.json --require-baseline" ]]\n'
+        '[[ "$7 $8 $9" == "--test-config-file tests/dfx/perf/tests/test_tts.json $BASELINE_FLAG" ]]\n'
         '[[ "${10} ${11}" == "-m full_model and tts and rocm and MI325 and cards_2" ]]\n'
         'for filename in $RESULT_FILES; do printf "%s" "$CONTENT" > "$BENCHMARK_DIR/$filename.json"; done\n'
         'exit "$GUARD_STATUS"\n',
@@ -59,6 +60,7 @@ def test_tts_perf_result_evidence(tmp_path, filenames, content, guard_status, ex
             "--cases",
             "case-a",
             "case-b",
+            *(["--baseline", baseline] if baseline else []),
         ],
         cwd=tmp_path,
         env={
@@ -67,6 +69,7 @@ def test_tts_perf_result_evidence(tmp_path, filenames, content, guard_status, ex
             "RESULT_FILES": " ".join(filenames),
             "CONTENT": content,
             "GUARD_STATUS": str(guard_status),
+            "BASELINE_FLAG": flag,
         },
         check=False,
     )

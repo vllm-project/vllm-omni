@@ -146,6 +146,94 @@ steps:
   # Single-GPU" and "with L4" (same selectors minus the NVIDIA-only FlashInfer /
   # CuTe DSL backends; GGUF and LTX-2 run separately), and for "Diffusion X2V · Wan2.2
   # Autoround Function Test". Non-blocking until burn-in.
+  # MI300 owners for CUDA NIGHTLY diffusion perf: "Diffusion X2I(&A&T) · Perf
+  # Test · Qwen-Image-2.1 · Single-GPU", "Diffusion X2V · Perf Test · Single-GPU
+  # / 2-GPU" (Wan2.2 I2V) and "· MiniMax-H3". The Qwen-Image-2.1 Ulysses-4 case
+  # hangs in warmup on the MI300 CI pods (passes on an MI325X node) and stays
+  # CUDA-only for now. --assert-baseline compares against an MI300 baseline
+  # where one exists and otherwise collects. Non-blocking until burn-in.
+  - group: ":racing_car: Diffusion Perf MI300 Nightly"
+    steps:
+      # As on CUDA: the high-concurrency sweep mixes prompt lengths, and only SDPA
+      # takes the resulting 4D attention mask.
+      - label: "Diffusion X2I · Perf · Qwen-Image-2.1 · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: [diffusion_qwen_image_21_perf, rocm_diffusion_nightly_runner]
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-perf-qwen-image-21-1gpu/**/*
+        commands:
+          - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
+          - export BENCHMARK_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-perf-qwen-image-21-1gpu/benchmark-results"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 5 165m rocm-perf-qwen-image-21-1gpu
+            tests/dfx/perf/scripts/run_benchmark.py
+            --test-config-file tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json --assert-baseline
+            -m 'full_model and diffusion and rocm and MI325 and cards_1'
+
+      - label: "Diffusion X2V · Perf · Wan2.2 I2V · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: [diffusion_wan22_perf, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-perf-wan22-i2v-1gpu/**/*
+        commands:
+          - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
+          - export BENCHMARK_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-perf-wan22-i2v-1gpu/benchmark-results"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 165m rocm-perf-wan22-i2v-1gpu
+            tests/dfx/perf/scripts/run_benchmark.py
+            --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json --assert-baseline
+            -m 'full_model and diffusion and rocm and MI325 and cards_1'
+
+      - label: "Diffusion X2V · Perf · Wan2.2 I2V · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: [diffusion_wan22_perf, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-perf-wan22-i2v-2gpu/**/*
+        commands:
+          - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
+          - export BENCHMARK_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-perf-wan22-i2v-2gpu/benchmark-results"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 2 165m rocm-perf-wan22-i2v-2gpu
+            tests/dfx/perf/scripts/run_benchmark.py
+            --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json --assert-baseline
+            -m 'full_model and diffusion and rocm and MI325 and cards_2'
+
+      - label: "Diffusion X2V · Perf · MiniMax-H3 · 4-GPU"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: [diffusion_minimax_h3_perf, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-perf-minimax-h3-4gpu/**/*
+        commands:
+          - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
+          - export BENCHMARK_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-perf-minimax-h3-4gpu/benchmark-results"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 4 165m rocm-perf-minimax-h3-4gpu
+            tests/dfx/perf/scripts/run_benchmark.py
+            --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json --assert-baseline
+            -m 'full_model and diffusion and rocm and MI325 and cards_4'
+
   - group: ":full_moon: Diffusion Quantization MI300 Nightly"
     steps:
       - label: "Diffusion · Quantization · 1-GPU"
@@ -1591,6 +1679,41 @@ steps:
             --cases
             test_voxtral_tts-default_voice_throughput_seed-tts-text
             test_voxtral_tts-default_voice_stress_seed-tts-text
+
+      # MI300 owner for the Chatterbox cases of CUDA NIGHTLY "TTS · Perf Test ·
+      # Single-GPU". Collects until MI300 baselines exist.
+      - label: "Chatterbox TTS Perf"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: [tts_qwen3_tts_perf, rocm_tts_perf_runner]
+        env:
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+        artifact_paths:
+          - artifacts/rocm-chatterbox-tts-perf/**/*
+        commands:
+          - >-
+            python3 .buildkite/amd/scripts/run_rocm_tts_perf.py
+            --gpus 1 --artifact-name rocm-chatterbox-tts-perf --baseline collect
+            --expect-results test_chatterbox_turbo_graph 9
+            --expect-results test_chatterbox_turbo_eager 1
+            --expect-results test_chatterbox_original_graph 9
+            --expect-results test_chatterbox_original_eager 1
+            --cases
+            test_chatterbox_turbo_graph-default_voice_latency_seed-tts-text
+            test_chatterbox_turbo_graph-default_voice_throughput_seed-tts-text
+            test_chatterbox_turbo_graph-default_voice_stress_seed-tts-text
+            test_chatterbox_turbo_graph-voice_clone_latency_seed-tts
+            test_chatterbox_turbo_graph-voice_clone_throughput_seed-tts
+            test_chatterbox_turbo_eager-default_voice_latency_seed-tts-text
+            test_chatterbox_original_graph-default_voice_latency_seed-tts-text
+            test_chatterbox_original_graph-default_voice_throughput_seed-tts-text
+            test_chatterbox_original_graph-default_voice_stress_seed-tts-text
+            test_chatterbox_original_graph-voice_clone_latency_seed-tts
+            test_chatterbox_original_graph-voice_clone_throughput_seed-tts
+            test_chatterbox_original_eager-default_voice_latency_seed-tts-text
 
   - group: ":full_moon: Qwen3-TTS Perf MI300 Nightly"
     steps:
