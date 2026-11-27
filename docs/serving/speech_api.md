@@ -151,6 +151,7 @@ Content-Type: application/json
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
+| `temperature` | float | null | Sampling temperature for the first autoregressive stage. Uses vLLM validation and normalization before adapter metadata and stage sampling: finite values in `[0, 2]`, with small positive values raised to `0.01`; `0` selects greedy sampling. A non-null top-level value overrides `extra_params.temperature`; otherwise the legacy nested value or deployment default is used. For Qwen3-TTS, also controls residual Code Predictor sampling unless explicit `extra_params.subtalker_sampling_params` are supplied; see Sampling overrides below. Models whose generation does not consume it (MiniMax Music 3, OmniVoice, VoxCPM2, Voxtral TTS, Ming TTS / Ming-flash-omni TTS, MOSS-TTS family, Higgs Audio v2, Gepard, YuE2, Ming3 Audio) and pure-diffusion TTS deployments reject this field with HTTP 400. For Audex with `cfg_scale > 1`, an explicit value overrides the tuned default of 0.05. |
 | `seed` | integer | null | Random seed for repeatable generation. |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
@@ -505,7 +506,7 @@ Client -> Server:
 | `{"type": "input.text", "text": "..."}` | Text chunk. It is accumulated in `buffered` mode or fed to the readiness policy in `commitment` mode. |
 | `{"type": "input.done"}` | End-of-input for the current utterance. It flushes buffered text or closes and flushes the commitment policy, waits for submitted work, and keeps the connection open. |
 | `{"type": "session.close"}` | Close the connection. In `commitment` mode it cancels active and queued synthesis. In `buffered` mode it discards text not yet submitted, but a close frame cannot be handled while a request is generating, including requests from the linguistic splitter. There is no separate `input.cancel` message. |
-| `{"type": "session.ping"}`| Deliver an optional keep alive message to the server |
+| `{"type": "session.ping"}` | Deliver an optional keep alive message to the server |
 
 Server -> Client:
 

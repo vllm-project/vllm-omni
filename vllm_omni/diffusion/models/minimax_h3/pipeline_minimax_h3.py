@@ -607,6 +607,29 @@ def _dit_rank_world() -> tuple[Any, int, int]:
     return group, dist.get_rank(group), dist.get_world_size(group)
 
 
+def _dit_cpu_rank_world() -> tuple[Any, int, int]:
+    """Return the CPU (gloo) group with the DiT ranks' view of rank and world size.
+
+    ``broadcast_object_list`` serializes Python objects and runs two
+    collectives, so it needs a group that can carry host buffers. On a device
+    group it instead allocates device buffers and drives the device backend,
+    which is what fails with ``EI0006 Communication_Error_Get_Socket`` on
+    ``HcclBroadcast`` when the device backend has to reach across interconnect
+    domains (issue #10645). The CPU group keeps the transfer host-side.
+
+    The ranks and the world size are the same as the device group's; only the
+    backend differs, so the two views stay consistent.
+    """
+    if not dist.is_initialized():
+        # A single process has no gloo group at all, and the callers take their
+        # world_size == 1 path, which is the same outcome a single-rank boot
+        # reaches. The device view degrades the same way, so the two views
+        # stay symmetric here.
+        return None, 0, 1
+    group = get_world_group().cpu_group
+    return group, dist.get_rank(group), dist.get_world_size(group)
+
+
 def _broadcast_rank0_exception(exc: Exception | None) -> None:
     """Synchronize a rank-0-only exception across every DiT rank.
 
@@ -618,7 +641,7 @@ def _broadcast_rank0_exception(exc: Exception | None) -> None:
     rank-0-only work, before any subsequent collective, so all ranks either
     raise the same error together or all continue.
     """
-    group, rank, world_size = _dit_rank_world()
+    group, rank, world_size = _dit_cpu_rank_world()
     if world_size == 1:
         if exc is not None:
             raise exc
@@ -1517,7 +1540,10 @@ class MiniMaxH3Pipeline(
         self._dlo_component_cache = None
         offloads_text_encoder = should_offload_component(od_config, TEXT_ENCODER_COMPONENT)
         needs_component_cache = legacy_manual_components or offloads_text_encoder
-        if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE and needs_component_cache:
+        if (
+            resolve_offload_strategy(od_config) in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE)
+            and needs_component_cache
+        ):
             self._dlo_component_cache = BoundedAllocatorCache(self.device)
             if legacy_manual_components:
                 _register_dlo_component_cache(
@@ -3145,7 +3171,7 @@ class MiniMaxH3Pipeline(
         )
 
     def _distribute_media_inputs(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaInput:
-        group, rank, world_size = _dit_rank_world()
+        group, rank, world_size = _dit_cpu_rank_world()
         if world_size == 1:
             assert media is not None
             return media
@@ -3167,7 +3193,7 @@ class MiniMaxH3Pipeline(
     def _broadcast_media_conditioning(
         self, conditioning: MiniMaxH3EncoderMediaConditioning | None
     ) -> MiniMaxH3EncoderMediaConditioning:
-        group, rank, world_size = _dit_rank_world()
+        group, rank, world_size = _dit_cpu_rank_world()
         if world_size == 1:
             assert conditioning is not None
             return conditioning
@@ -3203,7 +3229,10 @@ class MiniMaxH3Pipeline(
         return MiniMaxH3EncoderMediaConditioning(**metadata, **tensors)
 
     def _encode_local_media(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaConditioning:
-        group, rank, world_size = _dit_rank_world()
+        # The error-status gather moves Python objects, so it has to travel
+        # host-side over the gloo group like every other object collective
+        # here (issue #10645). The tensor broadcasts keep the device group.
+        group, rank, world_size = _dit_cpu_rank_world()
         distributed_video = self.video_vae.is_distributed_enabled()
         if distributed_video:
             media = self._distribute_media_inputs(media)
@@ -3368,7 +3397,7 @@ class MiniMaxH3Pipeline(
         Returns initial conditioning and optional request-owned window embeddings.
         Invalid continuation prompts are broadcast before any encoder collective.
         """
-        group, rank, world_size = _dit_rank_world()
+        group, rank, world_size = _dit_cpu_rank_world()
         prompts = (sampling.extra_args or {}).get("continuation_prompts")
         prepared = text_conditioning = None
         initial_noise_params = None
@@ -4623,11 +4652,15 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(
                 f"MiniMax H3 step execution produces one output per request, got num_outputs_per_prompt={num_outputs}"
             )
-        if getattr(self, "_dlo_residency_controller", None) is not None:
+        if getattr(self, "_dlo_residency_controller", None) is not None or (
+            (od_config := getattr(self, "od_config", None)) is not None
+            and resolve_offload_strategy(od_config)
+            in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE)
+        ):
             raise ValueError(
-                "MiniMax H3 step execution is not compatible with distributed layerwise offload; "
-                "the resident-layer window spans a whole denoise loop, so per-step streaming would "
-                "reload the DiT every step. Drop --step-execution or --enable-distributed-layerwise-offload."
+                "MiniMax H3 step execution is not compatible with distributed layerwise offload or submodule offload; "
+                "the offload residency window spans a whole denoise loop, so per-step streaming would "
+                "reload the DiT every step. Drop --step-execution or the offload flag."
             )
         # Request-scoped Cache-DiT (quality=high) mutates hook state on the
         # shared transformer rather than on ``StepRequestState``. In step mode
