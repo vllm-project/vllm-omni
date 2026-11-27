@@ -53,6 +53,11 @@ def _bare_plane(*, delivery_timeout_s=1.0, shutdown_timeout_s=1.0):
         _native_output_closed=False,
         _native_outputs_in_flight=defaultdict(int),
         _native_terminal_pending=set(),
+        _native_resumable=False,
+        _uncommitted_payloads={},
+        _paused_chunk_receivers=set(),
+        _chunk_receiver_handles={},
+        _pending_streaming_prefills={},
         _deferred_shm_releases=set(),
         _async_chunk=True,
         _can_send=True,
@@ -233,6 +238,69 @@ def test_resumable_output_keeps_scheduler_owned_segment_boundary(plane):
         _complete(plane, [{"codes.audio": torch.tensor([[token]])}], token=token)
     assert plane._native_requests["internal"].output_token_ids == [21, 2150, 22]
     assert len(plane.record.batches) == 3
+
+
+@pytest.mark.parametrize("reserve_output", [True, False])
+def test_native_resumable_publishes_only_scheduler_commits(plane, reserve_output):
+    from vllm_omni.core.sched.output import OmniChunkCommit
+
+    plane._native_resumable = True
+    plane._code_prompt_token_ids = {"external": [torch.tensor([[10]])]}
+    plane._ramp_chunk_count["external"] = 1
+    plane.register_request(_new_request())
+
+    for sampled in (21, 22):
+        if reserve_output:
+            plane.reserve_outputs(["internal"])
+        output = OmniModelRunnerOutput(
+            req_ids=["internal"],
+            sampled_token_ids=[[sampled, 99]],
+            prompt_logprobs_dict={},
+            inter_stage_outputs=[{"codes.audio": torch.tensor([[sampled]])}],
+        )
+        plane.publish_output(output)
+        assert output.inter_stage_outputs is None
+    assert plane.record.batches == []
+
+    plane.commit_resumable_outputs(
+        [OmniChunkCommit("internal", [21], segment_finished=True), OmniChunkCommit("internal", [], discard=True)]
+    )
+    [(request, payload)] = plane.record.batches[0]
+    assert request.sampled_token_ids == [21] and request.is_segment_finished
+    assert payload["codes"]["audio"].tolist() == [[21]]
+    assert "external" not in plane._code_prompt_token_ids
+    assert "external" not in plane._ramp_chunk_count
+    assert "internal" not in plane._native_outputs_in_flight
+    assert len(plane.record.batches) == 1
+
+    assert plane.request_terminal({"internal"}) == 1
+    [(terminal, terminal_payload)] = plane.record.batches[-1]
+    assert terminal.is_finished()
+    assert terminal_payload is None
+
+
+def test_tp_follower_does_not_hold_resumable_outputs(raw_plane):
+    from vllm_omni.core.sched.output import OmniChunkCommit
+
+    raw_plane._native_resumable = True
+    raw_plane._local_tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
+    raw_plane._omni_connector = object()
+    request = _new_request()
+    req_id = request.req_id
+    raw_plane.register_request(request)
+
+    # A non-replying worker executes the step without materializing its output.
+    raw_plane.reserve_outputs([req_id])
+    raw_plane.commit_resumable_outputs([OmniChunkCommit(req_id, [21], segment_finished=True)])
+
+    assert req_id in raw_plane._native_requests
+    assert req_id not in raw_plane._uncommitted_payloads
+    assert req_id not in raw_plane._native_outputs_in_flight
+
+    raw_plane.request_terminal({req_id})
+    assert req_id not in raw_plane._native_requests
+    assert not raw_plane._native_terminal_pending
+    assert raw_plane.record.cleaned == [req_id]
 
 
 def test_full_payload_qwen_builder_receives_complete_codec(raw_plane, monkeypatch):
@@ -675,7 +743,7 @@ def test_worker_failure_surfaces_and_close_drains_in_order(plane):
     assert events == ["send", "shutdown"]
 
 
-def test_permanent_put_failure_quarantines_and_holds_state(raw_plane):
+def test_permanent_put_failure_fails_request_without_quarantine(raw_plane):
     puts = []
 
     def put(**_kw):
@@ -687,12 +755,14 @@ def test_permanent_put_failure_quarantines_and_holds_state(raw_plane):
     raw_plane.register_request(_new_request())
     raw_plane.reserve_outputs(["internal"])
     raw_plane.request_terminal({"internal"})
-    with pytest.raises(RuntimeError, match="connector send failed"):
-        raw_plane.complete_outputs(req_ids=["internal"], inter_stage_outputs=[{"c": 0}], sampled_token_ids=[[21]])
-    assert len(puts) == 1 and raw_plane._native_output_error is not None  # fail fast, no retry
-    assert raw_plane._native_outputs_in_flight["internal"] == 1 and "internal" in raw_plane._native_terminal_pending
-    with pytest.raises(RuntimeError, match="quarantined"):  # the quarantine rejects new tickets
-        raw_plane._delivery_manager.create_ticket(request_id="other", put_key="other_0_0")
+    raw_plane.complete_outputs(req_ids=["internal"], inter_stage_outputs=[{"c": 0}], sampled_token_ids=[[21]])
+    assert puts  # the failed put is attempted, then given up
+    assert raw_plane._native_output_error is None
+    assert not raw_plane._delivery_manager.is_quarantined
+    failures = raw_plane._permanent_send_failure_map()
+    assert "external" in failures
+    assert "send failed permanently" in failures["external"][1]
+    raw_plane._delivery_manager.create_ticket(request_id="other", put_key="other_0_0")
     _stop_save_thread(raw_plane)
 
 
@@ -1230,6 +1300,10 @@ def test_connected_stages_create_native_data_plane(monkeypatch, producer, consum
         )
         runner = OmniGPUModelRunner(config, torch.device("cpu"))
         plane = runner._omni_data_plane
+        if not stage.supports_native_mrv2_data_plane:
+            # Scheduler-managed resumable profiles deliberately bypass native transport.
+            assert plane is None
+            continue
         assert plane is not None, f"stage {stage.stage_id} has no payload transport owner"
         try:
             assert plane._can_send is (processor is not None)
@@ -1290,6 +1364,7 @@ def test_native_request_preserves_streaming_flag_and_reference_audio(plane, fact
         request_id="internal",
         external_req_id="voice",
         resumable=True,
+        _omni_segment_generation=7,
         model_intermediate_buffer={"codes": {"ref": [0.1, -0.1]}, "meta": {"ref_audio_sr": 16000}},
     )
     data = (
@@ -1300,6 +1375,7 @@ def test_native_request_preserves_streaming_flag_and_reference_audio(plane, fact
     plane.register_request(data)
     state = plane._native_requests["internal"]
     assert state.resumable is True
+    assert data.segment_generation == state.segment_generation == 7
     state.accept_tokens([6561])
     snapshot = state.snapshot(include_token_history=True, sampled_token_ids=[6561])
     payload = tts2code2wav_async_chunk(
@@ -1328,6 +1404,8 @@ def test_release_reclaims_segments_no_downstream_stage_consumed(plane):
     """A text-only request never runs the Talker, so the producer must unlink."""
     ext_id = f"release_{uuid.uuid4().hex}"
     connector = SharedMemoryConnector({"stage_id": 0})
+    # The sender refuses a put to a stage with no visible peer, so keep a stage-1 receiver alive.
+    downstream = SharedMemoryConnector({"stage_id": 1})
     plane.__dict__.update(_omni_connector=connector, _stage_id=0, _request_ids_mapping={})
     plane.register_request(_new_request(external_req_id=ext_id))
     sibling_key = f"{ext_id}_1_0_0"
@@ -1349,6 +1427,7 @@ def test_release_reclaims_segments_no_downstream_stage_consumed(plane):
         assert connector.put("0", "1", f"{ext_id}_0_2", "late")[0]
         assert plane.release_shm_resources([ext_id, "unknown"]) == 1
     finally:
+        downstream.close()
         connector.close()
 
 
@@ -1440,3 +1519,95 @@ def test_native_perf_tags_survive_deferred_cohort_wire_and_shared_payload(raw_pl
         torch.testing.assert_close(shared.codes.audio, torch.tensor([1, 2]))
     else:
         assert shared == {"codes": {"audio": [1, 2]}, "meta": {"duplex_turn_id": 7, "duplex_epoch": 3}}
+
+
+@pytest.mark.parametrize("resumable", [False, True])
+@pytest.mark.parametrize("num_computed_tokens", [0, 3])
+@pytest.mark.parametrize("new_segment", [False, True])
+def test_reregister_preserves_preemption_but_replaces_resumable_segment(
+    plane, resumable, num_computed_tokens, new_segment
+):
+    plane._native_resumable = True
+    initial = _new_request()
+    initial.resumable = resumable
+    initial.segment_generation = 0
+    plane.register_request(initial)
+    previous = plane._native_requests["internal"]
+    previous.output_token_ids = [21]
+    plane.reserve_outputs(["internal"])
+    pending = plane._uncommitted_payloads.get("internal")
+    replacement = _new_request()
+    replacement.resumable = resumable
+    replacement.segment_generation = int(new_segment)
+    replacement.prompt_token_ids = [71, 72]
+    replacement.additional_information = {"new_segment": True}
+    replacement.model_intermediate_buffer = {"embed": "new"}
+    replacement.num_computed_tokens = num_computed_tokens
+    plane.register_request(replacement)
+    current = plane._native_requests["internal"]
+    if resumable and new_segment:
+        assert current is not previous
+        assert current.prompt_token_ids == [71, 72]
+        assert current.additional_information == {"new_segment": True}
+        assert current.model_intermediate_buffer == {"embed": "new"}
+        assert current.num_computed_tokens == num_computed_tokens
+        assert current.output_token_ids == []
+    else:
+        assert current is previous
+        assert current.output_token_ids == [21]
+    assert plane._native_outputs_in_flight["internal"] == 1
+    assert plane._uncommitted_payloads.get("internal") is pending
+
+
+def test_resumable_prefill_replay_after_preemption_stays_aligned(plane):
+    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import thinker2talker_async_chunk
+
+    plane._native_resumable = plane.uses_dflash = True
+    plane._send_side_request_payload = {}
+    plane.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            im_start_token_id=151644,
+            user_token_id=872,
+            talker_config=SimpleNamespace(accept_hidden_layer=24),
+            thinker_config=SimpleNamespace(audio_token_id=151675, image_token_id=151655, video_token_id=151656),
+        )
+    )
+    request = _new_request()
+    request.prompt_token_ids = [151644, 872, 198, 13, 151645, 198, 151644, 77091, 198]
+    request.segment_generation = 0
+    request.num_computed_tokens = 0
+    plane.register_request(request)
+    state = plane._native_requests["internal"]
+    rows = torch.arange(9 * 16, dtype=torch.float32).reshape(9, 16)
+    hidden = torch.arange(9 * 8, dtype=torch.float32).reshape(9, 8)
+
+    def prefill(start, end):
+        payload = {"hidden_states": {"layers": {0: rows[start:end], 24: hidden[start:end]}}, "embed": {}}
+        assert thinker2talker_async_chunk(plane, payload, state.snapshot(include_token_history=True)) is None
+
+    prefill(0, 3)
+    plane.reserve_outputs(["internal"])
+    queue = plane._uncommitted_payloads["internal"]
+    # Same generation, but vLLM reset the computed position for recomputation.
+    plane.register_request(request)
+    assert plane._native_requests["internal"] is state
+    assert plane._native_outputs_in_flight["internal"] == 1
+    assert plane._uncommitted_payloads["internal"] is queue
+    prefill(0, 4)
+    prefill(4, 9)
+    tokens = [1000, 1001]
+    decode_rows = torch.ones(2, 16)
+    chunk = thinker2talker_async_chunk(
+        plane,
+        {
+            "hidden_states": {"layers": {0: decode_rows}},
+            "meta": {"decode_span": True, "committed_token_count": 2},
+            "ids": {"output": tokens},
+        },
+        state.snapshot(include_token_history=True),
+        new_token_ids=tokens[1:],
+    )
+    assert chunk.ids.prompt == request.prompt_token_ids
+    torch.testing.assert_close(chunk.embed.prefill[:-1], rows)
+    torch.testing.assert_close(chunk.hidden_states.output, hidden)
+    assert chunk.embed.prefill.shape[0] == len(chunk.ids.prompt) + 1

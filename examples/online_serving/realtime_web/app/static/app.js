@@ -47,6 +47,23 @@
     cameraPreview.style.height = 'auto';
     cameraPreview.style.maxHeight = '480px';
     cameraPreview.style.flex = '0 0 100%';
+    const cameraStage = document.getElementById('cameraStage');
+    if (cameraStage) {
+      cameraStage.style.display = 'block';
+      cameraStage.style.position = 'relative';
+      cameraStage.style.order = '-1';
+      cameraStage.style.flex = '0 0 100%';
+      cameraStage.style.width = '100%';
+    }
+    const highlightLayer = document.getElementById('highlightLayer');
+    if (highlightLayer) {
+      highlightLayer.style.display = 'block';
+      highlightLayer.style.position = 'absolute';
+      highlightLayer.style.inset = '0';
+      highlightLayer.style.pointerEvents = 'none';
+      highlightLayer.style.overflow = 'hidden';
+      highlightLayer.style.zIndex = '2';
+    }
     const cameraActions = cameraPreview.closest('.call-actions');
     if (cameraActions) {
       cameraActions.style.flexWrap = 'wrap';
@@ -221,6 +238,30 @@
     connectionState.className = `status status-${kind}`;
   }
 
+  function toolWaitLabel(name) {
+    return {
+      calculator: '計算機',
+      get_current_datetime: '時間',
+      get_city_weather: '天氣',
+      convert_currency: '匯率',
+      DeepSeek: 'DeepSeek',
+      get_current_location: '位置',
+      WebSearch: '搜尋',
+      BraveSearch: '搜尋',
+      duckduckgo_search: '搜尋',
+      WebFetch: '網頁',
+    }[name] || '工具';
+  }
+
+  function announceToolWait(name) {
+    const sentence = `正在調用${toolWaitLabel(name)}，請稍等。`;
+    const turn = ensureTurn('assistant');
+    turn.value = sentence;
+    turn.text.textContent = sentence;
+    finishTranscript('assistant');
+    setModel(sentence);
+  }
+
   function setModel(label) {
     modelState.textContent = label;
   }
@@ -263,6 +304,68 @@
     return event.response_id || (event.response && event.response.id) || null;
   }
 
+  let videoHighlightBoxes = [];
+
+  function drawVideoHighlights(boxes) {
+    videoHighlightBoxes = Array.isArray(boxes) ? boxes : [];
+    const layer = document.getElementById('highlightLayer');
+    if (!layer) return;
+    layer.replaceChildren();
+    if (!videoHighlightBoxes.length || cameraPreview.style.display === 'none') return;
+    if (typeof cameraPreview.getBoundingClientRect !== 'function') return;
+    const display = cameraPreview.getBoundingClientRect();
+    if (display.width < 1 || display.height < 1) return;
+    const frameW = cameraPreview.videoWidth || display.width;
+    const frameH = cameraPreview.videoHeight || display.height;
+    // The preview is the whole frame (object-fit: contain), same pixels the model sees.
+    const scale = Math.min(display.width / frameW, display.height / frameH);
+    const drawnW = frameW * scale;
+    const drawnH = frameH * scale;
+    const drawnLeft = (display.width - drawnW) / 2;
+    const drawnTop = (display.height - drawnH) / 2;
+    const layerRect = typeof layer.getBoundingClientRect === 'function' ? layer.getBoundingClientRect() : display;
+    const originX = display.left - layerRect.left;
+    const originY = display.top - layerRect.top;
+    const clipL = originX;
+    const clipT = originY;
+    const clipR = originX + display.width;
+    const clipB = originY + display.height;
+    for (const box of videoHighlightBoxes) {
+      let left = originX + drawnLeft + drawnW * box[0] / 1000;
+      let top = originY + drawnTop + drawnH * box[1] / 1000;
+      let width = drawnW * (box[2] - box[0]) / 1000;
+      let height = drawnH * (box[3] - box[1]) / 1000;
+      if (left < clipL) { width -= clipL - left; left = clipL; }
+      if (top < clipT) { height -= clipT - top; top = clipT; }
+      if (left + width > clipR) width = clipR - left;
+      if (top + height > clipB) height = clipB - top;
+      if (width < 1 || height < 1) continue;
+      const el = document.createElement('div');
+      el.className = 'highlight-box';
+      el.style.left = `${left}px`;
+      el.style.top = `${top}px`;
+      el.style.width = `${width}px`;
+      el.style.height = `${height}px`;
+      layer.appendChild(el);
+    }
+  }
+
+  function showTurnText(turn, role) {
+    if (role === 'assistant' && typeof profile.presentAssistantText === 'function') {
+      const presented = profile.presentAssistantText(turn.value);
+      turn.text.textContent = presented.displayText;
+      turn.row.hidden = presented.displayText.length === 0;
+      drawVideoHighlights(presented.boxes);
+      return;
+    }
+    turn.text.textContent = turn.value;
+    turn.row.hidden = false;
+  }
+
+  if (typeof profile.presentAssistantText === 'function') {
+    window.addEventListener('resize', () => drawVideoHighlights(videoHighlightBoxes));
+  }
+
   function ensureTurn(role) {
     const existing = role === 'user' ? liveUserTurn : liveAssistantTurn;
     if (existing) return existing;
@@ -289,7 +392,7 @@
     // Deltas are incremental, including a longer one that starts with the
     // previous delta ("哈" then "哈哈"). Cumulative text arrives as text-final.
     turn.value += delta;
-    turn.text.textContent = turn.value;
+    showTurnText(turn, role);
     conversation.scrollTop = conversation.scrollHeight;
   }
 
@@ -311,8 +414,8 @@
     const current = turn || ensureTurn(role);
     if (finalText) {
       current.value = finalText;
-      current.text.textContent = finalText;
     }
+    showTurnText(current, role);
     rememberClosedTranscript(role, current.value, itemId);
     current.row.classList.remove('turn-live');
     if (role === 'user') liveUserTurn = null;
@@ -590,6 +693,8 @@
       pcm,
       responseId: responseId || currentResponseId,
       initialBufferMs: INITIAL_PLAYBACK_BUFFER_MS,
+      playbackSpeed: profile.playbackSpeed || 1,
+      holdUntilSecondChunk: profile.holdPlaybackUntilSecondChunk === true,
     }, [pcm.buffer]);
   }
 
@@ -672,7 +777,7 @@
       } else if (action.text) {
         existing.value = action.text;
       }
-      existing.text.textContent = existing.value;
+      showTurnText(existing, 'assistant');
       liveAssistantTurn = existing;
       return;
     }
@@ -698,7 +803,7 @@
       if (action.text) {
         const turn = ensureTurn('assistant');
         turn.value = action.text;
-        turn.text.textContent = action.text;
+        showTurnText(turn, 'assistant');
         if (responseId) assistantRowByResponse.set(responseId, turn);
       }
     } else finishTranscript(action.role, action.text, action.itemId);
@@ -789,7 +894,10 @@
         if (!pendingCommits.size) clearTimeout(turnTimeout);
         responseComplete = true;
         finishTranscript('assistant');
-        releaseVisionTurn(responseId);
+        // Hold vision-follow until the tool follow-up answers, or a camera
+        // commit can preempt it. Say so out loud: this turn has no speech of its own.
+        if (action.toolCall) announceToolWait(action.toolCall);
+        else releaseVisionTurn(responseId);
         requestPlaybackDrain(responseId);
         finishResponseIfReady();
         break;
@@ -1114,6 +1222,7 @@
     lastClosedUserItemId = '';
     lastClosedUserAt = 0;
     lastClosedRole = null;
+    drawVideoHighlights([]);
     sendTurnButton.disabled = true;
     pttHeld = false;
     pttUploadedInput = false;

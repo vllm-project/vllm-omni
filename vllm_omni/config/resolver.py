@@ -201,14 +201,15 @@ def _resolve_generic_diffusion_model_class(
     cli_overrides: Mapping[str, Any],
 ) -> tuple[bool, str | None]:
     """Detect generic diffusion support and its serving pipeline class."""
+    revision = cli_overrides.get("revision")
     model_class_name = cli_overrides.get("model_class_name") or resolve_model_class_name(
         model,
         str(cli_overrides.get("diffusion_load_format") or "default"),
-        cli_overrides.get("revision"),
+        revision,
     )
     supported = bool(model_class_name and model_class_name in DiffusionModelRegistry.get_supported_archs())
     if not supported:
-        supported = is_diffusion_model(model)
+        supported = is_diffusion_model(model, revision=revision)
     return supported, str(model_class_name) if model_class_name else None
 
 

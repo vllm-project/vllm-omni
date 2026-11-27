@@ -84,6 +84,8 @@ from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads, has_multivie
 logger = init_logger(__name__)
 
 
+# These are model-specific upload limits and intentionally do not follow the
+# process-wide vLLM remote-media configuration.
 MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 
 MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES = 50 * 1024 * 1024
@@ -810,8 +812,8 @@ def _validate_h3_control_uploads(
         reject("control_type=inpaint requires mask_reference.")
     if has_references:
         reject(
-            "MiniMax H3 control cannot be combined with input/image/video/audio references, "
-            "keyframes, or latent-mask editing."
+            "MiniMax H3 control cannot be combined with keyframes or latent-mask editing, "
+            "or with input/image/video/audio references outside task=ref2va."
         )
     config = extras.get(selected, {})
     if not isinstance(config, Mapping):
@@ -1145,7 +1147,7 @@ async def _parse_video_form(
     guidance_scale: float | None = Form(default=None),
     guidance_scale_2: float | None = Form(default=None),
     boundary_ratio: float | None = Form(default=None),
-    flow_shift: float | None = Form(default=None),
+    flow_shift: float | None = Form(default=None, gt=0, allow_inf_nan=False),
     true_cfg_scale: float | None = Form(default=None),
     seed: int | None = Form(default=None),
     generate_sound: bool | None = Form(default=None),
@@ -1333,14 +1335,21 @@ async def _parse_video_form(
                 control_type,
                 source_reference,
                 mask_reference,
-                has_references=bool(input_references)
-                or any(
-                    item is not None
-                    for item in (
-                        input_reference,
-                        parsed_image_reference,
-                        parsed_video_reference,
-                        parsed_audio_reference,
+                # Ref2VA references may accompany control; the pipeline checks the task its
+                # checkpoint takes control with (Ref2VA only on FastH3 Omni, T2VA otherwise).
+                has_references=(
+                    str((request.extra_params or {}).get("task", "")).lower() != "ref2va"
+                    and (
+                        bool(input_references)
+                        or any(
+                            item is not None
+                            for item in (
+                                input_reference,
+                                parsed_image_reference,
+                                parsed_video_reference,
+                                parsed_audio_reference,
+                            )
+                        )
                     )
                 )
                 or has_latent_edit,

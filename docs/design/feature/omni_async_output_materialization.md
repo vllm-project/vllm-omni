@@ -42,6 +42,18 @@ Opting out omits hidden-state output copies, while logits and sampling continue
 to receive the original hidden states. Models without the flag retain the
 existing hidden-state payload behavior.
 
+A request can also opt into its own last-layer hidden states with
+`SamplingParams.extra_args["return_hidden_states"]`, which the engine-core
+side lifts onto `OmniEngineCoreRequest.return_hidden_states`. RL teacher
+rollouts use the tensor for on-policy distillation. The AR runner returns the
+request's prefill rows once, on the step that completes its prefill, under
+`multimodal_output["teacher_hidden_states"]`; requests that did not opt in pay
+no copy. The key is separate from the reserved `hidden_states` payload nest,
+so pooler entries in the same slot are untouched. A later prefill chunk or a
+prefix-cache hit lacks rows of that step's tensor and raises instead of
+returning a partial payload: engines serving the opt-in run with chunked
+prefill and prefix caching disabled.
+
 The MRv2 generation runner has its own control-only fast path. Both its
 control-only and cached-request zero-token paths deliver pending request
 prewarms after finished-request cleanup and run optional idle prefetch only on
@@ -52,6 +64,25 @@ Warmup uses the forward thread, stream and inference mode; failures log once
 per hook at warning level (subsequent failures at debug) and leave the inline
 reference preparation path available. Connector and auxiliary-output work
 still runs on every idle step.
+
+## Native resumable Qwen3-Omni output
+
+For native MRv2 resumable requests, the connector sender rank retains completed
+step payloads until the scheduler returns accepted token IDs and the segment
+decision. The data plane publishes committed payloads in order. Other TP ranks
+participate in request cleanup without retaining unpublished output queues.
+
+A segment marker pauses receiver polling until the current segment has been
+processed. This prevents the next Talker prompt or Code2Wav chunk from
+overwriting unconsumed data. Resumable DFlash speech requires async chunks,
+synchronous AR scheduling, disabled Thinker prefix caching, PP=1, and eager
+Thinker and drafter execution. The optional
+`qwen3_omni_moe_resumable` pipeline uses scheduler-owned chunk transfer.
+
+The CUDA TP1/TP2 hardware results used vLLM 0.33.0 and require revalidation on
+the current vLLM 0.34 runtime. See the
+[configuration requirements](../../user_guide/examples/online_serving/qwen3_omni.md#dflash-thinker-decoding)
+and [validation report](../qwen3_omni_dflash_validation.md).
 
 ## Related files
 

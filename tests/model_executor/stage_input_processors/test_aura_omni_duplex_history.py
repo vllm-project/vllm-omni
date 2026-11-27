@@ -239,7 +239,11 @@ def test_duplex_interception_commits_silent_history_without_aura2tts() -> None:
         output,
         DuplexOutputDecision(
             action=DuplexOutputAction.DIRECT_RESPONSE,
-            metadata={"model_listen": True, "duplex_direct_response": True},
+            metadata={
+                "model_listen": True,
+                "duplex_direct_response": True,
+                "listen_source": "aura_silent",
+            },
         ),
     )
     plane = AuraDataPlaneSession(encode_audio=lambda *_a, **_k: None)
@@ -247,6 +251,9 @@ def test_duplex_interception_commits_silent_history_without_aura2tts() -> None:
     assert events and events[0].get("silent") is True
     assert events[0].get("model_context_text") == SILENT_TEXT
     assert events[0].get("abort_data_plane_request") is True
+    assert events[0].get("listen_source") == "aura_silent"
+    assert events[0].get("reason") == "aura_silent"
+    assert events[0].get("model_listen") is True
     assert history.pending_user == "look"
     from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
 
@@ -271,3 +278,52 @@ def test_proactive_silent_ticks_do_not_evict_a_real_turn() -> None:
     assert history.messages[1]["content"] == "真正的回答"
     assert len(history.messages) == 2
     drop_session_history("duplex-silent-ticks")
+
+
+def test_pending_overwrite_pairs_later_commit_with_vision_slot() -> None:
+    """Documents current single-slot race (not the desired end state).
+
+    Speech begin → vision begin overwrites pending → spoken commit lands on the
+    vision user/video slot; the speech transcript is lost.
+    """
+    drop_session_history("duplex-pending-ow")
+    history = get_or_create_session_history("duplex-pending-ow")
+    history.begin_user_turn("你好")
+    history.begin_user_turn("", video=("clip-v", {"fps": 2.0}))
+    history.commit_turn("你好，有什么我可以帮你的吗？")
+    assert [m["role"] for m in history.messages] == ["user", "assistant"]
+    assert history.messages[0]["content"] == ""
+    assert history.messages[0].get("video") == ("clip-v", {"fps": 2.0})
+    assert history.messages[1]["content"] == "你好，有什么我可以帮你的吗？"
+    drop_session_history("duplex-pending-ow")
+
+
+def test_pending_overwrite_then_silent_commit_leaves_silent_assistant() -> None:
+    """Vision silent commit after overwrite → last assistant is <|silent|> (len 10)."""
+    drop_session_history("duplex-pending-silent")
+    history = get_or_create_session_history("duplex-pending-silent")
+    history.begin_user_turn("你好")
+    history.begin_user_turn("", video=("clip-v", {"fps": 2.0}))
+    history.commit_turn(SILENT_TEXT)
+    assert history.messages[-1]["content"] == SILENT_TEXT
+    assert len(history.messages[-1]["content"]) == 10
+    assert history.messages[0]["content"] == ""
+    drop_session_history("duplex-pending-silent")
+
+
+def test_commit_turn_cleans_assistant_text_like_native() -> None:
+    drop_session_history("duplex-clean")
+    history = get_or_create_session_history("duplex-clean")
+    history.begin_user_turn("", video=("clip-a", {"fps": 2.0}))
+    history.commit_turn("<|respond|>現在他正看著前方微笑。<|im_end|>")
+    history.begin_user_turn("", video=("clip-b", {"fps": 2.0}))
+    history.commit_turn("<|silent|><|im_end|>")
+    history.begin_user_turn("框出來")
+    history.commit_turn("<|respond|><|respond|><think>\n\n</think>\n\n<|box_start|>(1,2),(3,4)<|box_end|><|im_end|>")
+    assert [message["content"] for message in history.messages[1::2]] == [
+        "<|respond|>現在他正看著前方微笑。",
+        SILENT_TEXT,
+        "<|respond|><|box_start|>(1,2),(3,4)<|box_end|>",
+    ]
+    assert "<|im_end|><|im_end|>" not in history.render_prefix()
+    drop_session_history("duplex-clean")

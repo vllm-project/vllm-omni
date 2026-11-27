@@ -7,6 +7,9 @@ pipeline: aura_omni
 async_chunk: true
 session_mode: duplex
 duplex_session:
+  # Session admission only. Orthogonal to per-stage max_num_seqs.
+  # supports_concurrent_turn_requests=True does not mean Stage0 runs in parallel
+  # when Stage0 max_num_seqs=1 (scheduler may queue the next ephemeral).
   max_sessions: 1
 
 connectors:
@@ -26,6 +29,8 @@ connectors:
 
 stages:
   - stage_id: 0
+    # =1: next turn may queue behind an in-flight ASR. Concurrent drain needs
+    # Stage2/3 headroom (see stage 2/3), not a higher Stage0, for TTS overlap.
     max_num_seqs: 1
     gpu_memory_utilization: 0.08
     enforce_eager: true

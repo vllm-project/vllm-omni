@@ -1,9 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import MethodType, SimpleNamespace
+from unittest.mock import Mock
+
+import numpy as np
 import pytest
 import torch
+from vllm.v1.worker.gpu.sample import gumbel
+from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.sampler import Sampler as MRv2Sampler
+from vllm.v1.worker.gpu.sample.states import SamplingStates
 
+from vllm_omni.model_executor.models.audio8_tts.audio8_tts_slow_ar import Audio8TTSSlowARForConditionalGeneration
 from vllm_omni.model_executor.models.audio8_tts.sampling import (
     filter_top_k_top_p,
     ras_sample_batch,
@@ -154,3 +163,116 @@ def test_single_request_batch_keeps_the_fast_path():
     batched = ras_sample_batch(logits, None, generators={0: torch.Generator().manual_seed(99)}, num_reqs=1, **kw)
     direct = ras_sample_semantic(logits, None, generator=torch.Generator().manual_seed(99), **kw)
     assert torch.equal(batched, direct)
+
+
+def _state(tensor: torch.Tensor) -> SimpleNamespace:
+    return SimpleNamespace(gpu=tensor, np=tensor.numpy())
+
+
+def _mrv2_sampler() -> tuple[MRv2Sampler, Mock]:
+    model = object.__new__(Audio8TTSSlowARForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.vllm_config = SimpleNamespace(speculative_config=None)
+    model._semantic_begin_id = 10
+    model._semantic_end_id = 12
+    model._num_semantic_ids = 3
+    model._eos_token_id = 4
+    model._ras_window_size = 2
+    model._ras_temperature = 1.2
+    model._ras_top_p = 1.0
+
+    states = SimpleNamespace(
+        vocab_size=16,
+        temperature=_state(torch.tensor([0.5, 0.5, 0.5, 0.0])),
+        top_k=_state(torch.tensor([16, 16, 2, 16], dtype=torch.int32)),
+        top_p=_state(torch.tensor([1.0, 1.0, 0.905, 1.0])),
+        min_p=_state(torch.zeros(4)),
+        seeds=_state(torch.tensor([111, 222, 333, 444])),
+    )
+    states.get_top_k_top_p = MethodType(SamplingStates.get_top_k_top_p, states)
+    req_states = SimpleNamespace(
+        total_len=_state(torch.tensor([2, 2, 4, 2], dtype=torch.int32)),
+        prompt_len=_state(torch.ones(4, dtype=torch.int32)),
+        all_token_ids=_state(torch.tensor([[10, 10, 0, 0], [3, 4, 0, 0], [3, 12, 11, 10], [3, 10, 0, 0]])),
+    )
+    fallback = Mock()
+    sampler = object.__new__(MRv2Sampler)
+    sampler.sample = fallback
+    sampler.sampling_states = states
+    sampler.req_states = req_states
+    sampler.return_sampling_mask = False
+    sampler.penalties_state = SimpleNamespace(use_penalty=np.zeros(4, dtype=bool))
+    sampler.logits_processors = []
+    sampler.thinking_budget_state = SimpleNamespace(apply=Mock())
+    sampler.use_fp64_gumbel = False
+    assert model.mrv2_custom_sampler(sampler) == (sampler, None)
+    return sampler, fallback
+
+
+def _mrv2_sample_args(slots: list[int], positions: list[int] | None = None) -> tuple:
+    indices = torch.tensor(slots, dtype=torch.int32)
+    pos = torch.tensor(positions if positions is not None else [0] * len(slots), dtype=torch.int64)
+    return indices, indices, indices.numpy(), pos, pos, torch.zeros_like(indices), pos.numpy() + 1
+
+
+def test_mrv2_ras_uses_generated_history_and_preserves_eos_and_greedy(monkeypatch):
+    sampler, fallback = _mrv2_sampler()
+
+    def mask_eos(logits, _):
+        logits[1, 4] = float("-inf")
+        return logits
+
+    sampler.logits_processors = [SimpleNamespace(apply=mask_eos)]
+    draw = Mock(side_effect=[torch.tensor([0, 0, 3, 0]), torch.tensor([1, 1, 1, 1])])
+    monkeypatch.setattr(gumbel, "gumbel_sample", draw)
+
+    logits = torch.full((4, 16), float("-inf"))
+    semantic_and_eos_ids = [10, 11, 12, 4]
+    logits[:, semantic_and_eos_ids] = torch.log(torch.tensor([0.60, 0.30, 0.09, 0.01]))
+    logits[2, semantic_and_eos_ids] = torch.log(torch.tensor([0.09, 0.01, 0.30, 0.60]))
+    # Put slot 2 first to make batch position differ from request-state index.
+    args = _mrv2_sample_args([2, 0, 1, 3], [3, 0, 1, 1])
+    tokens, _ = sampler.sample(logits, *args)
+
+    # Generated repeats redraw. At position 0, slot 0 has a match in the
+    # prompt and a future match in storage. EOS and greedy also preserve the draw.
+    assert tokens.tolist() == [11, 10, 4, 10]
+    fallback.assert_not_called()
+    sampler.thinking_budget_state.apply.assert_called_once()
+    assert torch.isfinite(logits[1, 4])
+    first, second = draw.call_args_list
+    assert torch.isfinite(first.args[0][0]).tolist() == [True, True, False, False]
+    assert torch.isneginf(second.args[0][1, 3])
+    torch.testing.assert_close(first.args[0][0, :2], logits[0, [10, 11]] / 0.5)
+    torch.testing.assert_close(second.args[0][0, :2], logits[0, [10, 11]] / 1.2)
+    assert not first.kwargs["is_drafting"]
+    assert second.kwargs["is_drafting"]
+    for call in (first, second):
+        assert call.args[1] is args[0]
+        assert call.args[3] is sampler.sampling_states.seeds.gpu
+        assert call.args[4] is args[3]
+
+
+@pytest.mark.parametrize("feature", ["logprobs", "mask", "penalty", "min_p", "bad_words"])
+def test_mrv2_ras_preserves_native_sampler_fallback(feature, monkeypatch):
+    sampler, fallback = _mrv2_sampler()
+    monkeypatch.setattr(gumbel, "gumbel_sample", Mock(side_effect=AssertionError("RAS must fall back")))
+    logits = torch.zeros(1, 16)
+    args = _mrv2_sample_args([0])
+    if feature == "mask":
+        sampler.return_sampling_mask = True
+    elif feature == "penalty":
+        sampler.penalties_state.use_penalty[0] = True
+    elif feature == "min_p":
+        sampler.sampling_states.min_p.np[0] = 0.1
+    elif feature == "bad_words":
+        bad_words = object.__new__(BadWordsState)
+        bad_words.num_bad_words = _state(torch.tensor([1, 0, 0, 0]))
+        sampler.logits_processors.append(bad_words)
+    fallback.return_value = (torch.tensor([10]), logits)
+    logprobs = feature == "logprobs"
+
+    result = sampler.sample(logits, *args, return_logprobs=logprobs)
+
+    assert result is fallback.return_value
+    fallback.assert_called_once_with(logits, *args, return_logprobs=logprobs)
