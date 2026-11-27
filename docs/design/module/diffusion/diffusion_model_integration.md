@@ -11,6 +11,12 @@ owners:
 primary_code_paths:
   - vllm_omni/diffusion/models/**
   - vllm_omni/diffusion/model_loader/**
+primary_code_path_owners:
+  # Additional owner for model pipelines, not the shared loader
+  - paths:
+      - vllm_omni/diffusion/models/**
+    owners:
+      - "@wtz2333"
 related_code_paths:
   - vllm_omni/diffusion/layers/**
   - vllm_omni/diffusion/lora/**
