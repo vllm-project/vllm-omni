@@ -98,7 +98,8 @@ _PINNED_HOST_ALLOCATOR_SETTINGS = {
 def _configure_pinned_host_allocator() -> None:
     """Apply DLO's pinned-allocator settings the user has not chosen explicitly."""
     user_conf = torch._C._accelerator_getAllocatorSettings().rstrip().rstrip(",")
-    settings = [f"{key}:{value}" for key, value in _PINNED_HOST_ALLOCATOR_SETTINGS.items() if key not in user_conf]
+    configured = user_conf.replace("pinned_use_hip_host_register", "pinned_use_cuda_host_register")
+    settings = [f"{key}:{value}" for key, value in _PINNED_HOST_ALLOCATOR_SETTINGS.items() if key not in configured]
     if settings:
         # The setter resets omitted device options, so replay the full current configuration.
         # Only affects later allocations; blocks pinned earlier keep their own free path.

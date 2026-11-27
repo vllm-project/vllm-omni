@@ -3131,6 +3131,15 @@ class TestDistributedComponentSelection:
                 None,
             ),
             (
+                "expandable_segments:True,pinned_use_hip_host_register:False",
+                "expandable_segments:True,pinned_use_hip_host_register:False,"
+                "pinned_max_round_threshold_mb:64,pinned_num_register_threads:8",
+            ),
+            (
+                "pinned_max_round_threshold_mb:128,pinned_num_register_threads:4,pinned_use_hip_host_register:False",
+                None,
+            ),
+            (
                 "max_split_size_mb:128",
                 "max_split_size_mb:128,pinned_max_round_threshold_mb:64,"
                 "pinned_use_cuda_host_register:True,pinned_num_register_threads:8",

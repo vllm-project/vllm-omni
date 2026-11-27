@@ -75,7 +75,9 @@ The backend reads PyTorch's current allocator configuration and preserves its
 options when appending defaults, including runtime settings and bracketed
 `roundup_power2_divisions` values. Replacing the configuration with only the
 pinned defaults would reset unrelated device-allocator options. Existing
-pinned settings take precedence; non-CUDA platforms are unchanged.
+pinned settings take precedence, including `pinned_use_hip_host_register`,
+which PyTorch treats as an alias of `pinned_use_cuda_host_register`. Non-CUDA
+platforms are unchanged.
 
 ### DLO consumes the existing parallel topology
 
