@@ -922,6 +922,7 @@ def test_cpu_prefetch_ownership_cancellation_and_failure(mocker):
     backend = object.__new__(BatchedToken2Wav)
     backend._prompt_features = {}
     backend._setup_cache = {}
+    backend._setup_host_cache = {}
     backend.speech_window = torch.zeros(1)
     backend._token2wav = mocker.Mock(_prepare_prompt_cpu=cpu, _prepare_prompt=finish)
     assert backend.prefetch_prompt_cpu("a", "1", 4)
@@ -973,6 +974,7 @@ def test_cpu_prefetch_ownership_cancellation_and_failure(mocker):
     queued = object.__new__(BatchedToken2Wav)
     queued._prompt_features = {}
     queued._setup_cache = {}
+    queued._setup_host_cache = {}
     queued.speech_window = torch.zeros(1)
     started.clear()
     release.clear()

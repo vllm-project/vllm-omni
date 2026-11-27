@@ -151,7 +151,7 @@ def prepare_stage_config_inputs(
         # launch path. The API worker's OmniBase has already done this work.
         from vllm_omni.entrypoints.omni_base import omni_snapshot_download
 
-        resolved_model = omni_snapshot_download(model)
+        resolved_model = omni_snapshot_download(model, revision=kwargs.get("revision"))
 
     resolved_kwargs = dict(kwargs)
     for legacy_arg in ("stage_configs_path", "stage_configs"):

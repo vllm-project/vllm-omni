@@ -37,6 +37,7 @@ Common `StagePipelineConfig` fields include:
 | `final_output` / `final_output_type` | Whether the stage produces a user-visible output and its modality. |
 | `owns_tokenizer` | Whether this stage owns the pipeline tokenizer. |
 | `model_arch`, `hf_config_name` | Stage-specific model architecture and nested HF config selector. |
+| `scheduler_window_policy` | Optional dotted class path implementing `SchedulerWindowPolicy`. The scheduler creates one instance for this stage to handle window admission, appends and request lifecycle events. Defaults to `None`; the MiniCPM-o duplex Thinker stage supplies a policy. |
 | `engine_output_type` | Canonical runtime output type: `text`, `image`, `audio`, `latent`, or `token_ids`. |
 | `custom_process_input_func` | Processor applied to this stage's incoming payload. |
 | `custom_process_next_stage_input_func` | Processor used for full-payload handoff to the next stage. |

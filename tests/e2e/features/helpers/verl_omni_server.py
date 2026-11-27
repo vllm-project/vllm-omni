@@ -97,14 +97,36 @@ def normalize_token_ids(tokenized_output) -> list[int]:
     return out
 
 
+def _optional_bool_vllm_args() -> set[str]:
+    """Verbatim port of ``verl.workers.rollout.vllm_rollout.utils._optional_bool_vllm_args``."""
+    from dataclasses import fields
+    from typing import get_args
+
+    from vllm.engine.arg_utils import AsyncEngineArgs
+
+    return {
+        field.name
+        for field in fields(AsyncEngineArgs)
+        if set(get_args(field.type)) == {bool, type(None)}
+        or (field.type is bool and (field.default is None or field.default is True))
+    }
+
+
 def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
     cli_args: list[str] = []
+    optional_bool_args = None
     for k, v in config.items():
         if v is None:
             continue
         if isinstance(v, bool):
             if v:
                 cli_args.append(f"--{k}")
+            else:
+                if optional_bool_args is None:
+                    optional_bool_args = _optional_bool_vllm_args()
+                if k.replace("-", "_") in optional_bool_args:
+                    # Omission may preserve True or resolve a delayed None to True.
+                    cli_args.append(f"--no-{k}")
         elif isinstance(v, list):
             if not v:
                 continue
@@ -114,6 +136,21 @@ def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
             cli_args.append(f"--{k}")
             cli_args.append(json.dumps(v) if isinstance(v, dict) else str(v))
     return cli_args
+
+
+def parse_serve_args(server_args_list: list[str]) -> TrackingNamespace:
+    """Parse ``vllm serve`` arguments with the production CLI, validation included."""
+    parser = TrackingArgumentParser(description="vLLM-Omni CLI")
+    subparsers = parser.add_subparsers(required=False, dest="subparser")
+    cmds: dict[str, Any] = {}
+    for cmd in vllm_omni.entrypoints.cli.serve.cmd_init():
+        cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
+        cmds[cmd.name] = cmd
+    parsed = parser.parse_args(args=server_args_list)
+    parsed.model = parsed.model_tag
+    if parsed.subparser in cmds:
+        cmds[parsed.subparser].validate(parsed)
+    return parsed
 
 
 def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -207,18 +244,7 @@ class vLLMOmniHttpServerLocal:
         model_path = str(_cfg_get(self.model_config, "local_path", None) or _cfg_get(self.model_config, "path"))
         server_args_list = ["serve", model_path] + build_cli_args_from_config(args)
 
-        parser = TrackingArgumentParser(description="vLLM-Omni CLI")
-        subparsers = parser.add_subparsers(required=False, dest="subparser")
-        cmds: dict[str, Any] = {}
-        for cmd in vllm_omni.entrypoints.cli.serve.cmd_init():
-            cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
-            cmds[cmd.name] = cmd
-        parsed = parser.parse_args(args=server_args_list)
-        parsed.model = parsed.model_tag
-        if parsed.subparser in cmds:
-            cmds[parsed.subparser].validate(parsed)
-
-        await self.run_server(parsed)
+        await self.run_server(parse_serve_args(server_args_list))
 
     async def run_server(self, args: TrackingNamespace) -> None:
         # Match the production entrypoint: parser defaults are not user overrides.

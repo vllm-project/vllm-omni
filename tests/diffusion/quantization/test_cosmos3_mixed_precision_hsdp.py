@@ -196,6 +196,16 @@ def _run_hsdp(rank, world_size, init_method, fmt, backend, parallel):
         destroy_distributed_environment()
 
 
+def _hardware_marks(backend: str | None, num_cards: int) -> list:
+    # FlashInfer CuTe DSL is NVIDIA-only. FP8 and NVFP4 emulation are validated
+    # on one MI300; multi-card variants stay CUDA-only for now.
+    if backend == "flashinfer_cutedsl":
+        return hardware_marks(res={"cuda": "B200"}, num_cards=num_cards)
+    if num_cards == 1:
+        return hardware_marks(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=num_cards)
+    return hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=num_cards)
+
+
 @pytest.mark.parametrize(
     "fmt,backend,parallel,world_size",
     [
@@ -205,10 +215,7 @@ def _run_hsdp(rank, world_size, init_method, fmt, backend, parallel):
             parallel,
             world_size,
             id=f"{fmt}-{backend}-{parallel}-{world_size}",
-            marks=hardware_marks(
-                res={"cuda": "B200" if backend == "flashinfer_cutedsl" else ["H100", "B200"]},
-                num_cards=world_size,
-            ),
+            marks=_hardware_marks(backend, world_size),
         )
         for fmt, backend in (("FP8", "auto"), ("NVFP4", "emulation"), ("NVFP4", "flashinfer_cutedsl"))
         for parallel, world_size in (

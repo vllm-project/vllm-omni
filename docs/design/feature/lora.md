@@ -18,7 +18,7 @@ applied to. User-facing configuration is in
 
 | | LLM stages (vLLM LoRA) | Diffusion stages (diffusion LoRA manager) |
 | --- | --- | --- |
-| Which models | The model class the stage loads must implement vLLM's `SupportsLoRA`; vLLM checks this when the stage engine starts. Examples: BAGEL stage 0 (`OmniBagelForConditionalGeneration`, run on GPU in [#8196](https://github.com/vllm-project/vllm-omni/pull/8196)) and the HunyuanImage-3 AR stage. The Qwen2.5-Omni and Qwen3-Omni pipelines load `Qwen2_5OmniForConditionalGeneration` / `Qwen3OmniMoeForConditionalGeneration` on stage 0, which do not implement it, and neither do talker or code2wav stages. | Pipelines listed in the [Diffusion LoRA guide](../../user_guide/diffusion/lora.md) |
+| Which models | Runtime `enable_lora` checks upstream `SupportsLoRA` on the loaded stage class when the engine starts (for example BAGEL stage 0 and the HunyuanImage-3 AR stage). Wrapper classes such as `Qwen2_5OmniForConditionalGeneration` and `Qwen3OmniMoeForConditionalGeneration` do not implement `SupportsLoRA` for runtime `enable_lora`, though their inner thinkers do; merged mode (`omni_lora_ipc`) bypasses runtime `enable_lora` and uses `SupportsMergedLoRA` / `packed_modules_mapping` instead. | Pipelines listed in the [Diffusion LoRA guide](../../user_guide/diffusion/lora.md) |
 | Enabled by | `enable_lora` on that stage (stage-scoped key in multi-stage pipelines) | `lora_path` / `lora_backend` on the diffusion config |
 | Adapters per request | One, on the entry stage only | One or a supported composition (PEFT backend); the distill backend fuses its weights once at initialization |
 | Limits | vLLM's `LoRAConfig` options of that stage (`max_loras`, `max_lora_rank`, `max_cpu_loras`, target modules) | `max_cpu_loras` of the diffusion config |
@@ -102,13 +102,35 @@ reject merged application during metadata loading because their sampling
 contract depends on runtime activation. See
 [adapter-declared schedules](../../user_guide/diffusion/lora.md#minimax-h3-adapter-declared-schedules).
 
+## Merged LoRA mode
+
+Engine-side merged LoRA updates live dense weights in place (`W = W_base + (B @ A) * scale` in fp32 from a host-resident pristine bank) without installing runtime LoRA wrappers into the forward module tree.
+
+### Application modes by stage type
+
+| Mode | Stage types | Forward path | Adapter updates |
+| --- | --- | --- | --- |
+| Runtime wrappers (`lora_application="runtime"`, `enable_lora=True`) | LLM and diffusion | Punica / wrapped linear layers | Per-request `LoRARequest`, `add_lora` / `remove_lora` / `pin_lora` |
+| Merged global policy (`lora_application="merged"`, `backend="omni_lora_ipc"`) | LLM (`enable_lora=False`) and diffusion | Unwrapped dense linear layers | Four-phase weight-transfer session while inference is paused |
+| Distill init-fuse (`lora_backend="distill"`) | Diffusion | Fused at checkpoint load | Static for process lifetime |
+
+### Serving and lifecycle rules
+
+- A merged engine serves one global policy. Generation requests must omit `LoRARequest`; passing a per-request adapter raises on diffusion stages and runtime `add_lora` / `pin_lora` raise on both stage types.
+- `remove_lora` restores the pristine base weights from the host bank and clears the registered merged adapter id.
+- `list_loras` reports the active merged adapter id.
+- Serving reuse between training steps requires pausing generation across each `start_weight_update` / `update_weights` / `finish_weight_update` session and invalidating caches after sync.
+- Models declare merged-LoRA support through `SupportsMergedLoRA` (`merged_lora_spec()` in `vllm_omni/lora/capability.py`). AR stages compose upstream `SupportsLoRA` declarations (`packed_modules_mapping`, `hf_to_vllm_mapper`). Pipelines that do not yet support merged LoRA or are runtime-only are registered explicitly in `vllm_omni/lora/capability.py` with a named reason.
+
 ## Not supported
 
 - One request applying different adapters to different LLM stages, or any
   adapter on a downstream LLM stage.
-- Enabling vLLM LoRA on several LLM stages of a multi-stage pipeline with a
-  single global option.
+- Enabling runtime vLLM LoRA (`enable_lora=True`) on several LLM stages of a multi-stage pipeline with a
+  single global option, or combining runtime `enable_lora=True` with `omni_lora_ipc` on the same stage.
 - Sharing an adapter cache between an LLM stage and a diffusion stage.
-- LoRA on an LLM stage whose model class does not implement `SupportsLoRA`.
+- Runtime LoRA (`enable_lora=True`) on an LLM stage whose loaded model class does not implement `SupportsLoRA`.
+- Merged LoRA on expert-routed MoE layers, quantized linears, HSDP, or inference weight offloading.
 - Applying a request's adapter to its CFG companion requests, or to the decode
   stage of a prefill-decode disaggregated pipeline.
+- Stacking several adapters in one diffusion request in merged mode.

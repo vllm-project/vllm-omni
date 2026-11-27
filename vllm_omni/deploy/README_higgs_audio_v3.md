@@ -138,6 +138,61 @@ trace for the exact Higgs batch/context distribution. Until vLLM has a
 workload-aware selector or XQA is faster for this BF16 shape, the model-level
 pin is the deterministic choice.
 
+## MRv2 INT8 drafting
+
+`higgs_audio_int8` is opt-in. The INT8 copy drafts one eight-codebook row and the
+BF16 Talker verifies it using the seeded single-step sampler's noise. Use one
+CUDA SM80+ GPU, BF16 target weights, FlashAttention, async scheduling, and
+`VLLM_BATCH_INVARIANT=1`. Keep prefix caching disabled. The extra weights reduce
+the memory available for the Stage 0 KV cache.
+
+Copy `higgs_multimodal_qwen3_mrv2_h200.yaml` to `higgs-k1.yaml`. For Stage 0,
+merge the fields below into the existing stage entry and remove
+`compilation_config.max_cudagraph_capture_size`.
+
+```yaml
+max_num_seqs: 16
+gpu_memory_utilization: 0.45
+async_scheduling: true
+enable_prefix_caching: false
+attention_backend: FLASH_ATTN
+max_num_batched_tokens: 2048
+max_model_len: 2048
+default_sampling_params:
+  max_tokens: 512
+compilation_config:
+  mode: 0
+  cudagraph_capture_sizes: [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48]
+speculative_config:
+  method: higgs_audio_int8
+  num_speculative_tokens: 1
+hf_overrides:
+  audio_full_sample_graph: true
+  enable_mlp_cudagraph: false
+```
+
+For Stage 1, set `max_num_seqs: 16`, `gpu_memory_utilization: 0.2`, and
+`hf_overrides.codec_cuda_graph: false`. For the single-step baseline, copy
+the resulting profile and remove Stage 0's `speculative_config`.
+
+```bash
+VLLM_BATCH_INVARIANT=1 VLLM_USE_DEEP_GEMM=0 VLLM_MOE_USE_DEEP_GEMM=0 \
+  vllm-omni serve bosonai/higgs-tts-3-4b --omni --trust-remote-code \
+  --revision 239f63fb7b02b1aa085f98d9efae5e35cc5523e8 --port 8098 \
+  --deploy-config higgs-k1.yaml
+```
+
+Send the same seeded request to each server and compare the audio chunk sizes
+and completion events.
+
+```bash
+curl --fail-with-body --no-buffer http://127.0.0.1:8098/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"bosonai/higgs-tts-3-4b","input":"The morning train arrived just as the lights came on.","seed":42,"max_new_tokens":512,"stream":true,"stream_format":"sse","response_format":"pcm"}'
+```
+
+Unseeded requests and the closing delay ramp use single-step sampling.
+
 ## Notes
 
 - Stage 1 remains `enforce_eager: true` in every profile (the codec CUDA

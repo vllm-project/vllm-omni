@@ -41,7 +41,7 @@ def _graph_key(model, batch, hidden, force_audio_inputs, metadata):
     )
 
 
-def _replay_captured(model, hidden, metadata, force_audio_inputs):
+def _replay_captured(model, hidden, metadata, force_audio_inputs, audio_noise=None):
     """Replay an already captured (bucket) graph writing inputs in place.
 
     The capture path below pads through temporaries on every call. Once a
@@ -70,7 +70,9 @@ def _replay_captured(model, hidden, metadata, force_audio_inputs):
         static_input_ids[:batch].copy_(model._last_step_input_ids)
         if batch < bucket:
             static_input_ids[batch:].fill_(model._audio_continuation_id)
-    if metadata.generators:
+    if audio_noise is not None:
+        static_noise[: batch * books].copy_(audio_noise)
+    elif metadata.generators:
         from vllm_omni.utils.seeded_exponential import fill_exponential_rows
 
         fill_exponential_rows(static_noise[: batch * books], [metadata.generators.get(i) for i in range(batch)])
@@ -90,10 +92,10 @@ def _replay_captured(model, hidden, metadata, force_audio_inputs):
     return output[:batch].clone()
 
 
-def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, active_batch=None):
+def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, active_batch=None, audio_noise=None):
     batch = hidden.shape[0]
     if active_batch is None:
-        replayed = _replay_captured(model, hidden, metadata, force_audio_inputs)
+        replayed = _replay_captured(model, hidden, metadata, force_audio_inputs, audio_noise)
         if replayed is not None:
             return replayed
     # Serving never captures a new shape. Unsupported shapes/metadata use the
@@ -270,6 +272,13 @@ def capture_sample_graphs(model, max_num_reqs):
         if model.mrv2_options.audio_mrv2_sample_graph_buckets
         else range(1, max_num_reqs + 1)
     )
+    if model.vllm_config.speculative_config is not None:
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+
+        rows = max(buckets) * model.num_codebooks
+        logits = torch.zeros((rows, model.modality_head.vocab_size), dtype=torch.float32, device=device)
+        top_k = torch.ones(rows, dtype=torch.int32, device=device)
+        apply_top_k_top_p(logits, top_k, None)
     model._ensure_decode_state_capacity(max(buckets), device)
     model._get_audio_gpu_staging_buffer(max(buckets), device)
     saved_state = {name: getattr(model, name).clone() for name in _STATE}

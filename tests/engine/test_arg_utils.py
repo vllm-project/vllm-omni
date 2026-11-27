@@ -288,6 +288,16 @@ def test_compute_hash_is_stable_across_launches(stage_id):
     assert first_hash == second_hash
 
 
+def test_scheduler_window_policy_preserves_the_model_compile_key():
+    config = OmniEngineArgs(worker_cls=AR_WORKER_CLS).create_engine_config()
+    assert "scheduler_window_policy" not in config.model_config.compile_factors()
+    original = hash_config(config)
+    config.model_config.scheduler_window_policy = (
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
+    )
+    assert hash_config(config) == original
+
+
 def test_compute_hash_keeps_stage_connector_settings():
     """Ensure connector settings that models read (e.g. codec chunk size) still change the hash."""
 
@@ -378,9 +388,22 @@ def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
     }
 
 
-def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, monkeypatch, mocker):
+@pytest.mark.parametrize(
+    ("model", "model_arch", "subfolder"),
+    [
+        ("remote/cosyvoice3", "CosyVoice3Model", "CosyVoice-BlankEN"),
+    ],
+)
+def test_remote_tokenizer_subfolder_download_does_not_report_failure(
+    tmp_path,
+    monkeypatch,
+    mocker,
+    model,
+    model_arch,
+    subfolder,
+):
     """A successful remote tokenizer download must not enter the error path."""
-    tokenizer_dir = tmp_path / "CosyVoice-BlankEN"
+    tokenizer_dir = tmp_path / subfolder
     tokenizer_dir.mkdir()
     baseline_config = Mock()
     warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
@@ -394,30 +417,44 @@ def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, m
         classmethod(lambda cls, model_config, **omni_kwargs: model_config),
     )
 
-    args = OmniEngineArgs(model="remote/cosyvoice3", model_arch="CosyVoice3Model")
+    args = OmniEngineArgs(model=model, model_arch=model_arch)
     assert args.create_model_config() is baseline_config
     assert args.tokenizer == str(tokenizer_dir)
     warning.assert_not_called()
 
 
-def test_patch_missing_local_hf_config(tmp_path):
+@pytest.mark.parametrize(
+    ("model_arch", "model_type"),
+    [
+        ("IndexTTS25TalkerForConditionalGeneration", "indextts2_5"),
+        (
+            "Confucius4TTSTalkerForConditionalGeneration",
+            "confucius4_tts",
+        ),
+    ],
+)
+def test_patch_missing_local_hf_config(
+    tmp_path,
+    model_arch,
+    model_type,
+):
     """Native model bundles may only contain a checkpoints/ directory."""
     (tmp_path / "checkpoints").mkdir()
     args = object.__new__(OmniEngineArgs)
     args.model = str(tmp_path)
-    args.model_arch = "IndexTTS25TalkerForConditionalGeneration"
+    args.model_arch = model_arch
     args.hf_config_path = None
 
     try:
-        args._patch_empty_hf_config("indextts2_5")
+        args._patch_empty_hf_config(model_type)
 
         assert args.hf_config_path is not None
         config_path = args.hf_config_path + "/config.json"
         with open(config_path, encoding="utf-8") as config_file:
             config = json.load(config_file)
         assert config == {
-            "model_type": "indextts2_5",
-            "architectures": ["IndexTTS25TalkerForConditionalGeneration"],
+            "model_type": model_type,
+            "architectures": [model_arch],
         }
     finally:
         if hasattr(args, "_temp_config_dir"):
@@ -519,6 +556,8 @@ def test_remote_hf_config_error_reaches_parent_loader(monkeypatch):
     """Remote resolution failures must stay on vLLM's normal error path."""
     loader_error = OSError("remote config resolution failed")
     parent_inputs = {}
+
+    monkeypatch.setattr("vllm.engine.arg_utils.get_model_path", lambda model, _revision=None: model)
 
     def controlled_get_config_dict(cls, model, **kwargs):
         raise loader_error
@@ -781,6 +820,7 @@ DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
     ("step_execution", True),
     ("vae_use_slicing", True),
     ("vae_use_tiling", True),
+    ("vae_stack_tiles", False),
     ("vae_fast_path", "channels_last"),
     ("vae_encode_fast_path", "off"),
     ("enable_multithread_weight_load", False),
@@ -790,6 +830,7 @@ DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
     ("enable_cpu_offload", True),
     ("enable_layerwise_offload", True),
     ("enable_distributed_layerwise_offload", True),
+    ("enable_submodule_offload", True),
     ("dlo_use_allgather", False),
     ("dlo_resident_layers", 2),
     ("host_weight_runtime_mode", "preferred"),
@@ -840,6 +881,7 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
         "enable_cuda_graph_decode": False,
         "enable_cfg_batching": True,
         "vae_encode_fast_path": "off",
+        "enable_submodule_offload": True,
     }
     engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**overrides))
     stage_cfg = StageConfigFactory.create_default_diffusion(
@@ -854,6 +896,7 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
     assert resolved["enable_cuda_graph_decode"] is False
     assert resolved["enable_cfg_batching"] is True
     assert resolved["vae_encode_fast_path"] == "off"
+    assert resolved["enable_submodule_offload"] is True
 
 
 @pytest.mark.parametrize(
@@ -873,7 +916,8 @@ def test_native_mrv2_worker_provides_connector_without_legacy_mixin(worker_cls):
 DIFFUSION_PARALLEL_KNBS = [
     ("ulysses_degree", 4),
     ("ulysses_mode", "advanced_uaa"),
-    ("ulysses_a2a_permute", True),
+    ("ulysses_overlap_chunks", 2),
+    ("ulysses_a2a_backend", "copy_engine"),
     ("ring_degree", 2),
     ("allgather_degree", 8),
     ("use_hsdp", True),
@@ -908,6 +952,9 @@ def test_from_cli_args_applies_diffusion_parallel_knobs():
             # Standalone HSDP (all other parallelism at 1) cannot
             # auto-calculate its shard size; pass one explicitly.
             factory_kwargs["hsdp_shard_size"] = 2048
+        if knob == "ulysses_overlap_chunks":
+            # The overlap runs on the copy-engine exchange.
+            factory_kwargs["ulysses_a2a_backend"] = "copy_engine"
         stage_cfg = StageConfigFactory.create_default_diffusion(factory_kwargs)[0]
         parallel_config = stage_cfg["engine_args"]["parallel_config"]
         assert parallel_config[knob] == value, f"{knob} did not reach parallel_config"

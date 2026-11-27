@@ -83,6 +83,7 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
     StageMetricsMessage,
     StageSubmissionMessage,
+    TextInputUpdate,
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import (
@@ -212,8 +213,14 @@ def build_engine_core_request_from_tokens(
 
     sampling_params = None
     pooling_params = None
+    return_hidden_states = False
     if isinstance(params, SamplingParams):
         sampling_params = params.clone()
+        extra_args = getattr(sampling_params, "extra_args", None)
+        if isinstance(extra_args, dict) and extra_args.get("return_hidden_states"):
+            # Lift the client-side extra_args opt-in onto the typed wire field
+            # so the runner never inspects free-form extra_args.
+            return_hidden_states = True
         if model_config is not None:
             remaining = model_config.max_model_len - length_from_prompt_token_ids_or_embeds(
                 prompt_token_ids, prompt_embeds
@@ -256,6 +263,7 @@ def build_engine_core_request_from_tokens(
         resumable=resumable,
         additional_information=additional_info_payload,
         model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
+        return_hidden_states=return_hidden_states,
     )
 
 
@@ -2879,6 +2887,24 @@ class OrchestratorBase:
     ) -> Any:
         """Process a bypassing request's raw prompt with the input processor that also prepares the
         prompts forwarded to this stage, so the stage keeps a single multimodal cache sender."""
+        startup_marker = os.getenv("MINICPMO_NPU_TALKER_PREFILL_STARTUP")
+        if (
+            stage_id == 1
+            and startup_marker
+            and req_id.startswith("minicpmo-talker-startup-")
+            and os.path.isfile(startup_marker)
+            and self._next_stage_input_is_tokens(prompt)
+        ):
+            # A synthetic Talker handoff is already tokenized. Use the same
+            # constructor as a normal Thinker-to-Talker transfer.
+            request = await self._build_next_stage_request(
+                req_id,
+                stage_id,
+                prompt,
+                req_state.sampling_params_list[stage_id],
+                replica_id=replica_id,
+            )
+            return apply_omni_final_stage_metadata(request, req_state.final_stage_id)
         if replica_id is not None:
             prompt = await asyncio.to_thread(self._scope_stage_mm_cache_to_replica, stage_id, prompt, replica_id)
         request = await self._process_stage_inputs(
@@ -3468,6 +3494,9 @@ class OrchestratorBase:
                 return
 
             final_stage_id = req_state.final_stage_id
+            # async-chunk may have prewarmed stages past this one; they will
+            # never receive input, so abort them instead of waiting for timeout.
+            prewarmed_downstream = any(stage > src_stage_id for stage in req_state.stage_submit_ts)
             final_pool = self.stage_pools[final_stage_id]
             final_output_type = getattr(final_pool.stage_client, "final_output_type", None)
             terminal_output = _build_terminal_empty_output(
@@ -3496,7 +3525,9 @@ class OrchestratorBase:
                     stage_submit_ts=submit_ts,
                 )
             )
-            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+            await self._cleanup_request_ids(
+                [req_id, *self._cfg_tracker.cleanup_parent(req_id)], abort=prewarmed_downstream
+            )
             return
 
         self._annotate_next_stage_inputs(src_stage_id, req_state, next_inputs)
@@ -3786,6 +3817,8 @@ class OrchestratorBase:
                 except StageUnavailableError:
                     await self._fail_request_dead_stage(request_id, route_stage_id)
                     return False
+            if next_stage_id == 2 and pinned_replica_id is None and not req_state.session_owned:
+                pinned_replica_id = next_pool.select_code2wav_replica(request_id)
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
             stamp_downstream_stage_submit(
                 req_state,
@@ -3862,6 +3895,11 @@ class OrchestratorBase:
                             memo,
                             shared_types=(torch.Tensor,),
                         )
+                        additional_information = base_input["additional_information"]
+                        if isinstance(additional_information, dict):
+                            for key in list(additional_information):
+                                if key == "input_stream" or key.startswith("input_stream."):
+                                    additional_information.pop(key)
                 else:
                     base_input = {}
 
@@ -4110,6 +4148,25 @@ class Orchestrator(OrchestratorBase):
             await self._handle_add_request(cast(StageSubmissionMessage, msg))
         elif msg_type == "streaming_update":
             await self._handle_streaming_update(cast(StageSubmissionMessage, msg))
+        elif msg_type == "append_text":
+            append = cast(TextInputUpdate, msg)
+            state = self.request_states.get(append.request_id)
+            if state is None:
+                await self.output_async_queue.put(
+                    ErrorMessage(
+                        request_id=append.request_id,
+                        error="No active request for text input append",
+                        fatal=False,
+                        status_code=400,
+                    )
+                )
+            else:
+                await self._dispatch_or_fail_request(
+                    lambda: self.stage_pools[state.entry_stage_id].append_text(append),
+                    req_id=state.request_id,
+                    stage_id=state.entry_stage_id,
+                    operation="append_text",
+                )
         elif msg_type == "add_companion_request":
             await self._handle_add_companion(cast(AddCompanionRequestMessage, msg))
         elif msg_type == "interaction":

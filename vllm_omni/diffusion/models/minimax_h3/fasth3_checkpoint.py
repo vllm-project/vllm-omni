@@ -20,6 +20,7 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 from .fasth3 import FASTH3_BASE_MODEL
+from .variant import FASTH3_OMNI, FASTH3_V2, H3Variant
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import AttentionSpec, OmniDiffusionConfig
@@ -100,12 +101,15 @@ class FastH3CheckpointSpec:
     """
 
     name: ClassVar[str] = "FastH3 V2"
+    variant: ClassVar[H3Variant] = FASTH3_V2
     partition: ClassVar[str] = "fl2va"
     transformer_component: ClassVar[str] = "transformer"
     video_shift: ClassVar[float] = 10.0
     vsa_tile_size: ClassVar[int] = 64
     vsa_ref_policy: ClassVar[str | None] = None
     vsa_ref_keep_rate: ClassVar[float | None] = None
+    # The V2 student's VSA gates were trained without adapters; Omni takes ordinary ones.
+    accepts_request_lora: ClassVar[bool] = False
     vsa_sparsity: float = 0.8
 
     @classmethod
@@ -204,7 +208,7 @@ class FastH3CheckpointSpec:
                 raise OmniClientError(f"{self.name} step execution does not support custom timesteps or sigmas")
         if sampling.timesteps is not None or sampling.sigmas is not None:
             raise OmniClientError(f"{self.name} does not support custom timesteps or sigmas")
-        if sampling.lora_request is not None and not isinstance(self, FastH3OmniCheckpointSpec):
+        if sampling.lora_request is not None and not self.accepts_request_lora:
             raise OmniClientError(f"{self.name} does not support per-request LoRA adapters")
         steps = sampling.num_inference_steps
         if steps is not None and steps != FASTH3_V2_BASE_SCHEDULE.num_inference_steps:
@@ -226,12 +230,14 @@ class FastH3OmniCheckpointSpec(FastH3CheckpointSpec):
     """Ref2VA PDD release, with frozen components from a pinned native base."""
 
     name: ClassVar[str] = "FastH3 Omni"
+    variant: ClassVar[H3Variant] = FASTH3_OMNI
     partition: ClassVar[str] = "ref2va"
     transformer_component: ClassVar[str] = "transformer_ref"
     video_shift: ClassVar[float] = 12.0
     vsa_tile_size: ClassVar[int] = 128
     vsa_ref_policy: ClassVar[str] = "p2_multi_region"
     vsa_ref_keep_rate: ClassVar[float] = 0.1
+    accepts_request_lora: ClassVar[bool] = True
     vsa_sparsity: float = 0.9
     base_revision: str = ""
 
