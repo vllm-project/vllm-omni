@@ -1186,10 +1186,10 @@ class TestSpeechAPI:
         """A name colliding with a built-in or precomputed voice is rejected."""
         handler = client.app.state.openai_serving_speech
         handler._adapter.capabilities.supported_speakers = {"vivian"}
-        handler._adapter.capabilities.precomputed_speakers = {"ono_anna": {}}
+        handler._adapter.capabilities.precomputed_speakers = {"one_anna": {}}
 
         files = {"audio_sample": ("test.wav", b"fake audio content" * 1000, "audio/wav")}
-        for reserved in ("Vivian", "ono_anna"):
+        for reserved in ("Vivian", "one_anna"):
             response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": reserved})
             assert response.status_code == 400
             assert "reserved" in response.json()["detail"]

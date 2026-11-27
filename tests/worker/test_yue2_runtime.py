@@ -160,8 +160,8 @@ def test_detach_and_delayed_completion_with_coalesced_tokens(mocker, outcome):
     assert step(payload=payload) == []
 
 
-def test_semantic_transition_carries_client_seed_and_isolation_optin(mocker):
-    """#11246: the ABC -> semantic transition keeps the isolation opt-in.
+def test_semantic_transition_carries_client_seed_and_isolation_flag(mocker):
+    """#11246: the ABC -> semantic transition keeps the isolation flag.
 
     The semantic phase rebuilds SamplingParams from the nested semantic args;
     the client seed (request-local randomness) and the explicit
