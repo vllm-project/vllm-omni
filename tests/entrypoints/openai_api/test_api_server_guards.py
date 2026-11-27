@@ -909,7 +909,10 @@ def test_should_enable_profiler_endpoints_matches_stage_config(stage_configs, ex
 
 
 @pytest.mark.asyncio
-async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_router(monkeypatch) -> None:
+@pytest.mark.parametrize("model_class_name", [None, "Motubrain2Pipeline"])
+async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_router(
+    monkeypatch, model_class_name
+) -> None:
     """Lock worker assembly: override, mount, storage, handlers, full census.
 
     Fails if assembly stops replacing upstream chat/batch/models/health/profiler,
@@ -997,7 +1000,7 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
 
     sock = _FakeSocket()
-    await api_server.omni_run_server_worker("127.0.0.1:8000", sock, _minimal_args())
+    await api_server.omni_run_server_worker("127.0.0.1:8000", sock, _minimal_args(model_class_name=model_class_name))
 
     served_wrapper = captured["served_app"]
     # Timestamp middleware wraps the FastAPI app.
@@ -1006,6 +1009,7 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     routes = served_app.routes
     _assert_unique_route_entries(routes)
     manifest = _route_manifest(routes)
+    assert (("WEBSOCKET", "/v1/realtime/robot/motubrain2") in manifest) == (model_class_name == "Motubrain2Pipeline")
 
     assert captured["supported_tasks"] == ("generate",)
     assert captured["storage_started"] is True

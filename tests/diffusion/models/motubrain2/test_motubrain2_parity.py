@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from PIL import Image
 from safetensors.torch import load_file
 
@@ -18,9 +20,8 @@ from vllm_omni.diffusion.models.motubrain2 import pipeline_motubrain2
 from vllm_omni.diffusion.output_formatter import format_diffusion_outputs, normalize_diffusion_postprocess_output
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.entrypoints.openpi.connection import _pack, _unpack
-from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.entrypoints.motubrain2 import router
+from vllm_omni.entrypoints.motubrain2_codec import pack_message, unpack_message
 
 pytestmark = [pytest.mark.cpu, pytest.mark.local_model, pytest.mark.diffusion]
 
@@ -82,32 +83,45 @@ def test_native_cli_matches_pipeline(tmp_path, monkeypatch):
     for camera, (filename,) in record["cameras"].items():
         with Image.open(assets / filename) as frame:
             obs[camera] = np.array(frame.convert("RGB"))
-    params = OmniDiffusionSamplingParams(
-        generator=torch.Generator().manual_seed(seed),
-        num_inference_steps=steps,
-        extra_args={"session_id": "parity", "robot_obs": obs},
-    )
-    req = OmniDiffusionRequest(prompt=obs["prompt"], sampling_params=params, request_id="tiny-policy")
-    result = pipeline(DiffusionRequestBatch([req]))
-    assert result.error is None
+
+    class TinyEngine:
+        def get_diffusion_od_config(self):
+            metadata = {"action_horizon": pipeline.horizon, "action_dim": pipeline.action_dim}
+            return SimpleNamespace(model_config={"motubrain2_metadata": metadata})
+
+        async def generate(self, *, prompt, sampling_params_list, request_id):
+            (params,) = sampling_params_list
+            request = OmniDiffusionRequest(prompt=prompt, sampling_params=params, request_id=request_id)
+            result = pipeline(DiffusionRequestBatch([request]))
+            assert result.error is None
+            (formatted,) = format_diffusion_outputs(
+                request=request,
+                od_config=pipeline.od_config,
+                diffusion_output=result,
+                output_data=result.output,
+                postprocess_output=normalize_diffusion_postprocess_output(result.output),
+            )
+            yield formatted
+
+    app = FastAPI()
+    app.state.engine_client = TinyEngine()
+    endpoint = "/v1/realtime/robot/motubrain2"
+    app.include_router(router)
+    obs.update(seed=seed, sampling_params={"num_inference_steps": steps})
+    with TestClient(app) as client, client.websocket_connect(endpoint) as socket:
+        metadata = unpack_message(socket.receive_bytes())
+        assert metadata["action_horizon"] == pipeline.horizon
+        socket.send_bytes(pack_message(obs))
+        response = unpack_message(socket.receive_bytes())
+        socket.send_bytes(pack_message({**obs, "return_native_outputs": False}))
+        actions = unpack_message(socket.receive_bytes())
+
     native = load_file(reference)
     assert native["decoded_valid"].all()
-    np.testing.assert_allclose(result.output["actions"], native["decoded_action"].numpy(), atol=1e-6, rtol=0)
-    (formatted,) = format_diffusion_outputs(
-        request=req,
-        od_config=pipeline.od_config,
-        diffusion_output=result,
-        output_data=result.output,
-        postprocess_output=normalize_diffusion_postprocess_output(result.output),
-    )
-    capability = {"action_horizon": pipeline.horizon, "action_dim": pipeline.action_dim}
-    serving = ServingRealtimeRobotOpenPI(
-        engine_client=SimpleNamespace(model_config={"policy_server_config": capability})
-    )
-    response = _unpack(_pack(serving._extract_actions(formatted, return_native_outputs=True)))
     assert response.keys() == native.keys() == {"video", "action", "decoded_action", "decoded_valid"}
     for name, tensor in native.items():
         expected = tensor.numpy()
         assert response[name].dtype == expected.dtype
-        np.testing.assert_allclose(response[name], expected, atol=1e-6, rtol=0)
-    np.testing.assert_array_equal(serving._extract_actions(formatted), response["decoded_action"])
+        np.testing.assert_array_equal(response[name], expected)
+    assert actions.dtype == np.float32
+    np.testing.assert_array_equal(actions, response["decoded_action"])

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""OpenPI serving adapter for the external Motubrain 2.0 policy."""
+"""Diffusion serving adapter for the external Motubrain 2.0 policy."""
 
 from __future__ import annotations
 
@@ -195,7 +195,7 @@ class Motubrain2Pipeline(nn.Module):
         self._holds_state = any(not field.get("model_used", True) for field in fields)
         self._needs_extrinsic = any(field["kind"] == "eef_camera" and field.get("model_used", True) for field in fields)
         self.default_num_inference_steps = self.policy.sampling["steps"]
-        self._validate_handshake(config.get("policy_server_config"))
+        self._validate_handshake(config.get("motubrain2_metadata"))
 
         self.rtc_config = validate_rtc_config(config.get("rtc"), self.horizon)
         self.sessions = SessionStore(config.get("max_sessions", 64))
@@ -235,7 +235,7 @@ class Motubrain2Pipeline(nn.Module):
         }
         for field, value in expected.items():
             if handshake.get(field) != value:
-                raise ValueError(f"policy_server_config.{field} must match the robot profile: expected {value!r}.")
+                raise ValueError(f"motubrain2_metadata.{field} must match the robot profile: expected {value!r}.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]] = ()) -> None:
         """The native policy already loaded and validated its own checkpoints."""
@@ -285,7 +285,7 @@ class Motubrain2Pipeline(nn.Module):
             policy.sampling = {**policy.sampling, "steps": int(steps)}
         extra = params.extra_args or {}
         session = self.sessions.peek(session_id)
-        session_seed = extra.get("openpi_session_seed")
+        session_seed = extra.get("motubrain2_session_seed")
         generator = params.generator
         if isinstance(generator, list) and len(generator) == 1:
             generator = generator[0]

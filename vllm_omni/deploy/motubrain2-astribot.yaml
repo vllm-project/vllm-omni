@@ -4,7 +4,7 @@ stages:
   - stage_id: 0
     engine_extras:
       model_config:
-        policy_server_config:
+        motubrain2_metadata:
           image_resolution: [720, 1280]
           # Torso pose, two head joints, left pose/gripper, right pose/gripper.
           # Each pose is XYZ + XYZW.

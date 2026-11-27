@@ -1,4 +1,4 @@
-# RoboTwin policy. One worker handles one OpenPI observation at a time.
+# RoboTwin policy. One worker handles one robot observation at a time.
 pipeline: motubrain2
 async_chunk: false
 distributed_executor_backend: mp
@@ -12,8 +12,6 @@ stages:
     enforce_eager: false
     default_sampling_params:
       seed: 0
-      extra_args:
-        openpi_session_rng: true
     model_class_name: Motubrain2Pipeline
     engine_extras:
       model_config:
@@ -23,7 +21,7 @@ stages:
         wan_subfolder: vae
         text_encoder: google/t5gemma-9b-9b-prefixlm-it
         da3: depth-anything/DA3-LARGE-1.1
-        policy_server_config:
+        motubrain2_metadata:
           image_resolution: [480, 640]
           n_external_cameras: 1
           needs_wrist_camera: true

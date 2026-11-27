@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Convert OpenPI robot observations into native Motubrain policy inputs."""
+"""Convert robot observations into native Motubrain policy inputs."""
 
 from __future__ import annotations
 
@@ -124,7 +124,7 @@ def build_observation(
 ) -> dict:
     """Build the observation expected by ``RawPolicy.predict``.
 
-    OpenPI delivers cameras as HWC uint8 arrays (or lists of frames). The native
+    Robot clients send cameras as HWC uint8 arrays (or lists of frames). The native
     policy expects ``[T, H, W, 3]`` uint8 clips keyed by the profile camera
     source. Optional ``state`` and ``camera_extrinsic`` values pass through.
     """

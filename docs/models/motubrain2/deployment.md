@@ -1,11 +1,10 @@
 # Motubrain 2.0 robot policy
 
 Motubrain predicts a chunk of controller actions from synchronized RGB views,
-a language instruction and the current robot pose. vLLM-Omni runs the external
-Motubrain policy in a single diffusion worker and serves its decoded actions
-through the [OpenPI WebSocket API](../../serving/openpi_api.md).
-The single-GPU BF16 configuration is the starting point for the Astribot S1
-and RoboTwin profiles in the [model support table](../supported_models.md).
+a language instruction and the current robot pose. A vLLM-Omni diffusion worker
+loads the Motubrain checkpoint and serves its decoded actions over the
+Motubrain WebSocket at `/v1/realtime/robot/motubrain2`. The single-GPU BF16
+configuration supports Astribot S1 and RoboTwin.
 
 ## Model and controller contract
 
@@ -39,7 +38,8 @@ Read `decoded_valid` before using native controller coordinates. A native
 response with masked coordinates clears the session's RTC prefix. An ordinary
 controller request requires every decoded coordinate to be valid.
 For real-time chunking, set `rtc.enabled` and
-`policy_server_config.needs_session_id` to true in the model configuration.
+`motubrain2_metadata.needs_session_id` to true under
+`stages[0].engine_extras.model_config` in the deployment YAML.
 Set `rtc.execute_prefix` to the number of actions the client executes per chunk.
 Use a unique `session_id` for each RTC rollout, e.g. a UUID. Send it with
 the first observation and again after a reset. The connection reuses the
@@ -171,9 +171,56 @@ Pass `--enforce-eager` to select eager kernels.
 FP32 denoiser weights require more memory. The external encoders apply their
 own precision policy.
 
+## Connect a robot client
+
+Connect the client to `ws://localhost:8000/v1/realtime/robot/motubrain2`.
+Replace `localhost` with the inference host when connecting from another
+machine. The server sends the profile metadata in the first binary MessagePack
+frame. Send one observation per binary frame (up to 64 MiB) and wait for its
+reply before submitting the next observation. Errors arrive as a mapping with
+`type: error` and a `message`. Existing robot clients that use the
+`__ndarray__` MessagePack marker with `dtype`, `shape` and `data` fields can
+keep their observation and reply formats when pointed at this URL.
+For Astribot S1 deployments using a RealWorldInference adapter, set the
+adapter's backend URL to the Motubrain endpoint. The adapter still supplies
+the calibrated extrinsic, synchronized camera frames and formatted instruction.
+
+The following example replays an Astribot observation saved as a NumPy archive.
+It reads the three RGB frames, the state and the extrinsic from the same capture.
+Run it in a client environment with the codec from the same vLLM-Omni checkout.
+The example checkout path on the client is `/opt/vllm-omni`.
+
+```bash
+uv pip install numpy msgpack 'websockets>=12'
+export PYTHONPATH="/opt/vllm-omni/vllm_omni/entrypoints${PYTHONPATH:+:${PYTHONPATH}}"
+```
+
+```python
+from uuid import uuid4
+
+import numpy as np
+from motubrain2_codec import pack_message, unpack_message
+from websockets.sync.client import connect
+
+uri = "ws://localhost:8000/v1/realtime/robot/motubrain2"
+with connect(uri, compression=None, max_size=None) as ws:
+    meta = unpack_message(ws.recv())
+    assert (meta["action_horizon"], meta["action_dim"]) == (24, 25)
+    with np.load("/models/calibration/astribot_observation.npz", allow_pickle=False) as record:
+        keys = (*meta["camera_sources"], "state", "camera_extrinsic")
+        observation = {key: record[key] for key in keys}
+    session = str(uuid4())
+    ws.send(pack_message({**observation, "prompt": "Pick up the object", "session_id": session, "seed": 42}))
+    actions = unpack_message(ws.recv())
+    assert isinstance(actions, np.ndarray) and actions.dtype == np.float32
+    assert actions.shape == (24, 25) and np.isfinite(actions).all()
+    ws.send(pack_message({"endpoint": "reset", "session_id": session}))
+    assert unpack_message(ws.recv())["status"] == "reset successful"
+```
+
 ## Verification
 
-Earlier qualification used vLLM 0.34.0, PyTorch 2.14.0, CUDA 13.0 and BF16
+Earlier worker qualification used vLLM 0.34.0, PyTorch 2.14.0, CUDA 13.0 and BF16
 denoiser weights on NVIDIA B200. Two requests
 with seed 42 for one recorded Astribot observation reproduced all 600 native
 action values on each tested deployment. Distill used its four-step consistency
@@ -190,33 +237,13 @@ A separate RoboTwin WebSocket test exercised the released DMD
 checkpoint with synthetic inputs and checked the 24 × 16 reply, unit pose
 quaternions and reset.
 
-Install `openpi-client` in a separate client environment and connect to
-`ws://localhost:8000/v1/realtime/robot/openpi`. For a recorded Astribot
-observation, the following checks the reply without sending commands to a robot.
-
-```python
-import numpy as np
-from openpi_client.websocket_client_policy import WebsocketClientPolicy
-
-policy = WebsocketClientPolicy(host="ws://localhost:8000/v1/realtime/robot/openpi")
-meta = policy.get_server_metadata()
-assert meta["action_dim"] == 25
-# Supply head_camera, left_camera, right_camera, state and camera_extrinsic
-# as NumPy arrays from the same observation.
-with np.load("/models/calibration/astribot_observation.npz", allow_pickle=False) as record:
-    observation = {name: record[name] for name in (*meta["camera_sources"], "state", "camera_extrinsic")}
-actions = np.asarray(policy.infer({**observation, "prompt": "Pick up the object", "seed": 42}))
-assert actions.shape == (meta["action_horizon"], meta["action_dim"])
-assert np.isfinite(actions).all()
-```
-
-The CPU parity test builds a small policy with local encoders and compares
-decoded actions with the upstream CLI. The checkpoint-gated WebSocket test
+The CPU suite exercises the Motubrain WebSocket and compares four outputs of
+a small policy with the native CLI. The checkpoint-gated WebSocket test
 accepts a prepared serving directory and its matching deployment.
 
 ```bash
 python -m pytest --run-level full_model /opt/vllm-omni/tests/diffusion/models/motubrain2
 MOTUBRAIN2_TEST_MODEL=/models/astribot-serving \
 MOTUBRAIN2_TEST_DEPLOY_CONFIG=/opt/vllm-omni/vllm_omni/deploy/motubrain2-astribot.yaml \
-  python -m pytest --run-level full_model /opt/vllm-omni/tests/e2e/online_serving/test_motubrain2_openpi.py
+  python -m pytest --run-level full_model /opt/vllm-omni/tests/e2e/online_serving/test_motubrain2_websocket.py
 ```

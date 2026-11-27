@@ -213,7 +213,7 @@ class ServingRealtimeRobotOpenPI:
         if result is None:
             raise RuntimeError("Robot OpenPI request produced no output.")
 
-        return self._extract_actions(result, return_native_outputs=obs.get("return_native_outputs") is True)
+        return self._extract_actions(result)
 
     def _stage_sampling_params_list(
         self, diffusion_params: OmniDiffusionSamplingParams, num_samples: int = 1
@@ -274,10 +274,10 @@ class ServingRealtimeRobotOpenPI:
         # params, so start from a clone of the diffusion stage's defaults
         # (e.g. a policy deploy yaml's ``extra_args``) and layer the OpenPI
         # protocol fields on top.
-        seed = obs.get("seed")
+        seed = obs.pop("seed", None)
         # Nested so engine knobs cannot collide with robot-defined obs keys.
         sampling = obs.get("sampling_params") or {}
-        robot_obs = {key: value for key, value in obs.items() if key not in ("seed", "sampling_params")}
+        robot_obs = {key: value for key, value in obs.items() if key != "sampling_params"}
         sampling_params = OmniDiffusionSamplingParams()
         for default_params in get_default_sampling_params_list(self.engine_client):
             if isinstance(default_params, OmniDiffusionSamplingParams):
@@ -285,13 +285,6 @@ class ServingRealtimeRobotOpenPI:
                 break
 
         extra_args = sampling_params.extra_args or {}
-        if extra_args.pop("openpi_session_rng", False):
-            # Preserve omission before the diffusion worker materializes its
-            # per-request generator. An explicit zero still means one seeded call.
-            if seed is None:
-                seed = sampling.get("seed")
-            if seed is None:
-                extra_args["openpi_session_seed"] = 0 if sampling_params.seed is None else sampling_params.seed
         extra_args.update(
             {
                 "reset": reset,
@@ -312,17 +305,12 @@ class ServingRealtimeRobotOpenPI:
             request_id=self._next_request_id(session_id),
         )
 
-    def _extract_actions(self, result: Any, *, return_native_outputs: bool = False) -> ActionOutput:
+    def _extract_actions(self, result: Any) -> ActionOutput:
         """Extract actions from engine result."""
         multimodal_output = getattr(result, "multimodal_output", None)
         if not isinstance(multimodal_output, Mapping):
             raise RuntimeError("Missing multimodal_output in robot policy result")
 
-        if return_native_outputs and "native_outputs" in multimodal_output:
-            native = multimodal_output["native_outputs"]
-            if not isinstance(native, Mapping):
-                raise ValueError("Robot policy native outputs must be a mapping.")
-            return {str(key): np.asarray(value) for key, value in native.items()}
         actions = multimodal_output.get("actions")
         if actions is None:
             raise RuntimeError("Missing multimodal_output['actions'] in robot policy result")

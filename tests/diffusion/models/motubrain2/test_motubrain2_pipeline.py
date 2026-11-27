@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Request and controller-output contracts of the Motubrain OpenPI adapter."""
+"""Request and controller-output contracts of the Motubrain adapter."""
 
 import sys
 from types import SimpleNamespace
@@ -157,7 +157,7 @@ def test_handshake_must_match_profile(make_pipeline, field, bad_value):
     metadata = {"action_dim": 1, "action_horizon": 4, "camera_sources": ["front"], "action_space": "joint_position"}
     metadata[field] = bad_value
     with pytest.raises(ValueError, match=field):
-        make_pipeline(policy_server_config=metadata)
+        make_pipeline(motubrain2_metadata=metadata)
 
 
 def test_only_dummy_observation_returns_zero_actions(pipeline):
@@ -215,7 +215,7 @@ def test_named_unseeded_requests_commit_and_reset_the_native_rng(pipeline):
         # Simulate the generator already materialized by the diffusion worker.
         return pipeline(
             _request(
-                _obs(session_id=session_id, openpi_session_seed=0 if requested is None else None, **extra),
+                _obs(session_id=session_id, motubrain2_session_seed=0 if requested is None else None, **extra),
                 generator=torch.Generator().manual_seed(99 if requested is None else requested),
             )
         )

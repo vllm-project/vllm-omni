@@ -132,9 +132,6 @@ frames are not observation messages.
   observation and seed. If omitted, the engine assigns a random per-request
   seed, so unseeded inferences are independent of each other. The API layer
   consumes `seed`; it is not forwarded inside the observation.
-- Deployments that opt into `openpi_session_rng` can manage an unseeded
-  random stream per rollout. The model controls how its stream advances on
-  unseeded calls and how explicit seeds and resets affect it.
 
 ## Limits and Errors
 
@@ -271,12 +268,6 @@ chunks, and contradictions with advertised capabilities or output metadata.
 Optional integer fields reject booleans and floating-point values. Missing
 metadata is accepted; supplied metadata groups must be mappings. Contract
 failures use the existing generic inference error response.
-
-Policies may also supply a typed `native_outputs` mapping. Clients can
-request it with `"return_native_outputs": true` in the observation. The
-response contains the arrays with their original dtypes. The policy defines
-the keys and shapes. Ordinary requests keep the action shape and float32
-validation described above.
 
 ### Compatibility and validation limits
 

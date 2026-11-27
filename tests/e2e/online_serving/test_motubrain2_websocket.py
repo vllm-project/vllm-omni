@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Run a released RoboTwin or Astribot policy through the OpenPI WebSocket.
+"""Run a released RoboTwin or Astribot policy through its Motubrain WebSocket.
 
 Set MOTUBRAIN2_TEST_MODEL to the prepared serving bundle. Optionally set
 MOTUBRAIN2_TEST_DEPLOY_CONFIG to the matching deployment with local encoders.
@@ -12,10 +12,12 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from websockets.sync.client import connect
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.entrypoints.motubrain2_codec import pack_message, unpack_message
 
 MODEL = os.environ.get("MOTUBRAIN2_TEST_MODEL", "")
 DEPLOY = os.environ.get("MOTUBRAIN2_TEST_DEPLOY_CONFIG") or get_deploy_config_path("motubrain2.yaml")
@@ -39,7 +41,7 @@ DEPLOY = os.environ.get("MOTUBRAIN2_TEST_DEPLOY_CONFIG") or get_deploy_config_pa
     ],
     indirect=True,
 )
-def test_motubrain2_openpi_online(omni_server, openai_client):
+def test_motubrain2_online(omni_server):
     profile = json.loads((Path(MODEL) / "profile.json").read_text())
     cameras = [view.get("source", view["name"]) for view in profile["views"]]
     state: list[float] = []
@@ -57,10 +59,13 @@ def test_motubrain2_openpi_online(omni_server, openai_client):
         "seed": 42,
         **{name: np.full((256, 448, 3), i * 40, dtype=np.uint8) for i, name in enumerate(cameras)},
     }
-    response = openai_client.send_robot_openpi_ws_request(
-        {"operations": [{"endpoint": "infer", "payload": observation}, {"endpoint": "reset"}]}
-    )[0]
-    meta = response.server_metadata
+    uri = f"ws://{omni_server.host}:{omni_server.port}/v1/realtime/robot/motubrain2"
+    with connect(uri, max_size=None) as socket:
+        meta = unpack_message(socket.recv(timeout=30))
+        socket.send(pack_message(observation))
+        actions = unpack_message(socket.recv(timeout=300))
+        socket.send(pack_message({"endpoint": "reset"}))
+        assert unpack_message(socket.recv(timeout=30)) == {"status": "reset successful"}
     assert meta["camera_sources"] == cameras
     assert meta["action_horizon"] == profile["action_steps"]
     assert meta["action_dim"] == len(state)
@@ -68,9 +73,7 @@ def test_motubrain2_openpi_online(omni_server, openai_client):
         meta["action_space"]
         == {16: "cartesian_pose_xyzw_gripper", 25: "cartesian_pose_xyzw_joint_position_gripper"}[len(state)]
     )
-    assert response.operation_responses[-1]["status"] == "reset successful"
-    assert response.action_tensors is not None
-    (actions,) = response.action_tensors
+    assert actions.dtype == np.float32
     assert actions.shape == (profile["action_steps"], len(state))
     assert np.isfinite(actions).all()
     for start in quaternion_offsets:

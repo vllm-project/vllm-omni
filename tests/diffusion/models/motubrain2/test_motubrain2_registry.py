@@ -3,6 +3,9 @@
 """Registry and deployment discovery for the Motubrain 2.0 adapter."""
 
 import json
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -13,7 +16,7 @@ from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.diffusion.models.motubrain2_pipeline_config import (
     MOTUBRAIN2_PIPELINE,
 )
-from vllm_omni.diffusion.registry import _DIFFUSION_MODELS, _NO_CACHE_ACCELERATION, DiffusionModelRegistry
+from vllm_omni.diffusion.registry import _DIFFUSION_MODELS, _NO_CACHE_ACCELERATION
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -32,10 +35,24 @@ def test_pipeline_topology_is_registered():
     assert stage.final_output_type == "action"
 
 
-def test_pipeline_class_imports_in_tree():
-    pipeline_cls = DiffusionModelRegistry._try_load_model_cls("Motubrain2Pipeline")
-    assert pipeline_cls is not None
-    assert pipeline_cls.__name__ == "Motubrain2Pipeline"
+def test_pipeline_and_endpoint_import_independently():
+    # A fresh interpreter also catches indirect and import-time dependencies.
+    source = """
+        import sys
+        for package in (
+            "openpi", "openpi_client", "vllm_omni.entrypoints.openpi", "vllm_omni.diffusion.models.pi",
+            "vllm_omni.diffusion.models.pi0", "vllm_omni.diffusion.models.pi05",
+            "lerobot.policies.pi0", "lerobot.policies.pi05",
+        ):
+            sys.modules[package] = None
+
+        from vllm_omni.diffusion.registry import DiffusionModelRegistry
+        from vllm_omni.entrypoints.motubrain2 import router
+        pipeline = DiffusionModelRegistry._try_load_model_cls("Motubrain2Pipeline")
+        assert pipeline is not None and pipeline.__name__ == "Motubrain2Pipeline"
+        assert any(route.path == "/v1/realtime/robot/motubrain2" for route in router.routes)
+    """
+    subprocess.run([sys.executable, "-c", textwrap.dedent(source)], check=True)
 
 
 def test_serving_directory_resolves_from_model_index(tmp_path):
@@ -57,7 +74,7 @@ def test_motubrain_deploy_exposes_policy_contract(deploy, width, action_space, d
         MOTUBRAIN2_PIPELINE, deploy_config_path=get_deploy_config_path(deploy)
     ).stage_configs[0]
     model_config = stage.diffusion_config.model_config
-    handshake = model_config["policy_server_config"]
+    handshake = model_config["motubrain2_metadata"]
     assert handshake["action_horizon"] == 24
     assert handshake["action_dim"] == width
     assert handshake["action_space"] == action_space
@@ -68,5 +85,4 @@ def test_motubrain_deploy_exposes_policy_contract(deploy, width, action_space, d
     assert stage.parallel_config.world_size == 1
     assert stage.model_config.enforce_eager is False
     assert stage.model_config.default_sampling_params["seed"] == 0
-    assert stage.model_config.default_sampling_params["extra_args"]["openpi_session_rng"] is True
     assert model_config.get("encoder_device") == encoder_device

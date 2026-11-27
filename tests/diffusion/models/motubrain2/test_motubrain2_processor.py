@@ -59,7 +59,7 @@ class ObservationTests(unittest.TestCase):
         clip = camera_clip(frame, "camera")
         self.assertEqual(tuple(clip.shape), (1, 8, 12, 3))
 
-    def test_native_nested_cameras_match_flat_openpi_observation(self):
+    def test_nested_and_flat_camera_observations_match(self):
         flat = _obs()
         native = {"instruction": flat.pop("prompt"), "cameras": flat}
         result = build_observation(native, VIEWS)
