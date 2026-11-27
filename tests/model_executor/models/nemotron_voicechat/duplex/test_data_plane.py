@@ -34,11 +34,17 @@ def _projector(encode_audio=lambda *_: None) -> NemotronVoiceChatDataPlaneSessio
 
 
 def _stage0_output(
-    request_id: str = "req-0", *, text_token: int = 12, function_token: int | None = None
+    request_id: str = "req-0",
+    *,
+    text_token: int = 12,
+    function_token: int | None = None,
+    fast_path: bool | None = None,
 ) -> SimpleNamespace:
     metadata: dict[str, object] = {"nvc_text_token_ids": [text_token]}
     if function_token is not None:
         metadata["nvc_function_token"] = [function_token]
+    if fast_path is not None:
+        metadata["nvc_function_fast_path"] = int(fast_path)
     completion = SimpleNamespace(multimodal_output=metadata)
     return SimpleNamespace(
         stage_id=0,
@@ -109,8 +115,7 @@ def test_delayed_tool_audio_counts_coverage_without_swallowing_speech_across_res
     projector._decode = lambda ids: '{"name":"lookup","arguments":{}}' if ids == [99] else "text"
 
     def text(token, fast=False, function=None):
-        output = _stage0_output(text_token=token, function_token=function)
-        output.request_output.outputs[0].multimodal_output["nvc_function_fast_path"] = int(fast)
+        output = _stage0_output(text_token=token, function_token=function, fast_path=fast)
         return list(projector.project_output(output))
 
     def audio(values):
