@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the NPU diffusion attention backend selector.
 
 Regression coverage for the eager ``mindiesd`` import in
 ``NPUOmniPlatform.get_diffusion_attn_backend_cls``: the import must run only
-for backends that reach mindiesd kernels (FLASH_ATTN, and RAINFUSION_ATTN via
-its dense FlashAttention fallback), so that a broken optional mindiesd
+for backends that reach mindiesd kernels (FLASH_ATTN, RAINFUSION_ATTN and
+SOL_ATTN), so that a broken optional mindiesd
 install cannot block backends that never use it (e.g. TORCH_SDPA).
 
 The platform module is loaded from source with fake vllm/vllm-ascend
@@ -32,6 +32,7 @@ _BACKEND_NAMES = (
     "FLASH_ATTN_3_HUB",
     "TORCH_SDPA",
     "RAINFUSION_ATTN",
+    "SOL_ATTN",
 )
 
 
@@ -162,6 +163,7 @@ def mindiesd_tracker(monkeypatch: pytest.MonkeyPatch):
         ("FLASH_ATTN_HUB", True),
         ("FLASH_ATTN_3_HUB", True),
         ("RAINFUSION_ATTN", True),
+        ("SOL_ATTN", True),
         # Backends that never reach mindiesd must not trigger the import.
         ("TORCH_SDPA", False),
     ],
@@ -181,16 +183,18 @@ def test_eager_mindiesd_import_scoped_to_mindiesd_backends(
     assert path == f"fake.backends.{expected.lower()}.Backend"
 
 
-def test_explicit_flash_attn_without_mindiesd_still_resolves(
+@pytest.mark.parametrize("backend", ["FLASH_ATTN", "SOL_ATTN"])
+def test_explicit_flash_or_sol_without_mindiesd_still_resolves(
     monkeypatch: pytest.MonkeyPatch,
+    backend: str,
 ):
     platform_cls = _load_platform_module(monkeypatch)
     monkeypatch.delitem(sys.modules, "mindiesd", raising=False)
     monkeypatch.setattr("importlib.util.find_spec", lambda name, *a, **k: None)
 
-    path = platform_cls.get_diffusion_attn_backend_cls("FLASH_ATTN", head_size=64)
+    path = platform_cls.get_diffusion_attn_backend_cls(backend, head_size=128)
 
-    assert path == "fake.backends.flash_attn.Backend"
+    assert path == f"fake.backends.{backend.lower()}.Backend"
 
 
 def test_default_backend_prefers_flash_attn_when_mindiesd_available(

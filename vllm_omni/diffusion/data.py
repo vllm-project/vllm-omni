@@ -2473,6 +2473,23 @@ class BlockSparseSpec:
 
 
 @dataclass
+class SolAttnSpec:
+    """Diagonal threshold and initial dense steps/layers for video self-attention."""
+
+    tau: float = 1.0
+    dense_steps: int = 4
+    dense_layers: int = 1
+
+    def __post_init__(self) -> None:
+        if isinstance(self.tau, bool) or not isinstance(self.tau, (int, float)) or not math.isfinite(self.tau):
+            raise ValueError("sol_attn.tau must be finite")
+        for name in ("dense_steps", "dense_layers"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"sol_attn.{name} must be a nonnegative integer")
+
+
+@dataclass
 class AttentionSpec:
     """Specifies a backend and its typed backend-specific config for one attention role."""
 
@@ -2485,10 +2502,15 @@ class AttentionSpec:
     sparge: SpargeAttnSpec | None = None
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
+    sol_attn: SolAttnSpec | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str):
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
+        if self.backend.upper() == "SOL_ATTN":
+            self.sol_attn = self._coerce(self.sol_attn, SolAttnSpec, "sol_attn") or SolAttnSpec()
+        elif self.sol_attn is not None:
+            raise ValueError("sol_attn options require the SOL_ATTN backend")
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.sparge = self._coerce(self.sparge, SpargeAttnSpec, "sparge")
@@ -2580,6 +2602,10 @@ class AttentionSpec:
                 kw["sparge_k_block_tokens"] = sp.k_block_tokens
             if sp.q_tile_override is not None:
                 kw["sparge_q_tile_override"] = sp.q_tile_override
+        if self.sol_attn is not None:
+            kw["tau"] = self.sol_attn.tau
+            kw["dense_layers"] = self.sol_attn.dense_layers
+            kw["dense_steps"] = self.sol_attn.dense_steps
         if self.block_sparse is not None:
             bs = self.block_sparse
             kw["sparsity"] = bs.sparsity
@@ -2667,6 +2693,7 @@ class AttentionConfig:
             "fastvideo_vsa_precision",
             "sparge",
             "block_sparse",
+            "sol_attn",
         }
         node_dict = dict(node)
         node_keys = set(node_dict)

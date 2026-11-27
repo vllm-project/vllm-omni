@@ -364,12 +364,10 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
                 )
                 backend_upper = "FLASH_ATTN"
 
-            if backend_upper in ("FLASH_ATTN", "RAINFUSION_ATTN") and find_spec("mindiesd"):
+            if backend_upper in ("FLASH_ATTN", "RAINFUSION_ATTN", "SOL_ATTN") and find_spec("mindiesd"):
                 # Eager-import mindiesd only for backends that actually reach
-                # mindiesd kernels: FLASH_ATTN directly, and RAINFUSION_ATTN
-                # via its dense FlashAttention fallback (used before
-                # start_step and on any layer without a sparsifiable video
-                # segment). Other backends (e.g. TORCH_SDPA) never touch
+                # MindIE-SD kernels for dense or sparse attention.
+                # Other backends (e.g. TORCH_SDPA) never touch
                 # mindiesd, so a broken optional install must not block them.
                 # CANN snapshots the custom-op registry at the first
                 # custom-op regInfo lookup in the process (e.g. a

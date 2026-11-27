@@ -20,6 +20,7 @@ For the internal selector, registry, and platform contract, see
 | Install and use SageAttention 2.2 or SageAttention3 | [SageAttention](attention_backends/sage.md) |
 | Use INT8 SPARGE top-k sparse attention on Intel XPU | [SPARGE Attention](attention_backends/sparge.md) |
 | Match training or rollout kernels loaded from Hugging Face | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
+| Use Sol-Attn with Wan2.2-TI2V-5B on Ascend NPU | [Sol-Attn](attention_backends/sol_attn.md) |
 | Use block-sparse video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
 | Use FastVideo VSA with FastWan2.2-TI2V-5B or FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
 | Run VDN-H3 (Video DeltaNet MiniMax-H3) hybrid-attention checkpoints on CUDA | [VDN-H3 Hybrid Attention](attention_backends/vdnh3_attn.md) |
@@ -39,6 +40,7 @@ For the internal selector, registry, and platform contract, see
 | `SPARGE_ATTN` | Block sparse + quantized | INT8 Q/K SPARGE top-k attention on Intel XPU | [SPARGE Attention](attention_backends/sparge.md) |
 | `FLASH_ATTN_HUB` | Hub kernel | FlashAttention 2 from Hugging Face `kernels` | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | `FLASH_ATTN_3_HUB` | Hub kernel | FlashAttention 3 from Hugging Face `kernels` on Hopper or newer | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
+| `SOL_ATTN` | Block sparse | Wan2.2-TI2V-5B video self-attention on Ascend NPU | [Sol-Attn](attention_backends/sol_attn.md) |
 | `RAINFUSION_ATTN` | Block sparse | MindIE-SD RainFusion video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
 | `FASTVIDEO_VSA` | Block sparse | FastVideo variable sparse self-attention for FastWan2.2-TI2V-5B and FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
 | `VDNH3_ATTN` | Hybrid window | Frame-window softmax of VDN-H3 hybrid attention; the model adds the linear branch | [VDN-H3 Hybrid Attention](attention_backends/vdnh3_attn.md) |
@@ -112,6 +114,7 @@ Backend-specific typed blocks are documented with their consumers:
   and [TRTLLM SAGE](attention_backends/trtllm.md#sage-quantization).
 - `skip_softmax`: [TRTLLM Skip-Softmax](attention_backends/trtllm.md#skip-softmax).
 - `sparge`: [SPARGE Attention](attention_backends/sparge.md#configuration).
+- `sol_attn`: [Sol-Attn](attention_backends/sol_attn.md).
 - `block_sparse`: [RainFusion](attention_backends/rainfusion.md#configuration).
 - `fastvideo_vsa_topk`: [FastVideo VSA](attention_backends/fastvideo_vsa.md#choose-top-k).
 

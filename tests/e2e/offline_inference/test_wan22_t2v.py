@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import os
+
+import numpy as np
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OfflineOmniClient
+from tests.helpers.runtime import OfflineOmniClient, OmniRunner
 from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -73,3 +76,46 @@ def test_text_to_video_001(offline_client: OfflineOmniClient):
         "sampling_params": sampling,
     }
     offline_client.send_diffusion_request(request_config)
+
+
+def _generate_ti2v_5b(backend: str) -> np.ndarray:
+    model = os.environ.get("WAN_MODEL", "Wan-AI/Wan2.2-TI2V-5B-Diffusers")
+    config: dict[str, object] = {"default": {"backend": "FLASH_ATTN"}}
+    if backend == "SOL_ATTN":
+        config["per_role"] = {"self": {"backend": backend, "sol_attn": {"dense_steps": 1}}}
+    with OmniRunner(
+        model,
+        deploy_config="vllm_omni/deploy/wan2_2_ti2v.yaml",
+        diffusion_attention_config=config,
+    ) as runner:
+        sampling = OmniDiffusionSamplingParams(
+            width=832, height=480, num_frames=17, num_inference_steps=2, guidance_scale=5.0, seed=1024
+        )
+        response = OfflineOmniClient(runner).send_diffusion_request({"prompt": PROMPT, "sampling_params": sampling})
+        frames = np.asarray((response.videos if response.videos is not None else response.images)[0])
+        assert frames.shape[-4:] == (17, 480, 832, 3)
+        assert np.isfinite(frames).all() and frames.max() > frames.min()
+        return frames
+
+
+@pytest.mark.advanced_model
+@pytest.mark.diffusion
+@hardware_test(res={"npu": "A2"})
+def test_ti2v_5b_sol_attn():
+    from vllm_omni.diffusion.attention.backends.sol_attn import _sol_unavailable_reason
+
+    # Cross the dense-to-Sol boundary in one short generation.
+    if reason := _sol_unavailable_reason():
+        pytest.skip(reason)
+    _generate_ti2v_5b("SOL_ATTN")
+
+
+@pytest.mark.advanced_model
+@pytest.mark.diffusion
+@hardware_test(res={"npu": "A2"})
+def test_ti2v_5b_sol_fallback_matches_flash():
+    from vllm_omni.diffusion.attention.backends.sol_attn import _sol_unavailable_reason
+
+    if _sol_unavailable_reason() is None:
+        pytest.skip("requires an environment without the Sol fused operator")
+    np.testing.assert_array_equal(_generate_ti2v_5b("SOL_ATTN"), _generate_ti2v_5b("FLASH_ATTN"))
