@@ -658,6 +658,27 @@ class TestNPU310PInt8LinearMethod:
         assert output.shape == (*shape[:-1], out_features)
         assert torch.equal(output, expected)
 
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    def test_310p_apply_rejects_non_fp16_activations(
+        self,
+        mock_quant_config,
+        mock_npu_310p,
+        dtype,
+    ):
+        from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
+
+        layer = Module()
+        layer.weight = Parameter(torch.randint(-127, 127, (128, 64), dtype=torch.int8), requires_grad=False)
+        layer.weight_scale = Parameter(torch.ones(128, dtype=torch.float32), requires_grad=False)
+
+        x = torch.randn(4, 64, dtype=dtype)
+        method = NPUInt8LinearMethod(mock_quant_config)
+
+        with pytest.raises(NotImplementedError, match="only supports torch.float16 activations"):
+            method.apply(layer, x)
+
+        mock_npu_310p.npu_quant_matmul_dequant.assert_not_called()
+
     def test_non_310p_keeps_quant_matmul_path(self, mocker: MockerFixture, mock_quant_config):
         from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
 
