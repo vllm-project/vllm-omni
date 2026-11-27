@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from functools import partial
 from types import SimpleNamespace
 from typing import Any, Self, cast
 
@@ -67,6 +68,10 @@ def _rope_axis(max_seq_len: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
     return phase.cos().float(), phase.sin().float()
 
 
+# local_attn_size is 21 frames, so the largest window-local temporal id is 20.
+_RELATIVE_MAX_FRAME_ID = 20
+
+
 def _projection_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
 
@@ -122,10 +127,32 @@ class ABotAttentionCache:
 
 @dataclass
 class ABotTransformerCache:
-    """One request's per-layer video K/V and reusable text K/V."""
+    """One request's per-layer video K/V and reusable text K/V.
+
+    ``reference`` holds the per-layer reference-image K/V when relative RoPE runs on the paged cache, whose
+    frame-sized pages cannot hold them. A call that carries the reference tokens fills it; later calls read it.
+    """
 
     self_attention: list[ABotAttentionCache | ARDiffusionPagedLayerContext | ARDiffusionPagedLayerInputs]
     cross_attention: list[ABotAttentionCache | None]
+    reference: list[ABotAttentionCache] | None = None
+
+
+@dataclass
+class ABotRelativeRope:
+    """Window-local RoPE state for one forward call (Iris, ``use_relative_rope``).
+
+    The cache holds un-rotated keys. Reference tokens are the cache sink and use their own positions; the video
+    window is re-rotated with ids 0..window-1, so positions never grow with the stream.
+    """
+
+    ref_tokens: int
+    query_ref_tokens: int
+    frame_tokens: int
+    video_rope: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
+    ref_rope: tuple[torch.Tensor, torch.Tensor] | None = None
+    # Pool slots of the visible paged window; every layer shares one block table, so they are computed once a call.
+    window_slots: torch.Tensor | None = None
 
 
 def allocate_abot_cache(
@@ -285,6 +312,68 @@ class ABotCausalSelfAttention(nn.Module):
 
         return next_key, next_value
 
+    def _paged_relative_window(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cache: ARDiffusionPagedLayerInputs,
+        reference: ABotAttentionCache | None,
+        relative: ABotRelativeRope,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write this call's un-rotated video K/V to the pool and return the reference plus visible window."""
+        if key.shape[0] != 1:
+            raise RuntimeError("ABot AR-Diffusion paged attention requires batch_size=1.")
+        if reference is None:
+            raise RuntimeError("Relative RoPE on the paged cache needs a per-layer reference K/V holder.")
+        ref, query_ref = relative.ref_tokens, relative.query_ref_tokens
+        if query_ref:
+            reference.key, reference.value = key[:, :query_ref], value[:, :query_ref]
+            reference.end = reference.absolute_end = query_ref
+        elif reference.end != ref:
+            raise RuntimeError(f"Paged relative RoPE expects {ref} cached reference tokens, found {reference.end}.")
+
+        key_pool, value_pool = cache.key_pool, cache.value_pool
+        key_pool[cache.video_slots] = key[0, query_ref:].to(key_pool.dtype)
+        value_pool[cache.video_slots] = value[0, query_ref:].to(value_pool.dtype)
+        if cache.private_slots is not None:
+            count = cache.private_slots.shape[0]
+            torch.index_select(key_pool[:-count], 0, cache.private_slots, out=key_pool[-count:])
+            torch.index_select(value_pool[:-count], 0, cache.private_slots, out=value_pool[-count:])
+        slots = relative.window_slots
+        visible_key = key_pool.new_empty((1, ref + slots.shape[0], *key_pool.shape[1:]))
+        visible_value = value_pool.new_empty((1, ref + slots.shape[0], *value_pool.shape[1:]))
+        if ref:
+            visible_key[:, :ref] = reference.key[:, :ref]
+            visible_value[:, :ref] = reference.value[:, :ref]
+        torch.index_select(key_pool, 0, slots, out=visible_key[0, ref:])
+        torch.index_select(value_pool, 0, slots, out=visible_value[0, ref:])
+        return visible_key, visible_value
+
+    def _attend_relative(
+        self,
+        query: torch.Tensor,
+        visible_key: torch.Tensor,
+        visible_value: torch.Tensor,
+        relative: ABotRelativeRope,
+    ) -> torch.Tensor:
+        ref = relative.ref_tokens
+        # fp32 cos/sin tables: the official path rotates at full precision and rounds to bf16 once.
+        rotate = self.rotary_embedding
+        frames = (visible_key.shape[1] - ref) // relative.frame_tokens
+        frame_ids = torch.arange(frames, device=query.device).clamp(max=_RELATIVE_MAX_FRAME_ID)
+        video_cos, video_sin = relative.video_rope(frame_ids)
+        key_parts = [rotate(visible_key[:, ref:], video_cos, video_sin)]
+        query_frames = (query.shape[1] - relative.query_ref_tokens) // relative.frame_tokens
+        query_cos, query_sin = relative.video_rope(frame_ids[-query_frames:])
+        query_parts = [rotate(query[:, relative.query_ref_tokens :], query_cos, query_sin)]
+        if ref:
+            ref_cos, ref_sin = cast(tuple[torch.Tensor, torch.Tensor], relative.ref_rope)
+            key_parts.insert(0, rotate(visible_key[:, :ref], ref_cos, ref_sin))
+            if relative.query_ref_tokens:
+                query_parts.insert(0, rotate(query[:, : relative.query_ref_tokens], ref_cos, ref_sin))
+        return self.attn(torch.cat(query_parts, dim=1), torch.cat(key_parts, dim=1), visible_value)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -294,6 +383,8 @@ class ABotCausalSelfAttention(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         sink_tokens: int = 0,
         update_cache: bool = True,
+        relative: ABotRelativeRope | None = None,
+        reference: ABotAttentionCache | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv(hidden_states)
         q_size = self.tp_inner_dim
@@ -306,6 +397,18 @@ class ABotCausalSelfAttention(nn.Module):
         query = query.unflatten(2, (self.num_local_heads, self.head_dim))
         key = key.unflatten(2, (self.num_local_heads, self.head_dim))
         value = value.unflatten(2, (self.num_local_heads, self.head_dim))
+
+        if relative is not None:
+            if isinstance(cache, ARDiffusionPagedLayerInputs):
+                visible_key, visible_value = self._paged_relative_window(
+                    key, value, cache=cache, reference=reference, relative=relative
+                )
+            else:
+                visible_key, visible_value = self._update_cache(
+                    cache, key, value, current_start, sink_tokens=relative.ref_tokens, update_cache=update_cache
+                )
+            hidden_states = self._attend_relative(query, visible_key, visible_value, relative)
+            return self.o(hidden_states.flatten(2, 3).type_as(query))
 
         if rotary_emb is not None:
             cos, sin = rotary_emb
@@ -586,13 +689,15 @@ class ABotCausalAttentionBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None,
         temb: torch.Tensor,
-        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
         *,
         self_cache: ABotAttentionCache | ARDiffusionPagedLayerInputs,
         cross_cache: ABotAttentionCache | None,
         current_start: int,
         sink_tokens: int = 0,
         update_cache: bool = True,
+        relative: ABotRelativeRope | None = None,
+        reference: ABotAttentionCache | None = None,
     ) -> tuple[torch.Tensor, ABotAttentionCache]:
         modulation = (self.modulation.unsqueeze(1) + temb.float()).to(hidden_states.dtype)
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -609,17 +714,24 @@ class ABotCausalAttentionBlock(nn.Module):
             rotary_emb=rotary_emb,
             sink_tokens=sink_tokens,
             update_cache=update_cache,
+            relative=relative,
+            reference=reference,
         )
         hidden_states = hidden_states + attn_output * gate_msa
 
-        # Cross-attention
-        norm_hidden = self.norm3(hidden_states)
+        # Cross-attention; reference tokens carried by this call do not attend to the text.
+        text_start = relative.query_ref_tokens if relative is not None else 0
+        norm_hidden = self.norm3(hidden_states[:, text_start:])
         attn_output, cross_cache = self.cross_attn(
             norm_hidden,
             encoder_hidden_states,
             cache=cross_cache,
         )
-        hidden_states = hidden_states + attn_output
+        if text_start:
+            text_hidden = hidden_states[:, text_start:] + attn_output
+            hidden_states = torch.cat((hidden_states[:, :text_start], text_hidden), dim=1)
+        else:
+            hidden_states = hidden_states + attn_output
 
         # Feed-forward with per-frame modulation
         norm_hidden = self.norm2(hidden_states.float()).to(hidden_states.dtype)
@@ -695,6 +807,8 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
         eps: float = 1e-6,
         rope_max_seq_len: int = 1024,
         downscale_factor_control_adapter: int = 16,
+        use_relative_rope: bool = False,
+        local_attn_size: int = 21,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -715,6 +829,8 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
             eps=eps,
             rope_max_seq_len=rope_max_seq_len,
             downscale_factor_control_adapter=downscale_factor_control_adapter,
+            use_relative_rope=use_relative_rope,
+            local_attn_size=local_attn_size,
         )
 
         self.patch_embedding = Conv3dLayer(
@@ -793,6 +909,8 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
         eps = config.get("eps", 1e-6)
         rope_max_seq_len = config.get("rope_max_seq_len", 1024)
         downscale_factor_control_adapter = config.get("downscale_factor_control_adapter", 16)
+        use_relative_rope = bool(config.get("use_relative_rope", False))
+        local_attn_size = config.get("local_attn_size", 21)
 
         return cls(
             patch_size=patch_size,
@@ -807,6 +925,8 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
             eps=eps,
             rope_max_seq_len=rope_max_seq_len,
             downscale_factor_control_adapter=downscale_factor_control_adapter,
+            use_relative_rope=use_relative_rope,
+            local_attn_size=local_attn_size,
             prefix=prefix,
         )
 
@@ -822,12 +942,24 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if start_frame + frames > self.config.rope_max_seq_len:
             raise ValueError("Temporal RoPE positions exceed rope_max_seq_len.")
+        frame_ids = torch.arange(start_frame, start_frame + frames, device=self._rope_temporal_cosine.device)
+        return self._rotary_for_frames(frame_ids, height=height, width=width, dtype=dtype, device=device)
+
+    def _rotary_for_frames(
+        self,
+        frame_ids: torch.Tensor,
+        *,
+        height: int,
+        width: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        frames = frame_ids.shape[0]
+        frame_ids = frame_ids.to(self._rope_temporal_cosine.device)
 
         def expand_axis(table: torch.Tensor, axis: str) -> torch.Tensor:
             if axis == "temporal":
-                return (
-                    table[start_frame : start_frame + frames].view(frames, 1, 1, -1).expand(frames, height, width, -1)
-                )
+                return table[frame_ids].view(frames, 1, 1, -1).expand(frames, height, width, -1)
             if axis == "height":
                 return table[:height].view(1, height, 1, -1).expand(frames, height, width, -1)
             return table[:width].view(1, 1, width, -1).expand(frames, height, width, -1)
@@ -853,6 +985,48 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
             sine.reshape(frames * height * width, -1).to(device=device, dtype=dtype),
         )
 
+    def _ref_geometry(self, ref_latents: torch.Tensor) -> tuple[int, int, int]:
+        """Return (slots, tokens per slot, tokens per slot row) of ``ref_latents`` [B, K, C, 1, H, W]."""
+        _, slots, _, frames, height, width = ref_latents.shape
+        patch_frames, patch_height, patch_width = self.config.patch_size
+        if frames != patch_frames:
+            raise ValueError(f"ref_latents must have {patch_frames} frame per slot, got {frames}.")
+        ref_h, ref_w = height // patch_height, width // patch_width
+        return slots, ref_h * ref_w, ref_w
+
+    def _ref_tokens(self, ref_latents: torch.Tensor, ref_mask: torch.Tensor | None) -> torch.Tensor:
+        batch_size, slots, channels, frames, height, width = ref_latents.shape
+        features = self.patch_embedding(ref_latents.reshape(batch_size * slots, channels, frames, height, width))
+        tokens = features.flatten(2).transpose(1, 2).reshape(batch_size, slots, -1, self.dim)
+        if ref_mask is not None:
+            tokens = tokens * ref_mask.to(device=tokens.device, dtype=tokens.dtype)[:, :, None, None]
+        return tokens.flatten(1, 2)
+
+    def _ref_rope(
+        self, ref_latents: torch.Tensor, *, dtype: torch.dtype, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reference slots sit at negative temporal positions, one block of ``max(tokens, 256)`` apart."""
+        slots, tokens_per_slot, ref_w = self._ref_geometry(ref_latents)
+        ref_h = tokens_per_slot // ref_w
+        temporal_dim = 2 * self._rope_temporal_cosine.shape[1]
+        positions = torch.tensor([-(slots - i) * max(tokens_per_slot, 256) for i in range(slots)], dtype=torch.float64)
+        frequencies = 1.0 / torch.pow(10000, torch.arange(0, temporal_dim, 2, dtype=torch.float64) / temporal_dim)
+        phase = torch.outer(positions, frequencies)
+
+        def expand(temporal: torch.Tensor, height_table: torch.Tensor, width_table: torch.Tensor) -> torch.Tensor:
+            return torch.cat(
+                (
+                    temporal[:, None, None, :].expand(slots, ref_h, ref_w, -1),
+                    height_table[:ref_h].to(temporal.device)[None, :, None, :].expand(slots, ref_h, ref_w, -1),
+                    width_table[:ref_w].to(temporal.device)[None, None, :, :].expand(slots, ref_h, ref_w, -1),
+                ),
+                dim=-1,
+            ).reshape(slots * tokens_per_slot, -1)
+
+        cosine = expand(phase.cos().float(), self._rope_height_cosine, self._rope_width_cosine)
+        sine = expand(phase.sin().float(), self._rope_height_sine, self._rope_width_sine)
+        return cosine.to(device=device, dtype=dtype), sine.to(device=device, dtype=dtype)
+
     def allocate_cache(
         self,
         *,
@@ -861,12 +1035,13 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
         latent_width: int,
         device: torch.device,
         dtype: torch.dtype,
+        ref_tokens: int = 0,
     ) -> ABotTransformerCache:
         patch_frames, patch_height, patch_width = self.config.patch_size
-        window_frames = 21  # local_attn_size from ABot-World config
+        window_frames = self.config.local_attn_size
         post_patch_height = latent_height // patch_height
         post_patch_width = latent_width // patch_width
-        max_tokens = int(window_frames * post_patch_height * post_patch_width)
+        max_tokens = int(window_frames * post_patch_height * post_patch_width) + ref_tokens
         tp_size = get_tensor_model_parallel_world_size()
         num_local_heads = self.config.num_attention_heads // tp_size
         return allocate_abot_cache(
@@ -934,6 +1109,8 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
         start_frame: int,
         update_cache: bool,
         action_condition: torch.Tensor | None = None,
+        ref_latents: torch.Tensor | None = None,
+        ref_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, channels, frames, height, width = hidden_states.shape
         patch_frames, patch_height, patch_width = self.config.patch_size
@@ -949,14 +1126,16 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
         current_start = patched_start_frame * tokens_per_frame
         sink_tokens = 0
 
-        rotary_emb = self._rotary_embedding(
-            frames=patched_frames,
-            height=patched_height,
-            width=patched_width,
-            start_frame=patched_start_frame,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        rotary_emb = None
+        if not self.config.use_relative_rope:
+            rotary_emb = self._rotary_embedding(
+                frames=patched_frames,
+                height=patched_height,
+                width=patched_width,
+                start_frame=patched_start_frame,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
 
         # Patch embedding
         hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
@@ -979,6 +1158,45 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
         )
         timestep_proj = timestep_proj.repeat_interleave(tokens_per_frame, dim=1)
 
+        relative = None
+        query_ref_tokens = 0
+        if self.config.use_relative_rope:
+            ref_tokens = 0
+            ref_rope = None
+            if ref_latents is not None:
+                ref_latents = ref_latents.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                slots, tokens_per_slot, _ = self._ref_geometry(ref_latents)
+                ref_tokens = slots * tokens_per_slot
+                ref_rope = self._ref_rope(ref_latents, dtype=torch.float32, device=hidden_states.device)
+                if current_start == 0:
+                    # Reference tokens enter the stream once, at time 0, and stay in the cache as its sink.
+                    query_ref_tokens = ref_tokens
+                    ref_temb = self.time_embedding(
+                        _sinusoidal_embedding(
+                            self.config.freq_dim, torch.zeros(batch_size * slots, device=hidden_states.device)
+                        ).to(hidden_states.dtype)
+                    )
+                    ref_proj = self.time_projection(ref_temb).unflatten(1, (6, self.dim))
+                    ref_proj = ref_proj.unflatten(0, (batch_size, slots)).repeat_interleave(tokens_per_slot, dim=1)
+                    hidden_states = torch.cat((self._ref_tokens(ref_latents, ref_mask), hidden_states), dim=1)
+                    timestep_proj = torch.cat((ref_proj, timestep_proj), dim=1)
+            relative = ABotRelativeRope(
+                ref_tokens=ref_tokens,
+                query_ref_tokens=query_ref_tokens,
+                frame_tokens=tokens_per_frame,
+                video_rope=partial(
+                    self._rotary_for_frames,
+                    height=patched_height,
+                    width=patched_width,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                ),
+                ref_rope=ref_rope,
+            )
+            sink_tokens = ref_tokens
+            # Cache positions count the reference prefix; the call that carries it writes from position 0.
+            current_start = 0 if query_ref_tokens else current_start + ref_tokens
+
         # Text embedding (cached across layers after first block)
         projected_text = (
             self.text_embedding(encoder_hidden_states) if any(c is None for c in cache.cross_attention) else None
@@ -1000,6 +1218,13 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
                 query_len=hidden_states.shape[1],
             )
             cache.self_attention = [layer_context.to_layer_inputs() for layer_context in cache.self_attention]
+            if relative is not None:
+                layer = cache.self_attention[0]
+                positions = torch.arange(int(layer.seq_lens[0]), device=hidden_states.device)
+                relative.window_slots = (
+                    layer.block_table[0, positions // layer.block_size].long() * layer.block_size
+                    + positions % layer.block_size
+                )
 
         for idx, block in enumerate(self.blocks):
             hidden_states, cross_cache = block(
@@ -1012,9 +1237,12 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
                 current_start=current_start,
                 sink_tokens=sink_tokens,
                 update_cache=update_cache,
+                relative=relative,
+                reference=cache.reference[idx] if cache.reference is not None else None,
             )
             cache.cross_attention[idx] = cross_cache
 
+        hidden_states = hidden_states[:, query_ref_tokens:]
         hidden_states = self.head(hidden_states, temb, tokens_per_frame=tokens_per_frame)
 
         return self._unpatchify(

@@ -67,7 +67,9 @@ ABOT_DMD_TIMESTEPS = (1000, 750, 500, 250)
 _WINDOW_FRAMES = 21
 _MAX_RAW_FRAMES = 117
 _MAX_SEQUENCE_LENGTH = 512
+_IRIS_GLOBAL_TOKENS = 384
 _REFERENCE_RESOLUTION = 512
+_REF_NUM_SLOTS = 5
 _MAX_SOURCE_IMAGE_PIXELS = 4096 * 4096
 _DEFAULT_HEIGHT = 512
 _DEFAULT_WIDTH = 832
@@ -126,6 +128,11 @@ def _paged_kv_tokens_per_frame(
             f"for {height}x{width}. Use 512x832 for the bundled Wan2.2 VAE."
         )
     return tokens_per_frame
+
+
+def _reference_tokens(*, vae_scale_factor: int, patch_height: int) -> int:
+    """DiT tokens of all reference slots; each slot is a square ``_REFERENCE_RESOLUTION`` image."""
+    return _REF_NUM_SLOTS * (_REFERENCE_RESOLUTION // vae_scale_factor // patch_height) ** 2
 
 
 def _validate_latent_channel_contract(
@@ -406,6 +413,7 @@ class ABotWorldCausalPipeline(
     dummy_run_num_frames: ClassVar[int] = 0
     _AR_BRANCH = "main"
     _AR_TEXT_CACHE = "text"
+    _AR_REF_CACHE = "ref"
     supports_step_execution: ClassVar[bool] = True
     _PROFILER_TARGETS = [
         "prepare_encode",
@@ -588,6 +596,10 @@ class ABotWorldCausalPipeline(
             * self._ar_width
             * self.transformer.dtype.itemsize
         )
+        cross_attention = [ARDiffusionCrossAttentionKVSpec(self._AR_TEXT_CACHE, _MAX_SEQUENCE_LENGTH)]
+        if cfg.use_relative_rope:
+            ref_tokens = _reference_tokens(vae_scale_factor=spatial, patch_height=patch_h)
+            cross_attention.append(ARDiffusionCrossAttentionKVSpec(self._AR_REF_CACHE, ref_tokens))
         return ARDiffusionKVCacheSpec(
             num_layers=int(cfg.num_layers),
             num_kv_heads=num_local_heads,
@@ -598,7 +610,7 @@ class ABotWorldCausalPipeline(
             sink_frames=0,
             kv_branches=(ARDiffusionKVBranchSpec(self._AR_BRANCH, 0),),
             session_capacity=2,
-            cross_attention=(ARDiffusionCrossAttentionKVSpec(self._AR_TEXT_CACHE, _MAX_SEQUENCE_LENGTH),),
+            cross_attention=tuple(cross_attention),
             model_owned_state_bytes_per_session=condition_bytes + vae_cache_bytes,
         )
 
@@ -668,10 +680,14 @@ class ABotWorldCausalPipeline(
                     raise ValueError("file-path reference images must be materialized by pre-process.")
                 resolved.append(r)
             reference_images = tuple(resolved)
-        if reference_images:
+        relative = bool(self.transformer.config.use_relative_rope)
+        if reference_images and not relative:
             raise NotImplementedError(
-                "ABot-World reference_images conditioning is not implemented; provide only multi_modal_data.image."
+                "reference_images conditioning needs an Iris checkpoint (use_relative_rope); "
+                "provide only multi_modal_data.image."
             )
+        if reference_images and len(reference_images) > _REF_NUM_SLOTS:
+            raise ValueError(f"reference_images accepts at most {_REF_NUM_SLOTS} images.")
 
         extra_args = getattr(sampling, "extra_args", None) or {}
         camera_action_script = extra_args.get(PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY)
@@ -695,17 +711,23 @@ class ABotWorldCausalPipeline(
         num_frames = getattr(sampling, "num_frames", None) or 9
         if isinstance(num_frames, bool) or not isinstance(num_frames, int) or num_frames <= 0:
             raise ValueError(f"num_frames must be a positive integer, got {num_frames!r}.")
-        if num_frames > _MAX_RAW_FRAMES and not bool(getattr(self.od_config, "step_execution", False)):
-            raise ValueError(f"num_frames must not exceed {_MAX_RAW_FRAMES}.")
+        if (
+            num_frames > _MAX_RAW_FRAMES
+            and not bool(getattr(self.od_config, "step_execution", False))
+            and getattr(sampling, "output_type", None) != "latent"
+        ):
+            raise ValueError(f"num_frames must not exceed {_MAX_RAW_FRAMES} when decoding to pixels.")
         if (num_frames - 1) % self.vae_scale_factor_temporal:
             raise ValueError(f"(num_frames - 1) must be divisible by {self.vae_scale_factor_temporal}.")
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         rope_max_seq_len = int(getattr(self.transformer.config, "rope_max_seq_len", num_latent_frames))
         if num_latent_frames > rope_max_seq_len:
             raise ValueError(f"num_latent_frames must not exceed RoPE horizon {rope_max_seq_len}.")
-        if num_latent_frames % self._num_frame_per_block:
+        # Relative-RoPE checkpoints prefill the source frame, then generate whole blocks.
+        generated_frames = num_latent_frames - 1 if relative else num_latent_frames
+        if generated_frames % self._num_frame_per_block:
             raise ValueError(
-                f"num_latent_frames ({num_latent_frames}) must be divisible by {self._num_frame_per_block}."
+                f"{generated_frames} generated latent frames must be divisible by {self._num_frame_per_block}."
             )
 
         max_sequence_length = getattr(sampling, "max_sequence_length", None) or _MAX_SEQUENCE_LENGTH
@@ -830,6 +852,36 @@ class ABotWorldCausalPipeline(
         mean, std = self._vae_latent_stats(latent)
         return ((latent - mean) / std).to(dtype=dtype)
 
+    def _encode_references(
+        self, references: tuple[PIL.Image.Image | torch.Tensor, ...] | None, dtype: torch.dtype
+    ) -> dict[str, torch.Tensor]:
+        """Encode reference images into ``ref_latents`` [1, slots, C, 1, h, w] and ``ref_mask`` [1, slots].
+
+        Slots without an image stay zero and masked; they still occupy cache and RoPE positions.
+        """
+        size = _REFERENCE_RESOLUTION
+        latents, mask = [], torch.zeros(1, _REF_NUM_SLOTS, device=self.device, dtype=dtype)
+        for slot in range(_REF_NUM_SLOTS):
+            image = references[slot] if references and slot < len(references) else None
+            if image is None:
+                latents.append(
+                    torch.zeros(
+                        1,
+                        int(self.transformer.config.in_channels),
+                        1,
+                        size // self.vae_scale_factor_spatial,
+                        size // self.vae_scale_factor_spatial,
+                        device=self.device,
+                        dtype=dtype,
+                    )
+                )
+                continue
+            if isinstance(image, PIL.Image.Image):
+                image = image.convert("RGB").resize((size, size), PIL.Image.Resampling.BICUBIC)
+            latents.append(self._encode_first_frame(image, size, size, dtype))
+            mask[0, slot] = 1
+        return {"ref_latents": torch.stack(latents, dim=1), "ref_mask": mask}
+
     def _build_action_tensor(
         self,
         camera_actions: tuple[tuple[str, ...], ...] | None,
@@ -856,6 +908,19 @@ class ABotWorldCausalPipeline(
         return t.to(dtype=dtype)
 
     def encode_prompt(self, prompt: str, *, max_sequence_length: int, dtype: torch.dtype) -> torch.Tensor:
+        if not self.transformer.config.use_relative_rope:
+            return self._encode_text(prompt, max_sequence_length=max_sequence_length, dtype=dtype)
+        # Iris conditions on a global row and an independently encoded local (event/action) row, left empty here.
+        local_length = max_sequence_length - _IRIS_GLOBAL_TOKENS
+        return torch.cat(
+            [
+                self._encode_text(prompt, max_sequence_length=_IRIS_GLOBAL_TOKENS, dtype=dtype),
+                self._encode_text("", max_sequence_length=local_length, dtype=dtype),
+            ],
+            dim=1,
+        )
+
+    def _encode_text(self, prompt: str, *, max_sequence_length: int, dtype: torch.dtype) -> torch.Tensor:
         text_inputs = self.tokenizer(
             [" ".join(prompt.strip().split())],
             padding="max_length",
@@ -883,7 +948,8 @@ class ABotWorldCausalPipeline(
         if state is None:
             raise RuntimeError("ABot AR text cache requested without a bound state.")
         if invalidate:
-            state.clear_cross_attention()
+            # Only the text entry: the reference entry is written once, before the first chunk.
+            state.kv_cache.release_cross_attention_branch(state.session_id, self._AR_TEXT_CACHE, self._AR_BRANCH)
         if not state.is_cross_attention_populated(self._AR_BRANCH, self._AR_TEXT_CACHE):
             # These projections bypass transformer.forward and its offload hook.
             residency = sequential_offload_component(self.transformer) if self._module_offload else nullcontext()
@@ -915,12 +981,24 @@ class ABotWorldCausalPipeline(
             for layer in state.get_cross_attention_kv(self._AR_BRANCH, self._AR_TEXT_CACHE)
         ]
 
+    def _ar_reference_caches(self) -> list[ABotAttentionCache]:
+        state = self._ar_diffusion_kv_state
+        if state is None:
+            raise RuntimeError("ABot AR reference cache requested without a bound state.")
+        layers = state.get_cross_attention_kv(self._AR_BRANCH, self._AR_REF_CACHE)
+        tokens = int(layers[0]["k"].shape[1])
+        return [
+            ABotAttentionCache(key=layer["k"], value=layer["v"], end=tokens, absolute_end=tokens, last_start=0)
+            for layer in layers
+        ]
+
     def _ar_transformer_cache(
         self,
         *,
         latent: torch.Tensor,
         cross_attention: list[ABotAttentionCache],
         commit_current: bool,
+        reference: list[ABotAttentionCache] | None = None,
     ) -> ABotTransformerCache:
         state = self._ar_diffusion_kv_state
         if state is None:
@@ -936,6 +1014,7 @@ class ABotWorldCausalPipeline(
                 commit_current=commit_current,
             ),
             cross_attention=cross_attention,
+            reference=reference,
         )
 
     def _generate_block(
@@ -951,7 +1030,9 @@ class ABotWorldCausalPipeline(
         cache: ABotTransformerCache | None,
         ar_cross_attention: list[ABotAttentionCache] | None,
         progress_bar: TqdmProgressBar[Any],
+        ref_kwargs: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        ref_kwargs = ref_kwargs or {}
         out_channels = int(self.transformer.config.out_channels)
         current_latents = noise_latent
         replace_first = start_frame == 0 and first_frame_latent is not None
@@ -990,6 +1071,7 @@ class ABotWorldCausalPipeline(
                 start_frame=start_frame,
                 update_cache=False,
                 action_condition=action_condition,
+                **ref_kwargs,
             )
             flow_pred = flow_pred[:, :out_channels]
 
@@ -1026,6 +1108,7 @@ class ABotWorldCausalPipeline(
             start_frame=start_frame,
             update_cache=True,
             action_condition=action_condition,
+            **ref_kwargs,
         )
         if ar_cross_attention is not None:
             state = self._ar_diffusion_kv_state
@@ -1053,7 +1136,8 @@ class ABotWorldCausalPipeline(
         inputs = self._parse_request(req)
         if (inputs.height, inputs.width) != (self._ar_height, self._ar_width):
             raise ValueError("ABot stepwise resolution must match the fixed AR cache geometry.")
-        total_chunks = inputs.num_latent_frames // inputs.num_frame_per_block
+        relative = bool(self.transformer.config.use_relative_rope)
+        total_chunks = (inputs.num_latent_frames - int(relative)) // inputs.num_frame_per_block
         if inputs.camera_action_script is not None and len(inputs.camera_action_script) != total_chunks:
             raise ValueError(
                 "camera_action_script must contain one action chunk per generated chunk; "
@@ -1072,14 +1156,49 @@ class ABotWorldCausalPipeline(
             "first_frame_latent": self._encode_first_frame(inputs.image, inputs.height, inputs.width, dtype),
             "schedule": _build_shifted_flow_schedule(flow_shift=inputs.flow_shift),
             "dtype": dtype,
+            "ref_kwargs": self._encode_references(inputs.reference_images, dtype) if relative else {},
         }
-        self._ar_text_caches(prompt_embeds, invalidate=False)
+        text_caches = self._ar_text_caches(prompt_embeds, invalidate=False)
+        if relative:
+            self._prefill_source_frame(state, text_caches)
         return state
+
+    def _prefill_source_frame(self, state: StepRequestState, text_caches: list[ABotAttentionCache]) -> None:
+        """Commit the clean source frame with the reference tokens, as request mode does before block one.
+
+        The reference K/V this call computes are published to the session's reference cache for every later call.
+        """
+        kv_state = self._ar_diffusion_kv_state
+        assert kv_state is not None
+        inputs: _ABotRequestInputs = state.extra["inputs"]
+        first_frame = state.extra["first_frame_latent"]
+        holders = [
+            ABotAttentionCache(key=first_frame.new_empty(0), value=first_frame.new_empty(0))
+            for _ in self.transformer.blocks
+        ]
+        cache = self._ar_transformer_cache(
+            latent=first_frame, cross_attention=text_caches, commit_current=True, reference=holders
+        )
+        _ = self.transformer(
+            hidden_states=first_frame.to(dtype=self.transformer.dtype),
+            timestep=torch.zeros((1, 1), device=self.device, dtype=torch.float32),
+            encoder_hidden_states=state.prompt_embeds,
+            cache=cache,
+            start_frame=0,
+            update_cache=True,
+            action_condition=self._build_action_tensor(None, 1, inputs.height, inputs.width, state.extra["dtype"]),
+            **state.extra["ref_kwargs"],
+        )
+        kv_state.populate_cross_attention(
+            self._AR_BRANCH, self._AR_REF_CACHE, ((holder.key, holder.value) for holder in holders)
+        )
+        kv_state.commit_paged_context(self._AR_BRANCH)
 
     def _prepare_next_chunk(self, state: StepRequestState) -> None:
         inputs: _ABotRequestInputs = state.extra["inputs"]
         block_frames = inputs.num_frame_per_block
-        start_frame = state.chunk_index * block_frames
+        relative = bool(self.transformer.config.use_relative_rope)
+        start_frame = state.chunk_index * block_frames + int(relative)
         camera = state.interaction_sessions.get("camera")
         live_actions = camera.chunk_actions if isinstance(camera, ABotCameraSession) else None
         if inputs.camera_action_script is not None:
@@ -1096,6 +1215,7 @@ class ABotWorldCausalPipeline(
             cast(torch.Tensor, state.prompt_embeds),
             invalidate=False,
         )
+        state.extra["ar_reference"] = self._ar_reference_caches() if relative else None
         latent_h = inputs.height // self.vae_scale_factor_spatial
         latent_w = inputs.width // self.vae_scale_factor_spatial
         state.latents = randn_tensor(
@@ -1138,6 +1258,7 @@ class ABotWorldCausalPipeline(
             latent=latents,
             cross_attention=state.extra["ar_cross_attention"],
             commit_current=False,
+            reference=state.extra.get("ar_reference"),
         )
         flow_pred = self.transformer(
             hidden_states=latents.to(dtype=self.transformer.dtype),
@@ -1147,6 +1268,7 @@ class ABotWorldCausalPipeline(
             start_frame=start_frame,
             update_cache=False,
             action_condition=state.extra["action_condition"],
+            **state.extra.get("ref_kwargs", {}),
         )
         return flow_pred[:, : int(self.transformer.config.out_channels)]
 
@@ -1184,6 +1306,8 @@ class ABotWorldCausalPipeline(
         if start_frame == 0:
             latents[:, :, 0] = extra["first_frame_latent"][:, :, 0]
         self._commit_stepwise_kv(state, latents)
+        if state.chunk_index == 0 and self.transformer.config.use_relative_rope:
+            latents = torch.cat((extra["first_frame_latent"].to(dtype=latents.dtype), latents), dim=2)
 
         inputs: _ABotRequestInputs = extra["inputs"]
         if inputs.output_type == "latent":
@@ -1216,7 +1340,11 @@ class ABotWorldCausalPipeline(
         num_latent_frames = self._num_frame_per_block
         num_media_frames = num_latent_frames * self.vae_scale_factor_temporal
         if state.chunk_index == 0:
-            num_media_frames -= self.vae_scale_factor_temporal - 1
+            if self.transformer.config.use_relative_rope:
+                # The prefilled source frame is decoded with the first chunk.
+                num_media_frames += 1
+            else:
+                num_media_frames -= self.vae_scale_factor_temporal - 1
         fps = state.sampling.fps
         if fps is None or float(fps) <= 0:
             # Key actions are applied per chunk, not paced against wall-clock frames;
@@ -1241,6 +1369,7 @@ class ABotWorldCausalPipeline(
             latent=latents,
             cross_attention=extra["ar_cross_attention"],
             commit_current=True,
+            reference=extra.get("ar_reference"),
         )
         _ = self.transformer(
             hidden_states=latents.to(dtype=self.transformer.dtype),
@@ -1250,6 +1379,7 @@ class ABotWorldCausalPipeline(
             start_frame=start_frame,
             update_cache=True,
             action_condition=extra["action_condition"],
+            **extra.get("ref_kwargs", {}),
         )
         assert self._ar_diffusion_kv_state is not None
         self._ar_diffusion_kv_state.commit_paged_context(self._AR_BRANCH)
@@ -1271,20 +1401,42 @@ class ABotWorldCausalPipeline(
         latent_w = inputs.width // self.vae_scale_factor_spatial
 
         first_frame_cond = self._encode_first_frame(inputs.image, inputs.height, inputs.width, dtype)
+        relative = bool(self.transformer.config.use_relative_rope)
+        ref_kwargs: dict[str, torch.Tensor] = {}
+        ref_tokens = 0
+        if relative:
+            ref_kwargs = self._encode_references(inputs.reference_images, dtype)
+            ref_tokens = _reference_tokens(
+                vae_scale_factor=self.vae_scale_factor_spatial, patch_height=self.transformer.config.patch_size[1]
+            )
         cache = self.transformer.allocate_cache(
             batch_size=1,
             latent_height=latent_h,
             latent_width=latent_w,
             device=self.device,
             dtype=dtype,
+            ref_tokens=ref_tokens,
         )
-        total_steps = (inputs.num_latent_frames // block_frames) * len(ABOT_DMD_TIMESTEPS)
+        first_block_start = 1 if relative else 0
+        total_steps = ((inputs.num_latent_frames - first_block_start) // block_frames) * len(ABOT_DMD_TIMESTEPS)
         generated_blocks: list[torch.Tensor] = []
 
         block_action = self._build_action_tensor(None, block_frames, inputs.height, inputs.width, dtype)
+        if relative:
+            # The source frame enters the clean context before any block is denoised.
+            _ = self.transformer(
+                hidden_states=first_frame_cond.to(dtype=self.transformer.dtype),
+                timestep=torch.zeros((1, 1), device=self.device, dtype=torch.float32),
+                encoder_hidden_states=prompt_embeds,
+                cache=cache,
+                start_frame=0,
+                update_cache=True,
+                action_condition=self._build_action_tensor(None, 1, inputs.height, inputs.width, dtype),
+                **ref_kwargs,
+            )
 
         with self.progress_bar(total=total_steps) as progress_bar:
-            for local_start in range(0, inputs.num_latent_frames, block_frames):
+            for local_start in range(first_block_start, inputs.num_latent_frames, block_frames):
                 noise = randn_tensor(
                     (1, out_channels, block_frames, latent_h, latent_w),
                     generator=inputs.generator,
@@ -1303,9 +1455,12 @@ class ABotWorldCausalPipeline(
                         cache=cache,
                         ar_cross_attention=None,
                         progress_bar=progress_bar,
+                        ref_kwargs=ref_kwargs,
                     )
                 )
 
+        if relative:
+            generated_blocks.insert(0, first_frame_cond.to(dtype=generated_blocks[0].dtype))
         generated_latents = torch.cat(generated_blocks, dim=2)
         cache = None
 

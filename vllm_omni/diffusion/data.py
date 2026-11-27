@@ -2071,9 +2071,9 @@ class OmniDiffusionConfig:
                         self.model_class_name = "Pi05Pipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
-                elif model_type == "ti2v" and self.model_class_name == "ABotWorldCausalPipeline":
-                    # The official ABot checkpoint uses its native single-directory
-                    # layout and intentionally has no Diffusers pipeline index.
+                elif model_type in ("ti2v", "ci2v") and self.model_class_name == "ABotWorldCausalPipeline":
+                    # The official ABot checkpoints (ABot-World-0 ti2v, 0.5 Iris ci2v) use their
+                    # native single-directory layout and intentionally have no Diffusers pipeline index.
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
