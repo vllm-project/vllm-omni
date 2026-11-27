@@ -68,6 +68,7 @@ class _ExecutorShutdownCleaner:
     broadcast_mq: MessageQueue | None = None
     num_workers: int = 0
     processes: list[mp.Process] | None = None
+    wait_for_shutdown: bool = True
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __call__(self) -> None:
@@ -98,7 +99,7 @@ class _ExecutorShutdownCleaner:
                 _NPU_WORKER_SHUTDOWN_GRACE_S if current_omni_platform.is_npu() else _WORKER_SHUTDOWN_GRACE_S
             )
             for action, grace in (
-                (None, shutdown_grace),
+                (None, shutdown_grace if self.wait_for_shutdown else 0),
                 ("terminate", _WORKER_TERMINATE_GRACE_S),
                 ("kill", _WORKER_KILL_GRACE_S),
             ):
@@ -370,54 +371,58 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
         scheduler_pipe_readers = []
         scheduler_pipe_writers = []
 
-        for i in range(num_gpus):
-            reader, writer = mp_context.Pipe(duplex=False)
-            scheduler_pipe_writers.append(writer)
-            process = mp_context.Process(
-                target=WorkerProc.worker_main,
-                args=(
-                    i,  # rank
-                    od_config,
-                    writer,
-                    broadcast_handle,
-                    wake_events[i],
-                    worker_extension_cls,
-                    custom_pipeline_args,
-                ),
-                kwargs={"sharing_registry": sharing_registry, "parent_pid": os.getpid()},
-                name=f"DiffusionWorker-{i}",
-                daemon=True,
-            )
-            scheduler_pipe_readers.append(reader)
-            # Spawn inherits the launching thread's CPU allowance before the
-            # child interpreter imports its main module, Torch or the worker.
-            with npu_worker_start_affinity(od_config, i, is_npu=current_omni_platform.is_npu()):
-                process.start()
-            processes.append(process)
+        try:
+            for i in range(num_gpus):
+                reader, writer = mp_context.Pipe(duplex=False)
+                scheduler_pipe_writers.append(writer)
+                scheduler_pipe_readers.append(reader)
+                process = mp_context.Process(
+                    target=WorkerProc.worker_main,
+                    args=(
+                        i,  # rank
+                        od_config,
+                        writer,
+                        broadcast_handle,
+                        wake_events[i],
+                        worker_extension_cls,
+                        custom_pipeline_args,
+                    ),
+                    kwargs={"sharing_registry": sharing_registry, "parent_pid": os.getpid()},
+                    name=f"DiffusionWorker-{i}",
+                    daemon=True,
+                )
+                # Spawn inherits the launching thread's CPU allowance before the
+                # child interpreter imports its main module, Torch or the worker.
+                with npu_worker_start_affinity(od_config, i, is_npu=current_omni_platform.is_npu()):
+                    process.start()
+                    processes.append(process)
 
-        # Wait for all workers to be ready
-        result_handles: list[Handle] = []
-        for writer in scheduler_pipe_writers:
-            writer.close()
+            # Wait for all workers to be ready
+            result_handles: list[Handle] = []
+            for writer in scheduler_pipe_writers:
+                writer.close()
 
-        for i, reader in enumerate(scheduler_pipe_readers):
-            try:
-                data = reader.recv()
-            except EOFError:
-                logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")
-                processes[i].join()
-                logger.error(f"Exit code: {processes[i].exitcode}")
-                raise
+            for i, reader in enumerate(scheduler_pipe_readers):
+                try:
+                    data = reader.recv()
+                except EOFError:
+                    logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")
+                    raise
 
-            if data["status"] != "ready":
-                raise RuntimeError("Initialization failed. Please see the error messages above.")
+                if data["status"] != "ready":
+                    raise RuntimeError("Initialization failed. Please see the error messages above.")
 
-            result_handle = data.get("result_handle")
-            if result_handle is None:
-                raise RuntimeError(f"Rank {i} did not provide a result queue handle")
-            result_handles.append(result_handle)
+                result_handle = data.get("result_handle")
+                if result_handle is None:
+                    raise RuntimeError(f"Rank {i} did not provide a result queue handle")
+                result_handles.append(result_handle)
 
-            reader.close()
+        except BaseException:
+            _ExecutorShutdownCleaner(processes=processes, wait_for_shutdown=False)()
+            raise
+        finally:
+            for pipe in (*scheduler_pipe_readers, *scheduler_pipe_writers):
+                pipe.close()
 
         logger.debug("All workers are ready")
 
