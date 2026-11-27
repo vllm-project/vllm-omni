@@ -228,8 +228,8 @@ class OpenAICreateSpeechRequest(BaseModel):
         description=(
             "Explicit opt-in to scheduler isolation for a seeded request: it waits for the "
             "engine to drain and runs alone, which makes its output byte-reproducible under "
-            "concurrency but lowers throughput while it runs. Requires a seed; a seed alone "
-            "no longer isolates the request."
+            "concurrency but lowers throughput while it runs. Requires a seed: the request "
+            "is rejected if the flag is set without one. A seed alone does not isolate."
         ),
     )
     initial_codec_chunk_frames: int | None = Field(
@@ -238,6 +238,17 @@ class OpenAICreateSpeechRequest(BaseModel):
         le=_INT64_MAX,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
+
+    @model_validator(mode="after")
+    def _seeded_isolation_requires_seed(self) -> "OpenAICreateSpeechRequest":
+        """The isolation flag without a seed can never isolate (#11246)."""
+        if self.seeded_isolation and self.seed is None:
+            raise ValueError(
+                "seeded_isolation requires a seed: the flag opts a seeded request into "
+                "scheduler isolation, so there is nothing to isolate without one."
+            )
+        return self
+
     non_streaming_mode: bool | None = Field(
         default=None,
         description=(

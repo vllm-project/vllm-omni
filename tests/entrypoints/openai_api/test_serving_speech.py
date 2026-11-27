@@ -6806,6 +6806,17 @@ class TestTTSAsyncOffloading:
         assert stage0_params.extra_args["omni_user_seed"] is True
         assert voxtral_server.engine_client.default_sampling_params_list[0].extra_args is None
 
+    def test_seeded_isolation_without_seed_is_rejected(self):
+        """The isolation flag without a seed is a 400, not a silent no-op (#11246)."""
+        from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+
+        with pytest.raises(ValueError, match="seeded_isolation requires a seed"):
+            OpenAICreateSpeechRequest(input="hello", voice="test", seeded_isolation=True)
+        # The valid combinations still construct.
+        OpenAICreateSpeechRequest(input="hello", voice="test", seed=42, seeded_isolation=True)
+        OpenAICreateSpeechRequest(input="hello", voice="test", seed=42)
+        OpenAICreateSpeechRequest(input="hello", voice="test")
+
     def test_prepare_speech_generation_seed_alone_keeps_normal_batching(self, voxtral_server, mocker: MockerFixture):
         """#11226: a client seed controls randomness only - no isolation marker."""
         default_params = voxtral_server.engine_client.default_sampling_params_list[0]
