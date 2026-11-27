@@ -30,6 +30,7 @@ class OmniServingCapability(Enum):
     MESSAGES = RouteTarget("/v1/messages", frozenset({"POST"}))
     INVOCATIONS = RouteTarget("/invocations", frozenset({"POST"}))
     GENERATE_TOKENS = RouteTarget("/inference/v1/generate", frozenset({"POST"}))
+    AUDIO_GENERATE = RouteTarget("/v1/audio/generate", frozenset({"POST"}))
     IMAGE_EDITS = RouteTarget("/v1/images/edits", frozenset({"POST"}))
     RUN = RouteTarget("/v1/run", frozenset({"POST"}))
 
@@ -46,6 +47,30 @@ class OmniServingCapability(Enum):
 class EndpointRestriction:
     capability: OmniServingCapability
     reason: str
+
+
+def speech_only_endpoint_restrictions(model_name: str) -> tuple[EndpointRestriction, ...]:
+    """Reject public generation routes that bypass speech prompt preparation.
+
+    Opt in only for pipelines that require the speech adapter's conditioning.
+    Keep the engine's internal ``generate`` task available for speech synthesis.
+    """
+    return tuple(
+        EndpointRestriction(
+            capability,
+            f"{model_name} does not support the {api_name} API. Use /v1/audio/speech instead.",
+        )
+        for capability, api_name in (
+            (OmniServingCapability.COMPLETIONS, "Completions"),
+            (OmniServingCapability.CHAT_COMPLETIONS, "Chat Completions"),
+            (OmniServingCapability.CHAT_COMPLETIONS_BATCH, "Batch Chat Completions"),
+            (OmniServingCapability.RESPONSES, "Responses"),
+            (OmniServingCapability.MESSAGES, "Messages"),
+            (OmniServingCapability.INVOCATIONS, "Invocations"),
+            (OmniServingCapability.GENERATE_TOKENS, "Generate Tokens"),
+            (OmniServingCapability.AUDIO_GENERATE, "Audio Generate"),
+        )
+    )
 
 
 def build_rejection_handler(reason: str):

@@ -655,7 +655,7 @@ def test_module_offload_rejects_unsupported_components(components, mocker):
         ({"parallel_config": DiffusionParallelConfig(allgather_degree=2)}, "only supports Ulysses"),
         ({"parallel_config": DiffusionParallelConfig(ulysses_degree=3)}, "16 attention heads"),
         ({"parallel_config": DiffusionParallelConfig(ulysses_mode="advanced_uaa")}, "strict Ulysses"),
-        ({"parallel_config": DiffusionParallelConfig(ulysses_a2a_permute=True)}, "strict Ulysses"),
+        ({"parallel_config": DiffusionParallelConfig(ulysses_a2a_backend="copy_engine")}, "ulysses_a2a_backend='nccl'"),
         ({"parallel_config": DiffusionParallelConfig(vae_patch_parallel_size=2)}, "VAE"),
         ({"dtype": torch.float32}, "bfloat16"),
         ({"cache_backend": "cache_dit"}, "cache backend"),
@@ -696,13 +696,14 @@ def test_unsupported_engine_features(overrides, match):
 
 @pytest.mark.parametrize("sp_size", [1, 2, 4, 8, 16])
 def test_supported_ulysses_config(sp_size):
-    validate_config(
-        OmniDiffusionConfig(
-            distributed_executor_backend="mp",
-            parallel_config=DiffusionParallelConfig(ulysses_degree=sp_size),
-            dtype=torch.bfloat16,
-        )
+    config = OmniDiffusionConfig(
+        distributed_executor_backend="mp",
+        parallel_config=DiffusionParallelConfig(ulysses_degree=sp_size),
+        dtype=torch.bfloat16,
     )
+    validate_config(config)
+    # The default "auto" transport is pinned to NCCL before any Attention layer is built.
+    assert config.parallel_config.ulysses_a2a_backend == "nccl"
 
 
 @pytest.mark.parametrize("sp_size", [2, 4, 8, 16])

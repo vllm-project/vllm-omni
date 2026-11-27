@@ -72,13 +72,22 @@ def write_model_dir(path: Path) -> str:
     return str(path)
 
 
-def stage_vllm_config(model: str, deploy: str, stage_id: int, **overrides: object) -> VllmConfig:
+def stage_vllm_config(
+    model: str,
+    deploy: str,
+    stage_id: int,
+    *,
+    deployment_scope: str | None = None,
+    **overrides: object,
+) -> VllmConfig:
     """One stage's engine config, as the orchestrator builds it from the deploy file.
 
     Args:
         model: The model directory.
         deploy: The deploy file's name in ``vllm_omni/deploy``, or a path to one.
         stage_id: The stage.
+        deployment_scope: Shared with every other stage of this deployment.
+            Each load without one mints its own connector scope.
         **overrides: Per-stage engine arguments over the deploy file's, as
             ``--stage-overrides`` gives them.
 
@@ -95,7 +104,7 @@ def stage_vllm_config(model: str, deploy: str, stage_id: int, **overrides: objec
     )
     stage = resolution.stage_configs[stage_id]
     spec = get_stage_connector_spec(
-        load_omni_transfer_config_for_model(model, resolution.config_path),
+        load_omni_transfer_config_for_model(model, resolution.config_path, deployment_scope=deployment_scope),
         stage_id,
         async_chunk=stage.connector_config.async_chunk,
     )

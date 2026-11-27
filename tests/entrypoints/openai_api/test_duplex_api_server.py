@@ -369,6 +369,22 @@ def test_minicpmo_serving_profiles(monkeypatch, deploy_name, expected):
     assert api_server._should_serve_duplex("openbmb/MiniCPM-o-4_5", {}) is True
 
 
+@pytest.mark.parametrize(
+    "deploy_name,expected",
+    [
+        (None, True),
+        ("realtime_venus_omni.yaml", True),
+        ("realtime_venus_omni_turn.yaml", False),
+    ],
+)
+def test_realtime_venus_serving_profiles(monkeypatch, deploy_name, expected):
+    from vllm_omni.model_executor.models.realtime_venus.pipeline import REALTIME_VENUS_OMNI_PIPELINE
+
+    monkeypatch.setattr(StageConfigFactory, "get_pipeline_config", lambda **_: REALTIME_VENUS_OMNI_PIPELINE)
+    kwargs = {} if deploy_name is None else {"deploy_config": deploy_name}
+    assert api_server._should_serve_duplex("Realtime-Venus-Omni", kwargs) is expected
+
+
 @pytest.mark.parametrize("asr", [False, True])
 @pytest.mark.parametrize("duplex", [False, True])
 def test_joyai_serving_profiles(monkeypatch, asr, duplex):
