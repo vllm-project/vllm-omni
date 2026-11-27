@@ -363,8 +363,6 @@ async def test_speech_e2e_log_reports_real_stream_flag(caplog):
     serving = _burst_serving()
     serving.request_logger = None  # force the DEBUG path
 
-    serving.request_logger = None  # force the DEBUG path
-
     async def results():
         for _ in range(2):
             yield SimpleNamespace(multimodal_output={"model_outputs": torch.zeros(320), "sr": 24000})
@@ -4853,9 +4851,11 @@ class TestStreamingResponse:
             collect=None,
             target_sample_rate=None,
             audio_format=None,
+            stream_flag=None,
         ):
             captured["tts_params"] = tts_params
             captured["target_sample_rate"] = target_sample_rate
+            captured["stream_flag"] = stream_flag
             yield b"\x00\x00"
 
         monkeypatch.setattr(speech_server, "_prepare_speech_generation", prepare)
@@ -4869,6 +4869,9 @@ class TestStreamingResponse:
         assert response.status_code == 200
         assert captured["tts_params"] is finalized_tts_params
         assert captured["target_sample_rate"] is None
+        # The raw-audio route wires stream_flag from request.stream; this
+        # request omits stream, so the E2E log must see "false".
+        assert captured["stream_flag"] == "false"
 
     def test_sse_streaming(self, streaming_app):
         """stream_format=sse without stream=True returns audio deltas as SSE."""
