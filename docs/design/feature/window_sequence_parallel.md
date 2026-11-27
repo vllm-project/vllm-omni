@@ -117,7 +117,7 @@ count to divide by eight. The model has no `_sp_plan`, and its attention uses
 `skip_sequence_parallel=True`; generic sequence hooks and Ulysses attention
 exchanges are not installed. Reports name the actual execution path explicitly.
 
-SeedVR2 rejects ring, allgather, `advanced_uaa`, and `ulysses_a2a_permute`.
+SeedVR2 rejects ring, allgather, `advanced_uaa`, and `ulysses_a2a_backend='copy_engine'`.
 Other diffusion models keep their existing Ulysses/Ring/AllGather behavior.
 
 ## SeedVR2 integration
