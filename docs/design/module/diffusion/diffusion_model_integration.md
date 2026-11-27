@@ -93,6 +93,18 @@ cached thought tokens or receiving incomplete image/CFG coverage is rejected
 before injection. Full recomputation can still drop thoughts. Standalone text
 requests and AR outputs without a completed CoT retain their template path.
 
+## Shared RMSNorm residual precision on NPU
+
+The shared `RMSNorm.forward_npu` uses `torch_npu.npu_add_rms_norm` when `x`
+and `residual` have the same dtype. With different dtypes, it materializes
+`residual + x` using PyTorch's dtype promotion, then calls `npu_rms_norm`
+with gamma converted to the sum's dtype. The returned residual and normalized
+output preserve the promoted dtype.
+
+Selection is automatic. Matching BF16 inputs use fusion, which can normalize
+the sum before BF16 rounding; this policy does not enforce the native rounding
+boundary for that case. Calls without a residual still use `npu_rms_norm`.
+
 ## Weight reloading
 
 Pipelines that support live RL weight updates opt in with

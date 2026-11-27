@@ -56,6 +56,8 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "NemotronVoiceChatTalkerForConditionalGeneration": "nemotron_voicechat",
     "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
+    "AuraQwen3VLForConditionalGeneration": "qwen3_vl",
+    "AuraQwen3_5ForConditionalGeneration": "qwen3_5",
 }
 
 # Model types whose official Hub repo ships no config.json, so
