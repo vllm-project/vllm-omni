@@ -3045,9 +3045,7 @@ async def async_request_openai_audio_speech(
                             "parsing as raw audio (diffusion TTS does not emit speech.metrics).",
                             content_type,
                         )
-                    sample_rate, channels = _stream_pcm_format_from_headers(
-                        response.headers, sample_rate, channels
-                    )
+                    sample_rate, channels = _stream_pcm_format_from_headers(response.headers, sample_rate, channels)
                     async for chunk in response.content.iter_any():
                         if not chunk:
                             continue
@@ -3059,9 +3057,12 @@ async def async_request_openai_audio_speech(
                 response_end_s = output.latency
 
                 if not total_pcm_bytes:
-                    raise ValueError(
-                        f"Audio stream returned no PCM data (Content-Type={response.headers.get('Content-Type')!r})"
-                    )
+                    # Empty SSE still needs the speech.audio.done failure below;
+                    # do not turn it into a generic "no PCM" traceback.
+                    if not (parse_as_sse and not saw_speech_audio_done):
+                        raise ValueError(
+                            f"Audio stream returned no PCM data (Content-Type={response.headers.get('Content-Type')!r})"
+                        )
                 if total_pcm_bytes % (sample_width * channels):
                     raise ValueError(
                         "Audio stream ended with an incomplete PCM frame "
