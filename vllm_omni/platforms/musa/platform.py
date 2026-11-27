@@ -164,8 +164,17 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
 
     @classmethod
     def record_device_event(cls) -> torch.Event | None:
+        """Record a device event on the default stream to mark tensor readiness.
+
+        Uses the generic ``torch.Event``, not ``torch.musa.Event``: the async
+        output consumer waits with ``torch.Stream.wait_event``, and the XPU and
+        NPU overrides both document that this binding silently no-ops for a
+        native backend event, leaving the side-stream D2H racing the still-running
+        forward so the host reads a partially written tensor. ``torch.Event``
+        dispatches to the active backend and stays cross-stream compatible.
+        """
         try:
-            event = torch.musa.Event()
+            event = torch.Event()
             event.record()
             return event
         except Exception:
