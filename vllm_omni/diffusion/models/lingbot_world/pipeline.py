@@ -29,6 +29,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_fast_path import install_wan_decoder_fast_path
 from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import install_wan_spatial_shard_decode
+from vllm_omni.diffusion.distributed.ulysses_transport import require_default_ulysses_transport
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession
@@ -273,20 +274,18 @@ def _validate_parallel_config(od_config: OmniDiffusionConfig) -> None:
     ring_degree = getattr(parallel_config, "ring_degree", 1) or 1
     allgather_degree = getattr(parallel_config, "allgather_degree", 1) or 1
     ulysses_mode = getattr(parallel_config, "ulysses_mode", "strict")
-    ulysses_a2a_permute = bool(getattr(parallel_config, "ulysses_a2a_permute", False))
     if (
         sequence_parallel_size != ulysses_degree
         or ring_degree != 1
         or allgather_degree != 1
         or ulysses_mode != "strict"
-        or ulysses_a2a_permute
     ):
         raise NotImplementedError(
-            "LingBot World sequence parallelism requires pure Ulysses with ulysses_a2a_permute disabled: "
+            "LingBot World sequence parallelism requires pure Ulysses in strict mode: "
             f"sequence_parallel_size={sequence_parallel_size}, ulysses_degree={ulysses_degree}, "
-            f"ring_degree={ring_degree}, allgather_degree={allgather_degree}, ulysses_mode={ulysses_mode!r}, "
-            f"ulysses_a2a_permute={ulysses_a2a_permute}."
+            f"ring_degree={ring_degree}, allgather_degree={allgather_degree}, ulysses_mode={ulysses_mode!r}."
         )
+    require_default_ulysses_transport(parallel_config, "LingBot World", NotImplementedError)
     if getattr(parallel_config, "use_hsdp", False):
         raise NotImplementedError("LingBot World v1 does not support HSDP.")
     if getattr(parallel_config, "enable_expert_parallel", False):

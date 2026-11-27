@@ -748,8 +748,11 @@ class OmniModelState(DefaultModelState):
             num_computed_tokens = None
             if req_states is not None:
                 prompt_len = self._get_req_state_value(getattr(req_states, "prompt_len", None), req_idx)
+                num_computed_field = getattr(req_states, "num_computed_tokens_np", None)
+                if num_computed_field is None:
+                    num_computed_field = getattr(req_states, "num_computed_tokens", None)
                 num_computed_tokens = self._get_req_state_value(
-                    getattr(req_states, "num_computed_tokens", None),
+                    num_computed_field,
                     req_idx,
                 )
             if num_computed_tokens is None:
