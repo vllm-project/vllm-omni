@@ -36,6 +36,8 @@ def is_frontend_only(single_stage_id_filter: int | None) -> bool:
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "ChatterboxForConditionalGeneration": "chatterbox",
+    "Confucius4TTSS2ADecoder": "confucius4_tts",
+    "Confucius4TTSTalkerForConditionalGeneration": "confucius4_tts",
     "CosyVoice3Model": "cosyvoice3",
     "GLMTTSForConditionalGeneration": "glm_tts",
     "IndexTTS2S2MelDecoder": "indextts2",
@@ -54,12 +56,18 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "NemotronVoiceChatTalkerForConditionalGeneration": "nemotron_voicechat",
     "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
+    "AuraQwen3VLForConditionalGeneration": "qwen3_vl",
+    "AuraQwen3_5ForConditionalGeneration": "qwen3_5",
 }
 
 # Model types whose official Hub repo ships no config.json, so
 # ``_patch_empty_hf_config`` writes one for a Hub id as well as for a local
 # directory instead of letting transformers fail on the missing file.
 _CONFIG_LESS_MODEL_TYPES: frozenset[str] = frozenset({"chatterbox"})
+
+# Model types whose local bundles may hold only checkpoint files; a missing
+# config.json is patched for a local directory only.
+_LOCAL_BUNDLE_MODEL_TYPES: frozenset[str] = frozenset({"indextts2_5", "confucius4_tts"})
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
 _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
@@ -76,6 +84,10 @@ def _register_omni_hf_configs() -> None:
             Alpamayo2SuperConfig,
         )
         from vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze import BreezeConfig
+        from vllm_omni.model_executor.models.confucius4_tts.configuration_confucius4_tts import (
+            Confucius4Config,
+            Confucius4TTSConfig,
+        )
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
             IndexTTS25Config,
@@ -125,6 +137,8 @@ def _register_omni_hf_configs() -> None:
     for model_type, config_cls in [
         ("alpamayo2_super", Alpamayo2SuperConfig),
         ("breeze", BreezeConfig),
+        ("confucius4", Confucius4Config),
+        ("confucius4_tts", Confucius4TTSConfig),
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
         ("ming3_tts", Ming3TTSConfig),
@@ -170,6 +184,15 @@ def register_omni_models_to_vllm():
     # (and matches OmniModelRegistry's omni-wins ordering).
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
         ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+
+    from vllm.v1.worker.gpu.spec_decode.speculator_config import register_speculative_method
+
+    from vllm_omni.model_executor.models.higgs_audio_v3.spec_config import (
+        HIGGS_AUDIO_SPEC_METHOD,
+        HiggsAudioSpeculatorConfig,
+    )
+
+    register_speculative_method(HIGGS_AUDIO_SPEC_METHOD, HiggsAudioSpeculatorConfig)
 
     # Register omni-specific reasoning parsers (e.g., step_audio).
     import vllm_omni.reasoning  # noqa: F401
@@ -369,6 +392,7 @@ class OmniEngineArgs(EngineArgs):
     diffusion_flashinfer_autotune: bool | None = None
     worker_type: str | None = None
     scheduling_metadata_adapter: str | None = None
+    scheduler_window_policy: str | None = None
     # Dotted path of a per-stage pooling-output decoder applied worker-side.
     pooling_output_decoder: str | None = None
     task_type: str | None = None
@@ -457,7 +481,8 @@ class OmniEngineArgs(EngineArgs):
     # invariant 1 below requires the overlap to stay a subset of that set.
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
-    ulysses_a2a_permute: bool | None = None
+    ulysses_overlap_chunks: int | None = None
+    ulysses_a2a_backend: str | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     use_hsdp: bool | None = None
@@ -532,16 +557,17 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
-            # Keep this exception model-scoped so other loader failures retain
-            # vLLM's normal error path.
+            # Some local native TTS bundles (IndexTTS 2.5, Confucius4-TTS) only
+            # contain checkpoint files and no HuggingFace config.json. Keep this
+            # exception model-scoped so other loader failures retain vLLM's
+            # normal error path.
             # Chatterbox's Hub repo ships none either, so its Hub id is patched
             # too, but only when the file is absent: a failure to load an
             # existing one stays on that error path.
             if model_type in _CONFIG_LESS_MODEL_TYPES:
                 if file_or_path_exists(self.model, "config.json", revision=self.revision):
                     return
-            elif model_type != "indextts2_5" or not os.path.isdir(self.model):
+            elif model_type not in _LOCAL_BUNDLE_MODEL_TYPES or not os.path.isdir(self.model):
                 return
             elif os.path.lexists(os.path.join(self.model, "config.json")):
                 return
@@ -689,6 +715,7 @@ class OmniEngineArgs(EngineArgs):
             model_arch=self.model_arch,
             worker_type=self.worker_type,
             scheduling_metadata_adapter=self.scheduling_metadata_adapter,
+            scheduler_window_policy=self.scheduler_window_policy,
             pooling_output_decoder=self.pooling_output_decoder,
             engine_output_type=self.engine_output_type,
             final_output=self.final_output,
@@ -827,7 +854,8 @@ class OrchestratorArgs:
     diffusers_call_kwargs: str = "{}"
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
-    ulysses_a2a_permute: bool | None = None
+    ulysses_overlap_chunks: int | None = None
+    ulysses_a2a_backend: str | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
@@ -971,7 +999,8 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         # them, the engine forwards them to DiffusionParallelConfig.
         "ulysses_degree",
         "ulysses_mode",
-        "ulysses_a2a_permute",
+        "ulysses_overlap_chunks",
+        "ulysses_a2a_backend",
         "ring_degree",
         "allgather_degree",
         "use_hsdp",

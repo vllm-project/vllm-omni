@@ -8,7 +8,8 @@
             "cuda": [
               "H100",
               "B200"
-            ]
+            ],
+            "rocm": "MI325"
           },
           "num_cards": 1
         }
@@ -57,6 +58,11 @@
             "request_throughput": 0.0414,
             "mean_e2el_ms": 24166.28,
             "mean_peak_memory_mb": 74032.6571
+          },
+          "MI300": {
+            "request_throughput": 0.0326,
+            "mean_e2el_ms": 30714.6255,
+            "mean_peak_memory_mb": 72700.0
           }
         }
       }
@@ -72,6 +78,7 @@
               "H100",
               "B200"
             ],
+            "rocm": "MI325",
             "npu": "A3"
           },
           "num_cards": 2
@@ -132,6 +139,11 @@
             "request_throughput": 0.0155,
             "mean_e2el_ms": 64626.4676,
             "mean_peak_memory_mb": 59763.64
+          },
+          "MI300": {
+            "request_throughput": 0.0412,
+            "mean_e2el_ms": 24264.8226,
+            "mean_peak_memory_mb": 46987.8
           }
         }
       },
@@ -173,6 +185,11 @@
             "request_throughput": 0.0021,
             "mean_e2el_ms": 467818.7769,
             "mean_peak_memory_mb": 59792.0
+          },
+          "MI300": {
+            "request_throughput": 0.008,
+            "mean_e2el_ms": 125636.035,
+            "mean_peak_memory_mb": 53704.8
           }
         }
       }
