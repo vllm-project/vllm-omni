@@ -1496,9 +1496,13 @@ rejected.
 | `minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 4 | 6 | 8 |
 | `minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 12 | 8 |
 | `minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 6 | 8 |
-| `minimax_h3_fl2v_turbo_8step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 12 | 128 |
+| `minimax_h3_fl2v_turbo_8step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA / Ref2VA | 8 | 8 | 12 | 128 |
 | `minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` | Ref2VA | 4 | 4 | 12 | 8 |
 | `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` | Ref2VA | 8 | 8 | 6 | 8 |
+
+The 8-step v1.2 row also serves Ref2VA, but only on a server started with
+`--task-type ref2va`. The combined partition still cannot serve Ref2VA with
+this adapter.
 
 `audio_flow_shift` is `3.0` across the family. Each row is the complete
 published filename; use it verbatim as `TURBO_FILE` below.
@@ -1529,7 +1533,8 @@ Diffusers file. The filename is the contract, so do not rename an artifact
 either -- a renamed file is rejected rather than served on a guess.
 
 FL2VA artifacts serve `t2va` and `fl2va` on any FL2VA or combined server.
-Ref2VA artifacts require
+The 8-step v1.2 FL2VA artifact also serves `ref2va`, but only on a server
+started with `--task-type ref2va`. Dedicated Ref2VA artifacts likewise require
 `--task-type ref2va`: a combined server serves `ref2va` from a second DiT that
 the adapter cannot bind to, so loading one there is refused rather than silently
 running an undistilled model on the few-step schedule.
@@ -1570,7 +1575,8 @@ both `--lora-path` and the request's `lora.path`, and carrying that row's
 and `12` for the 544p `8step_v1.0`. A request that does not match the loaded
 artifact is rejected, so a mismatch cannot silently degrade output.
 
-The two `ref2v` rows are not served by this FL2VA command. Start a
+The two `ref2v` rows, and Ref2VA with the 8-step v1.2 FL2VA artifact, are not
+served by this FL2VA command. Start a
 `--task-type ref2va` server, take a request from
 [Ref2VA](#3-ref2va-image-only-imageaudio-or-mixed-references) and override
 `num_inference_steps` and `flow_shift` with that row's values; those examples
