@@ -1127,7 +1127,9 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
         The supported CNN path has no class-token aggregation or isolated
         frames. All other checkpoint contracts retain ordinary preparation.
-        Each clip keeps the native tile gather order.
+        Each clip keeps the native tile gather order. The checkpoint's
+        ``encode_base`` must expose a callable ``DiagonalGaussianDistribution``
+        in its module globals. If it is unavailable, use ordinary preparation.
         """
         model = self.model
         if device.type not in ("cpu", "npu"):

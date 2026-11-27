@@ -674,6 +674,9 @@ sample. The flag follows the legacy preparation flag syntax. It defaults to
 value, `0`, `false`, or `off`. Other values, including `1`, `true`, and `on`,
 enable it on CPU and Ascend NPUs. CUDA, ROCm, XPU, and other devices use
 ordinary preparation, as do unsupported checkpoint configurations.
+The streamed path uses the callable `DiagonalGaussianDistribution` from the
+checkpoint's `encode_base` module. If that name is unavailable, encoding uses
+ordinary preparation.
 `VLLM_OMNI_VAE_ENCODE_LEGACY_PREP=1` takes precedence. Workers log the reason
 when they skip the streamed path or fall back after a local encoding failure.
 
