@@ -381,6 +381,7 @@ class OmniEngineArgs(EngineArgs):
     diffusion_flashinfer_autotune: bool | None = None
     worker_type: str | None = None
     scheduling_metadata_adapter: str | None = None
+    scheduler_window_policy: str | None = None
     # Dotted path of a per-stage pooling-output decoder applied worker-side.
     pooling_output_decoder: str | None = None
     task_type: str | None = None
@@ -468,8 +469,8 @@ class OmniEngineArgs(EngineArgs):
     # invariant 1 below requires the overlap to stay a subset of that set.
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
-    ulysses_a2a_permute: bool | None = None
     ulysses_overlap_chunks: int | None = None
+    ulysses_a2a_backend: str | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     use_hsdp: bool | None = None
@@ -702,6 +703,7 @@ class OmniEngineArgs(EngineArgs):
             model_arch=self.model_arch,
             worker_type=self.worker_type,
             scheduling_metadata_adapter=self.scheduling_metadata_adapter,
+            scheduler_window_policy=self.scheduler_window_policy,
             pooling_output_decoder=self.pooling_output_decoder,
             engine_output_type=self.engine_output_type,
             final_output=self.final_output,
@@ -840,8 +842,8 @@ class OrchestratorArgs:
     diffusers_call_kwargs: str = "{}"
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
-    ulysses_a2a_permute: bool | None = None
     ulysses_overlap_chunks: int | None = None
+    ulysses_a2a_backend: str | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
@@ -983,8 +985,8 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         # them, the engine forwards them to DiffusionParallelConfig.
         "ulysses_degree",
         "ulysses_mode",
-        "ulysses_a2a_permute",
         "ulysses_overlap_chunks",
+        "ulysses_a2a_backend",
         "ring_degree",
         "allgather_degree",
         "use_hsdp",

@@ -60,6 +60,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+ULYSSES_A2A_BACKENDS = ("auto", "nccl", "copy_engine")
+
 # Accepted values for ``OmniDiffusionConfig.vae_fast_path``.
 VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
 
@@ -320,21 +322,25 @@ class DiffusionParallelConfig:
       sequence shapes across the ring group.
     """
 
-    ulysses_a2a_permute: bool = False
-    """Use platform symmetric memory for eligible strict Ulysses exchanges.
+    ulysses_a2a_backend: str = "auto"
+    """Transport for the strict Ulysses all-to-all: ``"auto"``, ``"nccl"`` or ``"copy_engine"``.
 
-    On CUDA, enables CE (copy engines) on a single NVLink-connected node;
-    when disabled, Ulysses uses NCCL. NPU retains its eager, pure Ulysses
-    implementation over WORLD in one HCCS domain, using TorchNPU's NPUSHMEM
-    allocator, Triton-Ascend and a symmetric-memory runtime.
+    On CUDA, ``"copy_engine"`` uses CE (copy engines) on a single node whose GPUs have CUDA peer access (NVLink or PCIe
+    P2P). On NPU it selects the eager, pure Ulysses implementation over WORLD in one HCCS domain, using TorchNPU's
+    NPUSHMEM allocator, Triton-Ascend and a symmetric-memory runtime; ``"auto"`` keeps NPU on its default exchange.
+
+    ``"auto"`` uses the copy engine when the Ulysses group is on one node with CUDA peer access between every pair of
+    ranks and torch symmetric memory, and NCCL otherwise (and always with CUDA-graphed denoising).
     """
 
     ulysses_overlap_chunks: int = 0
-    """Overlap the CUDA copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
+    """Overlap the copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
 
-    Requires ``ulysses_a2a_permute`` and strict pure Ulysses. Each chunk's Q/K/V move to their head owners while
-    earlier chunks compute, and outputs return as each chunk finishes. Results match the unchunked path exactly when
-    the attention backend's per-head output does not depend on the number of heads per call.
+    Applies when the transport is the copy engine (ignored when ``"auto"`` resolves to NCCL) and requires strict pure
+    Ulysses. Each chunk's Q/K/V move to their head owners while earlier chunks compute, and outputs return as each
+    chunk finishes. The first call for each attention kernel and shape runs the overlap and the standard path on
+    every rank and keeps the overlap only if all ranks are bit-identical, so results match the unchunked path
+    exactly; other kernels and shapes keep the standard exchange.
     """
 
     cfg_parallel_size: int = 1
@@ -413,6 +419,10 @@ class DiffusionParallelConfig:
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
+        if self.ulysses_a2a_backend not in ULYSSES_A2A_BACKENDS:
+            raise ValueError(
+                f"ulysses_a2a_backend must be one of {ULYSSES_A2A_BACKENDS}, but got {self.ulysses_a2a_backend!r}."
+            )
         assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
             "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
@@ -439,15 +449,15 @@ class DiffusionParallelConfig:
         if self.ulysses_overlap_chunks < 0:
             raise ValueError(f"ulysses_overlap_chunks must be >= 0, but got {self.ulysses_overlap_chunks}")
         if self.ulysses_overlap_chunks > 0 and (
-            not self.ulysses_a2a_permute
+            self.ulysses_a2a_backend == "nccl"
             or self.ulysses_mode != "strict"
             or self.ring_degree != 1
             or self.allgather_degree != 1
         ):
             raise ValueError(
-                "ulysses_overlap_chunks requires ulysses_a2a_permute and strict pure Ulysses "
-                "(ulysses_mode='strict', ring_degree=1, allgather_degree=1). "
-                f"Got ulysses_a2a_permute={self.ulysses_a2a_permute}, ulysses_mode={self.ulysses_mode!r}, "
+                "ulysses_overlap_chunks requires the copy-engine transport (ulysses_a2a_backend 'auto' or "
+                "'copy_engine') and strict pure Ulysses (ulysses_mode='strict', ring_degree=1, allgather_degree=1). "
+                f"Got ulysses_a2a_backend={self.ulysses_a2a_backend!r}, ulysses_mode={self.ulysses_mode!r}, "
                 f"ring_degree={self.ring_degree}, allgather_degree={self.allgather_degree}."
             )
 

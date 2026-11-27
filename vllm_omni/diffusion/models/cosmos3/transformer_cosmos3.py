@@ -803,12 +803,15 @@ class Cosmos3CrossAttention(nn.Module):
             self.norm_q = QKRMSNorm(self.head_dim, eps=rms_norm_eps)
             self.norm_k = QKRMSNorm(self.head_dim, eps=rms_norm_eps)
 
+        # GEN already supplies BSND tensors; keep that layout in Ascend flash attention.
+        qkv_layout = "BSND" if current_omni_platform.is_npu() else None
         self.attn = FrameworkAttention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=1.0 / (self.head_dim**0.5),
             num_kv_heads=self.num_kv_heads,
+            qkv_layout=qkv_layout,
         )
         # Multi-control attention operates on one full [control_i, target]
         # sequence at a time. Keep those sequences replicated when Ulysses is
@@ -822,6 +825,7 @@ class Cosmos3CrossAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.multi_control_attn",
             skip_sequence_parallel=True,
+            qkv_layout=qkv_layout,
         )
 
     # TODO(follow-up): collapse _forward_local and _forward_sp into a single
