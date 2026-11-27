@@ -24,6 +24,7 @@ from vllm.benchmarks.startup import (
 
 from vllm_omni.entrypoints.cli.benchmark.base import OmniBenchmarkSubcommandBase
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.transformers_utils.repo_utils import hf_api
 from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 
@@ -58,6 +59,17 @@ def create_omni_and_measure_startup(args: TrackingNamespace) -> dict[str, float]
     return result_queue.get()
 
 
+def ensure_downloaded_if_hf_repo(args: TrackingNamespace):
+    """Check if the model needs to be downloaded; if it does, download it to the cache
+    before running any iterations.
+    """
+    hf = hf_api()
+    model = args.model
+    if hf.repo_exists(model):
+        print("Model is an HF repo; downloading to avoid skewed measurements...\n")
+        hf.snapshot_download(model)
+
+
 class OmniBenchmarkStartupSubcommand(OmniBenchmarkSubcommandBase):
     """The `startup` subcommand for vllm bench."""
 
@@ -78,6 +90,8 @@ class OmniBenchmarkStartupSubcommand(OmniBenchmarkSubcommandBase):
         # Set multiprocessing start method to 'spawn' for clean process isolation
         # This ensures each subprocess starts fresh without inheriting state
         multiprocessing.set_start_method("spawn", force=True)
+
+        ensure_downloaded_if_hf_repo(args)
 
         # Collect cold startup iterations
         print("Measuring cold startup time...\n")

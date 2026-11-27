@@ -8,6 +8,6 @@ vllm bench startup --omni --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --output-json startup.json
 ```
 
-Each iteration constructs the pipeline in a new process and times initialization. Cold iterations reuse vLLM's helpers to run against empty temporary cache directories; your existing caches are left untouched.
+If `--model` is a HugginfaceHub repo, we download it prior to running any iterations. Each iteration constructs the pipeline in a new process and times the initialization for creating the `Omni` instance given the pre-downloaded model. Cold iterations reuse vLLM's helpers to run each iteration with a fresh inductor & vLLM cache.
 
 Note that Omni currently reports only total startup time, not the compilation metrics that vLLM reports. Contributions for more granular metrics are welcome.
