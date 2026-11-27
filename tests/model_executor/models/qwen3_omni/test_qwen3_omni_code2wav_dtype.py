@@ -119,7 +119,7 @@ def test_invalid_fallback_option_fails_before_model_construction(mocker, value):
         _codec(mocker, torch.float32, device="cpu", connector={"extra": {"codec_cudnn_fp32_fallback": value}})
 
 
-@pytest.mark.parametrize("profile", ["qwen3_omni_moe.yaml", "qwen3_omni_moe_mrv2.yaml"])
+@pytest.mark.parametrize("profile", ["qwen3_omni_moe.yaml", "qwen3_omni_moe_codec.yaml"])
 @pytest.mark.parametrize("fallback", [False, True])
 def test_deploy_option_reaches_both_decoder_placements(mocker, blackwell_cudnn, tmp_path, profile, fallback):
     from tests.helpers.stage_config import get_deploy_config_path

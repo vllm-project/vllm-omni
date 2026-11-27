@@ -1,11 +1,11 @@
 # Model Runner V2 profile for Qwen3-Omni duplex.
 # Qwen duplex commits each utterance as a fresh request, so Thinker, Talker,
 # and Code2Wav use the same native MRv2 data plane as turn mode. CUDA, ROCm,
-# NPU and XPU run V2; MUSA's deferred V1 profile remains unsupported.
+# and XPU run V2. NPU and MUSA retain unsupported V1 overrides.
 # Unconfigured history_policy preserves full history. Per-request media counts
 # use vLLM defaults; configure smaller counts explicitly when needed. Context
 # capacity and Session input-admission budgets still apply.
 # Thinker prefix caching remains disabled in the inherited codec profile.
-base_config: qwen3_omni_moe_mrv2.yaml
+base_config: qwen3_omni_moe_codec.yaml
 
 session_mode: duplex

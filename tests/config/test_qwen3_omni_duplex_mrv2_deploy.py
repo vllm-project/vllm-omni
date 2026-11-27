@@ -60,16 +60,8 @@ def test_duplex_mrv2_profile_runs_v2_on_xpu(monkeypatch) -> None:
     assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True, True]
 
 
-def test_duplex_mrv2_profile_runs_v2_on_npu(monkeypatch) -> None:
-    config, stages = _resolve_stages(monkeypatch, "npu")
-    assert config.model_runner == "v2"
-    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True, True]
-    assert stages[0].yaml_engine_args["tensor_parallel_size"] == 2
-    assert stages[0].yaml_engine_args["enable_prefix_caching"] is False
-
-
-def test_duplex_mrv2_profile_keeps_deferred_musa_on_v1(monkeypatch) -> None:
-    platform = "musa"
+@pytest.mark.parametrize("platform", ["npu", "musa"])
+def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
     assert config.model_runner == "v1"
