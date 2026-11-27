@@ -598,10 +598,22 @@ class MiniMaxH3FinalLayer(nn.Module):
         """
         from safetensors import safe_open
 
-        if self.pdd_steps is not None:
-            raise ValueError("fused PDD heads cannot replace the FastH3 pdd_steps heads")
         with safe_open(path, "pt", device="cpu") as handle:
             heads = {key: handle.get_tensor(key) for key in handle.keys()}
+        steps = self.check_fused_pdd_heads(heads)
+        device = self.video_out.weight.device
+        self.fused_pdd_heads = {key: value.to(device=device, dtype=_FP32_DTYPE) for key, value in heads.items()}
+        return steps
+
+    def check_fused_pdd_heads(self, heads: Mapping[str, torch.Tensor]) -> int:
+        """Hold a per-step head stack to this layer's projections; returns its step count.
+
+        Run when the heads are loaded, so a stack fused for another width or
+        without one of the heads is refused there rather than in the first
+        denoise step that projects with it.
+        """
+        if self.pdd_steps is not None:
+            raise ValueError("fused PDD heads cannot replace the FastH3 pdd_steps heads")
         names = ("video_out",) if self.audio_out is None else ("video_out", "audio_out")
         expected = {f"{name}.{suffix}" for name in names for suffix in ("weight", "bias")}
         if set(heads) != expected:
@@ -616,9 +628,21 @@ class MiniMaxH3FinalLayer(nn.Module):
                 key = f"{name}.{suffix}"
                 if steps == 0 or tuple(heads[key].shape) != shape:
                     raise ValueError(f"MiniMax-H3 PDD {key} must have shape {shape}, got {tuple(heads[key].shape)}")
-                heads[key] = heads[key].to(device=projection.weight.device, dtype=_FP32_DTYPE)
-        self.fused_pdd_heads = heads
         return steps
+
+    def set_fused_pdd_heads(self, heads: Mapping[str, torch.Tensor] | None) -> None:
+        """Project the next forwards with ``heads`` (one row per step), or with the released heads for ``None``.
+
+        A request-scoped PDD adapter owns its heads, so the pipeline binds them
+        per request instead of loading them once as a PDD release does.
+        """
+        if heads is None:
+            self.fused_pdd_heads = None
+            return
+        if self.pdd_steps is not None:
+            raise ValueError("fused PDD heads cannot replace the FastH3 pdd_steps heads")
+        device = self.video_out.weight.device
+        self.fused_pdd_heads = {key: value.to(device=device, dtype=_FP32_DTYPE) for key, value in heads.items()}
 
     def _fused_pdd_project(self, h: torch.Tensor, name: str, step: int | None) -> torch.Tensor:
         heads = self.fused_pdd_heads

@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/fm/dit.py
 
 import torch
 import torch.nn as nn
+from vllm import _custom_ops as vllm_ops
 from x_transformers.x_transformers import RotaryEmbedding
 
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 from vllm_omni.model_executor.models.common.ming.dit_blocks import CondEmbedder, DiTBlock, FinalLayer
+from vllm_omni.platforms import current_omni_platform
+
+_HAS_VLLM_RMS_NORM = hasattr(vllm_ops, "rms_norm") and hasattr(vllm_ops, "fused_add_rms_norm")
 
 
 class DiT(nn.Module):
@@ -85,6 +89,50 @@ class DiT(nn.Module):
             x = block(x, mask, rope)
         x = self.final_layer(x)
         return x
+
+    def forward_blocks_and_tail(
+        self,
+        x: torch.Tensor,
+        rope: tuple[torch.Tensor, float | None],
+        patch_size: int,
+        *,
+        use_fused_norm: bool = False,
+    ) -> torch.Tensor:
+        """Run DiT blocks with optional fused residual-RMSNorm and project only the trailing ``patch_size`` tokens."""
+        if patch_size <= 0 or patch_size > x.shape[1]:
+            raise ValueError(f"Expected 0 < patch_size <= seq_len ({x.shape[1]}), got {patch_size}")
+        can_fuse_norm = (
+            use_fused_norm
+            and _HAS_VLLM_RMS_NORM
+            and current_omni_platform.is_cuda()
+            and x.is_cuda
+            and not self.training
+            and not torch.compiler.is_compiling()
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and len(self.blocks) > 0
+            and x.is_contiguous()
+        )
+        if not can_fuse_norm:
+            for block in self.blocks:
+                x = block(x, None, rope)
+            return self.final_layer(x[:, -patch_size:, :])
+
+        normed = torch.empty_like(x)
+        first_norm = self.blocks[0].norm1
+        vllm_ops.rms_norm(normed, x, first_norm.weight, first_norm.eps)
+        mlp_out = normed
+        for idx, block in enumerate(self.blocks):
+            attn_out = block.attn(normed, mask=None, rope=rope)
+            vllm_ops.fused_add_rms_norm(attn_out, x, block.norm2.weight, block.norm2.eps)
+            mlp_out = block.mlp(attn_out)
+            if idx + 1 < len(self.blocks):
+                next_norm = self.blocks[idx + 1].norm1
+                vllm_ops.fused_add_rms_norm(mlp_out, x, next_norm.weight, next_norm.eps)
+                normed = mlp_out
+        x_tail = (x[:, -patch_size:, :] + mlp_out[:, -patch_size:, :]).contiguous()
+        tail_norm = torch.empty_like(x_tail)
+        vllm_ops.rms_norm(tail_norm, x_tail, self.final_layer.norm_final.weight, self.final_layer.norm_final.eps)
+        return self.final_layer.linear(tail_norm)
 
     def forward_with_cfg(self, x, t, c, cfg_scale, latent_history, patch_size):
         # Always run the classifier-free-guidance path (cond + uncond). TTS

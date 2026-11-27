@@ -118,7 +118,14 @@ def test_eligible_layer_runs_local_attention_per_chunk(monkeypatch):
     strategy._ulysses_pg = "pg"
     query = torch.randn(1, 8, 8, 16)
     output = layer.Attention._forward_ulysses_ce_overlap(attention, strategy, query, query, query, metadata, 2)
-    assert output is query and calls == [metadata]
+    # The runner's output buffer is reused by the next call, so model code gets a copy.
+    assert torch.equal(output, query) and output is not query and calls == [metadata]
+
+
+def test_no_overlap_while_capturing_a_cuda_graph(monkeypatch):
+    attention, strategy, args = _case()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert layer.Attention._ulysses_ce_overlap_chunks(attention, strategy, **args) == 0
 
 
 class _Impl:

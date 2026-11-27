@@ -20,6 +20,11 @@ import torch
 import torch.nn as nn
 from vllm.platforms import current_platform
 
+from vllm_omni.model_executor.models.common.ming.cfm_dit import DiT
+from vllm_omni.model_executor.models.common.ming.cfm_kernels import (
+    cfm_triton_supported,
+    fused_cfm_euler_sde_step,
+)
 from vllm_omni.model_executor.models.common.ming.cfm_solver import DEFAULT_CFM_STEPS, build_timesteps
 
 
@@ -36,8 +41,29 @@ class CFMSampler(nn.Module):
         self.steps = steps
         self.include_final_noise = include_final_noise
 
+    def supports_fast_path_for(self, llm_cond: torch.Tensor) -> bool:
+        """Return True when this sampler's DiT model can run the CUDA Triton fast path."""
+        return (
+            isinstance(self.model, DiT)
+            and not self.model.training
+            and llm_cond.dtype in (torch.bfloat16, torch.float16)
+            and cfm_triton_supported(llm_cond)
+            and not any(block.attn.native_attention for block in self.model.blocks)
+        )
+
+    def _can_use_fast_path(self, llm_cond: torch.Tensor, lat_cond: torch.Tensor, y0: torch.Tensor) -> bool:
+        return (
+            self.supports_fast_path_for(llm_cond)
+            and llm_cond.ndim == 3
+            and lat_cond.ndim == 3
+            and y0.ndim == 3
+            and llm_cond.shape[0] == lat_cond.shape[0] == y0.shape[0]
+            and y0.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and cfm_triton_supported(y0)
+        )
+
     @torch.no_grad()
-    def forward(self, llm_cond, lat_cond, y0, t, sde_args, sde_rnd):
+    def forward_native(self, llm_cond, lat_cond, y0, t, sde_args, sde_rnd):
         model_dtype = llm_cond.dtype
         for step in range(self.steps):
             dt = t[step + 1] - t[step]
@@ -55,6 +81,52 @@ class CFMSampler(nn.Module):
             if self.include_final_noise or step < self.steps - 1:
                 y0 = y0 + sde_args[1] * (sde_args[2] ** 0.5) * (dt.abs() ** 0.5) * sde_rnd[step]
         return y0
+
+    @torch.no_grad()
+    def _forward_fast(self, llm_cond, lat_cond, y0, t, sde_args, sde_rnd):
+        model = self.model
+        assert isinstance(model, DiT)
+        model_dtype = llm_cond.dtype
+        patch_size = y0.shape[1]
+
+        # Hoist loop-invariant projections out of the ODE loop: conditioning,
+        # latent history, timestep embeddings, and rotary frequencies do not
+        # depend on the evolving state ``y0``.
+        c_cond = model.c_embedder(llm_cond)
+        c_bias = model.c_embedder.cond_embedder.bias
+        c_null = c_bias.view(1, 1, -1).expand_as(c_cond) if c_bias is not None else torch.zeros_like(c_cond)
+        c_2b = torch.cat((c_cond, c_null), dim=0)
+
+        h_1b = model.x_embedder(lat_cond)
+        h_2b = torch.cat((h_1b, h_1b), dim=0)
+
+        seq_len = c_2b.shape[1] + h_2b.shape[1] + patch_size
+        rope = model.rotary_embed.forward_from_seq_len(seq_len)
+        time_embs = model.t_embedder(t[: self.steps].to(model_dtype)).unsqueeze(1).unsqueeze(2)
+
+        y_model = y0.to(model_dtype)
+        for step in range(self.steps):
+            x_now_1b = model.x_embedder(y_model)
+            x = torch.cat((time_embs[step] + c_2b, h_2b, torch.cat((x_now_1b, x_now_1b), dim=0)), dim=1)
+            pred_cfg = model.forward_blocks_and_tail(x, rope, patch_size, use_fused_norm=True)
+            add_noise = self.include_final_noise or step < self.steps - 1
+            y0, y_model = fused_cfm_euler_sde_step(
+                pred_cfg,
+                y0,
+                sde_rnd[step],
+                t,
+                sde_args,
+                step,
+                add_noise=add_noise,
+                model_dtype=model_dtype,
+            )
+        return y0
+
+    @torch.no_grad()
+    def forward(self, llm_cond, lat_cond, y0, t, sde_args, sde_rnd):
+        if self._can_use_fast_path(llm_cond, lat_cond, y0):
+            return self._forward_fast(llm_cond, lat_cond, y0, t, sde_args, sde_rnd)
+        return self.forward_native(llm_cond, lat_cond, y0, t, sde_args, sde_rnd)
 
 
 class CFMGraphExecutor:

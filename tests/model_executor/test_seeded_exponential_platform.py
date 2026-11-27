@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -139,6 +140,38 @@ def test_batched_steps_match_torch_noise_at_each_request_offset(vocab):
             expected[frame, row].exponential_(generator=reference)
             assert reference.get_offset() == offsets[row] + (frame + 1) * increment
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_higgs_noise_preview_follows_committed_positions_after_batch_reorder():
+    from vllm_omni.model_executor.models.higgs_audio_v3.spec_decode import HiggsAudioSpeculator
+
+    device = torch.device("cuda")
+    state = SimpleNamespace(
+        generators={
+            name: torch.Generator(device=device).manual_seed(seed) for name, seed in (("a", 7), ("b", 2**63 + 5))
+        },
+        model=SimpleNamespace(num_codebooks=8, multimodal_embedding=SimpleNamespace(vocab_size=1026)),
+    )
+    state.generators["b"].set_offset(12)
+    references = {name: gen.clone_state() for name, gen in state.generators.items()}
+    spec = object.__new__(HiggsAudioSpeculator)
+    spec.device_rng = {}
+
+    noise, offsets, increment = spec.preview_noise(state, ["a", "b"], device)
+    expected = torch.stack(
+        [
+            torch.stack([torch.empty(8208, device=device).exponential_(generator=gen) for gen in references.values()])
+            for _ in range(2)
+        ]
+    )
+    torch.testing.assert_close(noise, expected, rtol=0, atol=0)
+    spec.update_offsets(["a", "b"], offsets + torch.tensor([2, 1], device=device) * increment)
+    reordered, _, _ = spec.preview_noise(state, ["b", "a"], device)
+    torch.testing.assert_close(reordered[0, 0], expected[1, 1], rtol=0, atol=0)
+    next_a = torch.empty(8208, device=device).exponential_(generator=references["a"])
+    torch.testing.assert_close(reordered[0, 1], next_a, rtol=0, atol=0)
+    assert [gen.get_offset() for gen in state.generators.values()] == [0, 12]
 
 
 @pytest.mark.cpu

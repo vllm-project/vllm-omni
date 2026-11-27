@@ -50,6 +50,8 @@ class MiniMaxMusic3Adapter(ARTTSAdapter):
 
     name = "minimax_music3"
     stage_keys = frozenset({"minimax_music3_ar"})
+    # Sampling is fixed by the checkpoint (see _UNSUPPORTED_SAMPLING_PARAMS).
+    supports_temperature = False
     # 9,000 frames at 25 fps is six minutes, the checkpoint's own ceiling.
     max_new_tokens_min = 1
     max_new_tokens_max = MAX_AUDIO_FRAMES

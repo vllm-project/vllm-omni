@@ -65,6 +65,9 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="PersonaPlexCode2Wav",
+            # Mimi keeps a streaming decoder row until the session finishes,
+            # including while its request is parked waiting for the next chunk.
+            retains_state_across_chunks=True,
             # In sync (non-async-chunk) mode the only pre-stage input proc is a
             # length-only placeholder; the bulk codec payload ships via the
             # worker connector from stage 0's full-payload producer.
