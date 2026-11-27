@@ -167,6 +167,32 @@ def test_rejected_draft_row_holds_the_block_until_the_accepted_row_arrives() -> 
     assert hidden[:, 1].tolist() == ids
 
 
+@pytest.mark.parametrize("terminal_step", [True, False], ids=["terminal-row", "no-terminal-row"])
+def test_length_stop_closes_with_the_rows_the_thinker_returned(terminal_step: bool) -> None:
+    thinker = _Thinker([TTS_BOS])
+    context = _context()
+    reply = list(range(100, 115))
+    emitted = []
+    for token_id in reply[:-1]:
+        emitted.extend(llm2tts_chunked([thinker.step([token_id])], None, False, context))
+    if terminal_step:
+        # The scheduler holds the length stop open for one draft-free forward
+        # of the final token, which returns that token's own row.
+        emitted.extend(llm2tts_chunked([thinker.step([reply[-1]])], None, False, context))
+        final = thinker.step([], finished=True)
+    else:
+        final = thinker.step([reply[-1]], finished=True)
+    emitted.extend(llm2tts_chunked([final], None, False, context))
+
+    blocks = [_handoff(tts_input) for tts_input in emitted]
+    spoken = reply if terminal_step else reply[:-1]
+    assert [ids for ids, _, _ in blocks] == [spoken[:10], spoken[10:]]
+    ids, hidden, meta = blocks[-1]
+    assert hidden[:, 1].tolist() == ids
+    assert hidden[:, 0].tolist() == [1 + reply.index(token_id) for token_id in ids]
+    assert meta["turn_chunk_close"] is True
+
+
 def test_short_reply_goes_out_whole_when_the_thinker_finishes() -> None:
     thinker = _Thinker([5, TTS_BOS])
     context = _context()
