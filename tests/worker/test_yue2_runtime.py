@@ -158,3 +158,87 @@ def test_detach_and_delayed_completion_with_coalesced_tokens(mocker, outcome):
     assert not scheduler._held_token_ids and not scheduler.requests
     assert scheduler.get_num_unfinished_requests() == 0
     assert step(payload=payload) == []
+
+
+def test_semantic_transition_carries_client_seed_and_isolation_optin(mocker):
+    """#11246: the ABC -> semantic transition keeps the isolation opt-in.
+
+    The semantic phase rebuilds SamplingParams from the nested semantic args;
+    the client seed (request-local randomness) and the explicit
+    seeded-isolation marker must both carry across, so an isolated request
+    does not rejoin the batch after the boundary. A seed-only request
+    carries its seed but no marker and keeps normal batching.
+    """
+    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+
+    from tests.core.sched.test_omni_ar_scheduler_logprobs import _bind_request_lifecycle, _make_scheduler_stub
+    from vllm_omni.core.sched.seeded_isolation import request_is_seeded
+    from vllm_omni.model_executor.models.yue2.request import SEMANTIC_ARGS
+
+    def make_request(*, isolated: bool):
+        extra_args = {
+            SEMANTIC_ARGS: {"yue2_max_audio_frames": 8, "yue2_seed": 5},
+            "tts_local_seed": 831001,
+        }
+        if isolated:
+            extra_args["omni_user_seed"] = True
+        request = OmniRequest("song", [1, 2, 3], SamplingParams(max_tokens=20, detokenize=False), None)
+        request.sampling_params.seed = 831001
+        request.sampling_params.extra_args = extra_args
+        request.status = RequestStatus.RUNNING
+        request.prefill_stats.set(num_prompt_tokens=3, num_local_cached_tokens=0, num_external_cached_tokens=0)
+        request.yue2_next_prefix = [7, 8, 9]
+        return request
+
+    for isolated, expect_seeded in ((True, True), (False, False)):
+        request = make_request(isolated=isolated)
+        scheduler = object.__new__(Yue2SchedulerBase)
+        scheduler.__dict__.update(vars(_make_scheduler_stub([request])))
+        scheduler.async_kv_waiting = create_request_queue(SchedulingPolicy.FCFS)
+        _bind_request_lifecycle(scheduler, update_request=lambda r, tokens: (tokens, False))
+        del scheduler._update_request_with_output
+        scheduler.max_model_len = 4096
+        scheduler.num_spec_tokens = 0
+        scheduler._pause_state = PauseState.UNPAUSED
+        scheduler.num_waiting_for_streaming_input = 0
+        scheduler._hold_payloadless_outputs = False
+        scheduler._held_token_ids = {}
+        scheduler._pending_input_timeout_outputs = {}
+        scheduler._streaming_context_overflow = {}
+        scheduler.kv_cache_manager.estimate_cached_tokens = lambda req: 0
+        scheduler.vllm_config.model_config.engine_output_type = "audio"
+        scheduler._inflight_prefills = {request}
+        scheduler._free_request_blocks = mocker.Mock()
+        scheduler.encoder_cache_manager = mocker.Mock(spec=EncoderCacheManager)
+        scheduler._release_replaced_streaming_prompt_cache = mocker.Mock()
+        scheduler.waiting.prepend_request = mocker.Mock()
+        replaces = []
+        scheduler._replace_streaming_session = lambda req, update: replaces.append((req, update))
+
+        schedule = mocker.Mock(
+            spec=OmniSchedulerOutput,
+            num_scheduled_tokens={request.request_id: 1},
+            total_num_scheduled_tokens=1,
+            scheduled_spec_decode_tokens={},
+        )
+        output = Yue2ModelRunnerOutput(
+            req_ids=[request.request_id],
+            sampled_token_ids=[[5]],
+            multimodal_outputs=[{}],
+            acoustic_started=[],
+            acoustic_ready={},
+        )
+        scheduler.update_from_output(schedule, output)
+
+        assert replaces, "the semantic transition must fire for the queued prefix"
+        _, update = replaces[0]
+        rebuilt = update.sampling_params
+        assert rebuilt.seed == 831001
+        assert rebuilt.extra_args["tts_local_seed"] == 831001
+        assert request_is_seeded(rebuilt) is expect_seeded
+        if isolated:
+            assert rebuilt.extra_args["omni_user_seed"] is True
+        else:
+            assert "omni_user_seed" not in rebuilt.extra_args
+        # The model-local seed is separate and untouched.
+        assert rebuilt.extra_args["yue2_seed"] == 5

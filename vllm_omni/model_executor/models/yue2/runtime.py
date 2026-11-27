@@ -223,13 +223,25 @@ class Yue2SchedulerBase(OmniARScheduler):
             prefix = getattr(request, "yue2_next_prefix", None)
             if request is None or request.is_finished() or prefix is None:
                 continue
-            args = dict(request.sampling_params.extra_args[SEMANTIC_ARGS])
+            old_params = request.sampling_params
+            args = dict(old_params.extra_args[SEMANTIC_ARGS])
             args["yue2_prefix_ids"] = prefix
+            # Carry the client-facing sampling state across the ABC -> semantic
+            # transition: the rebuilt params keep the request seed (request-local
+            # randomness) and, with it, the explicit seeded-isolation opt-in, so
+            # an isolated request does not rejoin the batch for its semantic
+            # phase. The model-local ``yue2_seed`` is separate and untouched.
+            client_seed = old_params.seed
+            if client_seed is not None:
+                args["tts_local_seed"] = client_seed
+                if old_params.extra_args.get("omni_user_seed"):
+                    args["omni_user_seed"] = True
             params = SamplingParams(
                 max_tokens=args["yue2_max_audio_frames"] + 2,
                 detokenize=False,
                 stop_token_ids=list(STOP_TOKEN_IDS),
                 extra_args=args,
+                seed=client_seed,
             )
             self.running.remove(request)
             self._release_replaced_streaming_prompt_cache(request)
