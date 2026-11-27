@@ -543,6 +543,13 @@ class NPUInt8LinearMethod(BaseInt8LinearMethod):
 
         x = x.reshape(-1, ori_shape[-1])
         if self._is_310p:
+            if ori_dtype != torch.float16:
+                raise NotImplementedError(
+                    "Ascend 310P INT8 linear (npu_quant_matmul_dequant) only supports "
+                    f"torch.float16 activations, got {ori_dtype}."
+                )
+            # npu_quant_matmul_dequant has no output_dtype argument; on 310P it
+            # preserves the float16 activation dtype.
             output = torch_npu.npu_quant_matmul_dequant(
                 x.contiguous(),
                 layer.weight,
