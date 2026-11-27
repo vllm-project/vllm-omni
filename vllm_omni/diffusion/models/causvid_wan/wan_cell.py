@@ -65,6 +65,10 @@ class WanCell(CellAdapter):
         gen.manual_seed(self.seed * 1_000_003 + chunk * 4096)
         return torch.randn(self.latent_shape, generator=gen, device=self.device, dtype=self.dtype)
 
+    def seed_clean_sink(self, req: str, latent: torch.Tensor) -> None:
+        """The first layer of a separate clean pass consumes chunk zero's final latent."""
+        self._live.setdefault(req, {})[0] = latent
+
     def _resolve_member_input(
         self,
         *,

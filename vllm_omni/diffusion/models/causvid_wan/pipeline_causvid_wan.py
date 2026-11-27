@@ -24,18 +24,22 @@ import torch.distributed as dist
 import torch.nn as nn
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
     ARDiffusionCellContext,
     CellRunSpec,
     CellTopology,
+    PendingAdmit,
     resolve_pp_rank_and_group,
     run_cell_pipeline,
 )
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     CellSchedule,
     Ordering,
+    SameStepBootstrap,
     build_cell_plan,
+    build_same_step_bootstrap,
     cfg_step_replicas,
     expected_prior_cells,
     rank_of_block,
@@ -511,6 +515,9 @@ class CausVidWanPipeline(nn.Module):
             chunk_base=chunk_base,
             same_step_session=same_step_session,
         )
+        bootstrap = build_same_step_bootstrap(schedule)
+        if bootstrap is not None:
+            return bootstrap, extra, denoise
         # Logical prior (not local residency) drives plan sources + cross-rank handoffs.
         prior = expected_prior_cells(schedule)
         return build_cell_plan(schedule, prior_history=prior), extra, denoise
@@ -608,10 +615,10 @@ class CausVidWanPipeline(nn.Module):
 
     def admit_cell_request(
         self, req: OmniDiffusionRequest, *, decode_tag: int = 0
-    ) -> tuple[Any, str, bool, Any | None]:
+    ) -> tuple[Any, str, bool, Any | None, SameStepBootstrap | None]:
         """Admit CellPlan and build WanCell under the bound context.
 
-        Returns ``(adapter, kv_id, persist, stream_job)``.
+        Returns ``(adapter, kv_id, persist, stream_job, bootstrap)``.
         """
         ctx = self._chunk_ctx
         if ctx is None:
@@ -626,6 +633,7 @@ class CausVidWanPipeline(nn.Module):
             raise ValueError("CausVidWan path requires a non-empty request_id or session_id")
         persist = binding.persist
         plan, extra, denoise = self._plan_for(req, chunk_base=binding.chunk_base, same_step_session=persist)
+        bootstrap = plan if isinstance(plan, SameStepBootstrap) else None
         schedule = plan.schedule
         if persist:
             ctx.kv.cache.bind_session_structure(kv_id, schedule.structural_key())
@@ -660,7 +668,9 @@ class CausVidWanPipeline(nn.Module):
         # Protect only the post-request keep set. Prior sources still needed mid-request
         # are covered by plan last-use and are reclaimed after their last consume.
         retain = clean_history_cells(schedule, num_blocks=num_blocks) if persist else set()
-        ctx.enqueue(kv_id, plan, chunk_tokens=chunk_tokens, retain=retain)
+        ctx.enqueue(
+            kv_id, plan.head if isinstance(plan, SameStepBootstrap) else plan, chunk_tokens=chunk_tokens, retain=retain
+        )
 
         prompt = self._prompt_text(req.prompt)
         prompt_embeds = self._encode_prompt(prompt, device, dtype)
@@ -704,7 +714,7 @@ class CausVidWanPipeline(nn.Module):
             decode_tag=decode_tag,
             serial_key=serial_key,
         )
-        return adapter, kv_id, persist, stream_job
+        return adapter, kv_id, persist, stream_job, bootstrap
 
     def _start_chunk_decode_and_wan_cell(
         self,
@@ -824,6 +834,70 @@ class CausVidWanPipeline(nn.Module):
             return self._video_output(video)
         return self._placeholder_output(device, dtype)
 
+    @staticmethod
+    def _run_same_step_bootstrap(
+        ctx: ARDiffusionCellContext, admitted: PendingAdmit, adapter: WanCell, bootstrap: SameStepBootstrap
+    ) -> None:
+        """Complete chunk zero, write its clean KV, then start the remaining denoising work."""
+        req, keep = admitted.req, admitted.retain
+        phase = ARDiffusionCellContext(ctx.spec, ctx.kv, pending=[admitted])
+        members = {req: adapter}
+        try:
+            run_cell_pipeline(ctx=phase, members=members)
+            check_request_cancellation()
+            schedule = bootstrap.schedule
+            step = schedule.num_denoise_steps
+            source = rank_of_block(step - 1, schedule.num_blocks - 1, schedule)
+            target = rank_of_block(step, 0, schedule)
+            rank, pp = ctx.spec.rank, ctx.spec.pp_group
+            if source == target:
+                if rank == target:
+                    adapter.seed_clean_sink(req, adapter.finished[req][0])
+            else:
+                # The last layer group of the head hands the final latent back
+                # to the first group of that replica for the clean forward.
+                if pp is None:
+                    raise RuntimeError("Split Same-Step clean sink requires a pipeline group")
+                if rank == source:
+                    pp.send_tensor_dict({"latent": adapter.finished[req][0]}, dst=target)
+                elif rank == target:
+                    payload = pp.recv_tensor_dict(src=source)
+                    if payload is None:
+                        raise RuntimeError("Missing chunk-zero latent for the Same-Step clean sink")
+                    adapter.seed_clean_sink(req, payload["latent"])
+
+            phase.enqueue(
+                req, bootstrap.sink, chunk_tokens=admitted.chunk_tokens, retain=keep | bootstrap.sink_versions
+            )
+            run_cell_pipeline(ctx=phase, members=members)
+            if bootstrap.tail is not None:
+                phase.enqueue(req, bootstrap.tail, chunk_tokens=admitted.chunk_tokens, retain=keep)
+                run_cell_pipeline(ctx=phase, members=members)
+        except Exception:
+            phase.drop(req)
+            raise
+
+    def _run_admitted_cells(
+        self, ctx: ARDiffusionCellContext, members: dict[str, WanCell], bootstraps: dict[str, SameStepBootstrap]
+    ) -> None:
+        if not bootstraps:
+            run_cell_pipeline(ctx=ctx, members=members)
+            return
+        try:
+            while ctx.pending:
+                index = next((i for i, item in enumerate(ctx.pending) if item.req in bootstraps), len(ctx.pending))
+                if index:
+                    pending, ctx.pending = ctx.pending[:index], ctx.pending[index:]
+                    phase = ARDiffusionCellContext(ctx.spec, ctx.kv, pending=pending)
+                    run_cell_pipeline(ctx=phase, members={item.req: members[item.req] for item in pending})
+                else:
+                    item = ctx.pending.pop(0)
+                    self._run_same_step_bootstrap(ctx, item, members[item.req], bootstraps[item.req])
+        except Exception:
+            for item in tuple(ctx.pending):
+                ctx.drop(item.req)
+            raise
+
     def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Mainline request entry: plan, run the Cell executor, then emit.
 
@@ -839,9 +913,10 @@ class CausVidWanPipeline(nn.Module):
         stream_jobs: list[Any | None] = []
         try:
             members: dict[str, WanCell] = {}
+            bootstraps: dict[str, SameStepBootstrap] = {}
             # Stable wave-local member identity, shared by sender and VAE owner.
             for decode_tag, item in enumerate(_as_request_list(req)):
-                adapter, kv_id, _persist, stream_job = self.admit_cell_request(item, decode_tag=decode_tag)
+                adapter, kv_id, _persist, stream_job, bootstrap = self.admit_cell_request(item, decode_tag=decode_tag)
                 # Record before type checks so a later admit/type failure still cancels.
                 stream_jobs.append(stream_job)
                 if not isinstance(adapter, WanCell):
@@ -849,8 +924,9 @@ class CausVidWanPipeline(nn.Module):
                 if kv_id in members:
                     raise ValueError(f"duplicate cell-batch member id {kv_id!r}")
                 members[kv_id] = adapter
-            # Batch organization lives in run_cell_pipeline; Pipeline only supplies members.
-            run_cell_pipeline(ctx=ctx, members=members)
+                if bootstrap is not None:
+                    bootstraps[kv_id] = bootstrap
+            self._run_admitted_cells(ctx, members, bootstraps)
             return [
                 self.emit_cell_output(adapter, kv_id, stream_job)
                 for (kv_id, adapter), stream_job in zip(members.items(), stream_jobs, strict=True)

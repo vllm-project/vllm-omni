@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -31,6 +33,8 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 
 from .sampler import WAN21_1_3B, WAN21_14B, WAN22_5B, WanFourStepSampler
+
+_SINK_LATENT_FRAMES = 3
 
 PROFILES = {
     "wan21_1p3b": (WAN21_1_3B, (1, 16, 1, 60, 104), 19),
@@ -67,8 +71,7 @@ class PhysisStageWanTransformer(StageWanTransformer):
         for name, parameter in self._wan.named_parameters():
             if fp32_parts.intersection(name.split(".")):
                 parameter.data = parameter.data.float()
-        self.sink_pages = {}
-        self.capture_sink = False
+        self.capture_sink: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None
         self._physis_chunk = 0
         self._physis_layer = 0
         self._physis_latent = None
@@ -132,8 +135,8 @@ class PhysisStageWanTransformer(StageWanTransformer):
         key = attn.norm_k(key).unflatten(2, (attn.num_kv_heads, attn.head_dim))
         value = value.unflatten(2, (attn.num_kv_heads, attn.head_dim))
         ctx = self._cell_kv_ctx
-        if self.capture_sink:
-            self.sink_pages[self._physis_layer] = (key[0].detach().contiguous(), value[0].detach().contiguous())
+        if self.capture_sink is not None:
+            self.capture_sink(self._physis_layer, key[0], value[0])
         history_tokens = 0
         if ctx is not None:
             ctx.key_pool.index_copy_(0, ctx.video_slots, key[0])
@@ -143,7 +146,9 @@ class PhysisStageWanTransformer(StageWanTransformer):
             slots = (
                 blocks[:, None] * ctx.block_size + torch.arange(ctx.block_size, device=blocks.device)[None, :]
             ).flatten()
-            sink_key, sink_value = self.sink_pages[self._physis_layer]
+            if ctx.external_sink is None:
+                raise RuntimeError("Physis Wan Same-Step requires a clean sink for each local layer")
+            sink_key, sink_value = ctx.external_sink
             key = torch.cat((sink_key, ctx.key_pool.index_select(0, slots)), dim=0).unsqueeze(0)
             value = torch.cat((sink_value, ctx.value_pool.index_select(0, slots)), dim=0).unsqueeze(0)
             history_tokens = key.shape[1] - query.shape[1]
@@ -239,8 +244,14 @@ class PhysisWanPipeline(CausVidWanPipeline):
 
     def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec:
         # S=D places each layer's matching-step history on a single rank.
-        # The permanent clean sink is stored separately in transformer.sink_pages.
-        return replace(super().ar_diffusion_noisy_kv_spec(), max_history_versions=self.max_history_chunks)
+        return replace(
+            super().ar_diffusion_noisy_kv_spec(),
+            max_history_versions=self.max_history_chunks,
+            max_external_sink_tokens=self.transformer.seq_len_for_latent(self._sink_latent_shape()),
+        )
+
+    def _sink_latent_shape(self):
+        return (*self.latent_shape[:2], _SINK_LATENT_FRAMES, *self.latent_shape[3:])
 
     def _sink_forward(self, latent, timestep, *, step, pp):
         tf = self.transformer
@@ -262,6 +273,9 @@ class PhysisWanPipeline(CausVidWanPipeline):
 
     def forward(self, req):
         ctx = self._execution_context()
+        kv = self._noisy_kv
+        if kv is None:
+            raise RuntimeError("Physis Wan requires runner-owned Noisy KV for the clean sink")
         _, pp = resolve_pp_rank_and_group()
         param = next(self.transformer.parameters())
         device, dtype = param.device, torch.bfloat16
@@ -272,12 +286,10 @@ class PhysisWanPipeline(CausVidWanPipeline):
             request_id = str(item.request_id)
             prompt = self._encode_prompt(self._prompt_text(item.prompt), device, dtype)
             tf = self.transformer
-            tf.sink_pages.clear()
-            tf.capture_sink = False
             tf.prepare_cell(prompt)
             timing = CellTiming(bool(extra.get("collect_chunk_timing", False)))
             sampler = WanFourStepSampler(self.profile)
-            shape = (*self.latent_shape[:2], 3, *self.latent_shape[3:])
+            shape = self._sink_latent_shape()
             latent = sampler.initial_noise(shape, device=device, dtype=dtype, seed=seed, chunk=0)
             sink_timesteps = [torch.tensor(t, dtype=torch.float32) for t in self.profile.timesteps]
             for step, timestep in enumerate(sink_timesteps):
@@ -285,9 +297,11 @@ class PhysisWanPipeline(CausVidWanPipeline):
                 latent = sampler.advance(latent, prediction, step=step, seed=seed, chunk=0)
             sink_latent = latent
             timing.mark(0)
-            tf.capture_sink = True
-            self._sink_forward(latent, torch.zeros((), dtype=torch.float32), step=4, pp=pp)
-            tf.capture_sink = False
+            tf.capture_sink = partial(kv.store_external_sink, request_id)
+            try:
+                self._sink_forward(latent, torch.zeros((), dtype=torch.float32), step=4, pp=pp)
+            finally:
+                tf.capture_sink = None
             ctx.enqueue(request_id, plan, chunk_tokens=self.block_size)
             adapter = PhysisWanCell(
                 tf,
@@ -311,5 +325,4 @@ class PhysisWanPipeline(CausVidWanPipeline):
                 outputs.append(result)
             else:
                 outputs.append(self._placeholder_output(device, dtype))
-            tf.sink_pages.clear()
         return outputs

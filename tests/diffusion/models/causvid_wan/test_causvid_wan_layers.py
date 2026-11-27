@@ -17,7 +17,11 @@ from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor i
     CellRunSpec,
     CellTopology,
 )
-from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Ordering
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
+    Ordering,
+    SameStepBootstrap,
+    expected_prior_cells,
+)
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
     CAUSVID_DEFAULT_DENOISE_STEPS,
     CAUSVID_DEFAULT_SHIFT,
@@ -28,7 +32,12 @@ from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
+    ARDiffusionNoisyKVSpec,
+    NoisyKVCache,
+    NoisyKVState,
+    clean_history_cells,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -101,7 +110,7 @@ def _compute_cell(adapter, req: str, cell, member_input=None):
 def _admit_cell(req: OmniDiffusionRequest, *, decode_tag: int, tags: dict[str, int], cells: dict):
     """Record the decode tag and hand back the prebuilt Cell, without a job."""
     tags[req.request_id] = decode_tag
-    return cells[req.request_id], req.request_id, False, None
+    return cells[req.request_id], req.request_id, False, None, None
 
 
 def _admit_cell_with_job(
@@ -116,7 +125,7 @@ def _admit_cell_with_job(
     del decode_tag
     if req.request_id == "B" and failure_stage == "admit":
         raise ValueError("decode wave failed")
-    return cells[req.request_id], req.request_id, False, _CancelJob(req.request_id, cancelled)
+    return cells[req.request_id], req.request_id, False, _CancelJob(req.request_id, cancelled), None
 
 
 def _emit_cell(adapter, kv_id, stream_job=None, *, emitted: list[str]):
@@ -297,7 +306,7 @@ def test_cell_schedule_accepts_known_values(name, step_replicas):
 
 
 @pytest.mark.parametrize("persistent", [False, True])
-def test_same_step_pipeline_single_chunk_sink_matches_session_policy(persistent):
+def test_same_step_pipeline_single_chunk_sink_runs_as_separate_session_phase(persistent):
     pipeline = _bare_pipeline(step_replicas=3, history=2)
     request = OmniDiffusionRequest(
         prompt="x",
@@ -307,9 +316,60 @@ def test_same_step_pipeline_single_chunk_sink_matches_session_policy(persistent)
         ),
     )
     plan, _, _ = pipeline._plan_for(request, same_step_session=persistent)
-    produced = {plan.task(slot, rank) for slot in range(plan.num_slots) for rank in range(plan.world)}
-    assert ((0, 3, 0) in produced) is persistent
-    assert (0, 0, 0) in produced
+    assert isinstance(plan, SameStepBootstrap) is persistent
+    head = plan.head if isinstance(plan, SameStepBootstrap) else plan
+    produced = {head.task(slot, rank) for slot in range(head.num_slots) for rank in range(head.world)}
+    assert produced - {None} == {(0, step, 0) for step in range(3)}
+    if isinstance(plan, SameStepBootstrap):
+        assert [plan.sink.task(0, rank) for rank in range(plan.sink.world)] == [None, None, (0, 3, 0)]
+        assert plan.tail is None
+
+
+@pytest.mark.parametrize("chunks", [1, 4])
+def test_standalone_sink_survives_session_continuation(chunks):
+    pipeline = _bare_pipeline(history=2)
+    device = torch.device("cpu")
+    cache = NoisyKVCache(
+        ARDiffusionNoisyKVSpec(1, 1, 1, 3, 3, 2),
+        dtype=torch.float32,
+        device=device,
+        layer_groups=1,
+        max_batch_size=1,
+    )
+    ctx = ARDiffusionCellContext(CellRunSpec(CellTopology(1, 1)), NoisyKVState(cache))
+    adapter = WanCell(
+        _GroupTransformer(is_layer_group_first=True, is_layer_group_last=True),
+        sampler=FlowEuler(1, shift=1.0),
+        prompt_embeds=torch.zeros(1, 8, 16),
+        latent_shape=(1, 4, 1, 2, 2),
+        seed=0,
+        device=device,
+        dtype=torch.float32,
+    )
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="session",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "same_step", "num_denoise_steps": 1, "num_chunks": chunks}
+        ),
+    )
+    plan, _, _ = pipeline._plan_for(req, same_step_session=True)
+    assert isinstance(plan, SameStepBootstrap)
+    keep = clean_history_cells(plan.schedule, num_blocks=1)
+    ctx.enqueue("session", plan.head, chunk_tokens=3, retain=keep)
+    pipeline._run_admitted_cells(ctx, {"session": adapter}, {"session": plan})
+    assert set(adapter.finished["session"]) == set(range(chunks))
+    assert set(cache.pool.keys) == {("session", *cell) for cell in keep}
+
+    req.sampling_params.extra_args["num_chunks"] = 1
+    continuation, _, _ = pipeline._plan_for(req, chunk_base=chunks, same_step_session=True)
+    assert not isinstance(continuation, SameStepBootstrap)
+    assert expected_prior_cells(continuation.schedule) == keep
+    keep = clean_history_cells(continuation.schedule, num_blocks=1)
+    ctx.enqueue("session", continuation, chunk_tokens=3, retain=keep)
+    pipeline._run_admitted_cells(ctx, {"session": adapter}, {})
+    assert set(adapter.finished["session"]) == set(range(chunks + 1))
+    assert set(cache.pool.keys) == {("session", *cell) for cell in keep}
 
 
 @pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step_kv"])

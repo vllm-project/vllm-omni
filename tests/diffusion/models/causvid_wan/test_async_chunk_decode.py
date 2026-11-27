@@ -243,7 +243,7 @@ def test_pipeline_forward_cancels_stream_job_when_cell_compute_fails(monkeypatch
     monkeypatch.setattr(
         pipeline,
         "admit_cell_request",
-        lambda _req, **_kwargs: (adapter, "kv-1", False, job),
+        lambda _req, **_kwargs: (adapter, "kv-1", False, job, None),
     )
 
     def _boom_cell(**_kwargs):

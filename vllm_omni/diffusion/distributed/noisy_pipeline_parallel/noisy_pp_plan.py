@@ -620,6 +620,18 @@ def _offset_chunk_ids(
     )
 
 
+def _same_step_sink_slots(schedule: CellSchedule) -> tuple[tuple[Cell | None, ...], ...]:
+    """One clean forward on the final noisy replica, grouped by its resident layers."""
+    step = schedule.num_denoise_steps
+    world = schedule.step_replicas * schedule.layer_groups
+    rows = []
+    for block in range(schedule.num_blocks):
+        row: list[Cell | None] = [None] * world
+        row[rank_of_block(step, block, schedule)] = (0, step, block)
+        rows.append(tuple(row))
+    return tuple(rows)
+
+
 def _cell_slots(schedule: CellSchedule) -> tuple[tuple[Cell | None, ...], ...]:
     if schedule.ordering is Ordering.SAME_STEP:
         if schedule.same_step_external_sink:
@@ -630,13 +642,7 @@ def _cell_slots(schedule: CellSchedule) -> tuple[tuple[Cell | None, ...], ...]:
         head = _base_cell_slots(replace(schedule, chunks=1))
         if schedule.chunks == 1 and not schedule.same_step_session:
             return head
-        # One clean pass, on the final noisy replica; never allocate a clean
-        # replica or run clean forwards for subsequent chunks.
-        clean = []
-        for block in range(schedule.num_blocks):
-            row: list[Cell | None] = [None] * (schedule.step_replicas * schedule.layer_groups)
-            row[rank_of_block(schedule.num_denoise_steps, block, schedule)] = (0, schedule.num_denoise_steps, block)
-            clean.append(tuple(row))
+        clean = _same_step_sink_slots(schedule)
         if schedule.chunks == 1:
             return (*head, *clean)
         tail = _base_cell_slots(replace(schedule, chunks=schedule.chunks - 1))
@@ -661,7 +667,14 @@ def build_cell_plan(
     schedule: CellSchedule,
     prior_history: frozenset[Cell] | None = None,
 ) -> CellPlan:
-    slots = _cell_slots(schedule)
+    return _compile_cell_plan(schedule, _cell_slots(schedule), prior_history)
+
+
+def _compile_cell_plan(
+    schedule: CellSchedule,
+    slots: tuple[tuple[Cell | None, ...], ...],
+    prior_history: frozenset[Cell] | None = None,
+) -> CellPlan:
     completions = _completions(slots)
     sources, transfers = _sources_and_transfers(slots, completions, schedule, prior_history)
     last_use = _last_use(slots, sources, transfers, schedule)
@@ -693,6 +706,31 @@ def build_cell_plan(
     plan = CellPlan(schedule, slots, completions, sources, transfers, last_use, wait_ready)
     _assert_invariants(plan, prior_history)
     return plan
+
+
+@dataclass(frozen=True)
+class SameStepBootstrap:
+    """Independent head, clean sink, and optional tail invocations for a new request."""
+
+    schedule: CellSchedule
+    head: CellPlan
+    sink: CellPlan
+    tail: CellPlan | None
+    sink_versions: frozenset[Cell]
+
+
+def build_same_step_bootstrap(schedule: CellSchedule) -> SameStepBootstrap | None:
+    """Plan a new Same-Step sink separately from both denoising invocations."""
+    if schedule.chunk_base != 0 or not schedule.same_step_has_sink:
+        return None
+    head = build_cell_plan(replace(schedule, chunks=1, same_step_session=False))
+    sink_schedule = replace(schedule, chunks=1, same_step_session=True)
+    sink = _compile_cell_plan(sink_schedule, _same_step_sink_slots(sink_schedule))
+    sink_versions = frozenset((0, schedule.num_denoise_steps, block) for block in range(schedule.num_blocks))
+    tail = None
+    if schedule.chunks > 1:
+        tail = build_cell_plan(replace(schedule, chunks=schedule.chunks - 1, chunk_base=1), prior_history=sink_versions)
+    return SameStepBootstrap(schedule, head, sink, tail, sink_versions)
 
 
 def rank_work(inflight: tuple[Inflight, ...], slot: int, rank: int) -> tuple[tuple[str, Cell], ...]:

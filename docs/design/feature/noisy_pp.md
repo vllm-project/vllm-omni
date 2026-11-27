@@ -82,11 +82,9 @@ feeds the next group). KV is keyed **per block** `b`: publish / transfer /
 wait when that cell finishes; a remote reader of `b` does not wait for the
 producer's other local blocks.
 
-CausVidWan accepts Self-Forcing / Latest-KV only. Pair schedule with topology: Self-Forcing →
-`S=1` layer PP only (`deploy/causvid_wan_self_forcing.yaml`); Latest-KV →
-vertical `S=D+1` (`deploy/causvid_wan_latest_kv.yaml`). Clean is an ordering
-property, independent of the history window (Self-Forcing and Latest-KV always,
-Same-Step runs it for chunk 0 only).
+CausVidWan supports Self-Forcing (`S=1`), Latest-KV (`S=D+1`), and
+Same-Step (`S=D`). Self-Forcing and Latest-KV run a clean pass for each
+chunk. Same-Step runs one clean pass for the first chunk when its KV will be used.
 
 Acceptance for #102: reproducible basic function + recorded config. No FPS /
 speedup SLA. DreamZero / LingBot paged-session defaults must not regress.
@@ -99,11 +97,9 @@ speedup SLA. DreamZero / LingBot paged-session defaults must not regress.
 | **Schedule / KV** | Cell `(chunk, step, block)` — one transformer block per tick |
 
 `cell_schedule` (request `extra_args`) must match the deployment topology:
-`S=1` → Self-Forcing, vertical `S=D+1` → Latest-KV (CausVidWan derives the
-default from `step_replicas` and rejects a mismatched explicit choice);
-Same-Step (`S=D`) is a generic schedule primitive with a fixed first-chunk clean
-sink; CausVidWan does not expose it. It is not a session property.
-Optional session only keeps clean KV across generations
+`S=1` → Self-Forcing, `S=D+1` → Latest-KV, `S=D` → Same-Step. CausVidWan
+derives the default from the topology and rejects a mismatched explicit choice.
+An optional session keeps the required history across generations
 ([Realtime AR-Diffusion sessions](realtime_ar_diffusion.md)).
 
 ## Architecture
@@ -237,25 +233,28 @@ context.
 Per-tick KV traffic ≈ history depth × one block × tokens × heads × dim per
 remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`.
 
-Physis pipelines supply their own clean sink through transformer-owned
-`sink_pages`. Their cell schedules set `same_step_external_sink=True`: every
-scheduled chunk runs only the four noisy steps and reads matching-step recent
-history, including scheduled chunk 0. The generic planner must not generate a
-second clean sink or retain scheduled chunk 0 permanently. Physis Wan sizes its
-per-rank KV pool for one step version per history chunk, since S=D fixes each
-layer/step to one rank; its external sink is stored separately.
+Physis pipelines run chunk 0's denoising and clean pass before scheduling
+the remaining chunks. Their tail plans set the internal
+`same_step_external_sink=True`, so the plan's local chunk 0 is the first tail
+chunk and follows the same rolling history policy as the other tail chunks.
+Physis Wan registers the clean sink with Noisy KV as per-layer pre-RoPE K/V.
+The KV budget includes the three latent frames of sink K/V separately from
+ordinary one-frame version slots. Attention applies RoPE after assembling the
+sink and rolling window. Physis LTX and H3 keep their transformer-local sink
+storage.
 
 ### Same-Step with a first-chunk clean sink
 
 `Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests and
 persistent single-chunk bootstrap requests.
-The topology stays `S=D`. Chunk 0 runs one extra clean forward on the last
-replica, then its clean KV is distributed once to the readers before later
-chunks start. When the clean successor is on the same rank, the executor carries
-the final latent directly into that pass, without adapter-local latent storage.
-Subsequent chunks use the normal Same-Step schedule. An ephemeral single-chunk
-request skips the unused clean forward and sink distribution; a persistent
-single-chunk request produces and retains it for continuation.
+The topology stays `S=D`. The CausVid pipeline completes chunk 0's denoising
+schedule, then runs a separate clean pass on the last replica using chunk 0's
+final latent. When the replica spans layer groups, the last group sends that
+latent back to the first group for the clean pass. Noisy KV stores the sink
+keys after RoPE and hands the retained pages to the tail before its denoising
+steps start.
+An ephemeral single-chunk request skips the unused clean pass. A persistent
+single-chunk request retains the sink for continuation.
 
 Each chunk reads the fixed clean sink plus its most recent `H` Same-Step
 history chunks, deduplicating chunk 0 while it is in the window. `H=0` keeps
@@ -270,7 +269,7 @@ requires separate validation.
 | `ar_diffusion_stage_config` | `step_replicas` | `S` |
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
-| Request `extra_args` | `cell_schedule` | CausVidWan (this stack layer): `self_forcing` \| `latest_kv`. Same-Step is shared plan/executor support only — the CausVidWan parser rejects it until the exposing stack layer lands. |
+| Request `extra_args` | `cell_schedule` | CausVidWan: `self_forcing` \| `latest_kv` \| `same_step`. Physis: `same_step`. |
 | | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (clean scheduling follows the ordering and CellPlan shape) |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.

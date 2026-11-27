@@ -17,6 +17,7 @@ from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan impor
     Inflight,
     Ordering,
     build_cell_plan,
+    build_same_step_bootstrap,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
@@ -75,6 +76,12 @@ class _SinkAdapter(CellAdapter):
         self.fixed_shape = fixed_shape
         self.clean_calls = 0
         self.completed: dict[int, torch.Tensor] = {}
+        self.finished = {"A": self.completed}
+        self.clean_latent: torch.Tensor | None = None
+
+    def seed_clean_sink(self, req, latent):
+        assert req == "A" and self.clean_latent is None
+        self.clean_latent = latent
 
     def compatibility_key(self, cell):
         return cell
@@ -94,6 +101,10 @@ class _SinkAdapter(CellAdapter):
         chunk, step, block = cell
         self.clean_calls += int(step == self.steps)
         payload = member_inputs[0] if member_inputs else None
+        if (chunk, step, block) == (0, self.steps, 0) and self.clean_latent is not None:
+            assert payload is None
+            payload = {"latent": self.clean_latent}
+            self.clean_latent = None
         if block == 0:
             if step > 0:
                 assert payload is not None, "step input must come from the executor or transport"
@@ -267,6 +278,7 @@ def _sink_pipeline_worker(
     history: int = 1,
     fixed_shape: bool = False,
     device_kind: str = "cpu",
+    standalone: bool = False,
 ) -> None:
     from vllm_omni.diffusion.distributed.noisy_pipeline_parallel import noisy_pp_executor as cell_executor
     from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
@@ -350,8 +362,17 @@ def _sink_pipeline_worker(
         ctx = ARDiffusionCellContext(
             spec=CellRunSpec(topology=CellTopology(steps, groups), rank=rank, pp_group=pp), kv=state
         )
-        ctx.enqueue("A", plan, chunk_tokens=1)
-        run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
+        if standalone:
+            from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
+
+            bootstrap = build_same_step_bootstrap(schedule)
+            assert bootstrap is not None
+            ctx.enqueue("A", bootstrap.head, chunk_tokens=1)
+            pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
+            pipeline._run_admitted_cells(ctx, {"A": adapter}, {"A": bootstrap})
+        else:
+            ctx.enqueue("A", plan, chunk_tokens=1)
+            run_cell_pipeline(ctx=ctx, members={"A": adapter})
         assert state.resident_versions == 0
         assert bool(fixed_recorder.calls) == fixed_shape
         expected_clean = sum(
@@ -398,5 +419,14 @@ def test_same_step_fixed_shape_activation_pipeline_matches_serial(steps, groups,
         _sink_pipeline_worker,
         args=(steps, groups, chunks, f"tcp://127.0.0.1:{get_open_port()}", history, True),
         nprocs=steps * groups,
+        join=True,
+    )
+
+
+def test_causvid_standalone_sink_distributed_pipeline_matches_serial():
+    torch.multiprocessing.spawn(
+        _sink_pipeline_worker,
+        args=(2, 2, 4, f"tcp://127.0.0.1:{get_open_port()}", 1, True, "cpu", True),
+        nprocs=4,
         join=True,
     )

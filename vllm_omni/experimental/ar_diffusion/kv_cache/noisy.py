@@ -59,6 +59,8 @@ class ARDiffusionNoisyKVSpec:
     # chunk-0 sink for Same-Step, whose consumer reads the version matching its
     # own step. Defaults to the diagonal case.
     max_history_versions: int | None = None
+    # Optional dense, pre-RoPE clean sink captured by the model once per request.
+    max_external_sink_tokens: int = 0
 
     @property
     def history_versions(self) -> int:
@@ -79,6 +81,8 @@ class ARDiffusionNoisyKVSpec:
             value = getattr(self, name)
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
+        if self.max_external_sink_tokens < 0:
+            raise ValueError("max_external_sink_tokens must be nonnegative")
         if self.max_chunk_tokens % self.block_size != 0:
             raise ValueError("max_chunk_tokens must be a multiple of block_size")
 
@@ -201,6 +205,7 @@ class NoisyLayerContext:
     seq_len: int
     # Cached paged-attn view (avoids realloc on the hot path).
     _inputs: ARDiffusionPagedLayerInputs | None = None
+    external_sink: tuple[torch.Tensor, torch.Tensor] | None = None
     _empty_action_slots: ClassVar[dict[tuple[str, int | None], torch.Tensor]] = {}
 
     def _action_slots(self) -> torch.Tensor:
@@ -360,7 +365,8 @@ class NoisyKVTransport:
 
         ops: list[dist.P2POp] = []
         send_kept: list[torch.Tensor] = []
-        recv_jobs: list[tuple[VersionKey, dict[str, torch.Tensor] | None, int]] = []
+        send_ops: list[int] = []
+        recv_jobs: list[tuple[VersionKey, dict[str, torch.Tensor] | None, int, slice]] = []
 
         for xfer in transfers:
             key = _version_key(xfer.req, xfer.version)
@@ -374,6 +380,7 @@ class NoisyKVTransport:
                 dst_global = _global_rank(pp_group, xfer.dst)
                 for tensor in (k, v):
                     group = _pg_for_tensor(pp_group, tensor)
+                    send_ops.append(len(ops))
                     ops.append(dist.P2POp(dist.isend, tensor, dst_global, group))
                     if tensor.is_cuda:
                         tensor.record_stream(stream or torch.cuda.current_stream(tensor.device))
@@ -394,26 +401,27 @@ class NoisyKVTransport:
                     }
                 nbytes = k_buf.numel() * k_buf.element_size() + v_buf.numel() * v_buf.element_size()
                 src_global = _global_rank(pp_group, xfer.src)
+                first = len(ops)
                 for tensor in (k_buf, v_buf):
                     group = _pg_for_tensor(pp_group, tensor)
                     ops.append(dist.P2POp(dist.irecv, tensor, src_global, group))
                     if tensor.is_cuda and stream is not None:
                         tensor.record_stream(stream)
-                recv_jobs.append((key, staging, nbytes))
+                recv_jobs.append((key, staging, nbytes, slice(first, len(ops))))
                 n_recv += 1
 
         ctx = torch.cuda.stream(stream) if stream is not None else nullcontext()
         with ctx:
             works = list(dist.batch_isend_irecv(ops)) if ops else []
+        # Gloo returns one Work per operation and waiting the same Work twice
+        # can block. Coalesced NCCL can return one handle for the whole batch.
+        per_operation = len(works) == len(ops)
         if n_send:
-            self._send_handles.extend(works)
+            self._send_handles.extend([works[i] for i in send_ops] if per_operation else works)
             self._send_keepalives.extend(send_kept)
-        for key, staging, nbytes in recv_jobs:
+        for key, staging, nbytes, selection in recv_jobs:
             merged = list(self._pending_recv.get(key, ([], None, 0))[0] or [])
-            if not merged:
-                merged = list(works)
-            else:
-                merged.extend(works)
+            merged.extend(works[selection] if per_operation else works)
             self._pending_recv[key] = (merged, staging, nbytes)
 
     def wait_sends(self) -> None:
@@ -487,29 +495,26 @@ class NoisyKVCache:
         per_req = max(spec.max_history_chunks + 2 + layer_groups, spec.max_history_chunks + step_replicas)
         per_req = max(per_req, spec.history_versions + 2 + layer_groups, spec.history_versions + step_replicas)
         desired = self.max_batch_size * per_req
-        bytes_per_version = (
-            2
-            * chunk_blocks
-            * spec.block_size
-            * spec.num_kv_heads
-            * spec.head_size
-            * torch.empty((), dtype=dtype).element_size()
-        )
-        bytes_all_layers = bytes_per_version * max(1, spec.num_layers)
+        bytes_per_token = 2 * spec.num_kv_heads * spec.head_size * torch.empty((), dtype=dtype).element_size()
+        bytes_per_version = spec.max_chunk_tokens * bytes_per_token
+        bytes_all_layers = bytes_per_version * spec.num_layers
+        # The sink is allocated on capture, outside the uniform version slots.
+        sink_bytes = self.max_batch_size * spec.max_external_sink_tokens * bytes_per_token * spec.num_layers
+        required_bytes = desired * bytes_all_layers + sink_bytes
         if available_bytes is not None:
             budget = int(available_bytes * float(gpu_memory_fraction))
             if bytes_all_layers <= 0:
                 raise RuntimeError("invalid NoisyKV geometry: bytes_all_layers <= 0")
-            max_by_budget = budget // bytes_all_layers
+            max_by_budget = (budget - sink_bytes) // bytes_all_layers
             if max_by_budget < 1:
                 raise RuntimeError(
                     f"NoisyKV budget too small for one per-layer version slot: "
-                    f"budget={budget} bytes_all_layers={bytes_all_layers}"
+                    f"budget={budget} bytes_all_layers={bytes_all_layers} external_sink_bytes={sink_bytes}"
                 )
             if max_by_budget < desired:
                 raise RuntimeError(
                     f"NoisyKV budget fits {max_by_budget} versions but configured schedule requires {desired}: "
-                    f"budget={budget} required_bytes={desired * bytes_all_layers}"
+                    f"budget={budget} required_bytes={required_bytes}"
                 )
         self.capacity = desired
         self.pool = VersionPool(
@@ -526,7 +531,8 @@ class NoisyKVCache:
         self.transport = NoisyKVTransport(self.pool)
         self.resident_peak = 0
         self.bytes_per_version = bytes_per_version
-        self.reserved_bytes = self.capacity * bytes_all_layers
+        self.reserved_bytes = required_bytes
+        self._external_sinks: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
         # Pool-scoped history survives per-invocation NoisyKVState instances.
         self._session_structural_keys: dict[str, tuple[object, ...]] = {}
         self._retained_history: dict[str, set[Cell]] = {}
@@ -651,6 +657,30 @@ class NoisyKVState(KVBackend[tuple[str, Cell], list[NoisyLayerContext]], KVCache
         bucket = self._retain.setdefault(req, set())
         bucket.update(cells)
 
+    def store_external_sink(self, req: str, block: int, key: torch.Tensor, value: torch.Tensor) -> None:
+        """Capture one local layer's dense clean K/V before admitting the tail plan."""
+        spec = self.cache.spec
+        pool = self.cache.pool
+        layer = block - pool.layer_offset
+        if not 0 <= layer < spec.num_layers:
+            raise ValueError(f"Noisy KV sink block {block} is not local")
+        if (
+            key.ndim != 3
+            or not 0 < key.shape[0] <= spec.max_external_sink_tokens
+            or key.shape[1:] != (spec.num_kv_heads, spec.head_size)
+            or value.shape != key.shape
+        ):
+            raise ValueError("Noisy KV external sink shape exceeds its configured geometry")
+        reference = pool.k_pools[layer]
+        if any(tensor.dtype != reference.dtype or tensor.device != reference.device for tensor in (key, value)):
+            raise ValueError("Noisy KV external sink must match pool dtype and device")
+        sinks = self.cache._external_sinks
+        if req in self.cache._active_states:
+            raise RuntimeError("Capture the external sink before starting the Noisy KV request")
+        if req not in sinks and len(sinks) >= self.cache.max_batch_size:
+            raise RuntimeError("Noisy KV external sink request capacity exceeded")
+        sinks.setdefault(req, {})[layer] = (key.detach().contiguous(), value.detach().contiguous())
+
     def begin_request(
         self,
         req: str,
@@ -721,6 +751,7 @@ class NoisyKVState(KVBackend[tuple[str, Cell], list[NoisyLayerContext]], KVCache
         active = self.cache._active_states.get(req)
         if active is not None and active is not self:
             raise RuntimeError(f"Noisy KV owner {req!r} is active in another state")
+        self.cache._external_sinks.pop(req, None)
         self.cache.transport.wait_sends()
         keep_cells = set(retain) if retain is not None else self._retain.get(req, set())
         keep = {_version_key(req, cell) for cell in keep_cells}
@@ -770,6 +801,7 @@ class NoisyKVState(KVBackend[tuple[str, Cell], list[NoisyLayerContext]], KVCache
         self._chunk_tokens.clear()
         self._last_use_global.clear()
         self._retain.clear()
+        self.cache._external_sinks.clear()
         self.cache._session_structural_keys.clear()
         self._inflight = ()
         self._clear_prepare_caches()
@@ -886,6 +918,7 @@ class NoisyKVState(KVBackend[tuple[str, Cell], list[NoisyLayerContext]], KVCache
             seq_lens = self._seq_lens_dev if share_bufs else self._seq_lens_dev.clone()
             video_slots = self._cached_write_slots(write_slot, chunk_tokens, device)
             local_layer = pool.local_layer(write_key)
+            sink_layers = self.cache._external_sinks.get(req)
             batch.append(
                 [
                     NoisyLayerContext(
@@ -900,6 +933,7 @@ class NoisyKVState(KVBackend[tuple[str, Cell], list[NoisyLayerContext]], KVCache
                         max_query_len=max_query_len,
                         max_seq_len=max_seq_len,
                         seq_len=seq_len,
+                        external_sink=sink_layers.get(local_layer) if sink_layers is not None else None,
                     )
                 ]
             )
