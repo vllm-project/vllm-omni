@@ -281,11 +281,13 @@ curl -sS -X POST "${API_URL}" \
   -o t2va.mp4
 ```
 
-This requires the FLASH_ATTN backend and MindIE-SD. H3 automatically applies
-exact power-of-two input pre-scaling (`laser_input_scale=256`) so the
-kernel's fp16 workspace cannot overflow on outlier activations. Measured on
-the FastH3 four-step Dense configuration below, T2VA 15 s at 1344x768, this
-kernel reduced end-to-end latency from ~73 s to ~57 s (about 22%).
+This requires the FLASH_ATTN backend and MindIE-SD. When LaserAttention runs,
+H3 applies power-of-two input pre-scaling (`laser_input_scale=256`) to protect
+its FP16 workspace from overflow. With MindIE-SD 3.3.0, A5 devices and calls
+with fewer than 2,048 query or valid K/V tokens use FlashAttentionScore
+directly in BSND, with the original softmax scale. An earlier LaserAttention
+comparison on the FastH3 four-step Dense configuration below, T2VA 15 s at
+1344x768, measured an end-to-end latency drop from ~73 s to ~57 s (about 22%).
 
 ## FastH3 four-step on A3
 
