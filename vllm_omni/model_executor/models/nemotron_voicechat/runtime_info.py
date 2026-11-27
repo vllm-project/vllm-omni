@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Runtime-info helpers shared by the thinker and talker AR stages."""
 
 from __future__ import annotations
@@ -46,6 +46,9 @@ def require_request_id(info: dict[str, Any], stage: str) -> str:
         meta = info.get("meta")
         if isinstance(meta, dict):
             request_id = meta.get("request_id")
+    if request_id is None:
+        # Native MRv2 buffers carry the runner-owned identity as req_id.
+        request_id = info.get("req_id")
     if request_id is None:
         raise RuntimeError(f"NemotronVoiceChat {stage} requires a request_id in the runtime info.")
     return str(request_id)

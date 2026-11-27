@@ -11,6 +11,7 @@ contract covers both audex pipelines (``audex`` TTS and ``audex_tta``).
 """
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -126,7 +127,7 @@ def _adapter() -> AudexAdapter:
 
 
 def _speech_request(**extra_params) -> OpenAICreateSpeechRequest:
-    payload = {"model": "audex", "input": "Hello world."}
+    payload: dict[str, Any] = {"model": "audex", "input": "Hello world."}
     if extra_params:
         payload["extra_params"] = extra_params
     return OpenAICreateSpeechRequest(**payload)
@@ -283,6 +284,17 @@ def test_guided_injection_sets_guided_temperature():
     assert out.temperature == 0.1
 
 
+@pytest.mark.parametrize("temperature", [0.0, 0.3])
+def test_guided_injection_keeps_explicit_temperature(temperature):
+    """A caller-supplied temperature (including 0 = greedy) wins over the CFG default."""
+    serving = TestAudexCfgInjection()._serving_with_fake_tokenizer()
+    cond = TestAudexCfgInjection()._cond_prompt()
+    params = SimpleNamespace(extra_args={"cfg_scale": 1.5}, temperature=temperature)
+    out = serving._adapter._inject_audex_cfg_pair_args("req-1", {"prompt": cond}, params, explicit_temperature=True)
+    assert out.temperature == temperature
+    assert out.extra_args["cfg_role"] == "cond"
+
+
 def test_typed_full_pipeline_uses_full_checkpoint_tokenizer(mocker):
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
 
@@ -299,7 +311,7 @@ def test_typed_full_pipeline_uses_full_checkpoint_tokenizer(mocker):
         "vllm_omni.model_executor.models.audex.checkpoint.ensure_audex_snapshot",
         return_value="/snapshots/audex",
     )
-    from_pretrained = mocker.patch("transformers.AutoTokenizer.from_pretrained", return_value=object())
+    from_pretrained = mocker.patch("transformers.PreTrainedTokenizerFast.from_pretrained", return_value=object())
 
     adapter = AudexAdapter(SpeechServingContext(server=serving, engine_client=serving.engine_client))
     adapter._get_tokenizer()

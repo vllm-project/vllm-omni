@@ -270,7 +270,7 @@ def test_videomme_save_eval_items_cli_sets_env(monkeypatch: pytest.MonkeyPatch) 
         return {"ok": "1"}
 
     monkeypatch.delenv("VIDEOMME_SAVE_EVAL_ITEMS", raising=False)
-    monkeypatch.setattr(serve, "main_async", fake_main_async)
+    monkeypatch.setattr(serve, "vllm_main_async", fake_main_async)
 
     args = Namespace(
         videomme_save_eval_items=True,

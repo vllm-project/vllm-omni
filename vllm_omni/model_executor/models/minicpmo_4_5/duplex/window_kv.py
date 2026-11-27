@@ -5,7 +5,8 @@
 ``window_plan.py`` holds the window arithmetic in plain integers; this file
 holds the three things that need an engine: the KV-cache spec/manager pair the
 scheduler resolves, the layer change that produces that spec, and the in-place
-re-RoPE that follows a trim.
+re-RoPE that follows a trim. The scheduler helper also keeps a barge-in's
+window for the session's next Stage-0 request (see ``snapshot_window``).
 
 One mechanism, matching the reference implementation
 ----------------------------------------------------
@@ -65,8 +66,9 @@ parent produced, so the kernel's choice -- not this module's -- is the one the
 chunk arithmetic uses.
 
 The arithmetic it delegates to is CPU-covered by
-``tests/model_executor/models/minicpmo_4_5/duplex/test_window_plan.py``, which
-also checks the RoPE identity behind :func:`rotate_cached_keys` numerically.
+``tests/model_executor/models/minicpmo_4_5/duplex/test_window_plan.py``. The
+neighboring ``test_window_wiring.py`` checks :func:`rotate_cached_keys`
+against attention and BF16 rotation references.
 ``tests/worker_v2/test_minicpmo_duplex_block_table.py`` exercises MRv2's actual
 GPU block-table gather across the allocation bound and after compaction. The
 spec disables ordinary sliding-window masking: that bound sizes admission,
@@ -99,27 +101,54 @@ Wiring, in the order the pieces get used
 from __future__ import annotations
 
 import functools
-from typing import Any
+import time
+from collections.abc import Iterable, Mapping
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec
 from vllm.v1.kv_cache_spec_registry import register_kv_cache_spec
 
+from vllm_omni.core.sched.window_policy import WindowCut, WindowOperation, duplex_window_replay_enabled
+from vllm_omni.engine.duplex.contracts import parse_duplex_resource_request_id
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowManager,
     ChunkWindowSpec,
 )
+from vllm_omni.model_executor.common.duplex.payload import payload_audio
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
+    APPEND_TEXT_TOKEN_IDS_KEY,
+    MiniCPMO45TurnState,
+    record_turn_sample,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
+    CARRIED_WINDOW_MAX_SESSIONS,
+    CARRIED_WINDOW_OFFER_TTL_S,
     DuplexWindowGeometry,
     PositionReanchor,
     align_up,
     cdiv,
     plan_position_reanchor,
+    prepare_stage0_window,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.request import Request, StreamingUpdate
+
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+
 
 #: Default block size for sliding window on CUDA. Hardware like Ascend NPU may
 #: use larger page sizes (e.g. 128).
 DUPLEX_WINDOW_BLOCK_SIZE = 16
+
+
+def duplex_stage0_session_id(request_id: str) -> str | None:
+    """Session id of a duplex Stage-0 resource request (``duplex-s.….r.stage0``), else None."""
+    fields = parse_duplex_resource_request_id(request_id)
+    return fields.session_id if fields is not None and fields.role == "stage0" else None
 
 
 def duplex_window_geometry(
@@ -580,7 +609,7 @@ class MiniCPMO45DuplexWindowPolicy:
         if mode != "basic":
             # Only basic mode uses zero-copy KV reuse with in-place Re-RoPE.
             # Context mode relies on previous-text accumulation and partial forward,
-            # so it routes explicitly through the official fallback (_prepare_minicpmo45_stage0_window).
+            # so it routes explicitly through the official fallback (prepare_stage0_window).
             return None
 
         base_len = int(getattr(session, "num_computed_tokens", 0) or 0)
@@ -590,7 +619,7 @@ class MiniCPMO45DuplexWindowPolicy:
 
         # Normalize total-sequence watermarks to content-only budgets for DuplexWindowGeometry
         # so that trigger_total == high_watermark and target_total == low_watermark,
-        # perfectly matching the fallback path (_prepare_minicpmo45_stage0_window).
+        # perfectly matching the fallback path (prepare_stage0_window).
         content_low = max(block_size, low_watermark - prefix_tokens)
         content_high = max(content_low, high_watermark - prefix_tokens)
 
@@ -628,7 +657,7 @@ class MiniCPMO45DuplexWindowPolicy:
         )
 
 
-class MiniCPMO45DuplexSchedulerHelper:
+class MiniCPMO45SchedulerWindowPolicy:
     """Scheduler-side window planning and request compaction helper for MiniCPM-o 4.5 duplex."""
 
     @classmethod
@@ -672,6 +701,21 @@ class MiniCPMO45DuplexSchedulerHelper:
         duplex_mgr = cls.find_duplex_window_manager(scheduler)
         if duplex_mgr is None:
             return None
+
+        coordinator = scheduler.kv_cache_manager.coordinator
+        managers = coordinator.single_type_managers
+        # The in-place path compacts one table and uses standard RoPE frequencies.
+        # Leave all tables untouched when the scheduler must rebuild the retained prompt.
+        if len(managers) != 1:
+            return None
+        for config in (
+            getattr(model_config, "hf_text_config", None),
+            getattr(model_config, "hf_config", None),
+        ):
+            for field in ("rope_parameters", "rope_scaling"):
+                rope = getattr(config, field, None)
+                if isinstance(rope, dict) and rope.get("rope_type", rope.get("type", "default")) != "default":
+                    return None
 
         # Free and compact blocks via explicit request-local sink boundary on KV manager.
         # Rejection before state mutation: if compaction returns 0, no state is changed.
@@ -795,9 +839,480 @@ class MiniCPMO45DuplexSchedulerHelper:
 
         return plan
 
+    def __init__(self) -> None:
+        self.carry: MiniCPMO45CarriedWindows | None = None
+
+    @staticmethod
+    def observe_progress(request: Request) -> None:
+        info = getattr(request, "model_intermediate_buffer", None)
+        if not duplex_window_replay_enabled(info):
+            return
+        duplex = info.get("duplex") if isinstance(info, dict) else None
+        if not isinstance(duplex, dict) or not duplex.get("data_plane"):
+            return
+        cfg = duplex.get("runtime_config", {})
+        ids = cfg.get("duplex_boundary_token_ids")
+        if not ids or duplex.get("session_window_owned") is False:
+            return
+        # Only returned frames count. num_computed_tokens already includes outstanding dispatches.
+        settled = min(request.num_computed_tokens - request.num_in_flight_tokens, request.num_tokens)
+        seq = duplex["seq"]
+        prior = getattr(request, "_minicpmo45_settled", None)
+        start = getattr(request, "_minicpmo45_window_open_start", None)
+        if start is None:
+            start = cfg["duplex_first_append_context_tokens"]
+        if settled <= start:
+            return
+        payload = duplex.get("payload") or {}
+        if prior is None or prior["seq"] != seq:
+            seeded = bool(cfg.get("initial_user_text")) and not getattr(request, "_minicpmo45_replay_source", None)
+            turn = (
+                replace(prior["turn"])
+                if prior
+                else MiniCPMO45TurnState(
+                    current_turn_ended=not seeded, pending_speech_context=seeded, pending_speech_response_open=seeded
+                )
+            )
+            if payload.get("is_speech") or (payload.get("video_frames") and payload_audio(payload) is None):
+                turn.pending_speech_context = True
+            request._minicpmo45_turn_at_start = turn
+        turn = replace(request._minicpmo45_turn_at_start)
+        generated = list(request._all_token_ids[request.num_prompt_tokens :])
+        terminators = {ids["listen_token_id"], ids["chunk_eos_token_id"], ids["chunk_tts_eos_token_id"]}
+        # A parked segment's last decision is known, but its terminator is
+        # fed with </unit> on the next prefill. Other samples require a settled decoder row.
+        consumed = min(len(generated), max(0, settled - request.num_prompt_tokens))
+        parked = bool(generated and generated[-1] in terminators)
+        active_ids = generated[:-1] if parked else generated[:consumed]
+        accepted = generated if parked else active_ids
+        backend_text = bool(cfg.get(APPEND_TEXT_TOKEN_IDS_KEY))
+        if (payload.get("text_token_ids") or backend_text) and settled >= request.num_prompt_tokens:
+            turn.observe_text_prefill(force_listen=payload.get("force_listen") is True, backend_result=backend_text)
+        if accepted and payload.get("open_assistant_turn") is True and payload.get("is_speech") is not True:
+            if turn.current_turn_ended:
+                turn.current_turn_ended = False
+                turn.pending_speech_response_open = True
+                turn.explicit_response_awaiting_content = True
+        for token in accepted:
+            record_turn_sample(turn, token, ids, payload, terminator=token in terminators)
+        ended = turn.current_turn_ended
+        if parked:
+            tail = [generated[-1], ids["unit_end_token_id"]]
+        else:
+            tail = ([] if ended else [ids["turn_eos_token_id"]]) + [ids["listen_token_id"], ids["unit_end_token_id"]]
+        special = cfg["duplex_window_special_token_ids"]
+        units = list(getattr(request, "_minicpmo45_window_units", ()))
+        rows = min(settled, request.num_prompt_tokens) - start
+        units.append(
+            {
+                "length": rows + len(active_ids) + len(tail),
+                "generated_token_ids": [t for t in active_ids if t not in special],
+            }
+        )
+        request._minicpmo45_settled = {
+            "seq": seq,
+            "units": units,
+            "previous": list(getattr(request, "_minicpmo45_window_previous_token_ids", ())),
+            "start": start,
+            "rows": rows,
+            "tail": [*active_ids, *tail],
+            "turn": turn,
+            "close_on_next_input": parked and not ended,
+            "parked": parked,
+            "accepted": accepted,
+        }
+
+    def superseded_by(self, request: Request, live: Mapping[str, Request]) -> list[str]:
+        sid = duplex_stage0_session_id(request.request_id)
+        if sid is None or not duplex_window_replay_enabled(getattr(request, "model_intermediate_buffer", None)):
+            return []
+        _, epoch, _ = _stage0_order(request.request_id)
+        return [
+            rid
+            for rid, previous in live.items()
+            if duplex_stage0_session_id(rid) == sid and _stage0_order(rid)[1] < epoch and not previous.is_finished()
+        ]
+
+    def prepare_admission(self, request: Request, max_prompt_len: int) -> int | None:
+        sid = duplex_stage0_session_id(request.request_id)
+        info = getattr(request, "model_intermediate_buffer", None)
+        if sid is None or not duplex_window_replay_enabled(info):
+            return None
+        if self.carry is None:
+            self.carry = MiniCPMO45CarriedWindows()
+        carry = self.carry
+        window = carry.windows.get(sid)
+        # Abort may have completed without another scheduler dispatch in between.
+        for old_id, pending in reversed(carry.pending.items()):
+            if duplex_stage0_session_id(old_id) == sid:
+                window = pending
+                break
+        duplex = info.get("duplex") if isinstance(info, dict) else None
+        if not isinstance(duplex, dict) or duplex.get("seq") != 1:
+            return None
+        if duplex.get("session_window_owned") is False:
+            return None
+        cfg = duplex["runtime_config"]
+        if "duplex_first_append_context_tokens" in cfg:
+            duplex["open_input_start"] = cfg["duplex_first_append_context_tokens"]
+        if not window or "seq" not in window:
+            return None
+        if _stage0_order(request.request_id)[1] <= _stage0_order(window["source"])[1]:
+            return None
+        mode = cfg["duplex_window_config"]["sliding_window_mode"]
+        units = list(window["units"])
+        previous = list(window["previous"])
+        marker = cfg.get("duplex_window_previous_marker_token_ids", [])
+        previous_len = len(marker) + len(previous) if previous and mode == "context" else 0
+        carried = sum(unit["length"] for unit in units)
+        payload = duplex["payload"]
+        opens_from_text = bool(cfg.get(APPEND_TEXT_TOKEN_IDS_KEY)) or (
+            bool(payload.get("text_token_ids")) and payload.get("force_listen") is not True
+        )
+        close_before_text = window["close_on_next_input"] and opens_from_text and bool(units)
+        close_on_next_input = window["close_on_next_input"] and not opens_from_text
+        extra = carried + previous_len + int(close_before_text or close_on_next_input)
+        length = request.num_prompt_tokens + extra
+        config = cfg["duplex_window_config"]
+        # If the next prefill crosses the same window watermark as an ordinary
+        # append, evict whole oldest units before admission.
+        cap = max_prompt_len
+        if mode == "basic":
+            high = int(config.get("basic_window_high_tokens", cap))
+            if length > high:
+                cap = min(cap, int(config.get("basic_window_low_tokens", high)))
+        max_units = int(config.get("context_max_units", len(units))) if mode == "context" else len(units)
+        skipped = 0
+        while mode != "off" and units and (length > cap or len(units) > max_units):
+            unit = units.pop(0)
+            skipped += 1
+            carried -= unit["length"]
+            if mode == "context":
+                limit = max(0, int(config.get("context_previous_max_tokens", 500)))
+                previous = (previous + unit["generated_token_ids"])[-limit:] if limit else []
+                previous_len = len(marker) + len(previous) if previous else 0
+            close_before_text = close_before_text and bool(units)
+            length = request.num_prompt_tokens + carried + previous_len + int(close_before_text or close_on_next_input)
+        if length > max_prompt_len:
+            return length
+        prompt_ids = [cfg["duplex_scheduler_token_id"]] * length
+        request.prompt_token_ids = prompt_ids
+        del request._all_token_ids[:]
+        request._all_token_ids.extend(prompt_ids)
+        request.num_prompt_tokens = length
+        request.block_hashes.clear()
+        request.update_block_hashes()
+        source_lengths = [unit["length"] for unit in units]
+        if close_before_text:
+            units[-1] = {**units[-1], "length": units[-1]["length"] + 1}
+            carried += 1
+        request._minicpmo45_window_units = units.copy()
+        request._minicpmo45_window_previous_token_ids = list(previous)
+        request._minicpmo45_window_previous_len = previous_len
+        request._minicpmo45_window_open_start = cfg["duplex_first_append_context_tokens"] + carried + previous_len
+        carry.admitted[request.request_id] = window["source"]
+        request._minicpmo45_replay_source = window["source"]
+        duplex["open_input_start"] = request._minicpmo45_window_open_start
+        duplex["stage0_window"] = {
+            "replace": True,
+            "mode": mode,
+            "replay_cut": request.request_id,
+            "carried_units": len(units),
+            "evicted_at_cut": skipped,
+            "carried_unit_lengths": source_lengths,
+            "replacement_prompt_len": length,
+            "previous_token_ids": previous,
+            "previous_marker_token_ids": marker,
+            "close_on_next_input": close_on_next_input,
+            "close_before_text": close_before_text,
+        }
+        if close_on_next_input:
+            duplex["payload"] = {**duplex["payload"], "force_listen": True}
+        return None
+
+    def prepare_append(
+        self,
+        scheduler: OmniARScheduler,
+        request: Request,
+        update: StreamingUpdate,
+        *,
+        segment_output_ids: list[int],
+        completed_terminator: int | None,
+    ) -> int | None:
+        info = getattr(update, "model_intermediate_buffer", None)
+        replay_enabled = duplex_window_replay_enabled(info)
+        if replay_enabled:
+            self.snapshot_window(request)
+        # A carried window must be placed by replacing the prompt, never by an in-place trim.
+        reanchored = None
+        if (
+            self.find_duplex_window_manager(scheduler) is not None
+            and getattr(request, "_minicpmo45_carried_window", None) is None
+        ):
+            reanchored = self.apply_session_window(
+                scheduler,
+                request,
+                update,
+                segment_output_ids=segment_output_ids,
+                completed_terminator=completed_terminator,
+            )
+        duplex = info.get("duplex") if isinstance(info, dict) else None
+        if isinstance(duplex, dict) and isinstance(duplex.get("stage0_window"), dict):
+            request._minicpmo45_window_planned = True
+        replaced = reanchored is None and prepare_stage0_window(
+            request,
+            update,
+            segment_output_ids=segment_output_ids,
+            completed_terminator=completed_terminator,
+        )
+        if (
+            replay_enabled
+            and isinstance(duplex, dict)
+            and (start := getattr(request, "_minicpmo45_window_open_start", None)) is not None
+        ):
+            duplex["open_input_start"] = start
+        if replaced:
+            return len(update.prompt_token_ids)
+        return None
+
+    def release_session(self, session_id: str) -> None:
+        if (carry := self.carry) is None:
+            return
+        carry.windows.pop(session_id, None)
+        for records in (carry.pending, carry.admitted, carry.snapshot_ids, carry.unstarted):
+            for rid in list(records):
+                if duplex_stage0_session_id(rid) == session_id:
+                    if isinstance(records, dict):
+                        records.pop(rid, None)
+                    else:
+                        records.discard(rid)
+
+    def snapshot_window(self, session: Any) -> None:
+        """Remember a Stage-0 request's window as the worker has it, before an append changes it.
+
+        The window plan runs when the append arrives, but the worker updates its
+        own units only when it runs that append. Until the append is scheduled,
+        an abort must keep the window as it was before the plan.
+        """
+        if duplex_stage0_session_id(session.request_id) is None:
+            return
+        carry = self.carry
+        if carry is None:
+            carry = MiniCPMO45CarriedWindows()
+            self.carry = carry
+        if getattr(session, "_minicpmo45_window_snapshot", None) is not None:
+            # An earlier append is still waiting to be booked: the worker has the window from before that one.
+            return
+        # Taken even when the window is empty: the worker has no closed unit before the first plan either.
+        session._minicpmo45_window_snapshot = {
+            "units": [dict(unit) for unit in getattr(session, "_minicpmo45_window_units", None) or ()],
+            "previous": list(getattr(session, "_minicpmo45_window_previous_token_ids", ()) or ()),
+            "carried": getattr(session, "_minicpmo45_carried_window", None),
+        }
+        carry.snapshot_ids.add(session.request_id)
+
+    def before_book(self, requests: Mapping[str, Request], output: SchedulerOutput) -> None:
+        """Drop the snapshots of requests whose append this step hands to the worker."""
+        carry = self.carry
+        if carry is None or not carry.snapshot_ids:
+            return
+        for request_id in carry.snapshot_ids.intersection(output.num_scheduled_tokens):
+            carry.snapshot_ids.discard(request_id)
+            request = requests.get(request_id)
+            if request is not None:
+                request._minicpmo45_window_snapshot = None
+
+    def before_finish(self, requests: Mapping[str, Request], request_ids: Iterable[str], *, aborted: bool) -> None:
+        """Note what finished duplex Stage-0 requests leave; the worker learns of them at the next step."""
+        carry = self.carry
+        if carry is None:
+            return
+        for request_id in request_ids:
+            request = requests.get(request_id)
+            # A request that already finished (freed later) never reaches the worker's finished set again.
+            live = request is not None and not request.is_finished()
+            if (
+                live
+                and duplex_stage0_session_id(request_id) is not None
+                and duplex_window_replay_enabled(getattr(request, "model_intermediate_buffer", None))
+            ):
+                if not getattr(request, "_minicpmo45_started", False):
+                    # Never scheduled: it neither holds nor replaces the session's kept window.
+                    carry.unstarted.add(request_id)
+                elif (
+                    aborted
+                    and request_id not in carry.pending
+                    and (window := self._window_left_by(request)) is not None
+                ):
+                    if "source" not in window and window["time"] is None:
+                        window["time"] = time.monotonic()
+                    carry.pending[request_id] = window
+            carry.snapshot_ids.discard(request_id)
+
+    @staticmethod
+    def _window_left_by(request: Any) -> dict[str, Any] | None:
+        """The completed units an aborted request leaves, or None when it has none."""
+        if (settled := getattr(request, "_minicpmo45_settled", None)) is not None:
+            return {**settled, "source": request.request_id, "time": None}
+        if getattr(request, "_minicpmo45_replay_source", None) is not None:
+            # Only the predecessor's rows have run. Its settled snapshot still
+            # owns the session and can be claimed by the next receiver.
+            return None
+        # An append the worker never ran leaves the window as it was before that append's plan.
+        window = getattr(request, "_minicpmo45_window_snapshot", None) or {
+            "units": getattr(request, "_minicpmo45_window_units", ()),
+            "previous": getattr(request, "_minicpmo45_window_previous_token_ids", ()),
+            "carried": getattr(request, "_minicpmo45_carried_window", None),
+        }
+        unplaced = window["carried"] or {}
+        units = [*unplaced.get("units", ()), *(window["units"] or ())]
+        if not units:
+            return None
+        previous = list(window["previous"] or ()) or list(unplaced.get("previous", ()))
+        # Units carried from an earlier abort keep that abort's time, so the offer never outlives the first abort.
+        kept_since = unplaced.get("time") if unplaced.get("units") else None
+        return {"units": units, "previous": previous, "time": kept_since}
+
+    def on_schedule(self, requests: Mapping[str, Request], output: SchedulerOutput) -> list[WindowOperation]:
+        """Decide this step's kept and handed windows, and queue the same steps for the worker.
+
+        The worker applies ``duplex_carry_ops`` in order at the start of the
+        step, before it frees the finished requests' state:
+          * ``("keep", session_id, request_id)``: keep the finished request's units for the session;
+          * ``("drop", session_id, "")``: drop the session's kept units;
+          * ``("hand", session_id, request_id)``: give them to the session's new request.
+        """
+        carry = self.carry
+        if carry is None:
+            return []
+        now = time.monotonic()
+        ops: list[WindowOperation] = []
+        windows = carry.windows
+        # Only pack bounded offers that will reach a receiver or survive this step.
+        pending_keeps: dict[str, WindowOperation] = {}
+        # A queued append can overflow and finish before its snapshot is committed.
+        carry.snapshot_ids.difference_update(output.finished_req_ids)
+        for request_id in sorted(output.finished_req_ids, key=_stage0_order):
+            session_id = duplex_stage0_session_id(request_id)
+            if session_id is None:
+                continue
+            if request_id in carry.unstarted:
+                carry.unstarted.discard(request_id)
+                continue
+            window = carry.pending.pop(request_id, None)
+            pending_keeps.pop(session_id, None)
+            if window is not None:
+                windows.pop(session_id, None)
+                windows[session_id] = window
+                op = WindowOperation("keep", session_id, request_id)
+                if "seq" in window:
+                    op = WindowOperation(
+                        "keep",
+                        session_id,
+                        request_id,
+                        WindowCut(
+                            window["seq"],
+                            window["start"],
+                            window["rows"],
+                            tuple(window["accepted"]),
+                            tuple(window["tail"]),
+                        ),
+                    )
+                    ops.append(op)
+                else:
+                    pending_keeps[session_id] = op
+            elif windows.get(session_id, {}).get("source"):
+                # A request which was cancelled before it settled any new rows
+                # leaves its predecessor intact. Close/expiry releases the session.
+                continue
+            elif windows.pop(session_id, None) is not None:
+                # The session's later request left nothing to keep, so its earlier window goes too.
+                ops.append(WindowOperation("drop", session_id))
+        # Highest epoch first: if two of a session's requests start in one step, the newer one gets the window.
+        new_reqs = getattr(output, "scheduled_new_reqs", ()) or ()
+        new_ids = sorted((req.req_id for req in new_reqs), key=_stage0_order, reverse=True)
+        for request_id in new_ids:
+            session_id = duplex_stage0_session_id(request_id)
+            if session_id is None:
+                continue
+            if (started := requests.get(request_id)) is not None:
+                started._minicpmo45_started = True
+            if session_id not in windows:
+                continue
+            if "source" in windows[session_id]:
+                # The receiver was bound before its prompt was sized. Cancelled or
+                # superseded waiters cannot take another request's replay buffer.
+                continue
+            window = windows.pop(session_id)
+            request = requests.get(request_id)
+            if (
+                request is None
+                or now - window["time"] > CARRIED_WINDOW_OFFER_TTL_S
+                # The worker drops carried units at the request's first window plan, so a carry that
+                # arrives after that plan can no longer be placed.
+                or getattr(request, "_minicpmo45_window_planned", False)
+            ):
+                ops.append(WindowOperation("drop", session_id))
+                continue
+            request._minicpmo45_carried_window = window
+            if (keep := pending_keeps.pop(session_id, None)) is not None:
+                ops.append(keep)
+            ops.append(WindowOperation("hand", session_id, request_id))
+        for target, source in carry.admitted.items():
+            if target not in output.finished_req_ids:
+                ops.append(
+                    WindowOperation("restore", duplex_stage0_session_id(target) or "", target, source_request_id=source)
+                )
+        carry.admitted.clear()
+        for session_id in [
+            sid
+            for sid, kept in windows.items()
+            if "source" not in kept and now - kept["time"] > CARRIED_WINDOW_OFFER_TTL_S
+        ]:
+            windows.pop(session_id)
+            ops.append(WindowOperation("drop", session_id))
+        unowned = [sid for sid, kept in windows.items() if "source" not in kept]
+        for oldest in unowned[:-CARRIED_WINDOW_MAX_SESSIONS]:
+            windows.pop(oldest)
+            ops.append(WindowOperation("drop", oldest))
+
+        ops.extend(op for sid, op in pending_keeps.items() if sid in windows)
+        return ops
+
+
+def _stage0_order(request_id: str) -> tuple[str, int, str]:
+    """Order finished or new Stage-0 requests by session, then by epoch as a number (``e.9`` before ``e.10``)."""
+    fields = parse_duplex_resource_request_id(request_id)
+    if fields is None or fields.role != "stage0":
+        return "", -1, request_id
+    return fields.session_id, fields.epoch, request_id
+
+
+class MiniCPMO45CarriedWindows:
+    """Scheduler-side barge-in carry state, one per scheduler (see ``MiniCPMO45SchedulerWindowPolicy``)."""
+
+    def __init__(self) -> None:
+        #: session id -> the window its aborted Stage-0 request left; the worker keeps the same ones.
+        self.windows: dict[str, dict[str, Any]] = {}
+        #: request id -> window of an aborted request whose finish has not reached the worker yet.
+        self.pending: dict[str, dict[str, Any]] = {}
+        #: Stage-0 requests whose window snapshot waits for their append to be booked.
+        self.snapshot_ids: set[str] = set()
+        #: Stage-0 requests that finished before their first scheduled step.
+        self.unstarted: set[str] = set()
+        self.admitted: dict[str, str] = {}
+
 
 class MiniCPMO45DuplexWorkerHelper:
     """Worker-side KV cache rotation and position metadata helper for MiniCPM-o 4.5 duplex."""
+
+    @classmethod
+    def get_reanchor_parameters(cls, runner: Any) -> tuple[int, int | None, torch.Tensor]:
+        """Resolve the same cache geometry for startup validation and rotation."""
+        block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
+        model_config = getattr(runner, "model_config", None)
+        head_dim = model_config.get_head_size() if model_config is not None else None
+        return block_size, head_dim, cls.get_rope_inv_freq(runner)
 
     @classmethod
     def get_rope_inv_freq(cls, runner: Any) -> torch.Tensor:
@@ -952,11 +1467,8 @@ class MiniCPMO45DuplexWorkerHelper:
                 assert_uniform_position_shift(positions, plan.moved_from)
 
             if positions.numel() > 0 and hasattr(runner, "kv_caches") and runner.kv_caches:
-                inv_freq = cls.get_rope_inv_freq(runner)
-                model_config = getattr(runner, "model_config", None)
-                head_dim = model_config.get_head_size() if model_config is not None else None
+                block_size, head_dim, inv_freq = cls.get_reanchor_parameters(runner)
                 kv_groups = getattr(runner, "kv_cache_group_ids", None)
-                block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
                 # Layers share their KV group's table; on MRv2 each lookup is a device read.
                 group_block_ids: dict[int, list[int]] = {}
                 for layer_idx, kv_cache in enumerate(runner.kv_caches):

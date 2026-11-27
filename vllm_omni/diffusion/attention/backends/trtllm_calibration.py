@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import fnmatch
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.layer import ScheduleCandidate
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
 
 logger = logging.getLogger(__name__)
 
@@ -79,17 +83,61 @@ def propagate_skip_softmax_calibration(specs: list, model: str | None, tf_config
     logger.info("Loaded skip-softmax calibration from checkpoint (%d curve(s): %s).", len(experts), ", ".join(experts))
 
 
-def apply_skip_softmax_calibration(attention_config: Any, model: Any) -> None:
-    cfg = attention_config
-    specs = getattr(cfg, "per_role", None)
-    calibration = None
-    for spec in (getattr(cfg, "default", None), *(specs.values() if specs else ())):
-        calibration = calibration or getattr(spec, "skip_calibration", None)
-    if not calibration:
-        return
+def collect_calibration_specs(
+    attention_config: AttentionConfig | None, schedule: AttentionScheduleConfig | None = None
+) -> list[AttentionSpec]:
+    """Baseline specs plus every schedule profile's specs, in a stable order.
 
-    stamped = apply_to_pipeline(model, calibration)
-    logger.info("Skip-softmax: stamped calibration onto %d attention layer(s).", stamped)
+    Both calibration discovery and the target-sparsity-without-calibration check have to see
+    non-active profiles, otherwise a profile the service default never references keeps an
+    undetected calibration gap. Without a schedule this returns exactly the baseline specs.
+    """
+    configs = [attention_config] if attention_config is not None else []
+    if schedule is not None:
+        configs.extend(schedule.profiles[name] for name in sorted(schedule.profiles))
+    return [spec for cfg in configs for spec in (cfg.default, *cfg.per_role.values()) if spec is not None]
+
+
+def layer_calibration_is_ignored(module_name: str, calibration: dict | None) -> bool:
+    """Whether this layer stays dense because the calibration explicitly ignores it.
+
+    Separates a preserved legitimate dense fallback from a layer whose expert simply carries no
+    curve: ``resolve_layer_calibration`` returns ``None`` for both, but only the first one is
+    acceptable when a profile asked for ``target_sparsity``.
+    """
+    entry = _layer_calibration_entry(module_name, calibration)
+    return entry is not None and is_ignored(module_name, entry.get("ignore"))
+
+
+def resolve_effective_calibration(
+    attention_config: AttentionConfig | None, schedule: AttentionScheduleConfig | None = None
+) -> dict | None:
+    """Fallback calibration for the baseline and for candidates that carry none of their own.
+
+    This is the first non-empty ``skip_calibration`` over ``collect_calibration_specs`` (baseline
+    default, baseline per-role, then profiles in sorted order). A prepared candidate with its own
+    ``skip_calibration`` is stamped and validated from that dict instead.
+    """
+    for spec in collect_calibration_specs(attention_config, schedule):
+        if spec.skip_calibration:
+            return spec.skip_calibration
+    return None
+
+
+def calibration_for_candidate(record: ScheduleCandidate, fallback: dict | None) -> dict | None:
+    """The dict that stamping writes onto this candidate impl."""
+    own = record.spec.skip_calibration if record.spec is not None else None
+    return own or fallback
+
+
+def apply_skip_softmax_calibration(
+    attention_config: AttentionConfig | None, model: Any, schedule: AttentionScheduleConfig | None = None
+) -> None:
+    fallback = resolve_effective_calibration(attention_config, schedule)
+    stamped = apply_to_pipeline(model, fallback)
+    if not stamped:
+        return
+    logger.info("Skip-softmax: stamped calibration onto %d attention impl(s).", stamped)
 
 
 _EXPERT_PREFIXES = ("transformer.", "transformer_2.")
@@ -120,33 +168,58 @@ def select_expert(module_name: str, expert_keys) -> str | None:
     return None
 
 
-def resolve_layer_calibration(module_name: str, calibration: dict) -> dict | None:
+def _layer_calibration_entry(module_name: str, calibration: dict | None) -> dict | None:
+    """This layer's expert entry, the whole dict when it has no experts, or None when no expert matches."""
     if not calibration:
         return None
     by_expert = calibration.get("by_expert")
-    if by_expert:
-        key = select_expert(module_name, by_expert.keys())
-        if key is None:
-            return None
-        entry = by_expert[key]
-    else:
-        entry = calibration
-    if is_ignored(module_name, entry.get("ignore")):
+    if not by_expert:
+        return calibration
+    key = select_expert(module_name, by_expert.keys())
+    return None if key is None else by_expert[key]
+
+
+def resolve_layer_calibration(module_name: str, calibration: dict | None) -> dict | None:
+    entry = _layer_calibration_entry(module_name, calibration)
+    if entry is None or is_ignored(module_name, entry.get("ignore")):
         return None
     return {"a": entry.get("a"), "b": entry.get("b")}
 
 
-def apply_to_pipeline(pipeline, calibration: dict) -> int:
-    if not calibration:
+def layer_calibration_curve(module_name: str, calibration: dict | None) -> tuple[float, float] | None:
+    """The ``(a, b)`` curve stamping writes onto this layer, or None when the layer stays dense."""
+    per = resolve_layer_calibration(module_name, calibration)
+    if per is None or per["a"] is None or per["b"] is None:
+        return None
+    return per["a"], per["b"]
+
+
+def _stamp_impl(impl, module_name: str, calibration: dict | None, seen: set[int]) -> int:
+    if impl is None or calibration is None or id(impl) in seen:
         return 0
+    set_layer = getattr(impl, "set_layer_calibration", None)
+    if set_layer is None:
+        return 0
+    curve = layer_calibration_curve(module_name, calibration)
+    if curve is None:
+        return 0
+    set_layer(*curve)
+    seen.add(id(impl))
+    return 1
+
+
+def apply_to_pipeline(pipeline, calibration: dict | None) -> int:
+    """Stamp the baseline from ``calibration`` and each candidate from its own dict or that fallback.
+
+    A shared candidate impl is stamped once. With no schedule, candidates are empty and this is the
+    baseline path. ``calibration`` may be None when every stampable curve lives on a candidate spec.
+    """
     stamped = 0
     for name, module in pipeline.named_modules():
-        impl = getattr(module, "attention", None)
-        set_layer = getattr(impl, "set_layer_calibration", None)
-        if set_layer is None:
-            continue
-        per = resolve_layer_calibration(name, calibration)
-        if per and per.get("a") is not None and per.get("b") is not None:
-            set_layer(per["a"], per["b"])
-            stamped += 1
+        seen: set[int] = set()
+        baseline = getattr(module, "attention", None)
+        stamped += _stamp_impl(baseline, name, calibration, seen)
+        # Deduplicated profiles share one impl; _stamp_impl stamps each impl once.
+        for record in getattr(module, "_schedule_candidates", {}).values():
+            stamped += _stamp_impl(record.impl, name, calibration_for_candidate(record, calibration), seen)
     return stamped

@@ -1,6 +1,5 @@
-# Use the published v0.33.0 base, then build the frozen matching source
-# below. This combination still requires Omni runtime qualification.
-ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.33.0
+# Use the published v0.34.0 runtime; Omni ROCm qualification is separate.
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.34.0@sha256:3cb773d23f063afa86291ef75773cdd486154ddea94c213300f4ed7cc42b7af1
 
 # Keep the dependency-heavy portion independent from the source tree. The
 # registry cache is keyed on these inputs, while the final source copy can be
@@ -8,12 +7,11 @@ ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.33.0
 FROM ${BASE_IMAGE} AS deps
 
 # NOTE: REMINDER to vLLM-Omni rebase maintainer
-# Build from the exact release-branch source until a matching prebuilt ROCm image is available.
-# Set USE_NIGHTLY_BUILD=0 only with a BASE_IMAGE that already contains the
-# target runtime. CUDA CI and the source commit are checked together in
-# tests/buildkite/test_rocm_dockerfile.py.
-ARG USE_NIGHTLY_BUILD=1
-ARG VLLM_VERSION_OR_COMMIT_HASH=4ba787ec9959e566d3b587a796dff07673324da5
+# Set USE_NIGHTLY_BUILD=1 only to rebuild the exact release source instead
+# of using the matching published ROCm runtime. CUDA CI and the source commit
+# are checked together in tests/buildkite/test_rocm_dockerfile.py.
+ARG USE_NIGHTLY_BUILD=0
+ARG VLLM_VERSION_OR_COMMIT_HASH=62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 
@@ -77,6 +75,9 @@ COPY tools/gradio_pillow13/ tools/gradio_pillow13/
 # Scope the override to Omni; dependency source builds need their own versions.
 ENV VLLM_OMNI_VERSION_OVERRIDE=0.0.0
 
+# The dev extra pins CUDA onnxruntime and the CUDA Mooncake wheel. The latter
+# overwrites the base image's ROCm build of the same ``mooncake`` package and
+# fails to import (libcudart.so.13); restore the ROCm builds.
 RUN python3 tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13 && \
     uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
         --no-cache-dir /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl \
@@ -85,6 +86,10 @@ RUN python3 tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13 && 
     python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
         "onnxruntime-rocm>=1.22.2" && \
     python3 -c "import importlib.metadata as m; import onnxruntime as ort; assert 'ROCMExecutionProvider' in ort.get_available_providers(), ort.get_available_providers(); assert m.version('onnxruntime-rocm'); assert not any(d.metadata['Name'] == 'onnxruntime' for d in m.distributions())" && \
+    python3 -m pip uninstall -y mooncake-transfer-engine-cuda13 && \
+    python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
+        "mooncake-transfer-engine-rocm==0.3.14" && \
+    python3 -c "import importlib.metadata as m; from mooncake.engine import TransferEngine; assert not any(d.metadata['Name'] == 'mooncake-transfer-engine-cuda13' for d in m.distributions())" && \
     python3 -c "from torchcodec.decoders import VideoDecoder"
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python

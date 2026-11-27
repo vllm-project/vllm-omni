@@ -269,6 +269,7 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
 def load_omni_transfer_config(
     config_path: str | Path | None = None,
     config_dict: dict[str, Any] | None = None,
+    deployment_scope: str | None = None,
 ) -> OmniTransferConfig | None:
     """Load OmniTransferConfig from file or dict."""
     if config_path is None and config_dict is None:
@@ -316,6 +317,15 @@ def load_omni_transfer_config(
 
     # Parse global connectors (from runtime.connectors)
     global_connectors = runtime_config.get("connectors", {})
+    # Transfer config is also loaded directly from the resolved YAML, without
+    # DeployConfig. Apply the same named-connector overlay on this path.
+    from vllm_omni.config.stage_config import _merge_connectors
+    from vllm_omni.platforms import current_omni_platform
+
+    platform = (current_omni_platform.device_name or "").lower()
+    platform_connectors = (config_dict.get("platforms") or {}).get(platform, {}).get("connectors")
+    if platform_connectors:
+        global_connectors = _merge_connectors(global_connectors, platform_connectors) or {}
 
     # Parse stage-level connectors
     stage_args = config_dict.get("stage_args", [])
@@ -432,9 +442,11 @@ def load_omni_transfer_config(
             f"{missing_str}. Define connectors or allow auto SHM creation for these edges."
         )
 
-    # Resolve once in the launcher; serialized connector extras carry the same
-    # namespace through EngineCore and multiprocess/TP workers.
-    wakeup_scope = uuid.uuid4().hex
+    # One scope per deployment. Head generates it and registration hands the
+    # same value to --headless; hashing each side's master address would
+    # split 127.0.0.1 from a hostname for the same endpoint. An explicit
+    # extra still wins. A caller with no scope keeps one UUID for this load.
+    wakeup_scope = deployment_scope or uuid.uuid4().hex
     for spec in connectors.values():
         if spec.name == "SharedMemoryConnector":
             spec.extra.setdefault("wakeup_scope", wakeup_scope)

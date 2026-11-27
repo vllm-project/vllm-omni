@@ -40,6 +40,8 @@ depends_on:
 validation_paths:
   - tests/engine/test_async_omni_engine_stage_init.py
   - tests/engine/test_membership_controller.py
+  - tests/engine/test_orchestrator.py
+  - tests/engine/test_orchestrator_error_handling.py
   - tests/engine/test_single_stage_mode.py
   - tests/engine/test_stage_engine_core_client.py
   - tests/engine/test_stage_engine_core_proc.py
@@ -53,8 +55,8 @@ upstream_refs:
   - vllm.v1.engine.utils.CoreEngineProcManager
   - vllm.v1.engine.coordinator.DPCoordinator
 invariant_namespace: STAGE-INV
-last_reviewed: 2026-08-07
-last_verified_commit: 3d7fc3b9ba3cac88d579d4dc35b78b0b641675fc
+last_reviewed: 2026-11-22
+last_verified_commit: 5b764aea027be18e7b1723c84e1a2b7aa1bb8029
 ---
 
 # Stage runtime and replica lifecycle
@@ -66,9 +68,8 @@ orchestrator.
 ## Contract status
 
 This document describes the current `StageRuntime`, `StagePool`, stage-client,
-and stage-process layout. The unified LLM/diffusion direction in
-[#5441](https://github.com/vllm-project/vllm-omni/pull/5441) remains in flight
-and is not presented as current behavior.
+and stage-process layout. [Sharing stages between pipelines](https://github.com/vllm-project/vllm-omni/issues/4108)
+remains an open design proposal. The earlier [LLM and DiT stage client and process refactor](https://github.com/vllm-project/vllm-omni/pull/5441) closed without merging.
 
 ## Ownership boundary
 
@@ -78,7 +79,7 @@ selection and affinity, stage-client/process lifecycle, liveness, draining,
 and shutdown.
 
 Local EngineCore initialization and multi-API serving use
-`StageRuntime.launch_stage_engines(num_api_servers=1)` as their common launch
+`StageRuntime.launch_stage_engines()` as their common launch
 entry. It resolves plans when not supplied by the runtime's device-group
 scheduler, coordinates device locks and environment overlays, starts engines,
 and rolls back resources on startup or attachment failure. Single-API clients
@@ -95,6 +96,51 @@ remote/headless stages, intra-stage data parallelism, and Ray backends.
 
 It does not own cross-stage request policy, model scheduler policy, connector
 transfer semantics, configuration precedence, or public error rendering.
+
+## Request-to-replica handoff
+
+In the [two-stage request trace](engine_orchestration.md#two-stage-request-lifecycle),
+[`StageRuntime._assemble_stage_pools`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/stage_runtime.py) provides one pool per
+logical stage with its replica clients and, for LLM stages, its output
+processor. The orchestrator chooses when to submit to each pool.
+[`StagePool.submit_initial`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/stage_pool.py) binds an unpinned local request
+through `select_replica_id`, which round-robins across
+available replicas for new requests. The pool registers the LLM output
+processor before the selected client's
+[`add_request_async`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/stage_engine_core_client.py) sends the request to EngineCore. In distributed mode, `StagePool.pick` reuses
+serviceable affinity or asks the load balancer to select from attached,
+serviceable replicas.
+
+The binding belongs to the pool. [`StagePool.abort_requests`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/stage_pool.py)
+groups aborts by existing affinity and sends them to the corresponding
+clients. The orchestrator tells the pool to
+`release_bindings` when the request is cleaned up. This
+frees request routing state and leaves the replica available for later
+requests. The [orchestrator tests](https://github.com/vllm-project/vllm-omni/blob/main/tests/engine/test_orchestrator.py) cover round-robin forwarding
+(`test_multi_replica_round_robin_distribution`), reuse of an existing binding
+(`test_stage_pool_submit_update_reuses_existing_binding`), and abort routing
+(`test_multi_replica_abort_broadcasts_to_all_replicas`).
+
+### Replica loss
+
+If polling reports `EngineDeadError` for a physical replica,
+[`Orchestrator._handle_dead_replica`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/orchestrator.py) asks the pool to
+`evict_replica` before failing stranded requests. For the
+ordinary non-shared-weight path, the pool retires the dead replica from
+routing. If another replica survives, orchestration fails requests bound to
+the dead one. With no surviving replica, it fails requests already routed
+through that stage. The frontend observes a fatal error on each affected
+request. The [orchestrator error tests](https://github.com/vllm-project/vllm-omni/blob/main/tests/engine/test_orchestrator_error_handling.py) cover both cases in
+`test_engine_dead_error_fails_only_dead_replica_requests` and
+`test_handle_dead_replica_last_replica_fails_all_stage_requests`.
+
+For a coordinator-driven removal, [`MembershipController.handle_unregister`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/membership_controller.py)
+acts first. It invalidates the address, detaches and shuts down the client,
+then calls the removal and request cleanup callbacks before queuing errors
+for affected requests. The [`test_unregister_awaits_async_removal_handler_before_request_cleanup`](https://github.com/vllm-project/vllm-omni/blob/main/tests/engine/test_membership_controller.py)
+checks that orchestration observes the removal before request cleanup.
+
+The implementation was checked at the revision in `last_verified_commit`.
 
 ## Candidate invariants
 
@@ -116,6 +162,18 @@ declared lost.
 **Rule:** Repeated shutdown or cleanup signals MUST NOT leak stage clients,
 process managers, or membership registrations.
 
+AR stage deployments may set `engine_extras.shutdown_timeout` to a nonnegative
+grace period in seconds. The stage client uses it when shutdown has no explicit
+timeout; an explicit caller timeout takes precedence, including zero. With no
+stage override, a positive upstream shutdown timeout is honored, otherwise the
+upstream process manager retains its default grace period. The timeout bounds
+process cleanup; it does not change request draining or admission policy.
+
+Once a local stage process enters final cleanup, repeated `SIGTERM` and
+`SIGINT` signals are ignored until its resource owners finish closing. Default
+signal handling is restored afterwards. The process manager can still enforce
+its shutdown deadline with `SIGKILL`.
+
 ## Invariant namespace
 
 `STAGE-INV` reserves `001-099` for placement and ownership, `100-199` for
@@ -128,7 +186,7 @@ Numbers become append-only after normative promotion.
 Exercise local and distributed startup, readiness, replica selection,
 affinity, membership changes, abort routing, process failure, draining, and
 repeated shutdown. Cross-stage policy changes belong in
-`engine_orchestration.md`.
+[engine orchestration](engine_orchestration.md).
 
 For multi-API changes, additionally exercise per-frontend channel assignment,
 shared-engine startup handshakes, frontend failure observation, and parent
@@ -136,7 +194,6 @@ cleanup without duplicate stage shutdown.
 
 ## Promotion gate
 
-- Reconcile terminology and ownership after #5441 reaches a final state.
 - Add or identify a dedicated StageRuntime/StagePool lifecycle suite; current
   evidence is distributed across the cited tests.
 - Demonstrate affinity preservation for update, interaction, and abort paths.

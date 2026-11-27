@@ -9,10 +9,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.openai import serving_speech as speech_module
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.tts_adapters.base import TTSModelAdapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -311,17 +313,11 @@ async def test_streaming_speech_does_not_finalize_continuity_on_error(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_streaming_speech_does_not_finalize_continuity_on_validation_error(monkeypatch):
+async def test_streaming_speech_does_not_finalize_continuity_on_validation_error(monkeypatch, mocker: MockerFixture):
     metrics = _MetricsStub()
-
-    def reject_generation(_tts_params, **_kwargs):
-        raise RuntimeError("generation validation failed")
-
-    adapter = SimpleNamespace(
-        validates_generation=True,
-        validate_generation=reject_generation,
-        validate_stream_audio=lambda **_kwargs: None,
-    )
+    adapter = mocker.create_autospec(TTSModelAdapter, instance=True)
+    adapter.validates_generation = True
+    adapter.validate_generation.side_effect = RuntimeError("generation validation failed")
     serving = _serving(metrics, adapter=adapter)
     monkeypatch.setattr("vllm_omni.entrypoints.openai.serving_speech.time.time", lambda: 100.25)
 

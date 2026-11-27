@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
-# Clean up old nightly builds from DockerHub (vllm/vllm-omni), keeping the
+# Clean up old nightly builds from DockerHub (vllm/vllm-omni, or the repo in $1), keeping the
 # newest 14 tags with the nightly- prefix.
 
 # Keep credentials and bearer tokens out of shell traces.
@@ -10,7 +10,7 @@ set +x
 set -eo pipefail
 
 TAG_PREFIX="nightly-"
-REPO="vllm/vllm-omni"
+REPO="${1:-vllm/vllm-omni}"
 REPO_API_URL="https://hub.docker.com/v2/namespaces/${REPO%/*}/repositories/${REPO#*/}/tags"
 
 echo "Cleaning up tags with prefix: $TAG_PREFIX in repository: $REPO"

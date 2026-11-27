@@ -38,6 +38,7 @@ from vllm_omni.diffusion.data import (
     is_diffusion_request_started_output,
 )
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackDecoder,
@@ -53,7 +54,6 @@ from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 
 logger = init_logger(__name__)
 
@@ -75,6 +75,7 @@ class StageDiffusionProc:
 
     DIFFUSION_PROC_DEAD = b"DIFFUSION_PROC_DEAD"
     _DEAD_SENTINEL_SEND_TIMEOUT_S = 5.0
+    _sharing_quiesced = False
 
     def __init__(self, model: str, od_config: OmniDiffusionConfig) -> None:
         self._model = model
@@ -82,6 +83,7 @@ class StageDiffusionProc:
         self._engine: DiffusionEngine | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._closed = False
+        self._sharing_quiesced = False
         # Set by ``_run_loop`` to the live dispatch task dict so
         # :attr:`queue_length` can report in-flight requests for the
         # OmniCoordinator heartbeat hook.
@@ -254,6 +256,17 @@ class StageDiffusionProc:
         LoRA methods remap arguments and post-process results to match
         the contract that ``AsyncOmni`` provides.
         """
+        if method in ("weight_sharing_quiesce", "weight_sharing_drain"):
+            if method == "weight_sharing_quiesce":
+                self._sharing_quiesced = True
+            else:
+                assert self._engine is not None
+                for request_id in list(self._active_tasks or {}):
+                    self._engine.abort(request_id)
+            active = list((self._active_tasks or {}).values())
+            if active:
+                await asyncio.gather(*active)
+            return True
         # Feedback only changes condition-protected host state and must not
         # wait behind an executor RPC for the current GPU chunk.
         if method in ("update_streaming_playback", "track_streaming_interaction", "release_streaming_output"):
@@ -584,6 +597,8 @@ class StageDiffusionProc:
                 msg_type = msg.get("type")
 
                 if msg_type == "add_request":
+                    if self._sharing_quiesced:
+                        raise RuntimeError("request received after sharing stage quiescence")
                     request_id = msg["request_id"]
                     task = asyncio.create_task(
                         _dispatch_request(
@@ -833,6 +848,7 @@ class StageDiffusionProcManager:
         omni_stage_id: int | None = None,
         omni_replica_id: int = 0,
     ) -> None:
+        self.uses_multiproc = DiffusionExecutor.get_class(od_config).uses_multiproc
         handshake_address = handshake_address or get_open_zmq_ipc_path()
         addresses = addresses or EngineZmqAddresses(
             inputs=[get_open_zmq_ipc_path()],
@@ -840,6 +856,12 @@ class StageDiffusionProcManager:
         )
 
         ctx = get_mp_context()
+        from vllm_omni.distributed.weight_sharing.runtime import CONFIG_KEY
+        from vllm_omni.distributed.weight_sharing.worker_registry import ConsumerWorkerRegistry
+
+        self.sharing_workers = getattr(od_config, "_sharing_worker_registry", None)
+        if CONFIG_KEY in od_config.additional_config and not isinstance(self.sharing_workers, ConsumerWorkerRegistry):
+            raise RuntimeError("shared consumer startup requires the owner's worker registry")
         proc = ctx.Process(
             target=StageDiffusionProc.run_diffusion_proc,
             name="StageDiffusionProc",
@@ -854,14 +876,25 @@ class StageDiffusionProcManager:
                 "omni_replica_id": omni_replica_id,
             },
         )
-        proc.start()
         self.proc = proc
         self.distributed_executor_backend = od_config.distributed_executor_backend
         self.addresses = addresses
         self.manager_stopped = False
         self.failed_proc_name: str | None = None
 
-        self._wait_until_started(handshake_address, stage_init_timeout)
+        try:
+            proc.start()
+            self._wait_until_started(handshake_address, stage_init_timeout)
+        except Exception as exc:
+            if self.sharing_workers is None:
+                raise
+            from vllm_omni.distributed.weight_sharing.worker_registry import ConsumerStartupError
+
+            try:
+                self.sharing_workers.terminate(timeout=10.0)
+            except Exception:
+                logger.exception("Shared consumer startup cleanup is unconfirmed")
+            raise ConsumerStartupError(str(exc), registry=self.sharing_workers) from exc
 
     @classmethod
     def launch_headless(
@@ -877,6 +910,7 @@ class StageDiffusionProcManager:
     ) -> StageDiffusionProcManager:
         """Launch a headless diffusion backend that connects to head-owned sockets."""
         self = cls.__new__(cls)
+        self.uses_multiproc = DiffusionExecutor.get_class(od_config).uses_multiproc
         ctx = get_mp_context()
         proc = ctx.Process(
             target=StageDiffusionProc.run_diffusion_proc,

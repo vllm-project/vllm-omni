@@ -1,3 +1,4 @@
+model_runner: v2
 async_chunk: false
 trust_remote_code: true
 pipeline: indextts2_5
@@ -6,7 +7,7 @@ connectors:
     name: SharedMemoryConnector
     extra:
       codec_streaming: false
-      connector_get_sleep_s: 0.01
+      connector_get_sleep_s: 0.001
       connector_get_max_wait_first_chunk: 5000
       connector_get_max_wait: 500
 stages:
@@ -59,6 +60,8 @@ stages:
       s2mel_dit_torch_compile: true
       s2mel_dit_torch_compile_mode: default
       s2mel_vocoder_torch_compile: false
+      # Opt-in scoped TF32 for S2Mel/CFM matmul; kept false by default to preserve baseline numerics.
+      s2mel_allow_tf32: false
     default_sampling_params:
       temperature: 0.0
       max_tokens: 32767

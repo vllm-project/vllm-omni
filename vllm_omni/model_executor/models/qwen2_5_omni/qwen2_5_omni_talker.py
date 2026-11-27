@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from __future__ import annotations
+
+import copy
 from collections.abc import Iterable
+from dataclasses import replace
 from functools import cached_property
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniTalkerConfig
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -18,8 +24,11 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
+
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 
 class Qwen2_5OmniTalkerForConditionalGeneration(
@@ -34,7 +43,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
             "talker.codec_head.": "language_model.lm_head.",
             "talker.model.": "language_model.model.",
             # projection weights
-            "talker.thinker_to_talker_proj.": "thinker_to_talker_proj.",
+            "talker.thinker_to_talker_proj.": "language_model.model.thinker_to_talker_proj.",
             # fallback root
             "talker.": "",
         }
@@ -43,21 +52,32 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config: Qwen2_5OmniTalkerConfig = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-        self.vllm_config = vllm_config
-        self.prefix = prefix
-        self.quant_config = quant_config
-
         if hasattr(config, "talker_config"):
             self.config = config.talker_config
             vllm_config.model_config.hf_text_config = vllm_config.model_config.hf_config.talker_config
         else:
             self.config = config
 
-        self.thinker_to_talker_proj = nn.Linear(
-            self.config.embedding_size,
-            self.config.hidden_size,
-        )
+        quant_config = vllm_config.quant_config
+        if isinstance(quant_config, ComponentQuantizationConfig):
+            quant_config = quant_config.resolve("talker")
+        elif isinstance(quant_config, OnlineQuantizationConfig):
+            # Online quantization targets the thinker LM only. Serialized
+            # checkpoint configs are kept so the talker's scales still load.
+            quant_config = None
+        if quant_config is not vllm_config.quant_config:
+            model_config = vllm_config.model_config
+            if quant_config is None:
+                # Unless this is a with_hf_config() view (the staged pipeline),
+                # VllmConfig rebuilds a missing quant_config from
+                # model_config.quantization on replace(), so clear it too.
+                model_config = copy.copy(model_config)
+                model_config.quantization = None
+            vllm_config = replace(vllm_config, model_config=model_config, quant_config=quant_config)
+        self.vllm_config = vllm_config
+        self.prefix = prefix
+        self.quant_config = quant_config
+
         self.language_model = init_vllm_registered_model(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "language_model"),
@@ -72,8 +92,15 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
 
+    @property
+    def thinker_to_talker_proj(self) -> torch.nn.Module:
+        # Kept for qwen2_5_omni.py, which projects the BOS/EOS codec embeddings with it.
+        return self.language_model.model.thinker_to_talker_proj
+
     @cached_property
     def sampler(self):
+        from vllm.v1.sample.sampler import Sampler
+
         if hasattr(self.language_model, "sampler"):
             return self.language_model.sampler
 
@@ -99,9 +126,6 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
             inputs_embeds = self.embed_input_ids(input_ids)
 
         input_ids = None
-
-        # projection
-        inputs_embeds = self.thinker_to_talker_proj(inputs_embeds)
 
         hidden_states = self.language_model.model(
             input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds

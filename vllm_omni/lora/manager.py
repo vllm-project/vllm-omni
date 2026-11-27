@@ -7,7 +7,7 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from enum import Enum
-from typing import Protocol, get_args
+from typing import Any, Protocol, get_args
 
 import torch
 import torch.nn as nn
@@ -26,17 +26,54 @@ from vllm.lora.utils import (
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 
 from vllm_omni.lora.binding import (
+    MOE_LORA_UNAVAILABLE_ERROR,
     _expand_expected_modules_for_packed_layers,
-    _match_target_modules,
+    build_target_module_matcher,
     detach_moe_lora_context,
     from_layer,
     moe_lora_kernel_requires_context,
+    normalize_target_modules,
 )
+from vllm_omni.lora.capability import MergedLoRASpec, resolve_merged_lora_spec
 from vllm_omni.lora.merged_weights import MergedLinearWeights
 from vllm_omni.lora.request import TensorLoRARequest
-from vllm_omni.lora.utils import stable_lora_int_id
+from vllm_omni.lora.utils import round_lora_scale, stable_lora_int_id
 
 logger = init_logger(__name__)
+
+
+def repack_lora_weights(
+    loras: dict[str, LoRALayerWeights],
+    packed_slices: dict[str, list[str]],
+    rank: int,
+) -> dict[str, LoRALayerWeights]:
+    """Reassemble composed slices into packed layers without changing the input mapping."""
+    composed_loras = dict(loras)
+    for name, slice_names in packed_slices.items():
+        if name in composed_loras:
+            raise ValueError(f"Cannot mix packed and fused LoRA layouts for {name}")
+        slices = [composed_loras.pop(slice_name, None) for slice_name in slice_names]
+        composed_loras[name] = PackedLoRALayerWeights(
+            module_name=name,
+            rank=rank,
+            lora_alphas=[None if weights is None else weights.rank for weights in slices],
+            lora_a=[None if weights is None else weights.lora_a for weights in slices],
+            lora_b=[None if weights is None else weights.lora_b for weights in slices],
+            scaling=[1.0] * len(slices),
+        )
+
+    return composed_loras
+
+
+def invalidate_denoise_graphs(reason: str) -> None:
+    """Drop captured diffusion denoise graphs that froze the previous adapter state.
+
+    Imported lazily so the shared manager does not load diffusion code at import
+    time; with no denoise graph runner in the process this is a no-op.
+    """
+    from vllm_omni.diffusion.graph import invalidate_denoise_graphs as invalidate
+
+    invalidate(reason)
 
 
 def _moe_lora_proj_names(moe_config: object | None) -> list[str]:
@@ -83,8 +120,13 @@ class LoRAManager:
     Pipeline-specific module selection and packing are supplied by hooks.
     """
 
-    # Valid max allowed ranks for LoRA in vLLM
-    _VALID_MAX_RANKS: list[int] = sorted(get_args(MaxLoRARanks))
+    # vLLM types ``max_lora_rank`` as a closed Literal that stops at 512. The
+    # rank only sizes the per-layer A/B buffers, so diffusion adapters may go
+    # higher: a fused few-step adapter concatenates its sources' factors (Pika
+    # Flex Turbo is rank 768 on H3's packed QKV), and so does request stacking.
+    _EXTENDED_MAX_RANKS: tuple[int, ...] = (768, 1024)
+    # Buffer ranks an adapter's rank is rounded up to.
+    _VALID_MAX_RANKS: list[int] = sorted({*get_args(MaxLoRARanks), *_EXTENDED_MAX_RANKS})
 
     # Adapter whose weights are still uploaded while gated off. Class-level so
     # a manager built without __init__ (some tests use object.__new__) reads as
@@ -94,6 +136,8 @@ class LoRAManager:
     _max_num_batched_tokens: int | None = None
     lora_application: str = "runtime"
     _merged_bank: MergedLinearWeights | None = None
+    _merged_spec: MergedLoRASpec | None = None
+    _defer_moe_wrap: bool = False
 
     def __init__(
         self,
@@ -124,6 +168,7 @@ class LoRAManager:
         self.lora_application = lora_application
         self.dtype = torch.float32 if lora_application == "merged" else dtype
         self._merged_bank = MergedLinearWeights() if lora_application == "merged" else None
+        self._merged_spec = self._resolve_merged_spec() if lora_application == "merged" else None
         if max_num_batched_tokens is not None and (
             type(max_num_batched_tokens) is not int or max_num_batched_tokens <= 0
         ):
@@ -162,6 +207,9 @@ class LoRAManager:
         self._adapter_access_order: OrderedDict[int, float] = OrderedDict()
         # Pinned adapters are not evicted
         self._pinned_adapters: set[int] = set()
+        # Composed multi-adapter LRU: sorted ((adapter_id, rounded_scale), ...)
+        # key -> registered adapter id of the composed LoRAModel.
+        self._composed_adapters: OrderedDict[tuple[tuple[int, float], ...], int] = OrderedDict()
 
         # track replaced modules
         # key: full module name (component.module.path); value: LoRA layer
@@ -177,6 +225,10 @@ class LoRAManager:
         self._scale_in_epilogue = getattr(pipeline, "diffusion_lora_scale_in_epilogue", False) is True
         if lora_application == "merged" and (self._fixed_adapter or self._scale_in_epilogue):
             raise ValueError("Generic merged LoRA does not support a pipeline's fixed-adapter specialization")
+        # Pipelines that own their MoE quant-method dispatch opt out of the eager
+        # no-adapter MoE runner wrap. Runners are still wrapped when a loaded
+        # adapter targets them.
+        self._defer_moe_wrap = getattr(pipeline, "diffusion_lora_defer_moe_wrap", False) is True
 
         logger.info(
             "Initializing LoRAManager: device=%s, dtype=%s, max_cached_adapters=%d, static_lora_path=%s",
@@ -188,6 +240,7 @@ class LoRAManager:
 
         try:
             if lora_path is not None:
+                logger.info("Loading LoRA during initialization from %s with scale %.2f", lora_path, lora_scale)
                 init_request = LoRARequest(
                     lora_name="static",
                     lora_int_id=stable_lora_int_id(lora_path),
@@ -200,7 +253,8 @@ class LoRAManager:
             # MoE kernels are LoRA-capable as soon as vllm_config.lora_config is
             # set, including HunyuanImage3 baseline generate() before any
             # adapter is loaded. Wrap runners and publish a no-adapter mapping
-            # so TRTLLM LoRA experts have a context on that first forward.
+            # so TRTLLM LoRA experts have a context on that first forward,
+            # unless the pipeline sets diffusion_lora_defer_moe_wrap.
             self._ensure_moe_lora_context()
             bind = getattr(pipeline, "_bind_diffusion_lora_manager", None)
             if callable(bind):
@@ -218,6 +272,22 @@ class LoRAManager:
         if self._fixed_adapter:
             request, scale = self._fixed_adapter_request, 1.0
         self.set_active_adapter(request, scale)
+
+    def set_request_adapters(
+        self,
+        requests: LoRARequest | list[LoRARequest | None] | tuple[LoRARequest | None, ...] | None,
+        scales: float | list[float] | tuple[float, ...] = 1.0,
+    ) -> None:
+        """Multi-adapter counterpart of set_request_adapter: a pipeline's fixed
+        student (if any) wins over any request-specified adapters."""
+        if self.lora_application == "merged":
+            if requests is not None:
+                raise ValueError("Merged LoRA uses a global policy; generate without a LoRARequest")
+            return
+        if self._fixed_adapter:
+            self.set_request_adapter(None)
+            return
+        self.set_active_adapters(requests, scales)
 
     @contextmanager
     def suspended(self) -> Iterator[None]:
@@ -262,6 +332,7 @@ class LoRAManager:
         self._adapter_access_order.clear()
         self._pinned_adapters.clear()
         self._active_adapter_id = self._suspended_adapter_id = None
+        invalidate_denoise_graphs("LoRA manager closed")
 
     def _compute_supported_lora_modules(self) -> set[str]:
         """Compute supported LoRA module suffixes for this pipeline.
@@ -287,6 +358,10 @@ class LoRAManager:
 
         return supported
 
+    def _resolve_merged_spec(self) -> MergedLoRASpec:
+        """Resolve and validate the merged-LoRA capability contract."""
+        return resolve_merged_lora_spec(self.pipeline, stage="diffusion")
+
     def _compute_packed_modules_mapping(self) -> dict[str, list[str]]:
         """Collect packed->sublayer mappings from the model.
 
@@ -298,6 +373,8 @@ class LoRAManager:
         mapping in multiple places, we derive packed→sublayer mappings from the
         model's `stacked_params_mapping`.
         """
+        if self._merged_spec is not None:
+            return {name: list(parts) for name, parts in self._merged_spec.packed_modules_mapping.items()}
 
         def _derive_from_stacked_params_mapping(stacked: object) -> dict[str, list[str]]:
             if not isinstance(stacked, (list, tuple)):
@@ -437,6 +514,230 @@ class LoRAManager:
 
         self._activate_adapter(adapter_id, lora_scale)
 
+    def set_active_adapters(
+        self,
+        lora_requests: LoRARequest | list[LoRARequest | None] | tuple[LoRARequest | None, ...] | None,
+        lora_scales: float | list[float] | tuple[float, ...] = 1.0,
+    ) -> None:
+        """Set the active LoRA adapter(s) for the pipeline.
+
+        A single request (or None) behaves exactly like set_active_adapter().
+        Multiple requests are composed into one rank-sum adapter whose deltas
+        equal sum(scale_i * B_i @ A_i @ x); see _compose_lora_models().
+        """
+        if lora_requests is None or isinstance(lora_requests, LoRARequest):
+            scale = lora_scales[0] if isinstance(lora_scales, (list, tuple)) else lora_scales
+            self.set_active_adapter(lora_requests, scale)
+            return
+
+        requests = list(lora_requests)
+        if isinstance(lora_scales, (list, tuple)):
+            scales = list(lora_scales)
+        else:
+            scales = [lora_scales] * len(requests)
+        if len(scales) != len(requests):
+            raise ValueError(f"Got {len(requests)} LoRA requests but {len(scales)} scales")
+
+        # Reject duplicate adapters before the zero-scale filter below, so a
+        # stack that names the same adapter twice is an error even when one of
+        # the entries would be scaled away.
+        seen_ids: set[int] = set()
+        for req in requests:
+            if req is None:
+                continue
+            if req.lora_int_id in seen_ids:
+                raise ValueError(f"Duplicate LoRA adapter in stack: id={req.lora_int_id}")
+            seen_ids.add(req.lora_int_id)
+
+        pairs = [
+            (req, scale) for req, scale in zip(requests, scales) if req is not None and not math.isclose(0.0, scale)
+        ]
+        if not pairs:
+            self.set_active_adapter(None)
+            return
+        if len(pairs) == 1:
+            self.set_active_adapter(pairs[0][0], pairs[0][1])
+            return
+        if self.lora_application == "merged":
+            raise ValueError("Merged LoRA uses a global policy; stacking multiple LoRA adapters is not supported")
+
+        key = tuple(sorted((req.lora_int_id, LoRAManager._get_rounded_scale(scale)) for req, scale in pairs))
+        composed_id = self._composed_adapters.get(key)
+        if composed_id is not None and composed_id in self._registered_adapters:
+            self._composed_adapters.move_to_end(key)
+            self._touch_adapter_info(composed_id)
+        else:
+            self._composed_adapters.pop(key, None)
+            composed_id = self._register_composed_adapter(key, pairs)
+
+        self._activate_adapter(composed_id, 1.0)
+
+    def _register_composed_adapter(
+        self,
+        key: tuple[tuple[int, float], ...],
+        pairs: list[tuple[LoRARequest, float]],
+    ) -> int:
+        """Load the source adapters, compose them, and register the result as
+        a regular adapter so the standard activation/cache paths apply.
+
+        Source adapters are used only until ``torch.cat`` in
+        ``_compose_lora_models``: cached ones are reused, missing ones are
+        loaded transiently without entering the LRU cache, so stacking works
+        with any ``max_cached_adapters`` value (including the default of 1).
+        """
+        specs: list[tuple[LoRAModel, float]] = []
+        validate_composition = getattr(self.pipeline, "_validate_diffusion_lora_composition", None)
+        for request, scale in pairs:
+            lora_model = self._registered_adapters.get(request.lora_int_id)
+            if lora_model is not None:
+                self._touch_adapter_info(request.lora_int_id)
+            else:
+                # Transient load for composition only; never registered, so it
+                # cannot evict (or be evicted from) the adapter cache.
+                lora_model, _ = self._load_adapter(request)
+            if callable(validate_composition):
+                validate_composition(lora_model=lora_model)
+            specs.append((lora_model, scale))
+
+        composed_key_repr = repr(key)
+        composed_id = stable_lora_int_id(composed_key_repr)
+        composed_model, peft_helper = self._compose_lora_models(composed_id, specs)
+
+        self._evict_for_new_adapter()
+        self._registered_adapters[composed_id] = composed_model
+        self._touch_adapter_info(composed_id)
+        try:
+            self._replace_layers_with_lora(peft_helper)
+        except Exception:
+            # As in add_adapter: a stack the layers cannot hold must not stay cached.
+            self._registered_adapters.pop(composed_id, None)
+            self._adapter_access_order.pop(composed_id, None)
+            raise
+
+        self._composed_adapters[key] = composed_id
+        self._composed_adapters.move_to_end(key)
+        while len(self._composed_adapters) > self.max_cached_adapters:
+            _, evicted_id = self._composed_adapters.popitem(last=False)
+            if evicted_id != composed_id and evicted_id != self._active_adapter_id:
+                self.remove_adapter(evicted_id)
+
+        logger.info(
+            "Registered composed adapter: id=%d, sources=%s, cache_size=%d/%d",
+            composed_id,
+            [request.lora_int_id for request, _ in pairs],
+            len(self._registered_adapters),
+            self.max_cached_adapters,
+        )
+        return composed_id
+
+    def unpack_lora_projections(
+        self, specs: list[tuple[LoRAModel, float]]
+    ) -> tuple[list[tuple[LoRAModel, float]], dict[str, list[str]]]:
+        """Normalize packed and separate projections to named slices for composition."""
+        repack: dict[str, list[str]] = {}
+        normalized_specs: list[tuple[LoRAModel, float]] = []
+        for model, scale in specs:
+            normalized = dict(model.loras)
+            for name, weights in model.loras.items():
+                if not isinstance(weights, PackedLoRALayerWeights):
+                    continue
+                prefix, _, suffix = name.rpartition(".")
+                mapping = self._packed_modules_mapping.get(suffix)
+                if mapping is not None and len(mapping) != len(weights.lora_a):
+                    raise ValueError(f"Packed LoRA slice count does not match mapping for {name}")
+                names = (
+                    [f"{prefix}.{sub}" if prefix else sub for sub in mapping]
+                    if mapping is not None
+                    else [f"{name}.__slice_{index}" for index in range(len(weights.lora_a))]
+                )
+                if mapping is None:
+                    repack[name] = names
+                del normalized[name]
+                for index, sub_name in enumerate(names):
+                    a, b = weights.lora_a[index], weights.lora_b[index]
+                    if a is None or b is None:
+                        continue
+                    if sub_name in normalized:
+                        raise ValueError(f"LoRA contains both packed and separate weights for {sub_name}")
+                    normalized[sub_name] = LoRALayerWeights(
+                        module_name=sub_name,
+                        rank=a.shape[0],
+                        lora_alpha=weights.lora_alphas[index],
+                        lora_a=a,
+                        lora_b=b,
+                        scaling=weights.scaling[index],
+                    )
+            normalized_specs.append((LoRAModel(lora_model_id=model.id, rank=model.rank, loras=normalized), scale))
+        return normalized_specs, repack
+
+    def _compose_lora_models(
+        self,
+        composed_id: int,
+        specs: list[tuple[LoRAModel, float]],
+    ) -> tuple[LoRAModel, PEFTHelper]:
+        """Compose k adapters into one rank-sum adapter per covered module.
+
+        For each module covered by any source adapter, concatenate the A
+        matrices along the rank dim and the scale-weighted B matrices along
+        the output dim: sum(scale_i * B_i @ A_i @ x) == B_cat @ A_cat @ x.
+        Modules covered by only some adapters take just their contributions.
+        """
+        specs, repack = self.unpack_lora_projections(specs)
+        module_names: set[str] = set()
+        for lora_model, _ in specs:
+            module_names.update(lora_model.loras.keys())
+
+        max_composed_rank = 0
+        max_supported_rank = self._VALID_MAX_RANKS[-1]
+        composed_loras: dict[str, LoRALayerWeights] = {}
+        for module_name in sorted(module_names):
+            lora_a_parts: list[torch.Tensor] = []
+            lora_b_parts: list[torch.Tensor] = []
+            for lora_model, scale in specs:
+                weights = lora_model.loras.get(module_name)
+                if weights is None:
+                    continue
+                lora_a_parts.append(weights.lora_a)
+                # Fold the checkpoint scaling into B: pipelines with
+                # scale-in-epilogue skip optimize(), so weights.scaling may
+                # still be non-1 and must not be dropped here.
+                lora_b_parts.append(weights.lora_b * (weights.scaling * scale))
+            if not lora_a_parts:
+                continue
+            composed_rank = sum(part.shape[0] for part in lora_a_parts)
+            if composed_rank > max_supported_rank:
+                raise ValueError(
+                    f"Combined LoRA rank for module {module_name} is {composed_rank}, "
+                    f"exceeding the maximum supported rank of {max_supported_rank}; "
+                    "reduce the number of stacked adapters or their ranks."
+                )
+            max_composed_rank = max(max_composed_rank, composed_rank)
+            # scaling=1.0: the per-adapter scale is already folded into B, so
+            # the composed adapter must not be scaled again at bind time.
+            composed_loras[module_name] = LoRALayerWeights(
+                module_name=module_name,
+                rank=composed_rank,
+                lora_alpha=composed_rank,
+                lora_a=torch.cat(lora_a_parts, dim=0),
+                lora_b=torch.cat(lora_b_parts, dim=1),
+                scaling=1.0,
+            )
+
+        composed_loras = repack_lora_weights(composed_loras, repack, max_composed_rank)
+
+        if not composed_loras:
+            raise ValueError("Cannot compose LoRA adapters: none of the adapters cover any module.")
+
+        composed_model = LoRAModel(lora_model_id=composed_id, rank=max_composed_rank, loras=composed_loras)
+        peft_helper = PEFTHelper.from_dict(
+            {
+                "r": max_composed_rank,
+                "lora_alpha": max_composed_rank,
+                "target_modules": sorted({name.split(".")[-1] for name in composed_loras}),
+            }
+        )
+        return composed_model, peft_helper
+
     def prepare_merged_adapter(
         self, request: LoRARequest, scale: float = 1.0
     ) -> tuple[LoRAModel, dict[str, torch.Tensor]]:
@@ -508,19 +809,18 @@ class LoRAManager:
         self._adapter_access_order.move_to_end(adapter_id)
 
     def _update_adapter_scale(self, adapter_id: int, lora_scale: float):
-        """Update the adapter scale for a given adapter ID. To avoid potential
-        issues with using Floats as keys, for now, we round float values to
-        3 decimal points.
-        """
+        """Update the adapter scale for a given adapter ID."""
         scale = LoRAManager._get_rounded_scale(lora_scale)
         self._adapter_scales[adapter_id] = scale
 
     @staticmethod
     def _get_rounded_scale(lora_scale: float):
         """Normalizes a lora scale for use as a key in the _adapter_scales
-        dict; for now we just round scales to 3 decimal places.
+        dict and in composed-adapter keys. Delegates to the canonical
+        ``round_lora_scale`` so manager identity always matches the scheduler
+        batch key and KV-cache namespace quantization.
         """
-        return round(lora_scale, 3)
+        return round_lora_scale(lora_scale)
 
     def _load_adapter(
         self,
@@ -536,12 +836,28 @@ class LoRAManager:
                 raise ValueError("TensorLoRARequest requires lora_application='merged'")
             if not lora_request.lora_tensors or not lora_request.peft_config:
                 raise ValueError("TensorLoRARequest requires lora_tensors and peft_config")
-            peft_helper = PEFTHelper.from_dict(lora_request.peft_config)
+            if not isinstance(lora_request.peft_config, dict):
+                raise ValueError(
+                    f"TensorLoRARequest.peft_config must be a dict, got {type(lora_request.peft_config).__name__}"
+                )
+            # Normalize target_modules once at ingest (fail-closed) before
+            # handing off to upstream's pass-through PEFTHelper.from_dict.
+            normalized_peft_config = dict(lora_request.peft_config)
+            normalized_peft_config["target_modules"] = normalize_target_modules(
+                normalized_peft_config.get("target_modules"),
+                allow_none=False,
+            )
+            peft_helper = PEFTHelper.from_dict(normalized_peft_config)
             peft_helper.validate_legal(
-                LoRAConfig(max_lora_rank=self._get_smallest_valid_max_rank(peft_helper.r), lora_dtype=self.dtype)
+                self._lora_config(self._get_smallest_valid_max_rank(peft_helper.r), lora_dtype=self.dtype)
             )
             if peft_helper.modules_to_save:
                 raise ValueError("Merged LoRA supports A/B adapters only, without modules_to_save")
+            weights_mapper = (
+                self._merged_spec.weights_mapper
+                if self._merged_spec is not None
+                else getattr(self.pipeline, "hf_to_vllm_mapper", None)
+            )
             lora_model = LoRAModel.from_lora_tensors(
                 lora_model_id=lora_request.lora_int_id,
                 tensors={
@@ -551,7 +867,7 @@ class LoRAManager:
                 peft_helper=peft_helper,
                 device="cpu",
                 dtype=self.dtype,
-                weights_mapper=getattr(self.pipeline, "hf_to_vllm_mapper", None),
+                weights_mapper=weights_mapper,
             )
             for weights in lora_model.loras.values():
                 if weights.lora_a is None or weights.lora_b is None:
@@ -639,6 +955,15 @@ class LoRAManager:
         denoiser is not scanned, adapters can load while applying to zero
         layers and produce base-identical output.
         """
+        if self._merged_spec is not None:
+            for component_name in self._merged_spec.components:
+                if component_name == "":
+                    yield "", self.pipeline
+                elif hasattr(self.pipeline, component_name):
+                    component = getattr(self.pipeline, component_name)
+                    if isinstance(component, nn.Module):
+                        yield component_name, component
+            return
         default_components = (
             "transformer",
             "transformer_2",
@@ -653,34 +978,73 @@ class LoRAManager:
             if isinstance(component, nn.Module):
                 yield component_name, component
 
+    def _get_lora_name_aliases(self, full_module_name: str) -> list[str]:
+        name_aliases = (
+            self._merged_spec.name_aliases
+            if self._merged_spec is not None
+            else getattr(self.pipeline, "_get_diffusion_lora_name_aliases", None)
+        )
+        if callable(name_aliases):
+            return list(name_aliases(full_module_name) or ())
+        return []
+
+    def _validate_adapter_targets(self, peft_helper: PEFTHelper) -> None:
+        """Reject MoE adapters before cache or layer state is mutated."""
+        if self._max_num_batched_tokens is not None:
+            return
+
+        _matches_target, _ = build_target_module_matcher(
+            getattr(peft_helper, "target_modules", None),
+            allow_none=self.lora_application != "merged",
+        )
+
+        from vllm.model_executor.layers.fused_moe import MoERunner
+
+        for component_name, component in self._iter_lora_components():
+            for module_name, module in component.named_modules(remove_duplicate=False):
+                if not isinstance(module, MoERunner):
+                    continue
+                full_module_name = f"{component_name}.{module_name}" if component_name else module_name
+                if _matches_target(full_module_name) or any(
+                    _matches_target(name) for name in _moe_lora_target_names(full_module_name, module)
+                ):
+                    raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
+
     def _replace_layers_with_lora(self, peft_helper: PEFTHelper) -> None:
-        self._ensure_max_lora_rank(peft_helper.r)
+        """Wrap the layers ``peft_helper`` targets, growing the buffers to its rank first.
 
-        target_modules = getattr(peft_helper, "target_modules", None)
-        target_modules_list: list[str] | None = None
-        target_modules_pattern: str | None = None
-        if isinstance(target_modules, str) and target_modules:
-            target_modules_pattern = target_modules
-        elif isinstance(target_modules, list) and target_modules:
-            target_modules_list = target_modules
+        All or nothing: when a wrapper cannot be built (its buffers are
+        allocated at the maximum rank, and rank 768 or 1024 can run out of
+        memory partway), the wrappers this call installed are removed and the
+        previous rank is restored. Otherwise the next adapter, whatever its
+        rank, would allocate the remaining layers at the rank that just failed.
+        """
+        self._validate_adapter_targets(peft_helper)
+        previous_rank = self._max_lora_rank
+        installed: list[tuple[str, nn.Module, str]] = []
+        try:
+            self._ensure_max_lora_rank(peft_helper.r)
+            self._install_lora_layers(peft_helper, installed)
+        except Exception:
+            for full_module_name, component, module_name in reversed(installed):
+                lora_layer = self._lora_modules.pop(full_module_name)
+                if self.lora_application == "runtime":
+                    replace_submodule(component, module_name, lora_layer.base_layer)
+            if self._max_lora_rank != previous_rank:
+                self._restore_max_lora_rank(previous_rank)
+            elif installed:
+                invalidate_denoise_graphs("LoRA layer installation failed")
+            raise
 
-        def _matches_target(module_name: str) -> bool:
-            if target_modules_pattern is not None:
-                import regex as re
-
-                return re.search(target_modules_pattern, module_name) is not None
-            if target_modules_list is None:
-                return True
-            return _match_target_modules(module_name, target_modules_list)
+    def _install_lora_layers(self, peft_helper: PEFTHelper, installed: list[tuple[str, nn.Module, str]]) -> None:
+        """Wrap every target layer not wrapped yet, recording each new wrapper in ``installed``."""
+        _matches_target, is_filtered = build_target_module_matcher(
+            getattr(peft_helper, "target_modules", None),
+            allow_none=self.lora_application != "merged",
+        )
 
         # dummy lora config
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
+        lora_config = self._buffer_lora_config()
 
         for component_name, component in self._iter_lora_components():
             # Collect replacements first to avoid mutating the module tree
@@ -720,15 +1084,21 @@ class LoRAManager:
                 if is_moe_runner:
                     moe_target_names = _moe_lora_target_names(full_module_name, module)
 
-                if target_modules_pattern is not None or target_modules_list is not None:
+                if is_filtered:
                     should_replace = _matches_target(full_module_name)
+                    if not should_replace:
+                        should_replace = any(
+                            _matches_target(alias) for alias in self._get_lora_name_aliases(full_module_name)
+                        )
                     if not should_replace and len(packed_modules_list) > 1:
                         prefix, _, packed_suffix = full_module_name.rpartition(".")
                         sub_suffixes = self._get_packed_sublayer_suffixes(packed_suffix, len(packed_modules_list))
                         if sub_suffixes is not None:
                             for sub_suffix in sub_suffixes:
                                 sub_full_name = f"{prefix}.{sub_suffix}" if prefix else sub_suffix
-                                if _matches_target(sub_full_name):
+                                if _matches_target(sub_full_name) or any(
+                                    _matches_target(alias) for alias in self._get_lora_name_aliases(sub_full_name)
+                                ):
                                     should_replace = True
                                     break
                     if not should_replace and moe_target_names is not None:
@@ -767,6 +1137,7 @@ class LoRAManager:
                     if self.lora_application == "runtime":
                         replace_submodule(component, module_name, lora_layer)
                     self._lora_modules[full_module_name] = lora_layer
+                    installed.append((full_module_name, component, module_name))
                     logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
 
     def _ensure_moe_lora_context(self) -> None:
@@ -775,8 +1146,11 @@ class LoRAManager:
         ``configure_diffusion_vllm_config`` sets ``lora_config`` for MoE + PEFT
         even when no adapter is loaded. TRTLLM LoRA experts then require a
         context on every apply(), including HunyuanImage3 baseline generate().
+
+        Skipped when the pipeline sets ``diffusion_lora_defer_moe_wrap``; its
+        runners are then wrapped only when a loaded adapter targets them.
         """
-        if self._max_num_batched_tokens is None:
+        if self._max_num_batched_tokens is None or self._defer_moe_wrap:
             return
         if self._max_lora_rank <= 0:
             self._ensure_max_lora_rank(min(self._VALID_MAX_RANKS))
@@ -789,13 +1163,7 @@ class LoRAManager:
         """Replace every MoE runner so LoRA-capable kernels get a mapping."""
         from vllm.model_executor.layers.fused_moe import MoERunner
 
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
+        lora_config = self._buffer_lora_config()
         for component_name, component in self._iter_lora_components():
             pending: list[tuple[str, str, nn.Module]] = []
             runner_names: set[str] = set()
@@ -828,6 +1196,30 @@ class LoRAManager:
                     self._lora_modules[full_module_name] = lora_layer
                     logger.debug("Replaced MoE runner: %s -> %s", full_module_name, type(lora_layer).__name__)
 
+    @staticmethod
+    def _lora_config(max_lora_rank: int, **fields: Any) -> LoRAConfig:
+        """A vLLM ``LoRAConfig`` whose rank may be one of ``_EXTENDED_MAX_RANKS``.
+
+        The config validates its rank against vLLM's Literal on construction
+        only, so an extended rank is assigned afterwards; every consumer reads
+        it as a plain buffer size.
+        """
+        vllm_max_rank = max(get_args(MaxLoRARanks))
+        config = LoRAConfig(max_lora_rank=min(max_lora_rank, vllm_max_rank), **fields)
+        if max_lora_rank > vllm_max_rank:
+            config.max_lora_rank = max_lora_rank
+        return config
+
+    def _buffer_lora_config(self) -> LoRAConfig:
+        """The config per-layer LoRA buffers are allocated from: one slot at the current maximum rank."""
+        return self._lora_config(
+            self._max_lora_rank,
+            max_loras=1,
+            max_cpu_loras=self.max_cached_adapters,
+            lora_dtype=self.dtype,
+            fully_sharded_loras=False,
+        )
+
     def _ensure_max_lora_rank(self, min_rank: int) -> None:
         """Ensure LoRA buffers can accommodate adapters up to `min_rank`.
 
@@ -841,25 +1233,26 @@ class LoRAManager:
         valid_max_rank = self._get_smallest_valid_max_rank(min_rank)
 
         logger.info("Increasing max LoRA rank: %d -> %d", self._max_lora_rank, valid_max_rank)
+        previous_rank = self._max_lora_rank
         self._max_lora_rank = valid_max_rank
         self._moe_punica_wrapper = None
 
         if not self._lora_modules:
             return
 
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
-
         # Recreate per-layer buffers with the new maximum rank. The previous
         # upload is gone, so nothing may be re-armed afterwards.
-        for lora_layer in self._lora_modules.values():
-            lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+        try:
+            lora_config = self._buffer_lora_config()
+            for lora_layer in self._lora_modules.values():
+                lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+        except Exception:
+            # A growth that fails partway (an allocation at rank 768 or 1024 can)
+            # leaves layers at two ranks.
+            self._restore_max_lora_rank(previous_rank)
+            raise
         self._suspended_adapter_id = None
+        invalidate_denoise_graphs("LoRA buffers reallocated")
 
         # Re-apply active adapter if needed (buffers were reset).
         if self._active_adapter_id is not None:
@@ -869,6 +1262,22 @@ class LoRAManager:
             self._activate_adapter(active_id, active_scale)
         else:
             self._publish_moe_lora_context()
+
+    def _restore_max_lora_rank(self, previous_rank: int) -> None:
+        """Put every wrapped layer back at ``previous_rank`` with nothing uploaded.
+
+        A retry then grows again from a consistent state instead of binding
+        into buffers of another rank.
+        """
+        self._max_lora_rank = previous_rank
+        self._moe_punica_wrapper = None
+        self._suspended_adapter_id = None
+        self._active_adapter_id = None
+        if previous_rank > 0:
+            lora_config = self._buffer_lora_config()
+            for lora_layer in self._lora_modules.values():
+                lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+        invalidate_denoise_graphs("LoRA buffer growth failed")
 
     @classmethod
     def _get_smallest_valid_max_rank(cls, min_rank: int) -> int:
@@ -908,15 +1317,12 @@ class LoRAManager:
         if lora_weights is not None:
             return lora_weights
 
-        # Model-scoped namespace aliases. HunyuanImage-3 registers the DiT
-        # under ``transformer.layers.*`` (``self.transformer`` aliases
-        # ``self.model``) while PEFT adapters use ``model.layers.*``.
-        name_aliases = getattr(self.pipeline, "_get_diffusion_lora_name_aliases", None)
-        if callable(name_aliases):
-            for alias in name_aliases(full_module_name) or []:
-                lora_weights = lora_model.get_lora(alias)
-                if lora_weights is not None:
-                    return lora_weights
+        # Model-scoped namespace aliases (declared on MergedLoRASpec or the
+        # pipeline's _get_diffusion_lora_name_aliases hook).
+        for alias in self._get_lora_name_aliases(full_module_name):
+            lora_weights = lora_model.get_lora(alias)
+            if lora_weights is not None:
+                return lora_weights
 
         return None
 
@@ -969,7 +1375,11 @@ class LoRAManager:
                 raise ValueError(f"LoRA factor shapes require A[rank, {base.input_size}] and B[{rows}, rank]")
 
     def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> None:
-        binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
+        binding_validator = (
+            self._merged_spec.validate_binding
+            if self._merged_spec is not None
+            else getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
+        )
         # Track successful bindings for generic and model-specific validation.
         lora_names_by_id = {id(weights): name for name, weights in lora_model.loras.items()}
         bound_lora_names: set[str] = set()
@@ -1093,7 +1503,11 @@ class LoRAManager:
                 # [all Q, all K, all V] the QKV output slices expect. The
                 # checkpoint sizes exclude replicated KV heads; set_lora()
                 # selects the appropriate Q shard and shared KV shard.
-                deinterleave = getattr(self.pipeline, "_deinterleave_fused_qkv_lora_b", None)
+                deinterleave = (
+                    self._merged_spec.deinterleave_fused_qkv_lora_b
+                    if self._merged_spec is not None
+                    else getattr(self.pipeline, "_deinterleave_fused_qkv_lora_b", None)
+                )
                 if isinstance(getattr(lora_layer, "base_layer", None), QKVParallelLinear) and callable(deinterleave):
                     deinterleaved = deinterleave(lora_weights.lora_b)
                     base = lora_layer.base_layer
@@ -1294,6 +1708,7 @@ class LoRAManager:
         for lora_layer in self._lora_modules.values():
             lora_layer.reset_lora(0)
         self._suspended_adapter_id = None
+        invalidate_denoise_graphs("LoRA layers reset")
 
     def _moe_token_lora_mapping(self) -> tuple[LoRAMapping, list[int | None]]:
         """Build a uniform token mapping for the current adapter state.
@@ -1303,7 +1718,7 @@ class LoRAManager:
         """
         max_tokens = self._max_num_batched_tokens
         if max_tokens is None:
-            raise RuntimeError("MoE LoRA token capacity was not configured")
+            raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
         slot = 1 if self._active_adapter_id is not None else 0
         mapping = LoRAMapping(
             index_mapping=(slot,) * max_tokens,
@@ -1321,15 +1736,9 @@ class LoRAManager:
 
         max_tokens = self._max_num_batched_tokens
         if max_tokens is None:
-            raise RuntimeError("MoE LoRA token capacity was not configured")
+            raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
         # GPU Punica requires LoRAConfig; also pass it to NPU.
-        lora_config = LoRAConfig(
-            max_lora_rank=self._max_lora_rank,
-            max_loras=1,
-            max_cpu_loras=self.max_cached_adapters,
-            lora_dtype=self.dtype,
-            fully_sharded_loras=False,
-        )
+        lora_config = self._buffer_lora_config()
         punica = get_punica_wrapper(max_tokens, max_batches=1, device=self.device, lora_config=lora_config)
         mapping, lora_index_to_id = self._moe_token_lora_mapping()
         punica.update_metadata(mapping, lora_index_to_id, 1, 0)
@@ -1389,6 +1798,7 @@ class LoRAManager:
             self._suspended_adapter_id = None
             self._active_adapter_id = adapter_id
             self._publish_moe_lora_context()
+            invalidate_denoise_graphs(f"LoRA adapter {adapter_id} re-armed")
             logger.debug("Re-armed suspended adapter %d", adapter_id)
             return
 
@@ -1435,6 +1845,7 @@ class LoRAManager:
         # still binds slot 0; without this the MoE kernels would keep taking
         # the no-LoRA path and silently skip the expert contribution.
         self._publish_moe_lora_context()
+        invalidate_denoise_graphs(f"LoRA adapter {adapter_id} activated")
 
     def _deactivate_all_adapters(self) -> None:
         if self._active_adapter_id is None:
@@ -1449,6 +1860,7 @@ class LoRAManager:
         self._suspended_adapter_id = self._active_adapter_id
         self._active_adapter_id = None
         self._publish_moe_lora_context()
+        invalidate_denoise_graphs("LoRA adapters suspended")
         logger.debug("All adapters deactivated")
 
     def _evict_for_new_adapter(self) -> None:
@@ -1488,16 +1900,24 @@ class LoRAManager:
 
         logger.info("Adding new adapter: id=%d, name=%s", adapter_id, lora_request.lora_name)
 
-        # evict if cache full before adding the new adapter
-        # so that we don't go over capacity on the new load
-        self._evict_for_new_adapter()
-
         lora_model, peft_helper = self._load_adapter(lora_request)
+        self._validate_adapter_targets(peft_helper)
+
+        # Evict only after validation so a rejected adapter cannot displace a
+        # working cached adapter.
+        self._evict_for_new_adapter()
         self._touch_adapter_info(adapter_id)
 
         self._registered_adapters[adapter_id] = lora_model
 
-        self._replace_layers_with_lora(peft_helper)
+        try:
+            self._replace_layers_with_lora(peft_helper)
+        except Exception:
+            # An adapter the buffers cannot hold must not stay cached: a retry
+            # would skip loading and fail while binding instead.
+            self._registered_adapters.pop(adapter_id, None)
+            self._adapter_access_order.pop(adapter_id, None)
+            raise
 
         logger.debug(
             "Adapter %d added, cache size: %d/%d", adapter_id, len(self._registered_adapters), self.max_cached_adapters
@@ -1533,6 +1953,19 @@ class LoRAManager:
         self._adapter_scales.pop(adapter_id, None)
         self._adapter_access_order.pop(adapter_id, None)
         self._pinned_adapters.discard(adapter_id)
+        stale_composed_keys = [
+            key
+            for key, cid in self._composed_adapters.items()
+            if cid == adapter_id or any(src_id == adapter_id for src_id, _ in key)
+        ]
+        for key in stale_composed_keys:
+            # A recursive remove_adapter() below may have dropped this key
+            # already when two stack keys resolve to the same composed id.
+            composed_id = self._composed_adapters.pop(key, None)
+            if composed_id is None:
+                continue
+            if composed_id != adapter_id and composed_id in self._registered_adapters:
+                self.remove_adapter(composed_id)
         logger.debug(
             "Adapter %d removed, cache size: %d/%d",
             adapter_id,

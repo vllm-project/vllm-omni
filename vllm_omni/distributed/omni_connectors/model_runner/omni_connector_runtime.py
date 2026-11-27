@@ -45,7 +45,7 @@ def needs_omni_connector(model_config: Any) -> bool:
     return (
         bool(getattr(model_config, "requires_full_payload_input", False))
         or bool(getattr(model_config, "custom_process_next_stage_input_func", None))
-        or get_stage_connector_role(model_config) is not None
+        or get_stage_connector_role(model_config) not in (None, "none")
     )
 
 
@@ -55,7 +55,10 @@ def _should_create_payload_connector(model_config: Any) -> bool:
     Sender edges may instead be owned solely by KV transfer. Receivers still
     need a connector even though they do not declare a downstream payload hook.
     """
-    if get_stage_connector_role(model_config) != "sender":
+    role = get_stage_connector_role(model_config)
+    if role == "none":
+        return False
+    if role != "sender":
         return True
 
     next_stage_func = getattr(model_config, "custom_process_next_stage_input_func", None)
@@ -137,6 +140,8 @@ class _OmniConnectorRuntimeMixin:
     _pending_save_reqs: dict[str, deque[Any]]
     _pending_save_counts: dict[str, int]
     _deferred_send_cleanup: set[str]
+    _active_recv_claim_keys: dict[str, str]
+    _recv_claim_abandons: deque[str]
     _chunk_ready_req_ids: set[str]
     _chunk_finished_req_ids: set[str]
     _stage_recv_req_ids: set[str]
@@ -147,6 +152,7 @@ class _OmniConnectorRuntimeMixin:
     _run_stage_payloads: dict[str, bytes]
     _chunk_stream_completed: set[str]
     _pending_full_payload_send: dict[str, tuple[Any, ...]]
+    _full_payload_token_ends: dict[str, dict[str, int]]
     _kv_sent_req_ids: list[str]
     _kv_pending_transfers: dict[str, dict[str, Any]]
     _kv_active_transfers: set[str]
@@ -169,6 +175,7 @@ class _OmniConnectorRuntimeMixin:
     _recv_loop: Any
     _save_loop: Any
     flush_full_payload_outputs: Any
+    _drop_full_payload_token_end: Any
     _custom_process_supports_is_finished_kwarg: Any
     _get_local_tp_group: Any
 
@@ -279,6 +286,11 @@ class _OmniConnectorRuntimeMixin:
         self._pending_save_reqs: dict[str, deque] = {}
         self._pending_save_counts: dict[str, int] = defaultdict(int)
         self._deferred_send_cleanup: set[str] = set()
+        # NIXL claims are thread-local to the receive poller. Remember the
+        # connector key while a get may still hold a claim, and hand that key
+        # to the poller when the runner cancels the receive.
+        self._active_recv_claim_keys: dict[str, str] = {}
+        self._recv_claim_abandons: deque[str] = deque()
         self._connector_send_error_sink: Callable[[BaseException], None] | None = None
         # -- per-cycle output accumulator --
         self._chunk_ready_req_ids: set[str] = set()
@@ -311,6 +323,7 @@ class _OmniConnectorRuntimeMixin:
         # -- full_payload_mode: accumulate latest pooler_output per request,
         #    send only when the request finishes (next-cycle flush) --
         self._pending_full_payload_send: dict[str, tuple[Any, ...]] = {}
+        self._full_payload_token_ends: dict[str, dict[str, int]] = {}
 
         # -- KV sent accumulator --
         self._kv_sent_req_ids: list[str] = []
@@ -390,15 +403,8 @@ class _OmniConnectorRuntimeMixin:
         saves is added to ``_deferred_send_cleanup`` so the bg save's
         decrement path drains it without leaving orphans.
         """
-        # Force-flush any pending full-payload accumulator entry before
-        # cleanup proceeds.  Without this, finished requests with no
-        # downstream consumer (e.g. text-only on multi-modal arch) leave
-        # the entry orphaned in _pending_full_payload_send across requests,
-        # which empirically destabilises subsequent thinker forwards by
-        # making prefix-cache reuse observe stale accumulator state.  The
-        # flush is idempotent when the entry has already been flushed by the
-        # scheduler-driven path, but this cleanup path runs for every request,
-        # so skip it entirely when the request never accumulated a payload.
+        # Normal cleanup flushes an entry the scheduler-driven path did not send,
+        # so a text-only request cannot leave stale state across request ID reuse.
         if req_id in self._pending_full_payload_send:
             try:
                 self.flush_full_payload_outputs({req_id})
@@ -414,6 +420,7 @@ class _OmniConnectorRuntimeMixin:
                     exc_info=True,
                 )
 
+        self._drop_full_payload_token_end(req_id)
         ext_id = self._request_ids_mapping.pop(req_id, None)
         keys_to_clean: list[str] = [req_id]
         if ext_id is not None and ext_id != req_id:
@@ -469,6 +476,17 @@ class _OmniConnectorRuntimeMixin:
             self._clear_recv_delivery_state(req_id)
 
     def _clear_recv_delivery_state(self, req_id: str) -> None:
+        claim_keys = getattr(self, "_active_recv_claim_keys", None)
+        abandons = getattr(self, "_recv_claim_abandons", None)
+        claim_key = claim_keys.pop(req_id, None) if claim_keys is not None else None
+        if claim_key and abandons is not None:
+            # The scheduler/runner may cancel the receive before the poller
+            # sees expiry. Queue the exact key so the receive thread can drop
+            # its thread-local claim; abandon_get is not safe from this thread.
+            abandons.append(claim_key)
+            work = getattr(self, "_work_available", None)
+            if work is not None:
+                work.set()
         self._get_req_chunk.pop(req_id, None)
         self._pending_load_reqs.pop(req_id, None)
         self._finished_load_reqs.discard(req_id)
@@ -1143,8 +1161,7 @@ class _OmniConnectorRuntimeMixin:
             return None
 
         params = signature.parameters
-        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
-            return "pooling_output"
+        accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
 
         supported = {
             name
@@ -1155,13 +1172,15 @@ class _OmniConnectorRuntimeMixin:
                 inspect.Parameter.KEYWORD_ONLY,
             )
         }
-        if not {"transfer_manager", "request"}.issubset(supported):
+        if not accepts_kwargs and not {"transfer_manager", "request"}.issubset(supported):
             return None
+        # Explicit payload parameters take precedence: a builder may accept
+        # unrelated **kwargs without reading its model output from them.
         if "pooling_output" in supported:
             return "pooling_output"
         if "multimodal_output" in supported:
             return "multimodal_output"
-        return None
+        return "pooling_output" if accepts_kwargs else None
 
     @staticmethod
     def _load_custom_batch_func(custom_process_func: Any | None) -> Any | None:
