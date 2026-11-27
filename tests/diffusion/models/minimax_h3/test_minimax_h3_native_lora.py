@@ -280,7 +280,7 @@ def test_native_stack_rejected_before_composition(tmp_path, monkeypatch, cached,
         if request.lora_int_id == native.lora_int_id:
             return pipeline._load_diffusion_lora_adapter(lora_request=request, lora_path=path, dtype=torch.float32)
         # Loading another source prunes the transient native ID in the old path.
-        pipeline._prune_native_lora_specs()
+        pipeline._prune_lora_specs()
         return LoRAModel(lora_model_id=peft.lora_int_id, rank=_TINY_RANK, loras={}), None
 
     if cached:

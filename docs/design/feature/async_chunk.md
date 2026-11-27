@@ -316,7 +316,82 @@ Single-stage pipelines without a connector set the same three keys in the
 stage's `additional_config`. When both sources are present, connector `extra`
 overrides `additional_config` per key. The policy remains disabled by default.
 
+#### Coalescing AR Execution Batches
+
+To coalesce both admissions and ongoing AR work, use these settings instead
+of `ar_prefill_admission_*`:
+
+```yaml
+generation_min_batch_size: 16
+generation_max_wait_ms: 6
+generation_always_wait_target_batch: false
+```
+
+Both AR and generation schedulers accept these keys in stage
+`engine_extras.additional_config` or connector `extra`, with connector values
+taking precedence for compatibility. Waiting is disabled by default and requires
+a batch target greater than one and a positive wait bound. Enabling it together
+with active prefill admission batching (`ar_prefill_admission_min_batch > 1`)
+or `minicpmo_talker_refill_coalesce: true` raises a configuration error on AR
+stages. Inactive prefill admission settings do not conflict.
+The legacy admission-only policy retains its existing behavior when execution
+coalescing is disabled.
+
+For both AR and generation schedulers, `generation_min_batch_size` must be in
+`[1, max_num_seqs]`, including when batch waiting is disabled.
+
+The AR gate counts distinct input-ready streams, runnable waiting requests,
+and running requests with outstanding token work. In-flight execution alone
+does not disqualify an async AR continuation. Input-blocked and finished requests
+do not count. This is a candidate count: upstream token budgets and allocation
+constraints can produce a smaller execution batch.
+
+Ready work executes when the target is reached or a monotonic wait bound
+expires. Below the configured target population, work executes immediately
+unless `generation_always_wait_target_batch: true` caps the target at the
+registered request count and retains the wait. The deadline does not restart
+when more requests become ready; an empty candidate set clears it. Final inputs
+share the bounded window.
+
+The V2 AR runner supports this policy with TP1/PP1 and
+`generation_coalescing_policy: fixed`. It revisits readiness on scheduler ticks,
+so dispatch includes tick granularity and does not block the scheduler thread.
+Input/control processing continues during the wait, and deferred steps schedule
+zero tokens before any allocation. AR does not support the generation
+scheduler's `idle_wait`, regular-batch cap or express scheduling features.
+
+Seeded-request isolation takes precedence: coalescing is bypassed and its
+deadline cleared during isolation-controlled solo or drain steps. Only explicit
+client seeds marked by upstream's `omni_user_seed` opt into isolation; deployment
+default seeds retain normal batching. Streaming text waits and isolation-hidden
+queues are excluded from the candidate count. Deferred steps retain upstream's
+chunk commits, receiver resumes, terminal cleanup and duplex carry operations.
+
+The default readiness hook supports legacy async-chunk receivers, native
+async-chunk coordinators, and orchestrator-fed Stage 0. For Stage 0 without a
+connector receive path, queued `WAITING` and `PREEMPTED` requests count as
+input-ready; streams parked for another append do not. Unsupported input sources
+disable AR batch waiting with a warning. Other input sources can override
+`OmniSchedulerMixin._get_coalescing_ready_request_ids()`; it must return a set,
+including an empty set before input arrives, and be safe during initialization.
+
 ### Code2Wav Batch Configuration
+
+Generation stages use the same `generation_*` settings, configuration precedence,
+and batch-target/timeout policy described in
+[Coalescing AR Execution Batches](#coalescing-ar-execution-batches). Generation
+counts input-ready requests with no execution in flight. Transport support differs:
+
+- **V2 with legacy transport:** stateful and stateless TP1/PP1 stages support the `fixed` policy.
+  Readiness is polled on scheduler ticks without blocking or consuming deferred
+  inputs. Async-chunk receivers and orchestrator-fed Stage 0 are supported;
+  other input sources can use the readiness hook described above.
+- **Native MRV2:** requires a stateful TP1/PP1 stage and retains notification-inbox
+  waiting, including the MRV2-only `idle_wait` policy.
+
+Legacy-transport inputs yielding `pending_generation` continue without another batch wait
+for the same input. `generation_max_regular_batch` caps execution batch size;
+first-chunk express scheduling retains its native MRV2 scope.
 
 For optimal performance with async_chunk, the code2wav stage should be configured with batching:
 

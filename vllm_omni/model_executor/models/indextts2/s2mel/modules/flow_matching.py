@@ -194,6 +194,19 @@ class BASECFM(torch.nn.Module, ABC):
         # Precompute mask once — T and x_lens are constant across all ODE steps.
         # x_mask [B, 1, T] broadcasts to [2B, 1, T] when CFG doubles batch.
         pre_mask = self._precompute_mask(x, x_lens)
+        eager_estimator = self._eager_estimator if hasattr(self, "_eager_estimator") else self.estimator
+        can_precompute_cond = bool(
+            getattr(eager_estimator, "_supports_precomputed_cond", False)
+            and callable(getattr(eager_estimator, "cond_projection", None))
+        )
+
+        def _project_cond_once(cond_in: torch.Tensor) -> torch.Tensor | None:
+            if not can_precompute_cond:
+                return None
+            if autocast_dtype is None:
+                return eager_estimator.cond_projection(cond_in)
+            with torch.autocast(x.device.type, dtype=autocast_dtype):
+                return eager_estimator.cond_projection(cond_in)
 
         if inference_cfg_rate > 0:
             cfg_prompt_x = prompt_x.new_zeros((2 * batch, *prompt_x.shape[1:]))
@@ -205,6 +218,11 @@ class BASECFM(torch.nn.Module, ABC):
             cfg_x = x.new_empty((2 * batch, *x.shape[1:]))
             cfg_t = x.new_empty((2 * batch,))
             cfg_pre_mask = self._repeat_pre_mask_for_cfg(pre_mask)
+            precomputed_cond = _project_cond_once(cfg_mu)
+        else:
+            precomputed_cond = _project_cond_once(mu)
+
+        est_extra_kw = {"precomputed_cond": precomputed_cond} if precomputed_cond is not None else {}
 
         for step in range(1, len(t_span)):
             dt = t_span[step] - t_span[step - 1]
@@ -222,6 +240,7 @@ class BASECFM(torch.nn.Module, ABC):
                     cfg_mu,
                     pre_mask=cfg_pre_mask,
                     unpad_data=unpad_data,
+                    **est_extra_kw,
                 )
 
                 dphi_dt, cfg_dphi_dt = stacked_dphi_dt.chunk(2, dim=0)
@@ -236,6 +255,7 @@ class BASECFM(torch.nn.Module, ABC):
                     mu,
                     pre_mask=pre_mask,
                     unpad_data=unpad_data,
+                    **est_extra_kw,
                 )
 
             x = x + dt * dphi_dt

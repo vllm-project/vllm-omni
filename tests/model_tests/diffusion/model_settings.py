@@ -140,6 +140,7 @@ DIFFUSION_TEST_SETTINGS = {
         builder=diff_model_builders.tiny_longcat_image_edit_builder,
         supported_tasks=[DiffusionTasks.IMAGE_TO_IMAGE],
         model_type_marker=ModelTypeMarker.DIFFUSION,
+        offline_init_timeout_s=900,
         extra_test_groups=[
             [DiffusionAccs.TEA_CACHE],
             [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
