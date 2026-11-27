@@ -192,13 +192,17 @@ class HunYuanAttention(nn.Module):
 
     def forward(
         self,
-        positions: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        positions: torch.Tensor | tuple[torch.Tensor, ...],
         hidden_states: torch.Tensor,
         kv_states: tuple[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        packed_rotary = getattr(self.rotary_emb, "apply_packed", None)
+        if packed_rotary is None:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self.rotary_emb(positions, q, k)
+        else:
+            q, k, v = packed_rotary(positions, qkv, self.q_size, self.kv_size)
         ori_k = k
         if self.use_qk_norm:
             q = self.query_layernorm(
@@ -298,7 +302,7 @@ class HunYuanCrossAttention(nn.Module):
 
     def forward(
         self,
-        positions: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        positions: torch.Tensor | tuple[torch.Tensor, ...],
         hidden_states: torch.Tensor,
         kv_states: tuple[torch.Tensor] | None = None,
     ) -> torch.Tensor:
@@ -501,7 +505,7 @@ class HunYuanDecoderLayer(nn.Module):
 
     def forward(
         self,
-        positions: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        positions: torch.Tensor | tuple[torch.Tensor, ...],
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         kv_states: tuple[torch.Tensor] | None = None,
@@ -601,7 +605,7 @@ class HunYuanModel(nn.Module, EagleModelMixin):
         prev_kv_states = None
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         shared_rope = getattr(self, "shared_rotary_emb", None)
-        layer_positions = positions if shared_rope is None else shared_rope.cos_sin(positions)
+        layer_positions = positions if shared_rope is None else shared_rope.prepare_factors(positions, hidden_states.dtype)
         for i, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
             hidden_states, residual, kv_states = layer(
                 layer_positions,
