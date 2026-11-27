@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from threading import Lock
 
 from vllm_omni.diffusion.weight_management.errors import ConfigError, LifecycleError
-from vllm_omni.diffusion.weight_management.interfaces import WeightStack
+from vllm_omni.diffusion.weight_management.interfaces import ExecutionOffloadFacts, WeightStack
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,32 @@ def parse_weight_stack(value: object) -> WeightStack:
 
 
 def is_unified(config: object) -> bool:
-    return parse_weight_stack(getattr(config, "diffusion_weight_stack", None)) is WeightStack.UNIFIED
+    value = getattr(config, "diffusion_weight_stack", None)
+    return isinstance(value, str) and parse_weight_stack(value) is WeightStack.UNIFIED
+
+
+def execution_offload_facts(config: object) -> ExecutionOffloadFacts:
+    """Return engine/executor offload facts for legacy or unified configuration."""
+    if is_unified(config):
+        # Before RFC 05 policy parsing exists, unified mode rejects offload so all facts are false.
+        return ExecutionOffloadFacts(
+            weight_collectives=False,
+            text_encoder_allgather=False,
+            whole_component_offload=False,
+        )
+    from vllm_omni.diffusion.offloader.config import (
+        TEXT_ENCODER_COMPONENT,
+        OffloadStrategy,
+        resolve_offload,
+    )
+
+    resolved = resolve_offload(config)
+    return ExecutionOffloadFacts(
+        weight_collectives=resolved.any_allgather,
+        text_encoder_allgather=resolved.offloads(TEXT_ENCODER_COMPONENT)
+        and resolved.uses_allgather(TEXT_ENCODER_COMPONENT),
+        whole_component_offload=resolved.strategy is OffloadStrategy.MODEL_LEVEL,
+    )
 
 
 # Identity keys support unhashable owners; weakrefs avoid leaking unclosed workers.

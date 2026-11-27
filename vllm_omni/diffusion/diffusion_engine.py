@@ -50,10 +50,6 @@ from vllm_omni.diffusion.io_support import (
 )
 from vllm_omni.diffusion.mixfusion.setup import validate_mixfusion_config
 from vllm_omni.diffusion.models.interface import supports_step_execution
-from vllm_omni.diffusion.offloader.config import (
-    OffloadStrategy,
-    resolve_offload_strategy,
-)
 from vllm_omni.diffusion.output_formatter import (
     format_diffusion_outputs,
     format_empty_diffusion_outputs,
@@ -667,10 +663,12 @@ class DiffusionEngine:
                 custom_output=custom_output,
             )
 
+        from vllm_omni.diffusion.weight_management.startup import execution_offload_facts
+
         if output.media is not None:
             if output.output is not None:
                 raise ValueError("DiffusionOutput cannot contain both media and legacy output")
-            model_level = resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
+            model_level = execution_offload_facts(self.od_config).whole_component_offload
             media = output.media.to_cpu() if model_level else output.media
             output_data = media.video.tensor
             outputs = finalize_diffusion_media(media, sampling_params=request.sampling_params)
@@ -683,7 +681,7 @@ class DiffusionEngine:
             # post-processing to avoid device OOM — model weights may still
             # reside on the device and leave no headroom for intermediates.
             output_data = output.output
-            if resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL:
+            if execution_offload_facts(self.od_config).whole_component_offload:
                 output_data = _move_tensor_tree_to_cpu(output_data)
 
             if self.post_process_func is not None:

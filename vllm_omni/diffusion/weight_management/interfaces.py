@@ -50,6 +50,15 @@ class WeightStack(str, enum.Enum):
     UNIFIED = "unified"
 
 
+@dataclass(frozen=True)
+class ExecutionOffloadFacts:
+    """Engine and executor offload facts shared across stacks (RFC 01 section 9.2)."""
+
+    weight_collectives: bool
+    text_encoder_allgather: bool
+    whole_component_offload: bool
+
+
 class LoadState(enum.Enum):
     """State of one unified startup transaction (RFC 01 section 4)."""
 

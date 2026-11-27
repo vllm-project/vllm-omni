@@ -41,7 +41,6 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.executor.async_output_cache import AsyncOutputFutureMixin
 from vllm_omni.diffusion.media import DiffusionMediaOutput
-from vllm_omni.diffusion.offloader.config import any_selected_component_uses_allgather
 from vllm_omni.diffusion.request_streaming import request_chunk_transport
 from vllm_omni.diffusion.sched.request_scheduler import (
     build_rank_local_dp_extra_args_signature,
@@ -897,8 +896,10 @@ class RayDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
             if new_req.diffusion_kv_metadata is not None:
                 args += (new_req.diffusion_kv_metadata,)
             try:
+                from vllm_omni.diffusion.weight_management.startup import execution_offload_facts
+
                 timeout_options: dict[str, Any] = {}
-                if any_selected_component_uses_allgather(self.od_config):
+                if execution_offload_facts(self.od_config).weight_collectives:
                     timeout_options["timeout"] = _DLO_DP_WAVE_TIMEOUT_S
                 result = self.collective_rpc(
                     "execute_model",

@@ -78,13 +78,13 @@ HSDP_DATA_PARALLEL_DEFAULT_BATCH_WAIT_MS = 500.0
 
 def uses_rank_local_dp_concurrency(od_config: object) -> bool:
     """Whether sharded weights serve different requests on each rank."""
-    from vllm_omni.diffusion.offloader.config import any_selected_component_uses_allgather
+    from vllm_omni.diffusion.weight_management.startup import execution_offload_facts
 
     parallel_config = getattr(od_config, "parallel_config", None)
     if (getattr(parallel_config, "data_parallel_size", 1) or 1) <= 1:
         return False
     return bool(
-        getattr(parallel_config, "hsdp_data_parallel", False) or any_selected_component_uses_allgather(od_config)
+        getattr(parallel_config, "hsdp_data_parallel", False) or execution_offload_facts(od_config).weight_collectives
     )
 
 
