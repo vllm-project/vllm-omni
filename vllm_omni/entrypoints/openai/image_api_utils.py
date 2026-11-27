@@ -103,21 +103,10 @@ def prepare_image_for_output_format(image: PIL.Image.Image, format: str) -> PIL.
     return image.convert("RGB")
 
 
-def encode_image_base64_with_compression(
+def encode_image_with_compression(
     image: PIL.Image.Image, format: str = "png", output_compression: int = 100
-) -> str:
-    """Encode a PIL image to a base64 image string.
-
-    Args:
-        image: PIL Image object.
-        format: Output image format, such as "png", "jpeg", or "webp".
-        output_compression: Compression level (0-100), where 100 keeps the
-            best quality for lossy formats and uses the lowest PNG compression.
-
-    Returns:
-        Base64-encoded image string.
-    """
-    buffer = io.BytesIO()
+) -> bytes | memoryview:
+    """Encode a PIL image in the requested format with compression from 0 to 100."""
     image = prepare_image_for_output_format(image, format)
     pil_format = "jpeg" if format == "jpg" else format
     save_kwargs = {}
@@ -129,10 +118,17 @@ def encode_image_base64_with_compression(
     if save_kwargs.get("compress_level") == 0 and image.mode in _UNCOMPRESSED_PNG_MODES:
         # Level 0 stores the image uncompressed; PIL still runs per-row
         # adaptive filtering, which cannot shrink stored data.
-        return base64.b64encode(encode_png_uncompressed(image)).decode("utf-8")
-    image.save(buffer, format=pil_format, **save_kwargs)
-    buffer.seek(0)
-    return base64.b64encode(buffer.read()).decode("utf-8")
+        return encode_png_uncompressed(image)
+    with io.BytesIO() as buffer:
+        image.save(buffer, format=pil_format, **save_kwargs)
+        return buffer.getvalue()
+
+
+def encode_image_base64_with_compression(
+    image: PIL.Image.Image, format: str = "png", output_compression: int = 100
+) -> str:
+    """Encode a PIL image as base64 with the requested format and compression."""
+    return base64.b64encode(encode_image_with_compression(image, format, output_compression)).decode("utf-8")
 
 
 # PIL mode -> (PNG color type, channels) for 8-bit images.

@@ -135,6 +135,7 @@ from vllm_omni.entrypoints.openai.errors import (
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
     encode_image_base64_with_compression,
+    encode_image_with_compression,
     parse_size,
     validate_layered_layers,
 )
@@ -166,6 +167,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageSegmentationResponse,
     ResponseFormat,
     SegmentationMaskFormat,
+    stream_image_file_response,
 )
 from vllm_omni.entrypoints.openai.protocol.rollout import (
     CreateSessionRequest,
@@ -2361,6 +2363,17 @@ def _build_image_generation_response(
 ) -> ImageGenerationResponse | StreamingResponse:
     """Encode generated images and apply the requested response format."""
     output_format = _choose_output_format(request.output_format or "png", None)
+    if request.response_format == ResponseFormat.FILE:
+        return stream_image_file_response(
+            [
+                encode_image_with_compression(
+                    image, format=output_format, output_compression=request.output_compression
+                )
+                for image in images
+            ],
+            output_format,
+        )
+
     image_data = [
         ImageData(
             b64_json=encode_image_base64_with_compression(
@@ -2383,10 +2396,7 @@ def _build_image_generation_response(
     size = _generated_size_str(images, request.size)
     if size is not None:
         response_kwargs["size"] = size
-    response = ImageGenerationResponse(**response_kwargs)
-    if request.response_format == ResponseFormat.FILE:
-        return response.stream_response()
-    return response
+    return ImageGenerationResponse(**response_kwargs)
 
 
 @router.post(

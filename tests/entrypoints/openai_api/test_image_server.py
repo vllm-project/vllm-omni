@@ -1726,6 +1726,39 @@ def test_image_file_response_format_single(test_client, output_format, expected_
     assert img.format == expected_pil_format
 
 
+@pytest.mark.parametrize("image_count", [1, 2])
+def test_image_file_response_preserves_encoded_png_without_base64(async_omni_test_client, monkeypatch, image_count):
+    import base64
+    import zipfile
+
+    images = [Image.new("RGBA", (256, 256), (40, 90, 170, 80 + index)) for index in range(image_count)]
+    async_omni_test_client.app.state.engine_client._images = images
+    request = {"prompt": "a dog", "n": image_count, "output_format": "png", "output_compression": 100}
+    json_response = async_omni_test_client.post("/v1/images/generations", json=request)
+    assert json_response.status_code == 200
+    expected = [base64.b64decode(image["b64_json"]) for image in json_response.json()["data"]]
+    assert len(expected) == image_count
+
+    def reject_base64(*args, **kwargs):
+        pytest.fail("File responses should not encode image bytes as base64")
+
+    monkeypatch.setattr("vllm_omni.entrypoints.openai.api_server.encode_image_base64_with_compression", reject_base64)
+    file_response = async_omni_test_client.post("/v1/images/generations", json={**request, "response_format": "file"})
+    assert file_response.status_code == 200
+    assert int(file_response.headers["content-length"]) == len(file_response.content)
+    if image_count == 1:
+        assert file_response.headers["content-type"] == "image/png"
+        assert file_response.content == expected[0]
+    else:
+        assert file_response.headers["content-type"] == "application/zip"
+        with zipfile.ZipFile(io.BytesIO(file_response.content)) as archive:
+            assert archive.namelist() == ["image_0.png", "image_1.png"]
+            assert [archive.read(name) for name in archive.namelist()] == expected
+    with Image.open(io.BytesIO(expected[0])) as image:
+        assert image.mode == "RGBA"
+        assert image.tobytes() == images[0].tobytes()
+
+
 @pytest.mark.parametrize(
     ("output_format", "image_count", "expected_media_type", "expected_pil_format"),
     [
