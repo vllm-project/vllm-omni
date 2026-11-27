@@ -120,6 +120,7 @@ class FakeRuntime:
     model: str
     engine: FakeEngine
     process_warmup_audio: dict[str, object]
+    process_warmup_turn: dict[str, object]
     health_error: bool = False
     shutdown_path: str | None = None
 
@@ -138,6 +139,7 @@ def fake_factory(model, options):
         model,
         FakeEngine(options.get("small_buffers", False)),
         {"audio": "AAAAAA==", "format": "pcm_f32le", "sample_rate_hz": 24000},
+        {"audio": "c3BlZWNo", "format": "pcm16", "sample_rate_hz": 16000},
         health_error=options.get("health_error", False),
         shutdown_path=options.get("shutdown_path"),
     )
@@ -345,6 +347,7 @@ def test_spawned_client_streams_audio_controls_and_invalidations():
         try:
             assert client.num_stages == 4
             assert client.metadata.warmup_audio["sample_rate_hz"] == 24000
+            assert client.metadata.warmup_turn["audio"] == "c3BlZWNo"
             assert client.duplex_capabilities.supports_chat_completions  # Model facts are unchanged.
             await client.check_health_async()
             rejected = DuplexOutputBuffer(max_bytes=1024, max_events=8)

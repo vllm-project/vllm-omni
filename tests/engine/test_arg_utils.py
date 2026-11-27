@@ -19,7 +19,7 @@ from unittest.mock import Mock
 import pytest
 from omegaconf import OmegaConf
 from pydantic import ValidationError
-from transformers import PretrainedConfig, Qwen3OmniMoeConfig
+from transformers import AutoConfig, PretrainedConfig, Qwen3OmniMoeConfig
 from vllm.config import VllmConfig
 from vllm.config.utils import hash_config
 from vllm.engine.arg_utils import EngineArgs
@@ -34,9 +34,10 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
     load_omni_transfer_config,
     resolve_omni_kv_config_for_stage,
 )
-from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.arg_utils import _ARCH_TO_MODEL_TYPE, OmniEngineArgs
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict, get_stage_connector_spec
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -287,6 +288,16 @@ def test_compute_hash_is_stable_across_launches(stage_id):
     assert first_hash == second_hash
 
 
+def test_scheduler_window_policy_preserves_the_model_compile_key():
+    config = OmniEngineArgs(worker_cls=AR_WORKER_CLS).create_engine_config()
+    assert "scheduler_window_policy" not in config.model_config.compile_factors()
+    original = hash_config(config)
+    config.model_config.scheduler_window_policy = (
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
+    )
+    assert hash_config(config) == original
+
+
 def test_compute_hash_keeps_stage_connector_settings():
     """Ensure connector settings that models read (e.g. codec chunk size) still change the hash."""
 
@@ -377,9 +388,22 @@ def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
     }
 
 
-def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, monkeypatch, mocker):
+@pytest.mark.parametrize(
+    ("model", "model_arch", "subfolder"),
+    [
+        ("remote/cosyvoice3", "CosyVoice3Model", "CosyVoice-BlankEN"),
+    ],
+)
+def test_remote_tokenizer_subfolder_download_does_not_report_failure(
+    tmp_path,
+    monkeypatch,
+    mocker,
+    model,
+    model_arch,
+    subfolder,
+):
     """A successful remote tokenizer download must not enter the error path."""
-    tokenizer_dir = tmp_path / "CosyVoice-BlankEN"
+    tokenizer_dir = tmp_path / subfolder
     tokenizer_dir.mkdir()
     baseline_config = Mock()
     warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
@@ -393,30 +417,44 @@ def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, m
         classmethod(lambda cls, model_config, **omni_kwargs: model_config),
     )
 
-    args = OmniEngineArgs(model="remote/cosyvoice3", model_arch="CosyVoice3Model")
+    args = OmniEngineArgs(model=model, model_arch=model_arch)
     assert args.create_model_config() is baseline_config
     assert args.tokenizer == str(tokenizer_dir)
     warning.assert_not_called()
 
 
-def test_patch_missing_local_hf_config(tmp_path):
+@pytest.mark.parametrize(
+    ("model_arch", "model_type"),
+    [
+        ("IndexTTS25TalkerForConditionalGeneration", "indextts2_5"),
+        (
+            "Confucius4TTSTalkerForConditionalGeneration",
+            "confucius4_tts",
+        ),
+    ],
+)
+def test_patch_missing_local_hf_config(
+    tmp_path,
+    model_arch,
+    model_type,
+):
     """Native model bundles may only contain a checkpoints/ directory."""
     (tmp_path / "checkpoints").mkdir()
     args = object.__new__(OmniEngineArgs)
     args.model = str(tmp_path)
-    args.model_arch = "IndexTTS25TalkerForConditionalGeneration"
+    args.model_arch = model_arch
     args.hf_config_path = None
 
     try:
-        args._patch_empty_hf_config("indextts2_5")
+        args._patch_empty_hf_config(model_type)
 
         assert args.hf_config_path is not None
         config_path = args.hf_config_path + "/config.json"
         with open(config_path, encoding="utf-8") as config_file:
             config = json.load(config_file)
         assert config == {
-            "model_type": "indextts2_5",
-            "architectures": ["IndexTTS25TalkerForConditionalGeneration"],
+            "model_type": model_type,
+            "architectures": [model_arch],
         }
     finally:
         if hasattr(args, "_temp_config_dir"):
@@ -518,6 +556,8 @@ def test_remote_hf_config_error_reaches_parent_loader(monkeypatch):
     """Remote resolution failures must stay on vLLM's normal error path."""
     loader_error = OSError("remote config resolution failed")
     parent_inputs = {}
+
+    monkeypatch.setattr("vllm.engine.arg_utils.get_model_path", lambda model, _revision=None: model)
 
     def controlled_get_config_dict(cls, model, **kwargs):
         raise loader_error
@@ -670,6 +710,80 @@ def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
     assert parallel_config["text_encoder_tp_size"] == 2
 
 
+# Chatterbox's Hub repository ships no config.json, so a config-less
+# directory or Hub id gets one written; a config.json that exists but fails
+# to load stays on vLLM's error path.
+def chatterbox_args(model: str, model_arch: str = "ChatterboxForConditionalGeneration") -> OmniEngineArgs:
+    return OmniEngineArgs(model=model, model_arch=model_arch, skip_tokenizer_init=True)
+
+
+def _patched_config(args: OmniEngineArgs) -> dict:
+    with open(os.path.join(args.hf_config_path, "config.json"), encoding="utf-8") as config_file:
+        return json.load(config_file)
+
+
+def test_config_less_chatterbox_directory_gets_a_config_written(tmp_path):
+    """The engine writes a config.json naming the model type, loads the directory through it, and removes it."""
+    args = chatterbox_args(str(tmp_path))
+
+    model_config = args.create_model_config()
+
+    config = model_config.hf_config
+    assert isinstance(config, ChatterboxConfig)
+    assert config.architectures == model_config.architectures == ["ChatterboxForConditionalGeneration"]
+    assert not os.path.exists(args.hf_config_path) and not hasattr(args, "_temp_config_dir")
+
+
+# The Hub is a remote service: its answers for the Hub id (no config.json, or
+# one that exists but cannot be fetched) are stood in for here.
+def no_config(cls, model, **kwargs):
+    """The Hub's answer for a repository without a config.json."""
+    raise OSError("no config")
+
+
+def test_config_less_chatterbox_hub_id_gets_a_config_written(monkeypatch):
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(no_config))
+    monkeypatch.setattr("vllm_omni.engine.arg_utils.file_or_path_exists", lambda *a, **k: False)
+    args = chatterbox_args("ResembleAI/chatterbox-turbo")
+    try:
+        # As create_model_config calls it: the model type comes from the architecture.
+        args._patch_empty_hf_config(_ARCH_TO_MODEL_TYPE[args.model_arch])
+        assert _patched_config(args) == {
+            "model_type": "chatterbox",
+            "architectures": ["ChatterboxForConditionalGeneration"],
+        }
+        # The engine then loads the written directory through AutoConfig.
+        monkeypatch.undo()
+        config = AutoConfig.from_pretrained(args.hf_config_path)
+        assert isinstance(config, ChatterboxConfig)
+        assert config.architectures == ["ChatterboxForConditionalGeneration"]
+    finally:
+        if hasattr(args, "_temp_config_dir"):
+            shutil.rmtree(args._temp_config_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("model_arch", ["ChatterboxForConditionalGeneration", "CosyVoice3Model"])
+def test_a_config_that_exists_but_fails_to_load_is_left_alone(tmp_path, model_arch):
+    """The engine writes no config over a broken one; loading the directory fails on the file itself."""
+    (tmp_path / "config.json").write_text("{")
+    args = chatterbox_args(str(tmp_path), model_arch)
+
+    with pytest.raises((OSError, ValueError)):
+        args.create_model_config()
+
+    assert args.hf_config_path is None
+    assert not hasattr(args, "_temp_config_dir")
+
+
+def test_chatterbox_hub_config_that_exists_but_fails_to_load_is_left_alone(monkeypatch):
+    # The file exists but the Hub refuses it, as for a gated repository.
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(no_config))
+    monkeypatch.setattr("vllm_omni.engine.arg_utils.file_or_path_exists", lambda *a, **k: True)
+    hub = chatterbox_args("ResembleAI/chatterbox-turbo")
+    hub._patch_empty_hf_config("chatterbox")
+    assert hub.hf_config_path is None
+
+
 # For https://github.com/vllm-project/vllm-omni/issues/8503
 # The non-parallel diffusion engine args the serve CLI registers on
 # OrchestratorArgs and the stage engine consumes. Values differ from the
@@ -706,6 +820,7 @@ DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
     ("step_execution", True),
     ("vae_use_slicing", True),
     ("vae_use_tiling", True),
+    ("vae_stack_tiles", False),
     ("vae_fast_path", "channels_last"),
     ("vae_encode_fast_path", "off"),
     ("enable_multithread_weight_load", False),
@@ -798,7 +913,8 @@ def test_native_mrv2_worker_provides_connector_without_legacy_mixin(worker_cls):
 DIFFUSION_PARALLEL_KNBS = [
     ("ulysses_degree", 4),
     ("ulysses_mode", "advanced_uaa"),
-    ("ulysses_a2a_permute", True),
+    ("ulysses_overlap_chunks", 2),
+    ("ulysses_a2a_backend", "copy_engine"),
     ("ring_degree", 2),
     ("allgather_degree", 8),
     ("use_hsdp", True),
@@ -833,6 +949,9 @@ def test_from_cli_args_applies_diffusion_parallel_knobs():
             # Standalone HSDP (all other parallelism at 1) cannot
             # auto-calculate its shard size; pass one explicitly.
             factory_kwargs["hsdp_shard_size"] = 2048
+        if knob == "ulysses_overlap_chunks":
+            # The overlap runs on the copy-engine exchange.
+            factory_kwargs["ulysses_a2a_backend"] = "copy_engine"
         stage_cfg = StageConfigFactory.create_default_diffusion(factory_kwargs)[0]
         parallel_config = stage_cfg["engine_args"]["parallel_config"]
         assert parallel_config[knob] == value, f"{knob} did not reach parallel_config"

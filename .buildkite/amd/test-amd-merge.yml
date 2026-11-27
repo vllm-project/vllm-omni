@@ -119,6 +119,69 @@ steps:
           exit "$$status"
           RUN_ADVANCED
 
+    # Mirrors the CUDA MERGE "Entrypoint Test with H100" selection: the advanced
+    # Qwen3-Omni duplex-playback and /v1/realtime cases (21 + 8). CUDA runs them
+    # in about 31 minutes on H100; MI300 also pays cold AITER compilation.
+    # test_livekit_client_vad_replay_without_runtime_jit stays CUDA-only: on MI300
+    # the Triton kernel_unified_attention JIT-compiles mid-request (AMD #17564).
+    - label: "MERGE · Qwen3-Omni Realtime and Duplex Entrypoints · 2-GPU"
+      agent_pool: mi300_2
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 90
+      source_file_dependencies: omni_qwen3_omni_duplex_playback_function
+      artifact_paths:
+        - "artifacts/rocm-merge-qwen3-omni-realtime/**/*"
+      commands:
+        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - export ROCM_MERGE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-merge-qwen3-omni-realtime"
+        - mkdir -p "$$ROCM_MERGE_ARTIFACT_DIR"
+        - |
+          set -euo pipefail
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 29 \
+            tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py \
+            tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py \
+            -m 'advanced_model and omni and rocm and MI325 and cards_2 and not nvidia_only' \
+            --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            2>&1 | tee "$$ROCM_MERGE_ARTIFACT_DIR/collection.log"
+        - |
+          bash <<'RUN_REALTIME'
+          set -euo pipefail
+          status=0
+          timeout --signal=TERM --kill-after=2m 80m \
+            pytest -s -v -ra \
+            tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py \
+            tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py \
+            -m 'advanced_model and omni and rocm and MI325 and cards_2 and not nvidia_only' \
+            --run-level advanced_model \
+            --shard-id=0 --num-shards=1 \
+            --junitxml="$$ROCM_MERGE_ARTIFACT_DIR/pytest.xml" || status=$$?
+          ps -eo pid,ppid,stat,args > "$$ROCM_MERGE_ARTIFACT_DIR/processes-after.txt" || true
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          if root.tag not in {"testsuite", "testsuites"}:
+              raise SystemExit("Unexpected JUnit root")
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+          errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+          if tests != 29 or skipped != 0 or failures != 0 or errors != 0:
+              print("Expected exactly 29 executed Qwen3-Omni realtime and duplex entrypoint tests; "
+                    f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+              raise SystemExit(5)
+          ' "$$ROCM_MERGE_ARTIFACT_DIR/pytest.xml"; then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          exit "$$status"
+          RUN_REALTIME
+
 - group: ":card_index_dividers: Simple Test"
   steps:
     - label: "Simple · Model Executor Test · Shard %N/%t"
@@ -814,7 +877,11 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
-      timeout_in_minutes: 50
+      # The existing Base suite can use 40 minutes; leave margin for the
+      # additional eight-minute decoder parity phase and cleanup.
+      timeout_in_minutes: 60
+      artifact_paths:
+        - artifacts/rocm-qwen3-tts-eager-warmup/**/*
       commands:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -831,6 +898,27 @@ steps:
           tests/e2e/offline_inference/test_qwen3_tts_base.py
           -m 'advanced_model and rocm and MI325 and cards_1 and not nvidia_only'
           --run-level "advanced_model"
+        - export QWEN3_TTS_WARMUP_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-tts-eager-warmup"
+        - mkdir -p "$$QWEN3_TTS_WARMUP_ARTIFACT_DIR"
+        - >-
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 4
+          tests/model_executor/models/qwen3_tts/test_eager_decoder_warmup.py
+          -m 'core_model and rocm and cards_1' --run-level core_model
+        - >-
+          timeout --signal=TERM --kill-after=1m 8m pytest -sv
+          tests/model_executor/models/qwen3_tts/test_eager_decoder_warmup.py
+          -m 'core_model and rocm and cards_1' --run-level core_model
+          --junitxml="$$QWEN3_TTS_WARMUP_ARTIFACT_DIR/pytest.xml"
+        - |
+          python - "$$QWEN3_TTS_WARMUP_ARTIFACT_DIR/pytest.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          cases = list(root.iter("testcase"))
+          assert len(cases) == 4, f"Expected four eager decoder parity tests, got {len(cases)}"
+          assert not any(list(root.iter(tag)) for tag in ("skipped", "failure", "error")), "Eager decoder parity did not fully pass"
+          PY
+
 
     # SDPA function check. Nightly keeps the separate AITER official-weight smoke.
     - label: "MERGE · Qwen-Image Online Smoke"

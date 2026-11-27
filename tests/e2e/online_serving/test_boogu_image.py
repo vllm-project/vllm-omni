@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Online serving tests for ``Boogu/Boogu-Image-0.1-Base`` (text-to-image).
@@ -34,7 +34,7 @@ MODEL = "Boogu/Boogu-Image-0.1-Base"
 T2I_PROMPT = "A mountain lake at sunset, photorealistic, cinematic lighting"
 NEGATIVE_PROMPT = ""
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
 
 TEST_PROMPTS: list[dict[str, str]] = [
     {"prompt": "a cup of coffee on a table", "negative_prompt": ""},
