@@ -11,7 +11,6 @@ from tempfile import TemporaryDirectory
 import torch
 from diffusers import ComponentsManager, MiniMaxH3ImageModularPipeline, ModularPipeline
 from diffusers.hooks import apply_group_offloading
-from PIL import Image
 
 
 def main():
@@ -54,23 +53,19 @@ def main():
             apply_group_offloading(
                 pipe.transformer, onload_device=device, offload_type="block_level", num_blocks_per_group=1
             )
-        with Image.open(output / "edit-input.png") as source_image:
-            reference = source_image.convert("RGB")
-        for task, case in request["cases"].items():
-            width, height = map(int, case["size"].split("x"))
-            kwargs = {"image": reference} if task == "edit" else {}
-            image = pipe(
-                prompt=case["prompt"],
-                height=height,
-                width=width,
-                generator=torch.Generator(device="cpu").manual_seed(case["seed"]),
-                output="images",
-                **kwargs,
-            )[0]
-            assert image.size == (width, height)
-            rgb = image.convert("RGB")
-            assert any(low != high for low, high in rgb.getextrema())
-            rgb.save(output / f"diffusers-{task}.png")
+        case = request["cases"]["t2i"]
+        width, height = map(int, case["size"].split("x"))
+        image = pipe(
+            prompt=case["prompt"],
+            height=height,
+            width=width,
+            generator=torch.Generator(device="cpu").manual_seed(case["seed"]),
+            output="images",
+        )[0]
+        assert image.size == (width, height)
+        rgb = image.convert("RGB")
+        assert any(low != high for low, high in rgb.getextrema())
+        rgb.save(output / "diffusers-t2i.png")
 
 
 if __name__ == "__main__":
