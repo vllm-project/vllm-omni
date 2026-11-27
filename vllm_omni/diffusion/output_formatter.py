@@ -152,11 +152,19 @@ def format_diffusion_outputs(
     is_text_output = postprocess_output.primary_key == "text"
 
     is_audio_output = supports_audio_output(od_config.model_class_name)
-    final_output_type = (
-        postprocess_output.primary_key
-        if postprocess_output.primary_key in {"image", "video"}
-        else get_diffusion_output_type(od_config.model_class_name)
+
+    final_output_type = next(
+        (
+            key
+            for key in ("video", "image", "text", "audio", "output", *STRUCTURED_PAYLOAD_KEYS)
+            if key in postprocess_output.outputs
+        ),
+        None,
     )
+
+    if final_output_type == "output":
+        final_output_type = get_diffusion_output_type(od_config.model_class_name)
+
     audio_sample_rate = _metadata_audio_sample_rate(postprocess_output.metadata)
     if is_audio_output and audio_sample_rate is None:
         model_cls = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)

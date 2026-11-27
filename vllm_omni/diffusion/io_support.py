@@ -53,12 +53,6 @@ def get_diffusion_output_type(model_class_name: str | None) -> str:
         return declared_output_type
     if model_class_name and supports_audio_output(model_class_name):
         return "audio"
-    if metadata.supports_segmentation:
-        return "segmentation"
-    if metadata.supports_video_segmentation:
-        return "video_segmentation"
-    if metadata.supports_video_depth:
-        return "video_depth"
     return "image"
 
 
