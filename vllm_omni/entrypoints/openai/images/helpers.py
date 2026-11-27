@@ -27,7 +27,6 @@ from http import HTTPStatus
 from numbers import Integral
 from typing import Any
 
-import httpx
 import numpy as np
 import pybase64 as base64
 from fastapi import HTTPException, Request, UploadFile
@@ -36,6 +35,11 @@ from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 
 from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config
+from vllm_omni.entrypoints.openai.media_input import (
+    MAX_IMAGE_INPUT_BYTES,
+    decode_base64_media,
+    download_media_bytes,
+)
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageSegmentationInstance,
     SegmentationMaskFormat,
@@ -202,7 +206,11 @@ async def _load_input_images(
         if isinstance(inp, str) and inp.startswith("data:image"):
             try:
                 _, b64_data = inp.split(",", 1)
-                image_bytes = base64.b64decode(b64_data)
+                image_bytes = decode_base64_media(
+                    b64_data,
+                    max_bytes=MAX_IMAGE_INPUT_BYTES,
+                    source="image edit input",
+                )
                 img = open_image(io.BytesIO(image_bytes))
                 images.append(img)
             except Exception as e:
@@ -210,14 +218,16 @@ async def _load_input_images(
 
         # 2. URL
         elif isinstance(inp, str) and inp.startswith("http"):
-            async with httpx.AsyncClient(timeout=60) as client:
-                try:
-                    resp = await client.get(inp)
-                    resp.raise_for_status()
-                    img = open_image(io.BytesIO(resp.content))
-                    images.append(img)
-                except Exception as e:
-                    raise ValueError(f"Failed to download image from URL {inp}: {e}")
+            try:
+                image_bytes = await download_media_bytes(
+                    inp,
+                    max_bytes=MAX_IMAGE_INPUT_BYTES,
+                    source="image edit input",
+                )
+                img = open_image(io.BytesIO(image_bytes))
+                images.append(img)
+            except Exception as e:
+                raise ValueError(f"Failed to download image from URL {inp}: {e}") from e
 
         # 3. UploadFile
         elif hasattr(inp, "file"):
