@@ -3,6 +3,7 @@
 
 """Unit tests for the shared offload plan resolver."""
 
+import logging
 from typing import ClassVar
 
 import pytest
@@ -448,6 +449,43 @@ class TestBackingResolution:
         assert encoder.backing is BackingKind.PINNED
         assert encoder.backing_fallback_reason is not None
         assert "reserved" in encoder.backing_fallback_reason
+
+
+class TestBackingFallbackWarningScope:
+    """Backing fallback warnings describe only selected components.
+
+    The resolver resolves backing for every discovered component so the plan
+    stays complete, but an incompatibility on a component the config never
+    offloads is noise: it degrades to PINNED silently, while a selected
+    component still explains its fallback.
+    """
+
+    _LOGGER = "vllm_omni.diffusion.offloader.plan_resolver"
+
+    def test_unselected_dit_falls_back_silently_under_hsdp(self, caplog):
+        pipeline = _WanStylePipeline()
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            resolved = resolve_offload_plan(pipeline, _config({"text_encoder"}, use_hsdp=True))
+
+        dit = resolved.dits[0]
+        assert not dit.selected
+        assert dit.backing is BackingKind.PINNED
+        assert dit.backing_fallback_reason is not None
+        assert "falling back" not in caplog.text
+
+    def test_selected_incompatible_dit_still_warns_under_hsdp(self, caplog):
+        pipeline = _WanStylePipeline()
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            resolved = resolve_offload_plan(pipeline, _config({"dit"}, use_hsdp=True))
+
+        dit = resolved.dits[0]
+        assert dit.selected
+        assert dit.backing is BackingKind.PINNED
+        assert dit.backing_fallback_reason is not None
+        assert "falling back" in caplog.text
+        assert "transformer" in caplog.text
 
 
 class TestPurity:

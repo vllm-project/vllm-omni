@@ -157,6 +157,7 @@ def _resolve_component_backing(
     declaration: OffloadPlan | None,
     config: OffloadConfig,
     default_backing: BackingKind,
+    selected: bool = True,
 ) -> tuple[bool, BackingKind, str | None]:
     """Resolve a component's one-shot flag and host backing, failing closed.
 
@@ -164,7 +165,9 @@ def _resolve_component_backing(
     can see as unservable (HSDP, multi-rank AllGather, reserved DISK) degrades
     to ``PINNED`` here, before a backend touches the mmap path. TP>1 and online
     quantization are loader-side preflights and are not visible at resolution
-    time.
+    time. ``selected`` only gates the fallback warning: a component the config
+    never offloads still resolves the same values, but its incompatibility is
+    not actionable, so it is not logged.
     """
     one_shot = declaration is not None and path in declaration.one_shot_component_paths
     requested = declaration.component_backing.get(path, default_backing) if declaration is not None else default_backing
@@ -177,7 +180,8 @@ def _resolve_component_backing(
         uses_allgather=uses_allgather,
     )
     if fallback_reason is not None:
-        _warn_backing_fallback(path, requested, fallback_reason)
+        if selected:
+            _warn_backing_fallback(path, requested, fallback_reason)
         return one_shot, BackingKind.PINNED, fallback_reason
     return one_shot, requested, None
 
@@ -423,6 +427,7 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
             declaration=declaration,
             config=config,
             default_backing=BackingKind.CHECKPOINT_MMAP,
+            selected=dit_selected,
         )
         stacks: tuple[BlockStack, ...] = ()
         children: tuple[ResolvedComponent, ...] = ()
@@ -479,6 +484,7 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
             declaration=declaration,
             config=config,
             default_backing=BackingKind.PINNED,
+            selected=selected,
         )
         encoders.append(
             ResolvedComponent(
