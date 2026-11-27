@@ -10,6 +10,7 @@ import pytest
 from vllm_omni.diffusion.models.gr00t import pipeline_gr00t
 from vllm_omni.diffusion.models.gr00t.pipeline_gr00t import Gr00tN1d7Pipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -74,6 +75,13 @@ def _pipeline():
     return Gr00tN1d7Pipeline(od_config=od_config)
 
 
+def _forward(pipeline: Gr00tN1d7Pipeline, req: OmniDiffusionRequest):
+    """The runner hands ``forward`` a request batch; a single-request wave returns one output."""
+    outputs = pipeline.forward(DiffusionRequestBatch(requests=[req]))
+    assert len(outputs) == 1
+    return outputs[0]
+
+
 def test_pipeline_initializes_local_policy():
     pipeline = _pipeline()
 
@@ -103,7 +111,7 @@ def test_forward_returns_dict_actions_in_output():
         ),
     )
 
-    output = pipeline.forward(req)
+    output = _forward(pipeline, req)
 
     assert output.error is None
     actions = output.output["actions"]
@@ -128,7 +136,7 @@ def test_dummy_warmup_returns_shape_correct_zero_actions():
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
     )
 
-    output = pipeline.forward(req)
+    output = _forward(pipeline, req)
 
     assert output.error is None
     actions = output.output["actions"]

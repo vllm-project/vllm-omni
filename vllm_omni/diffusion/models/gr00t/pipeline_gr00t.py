@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Iterable, Mapping
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -12,7 +12,6 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.gr00t.policy import Gr00tPolicy
-from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -37,6 +36,12 @@ class Gr00tN1d7Pipeline(nn.Module):
     draws the flow-matching noise, so repeating a request with the same seed reproduces
     its action chunk.
     """
+
+    # forward() serves the whole scheduler wave: single-observation requests are
+    # concatenated along the batch axis and served by one Gr00tPolicy.get_action()
+    # call. The bundled deploy config keeps max_num_seqs: 1, so a wave holds one
+    # request unless a deployment raises it.
+    supports_request_batch = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
@@ -114,22 +119,62 @@ class Gr00tN1d7Pipeline(nn.Module):
         return actions
 
     @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
+        """Run policy inference for every request in the wave.
+
+        Returns one DiffusionOutput per request, in ``req.requests`` order. A malformed
+        request fails on its own and does not affect the rest of the wave. ``reset`` is
+        applied before inference; the policy is shared by all sessions, so a reset from
+        any request applies to the whole wave.
+        """
         del kwargs
-        extra_args = req.sampling_params.extra_args or {}
-        robot_obs = extra_args.get("robot_obs")
-        if robot_obs is None:
-            if req.request_id == DUMMY_DIFFUSION_REQUEST_ID:
-                return DiffusionOutput(output={"actions": self._dummy_actions()})
-            return DiffusionOutput(error="Gr00tN1d7Pipeline.forward expects sampling_params.extra_args['robot_obs'].")
-        if not isinstance(robot_obs, Mapping):
-            return DiffusionOutput(error=f"robot_obs must be a dict, got {type(robot_obs).__name__}.")
+        outputs: list[DiffusionOutput | None] = [None] * req.num_reqs
+        pending: list[tuple[int, dict[str, Any], torch.Generator | None]] = []
+        for idx, request in enumerate(req.requests):
+            extra_args = request.sampling_params.extra_args or {}
+            robot_obs = extra_args.get("robot_obs")
+            if robot_obs is None:
+                if request.is_dummy_run_request_id(request.request_id):
+                    outputs[idx] = DiffusionOutput(output={"actions": self._dummy_actions()})
+                else:
+                    outputs[idx] = DiffusionOutput(
+                        error="Gr00tN1d7Pipeline.forward expects sampling_params.extra_args['robot_obs']."
+                    )
+                continue
+            if not isinstance(robot_obs, Mapping):
+                outputs[idx] = DiffusionOutput(error=f"robot_obs must be a dict, got {type(robot_obs).__name__}.")
+                continue
+            if extra_args.get("reset"):
+                self.reset()
+            policy_obs = _normalize_observation(robot_obs, language_key=self.policy.language_key)
+            pending.append((idx, policy_obs, _noise_generator(request.sampling_params, self.device)))
 
-        if extra_args.get("reset"):
-            self.reset()
+        if len(pending) > 1 and self.policy.strict:
+            # Strict mode validates the observation inside get_action(). Check each request
+            # first, so one invalid request (for example a float64 state) fails alone instead
+            # of failing the merged call and sending every wave it joins down the slow path.
+            valid = []
+            for idx, policy_obs, generator in pending:
+                try:
+                    self.policy.check_observation(policy_obs)
+                except (AssertionError, TypeError) as exc:
+                    outputs[idx] = DiffusionOutput(error=f"GR00T observation is invalid: {exc}")
+                else:
+                    valid.append((idx, policy_obs, generator))
+            pending = valid
 
-        policy_obs = _normalize_observation(robot_obs, language_key=self.policy.language_key)
-        generator = _noise_generator(req.sampling_params, self.device)
+        if len(pending) == 1:
+            # A single request keeps the unbatched path; its exceptions reach the runner as before.
+            idx, policy_obs, generator = pending[0]
+            outputs[idx] = self._run_policy(policy_obs, generator)
+        elif pending:
+            for (idx, _, _), output in zip(pending, self._run_policy_batch(pending)):
+                outputs[idx] = output
+
+        assert all(output is not None for output in outputs), "every request must get an output"
+        return cast(list[DiffusionOutput], outputs)
+
+    def _run_policy(self, policy_obs: dict[str, Any], generator: torch.Generator | None) -> DiffusionOutput:
         result = self.policy.get_action(policy_obs, {"generator": generator} if generator is not None else None)
         actions = result[0] if isinstance(result, tuple) else result
         if not isinstance(actions, Mapping):
@@ -137,6 +182,55 @@ class Gr00tN1d7Pipeline(nn.Module):
         # Return actions via output.output (like the DreamZero OpenPI policy) so the engine's
         # empty-output guard passes.
         return DiffusionOutput(output={"actions": _to_float32_action_dict(actions)})
+
+    def _run_policy_batch(
+        self, pending: list[tuple[int, dict[str, Any], torch.Generator | None]]
+    ) -> list[DiffusionOutput]:
+        """Serve several requests with one ``get_action`` call when their observations allow it.
+
+        Each request's generator draws its own sample's noise, so a request gets the same
+        initial noise as when it is served alone. If the observations cannot be merged, or
+        the batched call fails, every request is served on its own and only the failing
+        ones report an error.
+        """
+        observations = [policy_obs for _, policy_obs, _ in pending]
+        generators = [generator for _, _, generator in pending]
+        merged = _merge_observations(observations)
+        if merged is not None:
+            options = {"generator": generators} if any(g is not None for g in generators) else None
+            # The batched call draws each request's noise from its generator before it can
+            # fail, so keep the states to give a retried request the noise it draws alone.
+            generator_states = [g.get_state() if g is not None else None for g in generators]
+            try:
+                result = self.policy.get_action(merged, options)
+                actions = result[0] if isinstance(result, tuple) else result
+                if not isinstance(actions, Mapping):
+                    raise TypeError(f"GR00T policy returned {type(actions).__name__}; expected dict actions.")
+                per_request = _split_actions(_to_float32_action_dict(actions), len(pending))
+            # The runner does not isolate exceptions per request, so a failure here would fail
+            # every robot in the wave. Retry one request at a time so only the culprit errors.
+            except Exception:
+                logger.warning(
+                    "GR00T: batched inference of %d requests failed; serving them one at a time.",
+                    len(pending),
+                    exc_info=True,
+                )
+                for generator, state in zip(generators, generator_states):
+                    if generator is not None and state is not None:
+                        generator.set_state(state)
+            else:
+                return [DiffusionOutput(output={"actions": actions_i}) for actions_i in per_request]
+        else:
+            logger.debug("GR00T: %d observations cannot be merged; serving them one at a time.", len(pending))
+
+        outputs = []
+        for policy_obs, generator in zip(observations, generators):
+            try:
+                outputs.append(self._run_policy(policy_obs, generator))
+            # Reported on this request only; the other requests in the wave still get actions.
+            except Exception as exc:
+                outputs.append(DiffusionOutput(error=f"GR00T policy inference failed: {exc}"))
+        return outputs
 
 
 def _noise_generator(
@@ -168,6 +262,60 @@ def _noise_generator(
     if sampling_params.seed is not None:
         return torch.Generator(device=device).manual_seed(int(sampling_params.seed))
     return None
+
+
+def _merge_observations(observations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Concatenate single-sample observations along the batch axis.
+
+    Mirrors ``Gr00tPolicy._unbatch_observation``: video and state arrays carry a leading
+    batch dimension and language is a per-sample list. Returns ``None`` when the
+    observations cannot be merged: different modalities or keys, a sample with a batch
+    size other than one, different dtypes, or mismatched trailing shapes.
+    """
+    first = observations[0]
+    if not isinstance(first.get("video"), Mapping) or not first["video"]:
+        return None
+    try:
+        for obs in observations:
+            if set(obs) != set(first):
+                return None
+            for modality in first:
+                if not isinstance(obs[modality], Mapping) or set(obs[modality]) != set(first[modality]):
+                    return None
+                # A value without a length (None, a scalar) raises TypeError here, so the
+                # wave falls back to one call per request and only that request errors.
+                if any(len(value) != 1 for value in obs[modality].values()):
+                    return None
+                # Concatenating would silently upcast, e.g. uint8 frames next to float ones.
+                if modality != "language" and any(
+                    np.asarray(obs[modality][key]).dtype != np.asarray(first[modality][key]).dtype
+                    for key in first[modality]
+                ):
+                    return None
+        merged: dict[str, Any] = {}
+        for modality, keys in first.items():
+            if modality == "language":
+                merged[modality] = {
+                    key: [sample for obs in observations for sample in obs[modality][key]] for key in keys
+                }
+            else:
+                merged[modality] = {
+                    key: np.concatenate([np.asarray(obs[modality][key]) for obs in observations], axis=0)
+                    for key in keys
+                }
+    except (TypeError, ValueError):
+        return None
+    return merged
+
+
+def _split_actions(actions: dict[str, np.ndarray], num_requests: int) -> list[dict[str, np.ndarray]]:
+    """Slice a batched action dict into one single-sample action dict per request."""
+    for key, value in actions.items():
+        if value.shape[0] != num_requests:
+            raise RuntimeError(
+                f"GR00T policy returned action {key!r} with batch size {value.shape[0]} for {num_requests} requests."
+            )
+    return [{key: value[i : i + 1] for key, value in actions.items()} for i in range(num_requests)]
 
 
 def _normalize_observation(robot_obs: Mapping[str, Any], *, language_key: str) -> dict[str, Any]:
