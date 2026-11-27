@@ -10,6 +10,61 @@ import os
 from urllib.parse import urlsplit
 
 import pytest
+
+# === BEGIN temporary diagnostic probe (A5 torch/triton double registration) ===
+# Reproduce/inspect the "Only a single TORCH_LIBRARY can be used to register the
+# namespace triton" failure seen only on the A5 NPU agent. Remove before merge.
+import sys
+import traceback
+
+
+def _a5_torch_probe() -> None:
+    import os as _os
+    import pathlib as _pathlib
+    import subprocess as _sp
+
+    import torch as _torch
+
+    print("PROBE torch file:", _torch.__file__)
+    print("PROBE torch version:", _torch.__version__)
+    print(
+        "PROBE plugin autoload:",
+        _os.environ.get("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "enabled(default)"),
+    )
+    try:
+        _pkgs = _sp.check_output(
+            [_sp.sys.executable, "-m", "pip", "list", "--format=freeze"]
+        ).decode().splitlines()
+        print(
+            "PROBE torch/triton pkgs:",
+            [p for p in _pkgs if any(k in p.lower() for k in ("torch", "triton"))],
+        )
+    except Exception as _e:  # noqa: BLE001
+        print("PROBE pip list failed:", _e)
+    print(
+        "PROBE sys.meta_path:",
+        [m.__name__ if hasattr(m, "__name__") else str(m) for m in sys.meta_path],
+    )
+    print("PROBE sys.path:", sys.path)
+    _torch_dir = _pathlib.Path(_torch.__file__).parent.parent
+    for _pth in _torch_dir.glob("*.pth"):
+        print("PROBE .pth file:", _pth, "->", _pth.read_text().strip())
+
+    # Deliberately force a second execution of torch/__init__.py to capture the
+    # full traceback of where the duplicate "triton" TORCH_LIBRARY happens.
+    sys.modules.pop("torch", None)
+    try:
+        import torch  # noqa: F401
+    except RuntimeError:
+        print("PROBE reimport traceback:")
+        for _fr in traceback.extract_tb(sys.exc_info()[2]):
+            print(f"PROBE   {_fr.filename}:{_fr.lineno} in {_fr.name}: {_fr.line}")
+        raise
+
+
+_a5_torch_probe()
+# === END temporary diagnostic probe ===
+
 from PIL import Image
 
 from tests.helpers.client import OnlineOmniClient
