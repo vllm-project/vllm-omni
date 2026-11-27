@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 from vllm_omni.diffusion.models.minimax_h3 import vae
 from vllm_omni.diffusion.models.minimax_h3.npu import audio_tconv
@@ -49,3 +50,54 @@ def test_width_one_fir_fallback_is_not_a_fast_path_execution(mocker):
     packed_forward.assert_not_called()
     assert module._h3_fir_fallback_calls == 1
     assert not hasattr(module, "_h3_fir_c16_calls")
+
+
+def test_stage_installer_maps_the_latent_threshold_per_stage(mocker):
+    decoder = nn.Module()
+    first = nn.ConvTranspose1d(2, 2, kernel_size=4, stride=2, padding=1)
+    second = nn.ConvTranspose1d(2, 1, kernel_size=4, stride=2, padding=1)
+    decoder.ups = nn.ModuleList([nn.ModuleList([first]), nn.ModuleList([second])])
+    phase = mocker.patch.object(audio_tconv, "_conv_transpose1d_as_conv1d", return_value="phase")
+    assert audio_tconv.install_bigvgan_upsamplers(decoder) == 2
+
+    def probe(layer, length):
+        layer.eval()
+        layer._h3_stage_original_forward = mocker.Mock(return_value="native")
+        tensor = SimpleNamespace(
+            device=SimpleNamespace(type="npu"),
+            dtype=torch.float32,
+            ndim=3,
+            shape=(1, 2, length),
+            numel=lambda: 2 * length,
+        )
+        return layer(tensor)
+
+    assert probe(first, 127) == "native"
+    assert probe(first, 128) == "phase"
+    assert probe(second, 255) == "native"
+    assert probe(second, 256) == "phase"
+    assert phase.call_count == 2
+
+
+def test_decoder_pipeline_forwards_the_audio_decoder_switch(mocker, tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3_decoder as decoder_module
+
+    mocker.patch.object(decoder_module, "resolve_minimax_h3_decoder_model_path", return_value=str(tmp_path))
+    mocker.patch.object(decoder_module, "resolve_h3_lightvae_decoder_path", return_value=None)
+    mocker.patch.object(decoder_module, "get_local_device", return_value=torch.device("cpu"))
+    video = mocker.patch.object(decoder_module, "MiniMaxH3VideoVAE")
+    audio = mocker.patch.object(decoder_module, "MiniMaxH3AudioVAE")
+    mocker.patch.object(decoder_module.MiniMaxH3DecoderPipeline, "setup_diffusion_pipeline_profiler")
+    config = SimpleNamespace(
+        model="unused",
+        revision=None,
+        task_type=None,
+        trust_remote_code=False,
+        additional_config={"audio_vae_optimized_decode": True},
+        vae_stack_tiles=True,
+        enable_diffusion_pipeline_profiler=False,
+        parallel_config=SimpleNamespace(),
+    )
+    decoder_module.MiniMaxH3DecoderPipeline(od_config=config)
+    assert audio.call_args.kwargs["optimize_decode"] is True
+    assert video.called
