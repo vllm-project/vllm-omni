@@ -1129,13 +1129,14 @@ class _UnsupportedOnlineQuantMethod:
 def _compact_layer_offload_config(
     components: list[str],
     layer_options: dict[str, dict[str, str]],
+    data_parallel_size: int = 2,
 ) -> SimpleNamespace:
     return _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=False,
             tensor_parallel_size=1,
-            data_parallel_size=2,
+            data_parallel_size=data_parallel_size,
             sequence_parallel_size=1,
         ),
         quantization_config=None,
@@ -1230,6 +1231,47 @@ def test_rank_local_encoder_quantization_does_not_mark_dit_mmap_plan_online(monk
 
     assert loader.load_model(load_device="cpu") is model
     assert planned_online_quantization == [False]
+
+
+def test_unselected_quantized_dit_does_not_disqualify_encoder_mmap_plan(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    # Encoder-only selection reaches the distributed loader through the
+    # explicit AllGather transfer, the profile from the PR description's
+    # diagnostic. A single DLO rank keeps the disk-backed encoder eligible
+    # (rank-local alone resolves to plain layerwise, which has no loader plan).
+    config = _compact_layer_offload_config(
+        ["text_encoder"],
+        {"text_encoder": {"weight_transfer": "allgather"}},
+        data_parallel_size=1,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = _UnsupportedOnlineQuantMethod()
+    model.text_encoder = nn.Linear(2, 2, bias=False)
+    # The encoder declares its own mmap backing, so it stays eligible to be
+    # planned even though the unselected DiT is online-quantized.
+    model._offload_plan = OffloadPlan(
+        encoder_component_types={"text_encoder": "text_encoder"},
+        one_shot_component_paths=frozenset({"text_encoder"}),
+        component_backing={"text_encoder": BackingKind.CHECKPOINT_MMAP},
+    )
+    planned_calls: list[tuple[bool, tuple]] = []
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    loader.load_weights = lambda _model: None  # type: ignore[method-assign]
+    loader._process_weights_after_loading = lambda *_args: None  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+
+    def capture_plan(*_args, **kwargs):
+        planned_calls.append((kwargs["online_quantization"], kwargs["encoder_modules"]))
+        return HostWeightPlanResult(None, "test fallback")
+
+    monkeypatch.setattr(loader_mod, "build_checkpoint_mmap_plan", capture_plan)
+
+    assert loader.load_model(load_device="cpu") is model
+    assert planned_calls == [(False, (("text_encoder", model.text_encoder),))]
 
 
 def test_dlo_plan_loads_component_sources_outside_planned_dit(monkeypatch):

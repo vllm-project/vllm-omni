@@ -902,6 +902,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         ),
                     )
                     if dit_mmap_modules or encoder_mmap_modules:
+                        # Scope the online-quantization preflight to the DiTs
+                        # actually being planned: an unselected DiT cannot
+                        # disqualify an otherwise eligible BF16 encoder. A
+                        # planned encoder keeps its own rules -- AllGather
+                        # rejects unsupported methods separately, rank-local
+                        # streaming supports them.
                         plan_result = build_checkpoint_mmap_plan(
                             model,
                             dit_modules=dit_mmap_modules,
@@ -909,7 +915,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             model_path=str(self.od_config.model) or None,
                             tensor_parallel_size=tensor_parallel_size,
                             use_hsdp=use_hsdp,
-                            online_quantization=any(self._has_online_quant(dit) for dit in modules.dits),
+                            online_quantization=any(self._has_online_quant(module) for _, module in dit_mmap_modules),
                             has_distilled_lora=has_distilled_lora,
                             encoder_modules=encoder_mmap_modules,
                         )
