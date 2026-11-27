@@ -1459,17 +1459,18 @@ def fused_qkv_split_norm_rope(
         except ImportError:
             pass
         else:
-            cos, sin = rope_table.tensor_split(2, dim=-1)
+            rotary_dim = rope_table.shape[-1]
+            cos, sin = rope_table.reshape(qkv.shape[0], 2, rotary_dim // 2).transpose(0, 1).contiguous().unbind(0)
             q, k, v = eagle_split_norm_rope_concat(
                 packed,
                 q_weight,
                 k_weight,
-                cos.contiguous(),
-                sin.contiguous(),
+                cos,
+                sin,
                 head_counts,
                 norm_type=3,
                 rope_mode=1,
-                rotary_dim=rope_table.shape[-1],
+                rotary_dim=rotary_dim,
                 epsilon=eps,
                 output_bnsd=False,
             )
