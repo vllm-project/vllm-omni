@@ -6796,7 +6796,7 @@ class TestTTSAsyncOffloading:
                 "additional_information": {"voice": ["test"]},
             }
         )
-        request = OpenAICreateSpeechRequest(input="hello", voice="test", seed=42)
+        request = OpenAICreateSpeechRequest(input="hello", voice="test", seed=42, seeded_isolation=True)
 
         asyncio.run(voxtral_server._prepare_speech_generation(request))
 
@@ -6804,6 +6804,28 @@ class TestTTSAsyncOffloading:
         assert stage0_params.seed == 42
         assert stage0_params.extra_args["tts_local_seed"] == 42
         assert stage0_params.extra_args["omni_user_seed"] is True
+        assert voxtral_server.engine_client.default_sampling_params_list[0].extra_args is None
+
+    def test_prepare_speech_generation_seed_alone_keeps_normal_batching(self, voxtral_server, mocker: MockerFixture):
+        """#11226: a client seed controls randomness only - no isolation marker."""
+        default_params = voxtral_server.engine_client.default_sampling_params_list[0]
+        default_params.seed = None
+        default_params.extra_args = None
+        voxtral_server.engine_client.collective_rpc = mocker.AsyncMock(return_value=[False])
+        voxtral_server._adapter._build_prompt_async = mocker.AsyncMock(
+            return_value={
+                "prompt_token_ids": [1, 2, 3],
+                "additional_information": {"voice": ["test"]},
+            }
+        )
+        request = OpenAICreateSpeechRequest(input="hello", voice="test", seed=42)
+
+        asyncio.run(voxtral_server._prepare_speech_generation(request))
+
+        stage0_params = voxtral_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.seed == 42
+        assert stage0_params.extra_args["tts_local_seed"] == 42
+        assert "omni_user_seed" not in stage0_params.extra_args
         assert voxtral_server.engine_client.default_sampling_params_list[0].extra_args is None
 
     def test_prepare_speech_generation_awaits_qwen3_tts_async(self, qwen3_tts_server, mocker: MockerFixture):

@@ -220,10 +220,17 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         ge=_INT64_MIN,
         le=_INT64_MAX,
-        description="Random seed for reproducible generation. An explicitly set seed isolates the "
-        "request from other batched work: it waits for the engine to drain and runs alone, which makes "
-        "its output byte-reproducible but lowers throughput while it runs. A seed copied from a stage's "
-        "default_sampling_params does not trigger this.",
+        description="Random seed for reproducible generation. A seed controls this request's "
+        "sampling randomness only; it keeps normal continuous-batching admission.",
+    )
+    seeded_isolation: bool = Field(
+        default=False,
+        description=(
+            "Explicit opt-in to scheduler isolation for a seeded request: it waits for the "
+            "engine to drain and runs alone, which makes its output byte-reproducible under "
+            "concurrency but lowers throughput while it runs. Requires a seed; a seed alone "
+            "no longer isolates the request."
+        ),
     )
     initial_codec_chunk_frames: int | None = Field(
         default=None,

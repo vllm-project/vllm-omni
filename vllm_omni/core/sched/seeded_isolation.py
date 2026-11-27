@@ -23,9 +23,11 @@ instead of under one (3.6 s on an RTX 4080 SUPER; 5.9 s on an RTX 6000 Ada in an
 independent run), while 8 unseeded requests alone stay at 0.8-1.0 s.
 
 The request opts in through the ``omni_user_seed`` marker that the speech
-serving path sets when the client supplies a seed; stages that copy a
-``default_sampling_params`` seed, and the other entrypoints that do the same,
-stay unmarked. There is no process or engine switch. This module only decides *when* to isolate, so it can be
+serving path sets when the client explicitly asks for isolation on a seeded
+request (``seeded_isolation`` on the speech request); a client seed alone
+controls request-local randomness and keeps normal batching. Stages that copy
+a ``default_sampling_params`` seed, and the other entrypoints that do the same,
+stay unmarked. This module only decides *when* to isolate, so it can be
 unit-tested without a GPU or a scheduler instance.
 """
 
@@ -60,13 +62,16 @@ def isolation_plan(
 
 
 def request_is_seeded(sampling_params: object | None) -> bool:
-    """Whether the client asked for this request to be reproducible.
+    """Whether the client asked for this request to be isolated.
 
-    A request whose ``seed`` came from a stage's ``default_sampling_params`` is
-    not an opt-in: those seeds apply to every request on that deployment, so
-    isolating them would serialize the whole engine. The serving layer marks a
-    client-supplied seed with ``extra_args["omni_user_seed"]``; anything
-    unmarked keeps normal batching.
+    A client seed alone is not an opt-in: it only controls request-local
+    randomness, so a request stays batched unless the client explicitly asks
+    for isolation (``seeded_isolation`` on the speech request; the serving
+    layer then marks it with ``extra_args["omni_user_seed"]``). A request
+    whose ``seed`` came from a stage's ``default_sampling_params`` is never
+    marked either: those seeds apply to every request on that deployment, so
+    isolating them would serialize the whole engine. Anything unmarked keeps
+    normal batching.
     """
     if sampling_params is None:
         return False

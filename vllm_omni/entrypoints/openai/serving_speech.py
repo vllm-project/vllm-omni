@@ -2597,10 +2597,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if stage0_params.extra_args is None:
                 stage0_params.extra_args = {}
             stage0_params.extra_args["tts_local_seed"] = request.seed
-            # Only this stage received the client seed, so it is the only one
-            # that opts into seeded-request isolation; stage defaults stay
-            # unmarked and keep normal batching.
-            stage0_params.extra_args["omni_user_seed"] = True
+            # #11226: a client seed alone controls request-local randomness and
+            # keeps normal batching; isolation is an explicit opt-in on the
+            # request. Only this stage received the client seed, so it is the
+            # only one that can opt into seeded-request isolation; stage
+            # defaults stay unmarked and keep normal batching.
+            if request.seeded_isolation:
+                stage0_params.extra_args["omni_user_seed"] = True
 
         # When word_timestamps is requested, also ask for the aligner stage's
         # output so the orchestrator drives the request through the forced-aligner
