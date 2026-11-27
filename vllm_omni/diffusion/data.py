@@ -1644,6 +1644,17 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
+        if self.parallel_config.allgather_degree > 1:
+            for config in (
+                self.diffusion_attention_config,
+                *(self.diffusion_attention_schedule.profiles.values() if self.diffusion_attention_schedule else ()),
+            ):
+                for spec in (config.default, *config.per_role.values()):
+                    parallel = spec.block_sparse.parallel if spec and spec.block_sparse else None
+                    if parallel is not None and not parallel.get("rainfusion_reorder_hoist", True):
+                        raise ValueError(
+                            "CP x Ulysses requires rainfusion_reorder_hoist=true; otherwise use pure Ulysses"
+                        )
         validate_kv_cache_dtype_vs_attention_specs(
             self.diffusion_kv_cache_dtype, self.diffusion_attention_config, self.diffusion_attention_schedule
         )

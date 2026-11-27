@@ -15,7 +15,7 @@ from vllm_omni.diffusion import forward_context
 from vllm_omni.diffusion.attention.backends import rainfusion_attn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 from vllm_omni.diffusion.attention.parallel.ulysses_allgather import UlyssesAllGatherKVParallelAttention
-from vllm_omni.diffusion.data import MindIEParallelConfig
+from vllm_omni.diffusion.data import MindIEParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelResources
 from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
 from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence
@@ -340,3 +340,14 @@ def test_teardown_drains_before_releasing_state_and_is_idempotent(adapter, monke
     assert drained == [state]
     with pytest.raises(RuntimeError, match="closed"):
         run(adapter)
+
+
+def test_cp_rejects_disabled_rf_hoisting_at_config_build():
+    sparse = {
+        "backend": "RAINFUSION_ATTN",
+        "block_sparse": {"sparsity": 0.8, "parallel": {"rainfusion_reorder_hoist": False}},
+    }
+    with pytest.raises(ValueError, match="requires rainfusion_reorder_hoist=true"):
+        OmniDiffusionConfig(
+            parallel_config={"ulysses_degree": 8, "allgather_degree": 2}, diffusion_attention_config={"default": sparse}
+        )
