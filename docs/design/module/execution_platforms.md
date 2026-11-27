@@ -26,6 +26,11 @@ primary_code_path_owners:
       - vllm_omni/platforms/rocm/**
     owners:
       - "@haic0"
+  # Additional owner for the MUSA platform tree
+  - paths:
+      - vllm_omni/platforms/musa/**
+    owners:
+      - "@yeahdongcn"
 related_code_paths: []
 depends_on:
   - ar_runtime.md
