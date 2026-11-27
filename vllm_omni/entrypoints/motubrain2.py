@@ -86,14 +86,13 @@ class Motubrain2Serving:
             request_id=f"motubrain2-{random_uuid()}",
             sampling_params_list=[params],
         ):
-            output = result.multimodal_output
+            output = result.custom_output if native_outputs else result.multimodal_output
         if not isinstance(output, Mapping):
             raise RuntimeError("Missing Motubrain output")
         if native_outputs:
-            tensors = output.get("native_outputs")
-            if not isinstance(tensors, Mapping) or set(tensors) != set(_NATIVE_OUTPUTS):
+            if set(output) != set(_NATIVE_OUTPUTS):
                 raise RuntimeError("Missing native Motubrain outputs")
-            return {key: np.asarray(tensors[key]) for key in _NATIVE_OUTPUTS}
+            return {key: np.asarray(output[key]) for key in _NATIVE_OUTPUTS}
         actions = np.asarray(output["actions"], dtype=np.float32)
         expected = (self.metadata["action_horizon"], self.metadata["action_dim"])
         if actions.shape != expected or not np.isfinite(actions).all():

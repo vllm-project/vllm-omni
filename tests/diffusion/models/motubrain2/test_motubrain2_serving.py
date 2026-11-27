@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Exercise the dedicated Motubrain socket from a standalone MessagePack client."""
 
+from types import SimpleNamespace
+
 import msgpack
 import numpy as np
 import pytest
@@ -11,7 +13,7 @@ from fastapi.testclient import TestClient
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.diffusion.models.motubrain2_pipeline_config import MOTUBRAIN2_PIPELINE
-from vllm_omni.entrypoints.motubrain2 import router
+from vllm_omni.entrypoints.motubrain2 import Motubrain2Serving, router
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -51,9 +53,12 @@ def test_astribot_client_handshake_inference_and_reset():
         async def generate(self, *, prompt, request_id, sampling_params_list):
             (params,) = sampling_params_list
             calls.append((prompt, params))
-            yield OmniRequestOutput.from_diffusion(
-                request_id=request_id, images=[], multimodal_output={"actions": actions, "native_outputs": native}
-            )
+            if params.extra_args["robot_obs"].get("return_native_outputs"):
+                yield OmniRequestOutput.from_diffusion(request_id=request_id, images=[], custom_output=native)
+            else:
+                yield OmniRequestOutput.from_diffusion(
+                    request_id=request_id, images=[], multimodal_output={"actions": actions}
+                )
 
     app = FastAPI()
     app.state.engine_client = Engine()
@@ -99,3 +104,14 @@ def test_astribot_client_handshake_inference_and_reset():
         assert params.extra_args["reset"] is True
         assert params.seed == 0 and params.num_inference_steps == 2
         assert "motubrain2_session_seed" not in params.extra_args
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{}, {"decoded_action": np.zeros((1, 1))}])
+async def test_incomplete_native_output_is_rejected(payload):
+    async def generate(**kwargs):
+        yield OmniRequestOutput.from_diffusion(request_id=kwargs["request_id"], images=[], custom_output=payload)
+
+    serving = Motubrain2Serving(SimpleNamespace(generate=generate), {})
+    with pytest.raises(RuntimeError, match="Missing native Motubrain outputs"):
+        await serving.infer({"return_native_outputs": True}, session_id="robot", reset=True)

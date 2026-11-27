@@ -316,7 +316,8 @@ def test_native_output_preserves_partial_validity_and_invalidates_rtc_state(make
     pipeline.policy.valid[-1, 0] = False
     result = pipeline(_request(extra))
     assert result.error is None
-    mask = result.output["native_outputs"]["decoded_valid"]
+    assert result.output is None
+    mask = result.custom_output["decoded_valid"]
     assert mask.dtype == np.bool_
     np.testing.assert_array_equal(mask, pipeline.policy.valid.numpy())
     assert pipeline.sessions.peek("robot-a") is None

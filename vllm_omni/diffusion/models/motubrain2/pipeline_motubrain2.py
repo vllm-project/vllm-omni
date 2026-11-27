@@ -347,11 +347,12 @@ class Motubrain2Pipeline(nn.Module):
             return DiffusionOutput(error="Motubrain returned invalid controller coordinates.")
         if actions.shape != shape or not np.isfinite(actions[valid]).all():
             return DiffusionOutput(error=f"Motubrain must return finite valid controller actions shaped {shape}.")
-        output: dict[str, Any] = {"actions": actions}
         if native_outputs:
-            output["native_outputs"] = {
-                key: np.asarray(result[key]) for key in ("video", "action", "decoded_action", "decoded_valid")
-            }
+            # The engine forwards custom_output when no regular output or media is set.
+            tensors = {key: np.asarray(result[key]) for key in ("video", "action", "decoded_action", "decoded_valid")}
+            output = DiffusionOutput(custom_output=tensors)
+        else:
+            output = DiffusionOutput(output={"actions": actions})
         if session_id is not None and (session_seed is not None or self.rtc_config):
             # A masked native diagnostic can advance the RNG, but cannot seed RTC.
             last_action = actions.copy() if self.rtc_config and valid.all() else None
@@ -364,4 +365,4 @@ class Motubrain2Pipeline(nn.Module):
                 session = self.sessions.get(session_id)
                 session.last_action = last_action
                 session.rng_state = rng_state
-        return DiffusionOutput(output=output)
+        return output

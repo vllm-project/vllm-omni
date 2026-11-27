@@ -16,8 +16,8 @@ from PIL import Image
 from safetensors.torch import load_file
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.models.motubrain2 import pipeline_motubrain2
-from vllm_omni.diffusion.output_formatter import format_diffusion_outputs, normalize_diffusion_postprocess_output
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.entrypoints.motubrain2 import router
@@ -84,6 +84,10 @@ def test_native_cli_matches_pipeline(tmp_path, monkeypatch):
         with Image.open(assets / filename) as frame:
             obs[camera] = np.array(frame.convert("RGB"))
 
+    diffusion = DiffusionEngine.__new__(DiffusionEngine)
+    diffusion.od_config = pipeline.od_config
+    diffusion.post_process_func = None
+
     class TinyEngine:
         def get_diffusion_od_config(self):
             metadata = {"action_horizon": pipeline.horizon, "action_dim": pipeline.action_dim}
@@ -94,13 +98,7 @@ def test_native_cli_matches_pipeline(tmp_path, monkeypatch):
             request = OmniDiffusionRequest(prompt=prompt, sampling_params=params, request_id=request_id)
             result = pipeline(DiffusionRequestBatch([request]))
             assert result.error is None
-            (formatted,) = format_diffusion_outputs(
-                request=request,
-                od_config=pipeline.od_config,
-                diffusion_output=result,
-                output_data=result.output,
-                postprocess_output=normalize_diffusion_postprocess_output(result.output),
-            )
+            (formatted,) = diffusion.postprocess_output(request, result)
             yield formatted
 
     app = FastAPI()
