@@ -60,8 +60,8 @@ connectors:
       # Enable NPU cross-reference CFM batching for same-shape and ragged
       # requests, including different token/query, reference prompt and
       # conformer/CFM attention-history lengths and mixed final-chunk flags.
-      # Requires FP32 fused Whole-Euler, FP32 attention caches, no slot pool
-      # and code2wav_min_batch_size=1; otherwise warn and retain existing dispatch.
+      # Requires fused Whole-Euler with matching FP32 or FP16 attention caches,
+      # no slot pool and code2wav_min_batch_size=1.
       # Encoder/HiFT run in compatible subgroups; CFM uses per-request masks,
       # noise offsets and cache trimming. CNN/HiFT cache shapes, dtypes,
       # devices and the cache-epoch policy still constrain batching.
@@ -90,7 +90,6 @@ connectors:
       # startup instead of the first request. Overlays that still set
       # cfm_graph_precapture_after_load get a warning; it no longer has any effect.
       cfm_graph_precapture_at_init: true
-      # Non-CUDA retains FP32 Flow (required for NPU cross-reference CFM).
       # CUDA reference and flow tuning is scoped in platforms.cuda.connectors.
       token2wav_n_timesteps: 5
 
@@ -364,6 +363,8 @@ platforms:
     connectors:
       connector_of_shared_memory:
         extra:
+          # Use FP16 CFM while keeping the encoder and HiFT in FP32.
+          cfm_npu_float16: true
           codec_chunk_frames: 32
           token2wav_spk_cpu_reference: true
           token2wav_runtime_prompt_cache_size: 64

@@ -68,8 +68,8 @@ The CUDA duplex profile uses MRv2 on all three stages.
 The shared Code2Wav backend defaults to the fused CFM body on CUDA and NPU,
 and on ROCm when FP16 CFM or full-flow precision is selected, subject to
 architecture and attention-cache eligibility. CUDA accepts matching FP32 or
-FP16 estimator/cache types; ROCm accepts matching FP16 types; NPU retains FP32
-eligibility. CUDA FP32 fusion requires TF32 to be allowed. With
+FP16 estimator/cache types; ROCm accepts matching FP16 types; NPU accepts
+matching FP32 or FP16 types. CUDA FP32 fusion requires TF32 to be allowed. With
 `token2wav_float16: true` or `cfm_float16: true`, CUDA and ROCm fusion is
 independent of TF32, as is NPU fusion. Set
 `cfm_fused_body: false` in the stage connector extra to restore the original
@@ -94,7 +94,8 @@ dots with FP32 accumulation. Older CUDA devices and ROCm use the fused body's
 SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
 AddLayerNorm, independent of TF32. Unsupported DiT layouts and cache types
 retain the original body. CUDA supports matching FP32 or FP16 estimator/cache
-types; ROCm supports matching FP16 types; NPU supports FP32. Other platforms
+types; ROCm supports matching FP16 types; NPU supports matching FP32 or FP16
+types. Other platforms
 retain their existing default.
 Set `cfm_fused_body: false` in connector `extra` to restore the original body.
 On CUDA, disabling TF32 with `token2wav_allow_tf32: false` or
@@ -111,6 +112,15 @@ encoder, speaker extraction and HiFT retain their existing precision. This
 differs from `token2wav_float16`, which affects the whole flow. FP16 CFM changes
 rounding and requires speech-quality and service validation; it is off by
 default and does not reduce the number of flow steps.
+
+`cfm_npu_float16: true` in the same connector `extra` selects FP16 CFM on
+Ascend. The estimator and its CNN/attention caches use FP16. The noise table,
+CFG arithmetic, Euler integration and step sizes stay in FP32. The flow
+encoder, speaker extraction and HiFT keep their existing precision. Fused
+Whole-Euler and cross-reference batching accept matching FP16 caches. The
+bundled Ascend deploy profile enables FP16 CFM by default. Set
+`cfm_npu_float16: false` in its NPU connector override to select FP32 CFM.
+Both precisions use SDPA.
 
 `token2wav_spk_cuda_graph: true` opts the CUDA Torch CAM++ backend into
 exact-shape graph replay. CPU/NPU or TensorRT speaker configurations keep their
@@ -277,10 +287,10 @@ measuring steady-state RTF.
 With CUDA ragged Whole-Euler enabled, ready requests with different reference
 audio can share a Code2Wav decode batch. This also merges compatible tensor
 histories of different lengths for a single reference; it does not enable slot
-pooling. Other configurations retain reference-specific, exact-shape buckets,
-preserving CFM step-graph and TRT dispatch. Mixed-history arena replay is
-restricted to CUDA; the existing opt-in slot path is unchanged on other
-platforms.
+pooling. On Ascend, `cfm_npu_cross_reference_batching` admits mixed references
+and histories on fused Whole-Euler graphs with matching FP32 or FP16 attention
+caches, no slot pool, and `code2wav_min_batch_size=1`. Configurations outside
+these paths retain reference-specific, exact-shape buckets.
 
 Reference extraction and initial cache setup remain separate for each
 reference; speaker conditioning, attention lengths and cache trimming stay
@@ -437,11 +447,11 @@ body rather than per block. CUDA and the unfused DiT body are unaffected.
 
 ## NPU packed QKV normalization and cache writes
 
-The NPU fused CFM body reuses `qkv_head_layer_norm` for FP32 packed QKV with
-standard per-head LayerNorm. One Triton kernel reads the packed projection,
-normalizes Q/K in FP32 and writes Q plus the current K/V frames directly into
-the existing split cache. LayerNorm epsilon and affine parameters are retained;
-NPU launch disables implicit floating-point multiply/add contraction. Reduction
+The NPU fused CFM body reuses `qkv_head_layer_norm` for FP32 and FP16 packed QKV
+with matching cache and per-head LayerNorm parameter dtypes. One Triton kernel
+reads the packed projection, evaluates the reductions and affine in FP32, and
+writes Q and the current K/V frames in the input dtype. NPU launch disables
+implicit floating-point multiply/add contraction. Reduction
 rounding can differ from ACLNN, so this does not promise bitwise-identical audio.
 Unsupported types, partial affine parameters, indexed slot writes and environments
 without Triton retain the native operator path. CUDA launch behavior is unchanged.
@@ -455,7 +465,7 @@ Migration: the former stage-2 `additional_config.code2wav_fused_qkv_norm`
 key has been removed. A leftover value, including `false`, is ignored and
 does not disable fusion after restart. Remove this key from deployment and
 overlay YAML files. The NPU stage reader emits a one-time warning when it
-encounters the stale key; eligible FP32 inputs still automatically use fusion,
+encounters the stale key; eligible FP32 and FP16 inputs automatically use fusion,
 and unsupported inputs retain the native fallback.
 
 NPU compilation, graph replay, numerical parity and service performance must be
@@ -640,7 +650,7 @@ K-step, two Code2Wav replicas on one GPU, grouped reference setup of four,
 HiFT continuation shapes 3/43, speaker/S3 graph replay, and Flow FP16.
 The existing turn deployment inherits these defaults. Connector tuning is scoped
 to `platforms.cuda.connectors` in the existing YAML; other platforms retain their
-shared defaults, including FP32 Flow for NPU cross-reference CFM batching.
+shared defaults, including FP32 Flow on NPU unless FP16 CFM is selected.
 Speaker replay also checks the selected backend, so CPU ONNX Runtime and
 TensorRT overrides remain usable. The development runs used private CUDA MPS
 on one L20X; the CUDA tuning is not qualified for other platforms.

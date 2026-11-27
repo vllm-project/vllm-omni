@@ -1114,8 +1114,8 @@ class WholeEulerExecutionArena:
     def get_speakers_staging(self, batch_size: int, spk_dim: int) -> torch.Tensor:
         return self._buffer("speakers", (2 * batch_size, spk_dim))
 
-    def get_x_staging(self, batch_size: int, channels: int, mel_width: int) -> torch.Tensor:
-        return self._buffer("x", (batch_size, channels, mel_width))
+    def get_x_staging(self, batch_size: int, channels: int, mel_width: int, *, dtype: torch.dtype) -> torch.Tensor:
+        return self._buffer("x", (batch_size, channels, mel_width), dtype=dtype)
 
     def get_mu_staging(self, batch_size: int, channels: int, mel_width: int) -> torch.Tensor:
         return self._buffer("mu", (2 * batch_size, channels, mel_width))
@@ -1437,8 +1437,9 @@ class WholeEulerCFMGraphWrapper:
             "peak_reserved": 0,
         }
 
-        self.timeline, self.dt_steps = _euler_timeline(self.n_timesteps, self.device, self.dtype)
-        self.time_steps = [self.timeline[i] for i in range(self.n_timesteps)]
+        self.timeline, self.dt_steps = _euler_timeline(self.n_timesteps, self.device, self._euler_dtype)
+        time_inputs = self.timeline.to(dtype=self.dtype)
+        self.time_steps = [time_inputs[i] for i in range(self.n_timesteps)]
         arena_args = {
             "estimator": self.estimator,
             "n_timesteps": self.n_timesteps,
@@ -1494,6 +1495,11 @@ class WholeEulerCFMGraphWrapper:
         self._flush()
         self._retire(self._slot_graphs)
 
+    @property
+    def _euler_dtype(self) -> torch.dtype:
+        # Keep the solver state and step sizes in FP32 for the FP16 Ascend DiT.
+        return torch.float32 if self.device.type == "npu" and self.dtype == torch.float16 else self.dtype
+
     def _run_euler_loop(
         self,
         statics: _WholeEulerStatics,
@@ -1507,9 +1513,11 @@ class WholeEulerCFMGraphWrapper:
         # A slot-pool graph attends to the pool in place: no cache goes in.
         slotted = statics.slot_rows is not None
         no_cache = [None] * len(self.estimator.blocks)
+        mixed_precision = self._euler_dtype != self.dtype
         for step in range(self.n_timesteps):
             dt = self.dt_steps[step]
-            x_cfg = torch.cat((cur_x, cur_x), dim=0)
+            model_x = cur_x.to(dtype=self.dtype) if mixed_precision else cur_x
+            x_cfg = torch.cat((model_x, model_x), dim=0)
             speaker_features = statics.speakers_cfg.unsqueeze(-1).expand(-1, -1, width)
             estimator_input = torch.cat((x_cfg, statics.mu_cfg, speaker_features, statics.cond_cfg), dim=1)
             args = (
@@ -1545,6 +1553,8 @@ class WholeEulerCFMGraphWrapper:
                 )
                 _unpack_att_cache(packed_out, out_att_cache[step])
 
+            if mixed_precision:
+                estimate = estimate.float()
             cur_x = _euler_step(cur_x, estimate, dt, self.inference_cfg_rate, batch_size)
 
         return cur_x
@@ -1686,7 +1696,7 @@ class WholeEulerCFMGraphWrapper:
         **slots: torch.Tensor,
     ) -> _WholeEulerStatics:
         return _WholeEulerStatics(
-            x=arena.get_x_staging(graph_batch, channels, query_cap),
+            x=arena.get_x_staging(graph_batch, channels, query_cap, dtype=self._euler_dtype),
             mu_cfg=arena.get_mu_staging(graph_batch, channels, query_cap),
             speakers_cfg=arena.get_speakers_staging(graph_batch, spk_dim),
             cond_cfg=arena.get_cond_staging(graph_batch, channels, query_cap),
@@ -2151,7 +2161,7 @@ class WholeEulerCFMGraphWrapper:
                 room,
             )
             keys = keys[: max(0, room)]
-        x = torch.empty((1, int(channels), 1), device=self.device, dtype=self.dtype)
+        x = torch.empty((1, int(channels), 1), device=self.device, dtype=self._euler_dtype)
         entry_fn = functools.partial(self._entry, x=x, spk_dim=int(spk_dim), fill=self._precapture_fill)
         before = self._stats["captures"]
         for graph_batch, query_cap, offset in keys:

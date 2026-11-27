@@ -59,11 +59,15 @@ def prepare_estimator(estimator: nn.Module, *, pack_convs: bool = False) -> None
     for block in getattr(estimator, "blocks", ()):
         attn = getattr(block, "attn", None)
         if attn is not None and not attn.training and supports_packed_qkv(attn):
-            if attn.to_q.weight.device.type == "npu" and attn.to_q.weight.dtype == torch.float32:
+            if attn.to_q.weight.device.type == "npu" and attn.to_q.weight.dtype in {torch.float32, torch.float16}:
                 packed_qkv(attn)
         if pack_convs:
             for conv in (block.conv.block[1], block.conv.block[6]):
-                if not conv.training and conv.weight.device.type == "npu" and conv.weight.dtype == torch.float32:
+                if (
+                    not conv.training
+                    and conv.weight.device.type == "npu"
+                    and conv.weight.dtype in {torch.float32, torch.float16}
+                ):
                     packed_conv_columns(conv)
 
 
