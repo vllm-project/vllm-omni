@@ -22,13 +22,15 @@ class EvidenceScorer:
         history.append(value)
         return result
 
-    def score(self, frame: bytes, energy: float, onset: float) -> tuple[str, float]:
+    def observe(self, frame: bytes, energy: float) -> tuple[float, float]:
         difference = 0.0
         if frame and len(frame) == len(self.previous_frame):
             difference = sum(abs(a - b) for a, b in zip(frame, self.previous_frame, strict=True)) / len(frame)
         self.previous_frame = frame
-        visual = self._rank(difference, self.visual_history)
-        audio = self._rank(energy, self.audio_history)
+        return self._rank(difference, self.visual_history), self._rank(energy, self.audio_history)
+
+    def score(self, frame: bytes, energy: float, onset: float) -> tuple[str, float]:
+        visual, audio = self.observe(frame, energy)
         aligned = min(visual, audio, onset)
         return max(
             (("vision", visual - aligned), ("audio", audio - aligned), ("av", aligned)),

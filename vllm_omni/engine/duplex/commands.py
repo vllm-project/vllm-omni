@@ -93,7 +93,8 @@ class UpdateSession(DuplexCommand, _duplex_wire.UpdateSession):
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
         data["event"] = "session.update"
-        data["payload"] = dict(data.pop("patch", {}) or {})
+        data.pop("patch", None)
+        data["payload"] = dict(self.patch or {})
         return data
 
 
@@ -134,6 +135,9 @@ class Commit(DuplexCommand, _duplex_wire.Commit):
         data = DuplexCommand.payload(self)
         if self.create_response is not None:
             data["response_create"] = data.pop("create_response")
+        if not self.final or not self.memory_relevance:
+            data.pop("memory_relevance", None)
+            data.pop("memory_restore_opening", None)
         return data
 
 
@@ -171,7 +175,8 @@ class CreateItem(DuplexCommand, _duplex_wire.CreateItem):
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
         data["event"] = "conversation.item.create"
-        payload: dict[str, object] = {"item": dict(data.pop("item"))}
+        data.pop("item")
+        payload: dict[str, object] = {"item": dict(self.item)}
         previous = data.pop("previous_item_id", None)
         if previous is not None:
             payload["previous_item_id"] = previous

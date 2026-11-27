@@ -10,6 +10,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_evidence import 
     select_evidence_units,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import prepare_stage0_window
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_retrieval import plan_retrieval
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -78,3 +79,32 @@ def test_evidence_plan_tracks_noncontiguous_units_and_projected_length():
     assert plan["evidence_keep"] == [(0, 1, 4), (3, 0, 0), (4, 0, 0)]
     assert plan["replacement_prompt_len"] == 26
     assert len(update.prompt_token_ids) == 26
+
+
+def test_query_restores_archived_opening_without_expanding_window():
+    def unit(seq):
+        return {
+            "append_seq": seq,
+            "length": 79,
+            "modality_costs": (66, 10),
+            "evidence_score": 0.8,
+            "salience": (0.8, 0.0),
+        }
+
+    active = [unit(seq) for seq in range(30, 34)]
+    archive = {seq: unit(seq) for seq in (1, 2)}
+    kept, cold, plan = plan_retrieval(
+        active,
+        archive,
+        projected_len=500,
+        high=8000,
+        low=6000,
+        history_budget=800,
+        relevance=[(1, 0.9, None), (2, 0.8, None)],
+        restore_opening=True,
+    )
+    assert [item["append_seq"] for item in kept] == [1, 2, 33]
+    assert plan is not None
+    assert plan["retrieval_keep"] == [(-1, 0, 0, 79), (-2, 0, 0, 79), (3, 0, 0, 79)]
+    assert set(cold) == {30, 31, 32}
+    assert sum(item["length"] for item in kept) <= sum(item["length"] for item in active)

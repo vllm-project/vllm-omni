@@ -216,6 +216,26 @@ def translate_realtime_command(
         final = payload.get("final", True)
         create_response = payload.get("response_create", payload.get("create_response"))
         is_speech = payload.get("is_speech")
+        relevance = []
+        rows = payload.get("memory_relevance", [])
+        opening = payload.get("memory_restore_opening", False)
+        if not isinstance(rows, list) or len(rows) > 512 or type(opening) is not bool:
+            raise DuplexCommandError("Invalid memory relevance or opening flag", code="bad_event", event_id=event_id)
+        seen = set()
+        for row in rows:
+            if (
+                not isinstance(row, list)
+                or len(row) != 3
+                or type(row[0]) is not int
+                or not 0 < row[0] <= 2**31 - 1
+                or row[0] in seen
+                or any(
+                    score is not None and (type(score) not in (float, int) or not -1 <= score <= 1) for score in row[1:]
+                )
+            ):
+                raise DuplexCommandError("Invalid memory relevance row", code="bad_event", event_id=event_id)
+            seen.add(row[0])
+            relevance.append((row[0], row[1], row[2]))
         return Commit(
             event_id=event_id,
             final=bool(final) if isinstance(final, bool) else True,
@@ -225,6 +245,8 @@ def translate_realtime_command(
                 else (True if event_type == "input.commit" and create_response is None else None)
             ),
             is_speech=is_speech if isinstance(is_speech, bool) else None,
+            memory_relevance=tuple(relevance),
+            memory_restore_opening=opening,
         )
 
     if event_type == "input_audio_buffer.clear":

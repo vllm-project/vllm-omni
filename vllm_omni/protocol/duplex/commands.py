@@ -85,6 +85,8 @@ class Commit(realtime_commands.Commit):
     create_response: bool | None = None
     is_speech: bool | None = None
     realtime_item_id: str | None = None
+    memory_relevance: tuple[tuple[int, float | None, float | None], ...] = ()
+    memory_restore_opening: bool = False
 
 
 # ---- Tier 3: vLLM-Omni only ----

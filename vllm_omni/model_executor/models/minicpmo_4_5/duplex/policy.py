@@ -81,6 +81,7 @@ class MiniCPMO45DuplexWindowConfig:
     context_previous_max_tokens: int = 500
     context_max_units: int = 24
     evidence_history_tokens: int = 800
+    evidence_query_retrieval: bool = False
 
     @classmethod
     def from_mapping(cls, value: object) -> MiniCPMO45DuplexWindowConfig:
@@ -101,6 +102,9 @@ class MiniCPMO45DuplexWindowConfig:
         mode = source.get("sliding_window_mode", "basic")
         if mode not in {"off", "basic", "context", "evidence"}:
             raise ValueError("sliding_window_mode must be one of: off, basic, context, evidence")
+        retrieval = source.get("evidence_query_retrieval", False)
+        if type(retrieval) is not bool or (retrieval and mode != "evidence"):
+            raise ValueError("evidence_query_retrieval requires evidence window mode")
         config = cls(
             sliding_window_mode=str(mode),
             basic_window_high_tokens=integer("basic_window_high_tokens", 8000),
@@ -108,6 +112,7 @@ class MiniCPMO45DuplexWindowConfig:
             context_previous_max_tokens=integer("context_previous_max_tokens", 500),
             context_max_units=integer("context_max_units", 24),
             evidence_history_tokens=integer("evidence_history_tokens", 800),
+            evidence_query_retrieval=retrieval,
         )
         if config.basic_window_low_tokens >= config.basic_window_high_tokens:
             raise ValueError("basic_window_low_tokens must be less than basic_window_high_tokens")
@@ -125,6 +130,8 @@ class MiniCPMO45DuplexWindowConfig:
         }
         if self.sliding_window_mode == "evidence":
             result["evidence_history_tokens"] = self.evidence_history_tokens
+            if self.evidence_query_retrieval:
+                result["evidence_query_retrieval"] = True
         return result
 
 

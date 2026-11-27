@@ -385,16 +385,20 @@ def build_duplex_data_plane_prompt(
     model_fields: dict[str, object] = {"scheduler_token_id": token_id}
     window = runtime_config.get("duplex_window_config")
     if isinstance(window, dict) and window.get("sliding_window_mode") == "evidence":
+        query_retrieval = window.get("evidence_query_retrieval") is True
         model_fields["window_evidence"] = _window_evidence(payload)
         if (
             vision_tokens
-            and not first_audio_window
+            and (query_retrieval or not first_audio_window)
             and _duplex_pcm_sample_count(payload) == MiniCPMO45DuplexPolicy.CHUNK_SAMPLES
         ):
             audio_tokens = MiniCPMO45DuplexPolicy.audio_token_count(MiniCPMO45DuplexPolicy.CHUNK_SAMPLES)
             if runtime_config.get("duplex_wrap_unit_audio_markers"):
                 audio_tokens += 2
             model_fields["window_modalities"] = (vision_tokens, audio_tokens)
+        if final and query_retrieval and isinstance(payload, dict) and (relevance := payload.get("memory_relevance")):
+            model_fields["memory_relevance"] = relevance
+            model_fields["memory_restore_opening"] = payload.get("memory_restore_opening", False)
     return build_duplex_append_prompt(
         request_id=request_id,
         fence=fence,
@@ -1177,6 +1181,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             "context_previous_max_tokens",
             "context_max_units",
             "evidence_history_tokens",
+            "evidence_query_retrieval",
         )
         provided = {name: extra_body.pop(name) for name in names if name in extra_body}
         if not provided:
