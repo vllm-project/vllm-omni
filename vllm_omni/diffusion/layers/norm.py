@@ -145,17 +145,33 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Normalize NPU inputs, fusing residual addition for matching dtypes.
+
+        With a residual, return the normalized output and updated residual.
+        Mixed-dtype inputs use a separate addition with PyTorch's dtype
+        promotion. Non-NPU tensors use the native path.
+        """
         if not _is_npu_tensor(x):
             return self.forward_native(x, residual)
         import torch_npu
 
         if residual is not None:
-            output, _, updated_residual = torch_npu.npu_add_rms_norm(
-                x,
-                residual,
-                self.weight,
-                self.variance_epsilon,
-            )
+            if x.dtype == residual.dtype:
+                output, _, updated_residual = torch_npu.npu_add_rms_norm(
+                    x,
+                    residual,
+                    self.weight,
+                    self.variance_epsilon,
+                )
+                return output, updated_residual
+
+            # Materialize the promoted sum before normalization.
+            updated_residual = residual + x
+            output = torch_npu.npu_rms_norm(
+                updated_residual,
+                gamma=self.weight.to(updated_residual.dtype),
+                epsilon=self.variance_epsilon,
+            )[0]
             return output, updated_residual
 
         output = torch_npu.npu_rms_norm(x, gamma=self.weight, epsilon=self.variance_epsilon)[0]

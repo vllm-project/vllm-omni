@@ -556,7 +556,7 @@ The optimizations stacked by the recommended configurations above:
    kernel selected through `MINDIE_SD_FA_TYPE`, carried by the FLASH_ATTN
    backend with a mask-free packed varlen path and K/V prefix slicing driven
    by the packed `cu_seqlens` metadata.
-2. Ascend-friendly fused operators: RMSNorm, AddRMSNorm, GQA, SwiGLU, and
+2. Ascend-friendly fused operators: RMSNorm, dtype-selected AddRMSNorm, GQA, SwiGLU, and
    rotary position embedding from MindIE-SD.
 3. RainFusion block-sparse attention, optionally with EQBSA mixed INT8/FP8
    precision — see
@@ -566,6 +566,26 @@ The optimizations stacked by the recommended configurations above:
 5. Parallelism: USP, text-encoder TP, and native VAE `tile` patch
    parallelism, plus distributed layerwise offload.
 6. Post-training: few-step distillation via the FlashGen online LoRA.
+
+### Text-encoder RMSNorm precision
+
+The NPU RMSNorm path selects residual fusion automatically:
+
+| Input and residual dtypes | Behavior |
+| --- | --- |
+| Same | Fused AddRMSNorm |
+| Different | Separate add with dtype promotion, then RMSNorm |
+
+Mixed-dtype addition preserves the promoted residual. Matching BF16 inputs
+use fusion and can differ from explicit BF16 add-then-RMSNorm rounding.
+There is no fusion switch to configure.
+
+An earlier comparison of the two paths measured 39.54 ms fused versus 39.63 ms
+split on one Ascend 950PR (BF16, TP=1, 30 tokens; 20 interleaved pairs after
+three warmups per mode). The paired difference was +0.083 ms (+0.21%), with
+a 95% interval of -0.24 to +0.39 ms. This is historical path-level evidence,
+not validation of automatic dtype selection. Timing excludes tokenization,
+model loading, and video generation. See [measurement details](https://github.com/vllm-project/vllm-omni/pull/10141).
 
 ## Benchmarks (Atlas 800I A2 / A3)
 
