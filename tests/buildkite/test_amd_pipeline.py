@@ -1580,7 +1580,7 @@ def test_qwen3_omni_realtime_merge_job_mirrors_cuda_h100_entrypoints() -> None:
     assert step["agent_pool"] == "mi300_2"
     assert step["grade"] == "NonBlocking"
     assert step["source_file_dependencies"] == "omni_qwen3_omni_duplex_playback_function"
-    assert "assert-pytest-collection.sh 29" in commands
+    assert "assert-pytest-collection.sh 30" in commands
     assert "if tests != 29 or skipped != 0" in commands
     assert commands.count(marker) == 2
     for path in (

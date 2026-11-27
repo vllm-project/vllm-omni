@@ -139,7 +139,7 @@ steps:
         - mkdir -p "$$ROCM_MERGE_ARTIFACT_DIR"
         - |
           set -euo pipefail
-          bash .buildkite/amd/scripts/assert-pytest-collection.sh 29 \
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 30 \
             tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py \
             tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py \
             -m 'advanced_model and omni and rocm and MI325 and cards_2 and not nvidia_only' \
