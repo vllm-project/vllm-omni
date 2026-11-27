@@ -17,7 +17,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneContext
 from vllm_omni.model_executor.common.request_outputs import coerce_int
 from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import INTERRUPTION_KEY, MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import TEXT_WITHOUT_AUDIO_KEY
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
@@ -198,7 +198,8 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
 
         output_turn_id = output_turn_id_from_metadata(mm_output)
         text_input = coerce_int(mm_output.get("duplex_text_input")) == 1
-        if text_input and context.model_turn_id is not None:
+        interruption = coerce_int(mm_output.get(INTERRUPTION_KEY)) == 1
+        if (text_input or interruption) and context.model_turn_id is not None:
             output_turn_id = context.model_turn_id
         output_epoch = output_epoch_from_metadata(mm_output)
         expected_turn_id = context.active_response_turn_id
@@ -227,7 +228,19 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     runtime_result=runtime_result,
                 )
                 if not stale:
-                    yield from projected
+                    control_result = None
+                    for result in projected:
+                        if interruption:
+                            control_result = result
+                        if not interruption or result.get("model_listen") is not True:
+                            yield result
+                    # A cumulative snapshot may include earlier LISTEN units.
+                    # Only its final control acknowledges this interruption.
+                    if control_result is not None and control_result.get("model_listen") is True:
+                        control_result["interruption_completed"] = True
+                        if context.model_turn_id is not None:
+                            control_result["model_turn_id"] = context.model_turn_id
+                        yield control_result
                 else:
                     # Consume skipped tokens so their text and boundaries do not reach the next reply.
                     for _ in projected:
@@ -262,6 +275,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                 data_plane_request_id=request_id,
                 end_of_turn=explicit_reply,
                 continue_with_partial_input=text_input and not explicit_reply,
+                interruption_completed=interruption,
             )
             if output_turn_id is not None:
                 listen_result["model_turn_id"] = output_turn_id

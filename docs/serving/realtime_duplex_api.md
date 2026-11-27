@@ -659,8 +659,23 @@ The `"context"` mode instead retains `context_max_units` (24) recent units
 plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
 The window configuration is fixed when the session is created.
 
-On a locally managed Stage-0 replica, a barge-in or `response.cancel` ends the
-old output. Its replacement re-prefills the accepted Thinker context before
+In automatic MiniCPM duplex sessions (`extra_body.auto_response=true`),
+`response.cancel`, `output_audio_buffer.clear`, and explicit or speech-overlap
+barge-in end the current response while keeping the original Thinker request,
+epoch and KV. The server queues a text-only turn-end control followed by
+forced listening. Already submitted inputs finish in order; subsequent inputs
+continue on the same stream. Late text/audio from the cancelled answer is
+discarded. A later answer receives a new response ID, so clients should discard
+cancelled output by response ID rather than treating the whole epoch as dead.
+No history prefill is needed for this interruption, on either local or hosted
+Stage-0 replicas. Normal sliding-window eviction still applies. As in the
+official native implementation, KV can contain generated speech the client has
+not played; playback acknowledgements govern conversation history and do not
+roll back the Thinker KV.
+
+`input.cancel`, manual response sessions, context invalidation and session
+teardown retain the destructive cancellation path. On a locally managed
+Stage-0 replica, its replacement re-prefills the accepted Thinker context before
 processing its first input, including the processed rows of an unfinished
 unit. If the first new input is unforced text or carries a delegated tool
 result, it can open a reply on that same unit. In `"off"` mode, if the
@@ -772,7 +787,7 @@ up with the chunks sent before cancellation.
 ### Interrupt
 
 ```python
-await client.cancel_response()        # cancel the active response (epoch advances)
+await client.cancel_response()        # cancel the active response; native MiniCPM retains its epoch
 await client.clear_input()            # drop un-committed input audio
 ```
 
@@ -1600,7 +1615,11 @@ requests, and the session's advertised
   response (the cancelled epoch). The units still open from it, and the
   appends the cancel called off, are settled as `cancelled` right after the
   cancellation's own events, and the acknowledgements they held back are
-  sent. The cancel command itself is not acknowledged.
+  sent. Native MiniCPM automatic sessions retain submitted units and acknowledge
+  them as their work finishes; cancellation filters their old response output
+  without advancing the epoch. The turn-end control can appear as a listen
+  boundary with the next acknowledgement, at the same input time as the
+  preceding unit. The cancel command itself is not acknowledged.
 - **Failure after acceptance.** An append that fails after the model
   accepted it does not leave its acknowledgement to the timeouts: the failure
   closes the session, so its unit is settled with the teardown below
@@ -1857,8 +1876,8 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `conversation.item.delete` | 1 | Delete a stored item by id. |
 | `conversation.item.truncate` | 1 | Truncate an assistant item's audio/transcript at `audio_end_ms`. |
 | `response.create` | 1 | Explicitly request a response with per-response overrides. Requires committed audio input; otherwise `response_create_without_input`. |
-| `response.cancel` | 1 | Cancel the active (or named) response; advances `epoch`. |
-| `output_audio_buffer.clear` | 1 | Discard queued output audio; advances `epoch` (OpenAI: WebRTC-only, here also WebSocket). |
+| `response.cancel` | 1 | Cancel the active (or named) response; native automatic MiniCPM retains the request and `epoch`, other paths advance `epoch`. |
+| `output_audio_buffer.clear` | 1 | Discard queued output audio; native automatic MiniCPM retains the request and `epoch`, other paths advance `epoch` (OpenAI: WebRTC-only, here also WebSocket). |
 | `barge_in` | 3 | Explicit hard interrupt; requires `capabilities.supports_barge_in`. |
 | `turn.signal` | 3 | External turn-taking signal (e.g. `event:"barge_in"`); same capability gate. |
 | `playback.ack` | 3 | Report cumulative playback progress (`played_ms`, `committed_ms`, optional `truncate`). |

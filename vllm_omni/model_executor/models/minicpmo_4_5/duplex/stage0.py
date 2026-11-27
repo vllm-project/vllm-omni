@@ -21,7 +21,11 @@ from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 
 from vllm_omni.core.sched.window_policy import WindowOperation
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy, MiniCPMO45TurnState
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
+    INTERRUPTION_KEY,
+    MiniCPMO45DuplexPolicy,
+    MiniCPMO45TurnState,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -640,6 +644,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         seq: int | None = None,
         is_speech: bool = False,
         force_listen: bool = False,
+        interruption: bool = False,
         stage0_window: dict[str, object] | None = None,
         text_token_ids: list[int] | None = None,
         prepend_text_token_ids: list[int] | None = None,
@@ -893,6 +898,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "runtime_impl": "scheduler_data_plane",
                 "stage0_window_replaced": window_result is not None,
                 "text_input": has_text and not force_listen,
+                INTERRUPTION_KEY: interruption,
             }
         )
         # Standalone VISION input can open a response without speech. Camera
@@ -906,6 +912,8 @@ class MiniCPMO45Stage0DuplexRuntime:
             elif is_speech or (vision_only and num_frames) or prepend_text_token_ids:
                 state.pending_speech_context = True
                 state.pending_speech_append_identity = append_identity
+        if interruption:
+            state.interrupt()
         if is_speech:
             # The audio front end bounds its streaming history at 30 seconds.
             # Allow one reply at the end of the first voiced turn after that gap.

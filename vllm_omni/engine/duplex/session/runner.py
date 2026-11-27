@@ -480,7 +480,7 @@ class DuplexSessionRunner:
             return True
         decision: DuplexOutputDecision | None = None
         project = False
-        if stage_id < context.final_stage_id:
+        if stage_id < context.final_stage_id or (stage_id == 0 and self.run.interruption_pending):
             decision = self.model.decide_output(stage_id, output, context, streaming_context=streaming_context)
             # Optional mid-pipeline projection: client sees this stage; TTS still runs.
             if decision is None:
@@ -1198,7 +1198,9 @@ class DuplexSessionRunner:
                 task = await self._start_append(
                     {"type": "text", "text": command.text, "force_listen": command.force_listen is True},
                     final=False,
-                    precreate_response=command.force_listen is not True,
+                    # The control unit has not confirmed the next model turn
+                    # yet. Let its first output reserve the new response.
+                    precreate_response=command.force_listen is not True and not self.run.interruption_pending,
                 )
                 release = reservation.pop_all().close
                 task.add_done_callback(lambda _done: release())
@@ -1477,6 +1479,8 @@ class DuplexSessionRunner:
         new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
         retired = True
         if new_epoch != old_epoch:
+            self.run.pending_interruptions = 0
+            self.run.interrupted_through_turn = None
             self.tool_calls.invalidate_epoch(new_epoch)
             if not closing_before:
                 retired = self._retire_pending_function_output()
@@ -1685,11 +1689,13 @@ class DuplexSessionRunner:
         playback_was_active = helpers.assistant_playback_active(self.session)
         model_state.audio_buffer.clear_force_listen()
         session.reset_overlap_speech()
+        cancel_reason = str(decision.get("cancel_reason") or "barge_in")
+        if await self._interrupt_resident_response(reason=cancel_reason):
+            return not self.run.closing
         model_state.input_since_commit = False
         model_state.speech_since_commit = False
         had_append = await self.tasks.cancel_append_tasks()
         had_stream = self.run.stream_request_id is not None
-        cancel_reason = str(decision.get("cancel_reason") or "barge_in")
         cancelled = await self._cancel_active_response(
             self.tasks.active_response_task,
             reason=cancel_reason,
@@ -2765,6 +2771,8 @@ class DuplexSessionRunner:
                     event_id=event.get("realtime_event_id"),
                 )
                 return
+        if event_type != "input.cancel" and await self._interrupt_resident_response(reason=cancel_reason):
+            return
         had_unbuffered_append = model_state.input_since_commit and not model_state.audio_buffer.has_pending()
         self.memory.cancel_interaction()
         playback_was_active = helpers.assistant_playback_active(self.session)
@@ -2900,12 +2908,34 @@ class DuplexSessionRunner:
         if self.ctx.history_calibration is not None:
             self.ctx.history_calibration.request_ready()
 
+    async def _interrupt_resident_response(self, *, reason: str) -> bool:
+        """Stop playback and enqueue the model's ordered resident control, if supported."""
+        session = self.session
+        if not (
+            self.out.auto_responds()
+            and session.capabilities.supports_core_resumable_request
+            and (self.run.stream_request_id is not None or session.active_request_id is not None)
+            and (payload := self.plugin.interruption_payload()) is not None
+        ):
+            return False
+        self.run.pending_interruptions += 1
+        self.model_state.clear_continuation()
+        self._deferred_silence = None
+        self.memory.cancel_interaction()
+        await self._cancel_active_response(self.tasks.active_response_task, reason=reason, preserve_request=True)
+        # Already accepted units finish before this control, and subsequent
+        # client input follows it. Cancelling their submit tasks would
+        # compensate by aborting the resident KV.
+        await self._start_append(payload, final=False)
+        return True
+
     async def _cancel_active_response(
         self,
         active_task: asyncio.Task[None] | None,
         *,
         reason: str,
         notify: bool = True,
+        preserve_request: bool = False,
     ) -> bool:
         session = self.session
         has_running_task = active_task is not None and not active_task.done()
@@ -2923,7 +2953,7 @@ class DuplexSessionRunner:
             old_response_id = session.last_response_id
         committed_ms = session.playback.committed_ms
         audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
-        # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
+        # Cancelling the reply clears the concurrent-turn release.
         self.run.concurrent_turn_requests_released = False
         # The model is no longer filling the call this cancel tears down, so
         # client frames are appended again instead of dropped.
@@ -2933,6 +2963,7 @@ class DuplexSessionRunner:
         committed_message = session.end_response(
             commit_text=should_commit,
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
+            preserve_request=preserve_request,
         )
         committed = committed_message is not None
         if old_response_id is not None:
@@ -2959,6 +2990,22 @@ class DuplexSessionRunner:
             response_id=old_response_id,
             release_owner=not committed and committed_ms == 0 and not audio_started,
         )
+        if preserve_request:
+            old_playback = session.playback.as_dict()
+            session.clear_playback_cursor()
+            self.emit(
+                {
+                    "type": "audio.cancelled",
+                    "session_id": session.session_id,
+                    "response_id": old_response_id,
+                    "reason": reason,
+                    "cancelled_epoch": old_epoch,
+                    "epoch": old_epoch,
+                    "committed_ms": committed_ms,
+                    "playback": old_playback,
+                }
+            )
+            return True
         draining_cancels: list[tuple[str, int, dict[str, int]]] = []
         seen_responses: set[str] = set()
         if isinstance(old_response_id, str) and old_response_id:

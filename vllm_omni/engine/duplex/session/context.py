@@ -60,11 +60,15 @@ class DuplexRunState:
     runtime_closed: bool = False
     #: Request id of the resumable data-plane stream currently bound to the session.
     stream_request_id: str | None = None
+    #: Suppress output until the ordered resident interruption reaches Stage 0.
+    pending_interruptions: int = 0
+    #: Late downstream output from these model turns must not reopen a reply.
+    interrupted_through_turn: tuple[int, int] | None = None
     #: Model-confirmed (epoch, turn) allowed to continue past incomplete PCM.
     partial_input_continuation_turn: tuple[int, int] | None = None
     #: Plugin signaled that the next user commit may start while the current
     #: assistant audio is still draining. Cleared on barge-in/cancel, or when
-    #: the next ephemeral turn begins. Orthogonal to barge-in (which aborts).
+    #: the next ephemeral turn begins. Orthogonal to barge-in (which cancels the reply).
     concurrent_turn_requests_released: bool = False
     #: The plugin wants the next silence append issued immediately instead of on
     #: the 80 ms pacing clock (for example while a model decodes a tool call).
@@ -73,6 +77,10 @@ class DuplexRunState:
     fast_path_config_generation: int | None = None
     #: Client frames dropped because the model was on the fast path.
     fast_path_dropped_frames: int = 0
+
+    @property
+    def interruption_pending(self) -> bool:
+        return self.pending_interruptions > 0
 
 
 class RunnerServices(Protocol):

@@ -33,6 +33,18 @@ def _load_demo_module():
     return module
 
 
+def test_cancelled_audio_is_scoped_to_response_in_a_retained_epoch():
+    state = _load_demo_module().DemoState()
+    state.events = [
+        {"type": "response.output_audio.delta", "response_id": "old", "metadata": {"epoch": 0}},
+        {"type": "response.done", "response": {"id": "old", "status": "cancelled", "metadata": {"cancelled_epoch": 0}}},
+        {"type": "response.output_audio.delta", "response_id": "new", "metadata": {"epoch": 0}},
+    ]
+    assert state.stale_audio_delta_count() == 0
+    state.events.append({"type": "response.output_audio.delta", "response_id": "old", "metadata": {"epoch": 0}})
+    assert state.stale_audio_delta_count() == 1
+
+
 def _load_multi_demo_module():
     spec = importlib.util.spec_from_file_location("minicpmo_realtime_duplex_multi_session_test", MULTI_DEMO_PATH)
     assert spec is not None and spec.loader is not None

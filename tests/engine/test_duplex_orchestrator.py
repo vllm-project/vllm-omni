@@ -687,7 +687,7 @@ async def test_session_update_refreshes_the_next_append_sampling_params() -> Non
 
 
 @pytest.mark.asyncio
-async def test_forwarded_stage_requests_are_bound_and_barge_in_aborts_them() -> None:
+async def test_forwarded_stage_requests_are_bound_and_input_cancel_aborts_them() -> None:
     orchestrator, clients, rpc_q, _ = _build(stages=2)
     await _open(orchestrator, rpc_q)
     request_id = _stage0_request_id()
@@ -703,7 +703,7 @@ async def test_forwarded_stage_requests_are_bound_and_barge_in_aborts_them() -> 
     assert request_state.stage_fences[1] == DuplexFence(SESSION_ID)
     assert session.stage_request_submitted(1, request_id)
 
-    await _submit(orchestrator, commands.BargeIn())
+    await _submit(orchestrator, commands.CancelInput())
     assert session.epoch == 1
     assert clients[0].abort_calls == [[request_id]]
     assert clients[1].abort_calls == [[request_id]]
@@ -1528,7 +1528,7 @@ async def test_session_group_pins_initial_update_forward_prewarm_and_new_epoch(m
         for stage, replica in {0: 1, 1: 0, 2: 1}.items():
             assert pools[stage].get_bound_replica_id(request_id) == replica
             assert not pools[stage].clients[1 - replica].add_request_calls
-        await _submit(orchestrator, commands.BargeIn())
+        await _submit(orchestrator, commands.CancelInput())
         assert request_id not in orchestrator.request_states
         assert placement.snapshot()["reserved"] == before
         await _submit(orchestrator, _append_audio())
@@ -1743,7 +1743,7 @@ async def test_managed_window_follows_cancelled_epoch_and_releases_both_copies(m
         await _settle(orchestrator)
         session = orchestrator.session_manager.get(SESSION_ID)
         assert session.active_response_id
-        await _submit(orchestrator, commands.CancelResponse(response_id=session.active_response_id))
+        await _submit(orchestrator, commands.CancelInput())
         await _submit(orchestrator, _append_audio())
         second = _stage0_request_id(1)
         assert [args[0].request_id for args in owner.add_request_calls] == [first, second]

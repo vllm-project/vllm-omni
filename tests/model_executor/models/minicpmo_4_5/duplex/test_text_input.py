@@ -8,11 +8,64 @@ import torch
 from tests.model_executor.models.minicpmo_4_5.helpers import stage0_vision_runtime
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import build_duplex_data_plane_prompt
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import APPEND_TEXT_TOKEN_IDS_KEY
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import APPEND_TEXT_TOKEN_IDS_KEY, INTERRUPTION_KEY
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
-from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+    MiniCPMO45OmniForConditionalGeneration,
+    _duplex_row_outputs,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("window", [False, True])
+def test_interruption_appends_turn_eos_without_replaying_context_or_resetting_audio(window):
+    runtime = stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="interrupt", window_enabled=window)
+    state.context_token_ids = [200, 201]
+    state.context_embeds = [runtime._embed_token(i) for i in state.context_token_ids]
+    runtime._stage_prefill_embeddings_only(state, None, input_text_token_ids=[21, 22], epoch=0, seq=1)
+    state.pending_terminator_token = runtime.chunk_eos_token_id
+    state.audio_buffer = np.array([0.125, 0.25], dtype=np.float32)
+    audio_buffer = state.audio_buffer
+    state.generated_tokens = [51, 52]
+    state.current_turn_ended = False
+    state.pending_speech_context = True
+    state.pending_speech_response_open = True
+    payload = {
+        "type": "text",
+        "text_token_ids": [runtime.turn_eos_token_id],
+        "force_listen": True,
+        INTERRUPTION_KEY: True,
+    }
+    kwargs = MiniCPMO45OmniForConditionalGeneration._minicpmo45_duplex_prefill_kwargs({"epoch": 0, "seq": 2}, payload)
+    result = runtime._stage_prefill_embeddings_only(state, None, **kwargs)
+    prompt = build_duplex_data_plane_prompt(
+        request_id="resident",
+        fence=DuplexFence("interrupt"),
+        session_config={},
+        runtime_config={},
+        seq=2,
+        turn_seq=2,
+        payload=payload,
+        final=False,
+    )
+    assert result["input_token_ids"] == [
+        runtime.chunk_eos_token_id,
+        runtime.unit_end_token_id,
+        runtime.unit_token_id,
+        runtime.turn_eos_token_id,
+    ]
+    assert result["num_input_tokens"] == len(prompt["prompt_token_ids"]) == 4
+    assert _duplex_row_outputs([{"duplex": result}, {"duplex": {}}])[INTERRUPTION_KEY] == [True, False]
+    np.testing.assert_array_equal(state.audio_buffer, audio_buffer)
+    assert state.audio_encoder_chunk_idx == 0
+    assert state.generated_tokens == [51, 52]
+    assert state.current_turn_ended
+    assert not state.pending_speech_context and not state.pending_speech_response_open
+    if window:
+        assert len(state.window_units) == 1
+        assert state.pending_window_unit.token_ids == [runtime.unit_token_id, runtime.turn_eos_token_id]
 
 
 @pytest.mark.parametrize("window", [False, True])

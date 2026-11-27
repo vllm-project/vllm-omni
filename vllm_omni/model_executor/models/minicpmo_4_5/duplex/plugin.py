@@ -64,6 +64,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import MiniCPMO45PcmAppendBuffer
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     APPEND_TEXT_TOKEN_IDS_KEY,
+    INTERRUPTION_KEY,
     MiniCPMO45DuplexPolicy,
     MiniCPMO45DuplexWindowConfig,
 )
@@ -732,6 +733,11 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     input_clock_input_modalities = frozenset({"audio"})
     silence_continuation_samples = 16000
 
+    def interruption_payload(self) -> dict[str, object] | None:
+        # A text-only control unit closes the native turn without advancing the
+        # audio encoder or replaying history. Tokenization reserves its exact KV span.
+        return {"type": "text", "text": "<|turn_eos|>", "force_listen": True, INTERRUPTION_KEY: True}
+
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
         self.data_plane = MiniCPMO45DataPlaneSession(encode_audio)
@@ -898,11 +904,14 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         output: object,
         streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
-        if stage_id >= final_stage_id or not segment_finished:
+        if not segment_finished:
             return None
 
         completion = _first_completion(output)
         output_metadata = _multimodal_output(output, completion)
+        interruption = stage_id == 0 and _coerce_int(output_metadata.get(INTERRUPTION_KEY)) == 1
+        if stage_id >= final_stage_id and not interruption:
+            return None
         special_token_ids = _special_token_ids(segment_output_metadata)
         special_token_ids.update(_special_token_ids(output_metadata))
         listen_id = special_token_ids.get("listen_token_id")
@@ -937,6 +946,14 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             return None
 
         metadata = dict(output_metadata)
+        if interruption:
+            # Advance at the control unit's output, never when its append is
+            # queued: older units can still be running then. Downstream chunks
+            # already carry the old turn and the next Talker handoff resets it.
+            bridges = getattr(streaming_context, "bridge_states", None)
+            bridge = bridges.get("duplex") if isinstance(bridges, dict) else None
+            if isinstance(bridge, dict) and isinstance(bridge.get("model_turn_id"), int):
+                bridge["model_turn_id"] += 1
         for key, value in special_token_ids.items():
             metadata.setdefault(f"meta.{key}", value)
         metadata.update(

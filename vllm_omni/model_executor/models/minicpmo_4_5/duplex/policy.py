@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 # Server-owned token IDs appended after the media in one native input unit.
 APPEND_TEXT_TOKEN_IDS_KEY = "duplex_append_text_token_ids"
+# Server-owned control carried on one append, echoed as row-local output metadata.
+INTERRUPTION_KEY = "duplex_interruption"
 
 
 @dataclass(kw_only=True)
@@ -23,6 +25,13 @@ class MiniCPMO45TurnState:
     pending_speech_context: bool = False
     pending_speech_response_open: bool = False
     explicit_response_awaiting_content: bool = False
+
+    def interrupt(self) -> None:
+        """Close the answer, retaining input, generated history and decoder KV."""
+        self.current_turn_ended = True
+        self.pending_speech_context = False
+        self.pending_speech_response_open = False
+        self.explicit_response_awaiting_content = False
 
     def observe_text_prefill(self, *, force_listen: bool, backend_result: bool) -> None:
         """Apply the newly accepted client text or delegated result before sampling."""

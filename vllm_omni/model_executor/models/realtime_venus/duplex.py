@@ -99,6 +99,10 @@ class VenusDataPlane(MiniCPMO45DataPlaneSession):
 
 
 class RealtimeVenusDuplexPlugin(MiniCPMO45DuplexPlugin):
+    def interruption_payload(self) -> None:
+        # Tool cancellation still owns an epoch boundary.
+        return None
+
     plugin_id = "realtime_venus_omni"
     private_runtime_config_keys = MiniCPMO45DuplexPlugin.private_runtime_config_keys | {
         _RESULTS,

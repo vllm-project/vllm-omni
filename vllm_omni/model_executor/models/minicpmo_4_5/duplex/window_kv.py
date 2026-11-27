@@ -119,6 +119,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
 from vllm_omni.model_executor.common.duplex.payload import payload_audio
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     APPEND_TEXT_TOKEN_IDS_KEY,
+    INTERRUPTION_KEY,
     MiniCPMO45TurnState,
     record_turn_sample,
 )
@@ -888,6 +889,8 @@ class MiniCPMO45SchedulerWindowPolicy:
         backend_text = bool(cfg.get(APPEND_TEXT_TOKEN_IDS_KEY))
         if (payload.get("text_token_ids") or backend_text) and settled >= request.num_prompt_tokens:
             turn.observe_text_prefill(force_listen=payload.get("force_listen") is True, backend_result=backend_text)
+            if payload.get(INTERRUPTION_KEY) is True:
+                turn.interrupt()
         if accepted and payload.get("open_assistant_turn") is True and payload.get("is_speech") is not True:
             if turn.current_turn_ended:
                 turn.current_turn_ended = False

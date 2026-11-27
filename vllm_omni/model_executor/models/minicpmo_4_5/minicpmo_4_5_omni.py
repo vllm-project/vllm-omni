@@ -40,6 +40,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     APPEND_TEXT_TOKEN_IDS_KEY,
+    INTERRUPTION_KEY,
     MiniCPMO45DuplexPolicy,
     record_turn_sample,
 )
@@ -71,6 +72,7 @@ def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
     # audio follows text on the same resumable scheduler request.
     outputs["duplex_text_input"] = [info.get("text_input") is True for info in duplex_rows]
     outputs["duplex_explicit_reply"] = [info.get("duplex_explicit_reply") is True for info in duplex_rows]
+    outputs[INTERRUPTION_KEY] = [info.get(INTERRUPTION_KEY) is True for info in duplex_rows]
     prompt_rows = []
     for duplex_info in duplex_rows:
         prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
@@ -842,6 +844,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             "is_speech": bool(payload.get("is_speech", False)),
             "input_text_token_ids": payload.get("text_token_ids"),
             "force_listen": payload.get("force_listen") is True,
+            "interruption": payload.get(INTERRUPTION_KEY) is True,
             "stage0_window": window if isinstance(window, dict) else None,
             "text_token_ids": text_token_ids if isinstance(text_token_ids, list) else None,
             "prepend_text_token_ids": prepend_ids,

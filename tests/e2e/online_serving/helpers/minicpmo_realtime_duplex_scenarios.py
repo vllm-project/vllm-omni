@@ -605,33 +605,17 @@ class DemoState:
         return response_ids
 
     def stale_audio_delta_count(self) -> int:
-        cancelled_epochs_by_index: list[tuple[int, int]] = []
-        for index, event in enumerate(self.events):
-            if event.get("type") != "response.done":
-                continue
-            response = event.get("response")
-            if not isinstance(response, dict) or response.get("status") != "cancelled":
-                continue
-            metadata = response.get("metadata")
-            if not isinstance(metadata, dict):
-                continue
-            cancelled_epoch = metadata.get("cancelled_epoch")
-            if isinstance(cancelled_epoch, int):
-                cancelled_epochs_by_index.append((index, cancelled_epoch))
-        if not cancelled_epochs_by_index:
-            return 0
+        # Native interruption keeps the epoch alive for the next response.
+        cancelled_responses: set[str] = set()
         stale = 0
-        for index, event in enumerate(self.events):
-            if event.get("type") != "response.output_audio.delta":
-                continue
-            metadata = event.get("metadata")
-            if not isinstance(metadata, dict):
-                continue
-            event_epoch = metadata.get("epoch")
-            for cancel_index, cancelled_epoch in cancelled_epochs_by_index:
-                if index > cancel_index and event_epoch == cancelled_epoch:
-                    stale += 1
-                    break
+        for event in self.events:
+            response_id = self._event_response_id(event)
+            if event.get("type") == "response.done":
+                response = event.get("response")
+                if isinstance(response, dict) and response.get("status") == "cancelled" and response_id is not None:
+                    cancelled_responses.add(response_id)
+            elif event.get("type") == "response.output_audio.delta" and response_id in cancelled_responses:
+                stale += 1
         return stale
 
 
