@@ -260,16 +260,54 @@ other differences were single words. One request at concurrency 8 reached the
 
 ### 256 sentences, with the reference implementation
 
-Scope: the same benchmark command (`vllm bench serve --omni`) over the first
-256 distinct English sentences of the Seed-TTS evaluation list, text only, in
-list order, after 16 warm-up requests, with `max_new_tokens` 250. Each level
-ran two or three times; the first run of a level was discarded and the table
-gives the mean of the others. The word error rate is Whisper large-v3 on the
-same GPU.
+Scope: the first 256 distinct English sentences of the Seed-TTS evaluation
+list, text only, in list order, after 16 warm-up requests, with
+`max_new_tokens` 250.
+
+The sentences come from
+[`en/meta.lst`](https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval/blob/8f5e1aa2a35d42f42e940074c1983358b9491f89/en/meta.lst)
+of `zhaochenyang20/seed-tts-eval` at revision
+`8f5e1aa2a35d42f42e940074c1983358b9491f89` (1,088 rows; the sentence is the
+fourth `|` field). Reading the rows in order and skipping the 7 whose
+sentence had already appeared gives 256 sentences from the first 263 rows.
+They are written as `<utterance id>|||<sentence>` rows to
+`seedtts256/en/meta.lst`, which the `seed-tts-text` dataset reads. The
+command below reproduces that file from a copy of the source at
+`seed-tts-eval/en/meta.lst`.
+
+```bash
+mkdir -p seedtts256/en
+awk -F'|' '!seen[$4]++ { print $1 "|||" $4; if (++n == 256) exit }' \
+    seed-tts-eval/en/meta.lst > seedtts256/en/meta.lst
+```
+
+The benchmark command at concurrency 1, with the scoring options:
+
+```bash
+SEED_TTS_SIM_EVAL=0 SEED_TTS_UTMOS_EVAL=0 SEED_TTS_EVAL_DEVICE=cuda:0 \
+    vllm-omni bench serve --omni --host 127.0.0.1 --port 8091 --model sesame/csm-1b \
+    --backend openai-audio-speech --endpoint /v1/audio/speech \
+    --dataset-name seed-tts-text --dataset-path seedtts256 --seed-tts-locale en \
+    --disable-shuffle --num-prompts 256 --num-warmups 16 \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun \
+    --metric-percentiles 50,90,99 --max-concurrency 1 --request-rate inf \
+    --extra-body '{"max_new_tokens":250}' \
+    --save-result --save-detailed --result-dir bench256 --result-filename c1.json \
+    --seed-tts-wer-eval --seed-tts-wer-save-items
+```
+
+`--max-concurrency` took the values of the first column. Each level ran two
+or three times; the first run of a level was discarded and the table gives
+the mean of the others. The two `--seed-tts-wer-*` options were passed for
+the last run of levels 1, 4 and 8 and for one more run of level 1, with
+`SEED_TTS_WER_SAVE_AUDIO_DIR` set to keep the audio. `--seed-tts-wer-eval`
+scores the audio with Whisper large-v3 on the same GPU after the run, and
+`--seed-tts-wer-save-items` keeps the per-sentence transcripts in the result
+file.
 
 | Concurrency | Runs kept | RTF, mean / P99 | Per frame (ms) | First audio, median / P99 (ms) | Audio seconds per wall second | WER, mean |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 2 | 0.27 / 0.34 | 21.9 | 65 / 80 | 3.69 | 0.041, 0.038 |
+| 1 | 2 | 0.27 / 0.34 | 21.9 | 65 / 80 | 3.69 | 0.041, 0.037 |
 | 2 | 1 | 0.34 / 0.43 | 27.1 | 85 / 93 | 5.90 | not scored |
 | 4 | 2 | 0.36 / 0.46 | 29.1 | 100 / 132 | 11.02 | 0.036 |
 | 8 | 2 | 0.39 / 0.50 | 31.0 | 113 / 233 | 20.22 | 0.034 |
@@ -285,12 +323,46 @@ limit. Its rows time `generate()` and the codec decode in one process and
 return complete audio; the pipeline's rows above are client-side times of
 streamed requests.
 
+```python
+import torch
+from transformers import AutoProcessor, CsmForConditionalGeneration
+
+processor = AutoProcessor.from_pretrained("sesame/csm-1b")
+model = CsmForConditionalGeneration.from_pretrained("sesame/csm-1b", torch_dtype=torch.float32)
+model = model.to("cuda").eval()
+model.codec_model.float()
+sampling = {"do_sample": True, "temperature": 0.9, "top_k": 50, "depth_decoder_do_sample": True,
+            "depth_decoder_temperature": 0.9, "depth_decoder_top_k": 50}
+
+conversation = [{"role": "0", "content": [{"type": "text", "text": sentence}]}]
+inputs = processor.apply_chat_template(conversation, tokenize=True, return_dict=True).to("cuda")
+torch.manual_seed(1234 + index)  # index of the sentence in the list
+codes = model.generate(**inputs, **sampling, max_new_tokens=250)[0]
+
+# Static-cache row: set once before the first call, then call generate() without max_new_tokens.
+model.generation_config.cache_implementation = "static"
+model.depth_decoder.generation_config.cache_implementation = "static"
+model.generation_config.max_length = 33 + 250  # longest prompt of the 32 sentences + the frame limit
+model.generation_config.max_new_tokens = None
+```
+
+The BF16 row loads the model with `torch_dtype=torch.bfloat16`;
+`model.codec_model.float()` keeps the codec in FP32 in every row, as in the
+pipeline. Three generations of the first sentence run before the timed ones.
+Generation and decoding are timed between `torch.cuda.synchronize()` calls,
+and the frames before the first all-zero frame are decoded with
+`model.codec_model`. The audio is saved as 16-bit WAV and scored by the
+benchmark's own evaluator (`compute_seed_tts_wer_metrics`), so the
+transcription and the error rate are computed as for the pipeline's rows.
+With a static cache `generate()` compiles the forward pass itself: the first
+warm-up call took 11.5 s, against 1.7 s without it.
+
 | Implementation | Sentences | Per frame (ms) | RTF, mean / P99 | Audio seconds per wall second | WER, mean / median | Exact transcripts |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Transformers, FP32 | 256 | 56.6 | 0.73 / 0.78 | 1.39 | 0.049 / 0 | 75.8% |
 | Transformers, BF16 | first 32 | 58.7 | 0.75 / 0.81 | 1.33 | 0.026 / 0 | 78.1% |
-| Transformers, FP32, static cache (compiled) | first 32 | 52.3 | 0.67 / 0.75 | 1.49 | 0.036 / 0 | 75.0% |
-| This pipeline, 1 request | 256 | 21.9 | 0.27 / 0.34 | 3.69 | 0.041, 0.038 / 0 | 78.9%, 79.7% |
+| Transformers, FP32, static cache (compiled) | first 32 | 52.3 | 0.67 / 0.75 | 1.49 | 0.035 / 0 | 75.0% |
+| This pipeline, 1 request | 256 | 21.9 | 0.27 / 0.34 | 3.69 | 0.041, 0.037 / 0 | 78.9%, 79.7% |
 | This pipeline, 8 requests | 256 | 31.0 | 0.39 / 0.50 | 20.22 | 0.034 / 0 | 78.5% |
 
 Sentence by sentence, one pipeline run at 1 request and the FP32 reference
