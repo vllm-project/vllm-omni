@@ -22,6 +22,8 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import CHECKPOINT_KEY
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import MiniCPMO45SchedulerWindowPolicy
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -171,6 +173,60 @@ def test_preempted_resumable_stop_keeps_one_admission_entry():
     assert next_step.num_scheduled_tokens == {request.request_id: 32}
     assert request not in scheduler.waiting
     assert request not in scheduler.kv_holding_waiting
+
+
+@pytest.mark.parametrize("running", [False, True], ids=["waiting-prefill", "running-decode"])
+def test_capacity_pressure_reclaims_unclaimed_duplex_checkpoint(running):
+    scheduler = _scheduler("allow", block_size=1, num_blocks=33)
+    policy = MiniCPMO45SchedulerWindowPolicy()
+    policy.bind_scheduler(scheduler)
+    scheduler._window_policy = policy
+    cache = policy.committed_kv
+    request = Request("live", [7] * (31 if running else 32), SamplingParams(max_tokens=4), None)
+    if running:
+        scheduler.add_request(request)
+        step = scheduler.schedule()
+        scheduler.update_from_output(step, _output(request))
+
+    def metadata(turn_id, marker=None):
+        return {
+            "duplex": {
+                "data_plane": True,
+                "session_id": "held-session",
+                "session_window_owned": True,
+                "epoch": 0,
+                "turn_id": turn_id,
+                "runtime_config": {"duplex_window_config": {"sliding_window_mode": "basic"}},
+                CHECKPOINT_KEY: marker,
+            }
+        }
+
+    old = SimpleNamespace(
+        request_id="old",
+        model_intermediate_buffer=metadata(1),
+        num_prompt_tokens=1,
+        num_tokens=2,
+        num_computed_tokens=1,
+        num_in_flight_tokens=0,
+        num_preemptions=0,
+        last_sched_seq=0,
+        _all_token_ids=[7, 8],
+    )
+    update = SimpleNamespace(model_intermediate_buffer=metadata(2, {"completed_turn": 1, "history": "settled"}))
+    cache.record(old, update, settled_end=1)
+    old.model_intermediate_buffer = update.model_intermediate_buffer
+    [held] = cache.pool.get_new_blocks(1)
+    cache.manager.req_to_blocks[old.request_id] = [held]
+    cache.retain(old)
+    cache.manager.free(old.request_id)
+    assert held.ref_cnt == 1
+
+    if not running:
+        scheduler.add_request(request)
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens == {request.request_id: 1 if running else 32}
+    assert request.num_preemptions == 0
+    assert not cache.saved
 
 
 @pytest.mark.parametrize("requires_kv_delivery", [False, True])

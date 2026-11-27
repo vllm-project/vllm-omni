@@ -84,6 +84,26 @@ class MiniCPMO45CommittedKV:
         )
         self.pool = cache.block_pool
         self.saved: dict[str, _Saved] = {}
+        if self.manager is not None:
+            allocate = cache.allocate_slots
+
+            def allocate_slots(*args, **kwargs):
+                blocks = allocate(*args, **kwargs)
+                if blocks is None and self.reclaim_for_allocation():
+                    return allocate(*args, **kwargs)
+                return blocks
+
+            cache.allocate_slots = allocate_slots
+
+    def reclaim_for_allocation(self) -> bool:
+        """Give live allocation priority over checkpoints that have no successor yet."""
+        if not self.saved:
+            return False
+        free_before = self.pool.get_num_free_blocks()
+        for session_id in tuple(self.saved):
+            self.release(session_id)
+        # An older request's deferred free can still own the same blocks.
+        return self.pool.get_num_free_blocks() > free_before
 
     def release(self, session_id: str) -> None:
         saved = self.saved.pop(session_id, None)
