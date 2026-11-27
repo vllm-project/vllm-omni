@@ -14,10 +14,7 @@ Covers:
 
 from __future__ import annotations
 
-import ast
-import pathlib
 from types import SimpleNamespace
-from typing import Any
 
 import numpy as np
 import pytest
@@ -30,9 +27,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
     DUPLEX_WINDOW_BLOCK_SIZE,
-    MiniCPMO45DuplexSchedulerHelper,
     MiniCPMO45DuplexWindowManager,
     MiniCPMO45DuplexWorkerHelper,
+    MiniCPMO45SchedulerWindowPolicy,
     assert_uniform_position_shift,
     duplex_window_geometry,
     rotate_cached_keys,
@@ -42,27 +39,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
     PositionReanchor,
     plan_position_reanchor,
+    prepare_stage0_window,
 )
-
-repo_root = pathlib.Path(__file__).resolve().parent
-while repo_root.name and not (repo_root / "vllm_omni").is_dir():
-    repo_root = repo_root.parent
-
-
-def _extract_prepare_stage0_window():
-    p = repo_root / "vllm_omni" / "core" / "sched" / "omni_ar_scheduler.py"
-    tree = ast.parse(p.read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "_prepare_minicpmo45_stage0_window":
-            node.decorator_list = []
-            mod = ast.Module(body=[node], type_ignores=[])
-            ns: dict[str, Any] = {}
-            exec(compile(mod, str(p), "exec"), ns)
-            return ns["_prepare_minicpmo45_stage0_window"]
-    raise RuntimeError("Could not find _prepare_minicpmo45_stage0_window in omni_ar_scheduler.py")
-
-
-prepare_minicpmo45_stage0_window = _extract_prepare_stage0_window()
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -338,7 +316,7 @@ def test_scheduler_worker_end_to_end_state_agreement():
         },
     )
 
-    plan = MiniCPMO45DuplexSchedulerHelper.apply_session_window(scheduler, session, update)
+    plan = MiniCPMO45SchedulerWindowPolicy.apply_session_window(scheduler, session, update)
     assert plan is not None
     assert plan.delta == 16
     assert plan.moved_from == 32
@@ -675,7 +653,7 @@ def test_rejection_before_state_mutation():
         },
     )
 
-    result = MiniCPMO45DuplexSchedulerHelper.apply_session_window(scheduler, session, update)
+    result = MiniCPMO45SchedulerWindowPolicy.apply_session_window(scheduler, session, update)
     assert result is None
     # Verify zero state mutation: token sequences and counters are untouched!
     assert session.prompt_token_ids == [1, 2, 3, 4]
@@ -697,7 +675,7 @@ def test_non_duplex_regression():
     # Case 1: No duplex in buffer
     update1 = SimpleNamespace(prompt_token_ids=[4], model_intermediate_buffer={})
     scheduler = SimpleNamespace()
-    assert MiniCPMO45DuplexSchedulerHelper.apply_session_window(scheduler, session, update1) is None
+    assert MiniCPMO45SchedulerWindowPolicy.apply_session_window(scheduler, session, update1) is None
     assert session.num_computed_tokens == 3
 
     # Case 2: sliding_window_mode = 'off'
@@ -712,7 +690,7 @@ def test_non_duplex_regression():
             }
         },
     )
-    assert MiniCPMO45DuplexSchedulerHelper.apply_session_window(scheduler, session, update2) is None
+    assert MiniCPMO45SchedulerWindowPolicy.apply_session_window(scheduler, session, update2) is None
     assert session.num_computed_tokens == 3
 
 
@@ -822,7 +800,7 @@ def test_reanchor_ordinary_append_fallback_rebuild_sequence():
         },
     )
 
-    plan = MiniCPMO45DuplexSchedulerHelper.apply_session_window(
+    plan = MiniCPMO45SchedulerWindowPolicy.apply_session_window(
         scheduler,
         session,
         update_reanchor,
@@ -882,7 +860,7 @@ def test_reanchor_ordinary_append_fallback_rebuild_sequence():
     )
 
     # Zero-copy policy returns None (inside window)
-    plan_ordinary = MiniCPMO45DuplexSchedulerHelper.apply_session_window(
+    plan_ordinary = MiniCPMO45SchedulerWindowPolicy.apply_session_window(
         scheduler,
         session,
         update_ordinary,
@@ -891,7 +869,7 @@ def test_reanchor_ordinary_append_fallback_rebuild_sequence():
     assert plan_ordinary is None
 
     # Fallback / ordinary prepare helper runs
-    replaced = prepare_minicpmo45_stage0_window(
+    replaced = prepare_stage0_window(
         session,
         update_ordinary,
         segment_output_ids=[43],
@@ -931,7 +909,7 @@ def test_reanchor_ordinary_append_fallback_rebuild_sequence():
             }
         },
     )
-    replaced_fb = prepare_minicpmo45_stage0_window(
+    replaced_fb = prepare_stage0_window(
         session,
         update_fallback,
         segment_output_ids=[44],

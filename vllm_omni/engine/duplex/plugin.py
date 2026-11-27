@@ -16,7 +16,7 @@ import asyncio
 import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Hashable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from importlib import import_module
 from typing import TYPE_CHECKING
@@ -591,6 +591,7 @@ class DuplexModelPlugin(ABC):
     #: exactly like client audio, so it must be a unit the model accepts.
     silence_continuation_sample_rate_hz: int = 16000
     data_plane: DuplexDataPlane
+    _pipeline_config: PipelineConfig | None = None
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         # Constructor-only: concrete plugins hand the encoder to their data plane.
@@ -598,6 +599,31 @@ class DuplexModelPlugin(ABC):
 
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
         """Bind model policy to the resolved deployment topology before admission."""
+        self._pipeline_config = pipeline_config
+
+    def deployment_capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
+        """Resolve model capabilities against the topology bound at startup.
+
+        A single final text stage has no audio output or downstream transport.
+        Other topologies retain their plugin's contract, including transcripts
+        emitted alongside audio by a final speech stage.
+        """
+        capabilities = self.capabilities(max_sessions=max_sessions)
+        pipeline = self._pipeline_config
+        if pipeline is None or len(pipeline.stages) != 1:
+            return capabilities
+        stage = pipeline.stages[0]
+        if stage.final_output and stage.final_output_type == "text":
+            return replace(
+                capabilities,
+                supported_output_modalities=frozenset({"text"}) & capabilities.supported_output_modalities,
+                default_output_modalities=("text",),
+                supports_playback_ack=False,
+                supports_audio_truncate=False,
+                supports_stage_connector_handoff=False,
+                stage_handoff_transport=None,
+            )
+        return capabilities
 
     def configure_async_chunk(self, *, enabled: bool) -> None:
         """Receive the deploy-resolved ``async_chunk`` flag before admission.
@@ -639,6 +665,19 @@ class DuplexModelPlugin(ABC):
             "format": "pcm_f32le",
             "sample_rate_hz": int(self.silence_continuation_sample_rate_hz),
         }
+
+    def startup_warmup_turn(self) -> dict[str, object] | None:
+        """One spoken warmup append, or None to keep the shared probe.
+
+        The shared video-turn probe sends a short tone plus one frame. A model
+        that treats an empty transcript as silence never reaches its later
+        stages on that input. Override this with the same fields as an
+        ``input_audio_buffer.append`` (base64 ``audio``, ``format``,
+        ``sample_rate_hz``, and optionally ``is_speech`` and ``video_frames``)
+        plus ``instructions`` when the shared warmup prompt is wrong for the
+        model. None leaves the shared probe unchanged.
+        """
+        return None
 
     # ---- engine policy (was DuplexRuntimeExtension) ----
 
@@ -1064,6 +1103,19 @@ class DuplexModelPlugin(ABC):
         """
         del model_result
         return None
+
+    def function_call_releases_turn(self, model_result: Mapping[str, object]) -> bool:
+        """Whether publishing this call finishes a non-resumable turn.
+
+        The function-call branch returns before the normal end-of-turn path.
+        A call that still has speech, or a model that emits its own terminal
+        event afterwards, must keep the default: releasing here would abort
+        that speech. A model whose call has nothing left to speak overrides
+        this so the request is free before the client sends the tool result
+        and ``response.create``.
+        """
+        del model_result
+        return False
 
     def runtime_config_for_function_output(
         self,

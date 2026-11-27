@@ -949,6 +949,7 @@
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
+        "ready_check_timeout_sec": 600,
         "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
         "num_prompts": [
           80
@@ -992,6 +993,7 @@
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
+        "ready_check_timeout_sec": 600,
         "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
         "num_prompts": [
           100
@@ -1040,7 +1042,8 @@
             "cuda": [
               "H100",
               "B200"
-            ]
+            ],
+            "rocm": "MI325"
           },
           "num_cards": 1
         }
@@ -1291,7 +1294,8 @@
             "cuda": [
               "H100",
               "B200"
-            ]
+            ],
+            "rocm": "MI325"
           },
           "num_cards": 1
         }
@@ -1349,7 +1353,8 @@
             "cuda": [
               "H100",
               "B200"
-            ]
+            ],
+            "rocm": "MI325"
           },
           "num_cards": 1
         }
@@ -1600,7 +1605,8 @@
             "cuda": [
               "H100",
               "B200"
-            ]
+            ],
+            "rocm": "MI325"
           },
           "num_cards": 1
         }

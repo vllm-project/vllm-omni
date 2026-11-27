@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from vllm_omni.diffusion.attention.parallel import factory
-from vllm_omni.diffusion.distributed import a2a_permute
+from vllm_omni.diffusion.distributed import a2a_permute, ulysses_transport
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -20,6 +20,8 @@ def parallel_context(monkeypatch):
     monkeypatch.setattr(factory, "get_forward_context", lambda: SimpleNamespace(omni_diffusion_config=config))
     monkeypatch.setattr(factory, "get_sp_group", lambda: Mock(ulysses_world_size=2))
     monkeypatch.setattr(factory, "get_sequence_parallel_world_size", lambda: 2 * parallel.allgather_degree)
+    # "auto" probes the group collectively; these tests have no process group, so the copy engine is unsupported.
+    monkeypatch.setattr(ulysses_transport, "_is_nvidia_cuda", lambda: False)
     return parallel
 
 
@@ -36,7 +38,7 @@ def test_default_does_not_build_optional_extension(monkeypatch, parallel_context
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("allgather", [1, 2])
 def test_explicit_exchange_setting_is_forwarded(monkeypatch, parallel_context, enabled, allgather):
-    parallel_context.ulysses_a2a_permute = enabled
+    parallel_context.ulysses_a2a_backend = "copy_engine" if enabled else "nccl"
     parallel_context.allgather_degree = allgather
     strategy = Mock()
     name = "UlyssesAllGatherKVParallelAttention" if allgather > 1 else "UlyssesParallelAttention"
@@ -50,6 +52,7 @@ def test_explicit_exchange_setting_is_forwarded(monkeypatch, parallel_context, e
 @pytest.mark.parametrize("chunks", [0, 4])
 def test_ce_overlap_chunks_are_forwarded_to_pure_ulysses(monkeypatch, parallel_context, chunks):
     parallel_context.ulysses_overlap_chunks = chunks
+    parallel_context.ulysses_a2a_backend = "copy_engine"  # the overlap runs on the copy-engine exchange only
     strategy = Mock()
     monkeypatch.setattr(factory, "UlyssesParallelAttention", strategy)
 
