@@ -325,13 +325,15 @@ def test_adaln_offload_can_be_disabled_without_disabling_cache(offload_model_con
 
 
 @pytest.mark.parametrize("explicit", [False, True], ids=["default", "explicit"])
-@pytest.mark.parametrize("setting", ["module", "layer", "hsdp", "quantized", "non_cuda"])
+@pytest.mark.parametrize("setting", ["module", "layer", "file_backed", "hsdp", "quantized", "non_cuda"])
 def test_adaln_offload_preserves_incompatible_modes(offload_model_config, monkeypatch, setting, explicit):
     config = offload_model_config
     config.cache_config = {"minimax_h3_adaln_offload": True} if explicit else {}
     quant = None
     if setting in {"module", "layer"}:
         config.diffusion_offload_config = {"mode": setting, "components": ["dit"]}
+    elif setting == "file_backed":
+        config.additional_config = {"minimax_h3_file_backed_offload": True}
     elif setting == "hsdp":
         config.parallel_config.use_hsdp = True
     elif setting == "non_cuda":
@@ -418,6 +420,8 @@ def test_npu_adaln_default_preserves_opt_out_and_incompatible_modes(offload_mode
         config.cache_config["minimax_h3_adaln_cache"] = False
     elif setting in {"module", "layer"}:
         config.diffusion_offload_config = {"mode": setting, "components": ["dit"]}
+    elif setting == "file_backed":
+        config.additional_config = {"minimax_h3_file_backed_offload": True}
     elif setting == "hsdp":
         config.parallel_config.use_hsdp = True
     with torch.device("meta"):

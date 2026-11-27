@@ -836,9 +836,12 @@ class MiniMaxH3DiTModel(nn.Module):
         if type(enabled) is not bool:
             raise ValueError("minimax_h3_adaln_cache must be a boolean")
         offload = resolve_offload(od_config)
+        file_backed = (getattr(od_config, "additional_config", None) or {}).get("minimax_h3_file_backed_offload")
         conflicting_offload = (
-            offload.strategy is not OffloadStrategy.NONE and offload.offloads(DIT_COMPONENT)
-        ) or getattr(od_config.parallel_config, "use_hsdp", False)
+            file_backed is True
+            or (offload.strategy is not OffloadStrategy.NONE and offload.offloads(DIT_COMPONENT))
+            or getattr(od_config.parallel_config, "use_hsdp", False)
+        )
         # Default to host staging for the NPU image pipeline and SM120 CUDA.
         # Other pipelines/platforms keep resident weights unless opted in.
         # Use the worker's current device, not logical device zero.
