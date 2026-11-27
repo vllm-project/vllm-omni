@@ -868,17 +868,27 @@ class Cosmos3CrossAttention(nn.Module):
         # standard reverse-all-to-all path (no joint-output splitting).
         joint_q = q.new_empty(B, 0, self.num_heads_local, self.head_dim)
 
+        suffix_padding = 0
         gen_mask = None
         joint_mask = None
         if is_forward_context_available():
             ctx = get_forward_context()
             if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
-                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
-                gen_mask = torch.ones(B, padded_seq_len, dtype=torch.bool, device=q.device)
-                gen_mask[:, ctx.sp_original_seq_len :] = False
-                # UND K/V are trimmed to the common real text length before GEN
-                # attention, so every remaining joint key is valid.
-                joint_mask = torch.ones(B, k_und.shape[1], dtype=torch.bool, device=q.device)
+                parallel = ctx.omni_diffusion_config.parallel_config if ctx.omni_diffusion_config else None
+                if (
+                    parallel is not None
+                    and parallel.ulysses_degree > 1
+                    and parallel.ring_degree == parallel.allgather_degree == 1
+                    and parallel.ulysses_mode == "strict"
+                ):
+                    suffix_padding = ctx.sp_padding_size
+                else:
+                    padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                    gen_mask = torch.ones(B, padded_seq_len, dtype=torch.bool, device=q.device)
+                    gen_mask[:, ctx.sp_original_seq_len :] = False
+                    # UND K/V are trimmed to the common real text length before GEN
+                    # attention, so every remaining joint key is valid.
+                    joint_mask = torch.ones(B, k_und.shape[1], dtype=torch.bool, device=q.device)
 
         attn_metadata = AttentionMetadata(
             attn_mask=gen_mask,
@@ -887,6 +897,7 @@ class Cosmos3CrossAttention(nn.Module):
             joint_key=k_und,
             joint_value=v_und,
             joint_strategy="front",
+            ulysses_suffix_padding=suffix_padding,
         )
         out = self.attn(q, k, v, attn_metadata)
         return out.reshape(B, S_gen, -1)

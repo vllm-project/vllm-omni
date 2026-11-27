@@ -298,6 +298,8 @@ class AttentionMetadata:
     cross_kv_rows_validated: bool = False
     cross_query_mask: torch.Tensor | None = None
     cross_pair_mask_validated: bool = False
+    # Synthetic trailing Q/K/V rows after pure Ulysses gathers the sequence.
+    ulysses_suffix_padding: int = 0
 
     @classmethod
     def for_cross_kv_mask(cls, mask: torch.Tensor, *, kv_slice: slice | None = None) -> "AttentionMetadata":
