@@ -515,10 +515,18 @@ class TestSingleStageModeDetection:
             StageRuntime, "_before_initialize_stage_replicas", autospec=True, side_effect=capture_plans_and_stop
         )
         with pytest.raises(RuntimeError, match="stage plans captured"):
-            AsyncOmniEngine(model="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", stage_id=1)
+            AsyncOmniEngine(model="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", stage_id=1, async_chunk=False)
 
         # Since we have no master, we should only have plans for the selected stage id.
         assert [[replica.launch_mode for replica in plan.replicas] for plan in stage_plans] == [[], ["local"]]
+
+    def test_stage_id_without_master_rejects_async_chunk(self, mocker: MockerFixture):
+        """Ensure a stage served without a master rejects async_chunk, since /v1/run does not support it."""
+        mocker.patch.object(
+            StageRuntime, "_before_initialize_stage_replicas", side_effect=RuntimeError("stages should not start")
+        )
+        with pytest.raises(ValueError, match="does not support async_chunk"):
+            AsyncOmniEngine(model="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", stage_id=1, async_chunk=True)
 
     def test_stage_id_without_master_ignores_inactive_stage_device_layout(self, mocker: MockerFixture):
         """Ensure an inactive replicated stage's device layout does not block starting the selected stage."""
@@ -535,7 +543,8 @@ class TestSingleStageModeDetection:
             AsyncOmniEngine(
                 model="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
                 stage_id=0,
-                # The replicas / devices here are forced to 0 since we are only running stage 1
+                async_chunk=False,
+                # The replicas / devices here are forced to 0 since we are only running stage 0
                 stage_overrides={"1": {"num_replicas": 2, "devices": "0,0"}},
             )
 

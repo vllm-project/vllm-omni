@@ -317,12 +317,29 @@ class OmniEngineBase:
         ):
             raise ValueError("weight sharing requires local two-stage ownership and sequential initialization")
 
+        self.async_chunk = any(
+            bool(
+                getattr(
+                    getattr(stage, "connector_config", None),
+                    "async_chunk",
+                    getattr(getattr(stage, "engine_args", None), "async_chunk", False),
+                )
+            )
+            for stage in self.stage_configs
+        )
+
         if self._single_stage_id_filter is not None:
             self._validate_single_stage_choice(self._single_stage_id_filter, self.stage_configs)
+
             # If a stage is being served by itself (i.e., no master server, and only
             # taking Run requests), 0 out replicas of the nonselected stages. We also
             # clear their devices, since they'd be sized for replicas that won't run here.
             if not self.single_stage_mode:
+                if self.async_chunk:
+                    raise ValueError(
+                        "--stage-id without a master serves only /v1/run, which does not support async_chunk; "
+                        "pass --no-async-chunk"
+                    )
                 for stage_cfg in self.stage_configs:
                     if stage_cfg.stage_id != self._single_stage_id_filter:
                         stage_cfg.runtime_config.num_replicas = 0
@@ -339,16 +356,6 @@ class OmniEngineBase:
             )
 
         self.num_stages = len(self.stage_configs)
-        self.async_chunk = any(
-            bool(
-                getattr(
-                    getattr(stage, "connector_config", None),
-                    "async_chunk",
-                    getattr(getattr(stage, "engine_args", None), "async_chunk", False),
-                )
-            )
-            for stage in self.stage_configs
-        )
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
