@@ -209,6 +209,46 @@ def test_parallel_tile_failure_before_blend(monkeypatch, failure):
     assert DiagonalGaussianDistribution.calls == 0
 
 
+@pytest.mark.parametrize("failure", ["blend", "sample"])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_parallel_tile_failure_after_gather(monkeypatch, failure, rank):
+    vae = _vae()
+    process_group = object()
+    vae.model.parallel_tiling = True
+    vae._native_parallel_state = lambda: {"sp_rank": rank, "sp_size": 2, "sp_process_group": process_group}
+    collectives = []
+    failure_agreement = 2 if failure == "blend" else 3
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"rank 0 {failure} failed")
+
+    def agree(failed, *, group):
+        assert group is process_group
+        is_failure_agreement = collectives.count("agree") + 1 == failure_agreement
+        assert failed.item() == int(rank == 0 and is_failure_agreement)
+        if rank == 1 and is_failure_agreement:
+            failed.fill_(1)
+        collectives.append("agree")
+
+    def gather(tasks, tile_count):
+        assert len(tasks) * 2 == tile_count
+        collectives.append("gather")
+        return tasks * 2
+
+    if rank == 0:
+        target = vae.model if failure == "blend" else DiagonalGaussianDistribution
+        monkeypatch.setattr(target, failure, fail)
+    vae.model._all_gather_tiled_results = gather
+    monkeypatch.setattr("vllm_omni.diffusion.models.minimax_h3.vae.dist.all_reduce", agree)
+
+    assert vae._stream_encode_video_tiles(_frames(), torch.device("cpu")) is None
+    expected = ["agree", "gather", "agree"]
+    if failure == "sample":
+        expected.extend(["gather", "agree"])
+    assert collectives == expected
+    assert DiagonalGaussianDistribution.calls == int(rank == 1 and failure == "sample")
+
+
 def test_encoder_subclass_can_stream_tiles():
     class EncoderSubclass(EncoderFCN3D):
         pass
