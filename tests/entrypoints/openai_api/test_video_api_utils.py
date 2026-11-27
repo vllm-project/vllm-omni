@@ -59,7 +59,6 @@ def test_encode_video_bytes_selects_portable_ffmpeg_default(enable_borrowed_fram
         assert len(list(container.decode(video=0))) == 2
 
 
-
 def _install_http_transport(monkeypatch, handler, client_kwargs):
     async_client = httpx.AsyncClient
 

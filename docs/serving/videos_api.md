@@ -225,7 +225,11 @@ Set `extra_params.video_encoder_backend` to `"ffmpeg"` to encode non-streaming
 VAE output with the `ffmpeg` executable instead of PyAV. The default is
 `"pyav"`; streaming responses continue to use PyAV fragmented MP4. The ffmpeg
 backend uses MPEG-4 Part 2 (`mpeg4`) by default rather than PyAV's H.264, so
-clients must support that codec.
+clients must support that codec. The server rejects combining this backend
+with `preencode_mp4=true`, including when that flag comes from deployment
+sampling defaults, with HTTP 400 before generation. Set
+`extra_params.preencode_mp4` to `false` to override that default when selecting
+ffmpeg.
 
 A client that cannot place the control on the server filesystem can upload one
 control with `control_reference` and identify it with `control_type`. The API
