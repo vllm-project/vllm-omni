@@ -1641,7 +1641,7 @@ def test_distributed_ready_jobs_mirror_cuda_scopes(label: str, pool: str, expect
     command = " ".join("\n".join(step["commands"]).split())
 
     assert step["agent_pool"] == pool
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["env"]["ROCM_DIFFUSION_RUN_LEVEL"] == "core_model"
     assert f"run-rocm-diffusion-nightly.sh {expected} tests/distributed/omni_connectors/ {marker}" in command
     # Only the single-process Mooncake connector tests need the TCP path.
@@ -1741,10 +1741,10 @@ def test_qwen3_omni_realtime_merge_job_mirrors_cuda_h100_entrypoints() -> None:
     marker = "-m 'advanced_model and omni and rocm and MI325 and cards_2 and not nvidia_only'"
 
     assert step["agent_pool"] == "mi300_2"
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["source_file_dependencies"] == "omni_qwen3_omni_duplex_playback_function"
-    assert "assert-pytest-collection.sh 29" in commands
-    assert "if tests != 29 or skipped != 0" in commands
+    assert "assert-pytest-collection.sh 30" in commands
+    assert "if tests != 30 or skipped != 0" in commands
     assert commands.count(marker) == 2
     for path in (
         "tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py",
