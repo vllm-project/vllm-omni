@@ -14,7 +14,11 @@ from tests.helpers.mark import hardware_marks
 from vllm_omni.data_entry_keys import EmbeddingsStruct, HiddenStatesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=2), pytest.mark.parallel]
+pytestmark = [
+    pytest.mark.core_model,
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2),
+    pytest.mark.parallel,
+]
 
 
 def _native_nixl_available() -> bool:

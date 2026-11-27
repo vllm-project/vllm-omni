@@ -664,3 +664,176 @@ def test_reaping_keeps_consumed_records_bounded_behind_unread_keys(connector):
         assert not connector._pending_keys
     finally:
         receiver.close()
+
+
+def test_put_refuses_when_peer_shared_memory_is_not_visible():
+    """A sender that cannot see the receiver's IPC namespace must not report success."""
+    base = 50000 + (os.getpid() % 10000)
+    sender = SharedMemoryConnector({"stage_id": base})
+    key = f"peer_{uuid.uuid4().hex}"
+    try:
+        ok, size, meta = sender.put(str(base), str(base + 1), key, {"a": 1})
+        assert ok is False
+        assert size == 0
+        assert meta is None
+        receiver = SharedMemoryConnector({"stage_id": base + 1})
+        try:
+            assert sender.put(str(base), str(base + 1), key, {"a": 1})[0] is True
+            assert receiver.get(str(base), str(base + 1), key)[0] == {"a": 1}
+        finally:
+            receiver.close()
+        assert sender.put(str(base), str(base + 1), f"{key}-gone", {"a": 1})[0] is False
+    finally:
+        sender.close()
+
+
+def test_visibility_is_scoped_to_deployment():
+    """A same-numbered stage from another deployment in this namespace is not our peer."""
+    base = 50000 + (os.getpid() % 10000)
+    sender = SharedMemoryConnector({"stage_id": base, "wakeup_scope": f"b-{uuid.uuid4().hex}"})
+    other_deployment = SharedMemoryConnector({"stage_id": base + 1, "wakeup_scope": f"a-{uuid.uuid4().hex}"})
+    key = f"scoped_{uuid.uuid4().hex}"
+    try:
+        assert sender.put(str(base), str(base + 1), key, {"a": 1})[0] is False
+        receiver = SharedMemoryConnector({"stage_id": base + 1, "wakeup_scope": sender.config["wakeup_scope"]})
+        try:
+            assert sender.put(str(base), str(base + 1), key, {"a": 1})[0] is True
+            assert receiver.get(str(base), str(base + 1), key)[0] == {"a": 1}
+        finally:
+            receiver.close()
+    finally:
+        other_deployment.close()
+        sender.close()
+
+
+def test_separate_config_loads_share_one_deployment_scope():
+    """Head and --headless each load the config. The same master endpoint must match."""
+    from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        load_omni_transfer_config,
+        resolve_connector_spec,
+    )
+
+    config = {"stage_args": [{"stage_id": 0}, {"stage_id": 1, "engine_input_source": [0]}]}
+    scope = f"10.0.0.8:{18000 + (os.getpid() % 1000)}"
+    head = load_omni_transfer_config(config_dict=config, deployment_scope=scope)
+    headless = load_omni_transfer_config(config_dict=config, deployment_scope=scope)
+    other = load_omni_transfer_config(config_dict=config, deployment_scope=scope + "-other")
+    sender = OmniConnectorFactory.create_connector(
+        resolve_connector_spec(head.connectors[("0", "1")], stage_id=0, role="sender")
+    )
+    stranger = OmniConnectorFactory.create_connector(
+        resolve_connector_spec(other.connectors[("0", "1")], stage_id=1, role="receiver")
+    )
+    key = f"deploy_{uuid.uuid4().hex}"
+    receiver = None
+    try:
+        assert sender.put("0", "1", key, {"a": 1})[0] is False
+        receiver = OmniConnectorFactory.create_connector(
+            resolve_connector_spec(headless.connectors[("0", "1")], stage_id=1, role="receiver")
+        )
+        assert sender.put("0", "1", key, {"a": 1})[0] is True
+        assert receiver.get("0", "1", key)[0] == {"a": 1}
+    finally:
+        if receiver is not None:
+            receiver.close()
+        stranger.close()
+        sender.close()
+
+
+def test_closing_one_receiver_keeps_the_other_visible():
+    base = 60000 + (os.getpid() % 1000)
+    scope = f"live-{uuid.uuid4().hex}"
+    sender = SharedMemoryConnector({"stage_id": base, "wakeup_scope": scope})
+    first = SharedMemoryConnector({"stage_id": base + 1, "wakeup_scope": scope})
+    second = SharedMemoryConnector({"stage_id": base + 1, "wakeup_scope": scope})
+    key = f"both_{uuid.uuid4().hex}"
+    try:
+        first.close()
+        assert sender.put(str(base), str(base + 1), key, {"a": 1})[0] is True
+        assert second.get(str(base), str(base + 1), key)[0] == {"a": 1}
+    finally:
+        second.close()
+        sender.close()
+
+
+def test_head_deployment_id_matches_across_master_address_spellings():
+    """127.0.0.1 and localhost are one master. Connectors must share its id."""
+    import msgspec
+    import zmq
+    from vllm.utils.network_utils import get_open_port
+
+    from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        load_omni_transfer_config,
+        resolve_connector_spec,
+    )
+    from vllm_omni.engine.stage_engine_startup import OmniMasterServer, fetch_deployment_id
+
+    port = get_open_port()
+    server = OmniMasterServer(master_address="127.0.0.1", master_port=port, stage_ids=[0, 1])
+    server.start()
+    config = {"stage_args": [{"stage_id": 0}, {"stage_id": 1, "engine_input_source": [0]}]}
+    sender = receiver = literal_sender = literal_receiver = None
+    ctx = zmq.Context()
+    try:
+        from vllm_omni.engine.stage_engine_startup import ensure_matching_deployment_id
+
+        via_ip = fetch_deployment_id(omni_master_address="127.0.0.1", omni_master_port=port)
+        via_name = fetch_deployment_id(omni_master_address="localhost", omni_master_port=port)
+        assert via_ip == via_name == server.deployment_id
+        sock = ctx.socket(zmq.DEALER)
+        sock.connect(f"tcp://localhost:{port}")
+        sock.send(msgspec.msgpack.encode({"stage_id": 0}))
+        assert sock.poll(timeout=5_000)
+        registered = msgspec.msgpack.decode(sock.recv())["deployment_id"]
+        assert registered == server.deployment_id
+        ensure_matching_deployment_id(expected=via_ip, actual=registered)
+        sock.close(linger=0)
+
+        head = load_omni_transfer_config(config_dict=config, deployment_scope=via_ip)
+        headless = load_omni_transfer_config(config_dict=config, deployment_scope=via_name)
+        sender = OmniConnectorFactory.create_connector(
+            resolve_connector_spec(head.connectors[("0", "1")], stage_id=0, role="sender")
+        )
+        receiver = OmniConnectorFactory.create_connector(
+            resolve_connector_spec(headless.connectors[("0", "1")], stage_id=1, role="receiver")
+        )
+        key = f"spell_{uuid.uuid4().hex}"
+        assert sender.put("0", "1", key, {"a": 1})[0] is True
+        assert receiver.get("0", "1", key)[0] == {"a": 1}
+
+        literal_sender = OmniConnectorFactory.create_connector(
+            resolve_connector_spec(
+                load_omni_transfer_config(config_dict=config, deployment_scope=f"127.0.0.1:{port}").connectors[
+                    ("0", "1")
+                ],
+                stage_id=0,
+                role="sender",
+            )
+        )
+        literal_receiver = OmniConnectorFactory.create_connector(
+            resolve_connector_spec(
+                load_omni_transfer_config(config_dict=config, deployment_scope=f"localhost:{port}").connectors[
+                    ("0", "1")
+                ],
+                stage_id=1,
+                role="receiver",
+            )
+        )
+        assert literal_sender.put("0", "1", key + "-x", {"a": 1})[0] is False
+    finally:
+        for connector in (literal_receiver, literal_sender, receiver, sender):
+            if connector is not None:
+                connector.close()
+        ctx.term()
+        server.stop()
+
+
+def test_registration_rejects_stale_prefetched_deployment_id():
+    """Headless must not spawn after the master id drifts from the prefetch."""
+    from vllm_omni.engine.stage_engine_startup import ensure_matching_deployment_id
+
+    ensure_matching_deployment_id(expected="same-id", actual="same-id")
+    with pytest.raises(RuntimeError, match="deployment id changed"):
+        ensure_matching_deployment_id(expected="prefetch-old", actual="register-new")
