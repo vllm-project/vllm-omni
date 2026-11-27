@@ -1668,6 +1668,8 @@ steps:
         timeout_in_minutes: 180
         source_file_dependencies: [tts_voxtral_tts_perf, rocm_tts_perf_runner]
         env:
+          # Use cached/immediate solvers instead of searching during decoding.
+          MIOPEN_FIND_MODE: "FAST"
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
         artifact_paths:
           - artifacts/rocm-voxtral-tts-perf/**/*
