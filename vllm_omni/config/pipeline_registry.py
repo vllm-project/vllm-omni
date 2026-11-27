@@ -34,6 +34,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
 from vllm_omni.diffusion.models.mossimage_pipeline_config import MOSS_IMAGE_PIPELINE
+from vllm_omni.diffusion.models.motubrain2_pipeline_config import MOTUBRAIN2_PIPELINE
 from vllm_omni.diffusion.models.physis.h3.pipeline_config import PHYSIS_H3_PIPELINE
 from vllm_omni.diffusion.models.physis.ltx.pipeline_config import PHYSIS_LTX_PIPELINE
 from vllm_omni.diffusion.models.physis.wan.pipeline_config import PHYSIS_WAN_PIPELINE
@@ -253,6 +254,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "moss_tts_local": MOSS_TTS_LOCAL_PIPELINE,
     "moss_tts_nano": MOSS_TTS_NANO_PIPELINE,
     "moss_tts_realtime": MOSS_TTS_REALTIME_PIPELINE,
+    "motubrain2": MOTUBRAIN2_PIPELINE,
     # Alias: the Nemotron-Labs-Audex-2B repo-root config.json reports
     # ``model_type: nemotron_labs_audex``; bare ``vllm-omni serve <repo>``
     # auto-detects through it and must land on the default (TTS) pipeline.

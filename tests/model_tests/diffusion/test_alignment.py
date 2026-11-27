@@ -32,6 +32,8 @@ EXCLUDED_MODELS = [
     # Covered by tests/diffusion/test_mossimage_*.py and
     # test_mossimage_registry.py.
     "MOSSImagePipeline",
+    # Motubrain uses a robot observation and has its own tiny native reference-parity test.
+    "Motubrain2Pipeline",
     "GlmImagePipeline",
     "ZImagePipeline",
     "OvisImagePipeline",

@@ -249,6 +249,11 @@ _DIFFUSION_MODELS = {
         "pipeline",
         "MingImageDiffusionPipeline",
     ),
+    "Motubrain2Pipeline": (
+        "motubrain2",
+        "pipeline_motubrain2",
+        "Motubrain2Pipeline",
+    ),
     "SanaWmPipeline": (
         "sana_wm",
         "pipeline_sana_wm",
@@ -552,6 +557,8 @@ def supports_mixfusion(od_config: OmniDiffusionConfig) -> bool:
 
 
 _NO_CACHE_ACCELERATION = {
+    # Motubrain owns checkpoint-specific cache decisions inside its native denoising loop.
+    "Motubrain2Pipeline",
     # Praxis-1 jointly denoises video and actions in its own Euler window loop.
     "Praxis1Pipeline",
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).

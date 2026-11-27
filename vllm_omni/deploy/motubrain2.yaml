@@ -1,0 +1,38 @@
+# RoboTwin policy. One worker handles one robot observation at a time.
+pipeline: motubrain2
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    # Let the released policy select its local SwiGLU kernel.
+    enforce_eager: false
+    default_sampling_params:
+      seed: 0
+    model_class_name: Motubrain2Pipeline
+    engine_extras:
+      model_config:
+        # Encoder sources accept Hub IDs or local model directories.
+        # The native bundle supplies the sampler, step count and shifts.
+        wan: Wan-AI/Wan2.2-TI2V-5B-Diffusers
+        wan_subfolder: vae
+        text_encoder: google/t5gemma-9b-9b-prefixlm-it
+        da3: depth-anything/DA3-LARGE-1.1
+        motubrain2_metadata:
+          image_resolution: [480, 640]
+          n_external_cameras: 1
+          needs_wrist_camera: true
+          needs_stereo_camera: false
+          needs_session_id: false
+          # Left pose (XYZ + XYZW), left gripper, right pose, right gripper.
+          action_space: cartesian_pose_xyzw_gripper
+          action_horizon: 24
+          action_dim: 16
+          max_cameras: 3
+          camera_sources:
+            - cam_high
+            - cam_left_wrist
+            - cam_right_wrist
