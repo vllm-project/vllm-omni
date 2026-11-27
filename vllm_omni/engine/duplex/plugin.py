@@ -781,10 +781,10 @@ class DuplexModelPlugin(ABC):
         *,
         state: DuplexModelSessionState,
         fence: DuplexFence,
-        response_id: str,
+        response_id: str | None,
         completed_text: str | None,
     ) -> None:
-        """Observe a history-eligible response end. None denotes cancellation."""
+        """Observe completion or cancellation, including cancellation before a response ID exists."""
 
     @abstractmethod
     def plan_append(

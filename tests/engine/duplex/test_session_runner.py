@@ -1296,7 +1296,7 @@ async def test_clear_keeps_only_committed_replay_history(committed: bool) -> Non
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="original", turn_end=True))
         state = h.runner.model_state
         [old_turn] = state.replay_completed
-        assert (old_turn.source is not None) == committed
+        assert bool(old_turn.sources) == committed
 
         await h.run(commands.ClearInput())
         await h.run(append_audio(value=0.12))
@@ -1656,6 +1656,84 @@ async def test_cancel_replays_committed_audio_from_the_same_model_turn(monkeypat
             [unit] = turn["inputs"]
             assert unit["audio"] == b64(pcm_f32(16000, value=value))
             assert turn["user_only"] and not turn["response_token_ids"]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("later_input", ["silence", "committed", "delete-first-source"])
+async def test_later_cancel_replays_completed_reply_and_live_input_sources(monkeypatch, later_input) -> None:
+    _stub_tokenizer(monkeypatch)
+    h = await open_harness()
+    try:
+        h.session.config.playback_commit_policy = "ack_only"
+        await h.run(append_audio())
+        first = find(await h.run(commands.Commit(create_response=False)), "input_audio_buffer.committed")
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, text="original", finished=False))
+        response_id = h.session.active_response_id
+        assert response_id is not None
+
+        committed = later_input != "silence"
+        later_value = 0.10 if committed else 0.0
+        before = len(h.port.submissions)
+        await h.run(append_audio(value=later_value, is_speech=committed))
+        assert len(h.port.submissions) == before + 1
+        duplex = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert duplex["turn_id"] == 0 and not duplex["final"]
+
+        done = await h.deliver_and_settle(tts_output(request_id, text="original", turn_end=True))
+        assert find(done, "response.done").status == "completed"
+        ack = await h.run(commands.AckPlayback(response_id=response_id, played_ms=1000))
+        assert find(ack, "playback.acknowledged").details["history_committed"]
+        if committed:
+            find(await h.run(commands.Commit(create_response=False)), "input_audio_buffer.committed")
+        if later_input == "delete-first-source":
+            find(await h.run(commands.DeleteItem(item_id=first.item_id)), "conversation.item.deleted")
+
+        await h.run(append_audio(value=0.15))
+        next_turn = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["turn_id"]
+        await h.deliver_and_settle(
+            tts_output(h.stage0_request_id(), samples=48000, text="interrupted", turn_id=next_turn)
+        )
+        assert h.session.active_response_id is not None
+        assert find(await h.run(commands.BargeIn()), "response.done").status == "cancelled"
+        await h.run(append_audio(value=0.20))
+
+        replacement = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert (replacement["epoch"], replacement["seq"]) == (1, 1)
+        [completed] = replacement.get(REPLAY_CONTEXT_KEY, [])
+        expected = [0.05, 0.1] if committed else [0.05]
+        if later_input == "delete-first-source":
+            expected = [0.1]
+        assert [unit["audio"] for unit in completed["inputs"]] == [
+            b64(pcm_f32(16000, value=value)) for value in expected
+        ]
+        assert completed["response_token_ids"] == list(map(ord, "original"))
+        assert not replacement.get(CHECKPOINT_KEY)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_barge_in_before_response_creation_replays_committed_audio(monkeypatch) -> None:
+    _stub_tokenizer(monkeypatch)
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        find(await h.run(commands.Commit(create_response=False)), "input_audio_buffer.committed")
+        assert h.session.active_response_id is None
+        assert h.port.submissions
+        await h.run(commands.BargeIn())
+        await h.run(append_audio(value=0.15))
+
+        replacement = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert (replacement["epoch"], replacement["seq"]) == (1, 1)
+        assert replacement["session_window_replay"] is False
+        [turn] = replacement.get(REPLAY_CONTEXT_KEY, [])
+        assert turn["user_only"] and not turn["response_token_ids"]
+        [unit] = turn["inputs"]
+        assert unit["audio"] == b64(pcm_f32(16000, value=0.05))
     finally:
         await close_harness(h)
 

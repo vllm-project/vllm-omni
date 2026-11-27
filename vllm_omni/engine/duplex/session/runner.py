@@ -2887,12 +2887,11 @@ class DuplexSessionRunner:
         audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
         # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
         self.run.concurrent_turn_requests_released = False
-        if old_response_id is not None:
-            turn_id = session.active_response_turn_id
-            fence = session.fence if turn_id is None else DuplexFence(session.session_id, old_epoch, turn_id)
-            self.plugin.observe_response_end(
-                state=self.ctx.model_state, fence=fence, response_id=old_response_id, completed_text=None
-            )
+        turn_id = session.active_response_turn_id
+        fence = session.fence if turn_id is None else DuplexFence(session.session_id, old_epoch, turn_id)
+        self.plugin.observe_response_end(
+            state=self.ctx.model_state, fence=fence, response_id=old_response_id, completed_text=None
+        )
         should_commit = self.model.should_commit_response_to_history(session, old_response_id)
         committed_message = session.end_response(
             commit_text=should_commit,

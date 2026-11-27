@@ -108,7 +108,7 @@ class _ReplayTurn:
     item_id: str | None
     inputs: list[_ReplayInput]
     epoch: int
-    source: _ReplaySource | None
+    sources: dict[int, _ReplaySource]
     completed_text: str = ""
 
 
@@ -908,75 +908,71 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         if self.plugin_id == MiniCPMO45DuplexPlugin.plugin_id:
             assert isinstance(state, MiniCPMO45ServingSessionState)
             self._open_replay_epoch(state, fence.epoch)
-            replay_seqs = {unit.input_commit_seq for unit in state.replay_pending}
-            # A completed reply with mixed inputs can still be cancelled during playback.
-            replay_seqs.update(
-                unit.input_commit_seq
-                for turn in state.replay_completed
-                if turn.epoch == fence.epoch and turn.source is None
-                for unit in turn.inputs
-                if unit.user_media
-            )
-            state.replay_commits = {seq: source for seq, source in state.replay_commits.items() if seq in replay_seqs}
+            pending_seqs = {unit.input_commit_seq for unit in state.replay_pending}
+            state.replay_commits = {seq: source for seq, source in state.replay_commits.items() if seq in pending_seqs}
             source = _ReplaySource(item_id, source_id)
             state.replay_commits[input_commit_seq] = source
             state.has_committed_history = True
             for index, turn in enumerate(state.replay_completed):
-                if (
-                    turn.epoch == fence.epoch
-                    and turn.source is None
-                    and self._input_commit_seq(turn.inputs) == input_commit_seq
+                if turn.epoch == fence.epoch and any(
+                    unit.user_media and unit.input_commit_seq == input_commit_seq for unit in turn.inputs
                 ):
-                    state.replay_completed[index] = replace(turn, source=source)
+                    state.replay_completed[index] = replace(turn, sources={**turn.sources, input_commit_seq: source})
 
     def observe_input_clear(self, *, state: DuplexModelSessionState) -> None:
         assert isinstance(state, MiniCPMO45ServingSessionState)
         state.replay_pending = [unit for unit in state.replay_pending if unit.input_commit_seq in state.replay_commits]
-        state.replay_completed = [turn for turn in state.replay_completed if turn.source is not None]
+        state.replay_completed = [
+            replace(
+                turn,
+                inputs=[unit for unit in turn.inputs if not unit.user_media or unit.input_commit_seq in turn.sources],
+            )
+            for turn in state.replay_completed
+            if turn.sources
+        ]
         state.checkpoint_eligible = False
-
-    @staticmethod
-    def _input_commit_seq(inputs: list[_ReplayInput]) -> int | None:
-        # Synthetic silence advancing a reply owns no conversation item.
-        seqs = {unit.input_commit_seq for unit in inputs if unit.user_media}
-        return seqs.pop() if len(seqs) == 1 else None
 
     def observe_response_end(
         self,
         *,
         state: DuplexModelSessionState,
         fence: DuplexFence,
-        response_id: str,
+        response_id: str | None,
         completed_text: str | None,
     ) -> None:
         assert isinstance(state, MiniCPMO45ServingSessionState)
         if state.replay_epoch != fence.epoch:
             return
-        item_id = f"item_{response_id}"
+        item_id = f"item_{response_id}" if response_id is not None else None
         inputs = [unit for unit in state.replay_pending if unit.turn_id <= fence.turn_id]
         state.replay_pending = [unit for unit in state.replay_pending if unit.turn_id > fence.turn_id]
         if completed_text is None:
             commits = state.replay_commits
             # A generated reply can still be cancelled while the client plays it.
             for index, turn in enumerate(state.replay_completed):
-                if turn.item_id == item_id:
+                if item_id is not None and turn.item_id == item_id:
                     del state.replay_completed[index]
                     inputs = turn.inputs + inputs
-                    commit_seq = self._input_commit_seq(turn.inputs)
-                    if commit_seq is not None and turn.source is not None:
-                        commits = {**commits, commit_seq: turn.source}
+                    commits = {**commits, **turn.sources}
                     break
             groups: dict[int, list[_ReplayInput]] = {}
             for unit in inputs:
                 if unit.user_media and unit.input_commit_seq in commits:
                     groups.setdefault(unit.input_commit_seq, []).append(unit)
             state.replay_completed.extend(
-                _ReplayTurn(None, group, fence.epoch, commits[seq]) for seq, group in groups.items()
+                _ReplayTurn(None, group, fence.epoch, {seq: commits[seq]}) for seq, group in groups.items()
             )
-        elif inputs and (state.replay_overflow_turn is None or fence.turn_id > state.replay_overflow_turn):
-            commit_seq = self._input_commit_seq(inputs)
-            source = state.replay_commits.get(commit_seq) if commit_seq is not None else None
-            state.replay_completed.append(_ReplayTurn(item_id, inputs, fence.epoch, source, completed_text.strip()))
+        elif (
+            item_id is not None
+            and inputs
+            and (state.replay_overflow_turn is None or fence.turn_id > state.replay_overflow_turn)
+        ):
+            sources = {
+                seq: state.replay_commits[seq]
+                for unit in inputs
+                if unit.user_media and (seq := unit.input_commit_seq) in state.replay_commits
+            }
+            state.replay_completed.append(_ReplayTurn(item_id, inputs, fence.epoch, sources, completed_text.strip()))
         while (
             sum(unit.num_bytes for turn in state.replay_completed for unit in turn.inputs) > _REPLAY_MAX_BYTES
             or sum(unit.token_budget for turn in state.replay_completed for unit in turn.inputs) > _REPLAY_MAX_TOKENS
@@ -997,11 +993,9 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         return config
 
     @staticmethod
-    def _source_is_current(turn: _ReplayTurn, messages: dict, sources: Mapping) -> bool:
+    def _source_is_current(source: _ReplaySource, messages: dict, sources: Mapping) -> bool:
         return (
-            turn.source is not None
-            and sources.get(turn.source.item_id) == turn.source.source_id
-            and messages.get(turn.source.item_id, {}).get("role") == "user"
+            sources.get(source.item_id) == source.source_id and messages.get(source.item_id, {}).get("role") == "user"
         )
 
     @staticmethod
@@ -1018,13 +1012,17 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     def _checkpoint_signature(self, turns: list[_ReplayTurn], messages: dict, sources: Mapping) -> str | None:
         history = []
         for turn in turns:
-            if turn.item_id is None or not self._source_is_current(turn, messages, sources):
+            if turn.item_id is None or len(turn.sources) != 1:
+                return None
+            ((seq, source),) = turn.sources.items()
+            if not self._source_is_current(source, messages, sources) or any(
+                unit.user_media and unit.input_commit_seq != seq for unit in turn.inputs
+            ):
                 return None
             text = self._assistant_text(messages, turn.item_id)
             if text is None or text.strip() != turn.completed_text:
                 return None
-            assert turn.source is not None
-            history.append((turn.source.source_id, turn.item_id, text))
+            history.append((source.source_id, turn.item_id, text))
         return sha256(json.dumps(history).encode()).hexdigest() if history else None
 
     def _prepare_replay(self, session_config: dict[str, object], runtime_config: dict[str, object]) -> None:
@@ -1040,15 +1038,19 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         selected = []
         remaining = _REPLAY_MAX_TOKENS
         for turn in reversed(turns):
-            if not self._source_is_current(turn, messages, sources):
+            current_seqs = {
+                seq for seq, source in turn.sources.items() if self._source_is_current(source, messages, sources)
+            }
+            if not current_seqs:
                 continue
             text = self._assistant_text(messages, turn.item_id) if turn.item_id is not None else None
             user_only = text is None
-            inputs = turn.inputs
+            inputs = [
+                unit
+                for unit in turn.inputs
+                if (unit.input_commit_seq in current_seqs if unit.user_media else not user_only)
+            ]
             if user_only:
-                inputs = [unit for unit in inputs if unit.user_media]
-                if not inputs:
-                    continue
                 token_ids: list[int] = []
                 delimiters = 0 if inputs[0].preceding_closure else 2
             else:
