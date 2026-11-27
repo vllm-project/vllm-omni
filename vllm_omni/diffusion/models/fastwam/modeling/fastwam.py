@@ -166,7 +166,8 @@ class FastWAMModel(nn.Module):
 
         Args:
             image: uint8 [1, 3, H, W] (cameras already concatenated side by side).
-            context, context_mask: prompt context from :meth:`encode_prompt`.
+            context: prompt context from :meth:`encode_prompt`.
+            context_mask: prompt context mask from :meth:`encode_prompt`.
             proprio: normalised proprioception [1, proprio_dim] (float32).
             generator: CPU generator for the initial noise (``None``: global RNG).
             suite_id: task-suite index for a suite-conditioned action codec.
