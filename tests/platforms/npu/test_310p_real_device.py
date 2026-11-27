@@ -14,6 +14,8 @@ leaves a 310P host on the generic worker/runner with no 310P patch applied.
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 
 pytest.importorskip("vllm_ascend")
@@ -65,3 +67,27 @@ def test_worker_patch_is_applied() -> None:
 
     apply_patches()
     assert patch_registry._WORKER_PATCHED is True
+
+
+def test_default_diffusion_attn_selector_picks_sdpa_with_mindiesd() -> None:
+    from vllm_omni.diffusion.attention import selector
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+    from vllm_omni.platforms import current_omni_platform
+    from vllm_omni.platforms.npu.platform import NPUOmniPlatform
+
+    assert importlib.util.find_spec("mindiesd") is not None, "expected mindiesd to be installed on 310P CI"
+    assert isinstance(current_omni_platform, NPUOmniPlatform)
+    assert current_omni_platform.supports_diffusion_dense_flash_attention() is False
+
+    backend_path = current_omni_platform.get_diffusion_attn_backend_cls(None, head_size=64)
+    assert backend_path == DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
+
+    selector._cached_get_backend_cls.cache_clear()
+    try:
+        backend_cls, spec = selector.get_attn_backend_for_role("self", head_size=64)
+    finally:
+        selector._cached_get_backend_cls.cache_clear()
+
+    assert backend_cls is SDPABackend
+    assert spec is None
