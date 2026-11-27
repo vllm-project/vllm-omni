@@ -1,7 +1,7 @@
 # Adaptive head overlap for dense diffusion attention
 
 This offline experiment compares native Ulysses with an adaptive head split on a single NVLink node.
-Both engines enable `ulysses_a2a_permute` and set `VLLM_OMNI_PACKED_QKV=1`. With permute enabled,
+Both engines use `ulysses_a2a_backend="copy_engine"` and set `VLLM_OMNI_PACKED_QKV=1`. With this transport,
 the native baseline uses the grouped Q/K/V CE exchange. A selected split sends the Q, K and V head
 slices for each peer through the fixed-chunk CE runner. Both engines use the same graph boundary and inputs.
 

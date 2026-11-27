@@ -338,7 +338,8 @@ class DiffusionParallelConfig:
 
     Applies when the transport is the copy engine (ignored when ``"auto"`` resolves to NCCL) and requires strict pure
     Ulysses. Each chunk's Q/K/V move to their head owners while earlier chunks compute, and outputs return as each
-    chunk finishes. The first call for each attention kernel and shape runs the overlap and the standard path on
+    chunk finishes. The ``auto`` chunk setting compares an uneven split against native attention on real layers.
+    For a fixed chunk count, the first call for each attention kernel and shape runs both paths on
     every rank and keeps the overlap only if all ranks are bit-identical, so results match the unchunked path
     exactly; other kernels and shapes keep the standard exchange.
     """

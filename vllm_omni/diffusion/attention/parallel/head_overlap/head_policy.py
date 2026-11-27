@@ -418,12 +418,14 @@ def configure_head_overlap(pipeline):
         module = getattr(pipeline, name, None)
         if module is None:
             continue
+        strategies = ((key, getattr(layer, "parallel_strategy", None)) for key, layer in module.named_modules())
+        enabled = [(key, strategy) for key, strategy in strategies if getattr(strategy, "auto_head_overlap", False)]
+        if not enabled:
+            continue
         policy = HeadPolicy(group, props.multi_processor_count)
-        for layer_name, layer in module.named_modules():
-            strategy = getattr(layer, "parallel_strategy", None)
-            if getattr(strategy, "auto_head_overlap", False):
-                strategy.head_layer_name = layer_name
-                strategy.head_policy = policy
+        for layer_name, strategy in enabled:
+            strategy.head_layer_name = layer_name
+            strategy.head_policy = policy
         module._ulysses_head_policy = policy
         module.register_forward_pre_hook(policy.begin_component, with_kwargs=True)
         module.register_forward_hook(policy.finish_component)

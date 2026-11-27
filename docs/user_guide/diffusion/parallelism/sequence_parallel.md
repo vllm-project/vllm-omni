@@ -261,7 +261,8 @@ On a single SM90 node using dense, noncausal BF16 FA3, enable runtime selection 
 This also works with `Omni(..., ulysses_overlap_chunks="auto")`. The first real forwards for a layout
 prepare and time an uneven split against native packed-QKV CE. The worker logs the selected heads per rank
 and keeps one group when the split does not clear the timing margin. Unsupported attention stays native.
-The initial request includes exploration. Measure it separately from steady-state latency.
+With CUDA-graphed denoising, the default transport selects NCCL and skips head overlap.
+The initial eager request includes exploration. Measure it separately from steady-state latency.
 
 The trial layers contribute their real outputs to the first request. Head grouping and query tiling can change
 floating-point rounding, including for a layout that later selects native attention. Numerical equivalence is

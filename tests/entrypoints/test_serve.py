@@ -805,7 +805,15 @@ def test_serve_parser_accepts_ulysses_overlap_chunks(chunks) -> None:
     OmniServeCommand().subparser_init(subparsers)
 
     args = parser.parse_args(
-        ["serve", "fake-model", "--omni", "--ulysses-a2a-backend", "copy_engine", "--ulysses-overlap-chunks", str(chunks)]
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--ulysses-a2a-backend",
+            "copy_engine",
+            "--ulysses-overlap-chunks",
+            str(chunks),
+        ]
     )
 
     assert args.ulysses_overlap_chunks == chunks
