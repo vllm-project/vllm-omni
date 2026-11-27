@@ -326,9 +326,12 @@ class KyutaiAuraPipeline(nn.Module, SupportImageInput, SupportAudioInput, Suppor
             sessions.pop(request_id, None)
             return None
         if operation == "start":
+            image, prompt, seed, pending_cleanup = args
+            for ended_request_id in pending_cleanup:
+                sessions.pop(ended_request_id, None)
             if sessions:
                 raise RuntimeError("A live AURA session is already active.")
-            sessions[request_id] = AuraLiveAudio(self, *args)
+            sessions[request_id] = AuraLiveAudio(self, image, prompt, seed)
             return None
         if operation != "push":
             raise ValueError("Unknown AURA live audio operation.")

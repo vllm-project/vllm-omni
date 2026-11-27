@@ -119,6 +119,7 @@ class OmniStreamingVideoOutputHandler:
         self._stage_configs = stage_configs
         self._stall_timeout = stall_timeout
         self._start_timeout = start_timeout
+        self._pending_live_audio_cleanup: set[str] = set()
 
     async def warmup(self, request_path: str, *, timeout: float = 180.0) -> None:
         """Drain a configured generation and its encoder before HTTP admission.
@@ -366,12 +367,18 @@ class OmniStreamingVideoOutputHandler:
                     await asyncio.gather(response_task, return_exceptions=True)
                 if request_id is not None and not generation_done:
                     await self._abort_request(request_id)
-                if live_audio_queue is not None and request_id is not None:
-                    try:
-                        await self._live_audio_rpc("close", request_id)
-                    except Exception:
-                        logger.exception("Failed to release live video session %s", request_id)
-                resources.cleanup()
+                try:
+                    if live_audio_queue is not None and request_id is not None:
+                        try:
+                            await self._live_audio_rpc("close", request_id)
+                        except asyncio.CancelledError:
+                            self._pending_live_audio_cleanup.add(request_id)
+                            raise
+                        except Exception:
+                            self._pending_live_audio_cleanup.add(request_id)
+                            logger.exception("Failed to release live video session %s", request_id)
+                finally:
+                    resources.cleanup()
 
     async def _receive_start(self, websocket: WebSocket) -> tuple[VideoGenerationRequest, StreamingVideoFormat] | None:
         try:
@@ -1193,9 +1200,17 @@ class OmniStreamingVideoOutputHandler:
         stop: asyncio.Event,
         progress: _SessionProgress,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
+        pending_cleanup = tuple(self._pending_live_audio_cleanup)
         await self._live_audio_rpc(
-            "start", request_id, prompt["multi_modal_data"]["image"], prompt["prompt"], 42 if seed is None else seed
+            "start",
+            request_id,
+            prompt["multi_modal_data"]["image"],
+            prompt["prompt"],
+            42 if seed is None else seed,
+            pending_cleanup,
         )
+        # Keep any cleanup failures recorded while this start was in flight.
+        self._pending_live_audio_cleanup.difference_update(pending_cleanup)
         progress.touch()
         while not stop.is_set():
             try:
