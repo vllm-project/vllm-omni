@@ -56,6 +56,8 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "NemotronVoiceChatTalkerForConditionalGeneration": "nemotron_voicechat",
     "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
+    "AuraQwen3VLForConditionalGeneration": "qwen3_vl",
+    "AuraQwen3_5ForConditionalGeneration": "qwen3_5",
 }
 
 # Model types whose official Hub repo ships no config.json, so
@@ -182,6 +184,15 @@ def register_omni_models_to_vllm():
     # (and matches OmniModelRegistry's omni-wins ordering).
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
         ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+
+    from vllm.v1.worker.gpu.spec_decode.speculator_config import register_speculative_method
+
+    from vllm_omni.model_executor.models.higgs_audio_v3.spec_config import (
+        HIGGS_AUDIO_SPEC_METHOD,
+        HiggsAudioSpeculatorConfig,
+    )
+
+    register_speculative_method(HIGGS_AUDIO_SPEC_METHOD, HiggsAudioSpeculatorConfig)
 
     # Register omni-specific reasoning parsers (e.g., step_audio).
     import vllm_omni.reasoning  # noqa: F401
@@ -469,8 +480,8 @@ class OmniEngineArgs(EngineArgs):
     # invariant 1 below requires the overlap to stay a subset of that set.
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
-    ulysses_a2a_permute: bool | None = None
     ulysses_overlap_chunks: int | None = None
+    ulysses_a2a_backend: str | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     use_hsdp: bool | None = None
@@ -842,8 +853,8 @@ class OrchestratorArgs:
     diffusers_call_kwargs: str = "{}"
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
-    ulysses_a2a_permute: bool | None = None
     ulysses_overlap_chunks: int | None = None
+    ulysses_a2a_backend: str | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
@@ -985,8 +996,8 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         # them, the engine forwards them to DiffusionParallelConfig.
         "ulysses_degree",
         "ulysses_mode",
-        "ulysses_a2a_permute",
         "ulysses_overlap_chunks",
+        "ulysses_a2a_backend",
         "ring_degree",
         "allgather_degree",
         "use_hsdp",
