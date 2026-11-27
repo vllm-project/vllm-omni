@@ -3,7 +3,6 @@
 
 """Shared LIBERO frontend for a remote vLLM model or a local native model."""
 
-import pybase64 as base64
 import io
 import json
 import logging
@@ -16,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pybase64 as base64
 from PIL import Image
 
 from vllm_omni.entrypoints.cosmos3.action_policy_common import (
