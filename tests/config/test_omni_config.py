@@ -1822,6 +1822,7 @@ def test_sub_config_fields_match_structured_scopes():
         "generation_config",
         "override_generation_config",
         "enable_prompt_embeds",
+        "dit_load_aware_config",
         "scheduling_metadata_adapter",
         "scheduler_window_policy",
     }

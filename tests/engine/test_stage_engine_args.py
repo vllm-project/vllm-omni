@@ -96,6 +96,7 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "custom_voice_dir",
         "devices",
         "disable_autocast",
+        "dit_load_aware_config",
         "enable_broadcast_weight_load",
         "enable_multithread_weight_load",
         "env",

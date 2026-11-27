@@ -9,9 +9,9 @@ go through ``/v1/chat/completions`` (``--backend openai-chat-omni``) in a
 single benchmark run. This enables DTPS mixed-task scheduling evaluation
 within the unified ``vllm bench serve --omni`` framework.
 
-Set ``real_images_dir`` in the mixed-omni config (or point
-``MIXED_OMNI_REAL_IMAGES_DIR`` at a directory) to use real image files for
-the i2t/it2i input images instead of solid-color placeholders.
+Set ``real_images_dir`` in the mixed-omni config to use real image files for
+the i2t/it2i input images instead of solid-color placeholders; without it
+the default pool is the two real dog photos under ``tests/assets/hunyuan/``.
 """
 
 from __future__ import annotations
@@ -49,12 +49,11 @@ _RESOLUTIONS = [(512, 512), (1024, 1024), (1280, 720)]
 # Real-image sources, in priority order: config key -> env var -> repo assets.
 _REPO_IMAGES_DIR = os.path.join("tests", "assets", "hunyuan")
 _DEFAULT_IMAGES = ("hunyuan_baseline.png", "hunyuan_baseline_npu.png")
-_REAL_IMAGES_ENV = "MIXED_OMNI_REAL_IMAGES_DIR"
 
 
 def _discover_real_images(config: dict[str, Any]) -> list[str]:
     """Return real image paths for i2t/it2i inputs, or [] to use placeholders."""
-    directory = config.get("real_images_dir") or os.environ.get(_REAL_IMAGES_ENV, "")
+    directory = config.get("real_images_dir", "")
     if directory and not os.path.isdir(directory):
         logger.warning("[MIXED-OMNI] real_images_dir %s not found; using placeholders", directory)
         return []
