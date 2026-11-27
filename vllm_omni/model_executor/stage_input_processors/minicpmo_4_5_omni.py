@@ -421,9 +421,6 @@ def tts2code2wav_async_chunk(
     if finished and condition_key is not None:
         record["last_closed_condition"] = condition_key
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
-    # One window size for every payload. A separate smaller first window
-    # (initial_codec_chunk_frames) used to shorten the first payload, but with
-    # the steady window itself at 25 frames it only added a seam.
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end or speech_flush))
     if not flush_pending and len(pending) < chunk_frames:
@@ -1145,8 +1142,8 @@ def llm2tts(
             # Mirror the official streaming_generate unit loop. A segment delta
             # can start with SEVERAL unit decisions (forced/model listens from
             # chunks that produced no handoff accumulate ahead of the speak),
-            # so skip the leading listen run; the unit's own decisions start
-            # there. The first decision (<|speak|>, a <|tts_bos|> boundary, or
+            # so skip leading listens and empty chunks already returned to the
+            # session. The first decision (<|speak|>, a <|tts_bos|> boundary, or
             # the first text token when no marker is emitted) is fed back but
             # is not part of total_hidden_in_unit; TTS conditions on the
             # tokens after it, up to the chunk terminator. <|turn_eos|> is not
@@ -1155,9 +1152,31 @@ def llm2tts(
             # decisions reopen the turn, just as in streaming_generate.
             out_ids = llm_output_ids
             listen_id = special_token_ids.get("listen_token_id")
+            delegate_id = special_token_ids.get("delegate_token_id")
+            previous_unit_ends = {
+                listen_id,
+                special_token_ids.get("chunk_eos_token_id"),
+                special_token_ids.get("chunk_tts_eos_token_id"),
+            }
             unit_start = 0
-            while unit_start < len(out_ids) and out_ids[unit_start] == listen_id:
-                unit_start += 1
+            # Preserve the final token: it may be the current audio unit's
+            # only terminator and still owes the Talker a segment boundary.
+            # Empty text units are intercepted before reaching this handoff.
+            while unit_start + 1 < len(out_ids):
+                if out_ids[unit_start] in previous_unit_ends:
+                    unit_start += 1
+                    continue
+                if delegate_id is not None and out_ids[unit_start] == delegate_id:
+                    # A prior <|delegate|> unit was short-circuited via DIRECT_RESPONSE;
+                    # skip the entire delegate payload through its terminator before
+                    # slicing the current speaking unit's hidden rows.
+                    end_idx = unit_start + 1
+                    while end_idx < len(out_ids) and out_ids[end_idx] not in previous_unit_ends:
+                        end_idx += 1
+                    if end_idx + 1 < len(out_ids):
+                        unit_start = end_idx + 1
+                        continue
+                break
             # Only the unit's opening decision (or a boundary folded as the last
             # prompt token) starts the slice. The policy also rewrites a mid-unit
             # <|listen|> into <|tts_bos|>; like the official loop, that token is

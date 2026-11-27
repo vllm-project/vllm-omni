@@ -32,6 +32,7 @@ from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
@@ -83,6 +84,42 @@ def _make_runner():
     runner.req_states = SimpleNamespace(req_id_to_index={"r1": 0, "r2": 1})
     runner.execute_model_state = None
     return runner
+
+
+@pytest.mark.parametrize("is_new", [False, True])
+def test_model_input_delivery_follows_new_and_cached_request_ownership(mocker, is_new):
+    runner = _make_runner()
+    runtime = {"req_id": "request", "restored": not is_new}
+    runner.req_states.req_id_to_index = {} if is_new else {"request": 0}
+    runner.model_state = SimpleNamespace(intermediate_buffer=SimpleNamespace(buffers=[runtime]))
+    events = []
+
+    def admit_requests(_output):
+        events.append("admit")
+        if is_new:
+            runner.req_states.req_id_to_index = {"request": 0}
+            runtime["restored"] = True
+
+    mocker.patch.object(GPUModelRunner, "add_requests", side_effect=admit_requests)
+    mocker.patch.object(GPUModelRunner, "update_requests", side_effect=lambda _output: events.append("cached"))
+    runner.model.apply_text_input_update = lambda info, payload, *, replace: events.append(
+        f"input:{info['restored']}:{replace}"
+    )
+    output = OmniSchedulerOutput(**SchedulerOutput.make_empty().__dict__)
+    output.num_scheduled_tokens = {"request": 1}
+    output.total_num_scheduled_tokens = 1
+    payload = {"input_stream_update": {"token_ids": [31], "final": False}}
+    if is_new:
+        output.scheduled_new_reqs = [
+            SimpleNamespace(req_id="request", model_intermediate_buffer=payload, sampling_params=None)
+        ]
+    else:
+        output.scheduled_cached_reqs.req_ids = ["request"]
+        output.scheduled_cached_reqs.additional_information = {"request": payload}
+        runner.model_state.intermediate_buffer.update = lambda *_args: events.append("merged")
+    runner.add_requests(output)
+    runner.update_requests(output)
+    assert events == ["admit"] + (["input:True:True", "cached"] if is_new else ["cached", "input:True:False", "merged"])
 
 
 def test_dummy_sampler_run_uses_stateless_prompt_logits(monkeypatch) -> None:
@@ -360,6 +397,39 @@ def test_add_requests_empty_admission_and_stop_id_sanitization():
         parent.assert_called_once_with(output)
     assert sampling_params.all_stop_token_ids == {2150}
     assert sampling_params.eos_token_id == 151645
+
+
+def test_add_requests_tracks_hidden_states_opt_in():
+    runner = _make_runner()
+    runner.model = SimpleNamespace()
+    runner.sampler = Sampler.__new__(Sampler)
+    runner.sampler.logits_processors = [object.__new__(c) for c in (LogitBiasState, PenaltiesState, BadWordsState)]
+
+    def new_request(req_id: str, opted_in: bool) -> SimpleNamespace:
+        return SimpleNamespace(req_id=req_id, sampling_params=None, return_hidden_states=opted_in)
+
+    with patch.object(GPUModelRunner, "add_requests", return_value=None) as parent:
+        # Request data without the field predates the opt-in and stays untracked.
+        untagged = SimpleNamespace(req_id="untagged", sampling_params=None)
+        output = SchedulerOutput.make_empty()
+        output.scheduled_new_reqs = [new_request("opted", True), new_request("plain", False), untagged]
+        runner.add_requests(output)
+        parent.assert_called_once_with(output)
+        assert runner._hidden_state_req_ids == {"opted"}
+
+        # Bookkeeping runs on the no-new-requests fast path too, which returns
+        # before the upstream call.
+        output = SchedulerOutput.make_empty()
+        output.finished_req_ids = {"opted"}
+        runner.add_requests(output)
+        parent.assert_called_once()
+        assert runner._hidden_state_req_ids == set()
+
+        output = SchedulerOutput.make_empty()
+        output.scheduled_new_reqs = [new_request("later", True)]
+        runner.add_requests(output)
+        parent.assert_called_with(output)
+        assert runner._hidden_state_req_ids == {"later"}
 
 
 @pytest.mark.parametrize("new_request", [False, True])
@@ -888,6 +958,28 @@ def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch)
     runner.finish_requests(SimpleNamespace(finished_req_ids={"released"}, preempted_req_ids={"r1"}))
     assert calls == [{"released"}]
     assert sorted(c.args[0] for c in runner.model_state.remove_request.call_args_list) == [0]
+
+
+def test_finish_requests_passes_scheduler_decisions_before_freeing_finished_requests(monkeypatch):
+    """The model reads the step's scheduler decisions while finished requests' state still exists."""
+    from vllm_omni.core.sched.window_policy import WindowOperation
+
+    runner = _make_runner()
+    calls = []
+    runner.model = SimpleNamespace(
+        on_scheduler_output=lambda output: calls.append(("decisions", output.duplex_carry_ops)),
+        on_requests_finished=lambda ids: calls.append(("finished", set(ids))),
+    )
+    keep = WindowOperation("keep", "s", "r")
+    hand = WindowOperation("hand", "s", "next")
+    runner._mm_rng_state = SimpleNamespace(discard=lambda rid: calls.append(("discard_rng", rid)))
+    runner.model_state = MagicMock()
+    monkeypatch.setattr(GPUModelRunner, "finish_requests", lambda *args: None)
+
+    runner.finish_requests(SimpleNamespace(finished_req_ids={"r"}, preempted_req_ids=set(), duplex_carry_ops=[keep]))
+    runner.finish_requests(SimpleNamespace(finished_req_ids=set(), preempted_req_ids=set(), duplex_carry_ops=[hand]))
+
+    assert calls == [("decisions", [keep]), ("discard_rng", "r"), ("finished", {"r"}), ("decisions", [hand])]
 
 
 def test_aux_hidden_state_contract_uses_tuple_slot_not_structured_output():

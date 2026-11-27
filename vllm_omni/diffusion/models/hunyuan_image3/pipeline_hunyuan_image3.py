@@ -523,6 +523,21 @@ class HunyuanImage3Pipeline(
             return [f"model.{full_module_name[len('transformer.') :]}"]
         return []
 
+    def merged_lora_spec(self):
+        """Return the validated merged-LoRA capability contract for HunyuanImage-3."""
+        from vllm_omni.lora.capability import MergedLoRASpec
+
+        return MergedLoRASpec(
+            components=("transformer",),
+            packed_modules_mapping={
+                "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+                "gate_up_proj": ("gate_proj", "up_proj"),
+            },
+            name_aliases=self._get_diffusion_lora_name_aliases,
+            deinterleave_fused_qkv_lora_b=self._deinterleave_fused_qkv_lora_b,
+            unquantized_linear_only=True,
+        )
+
     def _deinterleave_fused_qkv_lora_b(self, lora_b: torch.Tensor) -> torch.Tensor | None:
         """Re-order a fused ``qkv_proj`` LoRA-B from the checkpoint's
         GQA-interleaved layout (per-KV-head ``[Q-group, K, V]``) into the block

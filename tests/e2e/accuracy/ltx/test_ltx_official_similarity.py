@@ -105,6 +105,12 @@ class LTXAccuracyCase:
     # Official uses block streaming; Omni uses layerwise offload. Both preserve
     # bf16 arithmetic while keeping full-resolution cases on one H100.
     enable_layerwise_offload: bool = False
+    # Two-stage Omni startup loads several large shards serially on a single
+    # accelerator. Keep its cold-start allowance local to these accuracy cases
+    # rather than changing the runtime defaults for every model.
+    omni_stage_init_timeout_s: int | None = None
+    omni_init_timeout_s: int | None = None
+    omni_process_timeout_s: int = 1800
 
 
 LTX2_REVISION = "47da56e2ad66ce4125a9922b4a8826bf407f9d0a"
@@ -179,6 +185,9 @@ TWO_STAGE_CASES = (
         gemma_model_env="VLLM_TEST_LTX23_MODEL",
         enable_layerwise_offload=True,
         image=I2V_IMAGE,
+        omni_stage_init_timeout_s=1200,
+        omni_init_timeout_s=1800,
+        omni_process_timeout_s=2400,
     ),
     LTXAccuracyCase(
         name="ltx2_two_stage_layer_fused_t2v",
@@ -197,6 +206,9 @@ TWO_STAGE_CASES = (
         seed=10,
         stg_block=29,
         enable_layerwise_offload=True,
+        omni_stage_init_timeout_s=1200,
+        omni_init_timeout_s=1800,
+        omni_process_timeout_s=2400,
     ),
     LTXAccuracyCase(
         name="ltx23_two_stage_layer_fused_i2v",
@@ -216,6 +228,9 @@ TWO_STAGE_CASES = (
         stg_block=28,
         enable_layerwise_offload=True,
         image=I2V_IMAGE,
+        omni_stage_init_timeout_s=1200,
+        omni_init_timeout_s=1800,
+        omni_process_timeout_s=2400,
     ),
 )
 
@@ -583,7 +598,11 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
             case.model_class_name,
         ]
     )
-    _run(omni_args, env=env)
+    if case.omni_stage_init_timeout_s is not None:
+        omni_args.extend(["--stage-init-timeout", str(case.omni_stage_init_timeout_s)])
+    if case.omni_init_timeout_s is not None:
+        omni_args.extend(["--init-timeout", str(case.omni_init_timeout_s)])
+    _run(omni_args, env=env, timeout=case.omni_process_timeout_s)
 
     official_metadata = json.loads((official_output / "metadata.json").read_text())
     omni_metadata = json.loads((omni_output / "metadata.json").read_text())

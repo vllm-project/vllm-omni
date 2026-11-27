@@ -397,7 +397,7 @@ not arbitrary Python statements. Keep packed metadata sharded/gathered in the
 same ownership model as tokens.
 
 When the target revision offers accelerated Ulysses transport such as
-`--ulysses-a2a-permute`, qualify it separately from regular Ulysses. Prove the
+`--ulysses-a2a-backend copy_engine`, qualify it separately from regular Ulysses. Prove the
 strict scatter-heads/gather-sequence layout selected the fast path, record
 one-time JIT/readiness cost, prewarm the maximum workspace shape before CUDA
 graph capture, keep the grow-only workspace on one stream, and exercise cleanup

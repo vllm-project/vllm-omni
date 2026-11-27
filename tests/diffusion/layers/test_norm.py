@@ -344,7 +344,7 @@ def test_rmsnorm_dtype_matches_parameter_and_fp32_accumulation_contract():
 
 @pytest.mark.cpu
 def test_rmsnorm_npu_receives_gamma_with_configured_dtype(monkeypatch: pytest.MonkeyPatch):
-    """The NPU fused op receives the bf16 checkpoint gamma used by H3."""
+    """Without a residual, NPU RMSNorm receives the configured checkpoint gamma."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
 
     captured: dict[str, torch.Tensor] = {}
@@ -443,14 +443,18 @@ def test_rmsnorm_non_npu_residual_delegates_to_native(
     assert captured["residual"] is residual
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.cpu
-def test_rmsnorm_npu_residual_uses_torch_npu_fused_op(monkeypatch: pytest.MonkeyPatch):
-    """NPU keeps the direct fused AddRMSNorm path instead of IR fallback."""
+def test_rmsnorm_npu_matching_residual_dtypes_use_fused_op(
+    monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, dtype: torch.dtype
+):
+    """Public NPU dispatch retains fused AddRMSNorm for matching input dtypes."""
+    from vllm_omni.diffusion.layers import custom_op
     from vllm_omni.diffusion.layers.norm import RMSNorm
 
     captured: dict[str, object] = {}
-    fused_output = torch.randn(2, 4, dtype=torch.bfloat16)
-    fused_residual = torch.randn(2, 4, dtype=torch.bfloat16)
+    fused_output = torch.randn(2, 4, dtype=dtype)
+    fused_residual = torch.randn(2, 4, dtype=dtype)
 
     def npu_add_rms_norm(
         x: torch.Tensor,
@@ -466,12 +470,15 @@ def test_rmsnorm_npu_residual_uses_torch_npu_fused_op(monkeypatch: pytest.Monkey
         "torch_npu",
         types.SimpleNamespace(npu_add_rms_norm=npu_add_rms_norm),
     )
+    mocker.patch.object(custom_op.current_omni_platform, "is_rocm", return_value=False)
+    mocker.patch.object(custom_op.current_omni_platform, "is_cuda", return_value=False)
+    mocker.patch.object(custom_op.current_omni_platform, "is_npu", return_value=True)
     monkeypatch.setattr("vllm_omni.diffusion.layers.norm._is_npu_tensor", lambda _: True)
-    norm = RMSNorm(4, eps=1e-5, dtype=torch.bfloat16)
-    x = torch.randn(2, 4, dtype=torch.bfloat16)
-    residual = torch.randn(2, 4, dtype=torch.bfloat16)
+    norm = RMSNorm(4, eps=1e-5, dtype=dtype)
+    x = torch.randn(2, 4, dtype=dtype)
+    residual = torch.randn(2, 4, dtype=dtype)
 
-    output, updated_residual = norm.forward_npu(x, residual)
+    output, updated_residual = norm(x, residual)
 
     assert output is fused_output
     assert updated_residual is fused_residual
@@ -479,6 +486,74 @@ def test_rmsnorm_npu_residual_uses_torch_npu_fused_op(monkeypatch: pytest.Monkey
     assert captured["residual"] is residual
     assert captured["gamma"] is norm.weight
     assert captured["epsilon"] == 1e-5
+
+
+@pytest.mark.parametrize(
+    ("x_dtype", "residual_dtype"),
+    [
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.bfloat16),
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float16),
+    ],
+)
+@pytest.mark.cpu
+def test_rmsnorm_npu_mixed_residual_dtypes_preserve_promotion(
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    x_dtype: torch.dtype,
+    residual_dtype: torch.dtype,
+):
+    """Mixed NPU inputs use separate addition with PyTorch dtype promotion."""
+    from vllm_omni.diffusion.layers import custom_op
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    captured: dict[str, object] = {}
+
+    def npu_rms_norm(value: torch.Tensor, gamma: torch.Tensor, epsilon: float):
+        captured.update(value=value, gamma=gamma, epsilon=epsilon)
+        output = torch.nn.functional.rms_norm(value.float(), (value.shape[-1],), gamma.float(), epsilon)
+        return (output.to(value.dtype),)
+
+    fused_add_norm = mocker.Mock(side_effect=AssertionError("Mixed input dtypes must not use fused AddRMSNorm"))
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        types.SimpleNamespace(npu_rms_norm=npu_rms_norm, npu_add_rms_norm=fused_add_norm),
+    )
+    mocker.patch.object(custom_op.current_omni_platform, "is_rocm", return_value=False)
+    mocker.patch.object(custom_op.current_omni_platform, "is_cuda", return_value=False)
+    mocker.patch.object(custom_op.current_omni_platform, "is_npu", return_value=True)
+    monkeypatch.setattr("vllm_omni.diffusion.layers.norm._is_npu_tensor", lambda _: True)
+
+    eps = 1e-5
+    norm = RMSNorm(4, eps=eps, dtype=x_dtype)
+    norm.weight.data.copy_(torch.tensor([1.0, 0.5, 1.5, 2.0], dtype=x_dtype))
+    weight_before = norm.weight.detach().clone()
+    x = torch.tensor([[1.0, -2.0, 3.0, -4.0]], dtype=x_dtype)
+    residual = torch.tensor([[0.00390625, 0.0078125, -0.0078125, 0.015625]], dtype=residual_dtype)
+    x_before = x.clone()
+    residual_before = residual.clone()
+
+    expected_residual = torch.tensor([[1.00390625, -1.9921875, 2.9921875, -3.984375]], dtype=torch.float32)
+    expected_output = expected_residual * torch.rsqrt(expected_residual.square().mean(-1, keepdim=True) + eps)
+    expected_output = expected_output * norm.weight.float()
+
+    output, updated_residual = norm(x, residual)
+
+    fused_add_norm.assert_not_called()
+    assert captured["value"] is updated_residual
+    gamma = captured["gamma"]
+    assert isinstance(gamma, torch.Tensor)
+    assert gamma.dtype == updated_residual.dtype
+    torch.testing.assert_close(gamma, weight_before.float(), atol=0, rtol=0)
+    assert captured["epsilon"] == eps
+    assert output.dtype == updated_residual.dtype == torch.promote_types(x_dtype, residual_dtype)
+    torch.testing.assert_close(updated_residual, expected_residual, atol=0, rtol=0)
+    torch.testing.assert_close(output, expected_output, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(x, x_before, atol=0, rtol=0)
+    torch.testing.assert_close(residual, residual_before, atol=0, rtol=0)
+    torch.testing.assert_close(norm.weight, weight_before, atol=0, rtol=0)
 
 
 # ── RMSNorm compile-path regression tests ──

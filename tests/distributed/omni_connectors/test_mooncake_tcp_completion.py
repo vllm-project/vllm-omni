@@ -39,7 +39,7 @@ def _tcp_receiver(pipe):
         pipe.send(True)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_tcp_write_completion_waits_for_receiver(monkeypatch):
     # Also exercise TCP on hosts where Mooncake would otherwise auto-select RDMA.
     monkeypatch.setenv("MC_FORCE_TCP", "1")

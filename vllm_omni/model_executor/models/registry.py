@@ -169,6 +169,9 @@ _OMNI_MODELS = {
         "qwen3_tts_talker",
         "Qwen3TTSTalkerForConditionalGeneration",
     ),
+    "KimiAudioForConditionalGeneration": ("kimi_audio", "kimi_audio", "KimiAudioForConditionalGeneration"),
+    "KimiAudioARStage": ("kimi_audio", "kimi_audio_ar_stage", "KimiAudioARStage"),
+    "KimiAudioDecoder": ("kimi_audio", "kimi_audio_decoder", "KimiAudioDecoder"),
     "Qwen3TTSTalkerForConditionalGeneration": (
         "qwen3_tts",
         "qwen3_tts_talker",
@@ -178,6 +181,17 @@ _OMNI_MODELS = {
         "qwen3_tts",
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
+    ),
+    ## Confucius4-TTS
+    "Confucius4TTSTalkerForConditionalGeneration": (
+        "confucius4_tts",
+        "confucius4_tts_talker",
+        "Confucius4TTSTalkerForConditionalGeneration",
+    ),
+    "Confucius4TTSS2ADecoder": (
+        "confucius4_tts",
+        "confucius4_tts_decoder",
+        "Confucius4TTSS2ADecoder",
     ),
     ## personaplex (Moshi finetune, full-duplex S2S; 2-stage audio->audio offline pipeline)
     # built by lead: personaplex_talker module + PersonaPlexTalkerForConditionalGeneration.
@@ -528,6 +542,11 @@ _OMNI_MODELS = {
         "aura_omni",
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
+    ),
+    "AuraQwen3_5ForConditionalGeneration": (
+        "aura_omni",
+        "qwen3_5",
+        "AuraQwen3_5ForConditionalGeneration",
     ),
     ## Response-judge stage models
     "ResponseJudgeQwen3ForCausalLM": (
