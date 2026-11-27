@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """TP unit tests for SANA-Video: distributed RMSNorm, sharded attention and
 sharded GLUMB temporal conv.
@@ -8,10 +8,9 @@ CPU-only. The TP world size and the collective are mocked so a single process
 simulates the shard/reduce logic a real multi-rank run depends on.
 """
 
-import os
-
 import pytest
 import torch
+from vllm.utils.network_utils import get_file_store_init_method
 
 from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
     GLUMBTempConv,
@@ -36,12 +35,18 @@ def tp1_group():
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29501")
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
-    initialize_model_parallel()
-    yield
-    cleanup_dist_env_and_memory()
+    # A fresh file store avoids the free-port probe/bind race of env://.
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=get_file_store_init_method(),
+    )
+    try:
+        initialize_model_parallel()
+        yield
+    finally:
+        cleanup_dist_env_and_memory()
 
 
 @pytest.fixture
@@ -51,7 +56,7 @@ def force_default_gemm(monkeypatch):
 
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
-        lambda: default_unquantized_gemm,
+        lambda *_args, **_kwargs: default_unquantized_gemm,
     )
 
 

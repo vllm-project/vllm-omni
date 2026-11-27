@@ -1,6 +1,7 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # Copyright (c) 2024 The Qwen Team and The HuggingFace Inc. team.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # This file has been modified by ByteDance Ltd. and/or its affiliates.
 #
@@ -48,10 +49,10 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sp_group,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
-from vllm_omni.diffusion.layers.mot.mot_layernorm import MoTRMSNorm
-from vllm_omni.diffusion.layers.mot.mot_qkv_parallel_linear import MoTQKVParallelLinear
-from vllm_omni.diffusion.layers.mot.mot_row_parallel_linear import MoTRowParallelLinear
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.models.bagel.mot.mot_layernorm import MoTRMSNorm
+from vllm_omni.diffusion.models.bagel.mot.mot_qkv_parallel_linear import MoTQKVParallelLinear
+from vllm_omni.diffusion.models.bagel.mot.mot_row_parallel_linear import MoTRowParallelLinear
 from vllm_omni.diffusion.utils.kv_utils import left_pad_stack
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
@@ -489,6 +490,7 @@ class PackedAttentionMoT(nn.Module):
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=True,
             num_kv_heads=self.total_num_kv_heads,
+            skip_sequence_parallel=True,
         )
         self.attn_noncausal = DiffusionAttention(
             num_heads=self.total_num_heads,
@@ -496,6 +498,14 @@ class PackedAttentionMoT(nn.Module):
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
             num_kv_heads=self.total_num_kv_heads,
+        )
+        self.attn_noncausal_local = DiffusionAttention(
+            num_heads=self.total_num_heads,
+            head_size=self.head_dim,
+            softmax_scale=1.0 / (self.head_dim**0.5),
+            causal=False,
+            num_kv_heads=self.total_num_kv_heads,
+            skip_sequence_parallel=True,
         )
 
     def _is_sp_active(self) -> bool:
@@ -582,7 +592,7 @@ class PackedAttentionMoT(nn.Module):
 
         # NOTE: we reshape to batched (1, S, H, D) for diffusion Attention
         # attn_out should be: (1, text_len + local_vae_len, H, D)
-        if self._is_sp_active():
+        if self._is_sp_active() and not update_past_key_values:
             # Joint mechanism keeps text+cache replicated across SP ranks
             attn_out = self.attn_noncausal(
                 vae_q.unsqueeze(0),
@@ -630,7 +640,7 @@ class PackedAttentionMoT(nn.Module):
                 k_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_k_parts, vae_k_parts)])
                 v_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_v_parts, vae_v_parts)])
                 metadata = None
-            attn_out = self.attn_noncausal(q_4d, k_4d, v_4d, metadata)
+            attn_out = self.attn_noncausal_local(q_4d, k_4d, v_4d, metadata)
 
         attn_out = attn_out.reshape(num_branches, -1, self.q_size)
         text_attn = attn_out[:, :text_per_branch].reshape(-1, self.q_size)
@@ -746,7 +756,7 @@ class PackedAttentionMoT(nn.Module):
             )
             attn_out = attn_out_4d.permute(0, 2, 1, 3)
         else:
-            attn = self.attn_causal if is_causal else self.attn_noncausal
+            attn = self.attn_causal if is_causal else self.attn_noncausal_local
             attn_out = attn(
                 q.unsqueeze(0),
                 full_k.unsqueeze(0),

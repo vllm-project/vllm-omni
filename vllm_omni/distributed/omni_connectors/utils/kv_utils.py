@@ -16,11 +16,30 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 
-from .initialization import KV_RANK_PORT_STRIDE, KV_REPLICA_PORT_STRIDE, KV_TRANSFER_PORT_OFFSET
+from .initialization import compute_connector_zmq_port
 
 logger = init_logger(__name__)
 
 LayerKV = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+# Per-sample KV for SamplingParams.n > 1 into a diffusion stage, for a sending
+# stage that opts in with ``omni_kv_config["per_sample_kv"]``: the stage pool
+# gives each sample its own global request id, so the AR runner sends each
+# sample's KV under its own key, and the orchestrator gives the diffusion
+# request the sample count to receive.
+PER_SAMPLE_KV_CONFIG_KEY = "per_sample_kv"
+PER_SAMPLE_KV_COUNT_KEY = "omni_per_sample_kv_count"
+
+
+def per_sample_kv_request_id(request_id: str, index: int) -> str:
+    """KV transfer key (global request id) of sample ``index`` of request ``request_id``."""
+    return f"{request_id}-sample{index}"
+
+
+def per_sample_kv_count(sampling_params: Any) -> int:
+    """Number of per-sample KV caches a diffusion request receives (1: a single KV)."""
+    extra_args = getattr(sampling_params, "extra_args", None) or {}
+    return int(extra_args.get(PER_SAMPLE_KV_COUNT_KEY, 1))
 
 
 # ------------------------------------------------------------------ #
@@ -123,12 +142,12 @@ def kv_zmq_port(
 
     """
     replica = get_omni_replica_id() if replica_id is None else max(int(replica_id), 0)
-    return (
-        base_port
-        + KV_TRANSFER_PORT_OFFSET
-        + replica * KV_REPLICA_PORT_STRIDE
-        + local_rank * KV_RANK_PORT_STRIDE
-        + from_stage
+    return compute_connector_zmq_port(
+        base_port,
+        purpose="kv_transfer",
+        from_stage=from_stage,
+        local_rank=local_rank,
+        replica_id=replica,
     )
 
 

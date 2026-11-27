@@ -119,7 +119,7 @@ def _download_component_snapshot(
     components against the default branch and the default cache while the AR
     backbone was pinned elsewhere would silently mix weights from two commits.
     """
-    from vllm.transformers_utils.repo_utils import hf_api
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     kwargs: dict[str, object] = {"allow_patterns": list(_COMPONENT_PATTERNS)}
     if revision is not None:

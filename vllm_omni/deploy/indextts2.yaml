@@ -1,3 +1,4 @@
+model_runner: v2
 async_chunk: false
 trust_remote_code: true
 connectors:
@@ -5,18 +6,18 @@ connectors:
     name: SharedMemoryConnector
     extra:
       codec_streaming: false
-      connector_get_sleep_s: 0.01
+      connector_get_sleep_s: 0.001
       connector_get_max_wait_first_chunk: 5000
       connector_get_max_wait: 500
 stages:
   - stage_id: 0
-    max_num_seqs: 4
-    gpu_memory_utilization: 0.4
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.3
     enable_prefix_caching: false
+    enable_chunked_prefill: false
     skip_tokenizer_init: true
-    tokenizer: gpt2
     async_scheduling: true
-    max_num_batched_tokens: 512
+    max_num_batched_tokens: 2560
     max_model_len: 2560
     devices: "0"
     output_connectors:
@@ -30,11 +31,10 @@ stages:
       stop_token_ids: [8193]
       detokenize: false
   - stage_id: 1
-    max_num_seqs: 4
-    gpu_memory_utilization: 0.4
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.35
     enable_prefix_caching: false
     skip_tokenizer_init: true
-    tokenizer: gpt2
     enforce_eager: true
     async_scheduling: true
     max_num_batched_tokens: 8192
@@ -45,11 +45,14 @@ stages:
     hf_overrides:
       diffusion_steps: 12
       s2mel_dit_bf16: true
+      s2mel_cfm_batch_size: 16
       s2mel_vocoder_bf16: true
       s2mel_vocoder_cuda_graph: true
       s2mel_dit_cuda_graph: true
-      s2mel_dit_cuda_graph_max_graphs: 4
-      s2mel_vocoder_capture_sizes: [128, 256, 384, 512]
+      s2mel_dit_cuda_graph_max_graphs: 8
+      # Opt-in scoped TF32 for S2Mel/CFM matmul; kept false by default to preserve baseline numerics.
+      s2mel_allow_tf32: false
+      s2mel_vocoder_capture_sizes: [128, 256, 384, 512, 640]
       s2mel_vocoder_compile_shapes: [256, 384, 512]
     default_sampling_params:
       temperature: 0.0

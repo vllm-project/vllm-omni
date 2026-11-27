@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import time
 from collections.abc import Iterable, Mapping
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -9,12 +11,20 @@ import torch
 from torch import nn
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.gr00t.policy import Gr00tPolicy
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = init_logger(__name__)
+
+# Modules the action head runs once per denoising step.
+_ACTION_HEAD_COMPILE_TARGETS = ("model", "action_encoder", "action_decoder")
+# Placeholder frame size for the compile warm-up; the processor resizes every frame.
+_WARMUP_FRAME_HW = (256, 256)
 
 
 def _to_float32_action_dict(actions: Mapping[str, Any]) -> dict[str, np.ndarray]:
@@ -30,15 +40,20 @@ class Gr00tN1d7Pipeline(nn.Module):
     vLLM-Omni owns the serving integration: OpenPI observations arrive through
     `sampling_params.extra_args["robot_obs"]`, this pipeline runs GR00T policy
     inference, and actions are returned through `DiffusionOutput.output["actions"]`.
+
+    The request's `seed` (materialised by the runner into `sampling_params.generator`)
+    draws the flow-matching noise, so repeating a request with the same seed reproduces
+    its action chunk.
     """
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
+        self.od_config = od_config
         model_config = od_config.model_config
         self.model_path = od_config.model
         self.embodiment_tag = str(model_config.get("embodiment_tag") or "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT")
         self.strict = bool(model_config.get("strict", True))
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = get_local_device()
 
         logger.info("Loading GR00T N1.7 policy from %s with embodiment_tag=%s", self.model_path, self.embodiment_tag)
         self.policy = Gr00tPolicy(
@@ -78,6 +93,97 @@ class Gr00tN1d7Pipeline(nn.Module):
                 f"policy_server_config.embodiment_tag={psc_embodiment!r} != "
                 f"model_config.embodiment_tag={self.embodiment_tag!r}."
             )
+
+    def setup_compile(self) -> None:
+        """Compile the action head's per-step modules; the Qwen3-VL backbone stays eager.
+
+        The runner calls this only when ``enforce_eager`` is off and the platform
+        supports inductor. The action head runs once per denoising step with shapes
+        fixed by the checkpoint, while the backbone's token count varies per
+        observation, so only the action head is compiled.
+
+        ``torch.compile`` is lazy, and the engine's startup dummy run returns
+        placeholder actions without running the model, so without a warm-up the
+        first real request would pay the whole compile. Each target is compiled
+        and then warmed up on a synthetic observation, so a compile failure shows
+        up here and names its module. On failure every target is restored to eager
+        before raising, and the runner continues without compile.
+        """
+        action_head = self.policy.model.action_head
+        granularity = self.od_config.diffusion_compile_granularity
+        dynamic = self.od_config.diffusion_compile_dynamic
+        compiled: list[nn.Module] = []
+        start = time.perf_counter()
+
+        def restore_eager() -> None:
+            # torch.compile(module.forward) is stored on the instance; dropping it
+            # restores the class method.
+            for module in compiled:
+                vars(module).pop("forward", None)
+
+        def compile_module(name: str) -> None:
+            module = getattr(action_head, name)
+            module.forward = torch.compile(module.forward, dynamic=dynamic)
+            compiled.append(module)
+
+        def compile_blocks() -> None:
+            regionally_compile(action_head.model, dynamic=dynamic)
+            compiled.extend(m for m in action_head.model.modules() if "forward" in vars(m))
+
+        if granularity == "full":
+            targets = [(f"action_head.{name}", partial(compile_module, name)) for name in _ACTION_HEAD_COMPILE_TARGETS]
+        else:
+            targets = [("action_head.model blocks", compile_blocks)]
+
+        for label, compile_target in targets:
+            compile_target()
+            if not compiled:
+                break
+            try:
+                self._warmup_compile()
+            except Exception as exc:
+                restore_eager()
+                raise RuntimeError(f"GR00T: torch.compile warm-up of {label} failed: {exc}") from exc
+        if not compiled:
+            logger.warning("GR00T: no action-head module was compiled; the policy runs eager.")
+            return
+
+        logger.info(
+            "GR00T: compiled %s at startup in %.1f s (granularity=%s, dynamic=%s).",
+            ", ".join(label for label, _ in targets),
+            time.perf_counter() - start,
+            granularity,
+            dynamic,
+        )
+
+    def _warmup_compile(self) -> None:
+        """Run one policy call on a synthetic observation built from the embodiment config.
+
+        Frames are black and the state is the dataset mean, so every processor step
+        sees valid input; the actions are discarded.
+        """
+        policy = self.policy
+        configs = policy.modality_configs
+        state_params = policy.processor.state_action_processor.norm_params[policy.embodiment_tag.value]["state"]
+        video_steps = len(configs["video"].delta_indices)
+        state_steps = len(configs["state"].delta_indices)
+        observation = {
+            "video": {
+                key: np.zeros((1, video_steps, *_WARMUP_FRAME_HW, 3), dtype=np.uint8)
+                for key in configs["video"].modality_keys
+            },
+            "state": {
+                key: np.broadcast_to(
+                    np.asarray(state_params[key]["mean"], dtype=np.float32),
+                    (1, state_steps, int(state_params[key]["dim"])),
+                ).copy()
+                for key in configs["state"].modality_keys
+            },
+            "language": {policy.language_key: [["warm up"]]},
+        }
+        generator = torch.Generator(device=self.device).manual_seed(0)
+        with torch.inference_mode():
+            policy.get_action(observation, {"generator": generator})
 
     def reset(self) -> dict[str, Any]:
         return self.policy.reset() or {}
@@ -123,13 +229,45 @@ class Gr00tN1d7Pipeline(nn.Module):
             self.reset()
 
         policy_obs = _normalize_observation(robot_obs, language_key=self.policy.language_key)
-        result = self.policy.get_action(policy_obs)
+        generator = _noise_generator(req.sampling_params, self.device)
+        result = self.policy.get_action(policy_obs, {"generator": generator} if generator is not None else None)
         actions = result[0] if isinstance(result, tuple) else result
         if not isinstance(actions, Mapping):
             return DiffusionOutput(error=f"GR00T policy returned {type(actions).__name__}; expected dict actions.")
         # Return actions via output.output (like the DreamZero OpenPI policy) so the engine's
         # empty-output guard passes.
         return DiffusionOutput(output={"actions": _to_float32_action_dict(actions)})
+
+
+def _noise_generator(
+    sampling_params: OmniDiffusionSamplingParams, device: torch.device | str
+) -> torch.Generator | None:
+    """Pick the generator that draws the action head's initial noise.
+
+    The runner materialises ``sampling_params.seed`` into ``sampling_params.generator`` on
+    the model device before every forward, and ``OmniDiffusionRequest`` assigns a random
+    seed when the caller omits one, so in serving the generator is always present. The
+    seed fallback serves callers that bypass the runner (direct use, unit tests). ``None``
+    leaves the action head on the global RNG, as upstream Isaac-GR00T runs. GR00T draws one
+    noise tensor per request, so a generator in any other form (for example a list of several
+    generators) is ignored with a warning and the seed fallback applies.
+    """
+    generator = sampling_params.generator
+    if isinstance(generator, list) and len(generator) == 1:
+        generator = generator[0]
+    if isinstance(generator, torch.Generator):
+        return generator
+    if generator is not None:
+        received = f"a list of {len(generator)} generators" if isinstance(generator, list) else type(generator).__name__
+        logger.warning(
+            "GR00T expects a single torch.Generator per request but got %s; ignoring it. The initial noise "
+            "falls back to sampling_params.seed=%s, or to the global RNG when that is None.",
+            received,
+            sampling_params.seed,
+        )
+    if sampling_params.seed is not None:
+        return torch.Generator(device=device).manual_seed(int(sampling_params.seed))
+    return None
 
 
 def _normalize_observation(robot_obs: Mapping[str, Any], *, language_key: str) -> dict[str, Any]:

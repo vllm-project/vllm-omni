@@ -42,7 +42,7 @@ document it in the docstring:
   codec exposes no streaming decode.
 
 If you choose delta, audit the full chain: `forward()` returns the new chunk →
-`_consolidate_multimodal_tensors()` in `vllm_omni/engine/output_processor.py`
+`_consolidate_multimodal_tensors()` in `vllm_omni/outputs/output_processor.py`
 concatenates the audio key into a single tensor at finish → streaming consumers
 receive per-step chunks, offline consumers receive the concatenated tensor. A
 mismatch (consolidator skips the key with `continue`, or consumers expect a list
@@ -202,8 +202,8 @@ it would not be picked up — the hub README is the documented surface.
 
 | File | Purpose |
 | ------ | --------- |
-| `models/qwen3_tts/qwen3_tts.py` | Unified model class |
-| `models/qwen3_tts/qwen3_tts_code_predictor_vllm.py` | Stage 0 - optimized AR |
+| `models/qwen3_tts/qwen3_tts_talker.py` | Stage 0 - AR talker (registered model class) |
+| `models/qwen3_tts/qwen3_tts_code_predictor_vllm.py` | Stage 0 - residual code predictor used by the talker |
 | `models/qwen3_tts/qwen3_tts_code2wav.py` | Stage 1 - decoder |
 | `deploy/qwen3_tts.yaml` (new schema) | Deploy config (async_chunk enabled) — paired with `models/qwen3_tts/pipeline.py` for the frozen topology |
 
@@ -689,7 +689,8 @@ class YourModelAdapter(ARTTSAdapter):
         """Return an error string, or None if the request is valid."""
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
-        return None
+        # Shared range check against ``max_new_tokens_min`` / ``max_new_tokens_max``.
+        return self._validate_max_new_tokens(request)
 
     async def build(
         self,
@@ -1021,8 +1022,8 @@ Adding a TTS model to vLLM-Omni involves:
 
 | File | Purpose |
 | ------ | --------- |
-| `models/qwen3_tts/qwen3_tts.py` | Unified model class |
-| `models/qwen3_tts/qwen3_tts_code_predictor_vllm.py` | AR stage with vLLM fused ops |
+| `models/qwen3_tts/qwen3_tts_talker.py` | Stage 0 AR talker (registered model class) |
+| `models/qwen3_tts/qwen3_tts_code_predictor_vllm.py` | Residual code predictor with vLLM fused ops |
 | `models/qwen3_tts/qwen3_tts_code2wav.py` | Decoder stage with `chunked_decode_streaming()` |
 | `models/qwen3_tts/pipeline.py` | Frozen pipeline topology (registered at import time) |
 | `deploy/qwen3_tts.yaml` | Deploy config (user-editable, async_chunk + SharedMemoryConnector) |

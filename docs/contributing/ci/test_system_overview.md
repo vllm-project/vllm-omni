@@ -150,7 +150,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
         <strong>Stability:</strong><br>
         <code>tests/dfx/stability/tests/</code><br>
         <strong>Reliability:</strong><br>
-        <code>tests/dfx/reliability/test_reliability_{model}.py</code>
+        <code>tests/dfx/reliability/test_{model}.py</code>
       </td>
       <td>
         <a href="test_writing_guide.md#l5-level-testing-stability-and-reliability-testing">L5</a><br>
@@ -182,6 +182,8 @@ CUDA **L4** (`full_model`) jobs are defined once in [`.buildkite/cuda/test-night
 - **Nightly:** scheduled `main` builds with `NIGHTLY=1` (and PR labels such as `nightly-test` / `omni-test`). Default fleet is typically H100.
 - **Pre-release:** the same L4 suite runs again on extra GPU SKUs before a release (for example B200 via `MIRROR_HW=b200`), so `full_model` coverage is not limited to the nightly machine type.
 
+AMD has an experimental, non-blocking `full_model` nightly vertical slice in [`.buildkite/amd/test-amd-nightly.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/test-amd-nightly.yml). It selects ROCm Qwen3-Omni function-expansion, accuracy, documentation-example, and AITER-on smoke coverage on the MI300 pool. AMD-only PR validation uses `amd-test` to admit the external AMD pipeline and `nightly-test` to select this suite; scheduled `main` builds select it with `NIGHTLY=1`. Keep it non-blocking while the lane accumulates stability and completion-time evidence.
+
 How count-form `mirror_hardwares` and `MIRROR_HW` pick a SKU: [CI Settings](./ci_settings.md).
 
 ### L2 / L3 diff-aware CI (CUDA)
@@ -190,11 +192,12 @@ On CUDA **L2** and **L3**, **E2E Test** Buildkite jobs may be omitted at pipelin
 
 ### Test helper environment variables
 
-Some shared helpers under `tests/helpers/` honor optional environment variables for local debugging. These are **not** set in CI by default.
+Some shared helpers under `tests/helpers/` honor optional environment variables for local debugging. CI sets `VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR` on selected TTS steps and uploads the retained files as artifacts; `VLLM_OMNI_KEEP_REQUEST_MEDIA` is not set in CI.
 
 | Variable | Accepted values | Description |
 | -------- | --------------- | ----------- |
 | `VLLM_OMNI_KEEP_REQUEST_MEDIA` | `1`, `true`, `yes` (case-insensitive) | When enabled, temporary WAV files created by `tests.helpers.media.convert_audio_bytes_to_text` are **not** deleted when the pytest process exits. By default, each call writes a unique file under the system temp directory via `tempfile.mkstemp` and registers `atexit` cleanup. Use this when debugging audio output validation (Whisper transcription, keyword checks, text–audio similarity). The saved path is logged as `audio data is saved: <path>`. |
+| `VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR` | Directory path | When set, at the `advanced_model` and `full_model` run levels, `tests.helpers.assertions.assert_audio_speech_response` retains failing speech-API audio before the test fails: a transcript mismatch writes the exact audio given to ASR as `failed_speech_<hash>.wav`, and a PCM HNR failure writes the raw response as `failed_speech_<hash>.pcm`, each with a `.json` holding the transcript, expected text, assertion message, audio format and sample rate. Sample-rate and size failures, and tests that assert on audio without this helper, write nothing. `tests.helpers.speaker_similarity` uses the same directory for `failed_voice_isolation_*` files. |
 
 Example (Linux / macOS):
 

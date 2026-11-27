@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Best-effort HuggingFace Hub prefetch for multi-subfolder pipelines.
 
@@ -30,8 +30,7 @@ Two environmental factors mask the race on main:
   ``cached_files`` (plural) which batch-resolves every shard listed in the
   index up-front via ``os.path.isfile`` and raises immediately if any shard
   is still sitting under its ``*.incomplete`` name. Same wave of v5 changes
-  that introduced ``tie_weights(missing_keys=..., recompute_mapping=...)``
-  (see the Dynin shim in ``dynin_omni_token2text.py``).
+  that introduced ``tie_weights(missing_keys=..., recompute_mapping=...)``.
 * CI shares ``HF_HOME=/fsx/hf_cache`` across pipelines (both the
   ``vllm-omni`` and ``vllm-omni-rebase`` pipelines mount the same FS). That
   cache is normally warm for long-lived repos like ``Qwen-Image-Edit-2509``,
@@ -195,19 +194,22 @@ def _repo_prefetch_lock(model: str) -> Iterator[None]:
     flock_held = False
 
     # --- fcntl.flock path ---
+    fcntl_mod: Any = None
     try:
-        import fcntl  # type: ignore[import-not-found]
-    except ImportError:  # pragma: no cover - non-POSIX (Windows)
-        fcntl = None
+        import fcntl as _fcntl
 
-    if fcntl is not None:
+        fcntl_mod = _fcntl
+    except ImportError:  # pragma: no cover - non-POSIX (Windows)
+        pass
+
+    if fcntl_mod is not None:
         try:
             lock_dir = _node_lock_dir()
         except OSError as exc:
             logger.warning("Could not allocate lock dir for prefetch of %s (%s); skipping flock", model, exc)
-            fcntl = None  # force dotfile fallback
+            fcntl_mod = None  # force dotfile fallback
 
-    if fcntl is not None and lock_dir is not None:
+    if fcntl_mod is not None and lock_dir is not None:
         lock_path = os.path.join(lock_dir, _safe_repo_filename(model))
         try:
             fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
@@ -217,7 +219,7 @@ def _repo_prefetch_lock(model: str) -> Iterator[None]:
 
         if fd is not None:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                fcntl_mod.flock(fd, fcntl_mod.LOCK_EX)
                 flock_held = True
                 logger.info("Acquired flock prefetch lock for %s at %s", model, lock_path)
             except OSError as exc:
@@ -249,9 +251,9 @@ def _repo_prefetch_lock(model: str) -> Iterator[None]:
     try:
         yield
     finally:
-        if flock_held and fd is not None:
+        if flock_held and fd is not None and fcntl_mod is not None:
             with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                fcntl_mod.flock(fd, fcntl_mod.LOCK_UN)
         if fd is not None:
             with contextlib.suppress(OSError):
                 os.close(fd)
@@ -297,7 +299,7 @@ def prefetch_subfolders(
     logger.info("Prefetching %s subfolders: %s", model, subfolders)
 
     try:
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
     except ImportError:  # pragma: no cover - huggingface_hub is a hard dep
         logger.debug("huggingface_hub unavailable; skipping prefetch of %s", model)
         return
@@ -334,7 +336,7 @@ def prefetch_subfolders(
     for attempt in range(1, _PREFETCH_MAX_ATTEMPTS + 1):
         try:
             with _repo_prefetch_lock(model):
-                snapshot_download(
+                hf_api().snapshot_download(
                     repo_id=model,
                     revision=revision,
                     allow_patterns=allow_patterns,

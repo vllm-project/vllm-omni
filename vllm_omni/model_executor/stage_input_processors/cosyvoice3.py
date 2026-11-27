@@ -99,7 +99,11 @@ def talker2code2wav_async_chunk(
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    """CosyVoice3 async_chunk processor: talker token stream -> code2wav chunks."""
+    """CosyVoice3 async_chunk processor: talker token stream -> code2wav chunks.
+
+    Every chunk carries the cached reference conditioning because MRv2
+    releases Code2Wav's request slot between chunks.
+    """
     with nullcontext():
         request_id = request.external_req_id
         finished = bool(is_finished or request.is_finished())
@@ -167,7 +171,6 @@ def talker2code2wav_async_chunk(
             request_state = {
                 "_cosyvoice3_async_state": {
                     "seen_len": 0,
-                    "sent_prompt": False,
                     "emitted_chunks": 0,
                     "emitted_token_len": 0,
                     "token_hop_len": chunk_size,
@@ -203,10 +206,7 @@ def talker2code2wav_async_chunk(
         if length <= 0:
             if not finished:
                 return None
-            embed_struct = None
-            if not state.get("sent_prompt", False):
-                embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
-                state["sent_prompt"] = True
+            embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
             state["terminal_sent"] = True
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
@@ -216,10 +216,7 @@ def talker2code2wav_async_chunk(
 
         emitted_token_len = int(state.get("emitted_token_len", 0))
         if finished and length <= emitted_token_len:
-            embed_struct = None
-            if not state.get("sent_prompt", False):
-                embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
-                state["sent_prompt"] = True
+            embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
             state["terminal_sent"] = True
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
@@ -249,10 +246,7 @@ def talker2code2wav_async_chunk(
         with nullcontext():
             code_predictor_codes = [int(frame[0]) for frame in token_frames[:prefix_len]]
 
-        embed_struct = None
-        if not state.get("sent_prompt", False):
-            embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
-            state["sent_prompt"] = True
+        embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
 
         payload = OmniPayloadStruct(
             codes=CodesStruct(audio=torch.tensor(code_predictor_codes, dtype=torch.long)),
@@ -278,6 +272,11 @@ def talker2code2wav_async_chunk(
         return payload
 
 
+# The processor derives new codec tokens from each complete generated prefix,
+# including decode steps without a multimodal payload and the terminal step.
+setattr(talker2code2wav_async_chunk, "_requires_full_token_history", True)
+
+
 # ============================================================================
 # Worker-connector data plane (non-async-chunk path).
 # cosyvoice3 talker emits `multimodal_outputs={"embed": {"speech_token": t,
@@ -292,7 +291,13 @@ def talker2code2wav_async_chunk(
 # CONCAT across the (already trivial) per-request accumulator history so a
 # regression where decode unexpectedly re-emits them does not silently
 # duplicate the prefill tensor.  See mixin._FULL_PAYLOAD_REPLACE_KEYS.
-_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"embed.speech_token", "embed.speech_feat", "embed.embedding"})
+_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset(
+    {"embed.speech_token", "embed.speech_feat", "embed.embedding", "embed.speech_token_len"}
+)
+
+
+# This processor consumes sampled codec IDs even when no tensor payload is emitted.
+talker2code2wav_async_chunk.requires_token_updates = True  # type: ignore[attr-defined]
 
 
 def text2flow_token_only(
@@ -347,20 +352,20 @@ def text2flow_full_payload(
     """
     del transfer_manager
     rid = getattr(request, "external_req_id", None) or getattr(request, "request_id", "?")
-    if not isinstance(pooling_output, dict):
+    if not isinstance(pooling_output, Mapping):
         logger.warning(
-            "cosyvoice3.text2flow_full_payload: pooling_output not a dict "
+            "cosyvoice3.text2flow_full_payload: pooling_output not a mapping "
             "(type=%s) for req=%s; consumer wait gate may hang.",
             type(pooling_output).__name__,
             rid,
         )
         return None
     embed_out: dict[str, Any] = {}
-    for key in ("speech_token", "speech_feat", "embedding"):
+    for key in ("speech_token", "speech_feat", "embedding", "speech_token_len"):
         v = pooling_output.get(f"embed.{key}")
         if v is None:
             nested = pooling_output.get("embed")
-            if isinstance(nested, dict):
+            if isinstance(nested, Mapping):
                 v = nested.get(key)
         if isinstance(v, torch.Tensor) and v.numel() > 0:
             embed_out[key] = v

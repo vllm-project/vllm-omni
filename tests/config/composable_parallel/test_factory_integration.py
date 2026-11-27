@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Integration tests: strategy overlay on the real merge_pipeline_deploy seam."""
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from vllm_omni.config.composable_parallel import (
     apply_strategy_specs,
 )
 from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
 
@@ -137,3 +138,63 @@ def test_cli_overrides_strategy_with_warning():
     assert _resolved(stages, "talker").runtime.num_replicas == 3
     # ...and the override was warned about, naming the conflicting field.
     assert any("num_replicas" in m and "overrides the strategy-derived" in m for m in messages)
+
+
+def test_typed_cli_overrides_strategy():
+    pipeline = OMNI_PIPELINES["qwen2_5_omni"]
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=load_deploy_config(_DEPLOY),
+        cli_overrides={"stage_1_num_replicas": 3},
+        strategy_specs={"talker": [_stage_replica(2, "round_robin")]},
+    )
+
+    talker = next(stage for stage in config.stage_configs if stage.model_stage == "talker")
+    assert talker.runtime_config.num_replicas == 3
+    assert config.orchestrator_config.omni_lb_policy == "round-robin"
+    assert config.strategy_omni_lb_policy == "round-robin"
+
+
+def test_typed_tp_only_strategy_has_no_derived_lb_policy():
+    pipeline = OMNI_PIPELINES["qwen2_5_omni"]
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=load_deploy_config(_DEPLOY),
+        cli_overrides={"omni_lb_policy": "round-robin"},
+        strategy_specs={"thinker": [_tp(1)]},
+    )
+
+    assert config.orchestrator_config.omni_lb_policy == "round-robin"
+    assert config.strategy_omni_lb_policy is None
+
+
+_TP2_STAGE_DEVICES = {"stage_0_devices": "0,1", "stage_1_devices": "2", "stage_2_devices": "2"}
+
+
+def test_legacy_stage_devices_override_satisfies_tp_strategy():
+    # Documented usage: bundled 1-GPU deploy + TP=2 strategy + a 2-GPU layout
+    # supplied through stage overrides. The device check must see the override.
+    stages, _ = StageConfigFactory._create_legacy_from_registry(
+        OMNI_PIPELINES["qwen2_5_omni"],
+        cli_overrides=dict(_TP2_STAGE_DEVICES),
+        strategy_specs={"thinker": [_tp(2)]},
+    )
+    assert _stage(stages, "thinker").runtime_overrides["devices"] == "0,1"
+
+
+def test_legacy_stage_devices_override_still_rejects_bad_count():
+    with pytest.raises(StrategyApplyError):
+        StageConfigFactory._create_legacy_from_registry(
+            OMNI_PIPELINES["qwen2_5_omni"],
+            cli_overrides={**_TP2_STAGE_DEVICES, "stage_0_devices": "0,1,2"},
+            strategy_specs={"thinker": [_tp(2)]},
+        )
+
+
+def test_structured_stage_devices_override_satisfies_tp_strategy():
+    cfg = VllmOmniConfig.from_pipeline_config(
+        OMNI_PIPELINES["qwen2_5_omni"],
+        cli_overrides=dict(_TP2_STAGE_DEVICES),
+        strategy_specs={"thinker": [_tp(2)]},
+    )
+    assert cfg is not None

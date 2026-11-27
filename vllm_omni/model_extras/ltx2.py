@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Request parameters shared by official LTX guidance pipelines."""
 
@@ -29,6 +29,20 @@ LTX_EXTRA_BODY_PARAMS = frozenset(
 )
 
 LTX_EXTRA_OUTPUT_PARAMS = frozenset()
+
+LTX_T2A_EXTRA_BODY_PARAMS = frozenset(
+    {
+        "audio_length",
+        "num_frames",
+        "audio_cfg_scale",
+        "audio_cfg_guidance_scale",
+        "audio_stg_scale",
+        "audio_stg_guidance_scale",
+        "audio_rescale_scale",
+        "audio_stg_blocks",
+        "sigmas",
+    }
+)
 
 
 def ltx_preserves_reference_image_size(*, model: str | None, revision: str | None = None) -> bool:

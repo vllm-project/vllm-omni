@@ -1,0 +1,38 @@
+# Opt-in Model Runner V2 profile. CUDA keeps the tuned graph settings below;
+# ROCm selects V2 while keeping Code2Wav eager.
+base_config: qwen3_tts_high_concurrency.yaml
+model_runner: v2
+
+platforms:
+  npu:
+    model_runner: v1
+  rocm:
+    model_runner: v2
+    # Derived single-GPU profiles enable NVIDIA MPS at the root. Platform
+    # selection happens after base-config resolution, so fail closed here and
+    # keep ROCm from inheriting that CUDA-only runtime option.
+    cuda_mps: false
+    stages:
+      - stage_id: 1
+        # MIOpen Conv1d cannot be invoked while vLLM captures the outer
+        # Code2Wav model graph. Keep CUDA's graph-enabled default, but run
+        # Stage 1 eager on ROCm so decoder convolutions execute normally.
+        enforce_eager: true
+  musa:
+    model_runner: v1
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      talker_first_audio: true
+      # Keep unqualified prefix-graph optimizations disabled in this profile.
+      code_predictor_prefix_graphs: false
+      ref_audio_artifact_cache_max_entries: 1024
+      # Opt-in B2 codec graphs. Validate quality for the deployment workload.
+      decode_batch_max_size: 2
+      decode_cudagraph_batch_sizes: [1, 2]
+
+stages:
+  - stage_id: 1
+    # Enable the decoder's inner graphs; the generation runner stays eager.
+    enforce_eager: false

@@ -23,9 +23,7 @@ bash run_server.sh
 
 The script allows overriding:
 - `MODEL` (default: `Wan-AI/Wan2.2-I2V-A14B-Diffusers`)
-- `PORT` (default: `8091`)
-- `BOUNDARY_RATIO` (default: `0.875`)
-- `FLOW_SHIFT` (default: `12.0`)
+- `PORT` (default: `8099`)
 - `CACHE_BACKEND` (default: `none`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
 
@@ -273,6 +271,31 @@ while true; do
   sleep 2
 done
 ```
+
+## PAN 2
+
+```bash
+# One GPU with ~100 GiB free; see the recipe for multi-GPU and smaller GPUs.
+vllm serve IFM/PAN2 --omni --port 8091
+```
+
+```bash
+create_response=$(curl -s http://localhost:8091/v1/videos \
+  -H "Accept: application/json" \
+  -F "prompt=The camera slowly pushes in as the scene comes to life, gentle wind moving through it." \
+  -F "input_reference=@first_frame.png" \
+  -F "seed=42")
+video_id=$(echo "$create_response" | jq -r '.id')
+```
+
+Poll and download the result as shown in [Poll Until
+Complete](#poll-until-complete). PAN 2 needs a structured prompt; the plain
+prompt above only shows the command. See the [PAN 2
+recipe](../../../../recipes/IFM/PAN2.md) for details.
+
+PAN 2 runs guardrails by default, which need the `pan2-guardrail` package:
+`pip install git+https://github.com/ifm-ai/pan2-guardrail`. `--no-guardrails`
+turns them off at your own risk.
 
 ## Example materials
 

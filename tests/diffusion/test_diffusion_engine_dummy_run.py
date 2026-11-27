@@ -7,13 +7,34 @@ from unittest.mock import Mock
 import pytest
 
 from vllm_omni.diffusion import io_support
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
+from vllm_omni.diffusion.models.helios.pipeline_helios import HeliosPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("model_class_name", ["DreamZeroPipeline", "LingBotWorldCausalDMDPipeline"])
+def test_observation_conditioned_startup_skips_generic_warmup(model_class_name: str) -> None:
+    """Observation-conditioned pipelines must not receive generic text requests."""
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.model_class_name = model_class_name
+    engine.od_config.diffusion_load_format = "default"
+    engine.add_req_and_wait_for_response = Mock(side_effect=AssertionError("generic text warmup submitted"))
+    engine.collective_rpc = Mock()
+    engine.close = Mock()
+
+    engine.run_startup_warmup()
+
+    engine.add_req_and_wait_for_response.assert_not_called()
+    engine.collective_rpc.assert_not_called()
+    engine.close.assert_not_called()
 
 
 @pytest.mark.parametrize("step_execution", [False, True])
@@ -52,6 +73,112 @@ def test_dummy_run_uses_enough_steps_for_execution_mode(
     assert captured_requests[0].sampling_params.num_inference_steps == 2
 
 
+def test_startup_runs_vae_warmup_after_generic_dummy():
+    events = []
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.additional_config = {"helios_vae_warmup_profiles": [{"height": 384, "width": 640}]}
+    engine._dummy_run = lambda: events.append("dummy_run")
+    engine.collective_rpc = Mock(side_effect=lambda method: events.append("vae_warmup"))
+    engine.close = Mock()
+
+    engine.run_startup_warmup()
+
+    assert events == ["dummy_run", "vae_warmup"]
+    engine.collective_rpc.assert_called_once_with(method="run_helios_vae_warmup")
+    engine.close.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "additional_config",
+    [
+        pytest.param({}, id="missing"),
+        pytest.param({"helios_vae_warmup_profiles": None}, id="none"),
+        pytest.param({"helios_vae_warmup_profiles": []}, id="empty-list"),
+        pytest.param({"helios_vae_warmup_profiles": ()}, id="empty-tuple"),
+    ],
+)
+def test_startup_skips_vae_warmup_when_profiles_are_disabled(additional_config: dict[str, object], mocker) -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.additional_config = additional_config
+    engine._dummy_run = mocker.Mock()
+    engine.collective_rpc = mocker.Mock()
+    engine.close = mocker.Mock()
+
+    engine.run_startup_warmup()
+
+    engine._dummy_run.assert_called_once_with()
+    engine.collective_rpc.assert_not_called()
+    engine.close.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "profiles",
+    [
+        pytest.param({}, id="empty-mapping"),
+        pytest.param("", id="empty-string"),
+        pytest.param(b"", id="empty-bytes"),
+        pytest.param(False, id="false"),
+        pytest.param(0, id="zero"),
+        pytest.param("384x640", id="string"),
+    ],
+)
+def test_startup_malformed_profiles_reach_pipeline_validation(profiles: object, mocker) -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.additional_config = {"helios_vae_warmup_profiles": profiles}
+    engine._dummy_run = mocker.Mock()
+    engine.close = mocker.Mock()
+    runner = object.__new__(DiffusionModelRunner)
+    runner.od_config = engine.od_config
+    runner.pipeline = object.__new__(HeliosPipeline)
+
+    def run_warmup(method: str) -> None:
+        assert method == "run_helios_vae_warmup"
+        runner.run_helios_vae_warmup()
+
+    engine.collective_rpc = mocker.Mock(side_effect=run_warmup)
+
+    with pytest.raises(TypeError, match="helios_vae_warmup_profiles must be a sequence of profile mappings"):
+        engine.run_startup_warmup()
+
+    engine._dummy_run.assert_called_once_with()
+    engine.collective_rpc.assert_called_once_with(method="run_helios_vae_warmup")
+    engine.close.assert_called_once_with()
+
+
+def test_startup_skips_vae_warmup_when_generic_dummy_fails():
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.additional_config = {"helios_vae_warmup_profiles": [{"height": 384, "width": 640}]}
+    engine._dummy_run = Mock(side_effect=RuntimeError("dummy failed"))
+    engine.collective_rpc = Mock()
+    engine.close = Mock()
+
+    with pytest.raises(RuntimeError, match="dummy failed"):
+        engine.run_startup_warmup()
+
+    engine.collective_rpc.assert_not_called()
+    engine.close.assert_called_once_with()
+
+
+def test_startup_closes_engine_when_vae_warmup_fails():
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.additional_config = {"helios_vae_warmup_profiles": [{"height": 384, "width": 640}]}
+    engine._dummy_run = Mock()
+    engine.collective_rpc = Mock(side_effect=RuntimeError("vae warmup failed"))
+    engine.close = Mock()
+
+    with pytest.raises(RuntimeError, match="vae warmup failed"):
+        engine.run_startup_warmup()
+
+    engine._dummy_run.assert_called_once_with()
+    engine.collective_rpc.assert_called_once_with(method="run_helios_vae_warmup")
+    engine.close.assert_called_once_with()
+
+
 def test_allgather_startup_runs_broadcast_dummy_request() -> None:
     engine = object.__new__(DiffusionEngine)
     engine.od_config = SimpleNamespace(
@@ -63,10 +190,12 @@ def test_allgather_startup_runs_broadcast_dummy_request() -> None:
         parallel_config=SimpleNamespace(data_parallel_size=2, sequence_parallel_size=1),
     )
     engine._dummy_run = Mock()
+    engine.collective_rpc = Mock()
 
     engine.run_startup_warmup()
 
     engine._dummy_run.assert_called_once_with()
+    engine.collective_rpc.assert_not_called()
 
 
 def test_dummy_run_num_frames_uses_explicit_model_setting(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -130,6 +259,38 @@ def test_dense_mode_does_not_build_kv_profile_request() -> None:
 
     assert engine._prepare_diffusion_kv_profile_requests() is None
     engine._make_dummy_request.assert_not_called()
+
+
+def test_explicit_profile_frames_preserve_warmup_skip(monkeypatch):
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.model_class_name = "HunyuanImage3ForCausalMM"
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.supports_multimodal_input", lambda _: (True, False))
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.image_color_format", lambda _: "RGB")
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.get_dummy_run_num_frames", lambda *_: 0)
+    kwargs = dict(height=1024, width=1024, guidance_scale=5.0, num_image_inputs=3)
+
+    assert engine._make_dummy_request(**kwargs) is None
+    request = engine._make_dummy_request(**kwargs, num_frames=1)
+
+    assert request is not None
+    assert request.sampling_params.num_frames == 1
+    assert request.sampling_params.num_inference_steps == 1
+    assert len(request.prompt["multi_modal_data"]["image"]) == 3
+
+
+def test_dummy_request_disables_attention_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Warmup and KV-profile requests run a fixed short step count, so they opt out of the service schedule."""
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.model_class_name = "mock_model"
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.supports_multimodal_input", lambda _: (False, False))
+
+    request = engine._make_dummy_request(height=64, width=64, guidance_scale=1.0, num_frames=1)
+
+    assert request is not None
+    assert request.sampling_params.attention_schedule == ()
+    assert request.sampling_params.attention_sigma_schedule == ()
 
 
 @pytest.mark.parametrize(
@@ -203,6 +364,7 @@ def test_paged_kv_profile_requests_match_per_rank_batch(
         width=1024,
         guidance_scale=5.0,
         num_image_inputs=3,
+        num_frames=1,
     )
     engine._prepare_request_for_admission.assert_called_once_with(request)
 

@@ -14,7 +14,7 @@ import dataclasses
 
 import pytest
 
-from vllm_omni.engine.duplex.messages import DuplexFence
+from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.experimental.fullduplex.core import protocol as ev
 from vllm_omni.experimental.fullduplex.core.adapter import (
     DuplexAdapter,
@@ -32,12 +32,15 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_fence_is_frozen_value_identity():
+    # The fence carries (session_id, epoch, turn_id). response_seq was
+    # dropped with the incarnation concept: response identity is the session's
+    # active_response_id, not a field of the fence.
     f = DuplexFence(session_id="s1")
-    assert (f.epoch, f.turn_id, f.response_seq) == (0, 0, 0)
+    assert (f.epoch, f.turn_id) == (0, 0)
     with pytest.raises(dataclasses.FrozenInstanceError):
         f.epoch = 1  # type: ignore[misc]
-    assert DuplexFence("s1", 1, 2, 3) == DuplexFence("s1", 1, 2, 3)
-    assert DuplexFence("s1", 1, 2, 3) != DuplexFence("s1", 2, 2, 3)
+    assert DuplexFence("s1", 1, 2) == DuplexFence("s1", 1, 2)
+    assert DuplexFence("s1", 1, 2) != DuplexFence("s1", 2, 2)
 
 
 def test_session_identity_rules():

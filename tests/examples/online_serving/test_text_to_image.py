@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Online serving tests: text-to-image.
 See examples/online_serving/text_to_image/README.md
@@ -13,12 +16,12 @@ from pathlib import Path
 
 import pytest
 
-from tests.examples.helpers import EXAMPLES, OUTPUT_DIR, run_cmd, write_zimage_lora
+from tests.examples.helpers import EXAMPLES, OUTPUT_DIR, run_cmd
 from tests.helpers.assertions import assert_image_valid
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams
 
-pytestmark = [pytest.mark.full_model, pytest.mark.example, *hardware_marks(res={"cuda": "H100"})]
+pytestmark = [pytest.mark.full_model, pytest.mark.example, *hardware_marks(res={"cuda": ["H100", "B200"]})]
 
 T2I_ONLINE_CLIENT = EXAMPLES / "online_serving" / "text_to_image" / "openai_chat_client.py"
 EXAMPLE_OUTPUT_SUBFOLDER = "example_online_t2i"
@@ -36,8 +39,9 @@ def example_output_dir() -> Path:
 # Two additional pre-requisites:
 # - omni_server must (and indeed is) defined as a module-scoped fixture
 # - test functions sharing the same param set must be adjacent to each other
-qwen_image_server_params = [OmniServerParams(model="Qwen/Qwen-Image")]
-z_image_turbo_server_params = [OmniServerParams(model="Tongyi-MAI/Z-Image-Turbo")]
+qwen_image_server_params = [
+    pytest.param(OmniServerParams(model="Qwen/Qwen-Image-2.1"), marks=hardware_marks(res={"rocm": "MI325"}))
+]
 
 
 # --- ### Method 1: Using curl ---
@@ -97,41 +101,3 @@ def test_api_calls_002(omni_server: OmniServer, example_output_dir: Path):
 
 @pytest.mark.skip("README section 'Method 3: Using Gradio Demo' is intentionally excluded for examples tests")
 def test_api_calls_003(): ...
-
-
-# --- ### Using Python Client with LoRA ---
-
-
-@pytest.mark.parametrize("omni_server", z_image_turbo_server_params, indirect=True)
-def test_lora_001(omni_server: OmniServer, example_output_dir: Path, tmp_path: Path):
-    lora_dir = tmp_path / "zimage_lora_a"
-    write_zimage_lora(lora_dir, v_scale=8.0)
-    case_dir = example_output_dir / "lora-001"
-    case_dir.mkdir(parents=True, exist_ok=True)
-    out = case_dir / "lora_001.png"
-    run_cmd(
-        [
-            sys.executable,
-            str(T2I_ONLINE_CLIENT),
-            "--prompt",
-            "A piece of cheesecake",
-            "--lora-path",
-            str(lora_dir),
-            "--lora-name",
-            "a",
-            "--lora-scale",
-            "1.0",
-            "--output",
-            str(out),
-            "--server",
-            f"http://{omni_server.host}:{omni_server.port}",
-        ]
-    )
-    assert_image_valid(out)
-
-
-# --- ### Using curl with LoRA (Images API) ---
-
-
-@pytest.mark.skip(reason="Covered by tests/diffusion/lora/test_images_generations_lora.py")
-def test_lora_002(): ...

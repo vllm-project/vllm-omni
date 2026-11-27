@@ -2,38 +2,57 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen3_omni>.
 
-
 ## Setup
+
 Use `--deploy-config` for deployment overrides such as stage memory allocation.
 See the [pipeline and deploy configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/).
+
+For experimental DFlash Thinker decoding, follow the
+[DFlash configuration requirements and limitations](../online_serving/qwen3_omni.md#experimental-dflash-thinker-decoding).
+They also apply to offline inference: use MRv1 with Thinker prefix caching
+disabled, and run both Thinker and drafter eagerly for speech output.
+CUDA Graph DFlash speech is outside the supported scope.
 
 ## Run examples
 
 ### Multiple Prompts
+
 Get into the example folder
+
 ```bash
 cd examples/offline_inference/qwen3_omni
 ```
+
 Then run the command below. Note: for processing large volume data, it uses py_generator mode, which will return a python generator from Omni class.
+
 ```bash
 bash run_multiple_prompts.sh
 ```
+
 ### Single Prompt
+
 Get into the example folder
+
 ```bash
 cd examples/offline_inference/qwen3_omni
 ```
+
 Then run the command below.
+
 ```bash
 bash run_single_prompt.sh
 ```
+
 If you have not enough memory, you can set thinker with tensor parallel. Just run the command below.
+
 ```bash
 bash run_single_prompt_tp.sh
 ```
 
 ### Modality control
+
 If you want to control output modalities, e.g. only output text, you can run the command below:
+
 ```bash
 python end2end.py --output-wav output_audio \
                   --query-type use_audio \
@@ -41,6 +60,7 @@ python end2end.py --output-wav output_audio \
 ```
 
 #### Using Local Media Files
+
 The `end2end.py` script supports local media files (audio, video, image) via command-line arguments:
 
 ```bash
@@ -61,6 +81,7 @@ python end2end.py --query-type mixed_modalities \
 ```
 
 If media file paths are not provided, the script will use default assets. Supported query types:
+
 - `use_video`: Video input
 - `use_image`: Image input
 - `use_audio`: Audio input
@@ -86,22 +107,26 @@ stage workers via the in-worker ``OmniChunkTransferAdapter`` / connector,
 **not** through the orchestrator.
 
 #### Single prompt
+
 ```bash
 cd examples/offline_inference/qwen3_omni
 bash run_single_prompt_async_chunk.sh
 ```
 
 #### Multiple prompts with concurrency control
+
 ```bash
 bash run_multiple_prompts_async_chunk.sh --max-in-flight 4
 ```
 
 #### Text-only output (skip audio generation)
+
 ```bash
 python end2end_async_chunk.py --query-type text --modalities text
 ```
 
 #### Custom deploy config
+
 ```bash
 python end2end_async_chunk.py \
     --query-type use_audio \

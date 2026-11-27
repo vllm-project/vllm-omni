@@ -53,10 +53,13 @@ def _make_request() -> Request:
 
 def _make_sched(request: Request) -> MagicMock:
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
+    sched._first_chunk_express = False
+    sched._express_min_slack_s = 0.0
     sched.requests = {request.request_id: request}
     sched.perf_metrics = None
     sched.defer_block_free = False
-    sched.structured_output_manager.should_advance.return_value = False
+    sched.structured_output_manager.accept_tokens.return_value = True
     sched._process_kv_transfer_trigger.return_value = False
     sched._maybe_decode_pooling_output.return_value = None
     sched._handle_stopped_request.return_value = True
@@ -93,7 +96,8 @@ def _frame(request: Request):
     model_runner_output.num_nans_in_logits = None
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
-    model_runner_output.req_id_to_index = {request.request_id: 0}
+    # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+    model_runner_output.req_ids = [request.request_id]
     model_runner_output.routed_experts = None
     return scheduler_output, model_runner_output
 

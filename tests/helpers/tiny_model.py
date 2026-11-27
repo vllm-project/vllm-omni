@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Reusable utility for building tiny diffusion models with random weights.
 
 Mirrors the component loading loop in DiffusionPipeline.from_pretrained,
@@ -33,7 +36,7 @@ def build_tiny_from_configs(
     pipeline_name: str,
     model_id: str,
     configs_dir: str | Path | None = None,
-    transform: dict[str, Callable[[dict], dict]] | None = None,
+    transform: dict[str | None, Callable[[dict], dict]] | None = None,
 ) -> str:
     """Build a tiny diffusion model with random weights.
 
@@ -44,14 +47,16 @@ def build_tiny_from_configs(
             config or transform) that don't have vendored configs.
         configs_dir: Path to a directory containing vendored config files
             (model_index.json and per-component config.json).
-        transform: Maps a component (subfolder) name to a function that
-            takes that component's raw config dict (fetched from model_id)
-            and returns a shrunk one, applied only when that component has
-            no vendored config in configs_dir. Lets each pipeline encode
-            exactly the shrink it needs (layer counts, and any component-
-            internal width that isn't read by another component), including
-            keeping sibling config fields in sync (e.g. layer_types matching
-            num_hidden_layers).
+        transform: Maps a component (subfolder) name or None to a function that
+            transforms a config dict. For subfolder keys, the function takes
+            that component's raw config dict (fetched from model_id) and returns
+            a shrunk one, applied only when that component has no vendored config
+            in configs_dir. For None key, the function transforms the pipeline's
+            model_index.json config dict. Lets each pipeline encode exactly the
+            transforms it needs (layer counts, config-level fields, and any
+            component-internal width that isn't read by another component),
+            including keeping sibling config fields in sync (e.g. layer_types
+            matching num_hidden_layers).
 
     Returns:
         Path to the saved tiny model directory with safetensors weights.
@@ -72,7 +77,7 @@ def build_tiny_from_configs(
         subfolder = kwargs.get("subfolder")
         load_kwargs = {"subfolder": subfolder} if subfolder else {}
         config = cls.load_config(pretrained_model_name_or_path, **load_kwargs)
-        if subfolder in transform:
+        if subfolder is not None and subfolder in transform:
             config = transform[subfolder](dict(config))
         return cls.from_config(config)
 
@@ -86,7 +91,7 @@ def build_tiny_from_configs(
         subfolder = kwargs.get("subfolder")
         load_kwargs = {"subfolder": subfolder} if subfolder else {}
         config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **load_kwargs)
-        if subfolder in transform:
+        if subfolder is not None and subfolder in transform:
             config_dict = transform[subfolder](config_dict)
         config = cls.config_class.from_dict(config_dict)
         return cls(config)
@@ -96,14 +101,23 @@ def build_tiny_from_configs(
     # can vendor just one component without also needing its own model_index.json.
     vendored_index = config_dir is not None and (config_dir / "model_index.json").exists()
     config_dict = DiffusionPipeline.load_config(config_dir if vendored_index else model_id)
+    if None in transform:
+        config_dict = transform[None](dict(config_dict))
     pipeline_cls = _get_pipeline_class(DiffusionPipeline, config=config_dict)
 
     init_dict, _, _ = pipeline_cls.extract_init_dict(config_dict)
 
-    # Pop non-component entries (optional pipeline kwargs like is_distilled),
-    # same as DiffusionPipeline.from_pretrained lines 345-350
+    # Mirrors DiffusionPipeline.from_pretrained's component parsing. Keep this
+    # close to upstream so diffusers bumps are easy to reconcile. Optional
+    # components such as WanPipeline's transformer/transformer_2 must stay in
+    # init_dict so they are instantiated below.
     _, optional_kwargs = DiffusionPipeline._get_signature_keys(pipeline_cls)
-    init_kwargs = {k: init_dict.pop(k) for k in optional_kwargs if k in init_dict}
+    init_kwargs = {
+        k: init_dict.pop(k) for k in optional_kwargs if k in init_dict and k not in pipeline_cls._optional_components
+    }
+
+    # Mirrors from_pretrained's load_module: skip components saved as [null, null].
+    init_dict = {k: v for k, v in init_dict.items() if v[0] is not None}
 
     with (
         patch.object(ModelMixin, "from_pretrained", classmethod(_diffusers_from_config)),

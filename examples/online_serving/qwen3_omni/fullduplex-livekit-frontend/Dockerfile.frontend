@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+FROM node:24-bookworm-slim AS dependencies
+
+ARG FRONTEND_REF=main
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates git \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install --global pnpm@9.15.9
+
+WORKDIR /app
+RUN git clone --depth 1 --branch "${FRONTEND_REF}" \
+    https://github.com/livekit-examples/agent-starter-react.git . \
+    && pnpm install --frozen-lockfile \
+    && rm -rf .git
+
+FROM node:24-bookworm-slim
+
+ENV NODE_ENV=development \
+    NEXT_TELEMETRY_DISABLED=1
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install --global pnpm@9.15.9
+
+WORKDIR /app
+COPY --from=dependencies --chown=node:node /app /app
+
+USER node
+
+EXPOSE 3000
+CMD ["pnpm", "dev", "--hostname", "0.0.0.0"]

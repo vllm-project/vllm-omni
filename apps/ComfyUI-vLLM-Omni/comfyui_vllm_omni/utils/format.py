@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Image/tensor format helpers.
 
 The image generation part is derived from dougbtv/comfyui-vllm-omni by Doug (@dougbtv).
@@ -126,10 +129,48 @@ def image_tensor_to_base64(tensor: torch.Tensor, filename: str = "image.png") ->
     return f"data:{mime_type};base64,{base64_str}"
 
 
-def video_to_bytes(video: VideoInput, filename: str = "video.mp4") -> BytesIO:
+def mask_tensor_to_png_bytes(mask: torch.Tensor, filename: str = "mask.png") -> BytesIO:
+    """Encode one ComfyUI MASK frame as a thresholded grayscale PNG."""
+    if mask.ndim == 3:
+        if mask.shape[0] != 1:
+            raise ValueError("Static mask accepts one frame; use mask_video for temporal masks.")
+        mask = mask[0]
+    elif mask.ndim != 2:
+        raise ValueError(f"Expected MASK shape (H, W) or (1, H, W), got {tuple(mask.shape)}.")
+    if not torch.isfinite(mask).all():
+        raise ValueError("Mask values must all be finite.")
+
+    mask_array = ((mask.detach().cpu() > 0.5).numpy().astype(np.uint8)) * 255
     output_buffer = BytesIO()
     output_buffer.name = filename
-    video.save_to(output_buffer)
+    Image.fromarray(mask_array).save(output_buffer, format="PNG")
+    output_buffer.seek(0)
+    return output_buffer
+
+
+def video_to_bytes(
+    video: VideoInput,
+    filename: str = "video.mp4",
+    *,
+    format: str | None = None,
+    codec: str | None = None,
+    crf: float | None = None,
+) -> BytesIO:
+    """Write ``video`` into a named buffer.
+
+    Without ``format``, ComfyUI keeps a loaded file's own container (MKV/WebM
+    stay Matroska); pass ``format="mp4"`` when the upload must be an MP4.
+    """
+    output_buffer = BytesIO()
+    output_buffer.name = filename
+    save_options = {}
+    if format is not None:
+        save_options["format"] = format
+    if codec is not None:
+        save_options["codec"] = codec
+    if crf is not None:
+        save_options["crf"] = crf
+    video.save_to(output_buffer, **save_options)
     output_buffer.seek(0)
     return output_buffer
 
@@ -141,6 +182,35 @@ def video_to_base64(video: VideoInput, filename: str = "video.mp4") -> str:
     base64_str = base64.b64encode(byte_data).decode("utf-8")
     mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return f"data:{mime_type};base64,{base64_str}"
+
+
+def bytes_to_restored_video(video_bytes: bytes, frame_rate: Fraction) -> VideoInput:
+    """Keep encoded streams and restore exact source FPS rounded by MP4 encoders."""
+    output = BytesIO()
+    try:
+        with av.open(BytesIO(video_bytes)) as source, av.open(output, "w", format="mp4") as target:
+            if not source.streams.video:
+                raise ValueError("No video stream found in restored payload.")
+            video = source.streams.video[0]
+            streams = {stream.index: target.add_stream_from_template(stream) for stream in source.streams}
+            streams[video.index].time_base = 1 / frame_rate
+            for packet in source.demux():
+                if packet.dts is None:  # PyAV's flush packets contain no encoded data.
+                    continue
+                index = packet.stream.index
+                if index == video.index:
+                    # CFR timestamps become frame indices; audio timestamps stay unchanged.
+                    packet.pts = round(packet.pts * packet.time_base * video.average_rate)
+                    packet.dts = round(packet.dts * packet.time_base * video.average_rate)
+                    packet.duration = 1
+                    packet.time_base = 1 / frame_rate
+                packet.stream = streams[index]
+                target.mux(packet)
+    except (av.FFmpegError, ValueError) as e:
+        raise RuntimeError(f"Failed to remux restored video: {e}") from e
+    output.seek(0)
+    # File-backed VIDEO lets SaveVideo reuse streams instead of encoding again.
+    return InputImpl.VideoFromFile(output)
 
 
 def bytes_to_video(video_bytes: bytes) -> VideoInput:
@@ -170,6 +240,10 @@ def bytes_to_video(video_bytes: bytes) -> VideoInput:
                 audio_stream = container.streams.audio[-1]
                 audio_frames = []
                 resampler = AudioResampler(format="fltp")
+                # Decoding the video stream above left the container at EOF.
+                # Rewind before demuxing again, or this pass yields no frames
+                # and the audio of a T2VA result is silently dropped.
+                container.seek(0)
                 for frame in container.decode(audio_stream):
                     if not isinstance(frame, AudioFrame):
                         continue

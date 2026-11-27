@@ -1,6 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5_ready",
+    "description": "The sweep is c1/c8/c16 with 10/80/160 seed-tts prompts. The previous H100 baseline was two points (c1/c4, 10/40 prompts) and cannot be indexed against this sweep. No c1/c8/c16 baseline is recorded for this prompt schedule; the empty baseline is intentional until those points are measured. test_minicpmo_4_5.json thresholds are a different prompt count and are not reused here.",
     "mark": [
       {
         "hardware_marks": {
@@ -30,11 +31,13 @@
         "endpoint": "/v1/chat/completions",
         "num_prompts": [
           10,
-          40
+          80,
+          160
         ],
         "max_concurrency": [
           1,
-          4
+          8,
+          16
         ],
         "no_oversample": true,
         "disable_shuffle": true,
@@ -51,30 +54,7 @@
           }
         },
         "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
-        "baseline": {
-          "H100": {
-            "request_throughput": [
-              0.9731,
-              1.1986
-            ],
-            "mean_ttft_ms": [
-              152.5665,
-              270.2559
-            ],
-            "mean_e2el_ms": [
-              1027.2953,
-              3306.3735
-            ],
-            "mean_audio_ttfp_ms": [
-              458.1553,
-              2030.2335
-            ],
-            "mean_audio_rtf": [
-              0.2357,
-              0.791
-            ]
-          }
-        }
+        "baseline": {}
       }
     ]
   }

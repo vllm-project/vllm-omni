@@ -11,12 +11,18 @@ instead of editing the shared serving module in ~10 scattered places.
 See the RFC for the full design (issue #4327).
 """
 
+import hashlib
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
+
+from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_codec_frame_rate, load_supported_speakers
+from vllm_omni.model_extras import get_extra_body_params
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -37,22 +43,101 @@ DEFAULT_TTS_LANGUAGES = frozenset(
     }
 )
 
-_conditioning_cache_salt_fn: "Callable[..., str] | None" = None
+
+def resolve_stage_model_path(engine_client: Any) -> str | None:
+    """Prefer typed stage model overrides, then legacy and served-model values."""
+    stages = getattr(engine_client, "stage_configs", ()) or ()
+    for stage in stages:
+        model_path = getattr(getattr(stage, "model_config", None), "model", None)
+        if model_path:
+            return str(model_path)
+    for stage in stages:
+        model_path = getattr(getattr(stage, "engine_args", None), "model", None)
+        if model_path:
+            return str(model_path)
+    model_path = getattr(engine_client, "model", None)
+    return str(model_path) if model_path else None
 
 
-def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: dict) -> str:
-    """Return the conditioning cache salt for ``request`` + ``tts_params``.
+def conditioning_cache_salt(
+    request: "OpenAICreateSpeechRequest",
+    tts_params: dict | None = None,
+    *,
+    registered_voice: tuple[str, int] | None = None,
+) -> str:
+    """Stable hash of the real Stage 0 conditioning for the prefix cache.
 
-    Lazily imports and caches ``serving_speech._conditioning_cache_salt`` on first
-    use: the import is deferred to break the adapters<->serving_speech import
-    cycle, and cached so it resolves once instead of on every ``build()`` call.
+    The talker's vLLM prompt is placeholder token ids; the real inputs are
+    rebuilt from text / ref_audio / ref_text into inputs_embeds. vLLM hashes
+    token ids (folded with cache_salt) for prefix caching, so without a salt
+    every request collides and a hit could reuse KV from a semantically
+    different input.
+
+    Raw request fields alone are not enough for uploaded voices: resolved
+    conditioning such as ``voice_created_at`` and content-aware ref-audio
+    cache keys must also be folded in. This distinguishes delete/re-upload of
+    the same voice and same-path local audio rewrites without hashing decoded
+    waveform arrays. An adapter may supply ``registered_voice=(name, created_at)``
+    only after verifying the uploaded voice and excluding inline audio overrides.
+    This replaces the uploaded data URI in the hash without changing the request.
     """
-    global _conditioning_cache_salt_fn
-    if _conditioning_cache_salt_fn is None:
-        from vllm_omni.entrypoints.openai.serving_speech import _conditioning_cache_salt
+    h = hashlib.sha256()
+    ref_audio: str | list[str] | tuple[str, int] | None = request.ref_audio
+    if (
+        isinstance(ref_audio, str)
+        and len(ref_audio) > 256
+        and tts_params is not None
+        and tts_params.get("ref_audio_cache_key") is not None
+    ):
+        # The resolve key below is already a content-aware digest of this
+        # locator. Hashing a repr of a large inline data URI again dominates
+        # the per-request serving cost without adding information.
+        ref_audio = ("ref_audio_cache_key", len(ref_audio))
+    for part in (
+        request.input,
+        request.task_type,
+        request.language,
+        request.voice,
+        request.ref_text,
+        registered_voice if registered_voice is not None else ref_audio,
+        request.instructions,
+        request.x_vector_only_mode,
+        request.speaker_embedding,
+    ):
+        h.update(b"\x00")
+        if part is not None:
+            h.update(repr(part).encode("utf-8"))
+    # Fold conditioning derived by adapters and absent from the raw request.
+    for key in (
+        "voice_created_at",
+        "task_type",
+        "speaker",
+        "ref_text",
+        "x_vector_only_mode",
+        "ref_audio_cache_key",
+        "ref_audio_2_cache_key",
+    ):
+        h.update(b"\x00")
+        value = tts_params.get(key) if tts_params is not None else None
+        if value is not None:
+            h.update(repr(value).encode("utf-8"))
+    # Pre-computed reference codes: their digest (folded only when present,
+    # so other requests keep their salts).
+    codes_key = tts_params.get("ref_codes_cache_key") if tts_params is not None else None
+    if codes_key is not None:
+        h.update(b"\x00ref_codes\x00" + str(codes_key).encode("utf-8"))
+    return h.hexdigest()[:32]
 
-        _conditioning_cache_salt_fn = _conditioning_cache_salt
-    return _conditioning_cache_salt_fn(request, tts_params)
+
+def validate_tts_request(adapter: "TTSModelAdapter", request: "OpenAICreateSpeechRequest") -> str | None:
+    """``adapter.validate`` after the checks every adapter shares: ``ref_audio_codes``
+    only where supported, rather than silently dropped."""
+    if getattr(request, "ref_audio_codes", None) is not None and not getattr(
+        adapter, "supports_reference_codes", False
+    ):
+        name = getattr(adapter, "name", None) or "this model"
+        return f"'ref_audio_codes' (pre-computed reference codes) is not supported by {name}"
+    return adapter.validate(request)
 
 
 def apply_max_new_tokens(
@@ -104,9 +189,50 @@ class PreparedRequest:
     tts_params: dict[str, Any] = field(default_factory=dict)
     model_type: str = "generic"
     output_policy: OutputPolicy = field(default_factory=OutputPolicy)
-    #: Cross-cutting per-request state the orchestrator still owns (e.g. the
-    #: Qwen3-TTS ref-audio warmup artifact key tracked after ``generate()``).
-    warmup_artifact_key: str | None = None
+    #: Additional complete prompts, executed in order after ``prompt``. Only
+    #: non-streaming audio without word timestamps supports this path.
+    additional_prompts: list[dict[str, Any]] = field(default_factory=list)
+    segment_silence_ms: int = 200
+
+
+class IncrementalInputNotReadyError(Exception):
+    """Recoverable initial-input wait, not an invalid request or engine error."""
+
+
+class IncrementalTTSInput(Protocol):
+    """Model-owned input conversion for one ordinary TTS request.
+
+    Each call receives released frontend text, not token IDs or a batch of
+    requests. The handler owns submission, output consumption, cancellation, and
+    EOF. Calls on an instance must be serialized.
+
+    Input conversion must preserve the complete-input model encoding regardless
+    of source chunking or delivery batching. Already submitted input is never
+    revised; EOF flushes the remaining encoding exactly once.
+
+    Before the first successful build, the caller accumulates initial text.
+    ``build`` receives the entire candidate, returning a request or raising
+    ``IncrementalInputNotReadyError`` if more input is required. This signal
+    neither submits a request nor consumes caller-owned input; retry with the
+    complete candidate, not only the newly arrived suffix. Implementations may
+    cache speculative encoding to avoid reprocessing an unchanged prefix.
+
+    EOF cannot require more input: ``build(final=True)`` either returns a
+    complete initial request or raises an actual input/construction error.
+    Catch only ``IncrementalInputNotReadyError`` as a normal wait. Other build
+    failures terminate the utterance; discard the instance rather than retrying.
+    A successful build is performed exactly once per instance.
+
+    After a successful build, ``append`` consumes each text delta exactly once.
+    It may buffer text without submitting an engine update. An empty final
+    append flushes pending text and closes input without ending generation.
+    Append/delivery failures terminate the utterance; do not retry a delta
+    whose engine delivery may already have occurred.
+    """
+
+    async def build(self, text: str, *, final: bool) -> PreparedRequest: ...
+
+    async def append(self, request_id: str, text: str, *, final: bool) -> None: ...
 
 
 @dataclass
@@ -128,11 +254,31 @@ class SpeechServingContext:
 
 
 @dataclass(frozen=True)
+class TextCommitmentCapabilities:
+    """Adapter contract for raw-text commitment through the WebSocket path.
+
+    These describe supported behavior, not a promise that the current server
+    deployment enables optional features such as the forced aligner. A future
+    stateful adapter must use a handler that implements its lifecycle contract.
+    """
+
+    #: Versioned key resolved by the streaming text frontend factory registry.
+    profile: str
+    languages: frozenset[str]
+    independent_segments: bool
+    preserves_cross_segment_context: bool
+    streaming_audio: bool
+    word_timestamps: bool
+    retry_failed_segments: bool
+
+
+@dataclass(frozen=True)
 class TTSCapabilities:
     precomputed_speakers: dict[str, dict[str, Any]] = field(default_factory=dict)
     supported_speakers: frozenset[str] = frozenset()
     supported_languages: frozenset[str] = DEFAULT_TTS_LANGUAGES
     codec_frame_rate: float | None = None
+    default_speaker: str | None = None
 
 
 class TTSModelAdapter(ABC):
@@ -164,8 +310,28 @@ class TTSModelAdapter(ABC):
     backend: ClassVar[str] = "ar"
     #: Whether streaming entrypoints must retain terminal metrics for validation.
     validates_generation: ClassVar[bool] = False
+    #: Whether to report a ``length`` finish of the AR entry stage (stopped at
+    #: ``max_new_tokens`` or the context window before end-of-speech) as
+    #: truncated audio: ``X-Audio-Truncated`` on non-streaming responses and
+    #: ``truncated`` on the SSE ``speech.audio.done`` event. Enable it only
+    #: after checking that this model's entry stage emits the speech itself, so
+    #: that a ``length`` finish means the audio was cut off. A
+    #: ``validate_generation`` error takes precedence: rejected audio is never
+    #: returned with the flag.
+    reports_length_truncation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    #: Whether the model honors the request-level ``temperature`` on its first
+    #: autoregressive stage. Models with checkpoint-fixed sampling set ``False``
+    #: so the serving layer rejects the field instead of silently applying it.
+    supports_temperature: ClassVar[bool] = True
+    supports_incremental_input: ClassVar[bool] = False
+    #: None disables commitment. Opt-in adapters describe their complete
+    #: commitment contract so the handler can validate every requested feature.
+    text_commitment: ClassVar[TextCommitmentCapabilities | None] = None
+    #: Whether ``request.ref_audio_codes`` (pre-computed reference codes) is
+    #: accepted; other adapters get a 4xx instead of silently dropping it.
+    supports_reference_codes: ClassVar[bool] = False
     #: Target sample rates validated for this adapter's output path. An empty
     #: set means that the adapter does not expose per-request resampling.
     supported_output_sample_rates: ClassVar[frozenset[int]] = frozenset()
@@ -214,6 +380,15 @@ class TTSModelAdapter(ABC):
         """
         return None
 
+    def _validate_max_new_tokens(self, request: "OpenAICreateSpeechRequest") -> str | None:
+        """Range-check ``request.max_new_tokens`` against the adapter bounds."""
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < self.max_new_tokens_min:
+                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
+            if request.max_new_tokens > self.max_new_tokens_max:
+                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
+        return None
+
     @abstractmethod
     async def build(
         self,
@@ -232,6 +407,10 @@ class TTSModelAdapter(ABC):
         Recomputing it here would misclassify uploaded voices as inline and drop
         the ``voice_name`` / ``voice_created_at`` metadata.
         """
+
+    async def create_incremental_input(self, request: "OpenAICreateSpeechRequest") -> IncrementalTTSInput:
+        """Create fresh model input state; ordinary request validation is shared."""
+        raise ValueError(f"Incremental model input is not supported by {self.name}")
 
     def apply_sampling_overrides(
         self,
@@ -262,26 +441,71 @@ class TTSModelAdapter(ABC):
         to unrelated TTS models.
         """
 
+    def validate_stream_audio(self, *, has_audio: bool) -> None:
+        """Validate audio availability before recording streaming success."""
+
+    def collect_response_metadata(self, audio_output: Mapping[str, Any], collect: dict) -> None:
+        """Fold engine-side metadata from the mm payload into ``collect``.
+
+        Called for the final non-streaming audio output and for each
+        audio-bearing streaming output, including partial or empty audio.
+        When the caller omits its metadata collector, serving supplies a
+        temporary dictionary for each call; adapters must not assume that
+        ``collect`` persists across streaming outputs.
+
+        Set ``audio_synthesis_error=True`` to reject a failed synthesis.
+        Serving also surfaces selected entries as non-streaming response
+        headers, such as ``audio_truncated`` -> ``X-Audio-Truncated``.
+        Default: no-op.
+        """
+
     async def warmup(self) -> None:
         return
+
+    def stage_setting(self, section: str, name: str) -> Any:
+        """The serving stage's deploy setting ``name``, or None when it is unset.
+
+        A typed stage config keeps the setting in one of its sections; a
+        legacy one keeps every setting flat under ``engine_args``. A section
+        the typed config lacks is a caller bug and raises ``AttributeError``;
+        only an unset setting returns None.
+
+        Args:
+            section: The typed config's section that holds the setting, such
+                as ``runtime_config`` for ``additional_config`` or
+                ``scheduler_config`` for ``max_num_seqs``.
+            name: The deploy file's key.
+        """
+        stage = self.ctx.server._tts_stage
+        engine_args = getattr(stage, "engine_args", None)
+        return getattr(getattr(stage, section) if engine_args is None else engine_args, name, None)
+
+    def shutdown(self) -> None:
+        """Release model-specific serving work before the executor shuts down."""
 
     def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
         return None
 
     def load_capabilities(self) -> TTSCapabilities:
+        speakers_list = list(self._load_supported_speakers())
+        default_speaker = speakers_list[0] if speakers_list else None
+        if default_speaker:
+            logger.info("Default speaker for CustomVoice task: %s", default_speaker)
         self.capabilities = TTSCapabilities(
             precomputed_speakers=self._load_precomputed_speakers(),
-            supported_speakers=frozenset(self._load_supported_speakers()),
+            supported_speakers=frozenset(speakers_list),
             supported_languages=self._load_supported_languages(),
             codec_frame_rate=self._load_codec_frame_rate(),
+            default_speaker=default_speaker,
         )
         return self.capabilities
 
     def _load_precomputed_speakers(self) -> dict[str, dict[str, Any]]:
         return {}
 
-    def _load_supported_speakers(self) -> set[str]:
+    def _load_supported_speakers(self) -> list[str]:
         # Preserve the legacy default path, which reads talker_config.
+        # Returns a list to preserve config order.
         return load_supported_speakers(self.ctx.engine_client)
 
     def _load_supported_languages(self) -> frozenset[str]:
@@ -311,25 +535,21 @@ class DiffusionTTSAdapter(TTSModelAdapter):
 
     backend: ClassVar[str] = "diffusion"
 
-    #: Backing diffusion pipeline class (for EXTRA_BODY_PARAMS lookup).
-    pipeline_cls: ClassVar[type | None] = None
-
     @classmethod
     def extra_body_params(cls) -> frozenset[str]:
-        """Fallback-safe access to the pipeline's declared body params.
-
-        Returns the pipeline's ``EXTRA_BODY_PARAMS`` if the #3572 contract is
-        present, else an empty frozenset (the adapter then uses its own inline
-        parameter logic).
-        """
-        params = getattr(cls.pipeline_cls, "EXTRA_BODY_PARAMS", None)
-        return frozenset(params) if params is not None else frozenset()
+        """Return body parameters declared for this adapter's model arches."""
+        params: set[str] = set()
+        for model_arch in cls.model_archs:
+            params.update(get_extra_body_params(model_arch))
+        return frozenset(params)
 
 
 # Re-exported here to avoid import cycles at call sites.
 __all__ = [
     "ARTTSAdapter",
     "DiffusionTTSAdapter",
+    "IncrementalInputNotReadyError",
+    "IncrementalTTSInput",
     "OutputPolicy",
     "PreparedRequest",
     "SpeechServingContext",

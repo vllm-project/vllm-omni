@@ -5,8 +5,9 @@
 # --forced-aligner sets just the model path.
 #
 # The stage runs the model with runner="pooling" + pooling_task="token_classify".
-# Prompt tokens, chat template and word segmentation are Qwen-specific and live
-# in qwen3_force_align_processor (not configurable here).
+# Prompt tokens and word segmentation are Qwen-specific and live in
+# qwen3_force_align_processor (not configurable here); the prompt is the same
+# string qwen_asr's encode_timestamp builds, with no chat template.
 
 forced_aligner:
   model: Qwen/Qwen3-ForcedAligner-0.6B

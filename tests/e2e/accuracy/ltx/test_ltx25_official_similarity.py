@@ -10,7 +10,8 @@ only the generation shape and step count are reduced for CI runtime.
 LTX-2.5 runs the official split-artifact pipelines with connector weights from
 the same Diffusers checkpoint under test. The distilled case covers the fixed
 two-stage schedule; the Full/SFT case covers raw dev weights and an explicit
-shared one-stage schedule.
+shared one-stage schedule. The text-to-audio case compares Omni's audio-only
+runtime with the official ``T2AOneStagePipeline`` on the same dev weights.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import pytest
@@ -31,9 +33,11 @@ import torch
 from huggingface_hub import hf_hub_download, snapshot_download
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
-from tests.e2e.accuracy.helpers import reset_artifact_dir
-from tests.helpers import skip_if_gated_repo_inaccessible
+from tests.e2e.accuracy.helpers import reset_artifact_dir, write_accuracy_result
 from tests.helpers.mark import hardware_test
+
+if TYPE_CHECKING:
+    from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
 
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
 LTX25_OFFICIAL_REVISION = "7954dcb0d986bdc36ef272564a9789ade07fcc65"
@@ -59,11 +63,17 @@ LTX25_OFFICIAL_VARIANT_FILES = {
         "spatial_upsampler": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
         "distilled_lora": "loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors",
     },
+    "t2a": {
+        "transformer": "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors",
+    },
 }
+# Audio-only variants never build the video VAE, so skip downloading it.
+LTX25_OFFICIAL_AUDIO_ONLY_VARIANTS = frozenset({"t2a"})
 # Version selected by the pinned official source's uv.lock. Keep it isolated
 # from Omni's runtime and development dependencies.
 OFFICIAL_OPENIMAGEIO_VERSION = "3.1.11.0"
 LTX25_PROMPT = "A cinematic shot of a red fox walking through a snowy forest at dawn, the camera tracking alongside."
+LTX25_T2A_PROMPT = "A close-up recording of a concert grand piano playing a gentle melody."
 LTX25_I2V_IMAGE_REPO = "huggingface/documentation-images"
 LTX25_I2V_IMAGE_FILENAME = "diffusers/svd/rocket.png"
 LTX25_I2V_IMAGE_REVISION = "645d8364f0c7a101180b364811b5a11a362e4010"
@@ -81,10 +91,15 @@ NEGATIVE_PROMPT = (
     "stylized filters, or AI artifacts."
 )
 
-# Release parity exercises the accelerated BF16 cuDNN path in both runtimes.
-# Degenerate one-token attention falls back to PyTorch SDPA MATH.
-ATTENTION_BACKEND = "torch_sdpa_cudnn_bf16"
+# CUDA release parity uses cuDNN in both runtimes. ROCm uses each runtime's
+# PyTorch SDPA priority order so both sides select the same available kernel.
+ATTENTION_BACKEND = "torch_sdpa_default_bf16" if torch.version.hip is not None else "torch_sdpa_cudnn_bf16"
 LTX25_STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
+# MI300 cold initialization legitimately exceeded the engine's 600-second
+# default in AMD weekly #17385. Keep the allowance case-local and bounded.
+LTX25_OMNI_STAGE_INIT_TIMEOUT_S = 1200
+LTX25_OMNI_INIT_TIMEOUT_S = 1800
+LTX25_OMNI_PROCESS_TIMEOUT_S = 2400
 
 
 @dataclass(frozen=True)
@@ -94,6 +109,12 @@ class LTXAccuracyThresholds:
     video_psnr_mean_db: float
     audio_relative_l2: float
     audio_cosine_similarity: float
+    audio_spectral_cosine_rocm: float
+    audio_rms_ratio_min_rocm: float
+    audio_rms_ratio_max_rocm: float
+    audio_quiet_reference_rms: float
+    audio_quiet_max_abs: float
+    audio_quiet_mean_abs: float
 
 
 STRICT_THRESHOLDS = LTXAccuracyThresholds(
@@ -102,6 +123,16 @@ STRICT_THRESHOLDS = LTXAccuracyThresholds(
     video_psnr_mean_db=40.0,
     audio_relative_l2=0.10,
     audio_cosine_similarity=0.99,
+    # ROCm convolution solver selection can perturb the vocoder waveform while
+    # preserving its magnitude spectrum and loudness. Keep CUDA's strict
+    # sample-wise contract, but compare the ROCm waveform in a phase-tolerant
+    # representation with a tight energy bound.
+    audio_spectral_cosine_rocm=0.995,
+    audio_rms_ratio_min_rocm=0.98,
+    audio_rms_ratio_max_rocm=1.02,
+    audio_quiet_reference_rms=1e-3,
+    audio_quiet_max_abs=2e-3,
+    audio_quiet_mean_abs=1e-4,
 )
 
 
@@ -127,10 +158,210 @@ def test_ltx_reference_runner_unwraps_flattened_pipeline_output() -> None:
     assert _omni_worker_peak_memory_mb([output]) == 12_345.0
 
 
+def test_ltx_reference_runner_unwraps_audio_only_output() -> None:
+    from vllm_omni.outputs import OmniRequestOutput
+
+    from .run_ltx25_reference import _unwrap_omni_audio_output
+
+    audio = object()
+    output = OmniRequestOutput(
+        stage_id=0,
+        final_output_type="audio",
+        _multimodal_output={"audio": audio, "audio_sample_rate": 48_000},
+    )
+
+    actual_audio, sample_rate = _unwrap_omni_audio_output([output])
+
+    assert actual_audio is audio
+    assert sample_rate == 48_000
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx_reference_runner_resolves_gemma4_rope_layer_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+    from transformers.models.gemma4_unified.modeling_gemma4_unified import (
+        Gemma4UnifiedTextRotaryEmbedding,
+    )
+
+    from .run_ltx25_reference import _configure_official_gemma4_rope_compatibility
+
+    @dataclass(frozen=True)
+    class LayerConfig:
+        head_dim: int
+
+    class Config:
+        is_heterogeneous = True
+        per_layer_config = {
+            "sliding_attention": LayerConfig(head_dim=256),
+            "full_attention": LayerConfig(head_dim=512),
+        }
+
+        @property
+        def head_dim(self) -> int:
+            raise AssertionError("heterogeneous global head_dim must not be read")
+
+    observed_default: list[tuple[object, torch.device | None, str | None, dict[str, object]]] = []
+    observed_proportional: list[tuple[object, torch.device | None, int | None, str | None, str, dict[str, object]]] = []
+
+    def original_compute_default_rope_parameters(
+        config: object,
+        device: torch.device | None = None,
+        layer_type: str | None = None,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, float]:
+        observed_default.append((config, device, layer_type, kwargs))
+        return torch.empty(0), 1.0
+
+    def original_compute_proportional_rope_parameters(
+        config: object,
+        device: torch.device | None = None,
+        seq_len: int | None = None,
+        layer_type: str | None = None,
+        head_dim_key: str = "head_dim",
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, float]:
+        observed_proportional.append((config, device, seq_len, layer_type, head_dim_key, kwargs))
+        return torch.empty(0), 2.0
+
+    monkeypatch.setattr(
+        Gemma4UnifiedTextRotaryEmbedding,
+        "compute_default_rope_parameters",
+        staticmethod(original_compute_default_rope_parameters),
+    )
+    monkeypatch.setitem(ROPE_INIT_FUNCTIONS, "proportional", original_compute_proportional_rope_parameters)
+
+    config = Config()
+    _configure_official_gemma4_rope_compatibility()
+    installed_default = Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters
+    installed_proportional = ROPE_INIT_FUNCTIONS["proportional"]
+    device = torch.device("cpu")
+    inv_freq, attention_scaling = installed_default(
+        cast("Gemma4UnifiedTextConfig", config),
+        device=device,
+        layer_type="sliding_attention",
+        sentinel=True,
+    )
+
+    assert inv_freq.numel() == 0
+    assert attention_scaling == 1.0
+    assert observed_default == [
+        (config.per_layer_config["sliding_attention"], device, "sliding_attention", {"sentinel": True})
+    ]
+
+    inv_freq, attention_scaling = installed_proportional(
+        cast("Gemma4UnifiedTextConfig", config),
+        device=device,
+        seq_len=1024,
+        layer_type="full_attention",
+        head_dim_key="global_head_dim",
+        sentinel=True,
+    )
+    assert inv_freq.numel() == 0
+    assert attention_scaling == 2.0
+    assert observed_proportional == [
+        (config.per_layer_config["full_attention"], device, 1024, "full_attention", "head_dim", {"sentinel": True})
+    ]
+
+    _configure_official_gemma4_rope_compatibility()
+    assert Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters is installed_default
+    assert ROPE_INIT_FUNCTIONS["proportional"] is installed_proportional
+
+
+@pytest.mark.parametrize(
+    ("hip_version", "expected_deterministic"),
+    [(None, True), ("6.3.0", False)],
+    ids=["cuda", "rocm"],
+)
+def test_ltx_reference_runner_uses_platform_vocoder_determinism(
+    monkeypatch: pytest.MonkeyPatch,
+    hip_version: str | None,
+    expected_deterministic: bool,
+) -> None:
+    from .run_ltx25_reference import _official_vocoder_deterministic_cudnn
+
+    monkeypatch.setattr(torch.version, "hip", hip_version)
+    previous = not expected_deterministic
+    with torch.backends.cudnn.flags(deterministic=previous):
+        with _official_vocoder_deterministic_cudnn("cuda"):
+            assert torch.backends.cudnn.deterministic is expected_deterministic
+        assert torch.backends.cudnn.deterministic is previous
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx_reference_runner_preserves_full_attention_rope_width() -> None:
+    from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
+    from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedTextRotaryEmbedding
+
+    from .run_ltx25_reference import _official_proportional_rope_parameters
+
+    config = Gemma4UnifiedTextConfig(
+        hidden_size=3840,
+        num_attention_heads=16,
+        num_hidden_layers=2,
+        layer_types=["sliding_attention", "full_attention"],
+        global_head_dim=512,
+    )
+    rotary = Gemma4UnifiedTextRotaryEmbedding(config)
+    inv_freq, scaling = _official_proportional_rope_parameters(
+        config, layer_type="full_attention", head_dim_key="global_head_dim"
+    )
+
+    assert inv_freq.shape == (256,)
+    torch.testing.assert_close(inv_freq, rotary.full_attention_inv_freq)
+    assert scaling == rotary.full_attention_attention_scaling
+
+
+def test_connector_weight_index_is_authoritative(tmp_path: Path) -> None:
+    from .run_ltx25_reference import _connector_weight_files
+
+    connector_root = tmp_path / "connectors"
+    connector_root.mkdir()
+    single_file = connector_root / "diffusion_pytorch_model.safetensors"
+    shard_1 = connector_root / "diffusion_pytorch_model-00001-of-00002.safetensors"
+    shard_2 = connector_root / "diffusion_pytorch_model-00002-of-00002.safetensors"
+    for path in (single_file, shard_1, shard_2):
+        path.touch()
+    (connector_root / "diffusion_pytorch_model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "audio_connector.weight": shard_2.name,
+                    "video_connector.weight": shard_1.name,
+                }
+            }
+        )
+    )
+
+    assert _connector_weight_files(tmp_path) == [shard_1, shard_2]
+
+
 def _run(command: list[str], *, env: dict[str, str], timeout: int = 1800) -> None:
     start = time.perf_counter()
     subprocess.run(command, env=env, timeout=timeout, check=True)
     print(f"{' '.join(command[:3])} finished in {time.perf_counter() - start:.1f}s")
+
+
+def _ltx25_runner_env(official_revision: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
+    env["PYTHONUNBUFFERED"] = "1"
+    repository_root = Path(__file__).resolve().parents[4]
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(repository_root) if not existing_pythonpath else f"{repository_root}{os.pathsep}{existing_pythonpath}"
+    )
+    return env
+
+
+def _omni_runner_timeout_args() -> list[str]:
+    return [
+        "--stage-init-timeout",
+        str(LTX25_OMNI_STAGE_INIT_TIMEOUT_S),
+        "--init-timeout",
+        str(LTX25_OMNI_INIT_TIMEOUT_S),
+    ]
 
 
 def _clone_pinned_source(root: Path, repository: str, revision: str) -> None:
@@ -249,7 +480,12 @@ def _resolve_ltx25_official_artifacts(
         variant_files = LTX25_OFFICIAL_VARIANT_FILES[checkpoint_variant]
     except KeyError as exc:
         raise ValueError(f"Unsupported official LTX-2.5 checkpoint variant: {checkpoint_variant!r}") from exc
-    files = {**LTX25_OFFICIAL_COMMON_FILES, **variant_files}
+    common_files = {
+        name: path
+        for name, path in LTX25_OFFICIAL_COMMON_FILES.items()
+        if not (checkpoint_variant in LTX25_OFFICIAL_AUDIO_ONLY_VARIANTS and name == "video_vae")
+    }
+    files = {**common_files, **variant_files}
     configured_model = os.environ.get("VLLM_TEST_LTX25_OFFICIAL_MODEL")
     configured_revision = os.environ.get("VLLM_TEST_LTX25_OFFICIAL_MODEL_REVISION")
     if configured_model and Path(configured_model).exists():
@@ -301,32 +537,6 @@ def _resolve_ltx25_image() -> Path:
             revision=LTX25_I2V_IMAGE_REVISION,
         )
     )
-
-
-def _require_ltx25_model_access() -> None:
-    configured_omni_model = os.environ.get("VLLM_TEST_LTX25_MODEL")
-    if not (configured_omni_model and Path(configured_omni_model).exists()):
-        omni_model = configured_omni_model or LTX25_OMNI_MODEL_ID
-        omni_revision = os.environ.get("VLLM_TEST_LTX25_MODEL_REVISION")
-        if omni_revision is None and omni_model == LTX25_OMNI_MODEL_ID:
-            omni_revision = LTX25_OMNI_MODEL_REVISION
-        skip_if_gated_repo_inaccessible(
-            omni_model,
-            revision=omni_revision,
-            filename="model_index.json",
-        )
-
-    configured_official_model = os.environ.get("VLLM_TEST_LTX25_OFFICIAL_MODEL")
-    if not (configured_official_model and Path(configured_official_model).exists()):
-        official_model = configured_official_model or LTX25_OFFICIAL_MODEL_ID
-        official_revision = os.environ.get("VLLM_TEST_LTX25_OFFICIAL_MODEL_REVISION")
-        if official_revision is None and official_model == LTX25_OFFICIAL_MODEL_ID:
-            official_revision = LTX25_OFFICIAL_MODEL_REVISION
-        skip_if_gated_repo_inaccessible(
-            official_model,
-            revision=official_revision,
-            filename=LTX25_OFFICIAL_COMMON_FILES["text_encoder"],
-        )
 
 
 def _ltx25_request(image: Path | None = None) -> dict[str, object]:
@@ -396,6 +606,51 @@ def _ltx25_full_request(image: Path | None = None) -> dict[str, object]:
     return request
 
 
+def _ltx25_t2a_request() -> dict[str, object]:
+    num_inference_steps = 30
+    return {
+        "prompt": LTX25_T2A_PROMPT,
+        "negative_prompt": NEGATIVE_PROMPT,
+        # 121 frames at 24 fps is about 5 s of audio on the causal 8k+1 grid.
+        "num_frames": 121,
+        "fps": 24,
+        "num_inference_steps": num_inference_steps,
+        "seed": 42,
+        "audio_cfg_scale": 7.0,
+        "audio_stg_scale": 1.0,
+        "audio_rescale_scale": 0.7,
+        "audio_stg_blocks": [28],
+        # Official T2A uses the default-token LTX2Scheduler schedule.
+        "sigmas": _ltx25_full_sigmas(num_inference_steps),
+    }
+
+
+def test_ltx25_t2a_request_is_audio_only() -> None:
+    request = _ltx25_t2a_request()
+    num_frames = request["num_frames"]
+    assert isinstance(num_frames, int)
+
+    assert not any(key.startswith("video_") for key in request)
+    assert "audio_modality_scale" not in request
+    assert (num_frames - 1) % 8 == 0
+    assert request["sigmas"] == _ltx25_full_request()["sigmas"]
+
+
+def test_ltx25_t2a_official_artifacts_skip_video_vae(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for relative_path in (
+        LTX25_OFFICIAL_COMMON_FILES["text_encoder"],
+        LTX25_OFFICIAL_COMMON_FILES["audio_vae"],
+        LTX25_OFFICIAL_VARIANT_FILES["t2a"]["transformer"],
+    ):
+        (tmp_path / relative_path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative_path).touch()
+    monkeypatch.setenv("VLLM_TEST_LTX25_OFFICIAL_MODEL", str(tmp_path))
+
+    artifacts, _, _ = _resolve_ltx25_official_artifacts(checkpoint_variant="t2a")
+
+    assert set(artifacts) == {"text_encoder", "audio_vae", "transformer"}
+
+
 def test_ltx25_full_request_pins_official_schedule() -> None:
     request = _ltx25_full_request()
     sigmas = request["sigmas"]
@@ -441,6 +696,51 @@ def _canonical_audio(audio: np.ndarray) -> np.ndarray:
     return audio.astype(np.float64)
 
 
+def _audio_spectral_cosine(reference: np.ndarray, prediction: np.ndarray) -> float:
+    """Compare time-averaged multi-resolution magnitude spectra."""
+    reference_tensor = torch.from_numpy(reference.astype(np.float32, copy=False))
+    prediction_tensor = torch.from_numpy(prediction.astype(np.float32, copy=False))
+    similarities: list[float] = []
+    fft_sizes = [n_fft for n_fft in (512, 1024, 2048) if n_fft <= reference_tensor.shape[-1]]
+    if not fft_sizes:
+        raise ValueError(f"Audio is too short for spectral comparison: shape={reference.shape}")
+    for n_fft in fft_sizes:
+        window = torch.hann_window(n_fft)
+        reference_magnitude = (
+            torch.stft(
+                reference_tensor,
+                n_fft=n_fft,
+                hop_length=n_fft // 4,
+                window=window,
+                return_complex=True,
+            )
+            .abs()
+            .mean(dim=-1)
+        )
+        prediction_magnitude = (
+            torch.stft(
+                prediction_tensor,
+                n_fft=n_fft,
+                hop_length=n_fft // 4,
+                window=window,
+                return_complex=True,
+            )
+            .abs()
+            .mean(dim=-1)
+        )
+        similarities.append(
+            float(
+                torch.nn.functional.cosine_similarity(
+                    reference_magnitude.flatten(),
+                    prediction_magnitude.flatten(),
+                    dim=0,
+                    eps=1e-12,
+                )
+            )
+        )
+    return float(np.mean(similarities))
+
+
 def _audio_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, float | bool]:
     reference = _canonical_audio(reference)
     prediction = _canonical_audio(prediction)
@@ -448,13 +748,179 @@ def _audio_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, f
     difference = reference - prediction
     reference_norm = max(float(np.linalg.norm(reference)), 1e-12)
     prediction_norm = max(float(np.linalg.norm(prediction)), 1e-12)
+    reference_rms = float(np.sqrt(np.mean(np.square(reference))))
+    prediction_rms = float(np.sqrt(np.mean(np.square(prediction))))
     return {
         "bitwise_equal": bool(np.array_equal(reference, prediction)),
+        "reference_rms": reference_rms,
+        "prediction_rms": prediction_rms,
+        "rms_ratio": prediction_rms / max(reference_rms, 1e-12),
+        "spectral_cosine_similarity": _audio_spectral_cosine(reference, prediction),
         "max_abs": float(np.abs(difference).max()),
         "mean_abs": float(np.abs(difference).mean()),
         "relative_l2": float(np.linalg.norm(difference) / reference_norm),
         "cosine_similarity": float(np.vdot(reference.ravel(), prediction.ravel()) / (reference_norm * prediction_norm)),
     }
+
+
+def _assert_strict_audio_similarity(audio_metrics: dict[str, float | bool]) -> None:
+    if audio_metrics["reference_rms"] <= STRICT_THRESHOLDS.audio_quiet_reference_rms:
+        assert audio_metrics["max_abs"] <= STRICT_THRESHOLDS.audio_quiet_max_abs
+        assert audio_metrics["mean_abs"] <= STRICT_THRESHOLDS.audio_quiet_mean_abs
+        return
+    if torch.version.hip is not None:
+        assert audio_metrics["spectral_cosine_similarity"] >= STRICT_THRESHOLDS.audio_spectral_cosine_rocm
+        assert STRICT_THRESHOLDS.audio_rms_ratio_min_rocm <= audio_metrics["rms_ratio"]
+        assert audio_metrics["rms_ratio"] <= STRICT_THRESHOLDS.audio_rms_ratio_max_rocm
+        return
+    assert audio_metrics["relative_l2"] <= STRICT_THRESHOLDS.audio_relative_l2
+    assert audio_metrics["cosine_similarity"] >= STRICT_THRESHOLDS.audio_cosine_similarity
+
+
+def test_strict_audio_similarity_uses_absolute_bounds_for_quiet_reference() -> None:
+    reference = np.zeros(1024, dtype=np.float32)
+    prediction = np.full(1024, STRICT_THRESHOLDS.audio_quiet_mean_abs / 2, dtype=np.float32)
+
+    metrics = _audio_metrics(reference, prediction)
+
+    assert metrics["relative_l2"] > STRICT_THRESHOLDS.audio_relative_l2
+    _assert_strict_audio_similarity(metrics)
+
+
+def test_strict_audio_similarity_rejects_noisy_quiet_prediction() -> None:
+    reference = np.zeros(1024, dtype=np.float32)
+    prediction = np.full(1024, STRICT_THRESHOLDS.audio_quiet_mean_abs * 2, dtype=np.float32)
+
+    with pytest.raises(AssertionError):
+        _assert_strict_audio_similarity(_audio_metrics(reference, prediction))
+
+
+def test_audio_spectral_cosine_ignores_phase_but_rejects_frequency_drift() -> None:
+    sample_rate = 8192
+    time_axis = np.arange(sample_rate, dtype=np.float32) / sample_rate
+    reference = np.sin(2 * np.pi * 440 * time_axis)
+    phase_shifted = np.sin(2 * np.pi * 440 * time_axis + np.pi / 2)
+    different_frequency = np.sin(2 * np.pi * 1200 * time_axis)
+
+    phase_metrics = _audio_metrics(reference, phase_shifted)
+    different_metrics = _audio_metrics(reference, different_frequency)
+
+    assert phase_metrics["cosine_similarity"] == pytest.approx(0.0, abs=1e-5)
+    assert phase_metrics["spectral_cosine_similarity"] >= STRICT_THRESHOLDS.audio_spectral_cosine_rocm
+    assert phase_metrics["rms_ratio"] == pytest.approx(1.0, abs=1e-5)
+    assert different_metrics["spectral_cosine_similarity"] < STRICT_THRESHOLDS.audio_spectral_cosine_rocm
+
+
+def test_rocm_audio_similarity_accepts_bounded_vocoder_variance(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Raw waveform values reproduce the widest observed full one-stage I2V
+    # variance in AMD weekly #17420. The phase-tolerant metrics are the ROCm
+    # gate; sample-wise values remain diagnostics and the strict CUDA gate.
+    audio_metrics: dict[str, float | bool] = {
+        "bitwise_equal": False,
+        "reference_rms": 0.20219951499039546,
+        "prediction_rms": 0.2031686440965695,
+        "rms_ratio": 0.2031686440965695 / 0.20219951499039546,
+        "spectral_cosine_similarity": 0.998,
+        "max_abs": 0.27880859375,
+        "mean_abs": 0.026644913640285137,
+        "relative_l2": 0.20617456549379734,
+        "cosine_similarity": 0.9788588385937623,
+    }
+
+    monkeypatch.setattr(torch.version, "hip", "6.3")
+    _assert_strict_audio_similarity(audio_metrics)
+
+    monkeypatch.setattr(torch.version, "hip", None)
+    with pytest.raises(AssertionError):
+        _assert_strict_audio_similarity(audio_metrics)
+
+
+@pytest.mark.parametrize(
+    ("spectral_cosine", "rms_ratio"),
+    [(0.99, 1.0), (1.0, 0.95), (1.0, 1.05)],
+)
+def test_rocm_audio_similarity_rejects_spectral_or_energy_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    spectral_cosine: float,
+    rms_ratio: float,
+) -> None:
+    monkeypatch.setattr(torch.version, "hip", "6.3")
+    audio_metrics: dict[str, float | bool] = {
+        "bitwise_equal": False,
+        "reference_rms": 0.2,
+        "prediction_rms": 0.2 * rms_ratio,
+        "rms_ratio": rms_ratio,
+        "spectral_cosine_similarity": spectral_cosine,
+        "max_abs": 0.1,
+        "mean_abs": 0.01,
+        "relative_l2": 0.01,
+        "cosine_similarity": 0.999,
+    }
+
+    with pytest.raises(AssertionError):
+        _assert_strict_audio_similarity(audio_metrics)
+
+
+def _write_ltx25_accuracy_result(
+    *,
+    model_id: str,
+    video_metrics: dict[str, float] | None,
+    audio_metrics: dict[str, float | bool],
+    metrics_json: Path,
+    extra: dict[str, object] | None = None,
+) -> None:
+    metrics: dict[str, object] = {
+        "audio_reference_rms": audio_metrics["reference_rms"],
+        "audio_prediction_rms": audio_metrics["prediction_rms"],
+        "audio_rms_ratio": audio_metrics["rms_ratio"],
+        "audio_spectral_cosine_similarity": audio_metrics["spectral_cosine_similarity"],
+        "audio_max_abs": audio_metrics["max_abs"],
+        "audio_mean_abs": audio_metrics["mean_abs"],
+        "audio_relative_l2": audio_metrics["relative_l2"],
+        "audio_cosine_similarity": audio_metrics["cosine_similarity"],
+    }
+    baseline: dict[str, float] = {
+        "audio_quiet_reference_rms": STRICT_THRESHOLDS.audio_quiet_reference_rms,
+        "audio_quiet_max_abs": STRICT_THRESHOLDS.audio_quiet_max_abs,
+        "audio_quiet_mean_abs": STRICT_THRESHOLDS.audio_quiet_mean_abs,
+    }
+    if torch.version.hip is not None:
+        baseline.update(
+            {
+                "audio_spectral_cosine_similarity": STRICT_THRESHOLDS.audio_spectral_cosine_rocm,
+                "audio_rms_ratio_min": STRICT_THRESHOLDS.audio_rms_ratio_min_rocm,
+                "audio_rms_ratio_max": STRICT_THRESHOLDS.audio_rms_ratio_max_rocm,
+            }
+        )
+    else:
+        baseline.update(
+            {
+                "audio_relative_l2": STRICT_THRESHOLDS.audio_relative_l2,
+                "audio_cosine_similarity": STRICT_THRESHOLDS.audio_cosine_similarity,
+            }
+        )
+    if video_metrics is not None:
+        metrics.update(
+            {
+                "video_ssim_mean": video_metrics["ssim_mean"],
+                "video_ssim_min": video_metrics["ssim_min"],
+                "video_psnr_mean_db": video_metrics["psnr_mean_db"],
+            }
+        )
+        baseline.update(
+            {
+                "video_ssim_mean": STRICT_THRESHOLDS.video_ssim_mean,
+                "video_ssim_min": STRICT_THRESHOLDS.video_ssim_min,
+                "video_psnr_mean_db": STRICT_THRESHOLDS.video_psnr_mean_db,
+            }
+        )
+    write_accuracy_result(
+        model_id=model_id,
+        dataset="video_audio_similarity",
+        metrics=metrics,
+        baseline=baseline,
+        extra={"metrics_json": str(metrics_json), **(extra or {})},
+    )
 
 
 def _assert_strict_similarity(
@@ -464,18 +930,16 @@ def _assert_strict_similarity(
     assert video_metrics["ssim_mean"] >= STRICT_THRESHOLDS.video_ssim_mean
     assert video_metrics["ssim_min"] >= STRICT_THRESHOLDS.video_ssim_min
     assert video_metrics["psnr_mean_db"] >= STRICT_THRESHOLDS.video_psnr_mean_db
-    assert audio_metrics["relative_l2"] <= STRICT_THRESHOLDS.audio_relative_l2
-    assert audio_metrics["cosine_similarity"] >= STRICT_THRESHOLDS.audio_cosine_similarity
+    _assert_strict_audio_similarity(audio_metrics)
 
 
 @pytest.mark.slow
 @pytest.mark.benchmark
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("task", ["t2v", "i2v"])
 def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path, task: str) -> None:
     """Compare Omni with official canonical DiffVAE and matching connector weights."""
-    _require_ltx25_model_access()
     artifact_parent = accuracy_artifact_root / "ltx_official"
     output_root = reset_artifact_dir(artifact_parent / f"ltx2_5_distilled_{task}")
     official_root, official_revision = _ltx25_official_source(artifact_parent)
@@ -492,14 +956,7 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
         str(request_path),
         "--enable-layerwise-offload",
     ]
-    env = os.environ.copy()
-    env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
-    env["PYTHONUNBUFFERED"] = "1"
-    repository_root = Path(__file__).resolve().parents[4]
-    existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        str(repository_root) if not existing_pythonpath else f"{repository_root}{os.pathsep}{existing_pythonpath}"
-    )
+    env = _ltx25_runner_env(official_revision)
 
     official_output = output_root / "official"
     _run(
@@ -541,8 +998,10 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
             str(omni_model),
             "--model-class-name",
             "LTX2DistilledTwoStagePipeline",
-        ],
+        ]
+        + _omni_runner_timeout_args(),
         env=env,
+        timeout=LTX25_OMNI_PROCESS_TIMEOUT_S,
     )
 
     official_metadata = json.loads((official_output / "metadata.json").read_text())
@@ -587,6 +1046,13 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
         "audio": audio_metrics,
     }
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
+    _write_ltx25_accuracy_result(
+        model_id=f"ltx25_distilled_{task}",
+        video_metrics=video_metrics,
+        audio_metrics=audio_metrics,
+        metrics_json=output_root / "metrics.json",
+        extra={"task": task, "pipeline_mode": "distilled_two_stage"},
+    )
     print(json.dumps(result, indent=2))
 
     _assert_strict_similarity(video_metrics, audio_metrics)
@@ -595,12 +1061,11 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
 @pytest.mark.slow
 @pytest.mark.benchmark
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("task", ["t2v", "i2v"])
 @pytest.mark.parametrize("pipeline_mode", ["full_one_stage", "full_two_stage"])
 def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pipeline_mode: str) -> None:
     """Compare raw official Full/SFT and DiffVAE weights with Omni."""
-    _require_ltx25_model_access()
     artifact_parent = accuracy_artifact_root / "ltx_official"
     output_root = reset_artifact_dir(artifact_parent / f"ltx2_5_{pipeline_mode}_{task}")
     model_class_name = {
@@ -629,14 +1094,7 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
         str(request_path),
         "--enable-layerwise-offload",
     ]
-    env = os.environ.copy()
-    env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
-    env["PYTHONUNBUFFERED"] = "1"
-    repository_root = Path(__file__).resolve().parents[4]
-    existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        str(repository_root) if not existing_pythonpath else f"{repository_root}{os.pathsep}{existing_pythonpath}"
-    )
+    env = _ltx25_runner_env(official_revision)
 
     official_output = output_root / "official"
     official_sidecar_args: list[str] = []
@@ -688,8 +1146,10 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
             str(omni_model),
             "--model-class-name",
             model_class_name,
-        ],
+        ]
+        + _omni_runner_timeout_args(),
         env=env,
+        timeout=LTX25_OMNI_PROCESS_TIMEOUT_S,
     )
 
     official_metadata = json.loads((official_output / "metadata.json").read_text())
@@ -743,6 +1203,129 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
         "audio": audio_metrics,
     }
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
+    _write_ltx25_accuracy_result(
+        model_id=f"ltx25_{pipeline_mode}_{task}",
+        video_metrics=video_metrics,
+        audio_metrics=audio_metrics,
+        metrics_json=output_root / "metrics.json",
+        extra={"task": task, "pipeline_mode": pipeline_mode},
+    )
     print(json.dumps(result, indent=2))
 
     _assert_strict_similarity(video_metrics, audio_metrics)
+
+
+@pytest.mark.slow
+@pytest.mark.benchmark
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
+def test_ltx25_t2a_matches_official(accuracy_artifact_root: Path) -> None:
+    """Compare Omni's audio-only runtime with the official T2A pipeline."""
+    artifact_parent = accuracy_artifact_root / "ltx_official"
+    output_root = reset_artifact_dir(artifact_parent / "ltx2_5_t2a_one_stage")
+    official_root, official_revision = _ltx25_official_source(artifact_parent)
+    official_artifacts, official_model_source, official_model_revision = _resolve_ltx25_official_artifacts(
+        checkpoint_variant="t2a"
+    )
+    omni_model, omni_model_source, omni_model_revision = _resolve_ltx25_omni_model(
+        transformer_subfolder="transformer_full"
+    )
+    request_path = output_root / "request.json"
+    request_path.write_text(json.dumps(_ltx25_t2a_request(), indent=2) + "\n")
+
+    # The audio-only transformer and Gemma fit on one H100 without offload.
+    runner = Path(__file__).with_name("run_ltx25_reference.py")
+    runner_args = [str(runner), "--request", str(request_path)]
+    env = _ltx25_runner_env(official_revision)
+
+    official_output = output_root / "official"
+    _run(
+        _official_runner_prefix()
+        + runner_args
+        + [
+            "--backend",
+            "official",
+            "--output-dir",
+            str(official_output),
+            "--official-root",
+            str(official_root),
+            "--official-pipeline",
+            "t2a_one_stage",
+            "--transformer-path",
+            str(official_artifacts["transformer"]),
+            "--text-encoder-path",
+            str(official_artifacts["text_encoder"]),
+            "--audio-vae-path",
+            str(official_artifacts["audio_vae"]),
+            "--connector-model",
+            str(omni_model),
+        ],
+        env=env,
+    )
+
+    omni_output = output_root / "omni"
+    _run(
+        [sys.executable]
+        + runner_args
+        + [
+            "--backend",
+            "omni",
+            "--output-dir",
+            str(omni_output),
+            "--model",
+            str(omni_model),
+            "--model-class-name",
+            "LTX2TextToAudioPipeline",
+        ]
+        + _omni_runner_timeout_args(),
+        env=env,
+        timeout=LTX25_OMNI_PROCESS_TIMEOUT_S,
+    )
+
+    official_metadata = json.loads((official_output / "metadata.json").read_text())
+    omni_metadata = json.loads((omni_output / "metadata.json").read_text())
+    assert official_metadata["official_revision"] == official_revision
+    assert official_metadata["pipeline"] == "T2AOneStagePipeline"
+    assert official_metadata["attention_backend"] == ATTENTION_BACKEND
+    assert official_metadata["connector_model"] == str(omni_model)
+    assert omni_metadata["model_class_name"] == "LTX2TextToAudioPipeline"
+    assert omni_metadata["attention_backend"] == ATTENTION_BACKEND
+    for key in ("seed", "num_frames", "sigmas", "audio_sample_rate"):
+        assert official_metadata[key] == omni_metadata[key], key
+    audio_metrics = _audio_metrics(
+        np.load(official_output / "audio.npy"),
+        np.load(omni_output / "audio.npy"),
+    )
+    result = {
+        "case": "ltx2_5_t2a_one_stage",
+        "task": "t2a",
+        "attention_backend": ATTENTION_BACKEND,
+        "official_revision": official_revision,
+        "official_model": official_model_source,
+        "official_model_revision": official_model_revision,
+        "official_connector_model": omni_model_source,
+        "official_connector_revision": omni_model_revision,
+        "omni_model": omni_model_source,
+        "omni_model_revision": omni_model_revision,
+        "resolved_omni_model_path": str(omni_model),
+        "thresholds": asdict(STRICT_THRESHOLDS),
+        "peak_memory_mb": {
+            "official_allocated": official_metadata["peak_memory_allocated_mb"],
+            "official_reserved": official_metadata["peak_memory_reserved_mb"],
+            "omni_worker_reported": omni_metadata["worker_peak_memory_mb"],
+            "omni_parent_allocated": omni_metadata["peak_memory_allocated_mb"],
+            "omni_parent_reserved": omni_metadata["peak_memory_reserved_mb"],
+        },
+        "audio": audio_metrics,
+    }
+    (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
+    _write_ltx25_accuracy_result(
+        model_id="ltx25_t2a",
+        video_metrics=None,
+        audio_metrics=audio_metrics,
+        metrics_json=output_root / "metrics.json",
+        extra={"task": "t2a"},
+    )
+    print(json.dumps(result, indent=2))
+
+    _assert_strict_audio_similarity(audio_metrics)

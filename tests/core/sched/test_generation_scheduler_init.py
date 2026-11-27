@@ -1,0 +1,224 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Exercise generation constructor policy after actual deploy/platform resolution."""
+
+from types import SimpleNamespace
+
+import pytest
+
+from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.config.pipeline_registry import resolve_pipeline_config
+from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler, VLLMScheduler
+from vllm_omni.platforms import current_omni_platform
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture
+def construct_scheduler(monkeypatch, mocker):
+    # Only upstream cache allocation and connector construction are omitted.
+    # Keep the actual Omni I/O initialization, native decision and constructor.
+    mocker.patch("vllm_omni.core.sched.omni_scheduler_mixin.OmniChunkTransferAdapter")
+
+    def upstream_init(self, config):
+        self.vllm_config = config
+        self.max_num_running_reqs = config.scheduler_config.max_num_seqs
+
+    monkeypatch.setattr(VLLMScheduler, "__init__", upstream_init)
+    return OmniGenerationScheduler
+
+
+def _config(*, native=True, stateful=True, tp=1, pp=1, extras=None, capacity=128):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            use_v2_model_runner=True,
+            supports_native_mrv2_data_plane=native,
+            retains_state_across_chunks=stateful,
+            async_chunk=True,
+            stage_id=1,
+            stage_connector_config={"extra": extras or {}},
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp, pipeline_parallel_size=pp),
+        scheduler_config=SimpleNamespace(max_num_seqs=capacity),
+        speculative_config=None,
+    )
+
+
+def test_legacy_custom_readiness_enables_batch_waiting(construct_scheduler):
+    class OrchestratorScheduler(OmniGenerationScheduler):
+        def _get_coalescing_ready_request_ids(self, connector_outputs=()):
+            return set()
+
+    config = _config(native=False, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 12})
+    config.model_config.async_chunk = False
+    scheduler = OrchestratorScheduler(config)
+    assert scheduler.chunk_transfer_adapter is None
+    assert scheduler._generation_min_batch_size == 4
+    assert scheduler._generation_max_wait_s == 0.012
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("connector_override", [False, True])
+def test_stage_additional_config_enables_generation_coalescing(construct_scheduler, native, connector_override):
+    extras = {"generation_min_batch_size": 8} if connector_override else {}
+    config = _config(native=native, extras=extras)
+    config.additional_config = {
+        "generation_min_batch_size": 4,
+        "generation_max_wait_ms": 12,
+        "generation_always_wait_target_batch": True,
+    }
+    scheduler = construct_scheduler(config)
+    assert scheduler._generation_min_batch_size == (8 if connector_override else 4)
+    assert scheduler._generation_max_wait_s == 0.012
+    assert scheduler._generation_always_wait_target_batch is True
+    assert config.additional_config["generation_min_batch_size"] == 4
+    assert config.model_config.stage_connector_config == {"extra": extras}
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_legacy_stage_zero_enables_batch_waiting_without_override(construct_scheduler, mocker, async_chunk):
+    adapter = mocker.patch("vllm_omni.core.sched.omni_scheduler_mixin.OmniChunkTransferAdapter")
+    adapter.return_value.receives_chunks = False
+    config = _config(native=False, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 12})
+    config.model_config.stage_id = 0
+    config.model_config.async_chunk = async_chunk
+    scheduler = construct_scheduler(config)
+    assert scheduler._generation_min_batch_size == 4
+    assert scheduler._generation_max_wait_s == 0.012
+
+
+@pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
+def test_moss_profile_generation_constructor_after_platform_resolution(
+    construct_scheduler, monkeypatch, mocker, platform
+):
+    # merge_pipeline_deploy owns platform resolution. Mock the detected device
+    # instead of applying an override first and then resolving the worker's
+    # actual platform a second time.
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
+    deploy = load_deploy_config(get_deploy_config_path("moss_tts_local.yaml"))
+    pipeline = resolve_pipeline_config("moss_tts_local")
+    if platform != "cuda":
+        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+            merge_pipeline_deploy(pipeline, deploy)
+        return
+    codec = merge_pipeline_deploy(pipeline, deploy)[1]
+    extras = deploy.connectors["shm"]["extra"]
+    config = _config(
+        native=codec.yaml_engine_args["use_v2_model_runner"],
+        stateful=pipeline.stages[1].retains_state_across_chunks,
+        capacity=codec.yaml_engine_args["max_num_seqs"],
+        extras=extras,
+    )
+    warning = mocker.patch("vllm_omni.core.sched.omni_generation_scheduler.logger.warning")
+    scheduler = construct_scheduler(config)
+    # The raw extras persist through fallback; the live constructor must cope.
+    assert extras["generation_min_batch_size"] == 16
+    assert extras["generation_max_wait_ms"] == 6
+    assert scheduler._native_data_plane is (platform == "cuda")
+    assert scheduler._generation_min_batch_size == 16
+    assert scheduler._generation_max_wait_s == 0.006
+    assert scheduler._generation_max_regular_batch == 0
+    warning.assert_not_called()
+
+
+@pytest.mark.parametrize("stateful,tp,pp", [(False, 1, 1), (True, 2, 1), (True, 1, 2)])
+def test_native_batch_waiting_still_rejects_unsupported_state_or_topology(construct_scheduler, stateful, tp, pp):
+    config = _config(
+        stateful=stateful, tp=tp, pp=pp, extras={"generation_min_batch_size": 32, "generation_max_wait_ms": 12}
+    )
+    with pytest.raises(ValueError, match="stateful|TP1/PP1"):
+        construct_scheduler(config)
+
+
+@pytest.mark.parametrize("policy", ["fixed", "idle_wait"])
+def test_personaplex_native_decoder_enables_batch_waiting(construct_scheduler, monkeypatch, policy):
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+    pipeline = resolve_pipeline_config("personaplex")
+    deploy = load_deploy_config(get_deploy_config_path("personaplex_duplex_mrv2.yaml"))
+    codec = merge_pipeline_deploy(pipeline, deploy)[1]
+    config = _config(
+        native=codec.yaml_engine_args["use_v2_model_runner"],
+        stateful=codec.yaml_engine_args["retains_state_across_chunks"],
+        capacity=codec.yaml_engine_args["max_num_seqs"],
+    )
+    config.additional_config = {
+        "generation_min_batch_size": 4,
+        "generation_max_wait_ms": 10,
+        "generation_coalescing_policy": policy,
+    }
+
+    scheduler = construct_scheduler(config)
+
+    assert scheduler._native_data_plane
+    assert scheduler._retains_state_across_chunks
+    assert scheduler._generation_min_batch_size == 4
+    assert scheduler._generation_max_wait_s == 0.01
+    assert scheduler._generation_coalescing_policy == policy
+
+
+@pytest.mark.parametrize(
+    "extras,message",
+    [
+        ({"generation_min_batch_size": 0}, "generation_min_batch_size"),
+        ({"generation_min_batch_size": 129}, "generation_min_batch_size"),
+        ({"generation_max_wait_ms": -1}, "generation_max_wait_ms"),
+        ({"generation_max_wait_ms": float("nan")}, "generation_max_wait_ms"),
+        ({"generation_max_regular_batch": -1}, "generation_max_regular_batch"),
+        ({"generation_coalescing_policy": "unknown"}, "generation_coalescing_policy"),
+    ],
+)
+def test_non_native_fallback_still_rejects_invalid_values(construct_scheduler, extras, message):
+    with pytest.raises(ValueError, match=message):
+        construct_scheduler(_config(native=False, extras=extras))
+
+
+@pytest.mark.parametrize("stateful", [False, True])
+def test_legacy_chunk_receiver_enables_batch_waiting(construct_scheduler, stateful):
+    config = _config(
+        native=False, stateful=stateful, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 10}
+    )
+    scheduler = construct_scheduler(config)
+    assert scheduler._generation_min_batch_size == 4
+    assert scheduler._generation_max_wait_s == 0.01
+
+
+def test_legacy_rejects_idle_inbox_waiting(construct_scheduler):
+    config = _config(
+        native=False,
+        extras={
+            "generation_min_batch_size": 4,
+            "generation_max_wait_ms": 10,
+            "generation_coalescing_policy": "idle_wait",
+        },
+    )
+    with pytest.raises(ValueError, match="only the fixed"):
+        construct_scheduler(config)
+
+
+def test_sender_only_adapter_keeps_batch_waiting_disabled(construct_scheduler, mocker):
+    adapter = mocker.patch("vllm_omni.core.sched.omni_scheduler_mixin.OmniChunkTransferAdapter")
+    adapter.return_value.receives_chunks = False
+    config = _config(native=False, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 10})
+    scheduler = construct_scheduler(config)
+    assert scheduler._generation_min_batch_size == 1
+    assert scheduler._generation_max_wait_s == 0
+
+
+@pytest.mark.parametrize("tp,pp", [(2, 1), (1, 2)])
+def test_legacy_batch_waiting_rejects_parallel_topologies(construct_scheduler, tp, pp):
+    config = _config(native=False, tp=tp, pp=pp, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 10})
+    with pytest.raises(ValueError, match="TP1/PP1"):
+        construct_scheduler(config)
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_batch_target_option_requires_a_boolean(construct_scheduler, value):
+    with pytest.raises(ValueError, match="generation_always_wait_target_batch must be a boolean"):
+        construct_scheduler(_config(native=False, extras={"generation_always_wait_target_batch": value}))
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_batch_target_option_reaches_each_runner(construct_scheduler, native):
+    scheduler = construct_scheduler(_config(native=native, extras={"generation_always_wait_target_batch": True}))
+    assert scheduler._generation_always_wait_target_batch is True

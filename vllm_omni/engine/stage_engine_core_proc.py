@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage Core Process for vLLM-Omni V1 architecture.
 
@@ -8,12 +11,15 @@ busy loop in a subprocess, communicating with StageEngineCoreClient via ZMQ.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import signal
 from typing import Any
 
+import msgspec
 import vllm.v1.engine.core as _vllm_engine_core_module
-from vllm.logger import init_logger
+from vllm.config import VllmConfig
+from vllm.logger import configure_logging, init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
 )
@@ -21,24 +27,34 @@ from vllm.utils.system_utils import (
     decorate_logs,
     set_process_title,
 )
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
 from vllm.v1.engine.utils import (
     EngineZmqAddresses,
     SignalCallback,
 )
+from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
-from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
+from vllm_omni.engine.messages import TextInputUpdate
 from vllm_omni.engine.stage_init_utils import (
     maybe_apply_cfg_scheduler_patches,
     set_death_signal,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
 
 _SIGNAL_EXIT_BASE = 128
+
+
+def _has_input_stream(request: Any) -> bool:
+    payload = getattr(request, "additional_information", None)
+    entries = payload if isinstance(payload, dict) else getattr(payload, "entries", {})
+    native = getattr(request, "model_intermediate_buffer", None) or {}
+    return "input_stream" in native or any(key == "input_stream" or key.startswith("input_stream.") for key in entries)
 
 
 def _install_phase_locks(kwargs: dict[str, Any], local_dp_rank: int) -> None:
@@ -75,6 +91,80 @@ def _signal_exit_code(signum: int) -> int:
     return _SIGNAL_EXIT_BASE + signum
 
 
+def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: Any) -> bool:
+    """Bind in-process first audio to the generic engine output sink."""
+    from vllm_omni.worker_v2.first_audio_sender import engine_output_queue_sink, supports_in_process_first_audio
+
+    if not supports_in_process_first_audio(model_executor.vllm_config, type(model_executor)):
+        return False
+    worker = getattr(getattr(model_executor, "driver_worker", None), "worker", None)
+    model_runner = getattr(worker, "model_runner", None)
+    model_state = getattr(model_runner, "model_state", None)
+    model = getattr(model_runner, "model", None)
+    decodes_audio = getattr(model, "first_frame_decoder", None) is not None or (
+        getattr(model, "stream_decoder", None) is not None and bool(getattr(model, "stream_first_audio", False))
+    )
+    if decodes_audio and hasattr(model_state, "set_first_audio_sink"):
+        assert model_state is not None
+        model_state.set_first_audio_sink(engine_output_queue_sink(output_queue, scheduler))
+        return True
+    return False
+
+
+def _release_runner_session_window(worker: Any, session_id: str) -> None:
+    worker = getattr(worker, "worker", worker)
+    model = worker.model_runner.get_model()
+    release = getattr(model, "release_session_window", None)
+    if release is not None:
+        release(session_id)
+
+
+def _release_runner_shm_resources(worker: Any, request_ids: list[str]) -> int:
+    worker = getattr(worker, "worker", worker)
+    release = getattr(getattr(worker, "model_runner", None), "release_omni_shm_resources", None)
+    return 0 if release is None else release(request_ids)
+
+
+def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any, input_queue: Any = None) -> bool:
+    """Bind the TP1 in-process runner control plane directly to its scheduler."""
+    if not isinstance(model_executor, UniProcExecutor):
+        return False
+    parallel_config = model_executor.vllm_config.parallel_config
+    if parallel_config.tensor_parallel_size != 1 or parallel_config.pipeline_parallel_size != 1:
+        return False
+    driver_worker = getattr(model_executor, "driver_worker", None)
+    worker = getattr(driver_worker, "worker", None)
+    model_runner = getattr(worker, "model_runner", None)
+    data_plane = getattr(model_runner, "_omni_data_plane", None)
+    sink = getattr(scheduler, "enqueue_omni_connector_output", None)
+    if data_plane is None or not callable(sink):
+        return False
+
+    def sink_and_wake(output: Any) -> None:
+        sink(output)
+        # WAKEUP only unblocks the idle wait. has_requests() stays true while
+        # the inbox holds this failure, so the next step emits it.
+        if input_queue is not None:
+            try:
+                input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+            except Exception:
+                logger.debug("Failed to wake engine core for connector output", exc_info=True)
+
+    data_plane.set_omni_connector_output_sink(sink_and_wake)
+    return True
+
+
+def _extend_handshake_timeout(timeout_s: float) -> None:
+    """Let this engine core wait at least ``timeout_s`` for the front-end's init message.
+
+    ``EngineCoreProc.startup_handshake`` reads the module global at call time,
+    and a stage process hosts exactly one engine core.
+    """
+    minutes = math.ceil(timeout_s / 60)
+    if minutes > _vllm_engine_core_module.HANDSHAKE_TIMEOUT_MINS:
+        _vllm_engine_core_module.HANDSHAKE_TIMEOUT_MINS = minutes
+
+
 class StageEngineCoreProc(EngineCoreProc):
     """Stage-specific engine core process for vLLM-Omni.
 
@@ -83,11 +173,114 @@ class StageEngineCoreProc(EngineCoreProc):
     ``EngineCoreProc.run_engine_core()``.
     """
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        current_omni_platform.prepare_stage_engine()
+        super().__init__(*args, **kwargs)
+        config = self.vllm_config.model_config
+        model_cls, _ = config.registry.resolve_model_cls(config.architectures, config)
+        self._input_stream_factory = getattr(model_cls, "create_input_stream", None)
+        _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
+        if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler, self.input_queue):
+            logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
+
+    def add_request(self, request: Any, request_wave: int = 0) -> None:
+        """Validate native input before admitting the request to the scheduler."""
+        stream = None
+        if _has_input_stream(request):
+            factory = self._input_stream_factory
+            if factory is None:
+                self._send_input_stream_error(request, "This model does not support text input append")
+                return
+            try:
+                stream = factory(request, self.vllm_config)
+            except Exception as exc:
+                logger.exception("Rejecting request %s during input stream validation", request.request_id)
+                self._send_input_stream_error(request, str(exc))
+                return
+
+        super().add_request(request, request_wave)
+        if stream is not None and not request.is_finished():
+            self.scheduler.register_input_stream(request.request_id, stream)
+
+    def _send_input_stream_error(self, request: Any, reason: str) -> None:
+        self.output_queue.put_nowait(
+            (
+                request.client_index,
+                OmniEngineCoreOutputs(
+                    finished_requests={request.request_id},
+                    outputs=[
+                        OmniEngineCoreOutput(
+                            request_id=request.request_id,
+                            new_token_ids=[],
+                            finish_reason=FinishReason.ERROR,
+                            stop_reason=reason,
+                        )
+                    ],
+                ),
+            )
+        )
+
+    def _handle_client_request(self, request_type: EngineCoreRequestType, request: Any) -> None:
+        super()._handle_client_request(request_type, request)
+        if request_type == EngineCoreRequestType.ABORT:
+            # The eager abort queue can run before earlier ADDs are drained.
+            # Only this FIFO dispatch fences those appends and permits ID reuse.
+            release_overflowed = getattr(self.scheduler, "release_overflowed_requests", None)
+            if release_overflowed is not None:
+                release_overflowed(request)
+
+    def omni_release_session_window(self, session_id: str) -> None:
+        policy = getattr(self.scheduler, "_window_policy", None)
+        if policy is not None:
+            policy.release_session(session_id)
+            self.model_executor.collective_rpc(_release_runner_session_window, args=(session_id,))
+
+    def omni_append_text(self, update: TextInputUpdate | dict[str, object]) -> dict[str, object]:
+        """Accept an append on the engine loop, ordered with ADD and ABORT."""
+        try:
+            if not isinstance(update, TextInputUpdate):
+                update = msgspec.convert(update, type=TextInputUpdate)
+            self.scheduler.append_text(update)
+        except (ValueError, msgspec.ValidationError) as exc:
+            return {"error": str(exc)}
+        return {"accepted": True}
+
+    def omni_release_request_resources(self, request_ids: list[str]) -> None:
+        """Release this stage's inter-stage transfer resources for *request_ids*.
+
+        Invoked over the UTILITY channel by the orchestrator once every stage
+        has finished with the request. Idempotent and safe for unknown ids.
+        """
+        adapter = getattr(getattr(self, "scheduler", None), "chunk_transfer_adapter", None)
+        if adapter is None:
+            # The MRv2 native data plane sends from the runner, not the scheduler.
+            if request_ids and getattr(self.scheduler, "_native_data_plane", False):
+                try:
+                    self.model_executor.collective_rpc(_release_runner_shm_resources, args=(list(request_ids),))
+                except Exception as e:
+                    # A failed release leaks the requests' SHM segments.
+                    logger.warning("omni_release_request_resources(%s) failed: %s", request_ids, e)
+            return
+        for request_id in request_ids or ():
+            try:
+                adapter.release_shm_resources(request_id)
+            except Exception as e:
+                logger.debug("omni_release_request_resources(%s) failed: %s", request_id, e)
+
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
         scheduler_request, current_wave = super().preprocess_add_request(request)
         scheduler_request.additional_information = request.additional_information
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
+        scheduler_request.payload_sender_info = getattr(request, "payload_sender_info", None)
+        # Lift the client-side extra_args opt-in onto the typed field here:
+        # frontends that build a plain EngineCoreRequest (input processors,
+        # run-request ingestion) never see the omni wire field.
+        return_hidden_states = bool(getattr(request, "return_hidden_states", False))
+        if not return_hidden_states:
+            extra_args = getattr(getattr(request, "sampling_params", None), "extra_args", None)
+            return_hidden_states = bool(isinstance(extra_args, dict) and extra_args.get("return_hidden_states"))
+        scheduler_request.return_hidden_states = return_hidden_states
         return scheduler_request, current_wave
 
     @staticmethod
@@ -99,6 +292,7 @@ class StageEngineCoreProc(EngineCoreProc):
         omni_stage_id: int | None = None,
         omni_replica_id: int = 0,
         omni_parallel_stage_init: bool = False,
+        omni_handshake_timeout_s: float | None = None,
         **kwargs: Any,
     ) -> None:
         """Launch StageEngineCoreProc busy loop in background process.
@@ -115,8 +309,17 @@ class StageEngineCoreProc(EngineCoreProc):
           - ``omni_replica_id``: cluster-unique replica id within the
             stage (assigned by :class:`OmniMasterServer`). Used for
             logging / metrics only.
+          - ``omni_handshake_timeout_s``: how long to wait for the
+            front-end's init message. A launcher that spawns every stage
+            first and then completes their handshakes one by one answers a
+            later stage only after the earlier stages are ready, which can
+            exceed vLLM's fixed 5-minute wait.
         """
         signal_callback: SignalCallback | None = None
+        vllm_config: VllmConfig = kwargs["vllm_config"]
+        if logging_config := getattr(vllm_config, "logging_config", None):
+            configure_logging(logging_config)
+
         maybe_register_config_serialize_by_value()
 
         # Register vllm-omni reasoning parsers (e.g. step_audio) in this
@@ -152,6 +355,17 @@ class StageEngineCoreProc(EngineCoreProc):
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
             os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
 
+            vllm_config = kwargs.get("vllm_config")
+            model_config = getattr(vllm_config, "model_config", None)
+            connector = getattr(model_config, "stage_connector_config", None) or {}
+            if (
+                int(omni_replica_id) == 0
+                and getattr(model_config, "model_stage", None) == "code2wav"
+                and connector.get("extra", {}).get("minicpmo_code2wav_sync_primary", False)
+            ):
+                vllm_config.scheduler_config.async_scheduling = False
+                logger.info("MiniCPM-o primary Code2Wav uses synchronous EngineCore scheduling")
+
             # Patch the decoder type so process_input_sockets (started
             # during __init__) decodes OmniEngineCoreRequest (which
             # carries additional_information) instead of the base
@@ -163,6 +377,11 @@ class StageEngineCoreProc(EngineCoreProc):
                 "[StageEngineCoreProc] Patched EngineCoreRequest -> OmniEngineCoreRequest: %s",
                 _vllm_engine_core_module.EngineCoreRequest,
             )
+
+            # Multi-API launches answer pre-spawned stages in launch order, so
+            # this stage may wait for earlier ones before its handshake reply.
+            if omni_handshake_timeout_s is not None:
+                _extend_handshake_timeout(omni_handshake_timeout_s)
 
             # CFG pairing scheduler patches must land before EngineCore builds
             # its Scheduler; gated on the stage's logits_processors and its
@@ -233,12 +452,18 @@ class StageEngineCoreProc(EngineCoreProc):
                 engine_core._send_engine_dead()
             raise
         finally:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
-            if signal_callback is not None:
-                signal_callback.stop()
-            if coord_client is not None:
-                with contextlib.suppress(RuntimeError):
-                    coord_client.close()
-            if engine_core is not None:
-                engine_core.shutdown()
+            # Repeated termination signals must not interrupt owner cleanup.
+            # The process manager can still enforce its SIGKILL deadline.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                if signal_callback is not None:
+                    signal_callback.stop()
+                if coord_client is not None:
+                    with contextlib.suppress(RuntimeError):
+                        coord_client.close()
+                if engine_core is not None:
+                    engine_core.shutdown()
+            finally:
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                signal.signal(signal.SIGINT, signal.SIG_DFL)

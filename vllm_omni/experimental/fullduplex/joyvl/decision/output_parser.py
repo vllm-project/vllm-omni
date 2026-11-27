@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -40,10 +40,10 @@ def parse_action(raw: str) -> ParsedAction:
         return ParsedAction(Action.SILENCE, raw=raw)
 
     if marker == -1:
-        payload = _collapse(text.splitlines()[0])
+        payload = _collapse(text)
     else:
         after = text[marker + len(RESPONSE_TOKEN) :].strip()
-        payload = _collapse(after.splitlines()[0]) if after else ""
+        payload = _collapse(after)
 
     for tag in _DELEGATION_MARKERS:
         idx = payload.find(tag)

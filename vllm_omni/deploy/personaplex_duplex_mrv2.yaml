@@ -1,0 +1,36 @@
+# CUDA Model Runner V2 profile for PersonaPlex full-duplex serving.
+base_config: personaplex.yaml
+
+session_mode: duplex
+model_runner: v2
+
+stages:
+  - stage_id: 0
+    # Stage 0 uses its model-owned duplex runtime through MRv2 post_sample.
+    model_runner: v2
+    async_scheduling: false
+    # hf_overrides replaces personaplex.yaml's rather than merging into it, so
+    # restate the RoPE table that covers the max_model_len inherited from it.
+    hf_overrides:
+      mimi_cuda_graphs: true
+      depformer_cuda_graphs: true
+      temporal_config:
+        max_position_embeddings: 46080
+
+  - stage_id: 1
+    # Stage 1 Code2Wav runs on MRv2 with shared Mimi decode
+    model_runner: v2
+    async_scheduling: true
+    hf_overrides:
+      mimi_cuda_graphs: true
+      mimi_decode_tf32: true
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1

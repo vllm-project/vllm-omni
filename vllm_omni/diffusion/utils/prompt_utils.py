@@ -1,4 +1,26 @@
+from collections.abc import Mapping
+
 import torch
+
+# ``OmniCustomPrompt`` keys that carry caller-tokenized ids. The native vLLM
+# spelling ``prompt_token_ids`` is deliberately not listed: multi-stage models
+# use it to hand an AR stage's tokens to their diffusion stage.
+PRE_TOKENIZED_PROMPT_KEYS = ("prompt_ids", "negative_prompt_ids")
+
+
+def pre_tokenized_prompt_keys(prompt: object) -> list[str]:
+    """Return the ``OmniCustomPrompt`` id fields a request actually populates."""
+    if not isinstance(prompt, Mapping):
+        return []
+    populated = []
+    for key in PRE_TOKENIZED_PROMPT_KEYS:
+        token_ids = prompt.get(key)
+        if token_ids is None:
+            continue
+        size = token_ids.numel() if isinstance(token_ids, torch.Tensor) else len(token_ids)
+        if size > 0:
+            populated.append(key)
+    return populated
 
 
 def validate_prompt_sequence_lengths(

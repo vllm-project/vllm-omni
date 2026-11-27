@@ -1,7 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
 """Pipeline topology for all MOSS-TTS variants (2-stage: talker → codec)."""
+
+from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.config.stage_config import (
     PipelineConfig,
@@ -29,6 +34,7 @@ MOSS_TTS_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="moss_tts",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
@@ -36,11 +42,15 @@ MOSS_TTS_PIPELINE = PipelineConfig(
             sampling_constraints={
                 "detokenize": False,
             },
+            # The local depth transformer folds each sampled code frame into this
+            # step's inputs_embeds inside talker_mtp (vllm-project/vllm-omni#6179).
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,
             model_stage="moss_tts_codec",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",
@@ -61,16 +71,21 @@ MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=0,
             model_stage="moss_tts",
+            supports_native_mrv2_data_plane=True,
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_raw_async_chunk"),
             sampling_constraints={"detokenize": False},
+            # The local depth transformer folds each sampled code frame into this
+            # step's inputs_embeds inside talker_mtp (vllm-project/vllm-omni#6179).
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,
             model_stage="moss_tts_codec",
+            supports_native_mrv2_data_plane=True,
             execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),
             final_output=True,
@@ -92,6 +107,7 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=0,
             model_stage="moss_tts_local",
+            supports_native_mrv2_data_plane=True,
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             owns_tokenizer=True,
@@ -100,11 +116,19 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [151645],
+                # The worker connector streams codes directly to the codec.
+                # This internal stage only needs to publish its terminal
+                # result; codec audio output remains incremental.
+                "output_kind": RequestOutputKind.FINAL_ONLY,
             },
+            # The local depth transformer folds each sampled code frame into this
+            # step's inputs_embeds inside talker_mtp (vllm-project/vllm-omni#6179).
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,
             model_stage="moss_tts_local_codec",
+            supports_native_mrv2_data_plane=True,
             execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),
             final_output=True,
@@ -124,4 +148,9 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
 # they have different talker architectures from the delay variant
 # (MossTTSRealtime / MossTTSLocalModel vs MossTTSDelayModel).
 
-__all__ = ["MOSS_TTS_PIPELINE", "MOSS_TTS_REALTIME_PIPELINE", "MOSS_TTS_LOCAL_PIPELINE"]
+
+__all__ = [
+    "MOSS_TTS_PIPELINE",
+    "MOSS_TTS_REALTIME_PIPELINE",
+    "MOSS_TTS_LOCAL_PIPELINE",
+]

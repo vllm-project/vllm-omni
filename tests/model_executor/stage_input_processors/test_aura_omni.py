@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -10,6 +10,9 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
+    _estimate_tts_prompt_len_from_token_ids,
+    _estimate_tts_prompt_len_official,
+    _normalize_asr_transcript,
     asr2aura,
     aura2tts,
 )
@@ -166,7 +169,7 @@ def test_aura2tts_supports_custom_voice_mode():
     assert tts_input["additional_information"]["task_type"] == ["CustomVoice"]
     assert tts_input["additional_information"]["speaker"] == ["Vivian"]
     assert "ref_audio" not in tts_input["additional_information"]
-    assert len(tts_input["prompt_token_ids"]) == 14
+    assert len(tts_input["prompt_token_ids"]) > 0
 
 
 def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
@@ -196,3 +199,224 @@ def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
 
 def test_aura2tts_drops_silent_response():
     assert aura2tts([_source_output(SILENT_TEXT)]) == []
+    assert aura2tts([_source_output(f"{SILENT_TEXT}<|im_end|>")]) == []
+
+
+def test_aura2tts_customvoice_uses_official_prompt_len_not_aura_token_count():
+    text = "当然可以，我正看着你呢。"
+    prompt = {
+        "additional_information": {
+            "tts_task_type": ["CustomVoice"],
+            "tts_speaker": ["Vivian"],
+            "tts_language": ["Chinese"],
+        }
+    }
+    aura_token_ids = list(range(80))
+    tts_info = {
+        "task_type": ["CustomVoice"],
+        "language": ["Chinese"],
+        "instruct": [""],
+        "text": [text],
+        "speaker": ["Vivian"],
+    }
+    official = _estimate_tts_prompt_len_official(tts_info, task_type="CustomVoice")
+    if official is None:
+        pytest.skip("Qwen3-TTS tokenizer unavailable for official prompt_len")
+    old_heuristic = _estimate_tts_prompt_len_from_token_ids(
+        aura_token_ids,
+        task_type="CustomVoice",
+        language="Chinese",
+        instruct="",
+    )
+    assert official != old_heuristic
+
+    [tts_input] = aura2tts(
+        [_source_output(text, token_ids=aura_token_ids)],
+        prompt=[prompt],
+    )
+    assert len(tts_input["prompt_token_ids"]) == official
+    assert tts_input["additional_information"]["instruct"] == [""]
+
+
+def test_aura2tts_strips_im_end_from_spoken_text():
+    prompt = {
+        "additional_information": {
+            "tts_ref_audio": ["ref.wav"],
+            "tts_ref_text": ["Reference transcript sample."],
+        }
+    }
+    [tts_input] = aura2tts([_source_output("你好。<|im_end|>")], prompt=[prompt])
+    assert tts_input["additional_information"]["text"] == ["你好。"]
+
+
+def test_aura2tts_does_not_treat_chinese_silence_as_special_token():
+    # [沉默] is not <|silent|>; prompt/session must instruct the real token.
+    prompt = {
+        "additional_information": {
+            "tts_ref_audio": ["ref.wav"],
+            "tts_ref_text": ["Reference transcript sample."],
+        }
+    }
+    assert len(aura2tts([_source_output("[沉默]")], prompt=[prompt])) == 1
+
+
+def test_aura2tts_tool_call_only_response_is_not_silent_but_has_nothing_to_speak():
+    """A tool-call-only turn is spoken (not <|silent|>), just with no prose yet."""
+    text = (
+        "<|respond|><tool_call>\n<function=get_city_weather>\n<parameter=city>\n"
+        "台北\n</parameter>\n</function>\n</tool_call>"
+    )
+    assert aura2tts([_source_output(text)]) == []
+
+
+def test_aura2tts_speaks_only_the_prose_prefix_before_a_tool_call():
+    text = (
+        "<|respond|>先幫你查一下天氣。<tool_call>\n<function=get_city_weather>\n"
+        "<parameter=city>\n台北\n</parameter>\n</function>\n</tool_call>"
+    )
+    prompt = {
+        "additional_information": {
+            "tts_ref_audio": ["ref.wav"],
+            "tts_ref_text": ["Reference transcript sample."],
+        }
+    }
+    [tts_input] = aura2tts([_source_output(text)], prompt=[prompt])
+    assert tts_input["additional_information"]["text"] == ["先幫你查一下天氣。"]
+
+
+def test_normalize_asr_transcript_strips_qwen3_asr_markup() -> None:
+    raw = "language Chinese<asr_text>出现《古韵》这本书的时候，提醒我。"
+    assert _normalize_asr_transcript(raw) == "出现《古韵》这本书的时候，提醒我。"
+    assert _normalize_asr_transcript("出现古韵这本书的时候提醒我。") == "出现古韵这本书的时候提醒我。"
+
+
+def test_asr2aura_builds_tools_block_from_additional_info() -> None:
+    prompt = {
+        "multi_modal_data": {"video": ["frame-0"]},
+        "additional_information": {
+            "aura_tools": [{"type": "function", "function": {"name": "calculator"}}],
+        },
+    }
+    [next_input] = asr2aura([_source_output("17乘以23")], prompt=[prompt])
+    assert "# Tools" in next_input["prompt"]
+    assert '"name": "calculator"' in next_input["prompt"]
+
+
+def test_asr2aura_no_tools_omits_tools_block() -> None:
+    prompt = {"multi_modal_data": {"video": ["frame-0"]}}
+    [next_input] = asr2aura([_source_output("hi")], prompt=[prompt])
+    assert "# Tools" not in next_input["prompt"]
+
+
+def test_asr2aura_tool_followup_has_no_new_user_turn_but_reads_history() -> None:
+    from vllm_omni.model_executor.models.aura_omni.duplex.history import (
+        drop_session_history,
+        get_or_create_session_history,
+    )
+
+    drop_session_history("sess-asr-followup")
+    history = get_or_create_session_history("sess-asr-followup")
+    history.begin_user_turn("台北天氣如何？")
+    history.commit_turn("<|respond|>查一下")
+    history.append_tool_response("18C sunny")
+
+    prompt = {
+        "multi_modal_data": {},
+        "additional_information": {
+            "aura_duplex": True,
+            "session_id": "sess-asr-followup",
+            "aura_tool_followup": True,
+        },
+    }
+    [next_input] = asr2aura([_source_output("ignored transcript")], prompt=[prompt])
+    # The tool_response renders, and nothing else (no new user turn for this
+    # ASR transcript) comes between it and the assistant continuation.
+    assert next_input["prompt"].endswith(
+        "<tool_response>\n18C sunny\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+    )
+    drop_session_history("sess-asr-followup")
+
+
+def test_next_duplex_sentence_chunk_waits_for_the_whole_utterance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_AURA_SENTENCE_TTS", raising=False)
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        next_duplex_sentence_chunk,
+    )
+
+    state: dict[str, object] = {}
+    first = "甲" * 12 + "。"
+    assert next_duplex_sentence_chunk(state, first, finished=False) is None
+    second = first + "乙" * 20 + "。"
+    assert next_duplex_sentence_chunk(state, second, finished=False) is None
+    chunk = next_duplex_sentence_chunk(state, second, finished=True)
+    assert chunk == second
+
+
+def test_next_duplex_sentence_chunk_holds_think_silent_and_flushes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        next_duplex_sentence_chunk,
+    )
+
+    assert next_duplex_sentence_chunk({}, "<think>still thinking", finished=False) is None
+    assert next_duplex_sentence_chunk({}, "<|silent|>", finished=True) is None
+    assert next_duplex_sentence_chunk({}, '<tool_call>{"a":1}</tool_call>', finished=False) is None
+
+    state: dict[str, object] = {}
+    assert next_duplex_sentence_chunk(state, "你好。", finished=False) is None
+    assert next_duplex_sentence_chunk(state, "你好。", finished=True) == "你好。"
+
+
+def test_next_duplex_sentence_chunk_finish_truncates_tool_call_from_speech(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        next_duplex_sentence_chunk,
+    )
+
+    with_prose = (
+        "<|respond|>先幫你查一下。<tool_call>\n<function=get_city_weather>\n"
+        "<parameter=city>\n台北\n</parameter>\n</function>\n</tool_call>"
+    )
+    assert next_duplex_sentence_chunk({}, with_prose, finished=True) == "先幫你查一下。"
+
+    tool_only = (
+        "<|respond|><tool_call>\n<function=get_city_weather>\n"
+        "<parameter=city>\n台北\n</parameter>\n</function>\n</tool_call>"
+    )
+    # Nothing left to speak this round once the tag is dropped; not an error.
+    assert next_duplex_sentence_chunk({}, tool_only, finished=True) is None
+
+
+def test_next_duplex_sentence_chunk_does_not_speak_a_grounding_box(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        next_duplex_sentence_chunk,
+    )
+
+    box = "<|respond|><|box_start|>(712.0,531.0),(888.0,662.0)<|box_end|>"
+    assert next_duplex_sentence_chunk({}, box, finished=True) is None
+    prose = "<|respond|>在這裡。<|box_start|>10,20,30,40<|box_end|>"
+    assert next_duplex_sentence_chunk({}, prose, finished=True) == "在這裡。"
+
+
+def test_aura2tts_skips_a_box_only_turn():
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import aura2tts
+
+    prompt = {"additional_information": {"tts_task_type": "CustomVoice", "tts_speaker": "Vivian"}}
+    assert aura2tts([_source_output("<|box_start|>(712.0,531.0),(888.0,662.0)<|box_end|>")], prompt=[prompt]) == []
+    [tts_input] = aura2tts(
+        [_source_output("在這裡。<|box_start|>10,20,30,40<|box_end|>")],
+        prompt=[prompt],
+    )
+    assert tts_input["additional_information"]["text"] == ["在這裡。"]
+
+
+def test_next_duplex_sentence_chunk_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "0")
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        next_duplex_sentence_chunk,
+    )
+
+    assert next_duplex_sentence_chunk({}, "甲" * 40 + "。", finished=False) is None

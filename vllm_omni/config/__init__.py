@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Configuration module for vLLM-Omni.
 """
@@ -10,6 +13,7 @@ from vllm_omni.config.omni_config import (
     OmniStageConnectorConfig,
     OmniStageDiffusionParallelConfig,
     OmniStageLoadConfig,
+    OmniStageLoRAConfig,
     OmniStageModelConfig,
     OmniStageParallelConfig,
     OmniStageRuntimeConfig,
@@ -33,6 +37,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.config.yaml_util import (
     create_config,
     load_yaml_config,
@@ -45,8 +50,10 @@ from vllm_omni.config.yaml_util import (
 # `from vllm_omni.config.lora import LoRAConfig` (used while data.py is still
 # loading) cannot close a circular import through DiffusionOutput.
 _LAZY_ATTRS = {
+    "OmniConfigResolution": ("vllm_omni.config.resolver", "OmniConfigResolution"),
     "StageConfigFactory": ("vllm_omni.config.config_factory", "StageConfigFactory"),
     "register_pipeline": ("vllm_omni.config.pipeline_registry", "register_pipeline"),
+    "resolve_omni_config": ("vllm_omni.config.resolver", "resolve_omni_config"),
 }
 
 __all__ = [
@@ -60,11 +67,14 @@ __all__ = [
     "VllmOmniGenerationStageConfig",
     "VllmOmniDiffusionStageConfig",
     "StageConfigType",
+    "OmniConfigResolution",
+    "resolve_omni_config",
     # Structured Omni sub-configs.
     "OmniStageCacheConfig",
     "OmniStageConnectorConfig",
     "OmniStageDiffusionParallelConfig",
     "OmniStageLoadConfig",
+    "OmniStageLoRAConfig",
     "OmniStageModelConfig",
     "VllmOmniOrchestratorConfig",
     "OmniStageParallelConfig",
@@ -78,6 +88,7 @@ __all__ = [
     "StageConfigFactory",
     "StageDeployConfig",
     "StageType",
+    "WatermarkConfig",
     "StageExecutionType",
     "StagePipelineConfig",
     "load_deploy_config",

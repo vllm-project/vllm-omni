@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CFG Parallel Mixin for Qwen Image series
 Shared by
 - QwenImagePipeline
@@ -67,7 +67,6 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
             Denoised latents
         """
         self.scheduler.set_begin_index(0)
-        self.transformer.do_true_cfg = do_true_cfg
         additional_transformer_kwargs = additional_transformer_kwargs or {}
 
         with self.progress_bar(total=len(timesteps)) as pbar:
@@ -78,6 +77,7 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
 
                 # Broadcast timestep to match batch size
                 timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
+                model_timestep = timestep / 1000
 
                 # Concatenate image latents with noise latents if available (for editing pipelines)
                 latent_model_input = latents
@@ -86,7 +86,7 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
 
                 positive_kwargs = {
                     "hidden_states": latent_model_input,
-                    "timestep": timestep / 1000,
+                    "timestep": model_timestep,
                     "guidance": guidance,
                     "encoder_hidden_states_mask": prompt_embeds_mask,
                     "encoder_hidden_states": prompt_embeds,
@@ -97,7 +97,7 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                 if do_true_cfg:
                     negative_kwargs = {
                         "hidden_states": latent_model_input,
-                        "timestep": timestep / 1000,
+                        "timestep": model_timestep,
                         "guidance": guidance,
                         "encoder_hidden_states_mask": negative_prompt_embeds_mask,
                         "encoder_hidden_states": negative_prompt_embeds,

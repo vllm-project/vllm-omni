@@ -2,13 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from vllm.v1.request import Request
 
 from vllm_omni.metrics import OrchestratorAggregator
 
 from .utils.logging import get_connector_logger
+
+# Upper bound on a previous streaming chunk's generation reserve: a duplex
+# turn-end chunk may retain more codec ids than the steady-state per-unit
+# reserve (see MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS).
+_MAX_PREVIOUS_CHUNK_GENERATION_RESERVE = 26 * 4
 
 logger = get_connector_logger(__name__)
 
@@ -345,7 +350,9 @@ def construct_next_stage_streaming_input_prompt(
                 f"confirmed={confirmed_num_computed_tokens}, prompt={request.num_prompt_tokens}"
             )
         previous_codec_ids = list(request._all_token_ids[request.num_prompt_tokens : confirmed_num_computed_tokens])
-        max_confirmed_codec_tokens = generation_reserve - 1
+        # The previous chunk may have been a turn-end unit that ran to the
+        # Talker's EOS with a larger reserve than this chunk's.
+        max_confirmed_codec_tokens = max(generation_reserve, _MAX_PREVIOUS_CHUNK_GENERATION_RESERVE) - 1
         if len(previous_codec_ids) > max_confirmed_codec_tokens:
             raise ValueError(
                 "streaming prompt recompute retained too many codec tokens: "
@@ -382,7 +389,8 @@ def construct_next_stage_streaming_input_prompt(
         # declares that transport behavior explicitly in payload metadata.
         new_prompt = [0] * replacement_prompt_len
         request._output_token_ids.clear()
-        request._all_token_ids.clear()
+        # _all_token_ids is a TokenBuffer (array) since vLLM 0.34; no .clear().
+        del request._all_token_ids[:]
         request._all_token_ids.extend(new_prompt)
         request.prompt_token_ids = new_prompt
         request.num_computed_tokens = 0
@@ -405,7 +413,7 @@ def construct_next_stage_streaming_input_prompt(
     # Extend prompt with kept output tokens.
     request.prompt_token_ids.extend(kept_output_tokens)
     if has_declared_prompt_len:
-        next_prompt_len = next_stage_prompt_len
+        next_prompt_len = cast(int, next_stage_prompt_len)
     else:
         next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
     new_prompt = [0] * next_prompt_len

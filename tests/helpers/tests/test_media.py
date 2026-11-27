@@ -44,6 +44,7 @@ def _stub_transcribe(monkeypatch) -> dict:
         "vllm_omni.platforms",
         SimpleNamespace(current_omni_platform=SimpleNamespace(is_available=lambda: False)),
     )
+    monkeypatch.setattr(media, "_serialize_whisper_model_download", lambda _model_size: nullcontext())
     return captured
 
 
@@ -63,6 +64,28 @@ def test_transcribe_defaults_to_auto_language(monkeypatch):
     media._whisper_transcribe_in_current_process("/tmp/does-not-matter.wav", "small")
 
     assert captured.get("language") is None
+    assert captured["temperature"] == 0.0
+
+
+def test_transcribe_uses_seeded_temperature_fallback_when_requested(monkeypatch):
+    captured = _stub_transcribe(monkeypatch)
+    seeds: list[int] = []
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(manual_seed=seeds.append))
+
+    media._whisper_transcribe_in_current_process(
+        "/tmp/does-not-matter.wav",
+        "small",
+        language="en",
+        temperature_fallback=True,
+    )
+
+    assert media.WHISPER_TEMPERATURE_FALLBACK == (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+    assert captured["temperature"] == media.WHISPER_TEMPERATURE_FALLBACK
+    assert captured["language"] == "en"
+    assert captured["word_timestamps"] is True
+    assert captured["condition_on_previous_text"] is False
+    assert media.WHISPER_TEMPERATURE_FALLBACK_SEED == 0
+    assert seeds == [media.WHISPER_TEMPERATURE_FALLBACK_SEED]
 
 
 class _FakeExecutor:
@@ -76,7 +99,7 @@ class _FakeExecutor:
 
     def submit(self, fn, *args):
         self.submitted.append((fn, args))
-        outcome = self._outcomes.pop(0) if self._outcomes else "London"
+        outcome = self._outcomes.pop(0) if self._outcomes else ("London", "cpu")
 
         def _result():
             if isinstance(outcome, BaseException):
@@ -110,9 +133,13 @@ def _reset_transcriber_singletons():
     """The worker and its model cache are module-level state; do not leak them across tests."""
     media.release_audio_transcriber()
     media._WHISPER_MODELS.clear()
+    media._WHISPER_LOADED_DEVICE = None
+    media._TRANSCRIBER_RESERVED_GIB = 0.0
     yield
     media.release_audio_transcriber()
     media._WHISPER_MODELS.clear()
+    media._WHISPER_LOADED_DEVICE = None
+    media._TRANSCRIBER_RESERVED_GIB = 0.0
 
 
 @pytest.mark.parametrize(
@@ -168,7 +195,17 @@ def test_bytes_entrypoint_forwards_language_to_subprocess(monkeypatch, tmp_path)
 
     fn, args = created[0].submitted[0]
     assert fn is media._whisper_transcribe_in_current_process
-    assert args[1:] == ("small", "en")
+    assert args[1:] == ("small", "en", False)
+
+
+def test_file_entrypoint_forwards_temperature_fallback_to_worker(monkeypatch):
+    created = _patch_executors(monkeypatch)
+
+    assert media.convert_audio_file_to_text("/tmp/clip.wav", temperature_fallback=True) == "London"
+
+    fn, args = created[0].submitted[0]
+    assert fn is media._whisper_transcribe_in_current_process
+    assert args == ("/tmp/clip.wav", "small", None, True)
 
 
 def test_parent_reuses_one_spawned_worker_across_calls(monkeypatch):
@@ -236,7 +273,10 @@ def test_worker_loads_each_model_size_once(monkeypatch):
 
 @pytest.mark.parametrize(
     ("second_outcome", "recovers"),
-    [(["London"], True), ([BrokenProcessPool("second")], False)],
+    [
+        ([("London", "cpu")], True),
+        ([BrokenProcessPool("second")], False),
+    ],
 )
 def test_broken_pool_is_discarded_and_retried_once(monkeypatch, second_outcome, recovers):
     """A dead worker is discarded and the call retried exactly once.
@@ -286,3 +326,103 @@ def test_transcription_failure_propagates_and_discards_the_worker(monkeypatch, e
 
     assert media.convert_audio_file_to_text("/tmp/b.wav") == "London"
     assert len(created) == 2  # a fresh worker for the next call
+
+
+def test_whisper_resident_vram_is_zero_until_a_gpu_result(monkeypatch):
+    """CPU fallback and in-flight loads must not hide engine leaks on the last GPU."""
+    assert media.whisper_resident_vram_gib() == 0.0
+    assert media.whisper_resident_device_index() is None
+
+    created = _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cpu")],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "small")
+
+    assert created[0].submitted
+    assert media.whisper_resident_vram_gib() == 0.0
+    assert media.whisper_resident_device_index() is None
+
+
+def test_whisper_resident_vram_tracks_gpu_device_after_success(monkeypatch):
+    _patch_executors(
+        monkeypatch,
+        outcomes_per_executor=([("London", "cuda:1", 2.5), ("Paris", "cuda:1", 9.6)],),
+    )
+    media.convert_audio_file_to_text("/tmp/a.wav", "small")
+    assert media.whisper_resident_device_index() == 1
+    assert media.whisper_resident_vram_gib() == pytest.approx(2.5)
+
+    media.convert_audio_file_to_text("/tmp/b.wav", "large-v3")
+    assert media.whisper_resident_device_index() == 1
+    assert media.whisper_resident_vram_gib() == pytest.approx(9.6)
+
+    media.release_audio_transcriber()
+    assert media.whisper_resident_vram_gib() == 0.0
+    assert media.whisper_resident_device_index() is None
+
+
+def test_whisper_unmeasured_gpu_result_credits_zero(monkeypatch):
+    """A GPU device without a reserved reading must not invent a size-table credit."""
+    _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0")],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "not-a-whisper-size")
+    assert media.whisper_resident_device_index() == 0
+    assert media.whisper_resident_vram_gib() == 0.0
+
+
+def test_whisper_resident_vram_uses_child_reserved(monkeypatch):
+    _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0", 1.0)],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "small")
+    assert media.whisper_resident_vram_gib() == pytest.approx(1.0)
+
+
+def test_whisper_resident_vram_does_not_cap_measured_reserved(monkeypatch):
+    _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0", 20.0)],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "small")
+    assert media.whisper_resident_vram_gib() == pytest.approx(20.0)
+
+
+def test_whisper_unknown_size_uses_measured_reserved(monkeypatch):
+    _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0", 3.0)],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "not-a-whisper-size")
+    assert media.whisper_resident_vram_gib() == pytest.approx(3.0)
+
+
+def test_later_whisper_sizes_reuse_the_first_selected_device(monkeypatch):
+    selected: list[str] = []
+
+    def fake_model(_size, device=None):
+        return SimpleNamespace(transcribe=lambda *_a, **_k: {"text": "x"})
+
+    def select_device() -> str:
+        selected.append("cuda:1")
+        return "cuda:1"
+
+    monkeypatch.setattr(media, "_select_whisper_device", select_device)
+    monkeypatch.setitem(sys.modules, "whisper", SimpleNamespace(load_model=fake_model))
+    monkeypatch.setattr(media, "_serialize_whisper_model_download", lambda model_size: nullcontext())
+
+    text, device, _reserved = media._whisper_transcribe_in_current_process("/tmp/a.wav", "small")
+    assert (text, device) == ("x", "cuda:1")
+    media._whisper_transcribe_in_current_process("/tmp/b.wav", "large-v3")
+    assert selected == ["cuda:1"]
+    assert media._WHISPER_LOADED_DEVICE == "cuda:1"
+
+
+def test_cleanup_whisper_allowance_is_zero_on_cpu(monkeypatch):
+    from tests.helpers import clean
+
+    monkeypatch.setattr(media, "whisper_resident_vram_gib", lambda: 11.0)
+    monkeypatch.setattr(media, "whisper_resident_device_index", lambda: None)
+    assert clean._whisper_vram_allowance() == (0.0, None)
+
+
+def test_cleanup_whisper_allowance_maps_logical_gpu(monkeypatch):
+    from tests.helpers import clean
+
+    monkeypatch.setattr(media, "whisper_resident_vram_gib", lambda: 2.5)
+    monkeypatch.setattr(media, "whisper_resident_device_index", lambda: 1)
+    monkeypatch.setattr(clean, "get_physical_device_indices", lambda devices: [7] if devices == [1] else [])
+    assert clean._whisper_vram_allowance() == (2.5, 7)
+
+
+def test_whisper_has_no_size_table():
+    assert not hasattr(media, "_WHISPER_VRAM_GIB")
+    assert not hasattr(media, "_WHISPER_VRAM_GIB_DEFAULT")

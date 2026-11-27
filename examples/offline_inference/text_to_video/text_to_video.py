@@ -235,7 +235,7 @@ def parse_extra_body(value: str) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a video from a text prompt. "
-        "Supports Wan2.2, HunyuanVideo-1.5, Helios, LingBot-Video, MAGI-2, "
+        "Supports Wan2.2, HunyuanVideo-1.5, Helios, LingBot-Video, MAGI-2, Kandinsky 6, "
         "and other text-to-video models."
     )
     parser.add_argument(
@@ -310,6 +310,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
+    parser.add_argument(
+        "--diffusion-attention-config",
+        type=json.loads,
+        default=None,
+        help="Per-role diffusion attention backend configuration as a JSON object.",
+    )
     parser.add_argument("--output", type=str, default=None, help="Output path (mp4). Default: model-specific.")
     parser.add_argument("--fps", type=float, default=None, help="Frames per second for the output video.")
     parser.add_argument(
@@ -326,6 +332,18 @@ def parse_args() -> argparse.Namespace:
         "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
+    )
+    parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=600,
+        help="Total timeout for orchestrator startup in seconds (default: 600s).",
+    )
+    parser.add_argument(
+        "--stage-init-timeout",
+        type=int,
+        default=300,
+        help="Timeout for initializing a single stage in seconds (default: 300s).",
     )
     parser.add_argument(
         "--enable-cpu-offload",
@@ -384,12 +402,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
-    parser.add_argument(
+    quantization_group = parser.add_mutually_exclusive_group()
+    quantization_group.add_argument(
         "--quantization",
         type=str,
         default=None,
         choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8"],
         help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU).",
+    )
+    quantization_group.add_argument(
+        "--quantization-config",
+        type=json.loads,
+        default=None,
+        help='Quantization JSON, e.g. \'{"method":"mxfp4","w4a8_fallback_steps":[0,2]}\'.',
     )
 
     # Distributed and parallel execution
@@ -563,6 +588,8 @@ def main():
         enable_distributed_layerwise_offload=args.enable_distributed_layerwise_offload,
         dlo_use_allgather=args.dlo_use_allgather,
         dlo_resident_layers=args.dlo_resident_layers,
+        init_timeout=args.init_timeout,
+        stage_init_timeout=args.stage_init_timeout,
     )
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
@@ -572,6 +599,10 @@ def main():
         omni_kwargs["flow_shift"] = args.flow_shift
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
+    if args.quantization_config is not None:
+        omni_kwargs["quantization_config"] = args.quantization_config
+    if args.diffusion_attention_config is not None:
+        omni_kwargs["diffusion_attention_config"] = args.diffusion_attention_config
     if args.cache_backend is not None:
         omni_kwargs["cache_backend"] = args.cache_backend
         omni_kwargs["cache_config"] = cache_config

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -30,10 +33,12 @@ class StubTransformer(nn.Module):
 class StubScheduler:
     def __init__(self, timesteps: list[int]) -> None:
         self.timesteps = torch.tensor(timesteps, dtype=torch.int64)
+        # Pipelines read the sigma ladder after set_timesteps.
+        self.sigmas = torch.linspace(1.0, 0.0, len(timesteps) + 1)
         self.config = SimpleNamespace(num_train_timesteps=1000)
         self.set_timesteps_calls: list[tuple[int, torch.device]] = []
 
-    def set_timesteps(self, num_steps: int, device: torch.device) -> None:
+    def set_timesteps(self, num_steps: int, device: torch.device, shift: float | None = None) -> None:
         self.set_timesteps_calls.append((num_steps, device))
 
 

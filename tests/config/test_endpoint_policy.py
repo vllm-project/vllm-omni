@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for endpoint restrictions logic."""
 
 import pytest
@@ -11,11 +11,64 @@ from vllm_omni.config.endpoint_policy import (
     OmniServingCapability,
     shutdown_unsupported_routes,
 )
+from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
+from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
+from vllm_omni.model_executor.models.fish_omni.pipeline import FISH_OMNI_PIPELINE
+from vllm_omni.model_executor.models.indextts2.pipeline import INDEXTTS2_PIPELINE, INDEXTTS25_PIPELINE
+from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE, QWEN3_TTS_PIPELINE
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SERVER_ROUTE = "/v1/completions"
+CHAT_SERVER_ROUTE = "/v1/chat/completions"
 REJECTION_REASON = "This route is banned!"
+
+
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        COSYVOICE3_PIPELINE,
+        FISH_OMNI_PIPELINE,
+        QWEN3_TTS_PIPELINE,
+        QWEN3_TTS_FUSED_PIPELINE,
+        INDEXTTS2_PIPELINE,
+        INDEXTTS25_PIPELINE,
+        BREEZE_TTS_2_PIPELINE,
+    ],
+    ids=lambda pipeline: pipeline.model_type,
+)
+def test_speech_pipelines_reject_generation_before_dispatch(pipeline):
+    app = FastAPI()
+    dispatched = []
+    paths = (
+        "/v1/completions",
+        "/v1/chat/completions",
+        "/v1/chat/completions/batch",
+        "/v1/responses",
+        "/v1/messages",
+        "/invocations",
+        "/inference/v1/generate",
+        "/v1/audio/generate",
+    )
+
+    async def generate():
+        dispatched.append(True)
+        return {"ok": True}
+
+    for path in paths:
+        app.add_api_route(path, generate, methods=["POST"])
+    app.add_api_route("/v1/audio/speech", generate, methods=["POST"])
+
+    shutdown_unsupported_routes(app, pipeline.endpoint_restrictions)
+    with TestClient(app) as client:
+        for path in paths:
+            response = client.post(path, json={"model": pipeline.model_type})
+            assert response.status_code == 400, path
+            assert response.json()["error"]["type"] == "BadRequestError", path
+            assert "/v1/audio/speech" in response.json()["error"]["message"], path
+        assert not dispatched
+        assert client.post("/v1/audio/speech", json={"input": "hello"}).status_code == 200
+        assert dispatched == [True]
 
 
 def _make_app_with_server_route():
@@ -42,6 +95,62 @@ def test_restricted_completions_returns_400():
     body = resp.json()
     assert body["error"]["message"] == REJECTION_REASON
     assert body["error"]["type"] == "BadRequestError"
+
+
+def test_restricted_chat_completions_returns_400():
+    """Ensure that chat completion routes can be rejected by pipeline policy."""
+    app = FastAPI()
+
+    @app.post(CHAT_SERVER_ROUTE)
+    async def existing_handler():
+        return {"ok": True}
+
+    restrictions = (
+        EndpointRestriction(
+            OmniServingCapability.CHAT_COMPLETIONS,
+            REJECTION_REASON,
+        ),
+    )
+    shutdown_unsupported_routes(app, restrictions)
+
+    client = TestClient(app)
+    resp = client.post(
+        CHAT_SERVER_ROUTE,
+        json={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"]["message"] == REJECTION_REASON
+    assert body["error"]["type"] == "BadRequestError"
+
+
+def test_restricted_image_edits_returns_400():
+    """Ensure pipelines can reject image edits independently of generation."""
+    app = FastAPI()
+
+    @app.post("/v1/images/edits")
+    async def existing_handler():
+        return {"ok": True}
+
+    @app.post("/v1/images/generations")
+    async def generations_handler():
+        return {"ok": True}
+
+    restrictions = (EndpointRestriction(OmniServingCapability.IMAGE_EDITS, REJECTION_REASON),)
+    shutdown_unsupported_routes(app, restrictions)
+
+    client = TestClient(app)
+    resp = client.post("/v1/images/edits")
+    assert resp.status_code == 400
+    assert resp.json()["error"]["message"] == REJECTION_REASON
+
+    # The restriction is endpoint-specific and must not remove generations.
+    resp = client.post("/v1/images/generations")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
 
 
 def test_unrestricted_completions_not_blocked():

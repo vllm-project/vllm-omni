@@ -1,21 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
 from torch import nn
 
 from tests.diffusion.models.wan2_2.conftest import StubScheduler, StubTransformer, StubVAE, noop_progress_bar
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import _WAN_TEXT_ENCODER_OFFLOAD_PLAN
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import _WAN_TEXT_ENCODER_OFFLOAD_PLAN, build_wan_scheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import (
     Wan22I2VPipeline,
     get_wan22_i2v_post_process_func,
     get_wan22_i2v_pre_process_func,
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -50,7 +52,7 @@ def _make_i2v_pipeline(*, expand_timesteps: bool) -> Wan22I2VPipeline:
 
 
 def _make_i2v_sampling(**overrides):
-    values = {
+    values: dict[str, object] = {
         "height": 16,
         "width": 16,
         "num_frames": 5,
@@ -275,16 +277,18 @@ def test_i2v_prepare_latents_preserves_batched_image_conditions() -> None:
     assert first_frame_mask.shape == (2, 1, 2, 2, 2)
 
 
-def test_i2v_forward_batches_conditions_random_inputs_and_outputs(monkeypatch) -> None:
+@pytest.mark.parametrize("solver", ["unipc", "euler"])
+@pytest.mark.parametrize("shift", [3.0, 5.0, 12.0])
+def test_i2v_forward_batches_conditions_random_inputs_and_outputs(monkeypatch, solver: str, shift: float) -> None:
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v.current_omni_platform",
         SimpleNamespace(is_available=lambda: False),
     )
     pipeline = _make_i2v_pipeline(expand_timesteps=True)
-    pipeline.scheduler = StubScheduler([9])
-    pipeline.od_config = SimpleNamespace(flow_shift=5.0)
-    pipeline._sample_solver = "unipc"
-    pipeline._flow_shift = 5.0
+    pipeline.scheduler = build_wan_scheduler(solver, shift)
+    pipeline.od_config = SimpleNamespace(flow_shift=shift)
+    pipeline._sample_solver = solver
+    pipeline._flow_shift = shift
     pipeline.boundary_ratio = 0.875
     pipeline.has_image_encoder = False
     pipeline._guidance_scale = None
@@ -310,7 +314,17 @@ def test_i2v_forward_batches_conditions_random_inputs_and_outputs(monkeypatch) -
 
     pipeline.encode_prompt = _fake_encode_prompt  # type: ignore[method-assign]
     pipeline.prepare_latents = _fake_prepare_latents  # type: ignore[method-assign]
-    pipeline.diffuse = lambda **kwargs: kwargs["latents"]  # type: ignore[method-assign]
+    diffuse_call = {}
+
+    def _fake_diffuse(**kwargs):
+        diffuse_call.update(kwargs)
+        return kwargs["latents"]
+
+    pipeline.diffuse = _fake_diffuse  # type: ignore[method-assign]
+    schedule_refreshes = []
+    pipeline._cache_dit_refresh_for_schedule = lambda pipeline, timesteps, boundary_timestep: schedule_refreshes.append(
+        (timesteps, boundary_timestep)
+    )
 
     gen_a = torch.Generator(device="cpu").manual_seed(1)
     gen_b = torch.Generator(device="cpu").manual_seed(2)
@@ -327,6 +341,8 @@ def test_i2v_forward_batches_conditions_random_inputs_and_outputs(monkeypatch) -
                     generator=gen_a,
                     latents=latents_a,
                     num_outputs_per_prompt=2,
+                    num_inference_steps=50,
+                    extra_args={"sample_solver": solver, "flow_shift": shift},
                 ),
             ),
             SimpleNamespace(
@@ -336,13 +352,30 @@ def test_i2v_forward_batches_conditions_random_inputs_and_outputs(monkeypatch) -
                     generator=gen_b,
                     latents=latents_b,
                     num_outputs_per_prompt=2,
+                    num_inference_steps=50,
+                    extra_args={"sample_solver": solver, "flow_shift": shift},
                 ),
             ),
         ]
     )
 
     outputs = pipeline.forward(batch)
+    if solver == "unipc":
+        sigmas = np.linspace(float(np.float32(0.999)), 0.0, 51)[:-1]
+        sigmas = shift * sigmas / (1.0 + (shift - 1.0) * sigmas)
+        torch.testing.assert_close(
+            pipeline.scheduler.sigmas, torch.tensor(np.append(sigmas, 0.0), dtype=torch.float32), rtol=0, atol=0
+        )
+        assert pipeline.scheduler.timesteps.tolist() == (sigmas * 1000).astype(np.int64).tolist()
+    else:
+        reference = build_wan_scheduler("euler", shift)
+        reference.set_timesteps(50, device="cpu")
+        torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
 
+    # Cache-DiT budgets are sized from the schedule this request actually denoises.
+    assert len(schedule_refreshes) == 1
+    assert schedule_refreshes[0][0] is diffuse_call["timesteps"]
+    assert schedule_refreshes[0][1] == diffuse_call["boundary_timestep"]
     assert prepare_call["batch_size"] == 4
     assert prepare_call["generator"] == [gen_a, gen_a, gen_b, gen_b]
     torch.testing.assert_close(prepare_call["latents"], torch.cat([latents_a, latents_b]))
@@ -353,6 +386,65 @@ def test_i2v_forward_batches_conditions_random_inputs_and_outputs(monkeypatch) -
     assert len(outputs) == 2
     torch.testing.assert_close(outputs[0].output, latents_a)
     torch.testing.assert_close(outputs[1].output, latents_b)
+
+
+@pytest.mark.parametrize("bad_shift", ["nan", float("nan"), "inf", 0.0, -2.0])
+def test_i2v_forward_never_caches_invalid_flow_shift(monkeypatch, bad_shift: object) -> None:
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v.current_omni_platform",
+        SimpleNamespace(is_available=lambda: False),
+    )
+    pipeline = _make_i2v_pipeline(expand_timesteps=True)
+    pipeline.scheduler = build_wan_scheduler("unipc", 5.0)
+    pipeline.od_config = SimpleNamespace(flow_shift=5.0)
+    pipeline._sample_solver = "unipc"
+    pipeline._flow_shift = 5.0
+    pipeline.boundary_ratio = 0.875
+    pipeline.has_image_encoder = False
+    pipeline._guidance_scale = None
+    pipeline._guidance_scale_2 = None
+    pipeline._num_timesteps = None
+    pipeline._current_timestep = None
+    pipeline.check_inputs = lambda **kwargs: None
+    pipeline.encode_prompt = lambda **kwargs: (torch.zeros(1, 2, 3), None)  # type: ignore[method-assign]
+    pipeline.prepare_latents = lambda **kwargs: (  # type: ignore[method-assign]
+        torch.zeros(1, 4, 2, 2, 2),
+        torch.zeros(1, 4, 1, 2, 2),
+        torch.ones(1, 1, 2, 2, 2),
+    )
+    pipeline.diffuse = lambda **kwargs: kwargs["latents"]  # type: ignore[method-assign]
+
+    def run(solver: str, shift: object) -> None:
+        request = SimpleNamespace(
+            request_id="schedule",
+            prompt={"prompt": "prompt", "multi_modal_data": {"image": torch.zeros(1, 3, 16, 16)}},
+            sampling_params=_make_i2v_sampling(
+                num_inference_steps=5, extra_args={"sample_solver": solver, "flow_shift": shift}
+            ),
+        )
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
+
+    def assert_euler_sigmas(shift: float) -> None:
+        reference = build_wan_scheduler("euler", shift)
+        reference.set_timesteps(5, device="cpu")
+        torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
+
+    unipc_scheduler = pipeline.scheduler
+    with pytest.raises(OmniClientError):
+        run("euler", bad_shift)
+    assert pipeline.scheduler is unipc_scheduler
+    assert (pipeline._sample_solver, pipeline._flow_shift) == ("unipc", 5.0)
+
+    run("euler", 12.0)
+    assert_euler_sigmas(12.0)
+
+    run("euler", 5.0)
+    euler_scheduler = pipeline.scheduler
+    with pytest.raises(OmniClientError):
+        run("euler", bad_shift)
+    assert pipeline.scheduler is euler_scheduler
+    assert (pipeline._sample_solver, pipeline._flow_shift) == ("euler", 5.0)
+    assert_euler_sigmas(5.0)
 
 
 def test_i2v_forward_rejects_mismatched_tensor_condition_shapes(monkeypatch) -> None:

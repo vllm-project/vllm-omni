@@ -10,6 +10,7 @@ OpenBMB/Omni-DuplexEval evaluator at :data:`PROTOCOL_PIN`.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable
 from typing import Any
 
@@ -30,7 +31,8 @@ def reminder_window(start_time: float, window_size: float = 10.0) -> tuple[float
     return float(start_time), float(start_time) + float(window_size)
 
 
-def parse_judge_json(text: str) -> dict[str, Any]:
+def parse_judge_json(text: str, *, required: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Recover official JSON wrappers, but reject missing or invalid scores."""
     for match in re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", str(text), re.S):
         try:
             value = json.loads(re.sub(r",\s*([}\]])", r"\1", match))
@@ -40,16 +42,12 @@ def parse_judge_json(text: str) -> dict[str, Any]:
             break
     else:
         value = {}
-        patterns = [
-            (r'"temporal_score"\s*:\s*(\d+)', "temporal_score", int),
-            (r'"is_relevant"\s*:\s*(\d+)', "is_relevant", int),
-            (r'"success_score"\s*:\s*([01])', "success_score", int),
-            (r'"content_score"\s*:\s*(\d+(?:\.\d+)?)', "content_score", float),
-        ]
-        for pattern, key, caster in patterns:
-            if match := re.search(pattern, str(text)):
-                parsed = caster(match.group(1))
-                value[key] = round(parsed, 2) if caster is float else parsed
+        for key in ("temporal_score", "is_relevant", "success_score", "content_score"):
+            if match := re.search(r'"' + key + r'"\s*:\s*([^,\s}]+)', str(text)):
+                try:
+                    value[key] = json.loads(match.group(1))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid judge field {key}") from exc
         for pattern, key in [
             (r'"temporal_reasoning"\s*:\s*"([^"]*)"', "temporal_reasoning"),
             (r'"content_reasoning"\s*:\s*"([^"]*)"', "content_reasoning"),
@@ -58,17 +56,30 @@ def parse_judge_json(text: str) -> dict[str, Any]:
             if match := re.search(pattern, str(text), re.S):
                 value[key] = match.group(1).strip()
                 break
-    for key in ("temporal_score", "is_relevant", "success_score"):
-        if key in value:
+    bounds = {"temporal_score": 3, "is_relevant": 1, "success_score": 1, "content_score": 3}
+    if not any(key in value for key in bounds):
+        raise ValueError("Judge response contains no score fields")
+    for key in required:
+        if key not in value:
+            raise ValueError(f"Judge response is missing {key}")
+    for key, maximum in bounds.items():
+        if key not in value:
+            continue
+        score = value[key]
+        if isinstance(score, str):
+            # The released evaluator accepts quoted numbers via float(...).
+            # Apply the same conversion before checking finiteness and range.
             try:
-                value[key] = int(float(value[key]))
-            except (TypeError, ValueError):
-                value[key] = 0
-    if "content_score" in value:
-        try:
-            value["content_score"] = round(float(value["content_score"]), 2)
-        except (TypeError, ValueError):
-            value["content_score"] = 0.0
+                score = float(score)
+            except ValueError as exc:
+                raise ValueError(f"Judge {key} must be a finite number") from exc
+        if isinstance(score, bool) or not isinstance(score, int | float):
+            raise ValueError(f"Judge {key} must be a finite number")
+        if isinstance(score, float) and not math.isfinite(score):
+            raise ValueError(f"Judge {key} must be a finite number")
+        if not 0 <= score <= maximum or (key != "content_score" and int(score) != score):
+            raise ValueError(f"Judge {key} is outside its allowed range: {score}")
+        value[key] = round(score, 2) if key == "content_score" else int(score)
     return value
 
 

@@ -15,6 +15,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from benchmarks.accuracy.common import pil_to_png_bytes
+from tests.helpers.assertions import assert_images_generations_response
 from tests.helpers.runtime import DiffusionResponse, OmniServer, OnlineOmniClient, dummy_messages_from_mix_data
 from tests.model_tests.diffusion.config_types import DiffusionTasks
 from vllm_omni.entrypoints.omni import Omni
@@ -40,6 +42,12 @@ VIDEO_GEN_SAMPLING_PARAMS = OmniDiffusionSamplingParams(
     height=HEIGHT,
     width=WIDTH,
     num_frames=VIDEO_NUM_FRAMES,
+    seed=42,
+)
+AUDIO_GEN_SAMPLING_PARAMS = OmniDiffusionSamplingParams(
+    num_inference_steps=2,
+    num_frames=9,
+    frame_rate=24.0,
     seed=42,
 )
 
@@ -204,6 +212,25 @@ def _run_online_i2i(
     return client.send_diffusion_request(request_config)
 
 
+def _build_online_image_edits_request(model: str, num_images: int) -> dict[str, Any]:
+    """Build a multipart ``/v1/images/edits`` request with repeated image fields."""
+    files = [
+        ("image", (f"image_{index}.png", pil_to_png_bytes(INPUT_IMAGE), "image/png")) for index in range(num_images)
+    ]
+    return {
+        "data": {
+            "model": model,
+            "prompt": PROMPT,
+            "size": f"{WIDTH}x{HEIGHT}",
+            "n": 1,
+            "response_format": "b64_json",
+            "num_inference_steps": 2,
+            "seed": 42,
+        },
+        "files": files,
+    }
+
+
 ### Offline task runners
 def run_and_validate_text_to_image_request(omni: Omni):
     """Run and validate a text to image request."""
@@ -239,6 +266,16 @@ def run_and_validate_image_to_video_request(omni: Omni, check_t2v_divergence: bo
         "I2V output is identical to T2V output with the same seed and prompt; "
         "the input image may not be reaching conditioning."
     )
+
+
+def run_and_validate_text_to_audio_request(omni: Omni):
+    outputs = omni.generate({"prompt": PROMPT}, AUDIO_GEN_SAMPLING_PARAMS)
+    assert len(outputs) == 1
+    audio = outputs[0].multimodal_output["audio"]
+    assert getattr(audio, "numel", lambda: len(audio))() > 0
+    sample_rate = outputs[0].multimodal_output.get("audio_sample_rate", outputs[0].multimodal_output.get("sr"))
+    assert sample_rate is not None
+    assert int(sample_rate) > 0
 
 
 def run_and_validate_determinism(omni: Omni, task_type: DiffusionTasks):
@@ -313,6 +350,27 @@ def _get_online_videos(responses: list[DiffusionResponse]) -> list:
     return videos
 
 
+def run_and_validate_online_text_to_audio_request(server: OmniServer, client: OnlineOmniClient):
+    """Run and validate a text-to-audio request through the OpenAI endpoint."""
+    responses = client.send_audio_generate_http_request(
+        {
+            "json": {
+                "model": server.model,
+                "input": PROMPT,
+                "response_format": "wav",
+                "num_frames": 9,
+                "frame_rate": 24.0,
+                "num_inference_steps": 2,
+                "seed": 42,
+            }
+        }
+    )
+    assert len(responses) == 1
+    response = responses[0]
+    assert response.status_code == 200
+    assert response.content
+
+
 ### Online task runners
 def run_and_validate_online_text_to_image_request(server: OmniServer, client: OnlineOmniClient):
     """Run and validate a text to image request through the server."""
@@ -322,6 +380,35 @@ def run_and_validate_online_text_to_image_request(server: OmniServer, client: On
 def run_and_validate_online_image_to_image_request(server: OmniServer, client: OnlineOmniClient):
     """Run and validate an image to image request through the server."""
     _validate_images(_get_online_images(_run_online_i2i(server, client)))
+
+
+def run_and_validate_online_image_edits(
+    server: OmniServer,
+    client: OnlineOmniClient,
+    num_images: int,
+    max_multimodal_image_inputs: int,
+):
+    """Run and validate one request through ``/v1/images/edits``."""
+    request = _build_online_image_edits_request(server.model, num_images)
+    if num_images <= max_multimodal_image_inputs:
+        response = client.send_images_edits_http_request(request)[0]
+        assert response.success, response.error_message
+        assert isinstance(response.json_body, dict)
+        assert_images_generations_response(
+            response.json_body,
+            {"json": {"n": 1, "size": f"{WIDTH}x{HEIGHT}"}},
+        )
+    else:
+        err_message = (
+            "Only a single image is supported by this model."
+            if max_multimodal_image_inputs == 1
+            else f"At most {max_multimodal_image_inputs} images are supported"
+        )
+        client.send_images_edits_http_request(
+            request,
+            err_code=400,
+            err_message=err_message,
+        )
 
 
 def run_and_validate_online_determinism(server: OmniServer, client: OnlineOmniClient, task_type: DiffusionTasks):

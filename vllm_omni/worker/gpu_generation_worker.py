@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import gc
 import os
 
@@ -8,14 +11,17 @@ from vllm.tracing import instrument
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
-from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
+from vllm.v1.worker.gpu_worker import (
+    CompilationTimes,
+    init_worker_distributed_environment,
+)
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.base import OmniGPUWorkerBase
-from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
 from vllm_omni.worker.memory_utils import request_memory_tolerant
 from vllm_omni.worker.mixins import OmniWorkerMixin
+from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
 
 logger = init_logger(__name__)
 
@@ -27,7 +33,7 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     ``execution_type=StageExecutionType.LLM_GENERATION``.
     """
 
-    model_runner_cls = GPUGenerationModelRunner
+    model_runner_cls = OmniGenerationModelRunner
 
     @instrument(span_name="Init device")
     def init_device(self):
@@ -96,13 +102,19 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
-        if self.use_v2_model_runner:
-            # OMNI: v2 model runner does not yet include omni hooks.
-            logger.warning("OMNI GPUGenerationWorker forces v1 model runner for omni hooks.")
-            self.use_v2_model_runner = False
-
+        logger.info("Using MR v2 OmniGenerationModelRunner for generation stage.")
         self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    @instrument(span_name="Compile/warmup")
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        """Generation stages have no KV cache or sampler — skip warmup_kernels."""
+        import time
+
+        start = time.perf_counter()
+        self.model_runner.profile_run()
+        self._capture_auxiliary_graphs()
+        return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)

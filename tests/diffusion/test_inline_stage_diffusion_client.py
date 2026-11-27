@@ -1,13 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    DIFFUSION_REQUEST_LIFECYCLE_KEY,
+    DIFFUSION_REQUEST_STARTED,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -78,6 +86,75 @@ async def test_inline_dispatch_request_success(client, mock_engine):
 
     assert output is not None
     assert output.request_id == "req-1"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_inline_dispatch_preserves_payload_sender_info(client, mock_engine, streaming):
+    async def _run_test():
+        requests = []
+
+        async def _step_streaming(request):
+            requests.append(request)
+            yield [OmniRequestOutput.from_diffusion(request_id=request.request_id, images=[MagicMock()])]
+
+        mock_engine.step_streaming = _step_streaming
+        client.od_config.streaming_output = streaming
+        payload_sender_info = {"host": "10.0.0.1", "zmq_port": 50071}
+        kv_transfer_params = {"remote_engine_id": "mooncake-producer", "remote_block_ids": [1, 2]}
+        await client.add_request_async(
+            "req-payload",
+            "A test prompt",
+            OmniDiffusionSamplingParams(),
+            kv_transfer_params=kv_transfer_params,
+            payload_sender_info=payload_sender_info,
+        )
+
+        for _ in range(10):
+            if requests:
+                break
+            await asyncio.sleep(0.01)
+
+        assert requests[0].payload_sender_info == payload_sender_info
+        assert requests[0].kv_transfer_params == kv_transfer_params
+
+    asyncio.run(_run_test())
+
+
+@pytest.mark.asyncio
+async def test_inline_non_streaming_dispatches_lifecycle_before_final(client, mock_engine):
+    lifecycle = OmniRequestOutput.from_diffusion(
+        request_id="req-lifecycle",
+        images=[],
+        custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED},
+        finished=False,
+    )
+    intermediate = OmniRequestOutput.from_diffusion(
+        request_id="req-lifecycle",
+        images=[],
+        custom_output={"chunk": 0},
+        finished=False,
+    )
+    final = OmniRequestOutput.from_diffusion(request_id="req-lifecycle", images=[MagicMock()])
+
+    async def _step_streaming(_request):
+        yield [lifecycle]
+        yield [intermediate]
+        yield [final]
+
+    mock_engine.step_streaming = _step_streaming
+
+    await client.add_request_async("req-lifecycle", "A test prompt", OmniDiffusionSamplingParams())
+
+    outputs = []
+    for _ in range(20):
+        output = client.get_diffusion_output_nowait()
+        if output is not None:
+            outputs.append(output)
+            if output.finished:
+                break
+        await asyncio.sleep(0.01)
+
+    assert outputs == [lifecycle, final]
 
 
 @pytest.mark.asyncio
@@ -235,3 +312,34 @@ def test_inline_client_requires_replica_id(mock_engine):
                 od_config=od_config,
                 metadata=metadata,
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method", ["update_streaming_playback", "track_streaming_interaction", "release_streaming_output"]
+)
+async def test_playback_feedback_bypasses_a_waiting_worker_rpc(client, mock_engine, method):
+    entered = threading.Event()
+    release = threading.Event()
+    feedback = []
+
+    def rpc(method, timeout, args, kwargs, unique_reply_rank):
+        if method == "submit_interaction":
+            entered.set()
+            assert release.wait(timeout=5)
+        elif method == "update_streaming_playback":
+            feedback.append(args)
+
+    mock_engine.collective_rpc.side_effect = rpc
+    mock_engine.update_streaming_playback.side_effect = lambda *args, **kwargs: feedback.append(args)
+    mock_engine.track_streaming_interaction.side_effect = lambda *args, **kwargs: feedback.append(args)
+    mock_engine.release_streaming_output.side_effect = lambda *args, **kwargs: feedback.append(args)
+    interaction = asyncio.create_task(client.submit_interaction_async("video", {"event": {}}))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        await asyncio.wait_for(client.collective_rpc_async(method, args=("video", 0.5)), 1)
+        assert feedback == [("video", 0.5)]
+        assert not interaction.done()
+    finally:
+        release.set()
+        await interaction

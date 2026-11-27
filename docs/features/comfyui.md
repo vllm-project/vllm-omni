@@ -13,7 +13,6 @@ It can send model inference requests to either a locally running vLLM-Omni servi
 !!! tip
     If you run both ComfyUI and vLLM-Omni on the same device, you can create separate virtual environments and use different Python versions for them.
 
-
 ## Installation
 
 Copy the `apps/ComfyUI-vLLM-Omni` folder to the `custom_nodes` subfolder of your ComfyUI installation. Your directory should look like `ComfyUI/custom_nodes/ComfyUI-vLLM-Omni`.
@@ -21,9 +20,10 @@ Copy the `apps/ComfyUI-vLLM-Omni` folder to the `custom_nodes` subfolder of your
 If you are running ComfyUI during copying, you should restart ComfyUI to load this extension.
 
 !!! tip
-    You can use utility websites such as https://download-directory.github.io/ to download a subdirectory of a repo. Also checkout community discussions (e.g., https://stackoverflow.com/questions/7106012/download-a-single-folder-or-directory-from-a-github-repository) for more info.
+    You can use utility websites such as <https://download-directory.github.io/> to download a subdirectory of a repo. Also checkout community discussions (e.g., <https://stackoverflow.com/questions/7106012/download-a-single-folder-or-directory-from-a-github-repository>) for more info.
 
 On the device and virtual environment you run ComfyUI, launch ComfyUI with
+
 ```bash
 cd ComfyUI
 
@@ -35,6 +35,7 @@ python main.py --cpu
 ```
 
 On the device and virtual environment you run vLLM-Omni, start a model service with
+
 ```bash
 vllm serve The_Model_ID_to_Serve --omni --port 8000
 ```
@@ -48,13 +49,31 @@ This extension offers the following nodes based on the output modalities:
 
 - **Generate Image** for text-to-image and image-to-image tasks
 - **Generate Video** for text-to-video and image-to-video tasks
+- **Restore Video (SeedVR2)** for remote VIDEO restoration with source FPS and audio.
+  [Standalone and remote H3 templates](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/seedvr2-restoration.md)
+  use separately configured model services and the whole-clip SeedVR2 API.
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
+- **Generate Music** for text-to-music tasks
 
 This extension also offers example workflows (at **ComfyUI sidebar -> Templates -> vLLM-Omni**)
 
 !!! info
     The node UI and feature designs are intended to match vLLM-Omni online serving interfaces. It cannot offer more than what the interfaces support.
+
+Every node carries the vLLM-Omni mark in its title bar and is tinted by what it outputs, so a graph is readable at a glance:
+
+| Colour | Nodes | What they produce |
+| --- | --- | --- |
+| Blue | Generate Image, Generate Video, Multimodality Understanding, TTS, TTS Voice Clone | A generated image, video, audio, or text. These are the only nodes that reach a server. |
+| Amber | AR / Diffusion / Multi-Stage Sampling Params | Sampling parameters that apply to any model |
+| Purple | Qwen TTS Params, Wan Video Params, MiniMax-H3 Video Params | Parameters that only one model family accepts |
+| Red | LoRA, FastH3 Deployment | Which weights the server is expected to have loaded |
+| Teal | Video References | Reference media |
+
+Recolouring a node by hand (right click -> Colors) overrides its tint, and the choice is kept.
+
+**Generate Video** takes a clip length in seconds (`duration`), not a frame count. Frames stay the wire unit and are derived with the node's `fps`, so the length is always measured against the rate that is actually served; models that accept only certain frame counts still round to their own lattice server-side. Graphs saved before this widget existed stored `num_frames` in its place and are converted on load, using the fps recorded alongside it -- the browser console names every node it rewrites.
 
 To build a simple workflow yourself,
 
@@ -65,6 +84,36 @@ To build a simple workflow yourself,
     - For multi-stage models, you can connect multiple **AR Sampling Params** and **Diffusion Sampling Params** nodes to a **Multi-Stage Sampling Params List** node, and connect this node to the generation node.
     - For some multi-stage models like BAGEL, [only one stage's sampling parameters are exposed and tunable via vLLM-Omni's online serving API](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/examples/online_serving/bagel/). Thus, these models are treated as single-stage ones. Please check the vLLM-Omni documentation on how to correctly set each model's sampling parameters.
     - For multi-stage models where all stages are either autoregression or diffusion, you can also connect only a single Sampling Params node, indicating that this set of sampling parameters will be used for all stages.
+
+## MiniMax H3 text-to-video workflow
+
+The **MiniMax H3 Text to Video** template uses the existing remote Generate Video,
+H3 Params, sampling, and Remote LoRA nodes. It includes Base settings and an
+optional Turbo preset, with native resolution, 24 FPS, and `17k+5` frame counts.
+ComfyUI receives the generated video and audio from the server; it does not load
+H3 weights locally. Configure the server-side LoRA path before enabling Turbo.
+
+See the [H3 workflow guide](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/minimax-h3-t2v.md)
+for server setup, template import, Turbo configuration, recorded validation,
+and saved-video/audio checks.
+
+## MiniMax H3 all-in-one workflow
+
+The **MiniMax-H3 All-in-One** template puts T2VA, first/last-frame FL2VA, and
+mixed-reference Ref2VA in one graph built from the existing nodes. The server
+URL, served model name, duration, sampling, and flow shifts are shared by all
+modes, and each mode is a group you enable or mute. It does not include a
+prompt LLM. See the
+[all-in-one workflow guide](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/h3-06-all-in-one.md).
+
+## MiniMax H3 music video workflow
+
+The **MiniMax-H3 Music Video** template builds a multi-shot music video from a
+supplied track. Each shot is a Ref2VA request driven by its slice of the track
+(`audio_mode=lock_source` on **MiniMax-H3 Video Params**) with a shared
+character/style image. ComfyUI's Concatenate Video node joins the shots and
+attaches the original recording. See the
+[music video workflow guide](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/h3-03-music-video.md).
 
 ## Examples & Screenshots
 

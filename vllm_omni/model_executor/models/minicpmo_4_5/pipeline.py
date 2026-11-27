@@ -8,6 +8,9 @@ Stage 2: Code2Wav — codec tokens to the final audio waveform.
 
 The thinker -> talker bridge uses ``llm2tts``. The talker -> Code2Wav bridge
 streams request-routed codec chunks.
+
+``minicpmo_4_5_thinker_only`` keeps only Stage 0. A deploy config selects it
+through its ``pipeline`` key; checkpoint auto-detection keeps the full pipeline.
 """
 
 from vllm_omni.config.stage_config import (
@@ -17,20 +20,35 @@ from vllm_omni.config.stage_config import (
 )
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni"
+_SCHEDULER_WINDOW_POLICY = (
+    "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
+)
 MINICPMO45_REFERENCE_AUDIO_KEY = "_minicpmo45_reference_audio"
+_CODEC_EOS_TOKEN_ID = 6561  # tts_config.num_audio_tokens - 1
+
+
+def _talker_stop_token_ids() -> list[int]:
+    """Stage 1's default stop id: the codec EOS of the one-frame head.
+
+    The deploy config that arms the multi-frame decode (stage 1's
+    ``speculative_config``, under ``platforms.npu``) collapses the vLLM-level
+    head to the two-wide continue/stop row, where the codec EOS can never
+    appear; that same config adds the stop marker (1) through its
+    ``default_sampling_params``, and ``merge_sampling_constraints`` unions both
+    lists. The marker therefore travels with the block that needs it, and this
+    default covers every deployment without one.
+
+    A deployment that keeps the marker here instead ends every one-frame
+    request on the first ordinary codec id 1.
+    """
+    return [_CODEC_EOS_TOKEN_ID]
 
 
 MINICPMO_4_5_PIPELINE = PipelineConfig(
     model_type="minicpmo_4_5",
     default_deploy_config_name="minicpmo_4_5.yaml",
     model_arch="MiniCPMO45OmniForConditionalGeneration",
-    duplex_runtime_extension=(
-        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.runtime.MiniCPMO45DuplexRuntimeExtension"
-    ),
-    duplex_serving_adapter=(
-        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.serving_adapter.MiniCPMO45ServingRuntimeAdapter"
-    ),
-    duplex_control_enabled=True,
+    duplex_plugin="vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin.MiniCPMO45DuplexPlugin",
     # MiniCPM-o 4.5's HF config.json reports `model_type="minicpmo"` and
     # `architectures=["MiniCPMO"]` — both shared verbatim with older MiniCPM-o
     # 1.0 / 2.6 checkpoints. The only field distinguishing the generations is
@@ -41,7 +59,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
     # checkpoint would also intersect ``["MiniCPMO"]`` here and get routed
     # into the 4.5 pipeline, which would then fail at load time.
     hf_architectures=("MiniCPMO", "MiniCPMO45OmniForConditionalGeneration"),
-    hf_config_predicate=lambda c: str(getattr(c, "version", "")) == "4.5",
+    hf_config_predicate=lambda c: str(getattr(c, "version", "")) == "4.5" and getattr(c, "vocab_size", None) != 151749,
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -51,9 +69,18 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="text",
             owns_tokenizer=True,
+            scheduler_window_policy=_SCHEDULER_WINDOW_POLICY,
             requires_multimodal_data=True,
             engine_output_type="latent",
-            sampling_constraints={"detokenize": True},
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
+            sampling_constraints={
+                "detokenize": True,
+                # The llm2tts bridge discards this boundary and every row
+                # after it, so stop Stage 0 as soon as either valid
+                # MiniCPM-o 4.5 turn terminator is sampled.
+                "stop_token_ids": [151704, 151645],
+            },
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -65,11 +92,14 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             custom_process_input_func=f"{_PROC}.llm2tts",
             custom_process_next_stage_input_func=f"{_PROC}.tts2code2wav_full_payload",
             async_chunk_process_next_stage_input_func=f"{_PROC}.tts2code2wav_async_chunk",
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             sampling_constraints={
                 "detokenize": False,
-                # MiniCPM-o 4.5 codec EOS is tts_config.num_audio_tokens - 1.
-                # Same pattern as Qwen3 talker's stop_token_ids: [2150].
-                "stop_token_ids": [6561],
+                # The stop id has to be one the vLLM-level head can actually
+                # emit, and that head changes shape when the K-frame loop is
+                # armed -- see _talker_stop_token_ids.
+                "stop_token_ids": _talker_stop_token_ids(),
             },
         ),
         StagePipelineConfig(
@@ -81,9 +111,44 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="MiniCPMO45Code2Wav",
+            retains_state_across_chunks=True,
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             sync_process_input_func=f"{_PROC}.tts2code2wav_token_only",
+            # Sends the reference audio with the async-chunk placeholder so
+            # Code2Wav can prepare it while it waits for chunk 0.
+            async_chunk_prewarm_payload_func=f"{_PROC}.code2wav_prewarm_payload",
             sampling_constraints={"detokenize": True},
             requires_full_payload_input=True,
+        ),
+    ),
+)
+
+MINICPMO_4_5_THINKER_ONLY_PIPELINE = PipelineConfig(
+    model_type="minicpmo_4_5_thinker_only",
+    default_deploy_config_name="minicpmo_4_5_duplex_thinker_only.yaml",
+    model_arch="MiniCPMO45OmniForConditionalGeneration",
+    duplex_plugin="vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin.MiniCPMO45DuplexPlugin",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="llm",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            scheduler_window_policy=_SCHEDULER_WINDOW_POLICY,
+            requires_multimodal_data=True,
+            engine_output_type="latent",
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
+            sampling_constraints={
+                "detokenize": True,
+                # The native duplex decoder continues through the checkpoint's EOS tokens.
+                "ignore_eos": True,
+                "stop_token_ids": [151705, 151718, 151721],
+            },
         ),
     ),
 )

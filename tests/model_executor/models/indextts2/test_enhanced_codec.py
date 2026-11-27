@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import pytest
 import torch
 
 from vllm_omni.model_executor.models.indextts2 import codec as codec_module
 from vllm_omni.model_executor.models.indextts2 import preprocess_utils
 from vllm_omni.model_executor.models.indextts2.codec import EnhancedCodec
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_enhanced_codec_decode_restores_hidden_size_and_doubles_time():
@@ -84,14 +87,116 @@ def test_model_asset_resolver_supports_native_checkpoints_layout(tmp_path):
     assert preprocess_utils.resolve_model_file(str(tmp_path), "codec.pth") == str(checkpoint)
 
 
-def test_campplus_falls_back_to_hub_for_local_model_dir(tmp_path, monkeypatch):
-    import huggingface_hub
+def test_wav2vec_remote_layout_falls_back_in_order(monkeypatch):
+    import transformers
+
+    calls = []
+
+    class FakeFeatureExtractor:
+        @classmethod
+        def from_pretrained(cls, **kwargs):
+            calls.append(("processor", kwargs.copy()))
+            if kwargs.get("subfolder") != "pretrained/w2v-bert-2.0":
+                raise OSError("not found")
+            return cls()
+
+    class FakeWav2Vec2(torch.nn.Module):
+        @classmethod
+        def from_pretrained(cls, **kwargs):
+            calls.append(("model", kwargs.copy()))
+            return cls()
+
+    monkeypatch.setattr(
+        transformers,
+        "AutoFeatureExtractor",
+        FakeFeatureExtractor,
+    )
+    monkeypatch.setattr(
+        transformers,
+        "Wav2Vec2BertModel",
+        FakeWav2Vec2,
+    )
+    monkeypatch.setattr(
+        preprocess_utils,
+        "resolve_model_directory",
+        lambda *_args: None,
+    )
+    preprocess_utils._wav2vec2_cache.clear()
+
+    model, processor = preprocess_utils.load_wav2vec2(
+        "org/model",
+        torch.device("cpu"),
+    )
+
+    assert isinstance(model, FakeWav2Vec2)
+    assert isinstance(processor, FakeFeatureExtractor)
+    assert calls == [
+        (
+            "processor",
+            {
+                "pretrained_model_name_or_path": "org/model",
+                "subfolder": "wav2vec2bert",
+            },
+        ),
+        (
+            "processor",
+            {
+                "pretrained_model_name_or_path": "org/model",
+                "subfolder": "w2v-bert-2.0",
+            },
+        ),
+        (
+            "processor",
+            {
+                "pretrained_model_name_or_path": "org/model",
+                "subfolder": "pretrained/w2v-bert-2.0",
+            },
+        ),
+        (
+            "model",
+            {
+                "pretrained_model_name_or_path": "org/model",
+                "subfolder": "pretrained/w2v-bert-2.0",
+            },
+        ),
+    ]
+
+
+def test_campplus_local_dir_does_not_silently_download(tmp_path, monkeypatch):
+    """A local bundle missing CAMPPlus must fail closed, not hit the Hub.
+
+    origin/main ``load_campplus`` treats ``os.path.isdir(model_path)`` as a
+    complete local snapshot and raises FileNotFoundError instead of
+    downloading ``funasr/campplus``. The old test name
+    ``test_campplus_falls_back_to_hub_for_local_model_dir`` encoded the
+    pre-guard behavior.
+    """
+    from vllm_omni.model_executor.models.indextts2.utils.campplus import dtdnn
+
+    class FakeCAMPPlus(torch.nn.Module):
+        def load_state_dict(self, state, strict=True):
+            self.loaded_state = (state, strict)
+
+    monkeypatch.setattr(dtdnn, "CAMPPlus", lambda **_kwargs: FakeCAMPPlus())
+    preprocess_utils._campplus_cache.clear()
+
+    with pytest.raises(FileNotFoundError, match="CAMPPlus checkpoint is missing from local bundle"):
+        preprocess_utils.load_campplus(str(tmp_path), torch.device("cpu"))
+
+
+def test_campplus_falls_back_to_hub_for_repo_id(tmp_path, monkeypatch):
+    from types import SimpleNamespace
 
     from vllm_omni.model_executor.models.indextts2.utils.campplus import dtdnn
+    from vllm_omni.transformers_utils import repo_utils
 
     checkpoint = tmp_path / "downloaded-campplus.bin"
     checkpoint.touch()
     downloads = []
+
+    def fake_download(repo_id, filename):
+        downloads.append((repo_id, filename))
+        return str(checkpoint)
 
     class FakeCAMPPlus(torch.nn.Module):
         def load_state_dict(self, state, strict=True):
@@ -99,14 +204,16 @@ def test_campplus_falls_back_to_hub_for_local_model_dir(tmp_path, monkeypatch):
 
     monkeypatch.setattr(dtdnn, "CAMPPlus", lambda **_kwargs: FakeCAMPPlus())
     monkeypatch.setattr(
-        huggingface_hub,
-        "hf_hub_download",
-        lambda repo_id, filename: downloads.append((repo_id, filename)) or str(checkpoint),
+        repo_utils,
+        "hf_api",
+        lambda: SimpleNamespace(
+            hf_hub_download=fake_download,
+        ),
     )
     monkeypatch.setattr(preprocess_utils.torch, "load", lambda *_args, **_kwargs: {"weight": torch.ones(1)})
     preprocess_utils._campplus_cache.clear()
 
-    model = preprocess_utils.load_campplus(str(tmp_path), torch.device("cpu"))
+    model = preprocess_utils.load_campplus("IndexTeam/IndexTTS-2", torch.device("cpu"))
 
     assert isinstance(model, FakeCAMPPlus)
     assert downloads == [("funasr/campplus", "campplus_cn_common.bin")]

@@ -1,13 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared stage-client typing for vLLM-Omni runtime surfaces."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest
 
+    from vllm_omni.engine import PayloadSenderInfo
+    from vllm_omni.engine.messages import TextInputUpdate
     from vllm_omni.inputs.data import (
         OmniDiffusionSamplingParams,
         OmniInteractionPrompt,
@@ -76,6 +81,7 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
 
     async def add_request_async(self, request: EngineCoreRequest) -> None: ...
 
+    async def append_text_async(self, update: TextInputUpdate) -> None: ...
     async def get_output_async(self) -> EngineCoreOutputs: ...
 
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None: ...
@@ -94,6 +100,16 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
         kv_transfer_port_offset: int = ...,
     ) -> dict[str, Any] | None: ...
 
+    def get_payload_sender_info(self) -> dict[str, Any] | None: ...
+
+
+class DiffusionSubmitKwargs(TypedDict, total=False):
+    """Kwargs the orchestrator passes to `StagePoolDiffusionClient.add_request_async`."""
+
+    kv_sender_info: dict[int, dict[str, Any]] | None
+    kv_transfer_params: dict[str, Any] | None
+    payload_sender_info: PayloadSenderInfo | None
+
 
 class StagePoolDiffusionClient(StagePoolClient, Protocol):
     """Pool-facing API for diffusion stages."""
@@ -105,6 +121,7 @@ class StagePoolDiffusionClient(StagePoolClient, Protocol):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
+        payload_sender_info: PayloadSenderInfo | None = None,
     ) -> None: ...
 
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None: ...

@@ -17,8 +17,8 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 from safetensors.torch import load_file, save_file
 
-import vllm_omni.diffusion.models.magi2.layers as layers_module
-import vllm_omni.diffusion.models.magi2.mh_moe as mh_moe_module
+import vllm_omni.diffusion.models.magi2.common_layers as layers_module
+import vllm_omni.diffusion.models.magi2.layers.native.mh_moe as mh_moe_module
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     build_checkpoint_mmap_plan,
 )
@@ -36,6 +36,7 @@ from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
     DistributedLayerwiseOffloadHook,
 )
+from vllm_omni.diffusion.offloader.plan_resolver import ResolvedComponent
 
 
 @dataclass(frozen=True)
@@ -44,12 +45,6 @@ class _WeightSourceStub:
     subfolder: str
     revision: str | None
     prefix: str
-
-
-@dataclass(frozen=True)
-class _PipelineModulesStub:
-    dits: list[nn.Module]
-    dit_names: list[str]
 
 
 _WORLD_SIZE = 4
@@ -189,7 +184,7 @@ def _load_mmap_transform_and_reconstruct(
         backend._mmap_transforms_by_tensor_id = {}
         backend._load_weights_via_mmap(
             pipeline,
-            _PipelineModulesStub(dits=[target], dit_names=["transformer"]),
+            (ResolvedComponent(path="transformer", module=target, selected=True),),
             plan_result.plan,
         )
 

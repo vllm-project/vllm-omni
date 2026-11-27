@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """External model loading, audio I/O, and emotion conditioning for IndexTTS2."""
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ logger = init_logger(__name__)
 
 _wav2vec2_cache: dict[tuple[str, str], tuple] = {}
 _semantic_codec_cache: dict[tuple[str, str, str], Any] = {}
-_campplus_cache: dict[tuple[str, str], Any] = {}
+_campplus_cache: dict[tuple[str, str, bool], Any] = {}
 _qwen_emotion_cache: dict[tuple[str, str], tuple] = {}
 
 
@@ -88,6 +88,7 @@ def load_wav2vec2(model_path: str, device: torch.device):
         "wav2vec2bert",
         "w2v-bert-2.0",
         os.path.join("hf_cache", "w2v-bert-2.0"),
+        os.path.join("pretrained", "w2v-bert-2.0"),
     )
     if local_dir is not None:
         try:
@@ -102,16 +103,25 @@ def load_wav2vec2(model_path: str, device: torch.device):
         except Exception as exc:
             raise RuntimeError(f"Failed to load local IndexTTS Wav2Vec2-BERT assets from {local_dir!r}") from exc
 
-    # Try a remote model subfolder, then the public base model.
-    try:
-        if model is None or processor is None:
+    # Try remote model subfolders, then the public base model.
+    if model is None or processor is None:
+        for subfolder in (
+            "wav2vec2bert",
+            "w2v-bert-2.0",
+            os.path.join("pretrained", "w2v-bert-2.0"),
+        ):
             src_args = dict(
                 pretrained_model_name_or_path=model_path,
-                subfolder="wav2vec2bert",
+                subfolder=subfolder,
             )
-            processor = AutoFeatureExtractor.from_pretrained(**src_args)
-            model = Wav2Vec2BertModel.from_pretrained(**src_args)
-    except Exception:
+            try:
+                processor = AutoFeatureExtractor.from_pretrained(**src_args)
+                model = Wav2Vec2BertModel.from_pretrained(**src_args)
+                break
+            except Exception:
+                processor = None
+                model = None
+    if model is None or processor is None:
         try:
             with _repo_prefetch_lock("facebook/w2v-bert-2.0"):
                 src_args = dict(pretrained_model_name_or_path="facebook/w2v-bert-2.0")
@@ -171,17 +181,23 @@ def load_semantic_codec(
         codec.load_state_dict(state, strict=False)
     else:
         import safetensors.torch
-        from huggingface_hub import hf_hub_download
 
-        ckpt_path = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
+        from vllm_omni.transformers_utils.repo_utils import hf_api
+
+        ckpt_path = hf_api().hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
         safetensors.torch.load_model(codec, ckpt_path)
     _freeze(codec.to(device=device, dtype=torch.float32))
     _semantic_codec_cache[cache_key] = codec
     return codec
 
 
-def load_campplus(model_path: str, device: torch.device):
-    cache_key = (model_path, str(device))
+def load_campplus(
+    model_path: str,
+    device: torch.device,
+    *,
+    allow_remote_fallback: bool = False,
+):
+    cache_key = (model_path, str(device), allow_remote_fallback)
     if cache_key in _campplus_cache:
         return _campplus_cache[cache_key]
     from .utils.campplus.dtdnn import CAMPPlus
@@ -193,14 +209,17 @@ def load_campplus(model_path: str, device: torch.device):
         "campplus_cn_common.bin",
         os.path.join("hf_cache", "campplus_cn_common.bin"),
         os.path.join("campplus", "campplus_cn_common.bin"),
+        os.path.join("pretrained", "campplus", "campplus_cn_common.bin"),
     ):
         ckpt_path = resolve_model_file(model_path, relative_path)
         if ckpt_path is not None:
             break
     if ckpt_path is None:
-        from huggingface_hub import hf_hub_download
+        if os.path.isdir(model_path) and not allow_remote_fallback:
+            raise FileNotFoundError(f"IndexTTS CAMPPlus checkpoint is missing from local bundle {model_path!r}")
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        ckpt_path = hf_hub_download("funasr/campplus", filename="campplus_cn_common.bin")
+        ckpt_path = hf_api().hf_hub_download("funasr/campplus", filename="campplus_cn_common.bin")
     state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     campplus.load_state_dict(state, strict=False)
     _freeze(campplus.to(device=device, dtype=torch.float32))

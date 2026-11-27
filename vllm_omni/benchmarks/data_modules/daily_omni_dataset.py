@@ -77,12 +77,45 @@ except ImportError:
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.hf import get_cached_tokenizer
 
+from vllm_omni.benchmarks.data_modules import DatasetSource
+
 try:
     from datasets import load_dataset
 except ImportError:
     load_dataset = None
 
 logger = logging.getLogger(__name__)
+
+
+def prepare_daily_omni_inputs(
+    source: DatasetSource, count: int, work: Path, *, indices: list[int] | None = None
+) -> dict[str, str | bool]:
+    """Materialize a verified QA prefix before the loader can skip source rows."""
+    root = source.resolve([source.manifest, "Videos.tar"])
+    videos = root / "Videos"
+    if not videos.is_dir():
+        videos = _extract_daily_omni_videos_tar(root / "Videos.tar", source.revision)
+    rows = json.loads((root / source.manifest).read_text())
+    if not isinstance(rows, list) or len(rows) != source.count:
+        raise ValueError("Pinned Daily-Omni question count changed")
+    if not 0 < count <= source.count:
+        raise ValueError("Request count exceeds the pinned dataset")
+    if indices is not None and (
+        len(indices) != count
+        or any(type(index) is not int or not 0 <= index < source.count for index in indices)
+        or len(set(indices)) != count
+    ):
+        raise ValueError("Sample indices must identify distinct Daily-Omni rows for every request")
+    work.mkdir(parents=True, exist_ok=True)
+    qa = work / "qa.json"
+    selected = rows[:count] if indices is None else [rows[index] for index in indices]
+    qa.write_text(json.dumps(selected, ensure_ascii=False), encoding="utf-8")
+    return {
+        "daily_omni_qa_json": str(qa),
+        "daily_omni_video_dir": str(videos),
+        "daily_omni_inline_local_video": True,
+    }
+
 
 # Official MiniCPM ``get_video_frame_audio_segments`` default (env ``MAX_NUM_FRAMES``).
 _MINICPM_MAX_NUM_FRAMES = int(os.environ.get("MAX_NUM_FRAMES", "64"))
@@ -170,7 +203,7 @@ def ensure_daily_omni_hub_videos_dir(repo_id: str) -> Path:
         raise ValueError("repo_id is required to download Daily-Omni Videos.tar")
 
     try:
-        from huggingface_hub import hf_hub_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
     except ImportError as e:
         raise ImportError(
             "Daily-Omni Hub media download requires huggingface_hub. "
@@ -180,7 +213,7 @@ def ensure_daily_omni_hub_videos_dir(repo_id: str) -> Path:
     tar_path: Path | None = None
     for fname in ("Videos.tar", "videos.tar"):
         try:
-            tar_path = Path(hf_hub_download(repo_id=rid, filename=fname, repo_type="dataset"))
+            tar_path = Path(hf_api().hf_hub_download(repo_id=rid, filename=fname, repo_type="dataset"))
             break
         except Exception:
             continue
@@ -237,14 +270,14 @@ def ensure_daily_omni_hub_root(repo_id: str) -> Path:
         raise ValueError("repo_id is required to download Daily-Omni from Hugging Face")
 
     try:
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
     except ImportError as e:
         raise ImportError(
             "Install huggingface_hub to load Daily-Omni from the Hub, or pass a local "
             "--daily-omni-qa-json / --daily-omni-video-dir mirror."
         ) from e
 
-    cache = snapshot_download(
+    cache = hf_api().snapshot_download(
         repo_id=rid,
         repo_type="dataset",
         allow_patterns=_DAILY_OMNI_QA_ALLOW_PATTERNS,

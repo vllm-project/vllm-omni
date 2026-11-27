@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -131,6 +135,9 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         inputs_embeds: torch.Tensor | None = None,
         *,
         last_talker_hidden: torch.Tensor | None = None,
+        sample_uniforms: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        generators: Any = None,
         **_: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate full RVQ codes + summed embeddings (single-loop, no KV cache).
@@ -179,10 +186,20 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             layer0_code = input_ids[:, pos : pos + 1]
             layer0_embed = embed_fn(layer0_code)
 
+            # The uniform buffer covers one decode step. Prefill spans keep
+            # drawing inside the predictor.
+            sampling_kwargs: dict[str, Any] = {}
+            if seq_len == 1 and sample_uniforms is not None:
+                sampling_kwargs["sample_uniforms"] = sample_uniforms
+            elif seq_len == 1 and generators is not None:
+                sampling_kwargs["generators"] = generators
+            elif seq_len == 1 and generator is not None:
+                sampling_kwargs["generator"] = generator
             pos_all_layers, proj_buf = self.code_predictor(
                 layer0_code,
                 layer0_embed,
                 last_talker_hidden,
+                **sampling_kwargs,
             )
 
             result_codes[:, :, pos : pos + 1] = pos_all_layers
@@ -299,13 +316,12 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         to vLLM's internal structure. Code predictor weights are routed
         to its custom loader for vocab extension support.
         """
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=["thinker.", "code2wav."],
-            # "code_predictor."],
-        )
+        loader = AutoWeightsLoader(self)
         # Don't apply mapper again since we already did it
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(
+            weights,
+            mapper=(self.hf_to_vllm_mapper) | WeightsMapper(orig_to_new_prefix={"thinker.": None, "code2wav.": None}),
+        )
 
         # Log load summary
         try:

@@ -1,11 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for the unified quantization framework."""
 
 import pytest
 from torch import nn
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def test_serialized_per_channel_fp8_reuses_upstream_kernel_and_limits_scope():
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config, resolve
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8DynamicTokenSym, kFp8StaticTokenSym
+
+    from vllm_omni.quantization import build_quant_config
+
+    metadata = {
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "weight_scheme": "per_channel",
+        "activation_scheme": "dynamic_per_token",
+        "quantized_modules": r"blocks\.\d+\.proj\.weight",
+    }
+    config = build_quant_config(metadata)
+    assert isinstance(config, ModelOptFp8Config)
+    spec, _, _ = resolve(config.quant_method, config, "blocks.0.proj")
+    assert spec.weight == kFp8StaticTokenSym
+    assert spec.activation == kFp8DynamicTokenSym
+    assert config.is_checkpoint_fp8_serialized
+    assert config.get_name() == "fp8"
+    assert not config.is_layer_excluded("blocks.0.proj")
+    assert config.is_layer_excluded("blocks.0.norm")
+    assert config.is_layer_excluded("text_encoder.proj")
+    with pytest.raises(ValueError, match="activation_scheme"):
+        build_quant_config(metadata | {"activation_scheme": "static"})
 
 
 def test_build_quant_config_fp8():
@@ -15,6 +42,164 @@ def test_build_quant_config_fp8():
     assert config is not None
     assert config.get_name() == "fp8"
     assert config.activation_scheme == "dynamic"
+    assert not config.is_checkpoint_fp8_serialized
+
+
+def test_build_quant_config_fp8_uses_native_online_quantization():
+    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config("fp8", ignored_layers=["proj_out"])
+    assert isinstance(config, OnlineQuantizationConfig)
+    assert config.args.linear.weight == kFp8StaticTensorSym
+    assert config.args.moe.weight == kFp8StaticTensorSym
+    assert config.ignored_layers == ["proj_out"]
+
+
+def _online_linear_cls():
+    """A linear class the online configs resolve a method for, with no weights to allocate.
+
+    Instances come from ``cls.__new__(cls)``: constructing a method needs an active
+    vLLM config, and a skipped layer must return before resolution reaches one.
+    """
+    from vllm.model_executor.layers.linear import LinearBase
+
+    class _Linear(LinearBase):
+        pass
+
+    return _Linear
+
+
+def test_online_fp8_ignored_layers_default_match_mode_is_exact():
+    """`ignored_layers` entries name a full layer prefix, so a short module name covers no block."""
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config("fp8", ignored_layers=["img_mlp"])
+    assert config.ignored_layers_match_mode == "exact"
+    resolved = config.resolve_quant_method_cls(_online_linear_cls(), "transformer_blocks.0.img_mlp.net.0.proj")
+    assert resolved is not None
+
+
+def test_online_fp8_substring_match_mode_covers_short_names():
+    """A pipeline that documents short names as patterns raises the mode to cover every block."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config("fp8", ignored_layers=["img_mlp"])
+    config.ignored_layers_match_mode = "substring"
+    linear_cls = _online_linear_cls()
+
+    method = config.get_quant_method(linear_cls.__new__(linear_cls), "transformer_blocks.0.img_mlp.net.0.proj")
+    assert isinstance(method, UnquantizedLinearMethod)
+    assert config.resolve_quant_method_cls(linear_cls, "transformer_blocks.0.attn.to_qkv") is not None
+
+
+def test_online_fp8_substring_match_mode_covers_text_encoder_subtrees():
+    """Qwen-Image-2.1 keeps the Qwen3-VL vision tower and the unused LM head out of FP8 this way."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config("fp8", ignored_layers=["model.visual", "lm_head"])
+    config.ignored_layers_match_mode = "substring"
+    linear_cls = _online_linear_cls()
+    layer = linear_cls.__new__(linear_cls)
+
+    assert isinstance(config.get_quant_method(layer, "model.visual.blocks.0.mlp.linear_fc1"), UnquantizedLinearMethod)
+    assert isinstance(config.get_quant_method(layer, "lm_head"), UnquantizedLinearMethod)
+
+
+def test_online_fp8_rocm_keeps_non_aligned_local_linear_dimensions_unquantized(monkeypatch):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    import vllm_omni.quantization.fp8_config as fp8_config_module
+    from vllm_omni.quantization import build_quant_config
+
+    class _RocmPlatform:
+        @staticmethod
+        def is_rocm() -> bool:
+            return True
+
+    monkeypatch.setattr(fp8_config_module, "current_platform", _RocmPlatform())
+    config = build_quant_config("fp8")
+    linear_cls = _online_linear_cls()
+    layer = linear_cls.__new__(linear_cls)
+    layer.input_size = 2520
+    layer.input_size_per_partition = 2520
+    layer.output_size = 10240
+    layer.output_size_per_partition = 10240
+
+    method = config.get_quant_method(layer, "gen_transformer.context_refiner.0.attn.to_q")
+
+    assert isinstance(method, UnquantizedLinearMethod)
+    assert config._reported_rocm_alignment_fallback
+
+    layer.input_size = 2528
+    layer.input_size_per_partition = 2528
+    layer.output_size = 2520
+    layer.output_size_per_partition = 2520
+    assert config._requires_rocm_alignment_fallback(layer)
+
+    layer.output_size = 2528
+    layer.output_size_per_partition = 2528
+    assert not config._requires_rocm_alignment_fallback(layer)
+
+
+def test_build_quant_config_upstream_online_fp8_shorthand():
+    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config("fp8_per_tensor", ignore=["proj_out"])
+    assert isinstance(config, OnlineQuantizationConfig)
+    assert config.args.linear.weight == kFp8StaticTensorSym
+    assert config.ignored_layers == ["proj_out"]
+
+
+def test_online_fp8_rejects_static_activation():
+    from vllm_omni.quantization import build_quant_config
+
+    with pytest.raises(ValueError, match="activation_scheme='dynamic'"):
+        build_quant_config("fp8", activation_scheme="static")
+
+
+def test_build_online_quant_config_preserves_explicit_native_args():
+    from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
+    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+
+    from vllm_omni.quantization import build_quant_config
+
+    args = QuantizationConfigArgs(linear=QuantSpec(weight="fp8_per_tensor_static"), ignore=["proj_out"])
+    config = build_quant_config("online", args=args)
+    assert isinstance(config, OnlineQuantizationConfig)
+    assert config.args is args
+    assert config.ignored_layers == ["proj_out"]
+
+
+def test_build_online_quant_config_requires_args():
+    from vllm_omni.quantization import build_quant_config
+
+    with pytest.raises(ValueError, match="requires quantization config arguments"):
+        build_quant_config("online")
+
+
+def test_serialized_checkpoint_replaces_online_fp8_config():
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+    config = resolve_quant_config_from_disk(
+        build_quant_config("fp8"),
+        {"quant_method": "fp8", "is_checkpoint_fp8_serialized": True, "activation_scheme": "static"},
+    )
+    assert isinstance(config, Fp8Config)
+    assert config.is_checkpoint_fp8_serialized
+    assert config.activation_scheme == "static"
 
 
 def test_build_quant_config_none():
@@ -39,7 +224,7 @@ def test_build_quant_config_invalid():
 def test_build_quant_config_dict():
     from vllm_omni.quantization import build_quant_config
 
-    config = build_quant_config({"method": "fp8", "activation_scheme": "static"})
+    config = build_quant_config({"method": "fp8", "is_checkpoint_fp8_serialized": True, "activation_scheme": "static"})
     assert config is not None
     assert config.get_name() == "fp8"
     assert config.activation_scheme == "static"
@@ -48,7 +233,7 @@ def test_build_quant_config_dict():
 def test_build_quant_config_dict_not_mutated():
     from vllm_omni.quantization import build_quant_config
 
-    original = {"method": "fp8", "activation_scheme": "static"}
+    original = {"method": "fp8", "is_checkpoint_fp8_serialized": True, "activation_scheme": "static"}
     copy = original.copy()
     build_quant_config(original)
     assert original == copy
@@ -99,7 +284,7 @@ def test_build_quant_config_per_component_inner_dict_not_mutated():
     """Inner component dicts should not be mutated by build_quant_config."""
     from vllm_omni.quantization import build_quant_config
 
-    inner = {"method": "fp8", "activation_scheme": "static"}
+    inner = {"method": "fp8", "is_checkpoint_fp8_serialized": True, "activation_scheme": "static"}
     original = inner.copy()
     build_quant_config({"transformer": inner, "vae": None})
     assert inner == original
@@ -115,20 +300,18 @@ def test_flat_dict_not_misdetected_as_per_component():
 
 
 def test_build_quant_config_passthrough():
-    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-
     from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.fp8_config import DiffusionFp8Config
 
-    fp8 = Fp8Config(is_checkpoint_fp8_serialized=False, activation_scheme="dynamic")
+    fp8 = DiffusionFp8Config()
     assert build_quant_config(fp8) is fp8
 
 
 def test_component_config_routing():
-    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-
     from vllm_omni.quantization import ComponentQuantizationConfig
+    from vllm_omni.quantization.fp8_config import DiffusionFp8Config
 
-    fp8 = Fp8Config(is_checkpoint_fp8_serialized=False, activation_scheme="dynamic")
+    fp8 = DiffusionFp8Config()
     config = ComponentQuantizationConfig(
         component_configs={"transformer": fp8, "vae": None},
     )
@@ -140,11 +323,10 @@ def test_component_config_routing():
 
 
 def test_component_config_with_default():
-    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-
     from vllm_omni.quantization import ComponentQuantizationConfig
+    from vllm_omni.quantization.fp8_config import DiffusionFp8Config
 
-    fp8 = Fp8Config(is_checkpoint_fp8_serialized=False, activation_scheme="dynamic")
+    fp8 = DiffusionFp8Config()
     config = ComponentQuantizationConfig(
         component_configs={"vae": None},
         default_config=fp8,
@@ -154,40 +336,40 @@ def test_component_config_with_default():
     assert config.resolve("vae.encoder") is None
 
 
-def test_integration_string():
+def test_integration_string(tmp_path):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-    config = OmniDiffusionConfig(model="test", quantization_config="fp8")
+    config = OmniDiffusionConfig(model=str(tmp_path), quantization_config="fp8")
     assert config.quantization_config is not None
     assert config.quantization_config.get_name() == "fp8"
 
 
-def test_integration_dict():
+def test_integration_dict(tmp_path):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
     config = OmniDiffusionConfig(
-        model="test",
-        quantization_config={"method": "fp8", "activation_scheme": "static"},
+        model=str(tmp_path),
+        quantization_config={"method": "fp8", "is_checkpoint_fp8_serialized": True, "activation_scheme": "static"},
     )
     assert config.quantization_config is not None
     assert config.quantization_config.get_name() == "fp8"
     assert config.quantization_config.activation_scheme == "static"
 
 
-def test_integration_no_quant():
+def test_integration_no_quant(tmp_path):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-    config = OmniDiffusionConfig(model="test")
+    config = OmniDiffusionConfig(model=str(tmp_path))
     assert config.quantization_config is None
 
 
-def test_integration_per_component():
+def test_integration_per_component(tmp_path):
     """OmniDiffusionConfig with per-component quantization dict."""
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.quantization import ComponentQuantizationConfig
 
     config = OmniDiffusionConfig(
-        model="test",
+        model=str(tmp_path),
         quantization_config={
             "transformer": {"method": "fp8"},
             "vae": None,

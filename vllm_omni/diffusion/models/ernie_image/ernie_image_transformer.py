@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_ernie_image.py
 
 from collections.abc import Iterable
@@ -27,6 +27,9 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfi
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
+)
+from vllm_omni.diffusion.models.ernie_image.fused_rope import (
+    try_fused_qk_rotary_emb,
 )
 
 logger = init_logger(__name__)
@@ -99,6 +102,26 @@ def _apply_rotary_emb(
     x1, x2 = x_rot.chunk(2, dim=-1)
     x_rotated = torch.cat((-x2, x1), dim=-1)
     return torch.cat((x_rot * cos_ + x_rotated * sin_, x[..., rot_dim:]), dim=-1)
+
+
+def _apply_qk_rotary_emb(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fused = try_fused_qk_rotary_emb(
+        query,
+        key,
+        freqs_cos,
+        freqs_sin,
+    )
+    if fused is not None:
+        return fused
+    return (
+        _apply_rotary_emb(query, freqs_cos, freqs_sin),
+        _apply_rotary_emb(key, freqs_cos, freqs_sin),
+    )
 
 
 class ErnieImageEmbedND3(nn.Module):
@@ -340,8 +363,7 @@ class ErnieImageAttention(nn.Module):
 
         if image_rotary_emb is not None:
             freqs_cos, freqs_sin = image_rotary_emb
-            query = _apply_rotary_emb(query, freqs_cos, freqs_sin)
-            key = _apply_rotary_emb(key, freqs_cos, freqs_sin)
+            query, key = _apply_qk_rotary_emb(query, key, freqs_cos, freqs_sin)
 
         attn_metadata = None
         if attention_mask is not None:
@@ -599,17 +621,12 @@ class ErnieImageTransformer2DModel(nn.Module):
         hidden_states, freqs_cos, freqs_sin, attention_mask = self.unified_prepare(hidden_states, text_bth, text_lens)
         attention_mask = self._slice_attention_mask_for_ring(attention_mask)
         rotary_pos_emb = (freqs_cos, freqs_sin)
-        S = hidden_states.shape[0]
-
         sample = self.time_proj(timestep)
         sample = sample.to(dtype=dtype)
         c = self.time_embedding(sample)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [
-            t.unsqueeze(0).expand(S, -1, -1).contiguous() for t in self.adaLN_modulation(c).chunk(6, dim=-1)
-        ]
+        temb = self.adaLN_modulation(c).chunk(6, dim=-1)
 
         for layer in self.layers:
-            temb = [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states = self._gradient_checkpointing_func(
                     layer,

@@ -8,9 +8,12 @@ from unittest.mock import Mock
 import pytest
 import torch
 from torch import nn
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.config import CacheConfig, KVTransferConfig, VllmConfig
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
+from tests.helpers.kv_layout import build_kv_cache_tensor, layout_for_backend
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -52,12 +55,13 @@ def _attention(*, enabled: bool, prefix: str = "image_attention") -> Attention:
     attention.head_size = 8
     attention.causal = False
     attention.attn_backend = _Backend
+    attention._schedule_candidate_checks = []
     return attention
 
 
 def _runner(attention: Attention) -> DiffusionModelRunner:
     runner = object.__new__(DiffusionModelRunner)
-    runner.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER, kv_transfer_config=None)
     runner.vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=4),
         model_config=SimpleNamespace(dtype=torch.float16),
@@ -79,7 +83,9 @@ def test_runner_discovers_native_spec_from_loaded_attention() -> None:
     assert spec.num_kv_heads == 2
     assert spec.head_size == 8
     assert spec.dtype is torch.bfloat16
-    assert spec.indexes_kv_by_block_stride is True
+    # vLLM 0.29 moved the block-stride decision off the spec onto the resolved
+    # physical layout; the backend's declaration must still select one.
+    assert layout_for_backend(_Backend).is_block_outermost is True
     assert spec.non_causal is True
 
 
@@ -112,7 +118,7 @@ def test_runner_retains_matching_rank_local_config() -> None:
     spec = runner.get_kv_cache_spec()["image_attention"]
     config = KVCacheConfig(
         num_blocks=8,
-        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes * 8, shared_by=["image_attention"])],
+        kv_cache_tensors=[build_kv_cache_tensor(spec, 8, ["image_attention"])],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["image_attention"], kv_cache_spec=spec)],
     )
 
@@ -126,7 +132,7 @@ def test_runner_rejects_rank_local_config_for_different_layers() -> None:
     spec = runner.get_kv_cache_spec()["image_attention"]
     config = KVCacheConfig(
         num_blocks=8,
-        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes * 8, shared_by=["other_attention"])],
+        kv_cache_tensors=[build_kv_cache_tensor(spec, 8, ["other_attention"])],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["other_attention"], kv_cache_spec=spec)],
     )
 
@@ -134,27 +140,45 @@ def test_runner_rejects_rank_local_config_for_different_layers() -> None:
         runner.set_kv_cache_config(config)
 
 
-def test_worker_selects_its_rank_local_config(monkeypatch) -> None:
+@pytest.mark.parametrize("worker_layout", [None, "LBNHC"])
+def test_worker_selects_its_rank_local_config(mocker, worker_layout) -> None:
     worker = object.__new__(DiffusionWorker)
     worker.rank = 1
-    worker.od_config = SimpleNamespace(num_gpus=2)
-    worker.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=None),
-        cache_config=SimpleNamespace(num_gpu_blocks=None),
-        kv_transfer_config=SimpleNamespace(kv_connector="MooncakeConnector", engine_id="dit-engine-1"),
+    worker.od_config = mocker.Mock(num_gpus=2)
+    worker.vllm_config = mocker.Mock(
+        spec=VllmConfig,
+        model_config=mocker.Mock(max_model_len=None),
+        cache_config=CacheConfig(),
+        parallel_config=mocker.Mock(prefill_context_parallel_size=1),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MooncakeConnector", kv_role="kv_consumer", engine_id="dit-engine-1"
+        ),
     )
+    worker.vllm_config.cache_config.kv_cache_layout = worker_layout
     worker._maybe_get_memory_pool_context = lambda _tag: nullcontext()
-    worker.model_runner = SimpleNamespace(set_kv_cache_config=lambda config: setattr(worker, "installed", config))
-    configs = [SimpleNamespace(num_blocks=4), SimpleNamespace(num_blocks=8)]
-    ensure_initialized = Mock()
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.diffusion_kv.kv_connector.ensure_kv_transfer_initialized",
-        ensure_initialized,
+    worker.model_runner = mocker.Mock(spec=DiffusionModelRunner)
+    configs = [KVCacheConfig(num_blocks=n, kv_cache_tensors=[], kv_cache_groups=[]) for n in (4, 8)]
+    for config in configs:
+        config.kv_cache_layout = "LBHNC"
+
+    def initialize(vllm_config, kv_cache_config):
+        # vLLM 0.34 Mooncake reads this before the runner allocates KV pages.
+        assert vllm_config.cache_config.get_resolved_kv_cache_layout() is KVCacheLayout.LBHNC
+
+    ensure_initialized = mocker.patch(
+        "vllm_omni.diffusion.diffusion_kv.kv_connector.ensure_kv_transfer_initialized", side_effect=initialize
     )
+
+    if worker_layout is not None:
+        with pytest.raises(ValueError, match="disagrees with the layout resolved by the control plane"):
+            worker.set_kv_cache_configs(configs, 64)
+        ensure_initialized.assert_not_called()
+        worker.model_runner.set_kv_cache_config.assert_not_called()
+        return
 
     worker.set_kv_cache_configs(configs, 64)
 
-    assert worker.installed is configs[1]
+    worker.model_runner.set_kv_cache_config.assert_called_once_with(configs[1])
     ensure_initialized.assert_called_once_with(worker.vllm_config, configs[1])
     assert worker.vllm_config.model_config.max_model_len == 64
     assert worker.vllm_config.cache_config.num_gpu_blocks == 8
@@ -173,10 +197,11 @@ def test_worker_honors_explicit_kv_memory_budget(monkeypatch) -> None:
     profile_request = object()
 
     assert worker.determine_available_kv_memory(profile_request) == [4096]
-    worker.model_runner.profile_run.assert_called_once_with(profile_request)
+    worker.model_runner.profile_run.assert_not_called()
 
 
 def test_worker_treats_zero_kv_memory_budget_as_profiled_auto_sizing(monkeypatch) -> None:
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=Mock()))
     worker = object.__new__(DiffusionWorker)
     worker.rank = 0
     worker.init_snapshot = SimpleNamespace(free_memory=900)
@@ -206,6 +231,7 @@ def test_worker_treats_zero_kv_memory_budget_as_profiled_auto_sizing(monkeypatch
 
 @pytest.mark.parametrize("non_kv_cache_memory", [750, 800])
 def test_worker_rejects_non_positive_profiled_kv_memory(monkeypatch, non_kv_cache_memory: int) -> None:
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=Mock()))
     worker = object.__new__(DiffusionWorker)
     worker.rank = 0
     worker.init_snapshot = SimpleNamespace(free_memory=900)
@@ -242,6 +268,7 @@ def test_worker_rejects_non_positive_profiled_kv_memory(monkeypatch, non_kv_cach
 
 
 def test_worker_profiles_activation_headroom_instead_of_current_residency(monkeypatch) -> None:
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=Mock()))
     worker = object.__new__(DiffusionWorker)
     worker.rank = 0
     worker.init_snapshot = SimpleNamespace(free_memory=1200)
@@ -307,3 +334,31 @@ def test_rank_probe_gathers_local_failure_before_raising(monkeypatch) -> None:
         )
 
     assert gathered == [(False, "ValueError: local failure")]
+
+
+def test_hunyuan_native_layer_identity_matches_ar_spec(monkeypatch):
+    import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer as hy3
+
+    monkeypatch.setattr(hy3, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(hy3, "get_sequence_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(hy3, "get_allgather_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(hy3, "get_sequence_parallel_rank", lambda: 0)
+    monkeypatch.setattr(hy3, "QKVParallelLinear", lambda **_: nn.Identity())
+    monkeypatch.setattr(hy3, "RowParallelLinear", lambda **_: nn.Identity())
+    monkeypatch.setattr(hy3, "get_rope", lambda **_: nn.Identity())
+
+    # Only backend construction is fake; execute both HY3 constructors and the
+    # real runner spec-discovery path, including the actual Attention prefix.
+    def attention(**kwargs):
+        return _attention(enabled=kwargs.get("paged_kv_cache_role") is not None, prefix=kwargs["prefix"])
+
+    monkeypatch.setattr(hy3, "Attention", attention)
+    model = hy3.HunYuanAttention(
+        config=SimpleNamespace(num_key_value_heads=2, attention_head_dim=8),
+        hidden_size=16,
+        num_heads=2,
+        num_kv_heads=2,
+        prefix="layers.3.self_attn",
+    )
+    runner = _runner(model.image_attn.attn)
+    assert set(runner.get_kv_cache_spec()) == {"model.layers.3.self_attn.attn"}

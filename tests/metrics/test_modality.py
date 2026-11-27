@@ -48,6 +48,8 @@ _EXPECTED_FAMILIES = [
     defs.AUDIO_UNDERRUN_S,
     defs.AUDIO_CONTINUITY_OK_METRIC,
     defs.AUDIO_SKIPPED_REQUESTS_METRIC,
+    defs.SPEECH_STREAM_ABORTED_METRIC,
+    defs.SPEECH_STREAM_COMPLETED_METRIC,
     defs.DIFFUSION_EXEC_S,
     defs.DIFFUSION_EXEC_PER_STEP_S,
     defs.DIFFUSION_PREPROCESS_S,
@@ -70,6 +72,8 @@ class TestRegistration:
         mod.observe_audio_underrun("s", "r", 0.01)
         mod.inc_audio_continuity_ok("s", "r", 100)
         mod.inc_audio_skipped("s", "r", "malformed_codec")
+        mod.inc_speech_stream_aborted("error")
+        mod.inc_speech_stream_completed()
         mod.observe_diffusion_exec("s", "r", 0.5)
         mod.observe_diffusion_exec_per_step("s", "r", 0.01)
         mod.observe_diffusion_preprocess("s", "r", 0.01)
@@ -91,6 +95,23 @@ class TestRegistration:
 
 
 class TestAudio:
+    def test_speech_stream_abort_counter_and_disabled_logging(self):
+        model = "test-speech-stream-abort-counter"
+        metrics = OmniModalityMetrics(model_name=model)
+        disabled = OmniModalityMetrics(model_name=model, log_stats=False)
+        metrics.inc_speech_stream_completed()
+        disabled.inc_speech_stream_completed()
+        assert REGISTRY.get_sample_value(defs.SPEECH_STREAM_COMPLETED_METRIC + "_total", {"model_name": model}) == 1.0
+        for reason in ("cancelled", "closed", "engine_dead", "error"):
+            metrics.inc_speech_stream_aborted(reason)
+            disabled.inc_speech_stream_aborted(reason)
+            assert (
+                REGISTRY.get_sample_value(
+                    defs.SPEECH_STREAM_ABORTED_METRIC + "_total", {"model_name": model, "reason": reason}
+                )
+                == 1.0
+            )
+
     def test_audio_ttfp_observed(self, mod: OmniModalityMetrics) -> None:
         stage, replica = "talker_ttfp", "0"
         mod.observe_audio_ttfp(stage, replica, 0.42)
@@ -241,6 +262,9 @@ class _StubModMetrics:
 
     def observe_audio_rtf(self, s, r, rtf):
         self.calls.append(("observe_audio_rtf", s, r, rtf))
+
+    def observe_audio_ttfp(self, s, r, t):
+        self.calls.append(("observe_audio_ttfp", s, r, t))
 
     def observe_audio_underrun(self, s, r, u):
         self.calls.append(("observe_audio_underrun", s, r, u))
@@ -532,6 +556,7 @@ class TestDiffusionUnitConversion:
             metrics={
                 "preprocess_time_ms": 50.0,
                 "diffusion_engine_exec_time_ms": 1500.0,
+                "output_ready_wait_time_ms": 250.0,
                 "postprocess_time_ms": 20.0,
                 "vae_decode_time_ms": 300.0,
                 "forward_time_ms": 800.0,
@@ -545,6 +570,7 @@ class TestDiffusionUnitConversion:
         assert dict(aggregator.diffusion_metrics["req-units"]) == {
             "preprocess_time_s": pytest.approx(0.05),
             "diffusion_engine_exec_time_s": pytest.approx(1.5),
+            "output_ready_wait_time_s": pytest.approx(0.25),
             "postprocess_time_s": pytest.approx(0.02),
             "vae_decode_time_s": pytest.approx(0.3),
             "forward_time_s": pytest.approx(0.8),
@@ -597,7 +623,6 @@ class TestObserveDiffusionFinalize:
 class TestObserveAudioFirstPacket:
     def test_observes_with_valid_inputs(self):
         stub = _StubModMetrics()
-        stub.observe_audio_ttfp = lambda s, r, t: stub.calls.append(("observe_audio_ttfp", s, r, t))
 
         observe_audio_first_packet(
             stub,
@@ -610,19 +635,16 @@ class TestObserveAudioFirstPacket:
 
     def test_replica_none_skipped(self):
         stub = _StubModMetrics()
-        stub.observe_audio_ttfp = lambda s, r, t: stub.calls.append(("observe_audio_ttfp", s, r, t))
         observe_audio_first_packet(stub, stage_id=1, replica_id=None, arrival_ts=100.0, now_ts=100.5)
         assert stub.calls == []
 
     def test_arrival_ts_zero_skipped(self):
         stub = _StubModMetrics()
-        stub.observe_audio_ttfp = lambda s, r, t: stub.calls.append(("observe_audio_ttfp", s, r, t))
         observe_audio_first_packet(stub, stage_id=1, replica_id=0, arrival_ts=0.0, now_ts=100.5)
         assert stub.calls == []
 
     def test_clock_skew_clamped_to_zero(self):
         stub = _StubModMetrics()
-        stub.observe_audio_ttfp = lambda s, r, t: stub.calls.append(("observe_audio_ttfp", s, r, t))
         observe_audio_first_packet(stub, stage_id=1, replica_id=0, arrival_ts=100.5, now_ts=100.0)
         assert stub.calls == [("observe_audio_ttfp", "1", "0", 0.0)]
 
@@ -664,6 +686,24 @@ class TestObserveAudioStreamingFinalize:
         underrun_calls = [c for c in stub.calls if c[0] == "observe_audio_underrun"]
         assert underrun_calls
         assert underrun_calls[0][-1] > 0.1
+        assert not any(c[0] == "inc_audio_continuity_ok" for c in stub.calls)
+
+    def test_stereo_channel_count_is_used_for_playback_rate(self):
+        stub = _StubModMetrics()
+        # At 100 Hz, s16le stereo consumes 400 bytes/s. The first 200-byte
+        # chunk buffers 0.5s, so a second chunk arriving at 1.0s underruns by 0.5s.
+        observe_audio_streaming_finalize(
+            stub,
+            stage_id=1,
+            replica_id=0,
+            chunk_arrival_times_s=[0.0, 1.0],
+            chunk_bytes=[200, 200],
+            sample_rate=100,
+            channels=2,
+            threshold_s=0.1,
+        )
+        underrun_calls = [c for c in stub.calls if c[0] == "observe_audio_underrun"]
+        assert underrun_calls == [("observe_audio_underrun", "1", "0", pytest.approx(0.5))]
         assert not any(c[0] == "inc_audio_continuity_ok" for c in stub.calls)
 
     def test_empty_arrivals_skipped(self):

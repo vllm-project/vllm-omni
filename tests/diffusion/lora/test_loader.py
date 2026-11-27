@@ -18,6 +18,7 @@ from vllm_omni.diffusion.lora.loader import (
     WanLoraLoaderMixin,
     _prepare_lora_delta,
     _remap_state_dict_keys,
+    _resolve_lora_compute_device,
 )
 
 HEAD_DIM = 24
@@ -334,24 +335,64 @@ class DummyQwenImagePipeline(nn.Module, QwenImageLoraLoaderMixin):
 
 
 class TestQwenImageLoraLoaderMixin:
-    def test_load_lora_weights(self, mocker: MockerFixture):
-        pipeline = DummyQwenImagePipeline(NUM_LAYERS, HEAD_DIM)
-        original_params = {name: param.clone() for name, param in pipeline.transformer.named_parameters()}
-
-        lora_state_dict = make_lora_state_dict_for_module(pipeline.transformer)
-        assert len(lora_state_dict) > 0
-
+    def test_load_unprefixed_default_adapter(self, mocker: MockerFixture):
+        pipeline = DummyQwenImagePipeline(1, HEAD_DIM)
+        to_out = pipeline.transformer.blocks[0].attn.to_out
+        original_weight = to_out.weight.detach().clone()
+        state_dict, delta = make_dummy_lora_state_dict(
+            "blocks.0.attn.to_out.0",
+            lora_a_suffix="lora_A.default.weight",
+            lora_b_suffix="lora_B.default.weight",
+        )
         mocker.patch(
             "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
             return_value=_convert_non_diffusers_qwen_lora_to_diffusers,
         )
-        pipeline.load_lora_weights(lora_state_dict, "adapter0")
 
-        # validate the weights are updated after lora loaded
-        assert_params_not_equal(pipeline.transformer, original_params)
+        pipeline.load_lora_weights(state_dict, "adapter0")
+        assert_close(to_out.weight, original_weight + delta)
 
-        # validate lora_loaded map is updated after lora loaded
-        assert "adapter0" in pipeline.lora_loaded
+    def test_load_mixed_prefix_keeps_bias_delta(self, mocker: MockerFixture):
+        pipeline = DummyQwenImagePipeline(2, HEAD_DIM, bias=True)
+        prefixed_out = pipeline.transformer.blocks[0].attn.to_out
+        unprefixed_out = pipeline.transformer.blocks[1].attn.to_out
+        original_weight = prefixed_out.weight.detach().clone()
+        original_bias = prefixed_out.bias.detach().clone()
+        original_unprefixed_weight = unprefixed_out.weight.detach().clone()
+        original_unprefixed_bias = unprefixed_out.bias.detach().clone()
+        prefixed, prefixed_delta = make_dummy_lora_state_dict("transformer.blocks.0.attn.to_out.0")
+        bias = torch.randn(HEAD_DIM)
+        prefixed["transformer.blocks.0.attn.to_out.bias"] = bias
+        unprefixed, unprefixed_delta = make_dummy_lora_state_dict(
+            "blocks.1.attn.to_out.0",
+            lora_a_suffix="lora_A.default.weight",
+            lora_b_suffix="lora_B.default.weight",
+        )
+        unprefixed_bias = torch.randn(HEAD_DIM)
+        unprefixed["blocks.1.attn.to_out.bias"] = unprefixed_bias
+        mocker.patch(
+            "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
+            side_effect=AssertionError("diffusers keys must not go through the legacy converter"),
+        )
+
+        pipeline.load_lora_weights({**prefixed, **unprefixed}, "adapter0")
+
+        assert_close(prefixed_out.weight, original_weight + prefixed_delta)
+        assert_close(prefixed_out.bias, original_bias + bias)
+        assert_close(unprefixed_out.weight, original_unprefixed_weight + unprefixed_delta)
+        assert_close(unprefixed_out.bias, original_unprefixed_bias + unprefixed_bias)
+
+    def test_load_lora_rejects_zero_matches(self):
+        pipeline = DummyQwenImagePipeline(1, HEAD_DIM)
+        original_params = {name: param.detach().clone() for name, param in pipeline.transformer.named_parameters()}
+        state_dict, _ = make_dummy_lora_state_dict("transformer.blocks.99.attn.to_out")
+
+        with pytest.raises(ValueError, match="No LoRA weights matched"):
+            pipeline.load_lora_weights(state_dict, "adapter0")
+
+        assert pipeline.lora_loaded == {}
+        assert not pipeline.lora_is_fused
+        assert_params_equal(pipeline.transformer, original_params)
 
     def test_unload_lora_weights(self, mocker: MockerFixture):
         pipeline = DummyQwenImagePipeline(NUM_LAYERS, HEAD_DIM)
@@ -378,17 +419,20 @@ class TestQwenImageLoraLoaderMixin:
         # validate lora_loaded map is updated
         assert "adapter0" not in pipeline.lora_loaded
 
-    def test_load_diffusers_lora_applies_non_unit_alpha(self, mocker: MockerFixture):
+    @pytest.mark.parametrize(
+        ("prefix", "adapter_suffix"), [("", ""), ("transformer.", ".default")], ids=["unprefixed", "prefixed"]
+    )
+    def test_load_diffusers_lora_applies_non_unit_alpha(self, mocker: MockerFixture, prefix: str, adapter_suffix: str):
         pipeline = DummyQwenImagePipeline(1, HEAD_DIM)
         to_out = pipeline.transformer.blocks[0].attn.to_out
         original_weight = to_out.weight.detach().clone()
-        base_key = "blocks.0.attn.to_out.0"
+        base_key = f"{prefix}blocks.0.attn.to_out.0"
         lora_a = torch.randn(RANK, HEAD_DIM)
         lora_b = torch.randn(HEAD_DIM, RANK)
         alpha = torch.tensor(6.0)
         state_dict = {
-            f"{base_key}.lora_A.weight": lora_a,
-            f"{base_key}.lora_B.weight": lora_b,
+            f"{base_key}.lora_A{adapter_suffix}.weight": lora_a,
+            f"{base_key}.lora_B{adapter_suffix}.weight": lora_b,
             f"{base_key}.alpha": alpha,
         }
         mocker.patch(
@@ -403,6 +447,131 @@ class TestQwenImageLoraLoaderMixin:
 
         pipeline.unload_lora_weights("adapter0")
         assert_close(to_out.weight, original_weight)
+
+    def test_load_flattened_lora_unet_keys_with_alpha_next_to_dotted_keys(self, mocker: MockerFixture):
+        pipeline = DummyQwenImagePipeline(2, HEAD_DIM)
+        # Flattened legacy names use Qwen's `transformer_blocks` module naming.
+        pipeline.transformer = nn.Module()
+        pipeline.transformer.transformer_blocks = nn.ModuleList(
+            [DummyTransformerBlock(HEAD_DIM), DummyTransformerBlock(HEAD_DIM)]
+        )
+        flat_out = pipeline.transformer.transformer_blocks[0].attn.to_out
+        dotted_out = pipeline.transformer.transformer_blocks[1].attn.to_out
+        original_flat = flat_out.weight.detach().clone()
+        original_dotted = dotted_out.weight.detach().clone()
+        flat_base = "lora_unet_transformer_blocks_0_attn_to_out_0"
+        flat_a, flat_b = torch.randn(RANK, HEAD_DIM), torch.randn(HEAD_DIM, RANK)
+        alpha = torch.tensor(6.0)
+        dotted_base = "transformer.transformer_blocks.1.attn.to_out.0"
+        dotted_a, dotted_b = torch.randn(RANK, HEAD_DIM), torch.randn(HEAD_DIM, RANK)
+        state_dict = {
+            f"{flat_base}.lora_A.weight": flat_a,
+            f"{flat_base}.lora_B.weight": flat_b,
+            f"{flat_base}.alpha": alpha,
+            f"{dotted_base}.lora_A.weight": dotted_a,
+            f"{dotted_base}.lora_B.weight": dotted_b,
+        }
+        mocker.patch(
+            "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
+            return_value=_convert_non_diffusers_qwen_lora_to_diffusers,
+        )
+
+        pipeline.load_lora_weights(state_dict, "adapter0")
+
+        assert_close(flat_out.weight, original_flat + (flat_b @ flat_a) * (alpha.item() / RANK))
+        assert_close(dotted_out.weight, original_dotted + dotted_b @ dotted_a)
+
+    def _pipeline_with_legacy_block(self, bias: bool = False):
+        pipeline = DummyQwenImagePipeline(1, HEAD_DIM, bias=bias)
+        pipeline.transformer.transformer_blocks = nn.ModuleList(
+            [DummyTransformerBlock(HEAD_DIM, bias=bias, stacked_params=True)]
+        )
+        return pipeline
+
+    def test_load_diffusion_model_default_weights_with_unprefixed_alpha(self, mocker: MockerFixture):
+        pipeline = self._pipeline_with_legacy_block()
+        to_out = pipeline.transformer.transformer_blocks[0].attn.to_out
+        original_weight = to_out.weight.detach().clone()
+        module = "transformer_blocks.0.attn.to_out.0"
+        lora_a, lora_b = torch.randn(RANK, HEAD_DIM), torch.randn(HEAD_DIM, RANK)
+        alpha = torch.tensor(6.0)
+        state_dict = {
+            f"diffusion_model.{module}.lora_A.default.weight": lora_a,
+            f"diffusion_model.{module}.lora_B.default.weight": lora_b,
+            f"{module}.alpha": alpha,
+        }
+        mocker.patch(
+            "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
+            return_value=_convert_non_diffusers_qwen_lora_to_diffusers,
+        )
+
+        pipeline.load_lora_weights(state_dict, "adapter0")
+
+        assert_close(to_out.weight, original_weight + (lora_b @ lora_a) * (alpha.item() / RANK))
+        pipeline.unload_lora_weights("adapter0")
+        assert_close(to_out.weight, original_weight)
+
+    def test_load_rejects_two_alphas_for_one_diffusion_model_module(self):
+        pipeline = self._pipeline_with_legacy_block()
+        to_out = pipeline.transformer.transformer_blocks[0].attn.to_out
+        original_weight = to_out.weight.detach().clone()
+        module = "transformer_blocks.0.attn.to_out.0"
+        state_dict = {
+            f"diffusion_model.{module}.lora_A.weight": torch.randn(RANK, HEAD_DIM),
+            f"diffusion_model.{module}.lora_B.weight": torch.randn(HEAD_DIM, RANK),
+            f"diffusion_model.{module}.alpha": torch.tensor(6.0),
+            f"{module}.alpha": torch.tensor(2.0),
+        }
+
+        with pytest.raises(ValueError, match="has both"):
+            pipeline.load_lora_weights(state_dict, "adapter0")
+
+        assert_close(to_out.weight, original_weight)
+        assert pipeline.lora_loaded == {}
+
+    def test_load_diffusion_model_keys_leave_dotted_bias_out_of_converter(self, mocker: MockerFixture):
+        pipeline = self._pipeline_with_legacy_block(bias=True)
+        legacy_out = pipeline.transformer.transformer_blocks[0].attn.to_out
+        dotted_out = pipeline.transformer.blocks[0].attn.to_out
+        original_legacy = legacy_out.weight.detach().clone()
+        original_weight = dotted_out.weight.detach().clone()
+        original_bias = dotted_out.bias.detach().clone()
+        module = "transformer_blocks.0.attn.to_out.0"
+        lora_a, lora_b = torch.randn(RANK, HEAD_DIM), torch.randn(HEAD_DIM, RANK)
+        alpha = torch.tensor(6.0)
+        dotted_a, dotted_b = torch.randn(RANK, HEAD_DIM), torch.randn(HEAD_DIM, RANK)
+        bias = torch.randn(HEAD_DIM)
+        state_dict = {
+            f"diffusion_model.{module}.lora_A.default.weight": lora_a,
+            f"diffusion_model.{module}.lora_B.default.weight": lora_b,
+            f"{module}.alpha": alpha,
+            "transformer.blocks.0.attn.to_out.0.lora_A.weight": dotted_a,
+            "transformer.blocks.0.attn.to_out.0.lora_B.weight": dotted_b,
+            "transformer.blocks.0.attn.to_out.bias": bias,
+        }
+        seen: list[set[str]] = []
+
+        def _recording_converter(lora_state):
+            seen.append(set(lora_state))
+            return _convert_non_diffusers_qwen_lora_to_diffusers(lora_state)
+
+        mocker.patch(
+            "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
+            return_value=_recording_converter,
+        )
+
+        pipeline.load_lora_weights(state_dict, "adapter0")
+
+        assert seen == [
+            {
+                f"diffusion_model.{module}.lora_A.weight",
+                f"diffusion_model.{module}.lora_B.weight",
+                f"{module}.alpha",
+            }
+        ]
+        assert_close(legacy_out.weight, original_legacy + (lora_b @ lora_a) * (alpha.item() / RANK))
+        assert_close(dotted_out.weight, original_weight + dotted_b @ dotted_a)
+        assert_close(dotted_out.bias, original_bias + bias)
 
 
 # ======================================================
@@ -509,3 +678,93 @@ def test_lora_loader_mixin_lora_is_fused_property(mocker: MockerFixture):
     assert pipeline2.lora_is_fused is False
     pipeline2.lora_is_fused = True
     assert pipeline2.lora_is_fused is True
+
+
+def test_prepare_lora_delta_with_compute_device():
+    base_key = "blocks.0.attn.to_q"
+    state_dict = {
+        f"{base_key}.lora_A.weight": torch.ones(RANK, HEAD_DIM),
+        f"{base_key}.lora_B.weight": torch.ones(HEAD_DIM, RANK),
+    }
+    delta, used_keys = _prepare_lora_delta(state_dict, base_key, compute_device=torch.device("cpu"))
+    assert delta is not None
+    assert delta.shape == (HEAD_DIM, HEAD_DIM)
+    assert len(used_keys) == 2
+
+
+def test_resolve_lora_compute_device_probes_unusable_accelerator(mocker: MockerFixture):
+    """cuda:N/npu:N may be reported without a physical device; the probe must reject it."""
+    mocker.patch(
+        "vllm_omni.diffusion.lora.loader.get_local_device",
+        return_value=torch.device("cuda:999"),
+    )
+    assert _resolve_lora_compute_device() is None
+
+
+def test_load_lora_into_module_cpu_weights_match_cpu_reference(mocker: MockerFixture):
+    """Regression test: params on CPU used to force compute_device=None and skip the
+    #7005 accelerator path. With an unusable accelerator, fusion must fall back to
+    CPU and still produce base + lora_B @ lora_A."""
+    pipeline = DummyPipeline(NUM_LAYERS, HEAD_DIM)
+    original_params = {name: param.clone() for name, param in pipeline.transformer.named_parameters()}
+
+    lora_state_dict = make_lora_state_dict_for_module(pipeline.transformer)
+    lora_state_dict = _remap_state_dict_keys(lora_state_dict, [(".to_out.0.", ".to_out.")])
+
+    mocker.patch(
+        "vllm_omni.diffusion.lora.loader.get_local_device",
+        return_value=torch.device("cuda:999"),
+    )
+
+    used_keys = pipeline.load_lora_into_module(lora_state_dict, pipeline.transformer)
+    assert len(used_keys) > 0
+    assert not (set(lora_state_dict.keys()) - used_keys)
+
+    for name, param in pipeline.transformer.named_parameters():
+        if not name.endswith(".weight"):
+            continue
+        base_key = name[: -len(".weight")]
+        key_a = f"{base_key}.lora_A.weight"
+        key_b = f"{base_key}.lora_B.weight"
+        if key_a in lora_state_dict and key_b in lora_state_dict:
+            expected = original_params[name] + (
+                lora_state_dict[key_b].to(param.dtype) @ lora_state_dict[key_a].to(param.dtype)
+            )
+            assert_close(param, expected)
+
+
+def test_load_lora_into_module_forwards_usable_accel_device(mocker: MockerFixture):
+    """A usable accelerator must be forwarded as compute_device for CPU params.
+    A spy forces the actual math back onto CPU so the test runs without a device."""
+    fake_dev = torch.device("cuda:0")
+    mocker.patch(
+        "vllm_omni.diffusion.lora.loader._resolve_lora_compute_device",
+        return_value=fake_dev,
+    )
+
+    seen_devices = []
+    original = _prepare_lora_delta
+
+    def spy(state_dict, base_key, *args, **kwargs):
+        seen_devices.append(kwargs.get("compute_device"))
+        kwargs["compute_device"] = None
+        return original(state_dict, base_key, *args, **kwargs)
+
+    mocker.patch(
+        "vllm_omni.diffusion.lora.loader._prepare_lora_delta",
+        side_effect=spy,
+    )
+
+    pipeline = DummyPipeline(NUM_LAYERS, HEAD_DIM)
+    original_params = {name: param.clone() for name, param in pipeline.transformer.named_parameters()}
+
+    lora_state_dict = make_lora_state_dict_for_module(pipeline.transformer)
+    lora_state_dict = _remap_state_dict_keys(lora_state_dict, [(".to_out.0.", ".to_out.")])
+
+    used_keys = pipeline.load_lora_into_module(lora_state_dict, pipeline.transformer)
+
+    # Every CPU param with a LoRA delta must have received the accelerator device.
+    assert seen_devices
+    assert all(d == fake_dev for d in seen_devices)
+    assert not (set(lora_state_dict.keys()) - used_keys)
+    assert_params_not_equal(pipeline.transformer, original_params)

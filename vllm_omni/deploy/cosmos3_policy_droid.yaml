@@ -1,0 +1,49 @@
+# Cosmos3 policy (DROID) deploy: single diffusion stage serving the OpenPI
+# realtime API (/v1/realtime/robot/openpi).
+#
+# Topology (COSMOS3_POLICY_PIPELINE) is declared in
+# vllm_omni/model_executor/models/cosmos3/pipeline.py. Policy checkpoints share
+# their HF metadata (model_type=cosmos3_omni, model_index.json _class_name=
+# Cosmos3OmniDiffusersPipeline) with the T2I/video Cosmos3 checkpoints, which
+# must keep using the default single-stage diffusion fallback — so this
+# pipeline cannot be auto-detected and must be selected explicitly:
+#
+#   vllm serve nvidia/Cosmos3-Nano-Policy-DROID --omni \
+#     --deploy-config /absolute/path/to/vllm-omni/vllm_omni/deploy/cosmos3_policy_droid.yaml
+#
+# Per-checkpoint model_config tweaks (e.g. policy_server_config values) can
+# still be layered on top with --stage-overrides; dict overrides deep-merge
+# with this file.
+
+pipeline: cosmos3_policy
+# async_chunk defaults to True, which the deploy validator rejects for a
+# single-stage pipeline (no next-stage processor). Must be false here.
+async_chunk: false
+distributed_executor_backend: mp
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    # OpenPI policy serving is one observation -> one action reply.
+    max_num_seqs: 1
+    model_class_name: Cosmos3OmniDiffusersPipeline
+    # JSON prompt formatting is a property of this DROID checkpoint's training
+    # recipe, not a generic server default.
+    default_sampling_params:
+      extra_args:
+        format_prompt_as_json: true
+    model_config:
+      # Policy serving emits robot actions, not text/video; the Cosmos3
+      # guardrail stack (gated nvidia/Cosmos-1.0-Guardrail repo) is not part
+      # of it. Equivalent to launching with --no-guardrails.
+      guardrails: false
+      # OpenPI handshake metadata advertised to the robot client. Sent verbatim
+      # (the pipeline never reads these); they describe the camera inputs and
+      # action space the client must produce for this checkpoint.
+      policy_server_config:
+        image_resolution: [540, 640]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position

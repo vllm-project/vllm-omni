@@ -12,6 +12,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT
 
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
@@ -154,6 +155,13 @@ def test_text_to_text_audio_001(omni_server, online_client) -> None:
     }
 
     online_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    if os.environ.get("QWEN3_OMNI_EXPECT_AITER_MM_ENCODER") == "1":
+        # Each parameter starts its own stage-CLI server. Check this instance's
+        # stage-0 selection before teardown truncates its logs for display.
+        thinker_log = omni_server.read_stage_logs().get(0, "")
+        assert "Using AttentionBackendEnum.ROCM_AITER_FA for MMEncoderAttention." in thinker_log, (
+            "Stage 0 did not select ROCM_AITER_FA for MMEncoderAttention"
+        )
 
 
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
@@ -482,3 +490,29 @@ def test_text_to_audio_long_output_001(omni_server, online_client) -> None:
     text = responses[0].text_content if responses else ""
     word_count = len(text.split())
     assert word_count >= 200, f"Expected at least 200 words in long output, got {word_count}"
+
+
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", [test_params[1]], indirect=True)
+@pytest.mark.parametrize(
+    "target",
+    [
+        "I feel sick, what should I do?",
+        "Please search The Best of Steely Dan: Then and Now saga.",
+    ],
+)
+def test_qwen3_omni_seed_tts_reads_questions_verbatim(omni_server, online_client, target: str) -> None:
+    # These Seed-TTS targets produced long answers in nightly build #17816.
+    # Isolate the thinker's reading contract; the dataset benchmark checks audio WER separately.
+    response = online_client.client.chat.completions.create(
+        model=omni_server.model,
+        messages=[
+            {"role": "system", "content": SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT},
+            {"role": "user", "content": target},
+        ],
+        modalities=["text"],
+        temperature=0,
+        max_tokens=128,
+    )
+    assert response.choices[0].finish_reason == "stop"
+    assert response.choices[0].message.content == target

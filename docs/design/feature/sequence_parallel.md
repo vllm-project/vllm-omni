@@ -7,6 +7,7 @@ This section describes how to add Sequence Parallel (SP) to a diffusion transfor
 ## Table of Contents
 
 - [Overview](#overview)
+- [Packed QKV exchanges](#packed-qkv-exchanges)
 - [UAA Mode (Experimental)](#uaa-mode-experimental)
 - [Approach 1: Non-Intrusive `_sp_plan` (Recommended)](#approach-1-non-intrusive-_sp_plan-recommended)
 - [Approach 2: Intrusive Modification (For Complex Cases)](#approach-2-intrusive-modification-for-complex-cases)
@@ -45,6 +46,71 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 | `sp_shard()` | Manual tensor sharding | Splits tensor across SP workers |
 | `sp_gather()` | Manual tensor gathering | Gathers sharded tensors from all workers |
 
+### NPU symmetric-memory Ulysses
+
+On NPU, `--ulysses-a2a-backend copy_engine` uses Python and Triton-Ascend to read peer
+symmetric memory directly into the final attention layout. It requires
+TorchNPU's NPUSHMEM allocator and the native SHMEM runtime. The backend
+loads the runtime from the installed `cann-shmem` wheel, or from the loader
+search path for a separately installed `libshmem.so`. Triton uses its normal
+JIT toolchain; no repository C++/AscendC extension is built.
+
+The backend requires eager execution, strict Ulysses, `ulysses_degree > 1`,
+`ring_degree = 1`, `allgather_degree = 1`, and a Ulysses group containing all
+WORLD ranks in the same order within one HCCS domain. Every rank must issue
+matching exchanges on one stream. A publication barrier precedes peer reads
+and a reuse barrier follows them. Outputs own their storage; one growable staging workspace is reused
+across layers. Worker shutdown must clear it collectively before destroying
+the process group.
+
+The NPU attention factory rejects Ulysses × AllGather-KV when this option is
+enabled: its Ulysses subgroup cannot use the runtime's WORLD-wide barriers.
+The same topology remains available through the standard communication path.
+
+## Packed QKV exchanges
+
+Set `VLLM_OMNI_PACKED_QKV=1` before worker startup to opt into a packed
+Q/K/V exchange. The option is platform-neutral and defaults to off. All ranks
+in each Ulysses group must use the same setting; changing it requires rebuilding
+the attention strategies, normally by restarting the workers.
+
+In strict Ulysses, eligible `[B, S_local, H, D]` Q/K/V tensors copy directly
+into a destination-major `[world_size, B, S_local, H_local, 3, D]` wire
+buffer. One ordinary `torch.distributed.all_to_all_single` exchanges Q/K/V;
+the receive buffer is unpacked into three contiguous attention inputs.
+The reverse output exchange restores `[B, S_local, H, D]` in one collective.
+This changes three forward plus one reverse exchanges into one forward plus
+one reverse exchange. The logical payload is unchanged.
+
+The path requires all of the following:
+
+- `ulysses_degree > 1` and the standard head-to-sequence layout
+  (`scatter_idx=2`, `gather_idx=1`).
+- Strict Ulysses mode, equal positive Q/K/V shapes, matching dtypes and devices,
+  and a head count divisible by `ulysses_degree`.
+- Inference tensors without gradients and no `gate_compress` tensor.
+- A process-group backend that supports `all_to_all_single` for those tensors.
+
+The existing strict-mode requirement for equally sized local sequence shards
+still applies. Strided producers, batch sizes greater than one, masked padding,
+and replicated joint Q/K/V in either the front or rear position preserve their
+existing ordering and metadata. Each call owns its staging and output storage;
+later calls cannot overwrite a previous result. The implementation uses the
+process group's normal collective backend without peer-memory mappings or a
+persistent workspace.
+
+Advanced UAA, unequal Q/K/V shapes (including GQA), gradients, and compressed
+gates retain their existing exchanges. An explicitly selected
+`--ulysses-a2a-backend` keeps precedence.
+
+Benchmark with the flag off and on using the same model, precision, topology,
+sequence shape, concurrency, and warmup. Larger messages and staging copies can
+offset the reduction in collective launches; fewer collectives alone do not
+guarantee lower end-to-end latency or peak memory. Collect profiler-disabled
+serving measurements separately from traces, and include packing/unpacking
+copies when comparing communication costs. Enabling the option on another
+platform does not establish correctness or a performance gain for that backend.
+
 ---
 
 ## UAA Mode (Experimental)
@@ -77,7 +143,9 @@ Use it when plain Ulysses-SP would otherwise fail because:
 
 - `auto_pad=True` pads sequence tokens in `_sp_plan` and requires attention backends that support `attention_mask`.
 - `advanced_uaa` does not depend on mask-based token padding inside Ulysses attention. It is therefore a better fit for non-divisible head counts and uneven Ulysses shard sizes.
-- `auto_pad=True` remains incompatible with Ring attention because the ring backend does not consume `attention_mask`.
+- `auto_pad=True` remains incompatible with Ring attention because the ring backend does not consume arbitrary
+  `attention_mask` values. A model with contiguous suffix padding may instead publish `valid_kv_length`; Ring trims
+  each circulated K/V block against that global valid prefix.
 - `advanced_uaa` is still experimental and hybrid mode remains limited by Ring's equal-shape requirement.
 
 ---
@@ -92,6 +160,8 @@ The `_sp_plan` mechanism allows SP **without modifying `forward()` logic**. The 
 - Predictable sharding/gathering patterns
 
 This is the ideal approach for integrating sequence parallelism into new models, as it is easier to maintain and ensure compatibility with other types of acceleration.
+
+MixFusion's packed-layout hooks reuse this mechanism: a model declares `_mixfusion_plan` instead of `_sp_plan`, and the framework applies the hooks at initialization in the same way (see [MixFusion layout abstraction](diffusion_continuous_batching.md#layout-abstraction)).
 
 **How it works:**
 1. Declare `_sp_plan` dict in your transformer class
@@ -279,6 +349,10 @@ NOTE: be careful to test adequately when refactoring classes that take this styl
 | `expected_dims` | int \| None | Expected tensor rank for validation (optional) |
 | `split_output` | bool | `False`: shard **input** params; `True`: shard **output** tensors |
 | `auto_pad` | bool | Auto-pad if sequence not divisible by world_size (default: `False`) |
+| `clone_shard` | bool | Give multi-rank shards their own contiguous storage (default: `False`); single-rank inputs are unchanged |
+
+With `clone_shard=True`, memory savings require callers to drop their references to the full tensor.
+Other references to the same storage also keep the full allocation alive.
 
 **SequenceParallelOutput Parameters:**
 
@@ -416,7 +490,7 @@ _sp_plan = {
 | Constraint | Description |
 |------------|-------------|
 | **Attention Backend Compatibility** | The attention backends must support `attention_mask`. Currently only `TORCH_SDPA` and `FLASH_ATTN` (default for diffusion models) are supported. |
-| **Ring Attention Limitation** | Ring attention does not support `attention_mask`. Therefore, when using `auto_pad=True`, the combination of Ulysses + Ring attention is not feasible. |
+| **Ring Attention Limitation** | Ring attention does not support arbitrary `attention_mask` values, so `auto_pad=True` remains incompatible. Contiguous suffix padding is supported when the model publishes the global `valid_kv_length` prefix. |
 
 1. Enable `auto_pad=True` for all sequence-dimension inputs in `_sp_plan`:
 ```python

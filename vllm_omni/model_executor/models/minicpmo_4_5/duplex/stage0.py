@@ -5,41 +5,204 @@ from __future__ import annotations
 
 import base64
 import copy
+import os
 import time
+from collections.abc import Callable, Generator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+from numpy.typing import NDArray
+from vllm.logger import init_logger
+from vllm.multimodal.image import open_image
 
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.core.sched.window_policy import WindowOperation
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy, MiniCPMO45TurnState
+
+if TYPE_CHECKING:
+    import torch
+    from PIL import Image
+    from torch import nn
+
+logger = init_logger(__name__)
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
-_MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
+_MINICPMO45_FRAME_POOL_LOCK = Lock()
+_MINICPMO45_FRAME_POOL: ThreadPoolExecutor | None = None
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _frame_preprocess_pool() -> ThreadPoolExecutor | None:
+    """Shared pool for camera-frame JPEG decode and slicing (both release the GIL); ``None`` on one CPU."""
+    global _MINICPMO45_FRAME_POOL
+    workers = min(4, os.cpu_count() or 1)
+    if workers <= 1:
+        return None
+    with _MINICPMO45_FRAME_POOL_LOCK:
+        if _MINICPMO45_FRAME_POOL is None:
+            _MINICPMO45_FRAME_POOL = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="minicpmo45-frames")
+    return _MINICPMO45_FRAME_POOL
+
+
+class _UnrecoverableWindowError(RuntimeError):
+    """The admitted request cannot reproduce its accepted history."""
 
 
 @dataclass
-class _MiniCPMO45Stage0SessionState:
+class _MiniCPMO45WindowUnit:
+    embeds: list[Any] = field(default_factory=list)
+    token_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class _MiniCPMO45CarriedWindow:
+    """A finished Stage-0 request's completed window units, kept in host memory."""
+
+    #: Every unit's embeds, concatenated; on the host, so no GPU memory is held.
+    embeds: torch.Tensor | None
+    #: Rows of each original embed tensor, unit after unit.
+    rows: list[int]
+    #: Embed tensors per unit.
+    unit_sizes: list[int]
+    token_ids: list[list[int]]
+    device: torch.device | str | None
+    #: Accepted physical prefix and suffix on either side of a context summary.
+    header: _MiniCPMO45CarriedWindow | None = None
+    sampling_history: list[int] = field(default_factory=list)
+    #: Units whose embeds could not be packed; kept as they are.
+    units: list[_MiniCPMO45WindowUnit] | None = None
+
+    @classmethod
+    def pack(cls, units: list[_MiniCPMO45WindowUnit]) -> _MiniCPMO45CarriedWindow:
+        import torch
+
+        tensors = [embed for unit in units for embed in unit.embeds]
+        first = tensors[0] if tensors else None
+        if first is None or not all(
+            isinstance(t, torch.Tensor)
+            and t.dim() == 2
+            and t.dtype == first.dtype
+            and t.shape[1] == first.shape[1]
+            and t.device == first.device
+            for t in tensors
+        ):
+            if first is not None:
+                logger.warning_once(
+                    "MiniCPM-o carried window embeds are not uniform 2-D tensors; keeping them in place"
+                )
+            return cls(None, [], [], [], None, units=list(units))
+        packed = torch.cat(tensors)
+        # A pinned, stream-ordered copy: the step does not wait for it, and unpack's copy back runs after it.
+        host = torch.empty(packed.shape, dtype=packed.dtype, pin_memory=packed.is_cuda)
+        host.copy_(packed, non_blocking=packed.is_cuda)
+        return cls(
+            embeds=host,
+            rows=[int(t.shape[0]) for t in tensors],
+            unit_sizes=[len(unit.embeds) for unit in units],
+            token_ids=[list(unit.token_ids) for unit in units],
+            device=first.device,
+        )
+
+    def unpack(self) -> list[_MiniCPMO45WindowUnit]:
+        if self.units is not None or self.embeds is None:
+            return list(self.units or ())
+        parts = iter(self.embeds.to(self.device, non_blocking=True).split(self.rows))
+        return [
+            _MiniCPMO45WindowUnit(embeds=[next(parts) for _ in range(size)], token_ids=ids)
+            for size, ids in zip(self.unit_sizes, self.token_ids)
+        ]
+
+
+@dataclass
+class _MiniCPMO45Stage0SessionState(MiniCPMO45TurnState):
     session_id: str
+    #: Any: MiniCPM-o remote-code processor (transformers, no importable type).
     streaming_processor: Any | None = None
-    audio_buffer: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    audio_buffer: NDArray[np.float32] = field(default_factory=lambda: np.array([], dtype=np.float32))
     audio_chunk_idx: int = 0
-    context_embeds: list[Any] = field(default_factory=list)
+    #: Streaming audio-encoder chunks only. VISION units advance
+    #: ``audio_chunk_idx`` but leave the mel processor on its first window.
+    audio_encoder_chunk_idx: int = 0
+    context_embeds: list[torch.Tensor] = field(default_factory=list)
     context_token_ids: list[int] = field(default_factory=list)
-    current_turn_ended: bool = True
+    context_prefix_embeds: list[Any] = field(default_factory=list)
+    context_prefix_token_ids: list[int] = field(default_factory=list)
+    context_suffix_embeds: list[Any] = field(default_factory=list)
+    context_suffix_token_ids: list[int] = field(default_factory=list)
+    window_units: list[_MiniCPMO45WindowUnit] = field(default_factory=list)
+    window_enabled: bool = False
+    window_previous_ids: list[int] = field(default_factory=list)
+    window_previous_marker: list[int] = field(default_factory=list)
+    pending_window_unit: _MiniCPMO45WindowUnit | None = None
+    pending_window_generated_tokens: list[int] = field(default_factory=list)
+    #: Completed units of the session's previous Stage-0 request (a barge-in
+    #: ended it), waiting for the scheduler's first window plan of this one.
+    carried_window_units: list[_MiniCPMO45WindowUnit] = field(default_factory=list)
+    # Only the latest two append versions can straddle an asynchronous cancel.
+    replay_inputs: dict[int, tuple[list[_MiniCPMO45WindowUnit], int, list[int], torch.Tensor]] = field(
+        default_factory=dict
+    )
+    opened_assistant_turn_segment: tuple[str, int] | None = None
     prepared_append_identity: tuple[int | None, int] | None = None
-    prepared_inputs_embeds: Any | None = None
+    prepared_inputs_embeds: torch.Tensor | None = None
     prepared_input_token_ids: list[int] = field(default_factory=list)
-    prepared_result: dict[str, Any] = field(default_factory=dict)
-    audio_past_key_values: Any | None = None
+    prepared_result: dict[str, object] = field(default_factory=dict)
+    #: Streaming-encoder state: a ``StreamingAudioKVCache`` on the batched
+    #: path, else the opaque transformers cache handed back to the model.
+    audio_past_key_values: object | None = None
+    #: Append identity of the last prefill that did work (successful or not).
+    attempted_append_identity: tuple[int | None, int] | None = None
+    #: This step's batched prefill result, taken by the append's own preprocess.
+    staged_prefill: tuple[tuple[int | None, int], dict[str, object]] | None = None
     pending_terminator_token: int | None = None
     last_terminator_token: int | None = None
-    pending_speech_context: bool = False
+    quiet_audio_units: int = 0
+    speech_after_idle: bool = False
+    idle_reply_due: bool = False
     pending_speech_append_identity: tuple[int | None, int] | None = None
-    pending_speech_response_open: bool = False
     generated_tokens: list[int] = field(default_factory=list)
+    # Sage-Interaction protocol switches (default False so stock MiniCPM-o 4.5 is unchanged).
+    wrap_unit_audio_markers: bool = False
+    allow_speech_interruption: bool = False
+    max_speak_tokens_per_chunk: int | None = None
+    max_delegate_query_tokens: int | None = None
+    in_delegate_unit: bool = False
+    # Per-append raw draws and their returned IDs. A sampled listen can be
+    # converted to tts_bos, and forced controls do not enter the penalty history.
+    replay_samples: dict[int, tuple[list[int], list[tuple[int, int | None]]]] = field(default_factory=dict)
+    last_raw_draw: int | None = None
+
+    def accepted_sampling_history(self, seq: int, accepted) -> list[int] | None:
+        base, draws = self.replay_samples.get(seq, ([], []))
+        prefix = draws[: len(accepted)]
+        if [final for final, _ in prefix] != list(accepted):
+            return None
+        return [*base, *(raw for _, raw in prefix if raw is not None)][
+            -MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE :
+        ]
+
+
+@dataclass(frozen=True, slots=True)
+class _MiniCPMO45AudioEncodeRequest:
+    """One streaming unit a prefill needs encoded; ``_stage_prefill_steps`` yields it."""
+
+    #: Any: transformers BatchFeature (or the dict fallback of _process_streaming_audio).
+    batch_feature: Any
+    state: _MiniCPMO45Stage0SessionState | None
+
+
+_PrefillSteps = Generator[_MiniCPMO45AudioEncodeRequest, "torch.Tensor | None", dict[str, object]]
 
 
 class MiniCPMO45Stage0DuplexRuntime:
@@ -56,14 +219,19 @@ class MiniCPMO45Stage0DuplexRuntime:
     chunk_tts_eos_token_id: int = -1
     turn_eos_token_id: int = -1
     audio_placeholder_token_id: int = -1
+    audio_start_token_id: int = -1
+    audio_end_token_id: int = -1
+    delegate_token_id: int = -1
     image_start_token_id: int = -1
     image_end_token_id: int = -1
 
-    def __init__(self, stage_model: Any, *, model_path: str | None = None, device: str = "cuda") -> None:
+    def __init__(self, stage_model: nn.Module, *, model_path: str | None = None, device: str = "cuda") -> None:
         self.stage_model = stage_model
         self.model_path = model_path
         self.device = device
         self.sessions: dict[tuple[str, int], _MiniCPMO45Stage0SessionState] = {}
+        # (session_id, epoch, seq) -> (frame payload, per-frame embeddings) of this runner step.
+        self._prefetched_vision: dict[tuple[str, int | None, int], tuple[tuple[object, ...], list[Any]]] = {}
         self.thinker = getattr(stage_model, "thinker", None) or getattr(stage_model, "model", None) or stage_model
         self.processor = (
             getattr(stage_model, "processor", None)
@@ -78,6 +246,176 @@ class MiniCPMO45Stage0DuplexRuntime:
         self._init_token_ids()
         if self.tokenizer is not None:
             self._require_special_token_ids()
+        # ``duplex_incremental_fbank`` (HF override, default off): see incremental_fbank.py.
+        self._incremental_fbank = (
+            getattr(getattr(stage_model, "config", None), "duplex_incremental_fbank", False) is True
+        )
+        # Built with the model, before its weights load and it switches to eval mode:
+        # the streaming encoder's CUDA graphs are captured later, by build_audio_cuda_graph().
+        self._audio_graph_attempted = False
+        # Barge-in carry, as the scheduler decides it (``apply_carry_ops``): session_id -> the completed
+        # window units an aborted Stage-0 request left, and units handed to a session's new request until
+        # that request's state is created.
+        self._carried_window_units: dict[str, _MiniCPMO45CarriedWindow] = {}
+        # session_id -> (request it was handed to, units).
+        self._replay_sources: dict[str, str] = {}
+        self._replay_windows: dict[str, _MiniCPMO45CarriedWindow] = {}
+        self._handed_window_units: dict[str, tuple[str, _MiniCPMO45CarriedWindow]] = {}
+
+    def apply_carry_ops(
+        self,
+        ops: list[WindowOperation],
+        state_of_request: Callable[[str], _MiniCPMO45Stage0SessionState | None],
+        live_state_of_session: Callable[[str], _MiniCPMO45Stage0SessionState | None],
+    ) -> None:
+        """Follow the scheduler's barge-in carry decisions for this step, in order.
+
+        A managed session keeps its accepted input rows, native sampler history
+        and the completed part of its open unit before the runner frees the old
+        request. The scheduler binds that snapshot to its replacement by request
+        ID before sizing the replacement's first prefill. Session teardown
+        releases the stored snapshot, including any unused receiver reference.
+
+        Independently managed replicas use the bounded completed-unit offer.
+        Its hand and drop operations follow the scheduler's expiry decisions.
+        """
+        for operation in ops:
+            op, session_id, request_id = operation[:3]
+            cut = operation[3] if len(operation) > 3 else ()
+            if op == "restore":
+                if (record := self._replay_windows.get(operation.source_request_id)) is not None:
+                    self._replay_windows[request_id] = record
+                continue
+            if op == "keep":
+                state = state_of_request(request_id)
+                units: list[_MiniCPMO45WindowUnit] = []
+                if state is not None and state.window_enabled:
+                    units = [*state.carried_window_units, *state.window_units]
+                    if cut:
+                        seq, start, rows, accepted, tail = cut
+                        record = state.replay_inputs.get(seq)
+                        if record is None:
+                            logger.error("No accepted MiniCPM-o prefill record for %s, seq=%s", request_id, seq)
+                            continue
+                        closed, offset, ids, tensor = record
+                        lo = start - offset
+                        if lo < 0 or lo + rows > len(ids):
+                            logger.error(
+                                "Invalid MiniCPM-o accepted span for %s: offset=%s rows=%s", request_id, lo, rows
+                            )
+                            continue
+                        last = _MiniCPMO45WindowUnit(
+                            [tensor[lo : lo + rows], *(self._embed_token(t) for t in tail)],
+                            [*ids[lo : lo + rows], *tail],
+                        )
+                        units = [*closed, last]
+                elif not cut and state is None and self._handed_window_units.get(session_id, ("",))[0] == request_id:
+                    # Handed to this request but its state was never created: pass the same units on.
+                    self._carried_window_units[session_id] = self._handed_window_units.pop(session_id)[1]
+                    continue
+                self._carried_window_units.pop(session_id, None)
+                if not units:
+                    # The scheduler keeps only windows with units, so the two sides disagree from here on.
+                    logger.warning(
+                        "MiniCPM-o barge-in carry: the scheduler kept request %s for session %s, "
+                        "but this side has no units for it",
+                        request_id,
+                        session_id,
+                    )
+                    continue
+                if cut:
+                    # An admitted successor may still be waiting for its first GPU
+                    # slice, so retain its reference when replacing the source.
+                    packed = _MiniCPMO45CarriedWindow.pack(units)
+                    history = state.accepted_sampling_history(seq, accepted)
+                    if history is None:
+                        logger.error("Missing accepted MiniCPM-o sampling history for %s seq=%s", request_id, seq)
+                        continue
+                    packed.sampling_history = history
+                    packed.header = _MiniCPMO45CarriedWindow.pack(
+                        [
+                            _MiniCPMO45WindowUnit(state.context_prefix_embeds, state.context_prefix_token_ids),
+                            _MiniCPMO45WindowUnit(state.context_suffix_embeds, state.context_suffix_token_ids),
+                        ]
+                    )
+                    prior_source = self._replay_sources.get(session_id)
+                    if prior_source != request_id and prior_source is not None:
+                        self._replay_windows.pop(prior_source, None)
+                    self._replay_sources[session_id] = request_id
+                    self._replay_windows[request_id] = packed
+                else:
+                    self._carried_window_units[session_id] = _MiniCPMO45CarriedWindow.pack(units)
+            elif op == "drop":
+                self._carried_window_units.pop(session_id, None)
+            elif op == "hand":
+                kept = self._carried_window_units.pop(session_id, None)
+                if kept is None:
+                    # The scheduler only hands what it told this side to keep; the plan check catches the rest.
+                    logger.warning("MiniCPM-o barge-in carry: no kept units for session %s", session_id)
+                    continue
+                live = live_state_of_session(session_id)
+                if live is not None:
+                    live.carried_window_units = kept.unpack() if live.window_enabled else []
+                else:
+                    self._handed_window_units[session_id] = (request_id, kept)
+
+    def release_session_window(self, session_id: str) -> None:
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import duplex_stage0_session_id
+
+        self._carried_window_units.pop(session_id, None)
+        self._handed_window_units.pop(session_id, None)
+        self._replay_sources.pop(session_id, None)
+        for rid in list(self._replay_windows):
+            if duplex_stage0_session_id(rid) == session_id:
+                self._replay_windows.pop(rid, None)
+
+    def restore_window_units(self, state: _MiniCPMO45Stage0SessionState) -> None:
+        """Give a new request's state the units the scheduler handed to its session (:meth:`apply_carry_ops`)."""
+        handed = self._handed_window_units.pop(state.session_id, None)
+        state.carried_window_units = handed[1].unpack() if handed is not None and state.window_enabled else []
+
+    def forget_handed_window_units(self, session_id: str, request_id: str) -> None:
+        """Drop units handed to a request that finished before its state took them."""
+        if getattr(self, "_replay_sources", {}).get(session_id) != request_id and hasattr(self, "_replay_windows"):
+            self._replay_windows.pop(request_id, None)
+        if self._handed_window_units.get(session_id, ("",))[0] == request_id:
+            self._handed_window_units.pop(session_id)
+
+    def build_audio_cuda_graph(self) -> bool:
+        """Capture the streaming-encoder CUDA graphs once weights are loaded (idempotent; failures stay eager).
+
+        The steady unit's mel-frame count comes from a probe processor configured like a session's: the
+        shared processor's default chunk is no model unit, and a first unit has its own size.
+        """
+        thinker = getattr(self, "thinker", None)
+        config = getattr(thinker, "config", None)
+        attempted = getattr(self, "_audio_graph_attempted", False)
+        self._audio_graph_attempted = True
+        if attempted or not bool(getattr(config, "duplex_audio_encoder_cuda_graph", True)):
+            return False
+        apm = getattr(self.thinker, "apm", None)
+        if getattr(apm, "training", False) is True and callable(getattr(apm, "eval", None)):
+            apm.eval()  # inference only; the loader's model.eval() covers it as well
+        build = getattr(self.thinker, "build_streaming_audio_graph_encoder", None)
+        if not callable(build) or self.processor is None:
+            return False
+        try:
+            probe = self._configure_streaming_processor(SimpleNamespace(streaming_processor=None))
+            if probe is None:
+                return False
+            for _ in range(2):  # the first unit, then the steady one
+                silence = np.zeros(self._streaming_chunk_size(probe), dtype=np.float32)
+                feature = probe.process_audio_streaming(silence, reset=False)
+            # A BatchFeature-like mapping or a (features, metadata) tuple, by processor version.
+            frames = int((feature["audio_features"] if isinstance(feature, dict) else feature[0]).shape[-1])
+        except Exception:
+            logger.info(
+                "MiniCPM-o could not derive the steady streaming-audio unit shape; "
+                "the streaming audio encoder stays eager",
+                exc_info=True,
+            )
+            return False
+        return bool(build(unit_frames=frames))
 
     def _stage_runtime_ready(self) -> bool:
         return self.processor is not None and self.tokenizer is not None and self.thinker is not None
@@ -85,7 +423,7 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _configure_streaming_processor(
         self,
         state: _MiniCPMO45Stage0SessionState | None = None,
-    ) -> Any | None:
+    ) -> Any | None:  # Any: MiniCPM-o remote-code processor
         processor = self.processor
         if processor is None:
             return None
@@ -93,9 +431,19 @@ class MiniCPMO45Stage0DuplexRuntime:
             if state.streaming_processor is not None:
                 return state.streaming_processor
             processor = copy.copy(processor)
+            # The streaming mel processor sets its feature extractor's log-mel floor
+            # on every chunk (set_spac_log_norm). The shallow copy would share that
+            # extractor with self.processor, whose process_audio then normalises the
+            # next session's reference voice under whatever floor the last chunk of
+            # any session left. One memo also binds the copied mel processor to the
+            # session's own extractor; set_streaming_mode rebuilds it on that one.
+            memo: dict[int, Any] = {}
+            shared_fe = getattr(self.processor, "audio_processor", None)
+            if shared_fe is not None:
+                processor.audio_processor = copy.deepcopy(shared_fe, memo)
             shared_mel = getattr(self.processor, "_streaming_mel_processor", None)
             if shared_mel is not None:
-                processor._streaming_mel_processor = copy.deepcopy(shared_mel)
+                processor._streaming_mel_processor = copy.deepcopy(shared_mel, memo)
             state.streaming_processor = processor
         if processor is None:
             return None
@@ -115,7 +463,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             reset_streaming = getattr(processor, "reset_streaming", None)
             if callable(reset_streaming):
                 reset_streaming()
-            return processor
+            return self._maybe_enable_incremental_fbank(processor)
         configure_streaming = getattr(processor, "configure_streaming", None)
         if callable(configure_streaming):
             configure_streaming(
@@ -124,15 +472,48 @@ class MiniCPMO45Stage0DuplexRuntime:
                 slide_trigger_seconds=30.0,
                 slide_stride_seconds=10.0,
             )
+        return self._maybe_enable_incremental_fbank(processor)
+
+    def _maybe_enable_incremental_fbank(self, processor: Any) -> Any:  # Any: remote-code processor
+        """Put the processor's streaming mel front end on the incremental path (``duplex_incremental_fbank``)."""
+        mel_processor = getattr(processor, "_streaming_mel_processor", None)
+        if getattr(self, "_incremental_fbank", False) and mel_processor is not None:
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.incremental_fbank import enable_incremental_fbank
+
+            if not enable_incremental_fbank(mel_processor):
+                logger.warning_once(
+                    "MiniCPM-o duplex_incremental_fbank: %s is not supported; the streaming fbank recomputes in full",
+                    type(mel_processor).__name__,
+                )
         return processor
+
+    @staticmethod
+    def _sync_session_runtime_config(
+        state: _MiniCPMO45Stage0SessionState,
+        runtime_config: dict[str, object],
+    ) -> None:
+        if "duplex_max_speak_tokens_per_chunk" in runtime_config:
+            speak_cap = _optional_int(runtime_config.get("duplex_max_speak_tokens_per_chunk"))
+            state.max_speak_tokens_per_chunk = speak_cap if speak_cap is not None and speak_cap > 0 else None
+        if "duplex_max_delegate_query_tokens" in runtime_config:
+            delegate_cap = _optional_int(runtime_config.get("duplex_max_delegate_query_tokens"))
+            state.max_delegate_query_tokens = delegate_cap if delegate_cap is not None and delegate_cap > 0 else None
 
     def _prepare_session_context(
         self,
         state: _MiniCPMO45Stage0SessionState,
-        session_config: dict[str, Any],
+        session_config: dict[str, object],
         *,
-        runtime_config: dict[str, Any] | None = None,
+        runtime_config: dict[str, object] | None = None,
     ) -> None:
+        rt = runtime_config or {}
+        window_config = rt.get("duplex_window_config")
+        state.window_enabled = bool(rt.get("duplex_boundary_token_ids")) or (
+            isinstance(window_config, dict) and window_config.get("sliding_window_mode") in {"basic", "context"}
+        )
+        state.wrap_unit_audio_markers = bool(rt.get("duplex_wrap_unit_audio_markers", False))
+        state.allow_speech_interruption = bool(rt.get("duplex_allow_speech_interruption", False))
+        self._sync_session_runtime_config(state, rt)
         if not self._stage_runtime_ready():
             return
         self._require_special_token_ids()
@@ -142,41 +523,136 @@ class MiniCPMO45Stage0DuplexRuntime:
         # only present when reference audio is embedded between them. The
         # template is shared with the serving adapter so the first-append
         # scheduler reserve can count these tokens exactly.
+        initial_user_text = (runtime_config or {}).get("initial_user_text")
+        effective_instructions = (runtime_config or {}).get("instructions")
+        if not (isinstance(effective_instructions, str) and effective_instructions):
+            effective_instructions = session_config.get("instructions")
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
-            session_config.get("instructions"),
+            effective_instructions,
             ref_audio is not None,
-            (runtime_config or {}).get("initial_user_text"),
+            initial_user_text,
         )
         for token_id in self._encode_text(prefix):
-            state.context_embeds.append(self._embed_token(token_id))
+            embed = self._embed_token(token_id)
+            state.context_embeds.append(embed)
             state.context_token_ids.append(token_id)
+            state.context_prefix_embeds.append(embed)
+            state.context_prefix_token_ids.append(token_id)
         if ref_audio is not None:
             ref_audio_embeds = self._stage_ref_audio_embeddings(ref_audio, state=state)
             if ref_audio_embeds is not None:
                 ref_audio_embeds = self._as_2d_tensor(ref_audio_embeds)
+                placeholder_ids = [self.unit_token_id] * int(ref_audio_embeds.shape[0])
                 state.context_embeds.append(ref_audio_embeds)
-                state.context_token_ids.extend([self.unit_token_id] * int(ref_audio_embeds.shape[0]))
+                state.context_token_ids.extend(placeholder_ids)
+                state.context_prefix_embeds.append(ref_audio_embeds)
+                state.context_prefix_token_ids.extend(placeholder_ids)
         for token_id in self._encode_text(suffix):
-            state.context_embeds.append(self._embed_token(token_id))
+            embed = self._embed_token(token_id)
+            state.context_embeds.append(embed)
             state.context_token_ids.append(token_id)
+            state.context_suffix_embeds.append(embed)
+            state.context_suffix_token_ids.append(token_id)
+        if isinstance(initial_user_text, str) and initial_user_text:
+            # Seeded text is pending user content just like a speech append.
+            # Otherwise the turn-ended latch forces its silent input clock to
+            # listen before the model can answer. Generated content clears it.
+            state.pending_speech_context = True
+            # The seeded template already opens the assistant turn. Match
+            # that prefix in the native listen/speak state machine so silence
+            # advances this response until the model emits turn_eos.
+            state.current_turn_ended = False
+            state.pending_speech_response_open = True
 
-    def _stage_prefill_embeddings_only(
+    def _stage_prefill_embeddings_only(self, state, audio_waveform, **kwargs: Any) -> dict[str, object]:
+        """Run :meth:`_stage_prefill_steps` for one append, encoding its units one at a time."""
+        return self._run_prefill_steps([self._stage_prefill_steps(state, audio_waveform, **kwargs)])[0]
+
+    @staticmethod
+    def take_staged_prefill(
+        state: _MiniCPMO45Stage0SessionState, epoch: int | None, seq: int | None
+    ) -> dict[str, object] | None:
+        """Pop the append :meth:`stage_prefill_batch` built for ``(epoch, seq)`` this step, if any."""
+        staged = state.staged_prefill
+        if staged is None:
+            return None
+        state.staged_prefill = None
+        if seq is None or staged[0] != (epoch, seq):
+            return None
+        return staged[1]
+
+    def batches_audio_encoder(self) -> bool:
+        """Whether the thinker can encode several sessions' audio units in one call."""
+        return self._batched_audio_encoder() is not None
+
+    def needs_prefill(self, state: _MiniCPMO45Stage0SessionState | None, epoch: int | None, seq: int | None) -> bool:
+        """Whether an append has not been built (or attempted) for this session yet."""
+        if seq is None or state is None:
+            return seq is not None
+        built = state.prepared_append_identity == (epoch, seq) and state.prepared_inputs_embeds is not None
+        return not built and state.attempted_append_identity != (epoch, seq)
+
+    def stage_prefill_batch(
+        self,
+        appends: list[tuple[_MiniCPMO45Stage0SessionState, NDArray[np.float32] | None, dict[str, Any]]],
+    ) -> None:
+        """Build distinct sessions' appends (each with a ``seq``), batching their ``k``-th unit encodes.
+
+        Results are staged on the session for the append's own ``preprocess`` this step.
+        """
+        if len({id(state) for state, _, _ in appends}) != len(appends):
+            raise ValueError("stage_prefill_batch needs one append per session")
+        steps = [self._stage_prefill_steps(state, audio, **kwargs) for state, audio, kwargs in appends]
+        for (state, _, kwargs), result in zip(appends, self._run_prefill_steps(steps), strict=True):
+            state.staged_prefill = ((kwargs.get("epoch"), kwargs["seq"]), result)
+
+    def _run_prefill_steps(self, steps: list[_PrefillSteps]) -> list[dict[str, object]]:
+        """Drive prefills to completion, encoding each round's pending units together."""
+        results: list[dict[str, object] | None] = [None] * len(steps)
+        pending: list[tuple[int, _MiniCPMO45AudioEncodeRequest]] = []
+
+        def advance(index: int, value: torch.Tensor | None, *, first: bool = False) -> None:
+            try:
+                request = next(steps[index]) if first else steps[index].send(value)
+            except StopIteration as stop:
+                results[index] = stop.value
+                return
+            pending.append((index, request))
+
+        for index in range(len(steps)):
+            advance(index, None, first=True)
+        while pending:
+            round_, pending = pending, []
+            embeds = self._stage_audio_embeddings_batch([request for _, request in round_])
+            for (index, _), embed in zip(round_, embeds, strict=True):
+                advance(index, embed)
+        return cast("list[dict[str, object]]", results)
+
+    def _stage_prefill_steps(
         self,
         state: _MiniCPMO45Stage0SessionState,
-        audio_waveform: Any,
+        audio_waveform: NDArray[np.float32] | None,
         *,
-        video_frames: list[Any] | None = None,
+        video_frames: list[Image.Image] | None = None,
+        encoded_frames: list[list[torch.Tensor]] | None = None,
+        input_text_token_ids: list[int] | None = None,
         epoch: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
-        final: bool = False,
-    ) -> dict[str, Any]:
-        """Build scheduler-owned Stage0 input embeddings for one audio append.
+        force_listen: bool = False,
+        stage0_window: dict[str, object] | None = None,
+        text_token_ids: list[int] | None = None,
+        prepend_text_token_ids: list[int] | None = None,
+    ) -> _PrefillSteps:
+        """Build scheduler-owned Stage0 input embeddings for one input unit.
 
         Unlike the legacy worker-control path, this method never calls an eager
         model forward. The normal vLLM runner consumes the returned embeddings
         and owns attention metadata, block tables, KV cache, and sampling.
+        Yields each unit's encoder request; the caller sends back its embeddings.
         """
+        import torch
+
         start_time = time.time()
         processor = self._configure_streaming_processor(state)
         append_identity = (epoch, seq) if seq is not None else None
@@ -189,14 +665,39 @@ class MiniCPMO45Stage0DuplexRuntime:
             result["inputs_embeds"] = state.prepared_inputs_embeds
             result["input_token_ids"] = list(state.prepared_input_token_ids)
             return result
+        state.attempted_append_identity = append_identity
         self._require_special_token_ids()
-        if audio_waveform is None or len(audio_waveform) == 0:
+        if isinstance(stage0_window, dict):
+            completed_ids = stage0_window.get("completed_token_ids")
+            if isinstance(completed_ids, list):
+                state.pending_window_generated_tokens = [int(token_id) for token_id in completed_ids]
+                prior = state.prepared_append_identity
+                if prior is not None and prior[1] in state.replay_samples:
+                    accepted = list(completed_ids)
+                    if isinstance(stop := stage0_window.get("completed_terminator_token_id"), int):
+                        accepted.append(stop)
+                    if (history := state.accepted_sampling_history(prior[1], accepted)) is not None:
+                        state.generated_tokens = history
+            completed_terminator = stage0_window.get("completed_terminator_token_id")
+            if isinstance(completed_terminator, int):
+                # Async sampling can overwrite the worker's pending token
+                # after the scheduler accepted a segment stop. Rebuild from
+                # the scheduler's canonical boundary, just like its content.
+                state.pending_terminator_token = completed_terminator
+        num_frames = len(encoded_frames) if encoded_frames is not None else len(video_frames or ())
+        # Client TEXT units are separate from server-owned result tokens
+        # appended after the unit's media embeddings below.
+        has_text = bool(input_text_token_ids)
+        vision_only = audio_waveform is None or len(audio_waveform) == 0
+        if vision_only and not num_frames and not has_text:
             return self._stage_prefill_result(False, start_time, "empty audio")
-        state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
+        if not vision_only:
+            state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
         chunk_size = self._streaming_chunk_size(processor)
-        self._pad_first_audio_chunk_if_needed(state, processor)
-        if len(state.audio_buffer) < chunk_size:
-            if video_frames:
+        if not vision_only:
+            self._pad_first_audio_chunk_if_needed(state, processor)
+        if not vision_only and len(state.audio_buffer) < chunk_size:
+            if num_frames:
                 # Frames belong to the unit this append closes, and the
                 # scheduler already reserved their vision tokens against this
                 # append. A frame arriving before its unit can close has
@@ -205,7 +706,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 return self._stage_prefill_result(
                     False,
                     start_time,
-                    f"{len(video_frames)} video frame(s) on an append that closes no model unit "
+                    f"{num_frames} video frame(s) on an append that closes no model unit "
                     f"(need {chunk_size} samples, only {len(state.audio_buffer)}); "
                     "send frames on unit boundaries",
                 )
@@ -217,17 +718,18 @@ class MiniCPMO45Stage0DuplexRuntime:
         # Omni duplex: encode this append's camera frames so the first unit can
         # carry them, mirroring official streaming_prefill (feed <unit>, then
         # every frame_list entry as its own <image> block, then the audio).
-        frame_blocks: list[Any] = []
-        if video_frames:
+        frame_blocks: list[list[torch.Tensor]] = []
+        if num_frames:
             self._require_vision_token_ids()
-            encoded_frames = self._stage_vision_embeddings(video_frames)
-            if encoded_frames is None or len(encoded_frames) != len(video_frames):
+            if encoded_frames is None:
+                encoded_frames = self._stage_vision_embeddings(video_frames or [])
+            if encoded_frames is None or len(encoded_frames) != num_frames:
                 return self._stage_prefill_result(False, start_time, "streaming vision embedding failed")
             if any(not slices for slices in encoded_frames):
                 return self._stage_prefill_result(False, start_time, "streaming vision embedding failed")
             frame_blocks = encoded_frames
 
-        embed_parts: list[Any] = []
+        embed_parts: list[torch.Tensor] = []
         token_ids: list[int] = []
         if state.audio_chunk_idx == 0 and state.context_embeds:
             embed_parts.extend(state.context_embeds)
@@ -240,28 +742,35 @@ class MiniCPMO45Stage0DuplexRuntime:
         # and intentionally leaves a small carry that is not another model unit.
         units_built = 0
         while True:
-            if len(state.audio_buffer) < chunk_size:
+            if vision_only and units_built:
                 break
-            audio_chunk = state.audio_buffer[:chunk_size]
-            batch_feature = self._process_streaming_audio(audio_chunk, state.audio_chunk_idx, processor=processor)
-            for name, value in (
-                ("chunk_idx", state.audio_chunk_idx),
-                ("use_extra_context", True),
-                ("prefix_extra_frames", 0 if state.audio_chunk_idx == 0 else 2),
-                ("suffix_extra_frames", 2),
-            ):
-                with suppress(Exception):
-                    setattr(batch_feature, name, value)
-            audio_embeds = self._stage_audio_embeddings(batch_feature, state=state)
-            if audio_embeds is None:
-                if units_built == 0:
-                    return self._stage_prefill_result(False, start_time, "streaming audio embedding returned empty")
-                break
-            consumed_samples = self._consumed_audio_samples(
-                state.audio_chunk_idx,
-                chunk_size,
-                processor=processor,
-            )
+            audio_embeds = None
+            consumed_samples = 0
+            if not vision_only:
+                if len(state.audio_buffer) < chunk_size:
+                    break
+                audio_chunk = state.audio_buffer[:chunk_size]
+                encoder_chunk_idx = state.audio_encoder_chunk_idx
+                batch_feature = self._process_streaming_audio(audio_chunk, encoder_chunk_idx, processor=processor)
+                for name, value in (
+                    ("chunk_idx", encoder_chunk_idx),
+                    ("use_extra_context", True),
+                    ("prefix_extra_frames", 0 if encoder_chunk_idx == 0 else 2),
+                    ("suffix_extra_frames", 2),
+                ):
+                    with suppress(Exception):
+                        setattr(batch_feature, name, value)
+                audio_embeds = yield _MiniCPMO45AudioEncodeRequest(batch_feature, state)
+                if audio_embeds is None:
+                    if units_built == 0:
+                        return self._stage_prefill_result(False, start_time, "streaming audio embedding returned empty")
+                    break
+                consumed_samples = self._consumed_audio_samples(
+                    encoder_chunk_idx,
+                    chunk_size,
+                    processor=processor,
+                )
+                state.audio_encoder_chunk_idx += 1
             if state.audio_chunk_idx > 0:
                 # Official duplex closes every unit (finalize_unit feeds the
                 # sampled terminator + </unit>) before the next <unit> opens.
@@ -270,12 +779,29 @@ class MiniCPMO45Stage0DuplexRuntime:
                 # the closure; the model's listen/speak policy depends on
                 # seeing its own past decisions in context.
                 pending_terminator = state.pending_terminator_token
+                closure_token_ids: list[int] = []
                 if pending_terminator is not None and units_built == 0:
                     state.pending_terminator_token = None
                     embed_parts.append(self._embed_token(pending_terminator))
                     token_ids.append(int(pending_terminator))
+                    closure_token_ids.append(int(pending_terminator))
                 embed_parts.append(self._embed_token(self.unit_end_token_id))
                 token_ids.append(self.unit_end_token_id)
+                closure_token_ids.append(self.unit_end_token_id)
+                if units_built == 0:
+                    self._finalize_window_unit(state, closure_token_ids)
+                elif state.pending_window_unit is not None:
+                    # Internal processor chunks belong to this same append.
+                    state.pending_window_unit.embeds.extend(
+                        self._embed_token(token_id) for token_id in closure_token_ids
+                    )
+                    state.pending_window_unit.token_ids.extend(closure_token_ids)
+            unit_embed_start = len(embed_parts)
+            unit_token_start = len(token_ids)
+            if units_built == 0 and prepend_text_token_ids:
+                for prepend_token_id in prepend_text_token_ids:
+                    embed_parts.append(self._embed_token(prepend_token_id))
+                    token_ids.append(int(prepend_token_id))
             embed_parts.append(self._embed_token(self.unit_token_id))
             token_ids.append(self.unit_token_id)
             if frame_blocks:
@@ -295,22 +821,64 @@ class MiniCPMO45Stage0DuplexRuntime:
                         embed_parts.append(self._embed_token(end_id))
                         token_ids.append(int(end_id))
                 frame_blocks = []
-            embed_parts.append(audio_embeds)
-            token_ids.extend(
-                [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
-            )
+            if audio_embeds is not None:
+                if state.wrap_unit_audio_markers:
+                    audio_start_id = self._required_optional_token_id("audio_start_token_id")
+                    audio_end_id = self._required_optional_token_id("audio_end_token_id")
+                    embed_parts.append(self._embed_token(audio_start_id))
+                    token_ids.append(int(audio_start_id))
+                    embed_parts.append(audio_embeds)
+                    token_ids.extend(
+                        [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
+                    )
+                    embed_parts.append(self._embed_token(audio_end_id))
+                    token_ids.append(int(audio_end_id))
+                else:
+                    embed_parts.append(audio_embeds)
+                    token_ids.extend(
+                        [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
+                    )
+            if input_text_token_ids and units_built == 0:
+                # Match native streaming_prefill(text_list=...): raw text after
+                # this unit's media, without a new chat template or audio clock.
+                text_ids = torch.tensor(input_text_token_ids, dtype=torch.long, device=self._model_device())
+                embed_parts.append(self._token_embedder()(text_ids))
+                token_ids.extend(input_text_token_ids)
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             units_built += 1
+            if state.window_enabled:
+                if state.pending_window_unit is None:
+                    state.pending_window_unit = _MiniCPMO45WindowUnit()
+                state.pending_window_unit.embeds.extend(embed_parts[unit_embed_start:])
+                state.pending_window_unit.token_ids.extend(token_ids[unit_token_start:])
             chunk_size = self._streaming_chunk_size(processor)
-        # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
-        # turn is opened once at session init; re-emitting the turn-open prefix per chunk
+        if text_token_ids and units_built:
+            # Official mixed-mode prefill puts <backend> text after the media
+            # and samples from its final token, in the same resident KV.
+            import torch
+
+            ids = torch.tensor(text_token_ids, dtype=torch.long, device=self._model_device())
+            text_embeds = self._as_2d_tensor(self._token_embedder()(ids))
+            embed_parts.append(text_embeds)
+            token_ids.extend(text_token_ids)
+            if state.pending_window_unit is not None:
+                state.pending_window_unit.embeds.append(text_embeds)
+                state.pending_window_unit.token_ids.extend(text_token_ids)
+        # Match official streaming_prefill: a unit carries media and optional text.
+        # The assistant turn opens once at session init; re-emitting its prefix per chunk
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
         # model-generated and tracked via current_turn_ended (mirrors streaming_generate).
         prompt_suffix_len = 0
 
-        import torch
-
+        try:
+            window_result = self._window_replacement_parts(state, stage0_window)
+        except _UnrecoverableWindowError as exc:
+            result = self._stage_prefill_result(False, start_time, str(exc))
+            result["request_error"] = str(exc)
+            return result
+        if window_result is not None:
+            embed_parts, token_ids = window_result
         inputs_embeds = torch.cat([self._as_2d_tensor(embed) for embed in embed_parts], dim=0)
         result = self._stage_prefill_result(True, start_time)
         result.update(
@@ -323,11 +891,33 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "uses_model_runner_scheduler": True,
                 "runner_kv_backed": True,
                 "runtime_impl": "scheduler_data_plane",
+                "stage0_window_replaced": window_result is not None,
+                "text_input": has_text and not force_listen,
             }
         )
-        if is_speech and (append_identity is None or state.pending_speech_append_identity != append_identity):
-            state.pending_speech_context = True
-            state.pending_speech_append_identity = append_identity
+        # Standalone VISION input can open a response without speech. Camera
+        # frames accompanying silent audio must retain the OMNI speech gate:
+        # otherwise every frame can re-open a completed conversation turn.
+        if append_identity is None or state.pending_speech_append_identity != append_identity:
+            if has_text or text_token_ids:
+                # Restore the previous window first, then apply this unit's text once.
+                state.observe_text_prefill(force_listen=force_listen, backend_result=bool(text_token_ids))
+                state.pending_speech_append_identity = append_identity
+            elif is_speech or (vision_only and num_frames) or prepend_text_token_ids:
+                state.pending_speech_context = True
+                state.pending_speech_append_identity = append_identity
+        if is_speech:
+            # The audio front end bounds its streaming history at 30 seconds.
+            # Allow one reply at the end of the first voiced turn after that gap.
+            state.speech_after_idle |= state.quiet_audio_units >= 30 and state.current_turn_ended
+            state.quiet_audio_units = 0
+            state.idle_reply_due = False
+        elif not (num_frames or has_text or text_token_ids):
+            state.quiet_audio_units += units_built
+            state.idle_reply_due |= state.speech_after_idle
+            state.speech_after_idle = False
+        else:
+            state.quiet_audio_units = 0
         if append_identity is not None:
             state.prepared_append_identity = append_identity
             state.prepared_inputs_embeds = inputs_embeds
@@ -335,8 +925,300 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.prepared_result = {k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}}
         return result
 
+    def _finalize_window_unit(
+        self,
+        state: _MiniCPMO45Stage0SessionState,
+        closure_token_ids: list[int],
+    ) -> None:
+        pending = state.pending_window_unit
+        if not state.window_enabled or pending is None:
+            state.pending_window_unit = None
+            state.pending_window_generated_tokens.clear()
+            return
+        generated = list(state.pending_window_generated_tokens)
+        token_ids = [*pending.token_ids, *generated, *closure_token_ids]
+        embeds = list(pending.embeds)
+        embeds.extend(self._embed_token(token_id) for token_id in generated)
+        embeds.extend(self._embed_token(token_id) for token_id in closure_token_ids)
+        state.window_units.append(_MiniCPMO45WindowUnit(embeds=embeds, token_ids=token_ids))
+        state.pending_window_unit = None
+        state.pending_window_generated_tokens.clear()
+
     @staticmethod
-    def _stage_prefill_result(success: bool, start_time: float, reason: str = "") -> dict[str, Any]:
+    def _tensor_rows(t: Any) -> int:
+        if hasattr(t, "shape"):
+            if getattr(t, "ndim", len(t.shape)) == 1:
+                return 1
+            if getattr(t, "ndim", len(t.shape)) == 3 and t.shape[0] == 1:
+                return int(t.shape[1])
+            return int(t.shape[0])
+        return 1
+
+    @classmethod
+    def _slice_single_tensor(cls, t: Any, start_row: int, end_row: int) -> Any:
+        if hasattr(t, "ndim"):
+            if t.ndim == 1:
+                return t
+            if t.ndim == 3 and t.shape[0] == 1:
+                return t[:, start_row:end_row]
+            return t[start_row:end_row]
+        return t
+
+    @classmethod
+    def _slice_embed_list(cls, embeds: list[Any], start_token: int, end_token: int) -> list[Any]:
+        if start_token >= end_token or not embeds:
+            return []
+        result: list[Any] = []
+        curr_offset = 0
+        for t in embeds:
+            num_rows = cls._tensor_rows(t)
+            t_start = curr_offset
+            t_end = curr_offset + num_rows
+            curr_offset = t_end
+
+            overlap_start = max(t_start, start_token)
+            overlap_end = min(t_end, end_token)
+            if overlap_start < overlap_end:
+                local_start = overlap_start - t_start
+                local_end = overlap_end - t_start
+                if local_start == 0 and local_end == num_rows:
+                    result.append(t)
+                else:
+                    result.append(cls._slice_single_tensor(t, local_start, local_end))
+        return result
+
+    def _evict_window_units_for_reanchor(
+        self,
+        state: _MiniCPMO45Stage0SessionState,
+        stage0_reanchor: dict[str, Any],
+    ) -> None:
+        """Evict completed window units that were dropped by zero-copy KV re-anchor.
+
+        Ensures worker history (state.window_units) stays bounded over long streaming sessions
+        when zero-copy Re-RoPE KV reuse is active and prompt rebuild is bypassed.
+        """
+        reanchor_id = stage0_reanchor.get("reanchor_id")
+        if reanchor_id:
+            applied = getattr(state, "_applied_reanchor_ids", None)
+            if applied is None:
+                applied = state._applied_reanchor_ids = set()
+            if reanchor_id in applied:
+                return
+            applied.add(reanchor_id)
+
+        delta = int(stage0_reanchor.get("delta", 0) or 0)
+        if delta <= 0 or not state.window_units:
+            return
+
+        moved_from = stage0_reanchor.get("moved_from")
+        sink_end = stage0_reanchor.get("sink_end")
+        if sink_end is None and moved_from is not None:
+            sink_end = int(moved_from) - delta
+        if sink_end is None:
+            sink_blocks = int(stage0_reanchor.get("sink_blocks", 0) or 0)
+            block_size = int(stage0_reanchor.get("block_size", 16) or 16)
+            sink_end = sink_blocks * block_size
+
+        prefix_tokens = int(stage0_reanchor.get("prefix_tokens", 0) or len(state.context_token_ids))
+        drop_start = max(0, int(sink_end) - prefix_tokens)
+        drop_end = drop_start + delta
+
+        new_units: list[_MiniCPMO45WindowUnit] = []
+        curr_offset = 0
+        for unit in state.window_units:
+            u_len = len(unit.token_ids)
+            u_start = curr_offset
+            u_end = curr_offset + u_len
+            curr_offset = u_end
+
+            local_drop_start = max(0, drop_start - u_start)
+            local_drop_end = min(u_len, drop_end - u_start)
+
+            if local_drop_start >= local_drop_end:
+                new_units.append(unit)
+            elif local_drop_start == 0 and local_drop_end == u_len:
+                continue
+            else:
+                kept_tokens = unit.token_ids[:local_drop_start] + unit.token_ids[local_drop_end:]
+                kept_embeds = self._slice_embed_list(unit.embeds, 0, local_drop_start) + self._slice_embed_list(
+                    unit.embeds, local_drop_end, u_len
+                )
+                unit.token_ids = kept_tokens
+                unit.embeds = kept_embeds
+                new_units.append(unit)
+
+        state.window_units = new_units
+
+    def _filler_units(self, lengths: list[Any], count: int) -> list[_MiniCPMO45WindowUnit]:
+        """``count`` units of <|listen|> with the planned lengths, for carried units this side lacks."""
+        sizes = [max(1, int(n)) for n in lengths][:count]
+        sizes += [1] * (count - len(sizes))
+        token = self.listen_token_id if self.listen_token_id >= 0 else 0
+        if not sizes:
+            return []
+        embed = self._embed_token(token)
+        return [_MiniCPMO45WindowUnit(embeds=[embed] * n, token_ids=[token] * n) for n in sizes]
+
+    def _end_carried_speech_with_listen(self, unit: _MiniCPMO45WindowUnit) -> None:
+        """Close the last unit before a cut as one where the model stopped speaking.
+
+        A speech unit ends in <|chunk_eos|> or <|chunk_tts_eos|>, which tells the
+        model it is still mid-turn. After a barge-in or cancel the next units are
+        the user's, so the unit is closed with <|listen|> instead, as when the
+        model yields on its own. The length is unchanged.
+        """
+        ids = unit.token_ids
+        speech_terminators = {self.chunk_eos_token_id, self.chunk_tts_eos_token_id} - {-1}
+        if len(ids) < 2 or len(unit.embeds) < 2 or ids[-1] != self.unit_end_token_id:
+            return
+        if ids[-2] not in speech_terminators or self.listen_token_id < 0:
+            return
+        if self.turn_eos_token_id >= 0 and len(ids) >= 3 and ids[-3] == self.turn_eos_token_id:
+            # Only the final generated token decides whether the turn stayed ended;
+            # text after an earlier turn_eos reopens it.
+            return
+        unit.token_ids = [*ids[:-2], self.listen_token_id, ids[-1]]
+        unit.embeds = [*unit.embeds[:-2], self._embed_token(self.listen_token_id), unit.embeds[-1]]
+
+    def _window_replacement_parts(
+        self,
+        state: _MiniCPMO45Stage0SessionState,
+        stage0_window: dict[str, Any] | None,
+    ) -> tuple[list[Any], list[int]] | None:
+        if not isinstance(stage0_window, dict):
+            return None
+        # The first window plan of a request is the only one that can place carried units.
+        carried, state.carried_window_units = state.carried_window_units, []
+        target = stage0_window.get("replay_cut")
+        if isinstance(target, str):
+            record = self._replay_windows.pop(target, None)
+            if record is None:
+                raise _UnrecoverableWindowError(f"Missing admitted MiniCPM-o replay for {target}")
+            carried = record.unpack()
+            if record.header is not None:
+                prefix, suffix = record.header.unpack()
+                state.context_prefix_embeds, state.context_prefix_token_ids = prefix.embeds, prefix.token_ids
+                state.context_suffix_embeds, state.context_suffix_token_ids = suffix.embeds, suffix.token_ids
+                state.context_embeds = [*prefix.embeds, *suffix.embeds]
+                state.context_token_ids = [*prefix.token_ids, *suffix.token_ids]
+            state.generated_tokens = list(record.sampling_history)
+            state.explicit_response_awaiting_content = False
+            state.current_turn_ended = True
+            state.pending_speech_context = False
+            state.pending_speech_response_open = False
+        if stage0_window.get("replace") is not True:
+            return None
+        try:
+            drop_units = max(0, int(stage0_window.get("drop_units", 0)))
+            carried_units = max(0, int(stage0_window.get("carried_units", 0) or 0))
+        except (TypeError, ValueError):
+            return None
+        # The scheduler places the newest units: an older one it dropped is never more recent than these.
+        placed = carried[len(carried) - carried_units :] if carried_units else []
+        lengths = stage0_window.get("carried_unit_lengths")
+        if carried_units and (
+            len(placed) != carried_units
+            or (isinstance(lengths, list) and [len(unit.token_ids) for unit in placed] != [int(n) for n in lengths])
+        ):
+            # This side doesn't have the units the scheduler planned. Fill their positions with <|listen|> so
+            # the prompt still has the planned length, rather than failing the step for every session.
+            logger.error(
+                "MiniCPM-o barge-in carry for session %s does not match the plan (kept %d units, planned %d); "
+                "placing filler units",
+                state.session_id,
+                len(carried),
+                carried_units,
+            )
+            if target:
+                raise _UnrecoverableWindowError(f"Inconsistent admitted MiniCPM-o replay for {target}")
+            placed = self._filler_units(lengths if isinstance(lengths, list) else [], carried_units)
+        elif placed and stage0_window.get("close_before_text"):
+            # The parked terminator and </unit> are pending replay. Close the
+            # old turn before that pair so the new text remains the decode position.
+            last = placed[-1]
+            placed[-1] = _MiniCPMO45WindowUnit(
+                [*last.embeds[:-2], self._embed_token(self.turn_eos_token_id), *last.embeds[-2:]],
+                [*last.token_ids[:-2], self.turn_eos_token_id, *last.token_ids[-2:]],
+            )
+        elif placed and not stage0_window.get("replay_cut"):
+            self._end_carried_speech_with_listen(placed[-1])
+        state.window_units[:0] = placed
+        if drop_units > len(state.window_units):
+            raise RuntimeError(
+                "MiniCPM-o Stage-0 window history is shorter than the scheduler drop plan: "
+                f"drop={drop_units}, completed={len(state.window_units)}"
+            )
+        del state.window_units[:drop_units]
+
+        mode = stage0_window.get("mode")
+        embeds: list[Any] = []
+        token_ids: list[int] = []
+        previous_ids: list[int] = []
+        if mode == "context":
+            embeds.extend(state.context_prefix_embeds)
+            token_ids.extend(state.context_prefix_token_ids)
+            previous = stage0_window.get("previous_token_ids")
+            previous_ids = [int(token_id) for token_id in previous] if isinstance(previous, list) else []
+            state.window_previous_ids = previous_ids
+            state.window_previous_marker = list(stage0_window.get("previous_marker_token_ids") or ())
+            if previous_ids:
+                # The plan carries the marker ids the scheduler sized the
+                # `previous` region from. Re-tokenizing here would be a second
+                # source of truth and could disagree with that length.
+                marker = stage0_window.get("previous_marker_token_ids")
+                marker_ids = [int(token_id) for token_id in marker] if isinstance(marker, list) else []
+                embeds.extend(self._embed_token(token_id) for token_id in [*marker_ids, *previous_ids])
+                token_ids.extend(marker_ids)
+                token_ids.extend(previous_ids)
+            embeds.extend(state.context_suffix_embeds)
+            token_ids.extend(state.context_suffix_token_ids)
+        else:
+            embeds.extend(state.context_embeds)
+            token_ids.extend(state.context_token_ids)
+        for unit in state.window_units:
+            embeds.extend(unit.embeds)
+            token_ids.extend(unit.token_ids)
+        if state.pending_window_unit is not None:
+            if target or stage0_window.get("recompute"):
+                # The replacement's new audio may have a conservative slot
+                # budget. Put surplus rows before that audio, after the exact
+                # accepted prefix, so chunked prefill sees the same cut.
+                expected = int(stage0_window["replacement_prompt_len"])
+                data = state.pending_window_unit
+                budget = expected - len(token_ids) - int(bool(stage0_window.get("close_on_next_input")))
+                if budget < 0:
+                    raise _UnrecoverableWindowError("Accepted window exceeds the admitted replacement")
+                if len(data.token_ids) < budget:
+                    pad = self.stage_padding_token_id()
+                    surplus = budget - len(data.token_ids)
+                    data.embeds.insert(0, self._embed_token(pad).expand(surplus, -1))
+                    data.token_ids[:0] = [pad] * surplus
+                elif len(data.token_ids) > budget:
+                    raise _UnrecoverableWindowError(
+                        f"New input needs {len(data.token_ids)} rows, only {budget} reserved"
+                    )
+            if stage0_window.get("close_on_next_input"):
+                state.pending_window_unit.embeds.append(self._embed_token(self.turn_eos_token_id))
+                state.pending_window_unit.token_ids.append(self.turn_eos_token_id)
+                state.current_turn_ended = True
+            embeds.extend(state.pending_window_unit.embeds)
+            token_ids.extend(state.pending_window_unit.token_ids)
+        expected = stage0_window.get("replacement_prompt_len")
+        if isinstance(expected, int) and expected != len(token_ids):
+            unit_lengths = [len(unit.token_ids) for unit in state.window_units]
+            pending_len = len(state.pending_window_unit.token_ids) if state.pending_window_unit is not None else 0
+            error_type = _UnrecoverableWindowError if target or stage0_window.get("recompute") else RuntimeError
+            raise error_type(
+                "MiniCPM-o Stage-0 window rebuild length mismatch: "
+                f"worker={len(token_ids)}, scheduler={expected}, mode={mode}, "
+                f"prefix={len(state.context_prefix_token_ids)}, "
+                f"suffix={len(state.context_suffix_token_ids)}, previous={len(previous_ids)}, "
+                f"units={unit_lengths}, pending={pending_len}, drop={drop_units}"
+            )
+        return embeds, token_ids
+
+    @staticmethod
+    def _stage_prefill_result(success: bool, start_time: float, reason: str = "") -> dict[str, object]:
         return {
             "success": success,
             "prefill_success": success,
@@ -347,22 +1229,23 @@ class MiniCPMO45Stage0DuplexRuntime:
         }
 
     @staticmethod
-    def _as_2d_tensor(value: Any) -> Any:
+    def _as_2d_tensor(value: torch.Tensor) -> torch.Tensor:
         if value.ndim == 1:
             return value.unsqueeze(0)
         if value.ndim == 3 and value.shape[0] == 1:
             return value.squeeze(0)
         return value
 
-    def _embed_token(self, token_id: int) -> Any:
+    def _embed_token(self, token_id: int) -> torch.Tensor:
         import torch
 
-        token = torch.tensor([int(token_id)], dtype=torch.long, device=self._model_device())
+        # A device-side fill: ``torch.tensor(..., device=...)`` is a blocking copy, 2-3 per unit.
+        token = torch.full((1,), int(token_id), dtype=torch.long, device=self._model_device())
         embedder = self._token_embedder()
         embeds = embedder(token)
         return self._as_2d_tensor(embeds)
 
-    def _token_embedding_dtype(self) -> Any:
+    def _token_embedding_dtype(self) -> torch.dtype | None:
         """dtype of the decoder token embeddings, the unit's reference dtype.
 
         Official ``get_vllm_embedding`` casts vision hidden states to the token
@@ -376,7 +1259,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             return dtype
         return getattr(next(self.thinker.parameters()), "dtype", None)
 
-    def _token_embedder(self) -> Any:
+    def _token_embedder(self) -> Callable[[torch.Tensor], torch.Tensor]:
         nested_embed = getattr(getattr(getattr(self.thinker, "llm", None), "model", None), "embed_tokens", None)
         if callable(nested_embed):
             return nested_embed
@@ -391,7 +1274,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                     return embedder
         raise AttributeError("MiniCPM-o stage0 model does not expose token embeddings")
 
-    def _model_device(self) -> Any:
+    def _model_device(self) -> torch.device | str:
         try:
             return next(self.thinker.parameters()).device
         except Exception:
@@ -402,14 +1285,14 @@ class MiniCPMO45Stage0DuplexRuntime:
             pass
         return self.device
 
-    def _streaming_chunk_size(self, processor: Any | None = None) -> int:
+    def _streaming_chunk_size(self, processor: Any | None = None) -> int:  # Any: remote-code processor
         processor = processor or self.processor
         get_chunk = getattr(processor, "get_streaming_chunk_size", None)
         if callable(get_chunk):
             return int(get_chunk())
         return 16000
 
-    def _sample_rate(self, processor: Any | None = None) -> int:
+    def _sample_rate(self, processor: Any | None = None) -> int:  # Any: remote-code processor
         processor = processor or self.processor
         return int(
             self._stage_param(
@@ -418,7 +1301,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             )
         )
 
-    def _first_chunk_samples(self, default_chunk_size: int, processor: Any | None = None) -> int:
+    def _first_chunk_samples(self, default_chunk_size: int, processor: Any | None = None) -> int:  # Any: processor
         processor = processor or self.processor
         if getattr(processor, "_streaming_mel_processor", None) is None:
             return default_chunk_size
@@ -427,9 +1310,9 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _pad_first_audio_chunk_if_needed(
         self,
         state: _MiniCPMO45Stage0SessionState,
-        processor: Any | None = None,
+        processor: Any | None = None,  # Any: remote-code processor
     ) -> None:
-        if state.audio_chunk_idx != 0 or len(state.audio_buffer) == 0:
+        if state.audio_encoder_chunk_idx != 0 or len(state.audio_buffer) == 0:
             return
         first_chunk_samples = self._first_chunk_samples(
             self._streaming_chunk_size(processor),
@@ -440,7 +1323,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         padding: np.ndarray = np.zeros(first_chunk_samples - len(state.audio_buffer), dtype=np.float32)
         state.audio_buffer = np.concatenate([padding, state.audio_buffer])
 
-    def _stage_param(self, name: str, default: Any) -> Any:
+    def _stage_param(self, name: str, default: object) -> Any:  # Any: attribute read off the remote-code model
         for target in (self.stage_model, self.thinker, getattr(self.thinker, "llm", None)):
             value = getattr(target, name, None)
             if value is not None:
@@ -455,7 +1338,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         chunk_idx: int,
         default_chunk_size: int,
         *,
-        processor: Any | None = None,
+        processor: Any | None = None,  # Any: remote-code processor
     ) -> int:
         processor = processor or self.processor
         if chunk_idx != 0:
@@ -472,11 +1355,11 @@ class MiniCPMO45Stage0DuplexRuntime:
 
     def _process_streaming_audio(
         self,
-        audio_chunk: Any,
+        audio_chunk: NDArray[np.float32],
         chunk_idx: int,
         *,
-        processor: Any | None = None,
-    ) -> Any:
+        processor: Any | None = None,  # Any: remote-code processor
+    ) -> Any:  # Any: transformers BatchFeature (or the dict fallback below)
         processor = processor or self.processor
         process = getattr(processor, "process_audio_streaming", None)
         if callable(process):
@@ -488,13 +1371,16 @@ class MiniCPMO45Stage0DuplexRuntime:
 
     def _stage_audio_embeddings(
         self,
-        batch_feature: Any,
+        batch_feature: Any,  # Any: transformers BatchFeature
         *,
         state: _MiniCPMO45Stage0SessionState | None = None,
-    ) -> Any | None:
+    ) -> torch.Tensor | None:
         if hasattr(batch_feature, "to"):
-            batch_feature = batch_feature.to(self.device)
-        self._ensure_dynamic_cache_compat()
+            batch_feature = self._audio_feature_to_device(batch_feature)
+        if state is not None and hasattr(state.audio_past_key_values, "to_legacy_cache"):
+            # A batched-path session whose unit this path has to take: hand the
+            # history over as the transformers cache the per-session path grows.
+            state.audio_past_key_values = state.audio_past_key_values.to_legacy_cache()
         has_audio_cache = state is not None and hasattr(self.thinker, "audio_past_key_values")
         previous_audio_past_key_values = (
             getattr(self.thinker, "audio_past_key_values", None) if has_audio_cache else None
@@ -533,24 +1419,111 @@ class MiniCPMO45Stage0DuplexRuntime:
             if has_audio_cache:
                 self.thinker.audio_past_key_values = previous_audio_past_key_values
 
+    def _stage_audio_embeddings_batch(
+        self,
+        requests: list[_MiniCPMO45AudioEncodeRequest],
+    ) -> list[torch.Tensor | None]:
+        """Encode one unit per request (distinct sessions); those the batched encoder takes share one pass."""
+        results: list[torch.Tensor | None] = [None] * len(requests)
+        encoder = self._batched_audio_encoder()
+        batched: list[tuple[int, _MiniCPMO45AudioEncodeRequest, Any]] = []
+        for index, request in enumerate(requests):
+            chunk = self._batched_audio_chunk(request) if encoder is not None else None
+            if chunk is None:
+                results[index] = self._stage_audio_embeddings(request.batch_feature, state=request.state)
+            else:
+                batched.append((index, request, chunk))
+        if batched:
+            assert encoder is not None
+            embeds, caches = encoder([chunk for _, _, chunk in batched])
+            for (index, request, _), embed, cache in zip(batched, embeds, caches, strict=True):
+                assert request.state is not None
+                request.state.audio_past_key_values = cache
+                results[index] = embed
+        return results
+
+    def _batched_audio_encoder(self) -> Callable[[list[Any]], tuple[list[Any], list[Any]]] | None:
+        encoder = getattr(self, "_batched_audio_encoder_fn", False)
+        if encoder is False:
+            if not getattr(self, "_audio_graph_attempted", False):
+                self.build_audio_cuda_graph()
+            thinker = getattr(self, "thinker", None)
+            batch = getattr(thinker, "get_audio_embedding_streaming_batch", None)
+            supported = getattr(thinker, "supports_streaming_audio_batch", None)
+            encoder = batch if callable(batch) and callable(supported) and supported() else None
+            self._batched_audio_encoder_fn = encoder
+        return encoder
+
     @staticmethod
-    def _decode_ref_audio_from_session_config(session_config: dict[str, Any]) -> Any | None:
+    def _batched_audio_chunk(request: _MiniCPMO45AudioEncodeRequest) -> Any | None:  # Any: StreamingAudioChunk
+        import torch
+
+        from vllm_omni.model_executor.models.minicpmo_4_5.streaming_audio_encoder import (
+            StreamingAudioChunk,
+            StreamingAudioKVCache,
+        )
+
+        cache = getattr(request.state, "audio_past_key_values", None)
+        if request.state is None or (cache is not None and not isinstance(cache, StreamingAudioKVCache)):
+            return None
+        feature = request.batch_feature
+        try:
+            features, lengths = feature["audio_features"], feature["audio_feature_lens"]
+        except (KeyError, TypeError):
+            return None
+        if not isinstance(features, torch.Tensor) or features.ndim != 3 or features.shape[0] != 1:
+            return None
+        if isinstance(lengths, (list, tuple)) and len(lengths) == 1:
+            lengths = lengths[0]
+        if not isinstance(lengths, torch.Tensor) or lengths.numel() != 1:
+            return None
+        # Same extra-context frames the per-session call passes.
+        return StreamingAudioChunk(
+            features=features,
+            cache=cache,
+            prefix_extra_frames=0 if int(getattr(feature, "chunk_idx", 0)) == 0 else 2,
+            suffix_extra_frames=2,
+            feature_length=int(lengths.reshape(-1)[0]),
+        )
+
+    def _audio_feature_to_device(self, batch_feature: Any) -> Any:  # Any: transformers BatchFeature
+        """Move one unit's log-mel features to the encoder without a host sync; integer lengths stay on the host."""
+        import torch
+
+        from vllm_omni.utils.device_copy import to_device_nonblocking
+
+        data = getattr(batch_feature, "data", None)
+        streaming = any(
+            callable(getattr(target, "get_audio_embedding_streaming", None))
+            for target in (self.stage_model, self.thinker)
+        )
+        if torch.device(self.device).type != "cuda" or not isinstance(data, dict) or not streaming:
+            return batch_feature.to(self.device)
+        batch_feature.data = {
+            key: to_device_nonblocking(value, self.device)
+            if isinstance(value, torch.Tensor) and torch.is_floating_point(value)
+            else value
+            for key, value in data.items()
+        }
+        return batch_feature
+
+    @staticmethod
+    def _decode_ref_audio_from_session_config(session_config: dict[str, object]) -> NDArray[np.float32] | None:
         from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import decode_native_ref_audio_from_config
 
         return decode_native_ref_audio_from_config({"extra_body": session_config})
 
     def _stage_ref_audio_embeddings(
         self,
-        ref_audio: Any,
+        ref_audio: NDArray[np.float32],
         *,
         state: _MiniCPMO45Stage0SessionState | None = None,
-    ) -> Any | None:
+    ) -> torch.Tensor | None:
         process_audio = getattr(self.processor, "process_audio", None)
         if callable(process_audio):
             batch_feature = process_audio([ref_audio])
             if hasattr(batch_feature, "to"):
                 batch_feature = batch_feature.to(self.device)
-            self._ensure_dynamic_cache_compat()
             for target in (self.stage_model, self.thinker):
                 get_audio_embedding = getattr(target, "get_audio_embedding", None)
                 if callable(get_audio_embedding):
@@ -586,36 +1559,16 @@ class MiniCPMO45Stage0DuplexRuntime:
         return self._stage_audio_embeddings(batch_feature, state=state)
 
     @staticmethod
-    def _ensure_dynamic_cache_compat() -> None:
-        try:
-            from transformers.cache_utils import DynamicCache
-        except Exception:
-            return
-        if hasattr(DynamicCache, "get_usable_length"):
-            return
-
-        def get_usable_length(self, new_seq_length: int | None = None, layer_idx: int = 0) -> int:
-            get_seq_length = getattr(self, "get_seq_length", None)
-            if not callable(get_seq_length):
-                return 0
-            try:
-                return int(get_seq_length(layer_idx))
-            except TypeError:
-                return int(get_seq_length())
-
-        DynamicCache.get_usable_length = get_usable_length  # type: ignore[attr-defined]
-
-    @staticmethod
-    def _cat_nested_tensors(value: Any) -> Any | None:
+    def _cat_nested_tensors(value: object) -> torch.Tensor | None:
         import torch
 
-        tensors = []
+        tensors: list[torch.Tensor] = []
 
-        def collect(item: Any) -> None:
+        def collect(item: object) -> None:
             if item is None:
                 return
             if hasattr(item, "detach"):
-                tensors.append(item)
+                tensors.append(cast("torch.Tensor", item))
                 return
             if isinstance(item, dict):
                 for child in item.values():
@@ -650,36 +1603,26 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "chunk_eos_token_id": self.chunk_eos_token_id,
                 "chunk_tts_eos_token_id": self.chunk_tts_eos_token_id,
                 "turn_eos_token_id": self.turn_eos_token_id,
+                "audio_start_token_id": self.audio_start_token_id,
+                "audio_end_token_id": self.audio_end_token_id,
+                "delegate_token_id": self.delegate_token_id,
+                "delegate_open_token_id": getattr(self, "delegate_open_token_id", -1),
+                "delegate_close_token_id": getattr(self, "delegate_close_token_id", -1),
             }.items()
             if isinstance(value, int) and value >= 0
         }
 
     @staticmethod
-    def _load_processor_from_path(model_path: str | None) -> Any | None:
+    def _load_processor_from_path(model_path: str | None) -> Any | None:  # Any: remote-code AutoProcessor
         if not model_path:
             return None
         try:
-            from transformers import AutoImageProcessor, AutoProcessor
+            from transformers import AutoProcessor
 
-            original_register = AutoImageProcessor.register
+            from vllm_omni.model_executor.models.minicpmo_4_5.processor import legacy_image_processor_registration
 
-            def register_image_processor(config_class, *args, **kwargs):
-                # The checkpoint's auto_map already loads this class. Its
-                # legacy string registration is incompatible with some
-                # Transformers versions and is otherwise redundant.
-                if config_class == "MiniCPMVImageProcessor":
-                    return None
-                return original_register(config_class, *args, **kwargs)
-
-            with _MINICPMO45_PROCESSOR_LOAD_LOCK:
-                setattr(AutoImageProcessor, "register", staticmethod(register_image_processor))
-                try:
-                    processor = AutoProcessor.from_pretrained(
-                        model_path,
-                        trust_remote_code=True,
-                    )
-                finally:
-                    setattr(AutoImageProcessor, "register", staticmethod(original_register))
+            with legacy_image_processor_registration():
+                processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         except Exception as exc:
             raise RuntimeError(f"Failed to load MiniCPM-o duplex processor from {model_path!r}") from exc
         if getattr(processor, "tokenizer", None) is None:
@@ -752,8 +1695,10 @@ class MiniCPMO45Stage0DuplexRuntime:
         return self.stage_padding_token_id()
 
     @staticmethod
-    def _decode_audio_payload(payload: dict[str, Any]) -> Any:
+    def _decode_audio_payload(payload: dict[str, object]) -> NDArray[np.float32]:
         audio = payload.get("audio") or payload.get("data")
+        if not audio and (payload.get("video_frames") or payload.get("text_token_ids")):
+            return np.empty(0, dtype=np.float32)
         if not isinstance(audio, str):
             raise ValueError("audio append payload requires base64 audio")
         fmt = payload.get("format") or "pcm_f32le"
@@ -762,22 +1707,20 @@ class MiniCPMO45Stage0DuplexRuntime:
         return np.frombuffer(base64.b64decode(audio), dtype=np.float32)
 
     @staticmethod
-    def _decode_video_frames_payload(payload: dict[str, Any]) -> list[Any]:
+    def _decode_video_frames_payload(payload: dict[str, object]) -> list[Image.Image]:
         """Decode omni-duplex camera frames (base64 JPEG/PNG) to PIL images."""
         frames = payload.get("video_frames")
         if not isinstance(frames, list) or not frames:
             return []
         from io import BytesIO
 
-        from PIL import Image
-
-        decoded: list[Any] = []
+        decoded: list[Image.Image] = []
         for frame_b64 in frames:
             if not isinstance(frame_b64, str) or not frame_b64:
                 continue
             try:
                 raw = base64.b64decode(frame_b64, validate=True)
-                image = Image.open(BytesIO(raw))
+                image = open_image(BytesIO(raw))
                 image.load()
             except Exception as exc:  # noqa: BLE001 - normalized below
                 raise ValueError("invalid omni duplex video frame payload") from exc
@@ -826,7 +1769,8 @@ class MiniCPMO45Stage0DuplexRuntime:
             return [1]
         return [2] + [1] * (frame_count - 1)
 
-    def _encode_processed_vision(self, processed: Any) -> list[Any] | None:
+    def _encode_processed_vision_batch(self, processed: list[Any]) -> list[list[torch.Tensor]] | None:  # BatchFeature
+        """Encode every slice of the ``processed`` frames in one vision-tower call."""
         targets = (self.stage_model, self.thinker, getattr(self.stage_model, "model", None))
         for target in targets:
             if target is None:
@@ -840,25 +1784,30 @@ class MiniCPMO45Stage0DuplexRuntime:
 
                 vpm_param = next(vpm.parameters())
                 device, dtype = vpm_param.device, vpm_param.dtype
-                pixel_nested = processed["pixel_values"]
-                tgt_nested = processed["tgt_sizes"]
-                flat_pixels: list[Any] = []
-                flat_tgt: list[Any] = []
-                for image_slices, image_tgt in zip(pixel_nested, tgt_nested):
-                    for slice_pixels in image_slices:
-                        flat_pixels.append(slice_pixels.to(device=device, dtype=dtype))
-                    tgt_tensor = image_tgt if hasattr(image_tgt, "reshape") else torch.tensor(image_tgt)
-                    flat_tgt.append(tgt_tensor.reshape(-1, 2))
+                flat_pixels: list[torch.Tensor] = []
+                flat_tgt: list[torch.Tensor] = []
+                slices_per_frame: list[int] = []
+                for frame in processed:
+                    num_slices = 0
+                    for image_slices, image_tgt in zip(frame["pixel_values"], frame["tgt_sizes"]):
+                        for slice_pixels in image_slices:
+                            flat_pixels.append(slice_pixels.to(device=device, dtype=dtype))
+                            num_slices += 1
+                        tgt_tensor = image_tgt if hasattr(image_tgt, "reshape") else torch.tensor(image_tgt)
+                        flat_tgt.append(torch.as_tensor(tgt_tensor).reshape(-1, 2))
+                    if num_slices == 0:
+                        return None
+                    slices_per_frame.append(num_slices)
                 if not flat_pixels:
                     return None
-                tgt_sizes = torch.cat(flat_tgt, dim=0).to(device=device, dtype=torch.int64)
+                tgt_sizes = torch.cat(flat_tgt, dim=0).to(device="cpu", dtype=torch.int64)
                 with torch.no_grad():
                     hidden = get_hidden({"pixel_values": flat_pixels, "tgt_sizes": tgt_sizes})
             except Exception:  # noqa: BLE001 - prefill fails with a reason
                 return None
             expected = MiniCPMO45DuplexPolicy.VISION_EMBEDS_PER_FRAME
             embed_dtype = self._token_embedding_dtype()
-            out: list[Any] = []
+            out: list[torch.Tensor] = []
             for block in hidden:
                 block_2d = self._as_2d_tensor(block)
                 if int(block_2d.shape[0]) != expected:
@@ -866,10 +1815,13 @@ class MiniCPMO45Stage0DuplexRuntime:
                 if embed_dtype is not None and block_2d.dtype != embed_dtype:
                     block_2d = block_2d.to(dtype=embed_dtype)
                 out.append(block_2d)
-            return out
+            if len(out) != sum(slices_per_frame):
+                return None
+            blocks = iter(out)
+            return [[next(blocks) for _ in range(num_slices)] for num_slices in slices_per_frame]
         return None
 
-    def _stage_vision_embeddings(self, frames: list[Any]) -> list[list[Any]] | None:
+    def _stage_vision_embeddings(self, frames: list[Image.Image]) -> list[list[torch.Tensor]] | None:
         """Encode camera frames for omni duplex via the loaded vision tower.
 
         Official ``streaming_prefill`` encodes each ``frame_list`` entry as its
@@ -880,17 +1832,96 @@ class MiniCPMO45Stage0DuplexRuntime:
         Frames are processed one at a time because ``process_image([a, b])``
         packs both PILs into one batch item.
         """
+        processed = self._preprocess_frames(frames)
+        return None if processed is None else self._encode_processed_vision_batch(processed)
+
+    def _preprocess_frames(self, frames: list[Image.Image]) -> list[Any] | None:  # Any: BatchFeature
+        """The CPU half of ``_stage_vision_embeddings``: each frame's processed slices; ``None`` on failure."""
         process_image = getattr(self.processor, "process_image", None)
         if not callable(process_image):
             return None
-        out: list[list[Any]] = []
+        out: list[Any] = []
         for frame, max_slices in zip(frames, self._official_max_slice_nums(len(frames))):
             try:
-                processed = process_image([frame], max_slice_nums=max_slices)
+                out.append(process_image([frame], max_slice_nums=max_slices))
             except Exception:  # noqa: BLE001 - prefill fails with a reason
                 return None
-            encoded = self._encode_processed_vision(processed)
-            if encoded is None:
-                return None
-            out.append(encoded)
         return out
+
+    def frame_kwargs(self, duplex: dict[str, Any], payload: dict[str, object]) -> dict[str, Any]:
+        """``encoded_frames`` prefetched for this append, else its decoded ``video_frames`` (``ValueError``)."""
+        encoded = self.take_prefetched_vision(duplex)
+        if encoded is not None:
+            return {"encoded_frames": encoded}
+        return {"video_frames": self._decode_video_frames_payload(payload)}
+
+    @staticmethod
+    def _vision_prefetch_key(duplex: dict[str, Any]) -> tuple[str, int | None, int] | None:
+        """``(session_id, epoch, seq)`` of an append, parsed like ``preprocess`` does; ``None`` if unkeyed."""
+        session_id, seq = str(duplex.get("session_id") or ""), _optional_int(duplex.get("seq"))
+        return (session_id, _optional_int(duplex.get("epoch")), seq) if session_id and seq is not None else None
+
+    def prefetch_vision(self, appends: list[dict[str, Any]]) -> None:
+        """Encode this step's appends' camera frames in ``vision_batch_size``-append tower calls.
+
+        Decode and slicing run on the frame pool, the next chunk's overlapping this chunk's encode.
+        Results are keyed by append and checked against its frame payload on use.
+        """
+        self._prefetched_vision.clear()
+        jobs: list[tuple[tuple[str, int | None, int], tuple[object, ...]]] = []
+        for duplex in appends:
+            key = self._vision_prefetch_key(duplex)
+            payload = duplex.get("payload")
+            frames = payload.get("video_frames") if isinstance(payload, dict) else None
+            if key is None or not isinstance(frames, list) or not frames:
+                continue
+            state = self.sessions.get(key[0])
+            if state is None or state.prepared_append_identity != key[1:] or state.prepared_inputs_embeds is None:
+                jobs.append((key, tuple(frames)))  # else already built: preprocess replays the cached append
+        if not jobs or not callable(getattr(self.processor, "process_image", None)):
+            return
+
+        def preprocess(frames: tuple[object, ...]) -> list[Any] | None:
+            try:
+                decoded = self._decode_video_frames_payload({"video_frames": list(frames)})
+            except ValueError:
+                return None
+            return self._preprocess_frames(decoded) if decoded else None
+
+        pool = _frame_preprocess_pool() if len(jobs) > 1 else None
+
+        def start(chunk: list[tuple[Any, tuple[object, ...]]]) -> list[Any]:
+            return [pool.submit(preprocess, frames) if pool is not None else frames for _, frames in chunk]
+
+        def finish(started: list[Any]) -> list[list[Any] | None]:
+            return [item.result() if pool is not None else preprocess(item) for item in started]
+
+        size = self._vision_prefetch_chunk_size()
+        chunks = [jobs[begin : begin + size] for begin in range(0, len(jobs), size)]
+        started = start(chunks[0])
+        for index, chunk in enumerate(chunks):
+            # Submit the next chunk before this chunk's encode so they overlap.
+            following = start(chunks[index + 1]) if index + 1 < len(chunks) else []
+            ready = [(job, processed) for job, processed in zip(chunk, finish(started)) if processed is not None]
+            items = [item for _, processed in ready for item in processed]
+            encoded = self._encode_processed_vision_batch(items) if ready else None
+            blocks = iter(encoded or ())
+            for (key, frames), processed in ready if encoded is not None else ():
+                self._prefetched_vision[key] = (frames, [next(blocks) for _ in processed])
+            started = following
+
+    def _vision_prefetch_chunk_size(self) -> int:
+        """Jobs per ``prefetch_vision`` chunk: the checkpoint's ``vision_batch_size``, else 16."""
+        for target in (self.stage_model, self.thinker, getattr(self.stage_model, "model", None)):
+            size = getattr(getattr(target, "config", None), "vision_batch_size", None)
+            if isinstance(size, int) and size > 0:
+                return size
+        return 16
+
+    def take_prefetched_vision(self, duplex: dict[str, Any]) -> list[list[torch.Tensor]] | None:
+        """Pop this append's prefetched per-frame embeddings if its frame payload still matches."""
+        key = self._vision_prefetch_key(duplex)
+        frames_payload, encoded = self._prefetched_vision.pop(key, (None, None)) if key is not None else (None, None)
+        payload = duplex.get("payload")
+        frames = payload.get("video_frames") if isinstance(payload, dict) else None
+        return encoded if isinstance(frames, list) and tuple(frames) == frames_payload else None

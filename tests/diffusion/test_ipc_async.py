@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for IPC async D2H stream packing."""
+
+import sys
+from types import SimpleNamespace
+from unittest.mock import ANY
 
 import pytest
 import torch
@@ -8,10 +12,12 @@ import torch
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.ipc import (
     _pack_diffusion_fields,
+    _pack_diffusion_media,
     _pack_tensor_if_large,
     _pack_value_if_large,
     pack_diffusion_output_shm,
 )
+from vllm_omni.platforms.interface import OmniPlatform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -43,7 +49,7 @@ class TestPackTensorIfLargeWithD2hStream:
         tensor = torch.zeros(1)
         d2h = mocker.MagicMock()
         _pack_value_if_large(tensor, d2h_stream=d2h)
-        mock_pack.assert_called_once_with(tensor, d2h_stream=d2h)
+        mock_pack.assert_called_once_with(tensor, d2h_stream=d2h, created=None)
 
     def test_pack_value_if_large_passes_stream_through_dict(self, mocker):
         """d2h_stream propagates through dict container packing."""
@@ -93,7 +99,7 @@ class TestPackDiffusionFieldsWithD2hStream:
         d2h = mocker.MagicMock()
         out = DiffusionOutput(output=torch.zeros(1))
         _pack_diffusion_fields(out, d2h_stream=d2h)
-        mock_pack_value.assert_called_once_with(torch.zeros(1), d2h_stream=d2h)
+        mock_pack_value.assert_called_once_with(torch.zeros(1), d2h_stream=d2h, created=None)
 
     def test_trajectory_fields_packed_with_stream(self, mocker):
         mock_pack_tensor = mocker.patch(
@@ -110,6 +116,98 @@ class TestPackDiffusionFieldsWithD2hStream:
         assert mock_pack_tensor.call_count == 2
 
 
+def _fake_device_tensor(mocker, host: torch.Tensor):
+    """A sub-threshold tensor that reports a non-CPU device.
+
+    ``.detach().cpu().contiguous()`` returns *host*, so the test can tell
+    whether packing moved the tensor to CPU without accelerator hardware.
+    """
+    fake = mocker.MagicMock(spec=torch.Tensor)
+    fake.device = torch.device("meta")
+    fake.nelement.return_value = host.nelement()
+    fake.element_size.return_value = host.element_size()
+    fake.untyped_storage.return_value.nbytes.return_value = host.untyped_storage().nbytes()
+    fake.detach.return_value.cpu.return_value.contiguous.return_value = host
+    return fake
+
+
+@pytest.fixture
+def set_device_tensor_ipc(monkeypatch):
+    """Make ``current_omni_platform.supports_device_tensor_ipc()`` return *flag*.
+
+    ``ipc.py`` does ``from vllm_omni.platforms import current_omni_platform`` at
+    call time; normally that goes through the module ``__getattr__`` and returns
+    ``_current_omni_platform``, but an earlier test in the same process can
+    leave a real module attribute ``current_omni_platform``, which then wins; so
+    the fixture sets both, and ``monkeypatch`` removes them again after the
+    test.
+    """
+
+    def _set(flag: bool) -> None:
+        platform = SimpleNamespace(supports_device_tensor_ipc=lambda: flag)
+        platforms_mod = sys.modules["vllm_omni.platforms"]
+        monkeypatch.setattr(platforms_mod, "_current_omni_platform", platform)
+        monkeypatch.setitem(vars(platforms_mod), "current_omni_platform", platform)
+
+    return _set
+
+
+class TestSmallDeviceTensorIpcFlag:
+    """``OmniPlatform.supports_device_tensor_ipc()`` gates the CPU move of sub-threshold device tensors."""
+
+    def test_flag_defaults_to_true(self):
+        assert OmniPlatform.supports_device_tensor_ipc() is True
+
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_small_cpu_tensor_returned_unchanged(self, set_device_tensor_ipc, flag):
+        set_device_tensor_ipc(flag)
+        small_tensor = torch.zeros(10)
+        assert _pack_tensor_if_large(small_tensor) is small_tensor
+
+    def test_small_device_tensor_kept_on_device_when_flag_true(self, mocker, set_device_tensor_ipc):
+        set_device_tensor_ipc(True)
+        fake = _fake_device_tensor(mocker, torch.arange(10, dtype=torch.float32))
+        result = _pack_tensor_if_large(fake)
+        assert result is fake
+        assert result.device.type == "meta"
+        fake.detach.assert_not_called()
+
+    def test_small_device_tensor_moved_to_cpu_when_flag_false(self, mocker, set_device_tensor_ipc):
+        set_device_tensor_ipc(False)
+        host = torch.arange(10, dtype=torch.float32)
+        fake = _fake_device_tensor(mocker, host)
+        result = _pack_tensor_if_large(fake)
+        assert result is host
+        assert result.device.type == "cpu"
+        assert result.is_contiguous()
+
+    def test_legacy_output_and_trajectory_fields_moved_to_cpu_when_flag_false(self, mocker, set_device_tensor_ipc):
+        set_device_tensor_ipc(False)
+        video_host, audio_host = torch.zeros(8), torch.ones(4)
+        latents_host, timesteps_host = torch.zeros(2), torch.ones(2)
+        out = DiffusionOutput(
+            output=(_fake_device_tensor(mocker, video_host), _fake_device_tensor(mocker, audio_host)),
+            trajectory_latents=_fake_device_tensor(mocker, latents_host),
+            trajectory_timesteps=_fake_device_tensor(mocker, timesteps_host),
+        )
+        _pack_diffusion_fields(out)
+        assert out.output[0] is video_host
+        assert out.output[1] is audio_host
+        assert out.trajectory_latents is latents_host
+        assert out.trajectory_timesteps is timesteps_host
+
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_diffusion_media_tensor_moved_to_cpu(self, mocker, set_device_tensor_ipc, flag):
+        set_device_tensor_ipc(flag)
+        host = torch.zeros(6)
+        media = mocker.MagicMock()
+        media.prepared_for_transport = True
+        media.video.schema_version = 1
+        media.video.tensor = _fake_device_tensor(mocker, host)
+        packed = _pack_diffusion_media(media, d2h_stream=None)
+        assert packed["video"]["tensor"] is host
+
+
 class TestPackDiffusionOutputShmWithD2hStream:
     """Test pack_diffusion_output_shm top-level dispatch with d2h_stream."""
 
@@ -120,7 +218,12 @@ class TestPackDiffusionOutputShmWithD2hStream:
         d2h = mocker.MagicMock()
         out = DiffusionOutput()
         pack_diffusion_output_shm(out, d2h_stream=d2h)
-        mock_pack_fields.assert_called_once_with(out, d2h_stream=d2h)
+        mock_pack_fields.assert_called_once_with(
+            out,
+            d2h_stream=d2h,
+            created=ANY,
+            pending_updates=ANY,
+        )
 
     def test_rpc_envelope_path_with_stream(self, mocker):
         mock_pack_fields = mocker.patch(
@@ -130,11 +233,11 @@ class TestPackDiffusionOutputShmWithD2hStream:
         result = DiffusionOutput()
         envelope = {"type": "diffusion_rpc_result", "result": result}
         pack_diffusion_output_shm(envelope, d2h_stream=d2h)
-        # envelope["result"] is replaced in-place by pack_diffusion_output_shm;
-        # assert with the original reference, not the replaced one.
         mock_pack_fields.assert_called_once_with(
             result,
             d2h_stream=d2h,
+            created=ANY,
+            pending_updates=ANY,
         )
 
     @pytest.mark.parametrize("wrapped_in_rpc_envelope", [False, True])
@@ -147,7 +250,12 @@ class TestPackDiffusionOutputShmWithD2hStream:
         tagged = {"dp_rank": 1, "output": result}
         value = {"type": "diffusion_rpc_result", "result": tagged} if wrapped_in_rpc_envelope else tagged
         pack_diffusion_output_shm(value, d2h_stream=d2h)
-        mock_pack_fields.assert_called_once_with(result, d2h_stream=d2h)
+        mock_pack_fields.assert_called_once_with(
+            result,
+            d2h_stream=d2h,
+            created=ANY,
+            pending_updates=ANY,
+        )
 
     def test_runner_output_path_with_stream(self, mocker):
         mock_pack_fields = mocker.patch(
@@ -163,9 +271,9 @@ class TestPackDiffusionOutputShmWithD2hStream:
             result=result,
         )
         pack_diffusion_output_shm(runner_out, d2h_stream=d2h)
-        # runner_out.result is replaced in-place by pack_diffusion_output_shm;
-        # assert with the original reference, not the replaced one.
         mock_pack_fields.assert_called_once_with(
             result,
             d2h_stream=d2h,
+            created=ANY,
+            pending_updates=ANY,
         )

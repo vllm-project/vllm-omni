@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 import torch.nn as nn
@@ -69,8 +69,15 @@ class StreamingLinearUpsample(nn.Module):
         super().__init__()
         self.scale_factor = scale_factor
         self.upsampler = nn.Upsample(scale_factor=scale_factor, mode="linear", align_corners=False)
+        # When set, a multi-frame chunk holds back only its last frame (the
+        # lookahead the interpolation needs) instead of the whole chunk, so
+        # decoding a chunk in one call emits the same samples, as early, as
+        # decoding it one frame per call.
+        self.frame_holdback = False
 
     def forward(self, x, state=None, is_last=False):
+        if self.frame_holdback:
+            return self._forward_frame_holdback(x, state, is_last)
         if x is None and is_last and (state is None or state.get("prev_chunk") is None):
             raise ValueError("Received end-of-stream without any latent chunk to upsample.")
         if state is None:
@@ -122,6 +129,33 @@ class StreamingLinearUpsample(nn.Module):
         final_out = torch.cat(output_chunks, dim=1) if output_chunks else None
         return final_out, state
 
+    def _forward_frame_holdback(self, x, state, is_last):
+        # x and the state frames are [Batch, Time, Dimension]. Linear
+        # interpolation of a frame reads only its two neighbours, so emitting
+        # every pending frame except the last one (plus one frame of left
+        # context) reproduces the per-frame streaming output.
+        held = None if state is None else state["held"]
+        left = None if state is None else state["left"]
+        if x is None:
+            if not is_last:
+                return None, state
+            if held is None:
+                raise ValueError("Received end-of-stream without any latent chunk to upsample.")
+            pending = held
+        else:
+            pending = x if held is None else torch.cat([held, x], dim=1)
+        if not is_last and pending.size(1) < 2:
+            return None, {"held": pending, "left": left}
+
+        emit = pending if is_last else pending[:, :-1]
+        inp = pending if left is None else torch.cat([left, pending], dim=1)
+        up = self.upsampler(inp.transpose(1, 2))
+        start = 0 if left is None else self.scale_factor
+        out = up[:, :, start : start + emit.size(1) * self.scale_factor].transpose(1, 2)
+        if is_last:
+            return out, None
+        return out, {"held": pending[:, -1:], "left": emit[:, -1:]}
+
 
 class Encoder(nn.Module):
     def __init__(self, encoder_args, input_dim=320, hop_size=320, latent_dim=64, patch_size=-1):
@@ -138,8 +172,9 @@ class Encoder(nn.Module):
         self.norm = nn.LayerNorm(config.hidden_size)
         self.patch_size = patch_size
         if patch_size != -1:
-            config.num_hidden_layers = 4
-            self.aggregator = Qwen2Model(config)
+            aggregator_config = _qwen2_config(encoder_args)
+            aggregator_config.num_hidden_layers = 4
+            self.aggregator = Qwen2Model(aggregator_config)
             self.cls_embed = nn.Parameter(torch.rand(1, 1, config.hidden_size))
             self.cls_embed.data.normal_(0, 0.02)
 
@@ -277,38 +312,53 @@ class Decoder(nn.Module):
 class AudioVAE(PreTrainedModel):
     config_class = AudioVAEConfig
 
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        *,
+        build_encoder: bool = True,
+        build_decoder: bool = True,
+    ):
         super().__init__(config)
+        if not build_encoder and not build_decoder:
+            raise ValueError("AudioVAE requires at least one of encoder or decoder.")
+
         self.config = config
+        self.encoder = None
+        self.decoder = None
         enc_kwargs = config.enc_kwargs
         dec_kwargs = config.dec_kwargs
-        for key in ("backbone", "input_dim", "latent_dim"):
-            if key not in enc_kwargs:
-                raise ValueError(f"AudioVAE.enc_kwargs missing required key: {key}")
-        for key in ("backbone", "output_dim", "latent_dim"):
-            if key not in dec_kwargs:
-                raise ValueError(f"AudioVAE.dec_kwargs missing required key: {key}")
+        if build_encoder:
+            for key in ("backbone", "input_dim", "latent_dim"):
+                if key not in enc_kwargs:
+                    raise ValueError(f"AudioVAE.enc_kwargs missing required key: {key}")
+        if build_decoder:
+            for key in ("backbone", "output_dim", "latent_dim"):
+                if key not in dec_kwargs:
+                    raise ValueError(f"AudioVAE.dec_kwargs missing required key: {key}")
 
-        hop_size = enc_kwargs.get("hop_size", enc_kwargs["input_dim"])
-        if enc_kwargs["input_dim"] != hop_size:
-            raise ValueError(f"AudioVAE encoder input_dim ({enc_kwargs['input_dim']}) != hop_size ({hop_size}).")
-        if hop_size != dec_kwargs["output_dim"]:
-            raise ValueError(
-                f"AudioVAE encoder hop_size ({hop_size}) != decoder output_dim ({dec_kwargs['output_dim']})."
+        if build_encoder:
+            hop_size = enc_kwargs.get("hop_size", enc_kwargs["input_dim"])
+            if enc_kwargs["input_dim"] != hop_size:
+                raise ValueError(f"AudioVAE encoder input_dim ({enc_kwargs['input_dim']}) != hop_size ({hop_size}).")
+            if build_decoder and hop_size != dec_kwargs["output_dim"]:
+                raise ValueError(
+                    f"AudioVAE encoder hop_size ({hop_size}) != decoder output_dim ({dec_kwargs['output_dim']})."
+                )
+            self.encoder = Encoder(
+                encoder_args=enc_kwargs["backbone"],
+                input_dim=enc_kwargs["input_dim"],
+                hop_size=hop_size,
+                latent_dim=enc_kwargs["latent_dim"],
+                patch_size=config.patch_size,
             )
-        self.encoder = Encoder(
-            encoder_args=enc_kwargs["backbone"],
-            input_dim=enc_kwargs["input_dim"],
-            hop_size=hop_size,
-            latent_dim=enc_kwargs["latent_dim"],
-            patch_size=config.patch_size,
-        )
-        self.decoder = Decoder(
-            decoder_args=dec_kwargs["backbone"],
-            output_dim=dec_kwargs["output_dim"],
-            latent_dim=dec_kwargs["latent_dim"],
-            patch_size=config.patch_size,
-        )
+        if build_decoder:
+            self.decoder = Decoder(
+                decoder_args=dec_kwargs["backbone"],
+                output_dim=dec_kwargs["output_dim"],
+                latent_dim=dec_kwargs["latent_dim"],
+                patch_size=config.patch_size,
+            )
         self.post_init()
 
     def _init_weights(self, module):
@@ -326,7 +376,17 @@ class AudioVAE(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
     @torch.inference_mode()
-    def encode_latent(self, waveform, waveform_length):
+    def encode_latent(
+        self,
+        waveform,
+        waveform_length,
+        *,
+        generator: torch.Generator | None = None,
+        encoder_output: torch.Tensor | None = None,
+    ):
+        """Sample prompt latents; ``encoder_output`` may supply a precomputed ``self.encoder(waveform)[0]``."""
+        if self.encoder is None:
+            raise RuntimeError("AudioVAE encoder is unavailable in decoder-only mode.")
         if waveform.ndim != 2:
             raise ValueError(f"Expected waveform rank-2 [Batch, Time], got {tuple(waveform.shape)}")
         if waveform_length.ndim != 1:
@@ -343,16 +403,24 @@ class AudioVAE(PreTrainedModel):
         frame_num = torch.ceil(waveform_length / self.config.enc_kwargs["input_dim"]).to(torch.int32)
         if self.config.patch_size != -1:
             frame_num = torch.ceil(frame_num / self.config.patch_size)
-        h, _ = self.encoder(waveform)
+        h = self.encoder(waveform)[0] if encoder_output is None else encoder_output
         h = h.transpose(1, 2)
 
         mean, scale = torch.chunk(h, 2, dim=1)
         std = F.softplus(scale) + 1e-4
-        latent = (mean + std * torch.randn_like(mean)).transpose(1, 2)
+        noise = torch.randn(
+            mean.shape,
+            generator=generator,
+            device=mean.device,
+            dtype=mean.dtype,
+        )
+        latent = (mean + std * noise).transpose(1, 2)
         return latent, frame_num
 
     @torch.inference_mode()
     def decode(self, latent, past_key_values=None, use_cache=False, stream_state=(None, None, None), last_chunk=False):
+        if self.decoder is None:
+            raise RuntimeError("AudioVAE decoder is unavailable in encoder-only mode.")
         if latent.dim() != 3:
             raise ValueError(f"Expected latent rank-3 [B,T,D], got shape={tuple(latent.shape)}")
         if latent.shape[0] <= 0:

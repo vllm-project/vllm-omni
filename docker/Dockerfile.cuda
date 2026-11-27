@@ -1,6 +1,13 @@
-ARG BASE_IMAGE=vllm/vllm-openai:v0.28.0
+ARG BASE_IMAGE=vllm/vllm-openai:v0.34.0@sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1
 FROM ${BASE_IMAGE}
+# The base's optional EFA NCCL override conflicts with Torch 2.14 metadata.
+# Use the official wheel's declared NCCL dependency for the Omni runtime.
+ENV UV_OVERRIDE=""
 
+# Verify the official release runtime against the same source and package
+# identity as CUDA CI.
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT=62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
+ARG VLLM_VERSION=0.34.0
 ARG COMMON_WORKDIR=/app
 
 WORKDIR ${COMMON_WORKDIR}
@@ -15,7 +22,41 @@ RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 
 # Step 2: Copy vllm-omni code and install
 COPY . ${COMMON_WORKDIR}/vllm-omni
-RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
+RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir \
+    -r requirements/cuda-runtime.txt --override requirements/cuda-telemetry-overrides.txt \
+    "nvidia-nccl-cu13==2.30.7" \
+    "vllm==${VLLM_VERSION}" \
+    "."
+
+# Rebuild LMCache against the selected Torch ABI instead of relying on a
+# precompiled connector wheel with the same Python package version. Retain
+# every published CUDA architecture.
+RUN uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
+    -r ${COMMON_WORKDIR}/vllm-omni/requirements/cuda-runtime.txt \
+    --override ${COMMON_WORKDIR}/vllm-omni/requirements/cuda-telemetry-overrides.txt \
+    ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" \
+    "setuptools_scm>=8" "grpcio==1.78.0" "grpcio-tools==1.78.0" wheel
+RUN PYTHON_SITE=$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))') && \
+    test -f "${PYTHON_SITE}/nvidia/cu13/include/cusparse.h" && \
+    test -f "${PYTHON_SITE}/nvidia/cusparselt/include/cusparseLt.h" && \
+    CUDA_VISIBLE_DEVICES="" CUDA_HOME=/usr/local/cuda BUILD_WITH_CUDA=1 MAX_JOBS=3 NVCC_THREADS=1 \
+    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0;10.0;11.0;12.0" \
+    CPATH="${PYTHON_SITE}/nvidia/cu13/include:${PYTHON_SITE}/nvidia/cusparselt/include${CPATH:+:${CPATH}}" \
+    uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
+    --no-cache --no-binary lmcache --no-build-isolation-package lmcache --reinstall-package lmcache \
+    -r ${COMMON_WORKDIR}/vllm-omni/requirements/cuda-runtime.txt \
+    --override ${COMMON_WORKDIR}/vllm-omni/requirements/cuda-telemetry-overrides.txt "lmcache==0.5.6"
+RUN python3 ${COMMON_WORKDIR}/vllm-omni/tools/prepare_ci_telemetry.py --check-runtime
+
+# cuDNN 9.24 causes the original Qwen-Image 2.1 pixel gate to fail under
+# Torch 2.14. Keep Torch's declared Python dependencies and load the verified
+# NVIDIA 9.25.1 wheel in a private target outside Python's import path.
+RUN uv pip install --target /opt/vllm-omni-cudnn --no-deps --only-binary=:all: \
+    --require-hashes -r ${COMMON_WORKDIR}/vllm-omni/requirements/cudnn-runtime.txt
+ENV LD_PRELOAD="/opt/vllm-omni-cudnn/nvidia/cudnn/lib/libcudnn.so.9 ${LD_PRELOAD:-}"
+ENV LD_LIBRARY_PATH="/opt/vllm-omni-cudnn/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-/usr/local/nvidia/lib:/usr/local/nvidia/lib64}"
+
+RUN python3 -c "from vllm._version import __commit_id__, __version__; commit = (__commit_id__ or '').removeprefix('g'); assert len(commit) >= 8 and '${VLLM_PRECOMPILED_WHEEL_COMMIT}'.startswith(commit), __commit_id__; assert __version__ == '${VLLM_VERSION}', __version__"
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 

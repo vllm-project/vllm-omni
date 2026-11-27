@@ -25,8 +25,8 @@ CATEGORIES = {
     "clients": {
         "name": "Clients",
         "description": (
-            "Client libraries that talk to a running vLLM-Omni server "
-            "(the full-duplex Realtime client and its per-model session presets)."
+            "Client libraries for full-duplex sessions: the Realtime WebSocket client, "
+            "the in-process client over `DuplexOmni`, and the per-model session presets."
         ),
     },
     "inputs": {
@@ -145,6 +145,7 @@ def scan_package(package_name: str = "vllm_omni") -> dict[str, list[str]]:
 
             # Skip excluded modules (avoid importing vllm during docs build)
             excluded_prefixes = [
+                "vllm_omni.benchmarks",  # api-autonav skips this implicit namespace package
                 "vllm_omni.diffusion.models.qwen_image",
                 "vllm_omni.diffusion.quantization",
                 "vllm_omni.quantization",

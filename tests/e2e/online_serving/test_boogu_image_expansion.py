@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 L4 expansion coverage for ``Boogu/Boogu-Image-0.1-Base`` (text-to-image).
@@ -48,8 +48,8 @@ MODEL = "Boogu/Boogu-Image-0.1-Base"
 T2I_PROMPT = "A mountain lake at sunset, photorealistic, cinematic lighting"
 NEGATIVE_PROMPT = ""
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
+PARALLEL_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 
 
 def _get_diffusion_feature_cases(model: str):

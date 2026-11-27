@@ -11,8 +11,15 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
-from tests.helpers.runtime import OmniResponse, OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.runtime import (
+    QWEN3_OMNI_COLD_INIT_TIMEOUT_S,
+    QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S,
+    OmniResponse,
+    OmniServerParams,
+    dummy_messages_from_mix_data,
+)
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -26,6 +33,8 @@ test_params = [
         model=MODEL,
         stage_config_path=MULTI_REPLICA_DEPLOY,
         server_args=["--disable-log-stats"],
+        stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None),
+        init_timeout=QWEN3_OMNI_COLD_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None,
     )
 ]
 
@@ -91,7 +100,7 @@ def _assert_audio_outputs(responses: list[OmniResponse], *, expect_text: bool) -
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_only_batch_uses_multi_replica_talker(omni_server, online_client) -> None:
     request_config = {
@@ -108,7 +117,7 @@ def test_text_only_batch_uses_multi_replica_talker(omni_server, online_client) -
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_audio_stream_batch_uses_multi_replica_vocoder(omni_server, online_client) -> None:
     request_config = {
@@ -125,7 +134,7 @@ def test_text_to_audio_stream_batch_uses_multi_replica_vocoder(omni_server, onli
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mixed_modal_stream_batch_generates_text_and_audio(omni_server, online_client) -> None:
     request_config = {
