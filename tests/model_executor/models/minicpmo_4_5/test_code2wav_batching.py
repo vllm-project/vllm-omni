@@ -260,6 +260,7 @@ def test_cfm_fused_body_default_respects_platform_and_precision(monkeypatch, cud
     from vllm_omni.platforms import current_omni_platform
 
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: cuda)
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
     monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
     if env is not None:
@@ -274,11 +275,37 @@ def test_cfm_fused_body_default_respects_platform_and_precision(monkeypatch, cud
     assert model._cfm_graph_config["row_offset_merge"] is False
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({}, False),
+        ({"token2wav_float16": True}, True),
+        ({"cfm_float16": True}, True),
+        ({"cfm_fused_body": True}, True),
+        ({"cfm_fused_body": False, "token2wav_float16": True}, False),
+    ],
+)
+def test_cfm_fused_body_defaults_on_for_rocm_fp16(monkeypatch, extra, expected):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "off")
+    config = _config()
+    config.model_config.stage_connector_config["extra"].update(extra)
+
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+
+    assert model._cfm_graph_config["fused_body"] is expected
+
+
 @pytest.mark.parametrize("extra,expected", [({}, True), ({"cfm_fused_body": False}, False)])
 def test_cfm_fused_body_defaults_on_for_npu(monkeypatch, extra, expected):
     from vllm_omni.platforms import current_omni_platform
 
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
     monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
     # NPU fusion does not use TF32, so the TF32 opt-out must not disable it.
@@ -1637,7 +1664,8 @@ def test_model_preserves_output_slots_and_prefers_runtime_codes():
     assert token2wav.flow.encoder.calls[-1] == 2
 
 
-def test_code2wav_projects_duplex_metadata_to_final_audio_output():
+@pytest.mark.parametrize("text_without_audio", [False, True])
+def test_code2wav_projects_duplex_metadata_to_final_audio_output(text_without_audio):
     model, token2wav = _model()
     segment = _info("duplex", 0, [10, 11])
     segment_text_utf8 = torch.tensor(list(b"hello"), dtype=torch.uint8)
@@ -1648,12 +1676,14 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
             "llm_output_text_utf8": segment_text_utf8,
             "tts_is_last_chunk": True,
             "turn_end": False,
+            "text_without_audio": text_without_audio,
         }
     )
 
     segment_output = _forward(model, [segment])
 
     assert segment_output.multimodal_outputs["meta.turn_end"][0].item() is False
+    assert segment_output.multimodal_outputs["meta.text_without_audio"][0].item() is text_without_audio
     # A Talker unit boundary only drains pending codec tokens. The official
     # streaming path keeps Token2wav open until the assistant turn ends.
     assert token2wav.flow.encoder.last_chunk_calls[-1] is False
@@ -1678,6 +1708,7 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     assert payload["meta.duplex_audio_cache_epoch"][0].item() == final["meta"]["cache_epoch"]
     assert payload["meta.duplex_audio_chunk_seq"][0].item() == 1
     assert payload["meta.turn_end"][0].item() is True
+    assert payload["meta.text_without_audio"][0].item() is text_without_audio
     assert token2wav.flow.encoder.last_chunk_calls[-1] is True
     assert "duplex" not in model._states
 

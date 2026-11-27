@@ -123,13 +123,9 @@ async def test_single_reference_list_is_resolved_once_and_preserved_in_prompt(ad
         ({"task_type": "Base"}, "VoiceDesign"),
         ({"ref_audio": REFERENCE, "ref_text": "words", "task_type": "VoiceDesign"}, "Base"),
         ({"extra_params": {"unknown": 1}}, "Unsupported"),
-        ({"extra_params": {"temperature": True}}, "finite number"),
-        ({"extra_params": {"temperature": float("nan")}}, "finite number"),
         ({"extra_params": {"cfg_scale": float("inf")}}, "finite number"),
         ({"extra_params": {"cfg_scale": 0}}, "positive"),
         ({"extra_params": {"guidance_scale": 0, "cfg_scale": 4}}, "positive"),
-        ({"extra_params": {"repetition_penalty": 0}}, "positive"),
-        ({"extra_params": {"temperature": -0.1}}, "temperature"),
         ({"extra_params": {"top_p": 0}}, "top_p"),
         ({"extra_params": {"top_p": 1.1}}, "top_p"),
         ({"extra_params": {"top_k": 1.5}}, "top_k"),
@@ -141,6 +137,20 @@ def test_unsupported_or_invalid_inputs_fail_before_build(adapter, kwargs, fragme
     error = adapter.validate(request)
     assert error is not None and fragment in error
     adapter.ctx.server._resolve_ref_audio.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("temperature", True),
+        ("temperature", float("nan")),
+        ("repetition_penalty", 0),
+        ("temperature", -0.1),
+    ],
+)
+def test_invalid_sampling_overrides_are_rejected_by_request_schema(key, value):
+    with pytest.raises(ValidationError, match=rf"extra_params\.{key}"):
+        OpenAICreateSpeechRequest(input="Hello.", extra_params={key: value})
 
 
 def test_empty_reference_list_is_rejected_by_request_schema():

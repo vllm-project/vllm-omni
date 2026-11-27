@@ -889,7 +889,7 @@ at most 15 seconds combined.
 ## Fun ControlNet Union (CTRL-01)
 
 The original [Alibaba PAI Fun ControlNet Union checkpoint](https://huggingface.co/alibaba-pai/MiniMax-H3-Fun-Controlnet-Union)
-adds one control branch to the existing FL2VA transformer. It accepts prepared
+adds one control branch to the server's transformer. It accepts prepared
 Canny, Depth, HED, MLSD or Pose videos and mask-based video inpainting. The
 control checkpoint contains only branch weights; keep the base FL2VA components
 available. ComfyUI-repacked, pruned and quantized control checkpoints are not
@@ -910,10 +910,14 @@ vllm serve "$MODEL" --omni --task-type fl2va --trust-remote-code \
 ```
 
 The initial control path uses resident BF16 weights and tensor parallelism.
-Reference/keyframe conditioning, visual timeline guides, sequence parallelism, approximate cache acceleration and
-quantized control execution require separate support; do not combine them with
-this configuration. Control/Turbo combinations need their own validation and
-are not established by ordinary H3 Turbo results.
+Keyframe conditioning, visual timeline guides, continuation (`continue_from` and long-video), sequence parallelism,
+approximate cache acceleration and quantized control execution require separate support; do not combine them with
+this configuration. The branch hints the task its DiT serves: an FL2VA server (`--task-type fl2va`) takes control on
+T2VA requests without references, and a Ref2VA server (`--task-type ref2va`) takes it on Ref2VA requests with their
+reference images, as the FastH3 Omni checkpoint does; see [FastH3 Omni control](../FastVideo/FastH3-Omni.md#controlnet).
+Reference rows receive no hint. A combined server has two DiTs and one branch, so it is refused at startup, and so
+is reference-KV offload (`kv_offload_config`), which compacts reference rows during the loop.
+Control/Turbo combinations need their own validation and are not established by ordinary H3 Turbo results.
 
 Active control conditioning cannot be reused in a `latent_refine` pass at a
 larger canvas after `latent_upscale`: its hint/source/mask rows still describe
@@ -1081,7 +1085,8 @@ retain the native `17n+5` video-frame grid, `5n+2` video-latent grid, and 40 Hz
 audio latents. A request for 75 seconds becomes 1,807 frames (75.292 seconds at
 24 FPS). In full mode, attention cost and activation memory grow with the full
 sequence length. Reference-video and reference-audio limits remain unchanged.
-Other task types retain full-mode behavior. Requests are limited to 30 seconds
+T2VA and FL2VA keep full mode unless the request sets
+`long_video_mode=continuation`. Requests are limited to 30 seconds
 in full mode and 300 seconds in continuation mode; without `long_video=true`,
 the limit remains 15 seconds. The limits cover duration aliases and explicit
 `num_frames`, and externally encoded requests are checked again before diffusion.
@@ -1135,9 +1140,9 @@ To continue a finished job in a separate request, see
 [MiniMax H3 Continuation Across Requests](../../docs/serving/videos_api.md#minimax-h3-continuation-across-requests).
 
 `long_video=true` selects this mode by default for Ref2VA. It can also be selected
-explicitly with `long_video_mode=continuation`. This experimental mode supports
-Ref2VA request execution with uncached denoising (`quality=lossless`); step
-execution is rejected. Use `long_video_mode=full` explicitly for whole-target
+explicitly with `long_video_mode=continuation`, which is how T2VA and FL2VA
+requests opt in. This experimental mode supports request execution with
+uncached denoising (`quality=lossless`); step execution is rejected. Use `long_video_mode=full` explicitly for whole-target
 sampling, including requests up to 30 seconds that require step execution.
 Continuation currently rejects latent-mask editing (`video_noise_mask` or
 `audio_noise_mask` with retained source regions). Full mode supports editing;
@@ -1184,9 +1189,48 @@ strings for the default 75-second request). These prompts are independently
 encoded with the same reference assets and selected in window order. Shot times
 inside each prompt describe that local window, including its hidden overlap.
 This option requires a local text encoder; external-encoder stage execution is
-not supported. Media positions use one shared origin after the longest encoded
-text prefix, so different prompt lengths do not shift the global AV clock.
-Without this list, the request's single prompt is reused as before.
+not supported. Ref2VA media positions use one shared origin after the longest
+encoded text prefix, so different prompt lengths do not shift the global AV clock;
+T2VA and FL2VA windows each follow their own prompt, as separate `continue_from`
+requests do. Without this list, the request's single prompt is reused as before.
+
+T2VA and FL2VA requests with more than one window prompt are refused while the
+text encoder uses distributed layerwise offload
+(`--enable-distributed-layerwise-offload`): their prompts are text-only encodes
+that run one after another, which that backend does not handle yet. A single
+prompt for all windows works there, and so do Ref2VA window prompts.
+
+T2VA and FL2VA windows carry the preceding AV latent tail as a frame-0 timeline
+guide, the layout [`continue_from`](../../docs/serving/videos_api.md#minimax-h3-continuation-across-requests)
+uses across requests, instead of a Ref2VA `latent_guide` reference. Each window
+gets the sampler inputs the matching request of a `continue_from` chain would.
+An FL2VA first frame conditions the first window only: later windows drop the
+keyframe and take the prompt encoded without the image, as a `continue_from`
+request without an image does, which requires a local text encoder. Any other
+keyframe is rejected; use `long_video_mode=full` for those. Nothing re-anchors
+the subject after the first window. When a reference has to hold for the whole
+clip, use Ref2VA, which keeps its references in every window.
+
+FL2VA windows default to 141 frames instead of 277. Later windows no longer
+carry the first frame, and in Ascend runs at 1344x768 with the Turbo 4-step
+adapter its look held across joins for 141- and 209-frame windows and was lost at
+the first join of a 277-frame window, in a `continue_from` chain as well. Base
+weights with the full schedule also held at 277; set `continuation_window_frames`
+to use longer windows there.
+
+How well a join holds also depends on the prompt. A prompt that describes a
+continuing scene joined cleanly throughout; one that describes a one-off action
+can restart it in a later window, for T2VA and FL2VA alike. Describe a scene that
+can continue, or give each window its own prompt.
+
+```bash
+curl --fail-with-body -sS -X POST "${API_URL}" \
+  --form-string 'prompt=A red fox walks slowly through a snowy pine forest at dawn, sniffing the ground, with soft pawsteps, steady winter wind and distant birds.' \
+  -F 'width=1344' -F 'height=768' -F 'fps=24' \
+  -F 'num_inference_steps=50' -F 'flow_shift=12' -F 'seed=1101' \
+  -F 'extra_params={"task":"t2va","duration":30,"long_video":true,"long_video_mode":"continuation","audio_flow_shift":3}' \
+  -o long-t2va.mp4
+```
 
 The cumulative latent is decoded once after all windows. Denoising memory is
 bounded by the window, while cumulative latent storage still grows with duration.
@@ -1225,11 +1269,11 @@ full and windowed latents.
 
 ## Request-scoped sampler
 
-H3 supports `euler` (the default), `res_multistep`, and `heun`. Select the sampler per
-request; it applies to both video and audio, using their separate sigma schedules.
-For the HTTP examples above, set `num_inference_steps=20` and add
-`"sampler":"res_multistep"` to the existing `extra_params` object. For example,
-the T2VA fields become:
+H3 supports `euler` (the default), `res_multistep`, `heun`, and `dpmpp_2m`.
+Select the sampler per request; it applies to both video and audio, using their
+separate sigma schedules. For the HTTP examples above, set
+`num_inference_steps=20` and add `"sampler":"res_multistep"` to the existing
+`extra_params` object. For example, the T2VA fields become:
 
 ```bash
 -F 'num_inference_steps=20' \
@@ -1248,20 +1292,22 @@ sampling_params = OmniDiffusionSamplingParams(
 )
 ```
 
-`euler` and `res_multistep` use one DiT evaluation per step in request mode and
-step execution. `heun` evaluates the DiT a second time at the Euler proposal and
-averages the two derivatives, so an N-step schedule ending at zero uses `2N - 1`
-evaluations; the final step to zero is a plain Euler update. Heun needs uncached
-model runs, so it is rejected with `quality=high` or a server-wide cache backend.
-`res_multistep` retains the previous denoised prediction independently for each
-request and each stream; its first and final updates use Euler. Omitting `sampler`
-or selecting `euler` preserves the existing Euler update. Reducing the step count
-reduces model evaluations, but quality depends on the prompt and configuration;
-20 RES steps are a candidate to compare against an Euler-50 reference.
+`euler`, `res_multistep`, and `dpmpp_2m` use one DiT evaluation per step in
+request mode and step execution. `heun` evaluates the DiT a second time at the
+Euler proposal and averages the two derivatives, so an N-step schedule ending at
+zero uses `2N - 1` evaluations; the final step to zero is a plain Euler update.
+Heun needs uncached model runs, so it is rejected with `quality=high` or a
+server-wide cache backend. `res_multistep` and `dpmpp_2m` retain the previous
+denoised prediction independently for each request and each stream; their first
+and final updates use Euler. `dpmpp_2m` extrapolates the prediction linearly in
+`-log(sigma)`. Omitting `sampler` or selecting `euler` preserves the existing
+Euler update. Reducing the step count reduces model evaluations, but quality
+depends on the prompt and configuration; 20 RES steps are a candidate to compare
+against an Euler-50 reference.
 
 Requests using a fixed distilled `base_schedule` from a checkpoint or adapter
-must keep `sampler="euler"`. RES and Heun sampling with those schedules have not
-been validated and are rejected with `ValueError`.
+must keep `sampler="euler"`. RES, Heun, and DPM++ 2M sampling with those
+schedules have not been validated and are rejected with `ValueError`.
 
 ## Request-scoped quality
 
@@ -1585,6 +1631,11 @@ evaluations.
 
 ### FlashGen native LoRA
 
+FlashGen native adapters require `--lora-application runtime` (the default).
+`--lora-application merged` is rejected during loading because the adapter's
+schedule and request validation require runtime activation. An active native
+adapter cannot be stacked with other adapters.
+
 The FlashGen 4-step T2VA artifact uses the native MiniMax-H3 module layout and
 declares its distilled sigma schedule in safetensors metadata. It is published on
 [ModelScope](https://modelscope.cn/models/FlashGen/Minimax-H3-4step-lora-flashgen):
@@ -1615,7 +1666,7 @@ Each request must use T2VA and the distilled interval-count contract:
 -F "lora={\"name\":\"h3-flashgen-v1.0\",\"path\":\"${FLASHGEN_LORA}\",\"scale\":1.0}"
 ```
 
-This path rejects Ref2VA and checkpoints that already pin `base_schedule` in
+The T2VA v1 artifact rejects Ref2VA and checkpoints that already pin `base_schedule` in
 `model_index.json`. The adapter metadata carries
 `base_schedule=1.0,0.7,0.4,0.15,0.0`, so `num_inference_steps=4` means four
 denoiser evaluations, not five sigma points. Request-mode generation may omit
@@ -1639,6 +1690,44 @@ To validate a deployment, post the same fixed-seed T2VA request twice with the
 adapter and twice without it, then compare the four output digests. The adapter
 is bound and deterministic when each pair matches internally and the two pairs
 differ from each other.
+
+#### FlashGen native LoRA v2 for I2VA and Ref2VA
+
+Use the published v2 safetensors file exported for the matching official base
+partition. For I2VA, start a FL2VA server with `--task-type fl2va` and send a
+single first frame in `input_reference`. Set `task=fl2va` and
+`frame_indices=[0]` in `extra_params`. For Ref2VA, start a dedicated Ref2VA
+server with `--task-type ref2va`; set `task=ref2va` and send the reference
+image in `input_reference`. Both services use `--lora-backend peft` and may
+preload the published file with `--lora-path`. Select it in the request with
+the usual `lora` field and `scale=1.0`. FL2VA exports also load on a
+`--task-type combined` server; requests using that adapter must still select
+`task=fl2va`.
+
+The [four-A5 conditioning validation](https://github.com/vllm-project/vllm-omni/pull/10596#discussion_r4623182377)
+also completed four-step FL2VA requests with a last frame, first and last
+frames, and `continue_from`. First/last output frames matched their input
+images with SSIM 0.982/0.979 in the tested two-frame case. Three keyframes
+and timeline guides were rejected by existing validation. Ref2VA requests
+with a video, image plus audio, and image plus video also completed with
+fully decodable video and audio. Reference audio/video adherence remains
+unverified; these results establish completion for the tested inputs.
+
+The artifact supplies a four-interval base sigma schedule. Omit `sampler`
+to use the H3 default Euler sampler. The adapter requires `flow_shift=12`
+and `audio_flow_shift=3`. If the base model defaults differ, pass these
+values explicitly in `extra_params`. Send `num_inference_steps=4` when using
+step execution.
+
+Ref2VA uses rank 384 for packed QKV and rank 128 for the other projections.
+The runtime LoRA manager uses a shared buffer rank across wrapped layers. It
+rounds 384 up to the next supported rank, 512, so rank-128 projections reserve
+four times the LoRA buffer capacity they would need at rank 128. The actual
+per-device memory overhead depends on tensor parallelism and the backend.
+The exported factors already carry their effective scale. An active v2
+adapter requires request `scale=1.0`; other nonzero scales are rejected.
+`scale=0` disables the adapter and its sampling constraints. Legacy T2VA v1
+request scaling is unchanged.
 
 ### FastH3 adapter
 
@@ -1751,6 +1840,74 @@ Use a `lora` array to combine multiple adapters, each with its own `scale`. Thes
 
 Select a specific file when a directory contains multiple adapters. General Diffusers checkpoint conversion is not supported.
 
+### Pika Flex Turbo LoRA
+
+[Pika-Labs/Pika-H3-Flex-Turbo-LoRA](https://huggingface.co/Pika-Labs/Pika-H3-Flex-Turbo-LoRA) fuses Pika's Flex
+adapter with a few-step distill into one native-layout LoRA, so it loads through the ComfyUI-style path above. The
+files carry no metadata; as with Turbo, the filename is the contract and must not be renamed:
+
+| Artifact | Server | `num_inference_steps` | `flow_shift` |
+| --- | --- | ---: | ---: |
+| `pika_h3_flex_turbo_<n>step[_draft\|_hd]_ref2va[_lite_r32].safetensors` | `--task-type ref2va` | `n` | 12 |
+| `pika_h3_flex_turbo_<n>step[_hd]_fl2va[_lite_r32].safetensors` | `--task-type fl2va` | `n` | 6 |
+
+`audio_flow_shift` is `3.0`. A request with another step count or shift is rejected, whether `lora.path` names the
+file or a directory holding only that file. The full files are rank 768 on
+the packed QKV projection, which sets the per-layer LoRA buffer rank to 768 for the whole server; the `_lite_r32`
+files stay at rank 96.
+
+### PDD acceleration LoRA
+
+[alibaba-pai/MiniMax-H3-Acc-LoRAs](https://huggingface.co/alibaba-pai/MiniMax-H3-Acc-LoRAs) applies Parallel
+Decoding Distillation: a rank-64 LoRA plus 32 copies of both output heads, of which four fuse into the head of each
+of eight forwards. The server fuses the heads when it loads the adapter and binds them for the requests that
+activate it, so it is selected like any other adapter:
+
+```bash
+hf download alibaba-pai/MiniMax-H3-Acc-LoRAs MiniMax-H3-Ref2VA-Acc-8Step.safetensors --local-dir "${PDD_DIR}"
+```
+
+Start a `--task-type ref2va` server with `--lora-backend peft` (`--task-type fl2va` for
+`MiniMax-H3-FL2VA-Acc-8Step.safetensors`) and send `num_inference_steps=8` with the base model's shifts
+(`flow_shift=12`, `audio_flow_shift=3`) and the adapter in `lora` at `scale=1.0`. Each head is the mean velocity
+of one block of that schedule, so a request with another scale, a sampler other than `euler`, or `latent_refine` is
+rejected. The adapter is refused at load on a combined server and with step execution, `--lora-application merged`
+or `--cache-backend tea_cache`: the heads belong to one DiT and are bound for one request at a time. It cannot be
+stacked with other adapters in a `lora` array.
+
+Keep the released filename. It names the DiT the adapter was distilled from, and the server refuses a file whose
+name does not match its `--task-type`. The file's metadata does not record the DiT, so a renamed or differently
+named export (`pdd_ema.safetensors`) is bound to whichever DiT the server runs, without that check.
+
+### Conditioning features with adapters
+
+ControlNet, `continue_from` and long-video continuation, latent-mask editing and timeline guides do not depend on
+how a request is sampled, so they are available with every adapter above on its own schedule. On one H200 node
+(TP 8, 480x832, 124 frames, seed 20261124, `quality=lossless`), each cell is one request.
+
+Ref2VA server (`--task-type ref2va`), one reference image:
+
+| Weights | Depth control | Guide at frame 96, SSIM to the guide (unguided) | Edit, kept half PSNR | `continue_from`, SSIM across the join (inside a clip) | 20 s `long_video` |
+| --- | --- | --- | --- | --- | --- |
+| Base Ref2VA, 20 steps | follows the pose | 0.930 (0.777) | 38.2 dB | 0.860 (0.825) | 481 frames |
+| LightX2V `ref2v_turbo_8step_v1.0_768p` | follows the pose | 0.914 (0.725) | 37.6 dB | 0.821 (0.838) | 481 frames |
+| Pika `8step_hd_ref2va` | follows the pose | 0.936 (0.724) | 38.4 dB | 0.907 (0.865) | 481 frames |
+| Pika `4step_ref2va_lite_r32` | follows the pose | 0.879 (0.723) | 36.6 dB | 0.796 (0.806) | 481 frames |
+| PAI `Ref2VA-Acc-8Step` | follows the pose | 0.932 (0.747) | 37.9 dB | 0.824 (0.794) | 481 frames |
+
+FL2VA server (`--task-type fl2va`), T2VA requests with `aspect_ratio=9:16`:
+
+| Weights | Depth control | Guide at frame 96, SSIM to the guide (unguided) | Edit, kept half PSNR | `continue_from`, SSIM across the join (inside a clip) | 20 s `long_video` |
+| --- | --- | --- | --- | --- | --- |
+| Base FL2VA, 20 steps | follows the pose | 0.932 (0.619) | 35.7 dB | 0.858 (0.834) | 481 frames |
+| LightX2V `fl2v_turbo_8step_v1.2_768p` | follows the pose | 0.928 (0.600) | 35.4 dB | 0.800 (0.773) | 481 frames |
+| Pika `8step_hd_fl2va` | follows the pose | 0.913 (0.565) | 35.9 dB | 0.755 (0.700) | 481 frames |
+| PAI `FL2VA-Acc-8Step` | follows the pose | 0.923 (0.625) | 35.6 dB | 0.829 (0.795) | 481 frames |
+
+Depth control was judged by eye against the control clip; the other columns are measured on the returned MP4s. The
+guide image is a frame of the base Ref2VA row's unguided clip, which raises that row's unguided figure. These runs
+establish that each combination completes and takes effect, not a quality ranking: one prompt, one seed.
+
 ## Key parameters
 
 | Parameter | Recommended value | Notes |
@@ -1761,7 +1918,7 @@ Select a specific file when a directory contains multiple adapters. General Diff
 | `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
 | `fps` | `24` | H3 output FPS is fixed |
 | `num_inference_steps` | `50` | Matches the reference accuracy workloads |
-| `extra_params.sampler` | `euler` | Per-request `euler`, `res_multistep`, or `heun` for both streams; fixed distilled schedules require Euler; Heun requires uncached runs |
+| `extra_params.sampler` | `euler` | Per-request `euler`, `res_multistep`, `heun`, or `dpmpp_2m` for both streams; fixed distilled schedules require Euler; Heun requires uncached runs |
 | `flow_shift` | `12` | Video sigma shift |
 | `audio_flow_shift` | `3` | Audio sigma shift, passed in `extra_params` |
 | `seed` | Task-specific | Use a fixed value for reproducibility |

@@ -186,7 +186,9 @@ Before real requests are admitted, the engine and Workers:
    a latency sample. On NPU, it may use SDPA only when MindIE-SD is
    unavailable; this is the sole intentional fallback and applies only to this
    startup profile.
-4. Build the native cache configuration and resolve block geometry.
+4. Build the native cache configuration and resolve block geometry and physical
+   layout. Each Worker adopts the control-plane layout before constructing its
+   native KV connector; connectors may read the layout during initialization.
 5. Allocate rank-local physical pages and create the Scheduler facade over the
    same geometry.
 

@@ -25,7 +25,7 @@ pytestmark = [pytest.mark.full_model, pytest.mark.diffusion, pytest.mark.paralle
 
 
 def _sp_worker(rank: int, world_size: int, init_method: str, output_dir: str):
-    device = torch.device(f"cuda:{rank}")
+    device = torch.device(f"{current_omni_platform.device_type}:{rank}")
     current_omni_platform.set_device(device)
     torch.set_num_threads(1)
     init_distributed_environment(world_size=world_size, rank=rank, local_rank=rank, distributed_init_method=init_method)
@@ -64,7 +64,7 @@ def _sp_worker(rank: int, world_size: int, init_method: str, output_dir: str):
         destroy_distributed_env()
 
 
-@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=2)
+@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=2)
 def test_mossimage_sp_matches_single_gpu_with_odd_joint_length(tmp_path):
     for world_size in (1, 2):
         torch.multiprocessing.spawn(

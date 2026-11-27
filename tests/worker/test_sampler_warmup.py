@@ -104,9 +104,12 @@ def test_ar_worker_registers_sampler_warmup_before_upstream_kernel_warmup(monkey
     assert next_impl is OmniGPUWorkerBase
     calls = []
     monkeypatch.setattr(gpu_ar_worker, "warm_up_moe_prefill_kernels", lambda worker: calls.append("moe_prefill"))
+    monkeypatch.setattr(
+        gpu_ar_worker, "warm_up_triton_attention_prefill", lambda worker: calls.append("triton_attention")
+    )
     monkeypatch.setattr(gpu_ar_worker, "register_top_k_top_p_warmup", lambda worker: calls.append("sampler"))
     monkeypatch.setattr(OmniGPUWorkerBase, "compile_or_warm_up_model", lambda self: calls.append("upstream"))
 
     GPUARWorker.compile_or_warm_up_model(object.__new__(GPUARWorker))
 
-    assert calls == ["moe_prefill", "sampler", "upstream"]
+    assert calls == ["moe_prefill", "triton_attention", "sampler", "upstream"]

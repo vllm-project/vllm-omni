@@ -20,6 +20,9 @@ __all__ = ["REALTIME_ERROR_TYPES_BY_CODE", "RealtimeProtocolError", "realtime_er
 #: OpenAI Realtime ``error.type`` for each internal error code.
 REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "bad_event": "invalid_request_error",
+    "unsupported_output_modality": "invalid_request_error",
+    "unsupported_parameter": "invalid_request_error",
+    "unsupported_operation": "invalid_request_error",
     "bad_audio": "invalid_request_error",
     "config_timeout": "invalid_request_error",
     "invalid_json": "invalid_request_error",
@@ -32,6 +35,8 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "runtime_abort_failed": "server_error",
     "runtime_data_plane_stream_failed": "server_error",
     "runtime_data_plane_text_without_audio": "server_error",
+    "runtime_data_plane_missing_tokenizer": "server_error",
+    "runtime_data_plane_unterminated_unit": "server_error",
     "resource_exhausted": "rate_limit_error",
     "replica_unavailable": "server_error",
     "session_exists": "invalid_request_error",

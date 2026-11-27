@@ -5,8 +5,11 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from vllm.logger import init_logger
@@ -61,6 +64,43 @@ def read_bool_flag(extra: Mapping[str, Any], key: str, default: bool) -> bool:
     if value is None:
         return default
     return parse_bool_flag(value, key)
+
+
+@contextmanager
+def npu_prefill_startup_environment(deploy_config: str | Path) -> Iterator[None]:
+    """Share private startup markers with this service's local stage workers."""
+    from vllm_omni.config.stage_config import _DEPLOY_DIR, resolve_deploy_yaml
+
+    path = Path(deploy_config)
+    if path.parent == Path(".") and not path.exists():
+        path = _DEPLOY_DIR / path
+    deploy = resolve_deploy_yaml(path)
+    if deploy.get("pipeline") != "minicpmo_4_5":
+        yield
+        return
+
+    stage_names = {0: "THINKER", 1: "TALKER"}
+    markers = []
+    for stage in deploy.get("platforms", {}).get("npu", {}).get("stages", ()):
+        role = stage_names.get(stage["stage_id"])
+        if role is not None and read_bool_flag(
+            stage.get("additional_config") or {}, "minicpmo_prefill_precapture", False
+        ):
+            key = f"MINICPMO_NPU_{role}_PREFILL_STARTUP"
+            if key not in os.environ:
+                markers.append((key, role.lower()))
+    if not markers:
+        yield
+        return
+
+    with TemporaryDirectory(prefix="minicpmo-prefill-") as directory:
+        for key, role in markers:
+            os.environ[key] = str(Path(directory) / role)
+        try:
+            yield
+        finally:
+            for key, _ in markers:
+                os.environ.pop(key, None)
 
 
 # Legacy environment switches for the Token2Wav TensorRT path (#6232). Each one

@@ -35,7 +35,7 @@ def _load(name, path):
 
 
 @pytest.mark.parametrize("platform", ["cuda", "npu"])
-def test_json_matrix_matches_scenario_v2(platform):
+def test_non_duplex_dataset_matrix(platform):
     configs = json.loads((ROOT / "tests/dfx/perf/tests/test_qwen3_omni_non_full_duplex.json").read_text())
     params = [p for c in configs for p in c["benchmark_params"] if platform in c["mark"][0]["hardware_marks"]["res"]]
     expected = (
@@ -134,7 +134,6 @@ def test_cuda_pipeline_uses_json_runner_and_function_regression():
         assert 0 < step["timeout_in_minutes"] <= 120
         commands = "\n".join(step["commands"])
         assert "run_benchmark.py" in commands and "test_qwen3_omni_non_full_duplex.json" in commands
-    assert not any("Verbatim Reading Regression" in s.get("label", "") for s in steps)
     expansion = (ROOT / "tests/e2e/online_serving/test_qwen3_omni_expansion.py").read_text(encoding="utf-8")
     assert "def test_qwen3_omni_seed_tts_reads_questions_verbatim" in expansion
 
@@ -235,17 +234,16 @@ def test_cuda_pipeline_selects_each_matrix_case_once():
         ("test_qwen3_omni_datasets_cuda_default", "default-seed-tts-c64"),
         ("test_qwen3_omni_datasets_cuda_async_daily", "async-prefix-daily-omni-c8"),
         *{("test_qwen3_omni_datasets_cuda_async_seed", f"async-prefix-seed-tts-c{c}") for c in (1, 16, 32, 64)},
-        ("test_qwen3_omni_duplex_omni_duplex_eval", "c8_accuracy_response_stats_v5"),
-        ("test_qwen3_omni_duplex_omniinteract", "c8_accuracy_response_stats_v5"),
+        ("test_qwen3_omni_duplex_omni_duplex_eval", "c8_accuracy_response_stats"),
+        ("test_qwen3_omni_duplex_omniinteract", "c8_accuracy_response_stats"),
     }
     assert selected == Counter({case: 1 for case in expected})
 
 
-def test_a3_keeps_existing_jobs_until_full_matrix_qualification():
+def test_a3_nightly_runs_qwen3_accuracy_and_perf_jobs():
     pipeline = yaml.safe_load((ROOT / ".buildkite/npu/test-npu-nightly.yml").read_text())
     steps = [step for group in pipeline["steps"] if "steps" in group for step in group["steps"]]
     commands = "\n".join(command for step in steps for command in step.get("commands", []))
-    assert "test_qwen3_omni_nightly.py" not in commands
     assert "test_qwen3_omni.py -m" in commands
     assert "test_qwen3_omni_no_async_chunk.json" in commands
     assert "test_qwen3_omni_async_chunk.json" in commands
@@ -256,9 +254,9 @@ def test_combined_artifact_enters_performance_report(tmp_path):
     combined = {
         "benchmark_suite": "qwen3-omni-datasets",
         "model_id": "Qwen",
-        "name": "default-daily-c64",
+        "name": "async-prefix-daily-omni-c8",
         "dataset_name": "daily-omni",
-        "max_concurrency": 64,
+        "max_concurrency": 8,
         "mean_ttft_ms": 10,
         "daily_omni_accuracy": 0.75,
         "date": "20261110-000000",

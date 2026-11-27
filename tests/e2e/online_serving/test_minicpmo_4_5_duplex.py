@@ -8,10 +8,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import wave
 from pathlib import Path
 from typing import TypedDict
 
 import pytest
+import regex as re
 import websockets
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
@@ -22,6 +24,7 @@ from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     realtime_url,
     resolve_ref_audio,
     validated_input_wav,
+    validated_wav,
 )
 from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import (
     _read_wav_pcm16,
@@ -77,9 +80,11 @@ def _assert_session_metrics(metrics: object, *, expected_count: int) -> None:
     assert rtf is not None and rtf >= 0
 
 
-async def _receive_protocol_events(ws, required_types: set[str], *, timeout_s: float) -> list[dict[str, object]]:
+async def _receive_protocol_events(
+    ws, required_types: set[str], *, timeout_s: float, event_log: list[dict[str, object]] | None = None
+) -> list[dict[str, object]]:
     async def receive() -> list[dict[str, object]]:
-        events: list[dict[str, object]] = []
+        events: list[dict[str, object]] = [] if event_log is None else event_log
         seen: set[str] = set()
         while not required_types.issubset(seen):
             raw = await ws.recv()
@@ -122,6 +127,130 @@ async def _run_protocol_smoke(*, url: str, model: str, ref_audio: Path) -> list[
         await ws.send(json.dumps({"type": "session.close"}))
         events.extend(await _receive_protocol_events(ws, {"session.closed"}, timeout_s=60))
     return events
+
+
+async def _run_streaming_text_input(
+    *, url: str, model: str, output_dir: Path, with_audio: bool, timeout_s: float = 120.0
+) -> dict[str, object]:
+    """Require facts from separate text fragments and, optionally, spoken PCM."""
+    events: list[dict[str, object]] = []
+    sent: list[dict[str, object]] = []
+    waveform = bytearray()
+    transcript: list[str] = []
+    output_dir.mkdir(parents=True, exist_ok=True)
+    async with websockets.connect(build_realtime_url(url, model, autostart=False), max_size=64 * 1024 * 1024) as ws:
+
+        async def send(event: dict[str, object]) -> None:
+            sent.append(event)
+            await ws.send(json.dumps(event))
+
+        await send(
+            {
+                "type": "session.update",
+                "session": {
+                    "model": model,
+                    "modalities": ["text", "audio"],
+                    "instructions": "You are a concise assistant. Use the text and speech in this conversation. Answer in English.",
+                    "input_audio_format": "pcm16",
+                    "output_audio_format": "pcm16",
+                    "temperature": 0,
+                    "extra_body": {"auto_response": True, "force_listen_count": 0},
+                },
+            }
+        )
+        events.extend(await _receive_protocol_events(ws, {"session.created"}, timeout_s=60))
+        created = next(e for e in events if e["type"] == "session.created")
+        session = created["session"]
+        assert isinstance(session, dict)
+        assert "text" in session["capabilities"]["optional_input_modalities"]
+        await send({"type": "input.text.append", "text": "Remember the code word ", "force_listen": True})
+        await asyncio.sleep(0.2)
+        await send({"type": "input.text.append", "text": "blue whale. ", "force_listen": True})
+        if with_audio:
+            path = validated_wav(
+                Path(__file__).resolve().parents[2] / "assets/minicpmo_4_5/text_stream_number_16k.wav",
+                "aa0d189849262dcc2a921740e5bdc124aebb1412e82bed0c2488099063afa413",
+            )
+            with wave.open(str(path)) as wav:
+                pcm = wav.readframes(wav.getnframes())
+            # Complete model units without a commit; keep the real speech and
+            # its natural trailing silence, padding only the final partial unit.
+            pcm += bytes((-len(pcm)) % 32000)
+            for offset in range(0, len(pcm), 6400):
+                await send(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(pcm[offset : offset + 6400]).decode(),
+                        "format": "pcm16",
+                        "sample_rate_hz": 16000,
+                        "is_speech": True,
+                        "force_listen": True,
+                    }
+                )
+                if offset == 6400:
+                    await send(
+                        {
+                            "type": "input.text.append",
+                            "text": "Listen to the spoken secret number. ",
+                            "force_listen": True,
+                        }
+                    )
+                await asyncio.sleep(0.2)
+        else:
+            await send({"type": "input.text.append", "text": "The secret number is seven. ", "force_listen": True})
+        await send(
+            {"type": "input.text.append", "text": "What are the code word and the secret number? Say both briefly."}
+        )
+        try:
+            await _receive_protocol_events(ws, {"response.done"}, timeout_s=timeout_s, event_log=events)
+        finally:
+            (output_dir / "input.json").write_text(json.dumps(sent, ensure_ascii=False, indent=2))
+            (output_dir / "events.json").write_text(json.dumps(events, ensure_ascii=False, indent=2))
+            await send({"type": "session.close"})
+            events.extend(await _receive_protocol_events(ws, {"session.closed"}, timeout_s=30))
+    for event in events:
+        if event["type"] == "response.output_audio_transcript.delta":
+            transcript.append(str(event.get("delta", "")))
+        if event["type"] == "response.output_audio.delta":
+            delta = event["delta"]
+            assert isinstance(delta, str)
+            waveform.extend(base64.b64decode(delta))
+    with wave.open(str(output_dir / "response.wav"), "wb") as wav:
+        wav.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
+        wav.writeframes(waveform)
+    answer = "".join(transcript)
+    result = {
+        "transcript": answer,
+        "audio_bytes": len(waveform),
+        "with_audio": with_audio,
+        "response_statuses": [
+            response["status"]
+            for e in events
+            if e["type"] == "response.done" and isinstance(response := e.get("response"), dict)
+        ],
+    }
+    (output_dir / "events.json").write_text(json.dumps(events, ensure_ascii=False, indent=2))
+    (output_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
+    assert result["response_statuses"] == ["completed"], result
+    assert len(waveform) > 0, result
+    # Native transcript chunks may omit whitespace at their boundaries.
+    assert re.search(r"blue\s*whale", answer.lower()) and re.search(r"\b(?:seven|7)\b", answer.lower()), result
+    return result
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("with_audio", [False, True], ids=["text", "text-and-speech"])
+def test_duplex_streaming_text_input(omni_server, tmp_path: Path, with_audio: bool) -> None:
+    asyncio.run(
+        _run_streaming_text_input(
+            url=realtime_url(omni_server),
+            model=omni_server.model,
+            output_dir=tmp_path,
+            with_audio=with_audio,
+        )
+    )
 
 
 async def _run_text_only_response_create(

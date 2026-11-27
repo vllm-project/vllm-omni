@@ -23,6 +23,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+from vllm_omni.diffusion.distributed.ulysses_transport import require_default_ulysses_transport
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
@@ -144,8 +145,9 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         raise ValueError("Hy-Nomas only supports Ulysses SP, without TP, PP, DP, CFG parallelism or HSDP.")
     if 16 % parallel.ulysses_degree:
         raise ValueError("Hy-Nomas ulysses_degree must divide its 16 attention heads.")
-    if parallel.ulysses_mode != "strict" or parallel.ulysses_a2a_permute:
+    if parallel.ulysses_mode != "strict":
         raise ValueError("Hy-Nomas requires strict Ulysses SP.")
+    require_default_ulysses_transport(parallel, "Hy-Nomas")
     if parallel.vae_patch_parallel_size != 1 or parallel.text_encoder_tp_size != 1 or parallel.enable_expert_parallel:
         raise ValueError("Hy-Nomas does not support VAE, text encoder or expert parallelism.")
     if config.dtype != torch.bfloat16:

@@ -2866,7 +2866,7 @@
     "tests/config/test_omni_config.py::test_from_pipeline_config_owns_model_cli_fields[served_model_name-qwen3_tts]": 0.011536262987647206,
     "tests/config/test_omni_config.py::test_from_pipeline_config_prefers_loaded_user_deploy_config": 0.0024137860164046288,
     "tests/config/test_omni_config.py::test_from_pipeline_config_preserves_current_pipeline_config_object": 0.020978316955734044,
-    "tests/config/test_omni_config.py::test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute": 0.002671030058991164,
+    "tests/config/test_omni_config.py::test_from_pipeline_config_preserves_deployed_ulysses_a2a_backend": 0.002671030058991164,
     "tests/config/test_omni_config.py::test_from_pipeline_config_preserves_diffusion_parallel_mask_sp_padding": 0.004142655001487583,
     "tests/config/test_omni_config.py::test_from_pipeline_config_preserves_legacy_pp_dp_for_world_size": 0.008121916966047138,
     "tests/config/test_omni_config.py::test_from_pipeline_config_records_loaded_deploy_path_on_orchestrator_config": 0.006517383037135005,

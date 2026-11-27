@@ -385,6 +385,26 @@ def build_voxcpm2_prompt(
     return prompt
 
 
+def _platform_copies_to_host_async() -> bool:
+    """Whether device-to-host copies here use pinned memory and a non-blocking copy.
+
+    The stop-mask and delayed-audio copies allocate pinned host memory whenever
+    this returns True, so it must stay limited to platforms that support it.
+    """
+    platform = omni_platform.current_omni_platform
+    return platform.device_type == "cuda" or getattr(platform, "is_npu", lambda: False)()
+
+
+def _platform_uses_stop_mask_side_stream() -> bool:
+    """Whether the stop-mask copy runs on a side stream.
+
+    CUDA and NPU overlap a pinned copy there; XPU and MUSA keep the side stream
+    with a blocking copy. Other platforms, such as MPS, whose streams and events
+    do not interoperate, read the mask synchronously.
+    """
+    return _platform_copies_to_host_async() or omni_platform.current_omni_platform.device_type in ("xpu", "musa")
+
+
 @lru_cache(maxsize=32)
 def _audio_resampler_on_device(orig_sr: int, target_sr: int, device: torch.device) -> nn.Module:
     import torchaudio
@@ -1253,7 +1273,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._enable_delayed_audio_copy = self._runtime_config.enable_delayed_audio_copy
         self._delayed_audio_copy_use_events = use_cuda_graph and self._runtime_config.delayed_audio_copy_use_events
         self._coalesce_audio_d2h = self._runtime_config.coalesce_audio_d2h
-        self._enable_batched_vae_decode = self._runtime_config.enable_batched_vae_decode
+        self._enable_batched_vae_decode = self._resolve_batched_vae_decode(use_cuda_graph)
         self._enable_batched_fsq_fusion = self._runtime_config.enable_batched_fsq_fusion
         self._batched_fsq_fusion_max_batch = self._runtime_config.batched_fsq_fusion_max_batch
         self._audio_copy_stream: torch.cuda.Stream | None = None
@@ -1290,6 +1310,25 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._active_state_warned = False
 
     # -------------------- custom voice profiles --------------------
+
+    def _resolve_batched_vae_decode(self, use_cuda_graph: bool) -> bool:
+        """Resolve the legacy latent-cohort decoder against the runtime condition.
+
+        The unified decode graph batches VAE decode itself, so the legacy path
+        must stay off whenever that graph runs (#9738). The delayed-copy and
+        VAE-graph incompatibilities only matter for a path that can actually
+        run, so they are checked on the resolved value instead of on the raw
+        flag; otherwise the default CUDA configuration warns about a decoder it
+        will never use.
+        """
+        enabled = self._runtime_config.effective_batched_vae_decode(use_cuda_graph=use_cuda_graph)
+        if enabled and (self._enable_delayed_audio_copy or self._audio_emit_every > 1 or self._enable_vae_cuda_graph):
+            logger.warning(
+                "VoxCPM2 batched VAE decode is incompatible with delayed audio copy, "
+                "audio_emit_every > 1, and VAE CUDA Graph; disabling batched VAE decode."
+            )
+            return False
+        return enabled
 
     @staticmethod
     def _clone_prompt_cache(cache: dict[str, Any]) -> dict[str, Any]:
@@ -3435,24 +3474,26 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     def _enqueue_delayed_audio_copy(self, state: _RequestState, audio: torch.Tensor) -> None:
         src = audio.detach().contiguous()
-        if src.device.type != omni_platform.current_omni_platform.device_type:
+        if src.device.type != omni_platform.current_omni_platform.device_type or not _platform_copies_to_host_async():
             state.pending_audio_copies.append(_PendingAudioCopy(host=src.cpu().contiguous()))
             return
 
         # Compiled/graph VAE output storage can be reused on the next token.
         if self._vae_output_storage_may_be_reused():
             src = src.clone()
+        # Pinned: only CUDA/NPU reach here (_platform_copies_to_host_async).
         host = torch.empty(src.shape, dtype=src.dtype, device="cpu", pin_memory=True)
+        device_module = torch.get_device_module(src.device)
         if self._audio_copy_stream is None:
-            self._audio_copy_stream = torch.cuda.Stream(device=src.device)
+            self._audio_copy_stream = device_module.Stream(device=src.device)
         copy_stream = self._audio_copy_stream
-        copy_stream.wait_stream(torch.cuda.current_stream(src.device))
-        with torch.cuda.stream(copy_stream):
+        copy_stream.wait_stream(device_module.current_stream(src.device))
+        with device_module.stream(copy_stream):
             host.copy_(src, non_blocking=True)
             src.record_stream(copy_stream)
             event = None
             if self._delayed_audio_copy_use_events:
-                event = torch.cuda.Event()
+                event = device_module.Event()
                 event.record(copy_stream)
         state.pending_audio_copies.append(_PendingAudioCopy(host=host, event=event, source=src, async_copy=True))
 
@@ -3553,6 +3594,16 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         else:
             stacked = torch.stack([stop_logits[0] for _, stop_logits in pending], dim=0)
 
+        if not _platform_uses_stop_mask_side_stream():
+            # No pinned async copy to overlap, and MPS streams and events do
+            # not interoperate, so read the mask synchronously.
+            stop_mask_cpu = (stacked[:, 1] > stacked[:, 0]).cpu()
+            for i, (state, _) in enumerate(pending):
+                state.pending_stop_mask_cpu = stop_mask_cpu[i : i + 1]
+                state.pending_stop_mask_event = None
+            return
+
+        pinned = _platform_copies_to_host_async()
         device_module = torch.get_device_module(current_omni_platform.get_torch_device())
 
         # Compute the mask and stage the D2H copy on a dedicated side stream:
@@ -3573,24 +3624,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 stop_logits.record_stream(self._stop_mask_stream)
             if model_state is not None:
                 stacked.record_stream(self._stop_mask_stream)
-            # pin_memory=True raises on recent PyTorch builds without an
-            # accelerator; gate it like the host-tensor path below. The
-            # pending states were filtered to this device's tensors above,
-            # so the side-stream copy only ever runs with a device present.
-            on_device = (
-                omni_platform.current_omni_platform.device_type == "cuda"
-                or getattr(omni_platform.current_omni_platform, "is_npu", lambda: False)()
-            )
-            stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=on_device)
+            # Pinned only on CUDA/NPU (_platform_copies_to_host_async); XPU and
+            # MUSA copy through the side stream without pinning.
+            stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=pinned)
             # Canary: a host read that races ahead of the DMA observes True —
             # a deterministic wrong value for keep-going requests, caught by
             # the latch test's expected-value assertion (instead of
             # uninitialized garbage that can accidentally match).
             stop_mask_cpu.fill_(True)
-            if on_device:
-                stop_mask_cpu.copy_(stop_mask_gpu, non_blocking=True)
-            else:
-                stop_mask_cpu.copy_(stop_mask_gpu)
+            stop_mask_cpu.copy_(stop_mask_gpu, non_blocking=pinned)
             copy_done.record(self._stop_mask_stream)
 
         for i, (state, _) in enumerate(pending):

@@ -11,11 +11,12 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import msgspec
 import pytest
 from pytest_mock import MockerFixture
 from vllm.config import VllmConfig
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
@@ -23,6 +24,7 @@ from vllm.v1.request import RequestStatus
 from vllm.v1.serial_utils import run_method
 
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
+from vllm_omni.engine import OmniEngineCoreOutputs
 from vllm_omni.engine.stage_engine_core_proc import (
     StageEngineCoreProc,
     _bind_first_audio_sink,
@@ -100,6 +102,65 @@ def test_ordered_abort_supports_scheduler_without_overflow_fences(mocker):
     engine._handle_client_request(EngineCoreRequestType.ABORT, ["request"])
 
     engine.scheduler.finish_requests.assert_called_once_with(["request"], RequestStatus.FINISHED_ABORTED)
+
+
+@pytest.mark.parametrize("unsupported_model", [False, True])
+def test_input_stream_admission_error_does_not_enter_the_scheduler(mocker, unsupported_model):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    reason = (
+        "This model does not support text input append"
+        if unsupported_model
+        else "Text input exceeds its token capacity"
+    )
+    engine._input_stream_factory = None if unsupported_model else mocker.Mock(side_effect=ValueError(reason))
+    engine.vllm_config = SimpleNamespace()
+    engine.output_queue = mocker.Mock()
+    engine.scheduler = mocker.Mock()
+    request = SimpleNamespace(
+        request_id="invalid",
+        client_index=3,
+        additional_information={"input_stream": {"token_ids": [31, 32]}},
+        model_intermediate_buffer=None,
+    )
+
+    with patch.object(EngineCoreProc, "add_request") as add_request:
+        engine.add_request(request)
+
+    add_request.assert_not_called()
+    engine.scheduler.register_input_stream.assert_not_called()
+    output = engine.output_queue.put_nowait.call_args.args[0][1]
+    assert output.finished_requests == {"invalid"}
+    assert output.outputs[0].finish_reason == FinishReason.ERROR
+    assert output.outputs[0].stop_reason == reason
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(output), type=OmniEngineCoreOutputs)
+    assert decoded.finished_requests == {"invalid"}
+    assert decoded.outputs[0].stop_reason == reason
+
+
+def test_input_stream_is_registered_only_after_parent_admission(mocker):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    stream = object()
+    engine._input_stream_factory = mocker.Mock(return_value=stream)
+    engine.vllm_config = SimpleNamespace()
+    engine.output_queue = mocker.Mock()
+    engine.scheduler = mocker.Mock()
+    request = SimpleNamespace(
+        request_id="valid",
+        client_index=0,
+        additional_information={"input_stream": {"token_ids": [31]}},
+        model_intermediate_buffer=None,
+        is_finished=lambda: False,
+    )
+
+    with patch.object(
+        EngineCoreProc,
+        "add_request",
+        side_effect=lambda *_args: engine.scheduler.register_input_stream.assert_not_called(),
+    ) as add_request:
+        engine.add_request(request, request_wave=4)
+
+    add_request.assert_called_once_with(request, 4)
+    engine.scheduler.register_input_stream.assert_called_once_with("valid", stream)
 
 
 def test_release_reaches_native_data_plane_runner(mocker):
@@ -193,6 +254,41 @@ def test_preprocess_add_request_preserves_omni_fields():
     assert current_wave == 3
     assert result.external_req_id == "external"
     assert result.additional_information == {"conditioning": "payload"}
+    # No sampling_params and no typed field: the hidden-states opt-in stays off.
+    assert result.return_hidden_states is False
+
+
+@pytest.mark.parametrize(
+    ("typed", "extra_args", "expected"),
+    [
+        # Frontends that build a plain EngineCoreRequest never set the typed
+        # field; the SamplingParams.extra_args opt-in must still be lifted.
+        (False, {"return_hidden_states": True}, True),
+        ("missing", {"return_hidden_states": True}, True),
+        # A typed opt-in does not depend on the extra_args flag.
+        (True, None, True),
+        (True, {}, True),
+        (False, None, False),
+        (False, {"unrelated": 1}, False),
+        ("missing", {}, False),
+    ],
+)
+def test_preprocess_add_request_lifts_hidden_states_opt_in(mocker, typed, extra_args, expected):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    request = SimpleNamespace(
+        request_id="internal",
+        additional_information=None,
+        sampling_params=SimpleNamespace(extra_args=extra_args),
+    )
+    if typed != "missing":
+        request.return_hidden_states = typed
+    scheduler_request = SimpleNamespace()
+    mocker.patch.object(EngineCoreProc, "preprocess_add_request", return_value=(scheduler_request, 0))
+
+    result, _ = engine.preprocess_add_request(request)
+
+    assert result is scheduler_request
+    assert result.return_hidden_states is expected
 
 
 def test_first_audio_binding_preserves_talker_marker():

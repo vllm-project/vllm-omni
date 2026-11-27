@@ -23,6 +23,13 @@ control on device. Code2Wav reuses mainline Whole-Euler Flow graphs and shared
 prompt state. The previous experimental block compilation, tiled attention,
 channels-last and merged-CFM implementations are removed.
 
+## Ascend two-card profile
+
+The [Ascend deployment recipe](gh-file:recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md)
+keeps Thinker 40960, Talker 4096, two Talker and two Code2Wav replicas, and
+five-step CFM. Eligible graphs qualify against reference results before
+replay. Failed qualification keeps the reference path.
+
 ## Turn prefix-cache memory
 
 The persistent stage-output cache is a pageable CPU mirror, not a second
@@ -58,11 +65,13 @@ The previous process matmul policy is restored afterwards. cuDNN's TF32 policy
 is independent. HiFT stays IEEE FP32. TF32 changes rounding.
 The CUDA duplex profile uses MRv2 on all three stages.
 
-The shared Code2Wav backend defaults to the fused CFM body on both CUDA and
-NPU, subject to architecture and attention-cache eligibility. CUDA accepts
-matching FP32 or FP16 estimator/cache types; NPU retains FP32 eligibility. CUDA
-FP32 fusion requires TF32 to be allowed. With `token2wav_float16: true` or
-`cfm_float16: true`, CUDA fusion is independent of TF32, as is NPU fusion. Set
+The shared Code2Wav backend defaults to the fused CFM body on CUDA and NPU,
+and on ROCm when FP16 CFM or full-flow precision is selected, subject to
+architecture and attention-cache eligibility. CUDA accepts matching FP32 or
+FP16 estimator/cache types; ROCm accepts matching FP16 types; NPU retains FP32
+eligibility. CUDA FP32 fusion requires TF32 to be allowed. With
+`token2wav_float16: true` or `cfm_float16: true`, CUDA and ROCm fusion is
+independent of TF32, as is NPU fusion. Set
 `cfm_fused_body: false` in the stage connector extra to restore the original
 body. On CUDA, disabling `token2wav_allow_tf32` or setting
 `MINICPMO_CODE2WAV_TF32=off` disables the default fusion choice only for FP32; an explicit
@@ -78,13 +87,15 @@ Check the startup precapture budget warning when tuning `cfm_max_graphs` for
 memory-constrained deployments.
 
 CFM graph execution defaults to the fused DiT body on CUDA (when TF32 is
-allowed or FP16 CFM is selected) and on NPU. NVIDIA SM80+ uses the existing
-tiled attention kernel for both FP32 and FP16 Q/K/V, including the non-pooled
-CFM arena. FP32 uses TF32 dots; FP16 uses FP16 dots with FP32 accumulation.
-Older CUDA devices use the fused body's SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
+allowed or FP16 CFM is selected), on ROCm when FP16 is selected, and on NPU.
+NVIDIA SM80+ uses the existing tiled attention kernel for both FP32 and FP16
+Q/K/V, including the non-pooled CFM arena. FP32 uses TF32 dots; FP16 uses FP16
+dots with FP32 accumulation. Older CUDA devices and ROCm use the fused body's
+SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
 AddLayerNorm, independent of TF32. Unsupported DiT layouts and cache types
 retain the original body. CUDA supports matching FP32 or FP16 estimator/cache
-types; NPU supports FP32. Other platforms retain their existing default.
+types; ROCm supports matching FP16 types; NPU supports FP32. Other platforms
+retain their existing default.
 Set `cfm_fused_body: false` in connector `extra` to restore the original body.
 On CUDA, disabling TF32 with `token2wav_allow_tf32: false` or
 `MINICPMO_CODE2WAV_TF32=off` disables the default fusion choice only for FP32; an explicit
@@ -94,10 +105,10 @@ floating-point rounding and does not promise identical waveforms.
 
 ## Optional CFM precision and speaker replay
 
-`cfm_float16: true` in connector `extra` opts CUDA Code2Wav into FP16 for the
-CFM estimator, its random-noise table and attention caches. The flow encoder,
-speaker extraction and HiFT retain their existing precision. This differs
-from `token2wav_float16`, which affects the whole flow. FP16 CFM changes
+`cfm_float16: true` in connector `extra` opts CUDA or ROCm Code2Wav into FP16
+for the CFM estimator, its random-noise table and attention caches. The flow
+encoder, speaker extraction and HiFT retain their existing precision. This
+differs from `token2wav_float16`, which affects the whole flow. FP16 CFM changes
 rounding and requires speech-quality and service validation; it is off by
 default and does not reduce the number of flow steps.
 
@@ -156,13 +167,13 @@ stages:
 vLLM 0.34 resolves a draft config with `architectures: ["DSparkDraftModel"]`
 and `model_type: qwen3` to `Qwen3DSparkModel`. Drafters that read Thinker
 layers use the Thinker MRv2 auxiliary-hidden-state interface.
-Validation covers CUDA turn sessions with greedy text and speech output.
-Duplex sessions keep their own sampler and are not covered. NPU and ROCm use
-MRv2 but do not inherit this CUDA drafter configuration; XPU and MUSA retain
-the deferred V1 default and cannot run it with vLLM 0.34.
+CUDA turn sessions support DSpark with greedy text and speech output. Ascend
+MRv2 also supports DSpark for ordinary chat, including chat served by a duplex
+deployment. Native duplex requests keep their own sampler and skip drafts.
+ROCm uses MRv2. XPU and MUSA retain the deferred V1 default.
 Greedy text can differ from decoding without drafts at near-tied tokens.
 
-The default single-card and two-card Ascend profiles use synchronous MRv2
+The default single-card and two-card Ascend YAMLs use synchronous MRv2
 with seven Ngram draft tokens for greedy Thinker requests. The scheduler
 drafts from committed token history and the NPU verifies the drafts. When
 a Thinker decode batch includes non-greedy sampling, MRv2 scheduler Ngram
@@ -180,9 +191,12 @@ To disable Thinker Ngram, set `speculative_config: null` for stage 0 under
 `platforms.npu.stages` in a deploy overlay. Use `async_scheduling: true` there
 to restore asynchronous scheduling for ordinary decoding.
 
-The Ascend `minicpmo_4_5_npu_2card.yaml` profile colocates Thinker and
-Talker and gives Code2Wav its own NPU. The `minicpmo_4_5_2gpu.yaml`
-profile gives Thinker its own device and colocates Talker and Code2Wav.
+The Ascend `minicpmo_4_5_2gpu.yaml` profile puts Thinker on the second
+visible NPU and one replica of Talker and Code2Wav on each NPU. It inherits
+the common stage settings from `minicpmo_4_5.yaml`. The
+[Ascend deployment recipe](gh-file:recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md)
+uses the original checkpoint and Ngram by default. It documents optional
+Thinker DSpark.
 
 ## Thinker prefix cache with drafts
 
@@ -298,9 +312,11 @@ or reference normalization policy.
 
 `minicpmo_4_5.yaml` selects MRv2 for the Thinker, Talker and Code2Wav on CUDA,
 ROCm and NPU. ROCm keeps the shared duplex topology, async chunks, devices and
-connector contract; it does not inherit the CUDA-only attention, speculation,
-graph or fused-kernel settings. This runner selection alone does not establish
-ROCm performance or quality qualification. The Thinker has no async producer,
+connector contract; it does not inherit CUDA-only attention, speculation or
+graph tuning. An explicit ROCm FP16 Code2Wav configuration selects the shared
+fused CFM body with its SDPA fallback, not NVIDIA tiled attention. This runner
+selection and dispatch coverage alone do not establish ROCm performance or
+quality qualification. The Thinker has no async producer,
 so the orchestrator hands each finished segment to `llm2tts`.
 The Talker reuses the streaming prompt recipe (full attention extends its KV
 prefix until capacity; sliding recompute rebuilds the previous condition,
