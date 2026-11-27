@@ -50,6 +50,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaMLP
+from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON
 from vllm.v1.core.sched.output import GrammarOutput
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -962,6 +964,9 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             hidden_states = self._maybe_apply_audio_feedback(hidden_states, input_ids)
 
         audio_mask = self.audio_token_mask(input_ids) if input_ids is not None else None
+        # Resolve uniform audio routing once instead of indexing in every layer.
+        if audio_mask is not None and audio_mask.all().item():
+            audio_mask = None
 
         # Fused-residual loop: layers return (hidden, residual)
         # where ``residual`` carries everything up to the post-MLP add.
@@ -1439,42 +1444,53 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         #   - emit ``audio_stream_eos_id`` (1025) only during ramp-down.
         bos_pre = int(self.config.audio_stream_bos_id)
         eos_pre = int(self.config.audio_stream_eos_id)
-        for local_i, batch_i in enumerate(audio_row_indices):
-            state_pre = self._audio_state.get(self._audio_state_key_for_row(int(batch_i), request_ids))
-            num_delay_pre = int(state_pre.get("num_delay", 0)) if state_pre else 0
-            num_rem_pre = state_pre.get("num_remaining_delays") if state_pre else None
-            if num_rem_pre is not None:
-                # Ramp-down: mask all but EOS for the EOS-locked codebooks; the
-                # remaining ones still emit content. Locked range: codebooks
-                # [0 : num_codebooks - num_rem_pre].
-                lock_until = int(self.config.num_codebooks) - int(num_rem_pre)
-                for q in range(int(self.config.num_codebooks)):
-                    row = cb_logits[local_i, q]
-                    if q < lock_until:
-                        mask = torch.full_like(row, float("-inf"))
-                        mask[eos_pre] = row[eos_pre]
-                        cb_logits[local_i, q] = mask
-                    else:
-                        # Disallow stream specials during ramp-down content frames
-                        cb_logits[local_i, q, bos_pre] = float("-inf")
-                        cb_logits[local_i, q, eos_pre] = float("-inf")
-            else:
-                # Leading delay phase. Codebook k starts emitting real content
-                # at step k (delay = k). Steps with k > num_delay_pre are still
-                # in BOS phase — force 1024. Steps with k <= num_delay_pre are
-                # content — disallow 1024 (BOS) and 1025 (EOS).
-                for q in range(int(self.config.num_codebooks)):
-                    row = cb_logits[local_i, q]
-                    if q > num_delay_pre:
-                        mask = torch.full_like(row, float("-inf"))
-                        mask[bos_pre] = row[bos_pre]
-                        cb_logits[local_i, q] = mask
-                    else:
-                        cb_logits[local_i, q, bos_pre] = float("-inf")
-                        # Allow EOS at codebook 0 only (it gates ramp-down).
-                        # Disallow at all other content codebooks.
-                        if q != 0:
+        if current_platform.is_cuda() and HAS_TRITON and cb_logits.is_cuda:
+            from .delay_pattern_mask import mask_audio_logits_
+
+            delay_states = []
+            for batch_i in audio_row_indices:
+                req_state = self._audio_state.get(self._audio_state_key_for_row(int(batch_i), request_ids))
+                delay = int(req_state.get("num_delay", 0)) if req_state else 0
+                remaining = req_state.get("num_remaining_delays") if req_state else None
+                delay_states.append((delay, -1 if remaining is None else int(remaining)))
+            mask_audio_logits_(cb_logits, delay_states, bos_pre, eos_pre)
+        else:
+            for local_i, batch_i in enumerate(audio_row_indices):
+                state_pre = self._audio_state.get(self._audio_state_key_for_row(int(batch_i), request_ids))
+                num_delay_pre = int(state_pre.get("num_delay", 0)) if state_pre else 0
+                num_rem_pre = state_pre.get("num_remaining_delays") if state_pre else None
+                if num_rem_pre is not None:
+                    # Ramp-down: mask all but EOS for the EOS-locked codebooks; the
+                    # remaining ones still emit content. Locked range: codebooks
+                    # [0 : num_codebooks - num_rem_pre].
+                    lock_until = int(self.config.num_codebooks) - int(num_rem_pre)
+                    for q in range(int(self.config.num_codebooks)):
+                        row = cb_logits[local_i, q]
+                        if q < lock_until:
+                            mask = torch.full_like(row, float("-inf"))
+                            mask[eos_pre] = row[eos_pre]
+                            cb_logits[local_i, q] = mask
+                        else:
+                            # Disallow stream specials during ramp-down content frames
+                            cb_logits[local_i, q, bos_pre] = float("-inf")
                             cb_logits[local_i, q, eos_pre] = float("-inf")
+                else:
+                    # Leading delay phase. Codebook k starts emitting real content
+                    # at step k (delay = k). Steps with k > num_delay_pre are still
+                    # in BOS phase — force 1024. Steps with k <= num_delay_pre are
+                    # content — disallow 1024 (BOS) and 1025 (EOS).
+                    for q in range(int(self.config.num_codebooks)):
+                        row = cb_logits[local_i, q]
+                        if q > num_delay_pre:
+                            mask = torch.full_like(row, float("-inf"))
+                            mask[bos_pre] = row[bos_pre]
+                            cb_logits[local_i, q] = mask
+                        else:
+                            cb_logits[local_i, q, bos_pre] = float("-inf")
+                            # Allow EOS at codebook 0 only (it gates ramp-down).
+                            # Disallow at all other content codebooks.
+                            if q != 0:
+                                cb_logits[local_i, q, eos_pre] = float("-inf")
 
         # Sample per-codebook, following the upstream
         # ``HiggsAudioModel._sample_audio_tokens`` pipeline byte-for-byte.

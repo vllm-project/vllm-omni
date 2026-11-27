@@ -53,17 +53,17 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["diffusion_kv_cache_dtype"] == "fp8_e4m3"
 
 
-def test_default_stage_config_preserves_ulysses_a2a_permute() -> None:
+def test_default_stage_config_preserves_ulysses_a2a_backend() -> None:
     stage_cfg = StageConfigFactory.create_default_diffusion(
         {
             "ulysses_degree": 4,
-            "ulysses_a2a_permute": True,
+            "ulysses_a2a_backend": "copy_engine",
         }
     )[0]
 
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config["ulysses_degree"] == 4
-    assert parallel_config["ulysses_a2a_permute"] is True
+    assert parallel_config["ulysses_a2a_backend"] == "copy_engine"
 
 
 def test_default_stage_config_preserves_model_extras():
@@ -448,18 +448,19 @@ def test_serve_cli_accepts_hsdp_data_parallel():
     assert stage_cfg["engine_args"].get("request_batch_max_wait_ms") is None
 
 
-@pytest.mark.parametrize("enabled", [True, False])
-def test_serve_cli_preserves_ulysses_a2a_permute(enabled: bool) -> None:
+@pytest.mark.parametrize("backend", ["auto", "nccl", "copy_engine"])
+def test_serve_cli_preserves_ulysses_a2a_backend(backend: str) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     OmniServeCommand().subparser_init(subparsers)
-    flag = "--ulysses-a2a-permute" if enabled else "--no-ulysses-a2a-permute"
-    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-degree", "4", flag])
+    args = parser.parse_args(
+        ["serve", "fake-model", "--omni", "--ulysses-degree", "4", "--ulysses-a2a-backend", backend]
+    )
 
     stage_cfg = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config["ulysses_degree"] == 4
-    assert parallel_config["ulysses_a2a_permute"] is enabled
+    assert parallel_config["ulysses_a2a_backend"] == backend
 
 
 def test_serve_cli_accepts_text_encoder_tp_size():

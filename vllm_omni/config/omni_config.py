@@ -302,7 +302,8 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     ring_degree: int
     allgather_degree: int
     ulysses_mode: str
-    ulysses_a2a_permute: bool
+    ulysses_overlap_chunks: int
+    ulysses_a2a_backend: str
     cfg_parallel_size: int
     vae_patch_parallel_size: int
     vae_parallel_mode: str
@@ -685,6 +686,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     tokenizer_subdir: str | None = None
     requires_full_payload_input: bool = False
     scheduling_metadata_adapter: str | None = None
+    scheduler_window_policy: str | None = None
     # Upstream ModelConfig inputs that users pass as global CLI flags.
     served_model_name: str | list[str] | None = None
     allowed_local_media_path: str | None = None
@@ -904,7 +906,8 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ring_degree: int = Field(default=1, ge=1)
     allgather_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
-    ulysses_a2a_permute: bool = False
+    ulysses_overlap_chunks: int = Field(default=0, ge=0)
+    ulysses_a2a_backend: str = "auto"
     cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
     text_encoder_tp_size: int = Field(default=1, ge=1)
@@ -926,6 +929,10 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             )
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
+        from vllm_omni.diffusion.data import ULYSSES_A2A_BACKENDS
+
+        if self.ulysses_a2a_backend not in ULYSSES_A2A_BACKENDS:
+            raise ValueError(f"ulysses_a2a_backend must be one of {ULYSSES_A2A_BACKENDS}")
         if self.vae_parallel_mode not in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}:
             raise ValueError(
                 "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
@@ -1668,6 +1675,7 @@ _DIFFUSION_ENGINE_ADAPTER_METADATA_FIELDS = frozenset(
         "requires_full_payload_input",
         "sampling_extra_args_keys",
         "scheduling_metadata_adapter",
+        "scheduler_window_policy",
         "session_mode",
     }
 )
@@ -2326,6 +2334,7 @@ def _build_model_config(
     kwargs["requires_full_payload_input"] = topology.requires_full_payload_input
     kwargs["model"] = _first_defined(kwargs.get("model"), model)
     kwargs["scheduling_metadata_adapter"] = topology.scheduling_metadata_adapter
+    kwargs["scheduler_window_policy"] = topology.scheduler_window_policy
     if "model_arch" not in kwargs:
         kwargs["model_arch"] = topology.model_arch or pipeline.model_arch or None
     if "trust_remote_code" not in kwargs and deploy.trust_remote_code is not None:

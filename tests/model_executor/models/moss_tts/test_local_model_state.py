@@ -264,7 +264,7 @@ def test_local_seeded_mtp_keeps_per_row_generators_in_one_batch():
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
-def test_slot_mtp_graph_padding_reorder_and_owned_output():
+def test_slot_mtp_graph_padding_reorder_and_owned_output(request):
     if not DEVICE_MODULE.is_available():
         pytest.skip("CUDA required")
     states = [_state(cls, torch.device(DEVICE_TYPE)) for cls in (OmniModelState, MossLocalModelState)]
@@ -301,6 +301,15 @@ def test_slot_mtp_graph_padding_reorder_and_owned_output():
 
     candidate._mtp_state._mtp_runner = replay
     candidate._mtp_state._is_mtp_graph_runner = lambda: True
+
+    def release_graph_runner():
+        DEVICE_MODULE.synchronize()
+        # Break the owner/MTPState cycle's reference to the graph closure so
+        # its destructor cannot run during a later test's CUDA graph capture.
+        del candidate._mtp_state._mtp_runner
+        del candidate._mtp_state._is_mtp_graph_runner
+
+    request.addfinalizer(release_graph_runner)
     from vllm.config import CUDAGraphMode
 
     def dispatcher(bsz):

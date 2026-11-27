@@ -12,6 +12,7 @@ and applies the session-owned policy.
 
 from __future__ import annotations
 
+import asyncio
 import time as _time
 from collections.abc import Callable, Coroutine
 from contextlib import nullcontext
@@ -27,6 +28,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.core.sched.duplex_stage_work import stage_work_rows
+from vllm_omni.core.sched.window_policy import duplex_window_replay_enabled
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreRequest
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
@@ -111,6 +113,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         self.plugin = plugin
         self.duplex_session_config = duplex_session_config
         self.replica_placement: DuplexReplicaPlacement | None = None
+        self._window_replicas: dict[str, tuple[int, Any]] = {}
+        self._window_releases: dict[str, asyncio.Task] = {}
         admission_limit = None
         if duplex_session_config.replica_policy == "least_sessions":
             stage_replica_counts = [pool.num_replicas for pool in self.stage_pools]
@@ -194,9 +198,23 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         Shared by the in-process engine-death path and the membership-detach path so
         both reach the same placement/eviction/session-failure sequence.
         """
+        owners = getattr(self, "_window_replicas", {})
+        window_sessions = [sid for sid, (index, _) in owners.items() if stage_id == 0 and index == replica_id]
+        for sid in window_sessions:
+            owners.pop(sid)
+            release = self._window_releases.pop(sid, None)
+            if release is not None:
+                # A timed-out utility call still belongs to the retired client.
+                if not release.cancel() and not release.cancelled():
+                    release.exception()
         if self.replica_placement is None:
+            if window_sessions:
+                pool = self.stage_pools[stage_id]
+                if 0 <= replica_id < pool.num_replicas and pool.clients[replica_id] is not None:
+                    pool.evict_replica(replica_id)
+                await self.session_manager.fail_sessions(window_sessions, reason=reason)
             return
-        affected = self.replica_placement.mark_unavailable(stage_id, replica_id)
+        affected = set(self.replica_placement.mark_unavailable(stage_id, replica_id)) | set(window_sessions)
         pool = self.stage_pools[stage_id]
         if 0 <= replica_id < pool.num_replicas and pool.clients[replica_id] is not None:
             # Prevent dispatch before any cleanup await. Preserve request bindings
@@ -294,6 +312,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         prompt = getattr(req_state, "prompt", None)
         info = prompt.get("additional_information") if isinstance(prompt, dict) else None
         item_id = info.get("realtime_item_id") if isinstance(info, dict) else None
+        duplex_bridge = req_state.streaming.bridge_states.get("duplex", {})
+        model_turn_id = duplex_bridge.get("model_turn_id") if isinstance(duplex_bridge, dict) else None
         context = DuplexOutputContext(
             identity=DuplexRequestIdentity(
                 session_id=req_state.session_id,
@@ -304,6 +324,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             segment_token_ids=tuple(segment.token_ids),
             segment_output_metadata=segment.output_metadata,
             perf_chunks=self._take_perf_chunks(req_state, stage_id),
+            model_turn_id=model_turn_id if stage_id == 0 and isinstance(model_turn_id, int) else None,
         )
         return runner.on_stage_output(
             stage_id,
@@ -546,12 +567,12 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             outputs = await super()._cleanup_request_ids(
                 cleanup_ids, abort=abort, release_owners=release_owners, trace_error=trace_error
             )
+            if closing_session_ids:
+                await self.session_manager.finalize_closed_sessions(closing_session_ids)
         except BaseException:
             if closing_session_ids:
                 self.session_manager.defer_request_cleanups(closing_session_ids)
             raise
-        if closing_session_ids:
-            self.session_manager.finalize_closed_sessions(closing_session_ids)
         for request_id in cleanup_ids:
             self.session_manager.unregister_request(request_id)
         return outputs
@@ -593,6 +614,30 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         except BaseException:
             self.replica_placement.release(session_id)
             raise
+
+    async def release_session_window(self, session_id: str) -> None:
+        owners = getattr(self, "_window_replicas", {})
+        owner = owners.get(session_id)
+        if owner is None:
+            return
+        replica, client = owner
+        pool = self.stage_pools[0]
+        if replica < len(pool.clients) and pool.clients[replica] is client:
+            release = self._window_releases.get(session_id)
+            if release is None:
+                release = asyncio.create_task(client.call_utility_async("omni_release_session_window", session_id))
+                self._window_releases[session_id] = release
+            try:
+                done, _ = await asyncio.wait((release,), timeout=pool.RELEASE_RPC_TIMEOUT_S)
+                if owners.get(session_id) is owner:
+                    if not done:
+                        raise TimeoutError(f"Timed out releasing the Stage-0 window for {session_id}")
+                    release.result()
+            finally:
+                if release.done() and self._window_releases.get(session_id) is release:
+                    self._window_releases.pop(session_id)
+        if owners.get(session_id) is owner:
+            owners.pop(session_id)
 
     def release_session(self, session_id: str) -> None:
         if self.replica_placement is not None:
@@ -778,8 +823,32 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             if not isinstance(request_state, DuplexOrchestratorRequestState):
                 raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
             pinned_replica_id = self._session_route(context.stage_id, request_state)
+            pool = self.stage_pools[context.stage_id]
+            model_config = getattr(getattr(pool, "stage_vllm_config", None), "model_config", None)
+            keeps_window = (
+                context.stage_id == 0
+                and submission.resumable
+                and isinstance(getattr(model_config, "scheduler_window_policy", None), str)
+                and duplex_window_replay_enabled(submission.prompt.get("model_intermediate_buffer"))
+            )
+            if keeps_window:
+                owner = self._window_replicas.get(context.session_id)
+                if owner is not None:
+                    pinned_replica_id, client = owner
+                    if pool.clients[pinned_replica_id] is not client or not pool.is_replica_available(
+                        pinned_replica_id
+                    ):
+                        raise StageUnavailableError(f"duplex window owner for {context.session_id} is unavailable")
+                else:
+                    if pinned_replica_id is None:
+                        pinned_replica_id = await pool.pick(context.request_id)
+                    client = pool.clients[pinned_replica_id]
+                    # Independently managed workers may outlive a detached client.
+                    # Only a process this deployment owns can hold a durable lease.
+                    if getattr(getattr(client, "resources", None), "engine_manager", None) is not None:
+                        self._window_replicas[context.session_id] = (pinned_replica_id, client)
             if pinned_replica_id is not None:
-                self.stage_pools[context.stage_id].bind_request_to_replica(context.request_id, pinned_replica_id)
+                pool.bind_request_to_replica(context.request_id, pinned_replica_id)
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
             request_state.streaming.enabled = submission.resumable
             if submission.resumable:
@@ -790,6 +859,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                     model_config=self.stage_pools[context.stage_id].stage_vllm_config.model_config,
                     resumable=True,
                 )
+                if keeps_window and isinstance(request.model_intermediate_buffer, dict):
+                    duplex = request.model_intermediate_buffer.get("duplex")
+                    if isinstance(duplex, dict):
+                        duplex["session_window_owned"] = context.session_id in self._window_replicas
                 if submission.input_capacity is not None:
                     self._input_capacity_validator(submission.input_capacity)(
                         length_from_prompt_token_ids_or_embeds(request.prompt_token_ids, request.prompt_embeds)

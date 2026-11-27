@@ -120,7 +120,7 @@ pytestmark = [
 
 
 @pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"}, num_cards=2)
 def test_glm_image_autoround_w4a16_generates_image(offline_client: OfflineOmniClient):
     """Load the W4A16 quantized GLM-Image model and verify it produces a valid image."""
     gc.collect()
@@ -185,7 +185,7 @@ def test_glm_image_autoround_w4a16_generates_image(offline_client: OfflineOmniCl
 
 
 @pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"}, num_cards=2)
 def test_glm_image_autoround_w4a16_image_to_image(offline_client: OfflineOmniClient):
     """Load the W4A16 quantized GLM-Image and verify image-to-image generation works."""
     ref_image_arr = generate_synthetic_image(WIDTH, HEIGHT)["np_array"]

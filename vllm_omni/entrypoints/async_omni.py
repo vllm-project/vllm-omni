@@ -934,6 +934,13 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         await self._settle_pending_submits(internal_ids)
         await self._abort(internal_ids, timeout=timeout)
 
+    async def append_text(self, request_id: str, token_ids: list[int], *, final: bool = False) -> None:
+        """Append body IDs to exactly one submitted external request."""
+        internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id == request_id]
+        if len(internal_ids) != 1:
+            raise ValueError(f"Text input requires exactly one active request for {request_id!r}")
+        await self.engine.append_text_async(internal_ids[0], token_ids, final=final)
+
     async def update_streaming_playback(self, request_id: str, position_seconds: float) -> None:
         """Forward external-session playback progress to the diffusion engine."""
         self.validate_streaming_playback_request()
@@ -1810,13 +1817,20 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         await self._weight_transfer_rpc("init_weight_transfer_engine", (init_info,))
         logger.info("[%s] Weight transfer engine initialized", self._name)
 
-    async def start_weight_update(self) -> None:
+    async def start_weight_update(self, update_id: str | None = None) -> None:
         """Start a new weight update session across configured stages.
 
         Each worker delegates preparation to its configured WTE backend,
-        which owns whether the update uses layerwise reload.
+        which owns whether the update uses layerwise reload. When ``update_id``
+        is supplied, workers tag the active session so an interrupted start can
+        be aborted only by the matching caller.
         """
-        await self._weight_transfer_rpc("start_weight_update")
+        if update_id is None:
+            await self._weight_transfer_rpc("start_weight_update")
+        else:
+            if not isinstance(update_id, str) or not update_id.strip():
+                raise ValueError("update_id must be a non-empty string")
+            await self._weight_transfer_rpc("start_weight_update_with_id", (update_id,))
         logger.info("[%s] Weight update session started", self._name)
 
     async def update_weights(self, update_info: dict) -> None:
