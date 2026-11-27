@@ -1656,6 +1656,18 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
+        if self.diffusion_attention_schedule is not None:
+            configs = {"baseline": self.diffusion_attention_config}
+            configs.update(
+                (f"profile {name!r}", profile) for name, profile in self.diffusion_attention_schedule.profiles.items()
+            )
+            for source, config in configs.items():
+                for role, spec in (("default", config.default), *config.per_role.items()):
+                    if isinstance(spec, BlockSparseAttentionSpec):
+                        raise ValueError(
+                            f"diffusion_attention_schedule does not support block_sparse in {source} ({role}); "
+                            "use block_sparse with fixed roles or remove it from the scheduled configuration."
+                        )
         validate_kv_cache_dtype_vs_attention_specs(
             self.diffusion_kv_cache_dtype, self.diffusion_attention_config, self.diffusion_attention_schedule
         )

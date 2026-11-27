@@ -327,6 +327,25 @@ class TestAttentionScheduleConfig:
         with pytest.raises((TypeError, ValueError)):
             OmniDiffusionConfig(diffusion_attention_schedule=raw)
 
+    @pytest.mark.parametrize(
+        ("baseline", "profile", "source"),
+        [
+            (
+                {"per_role": {"cosmos3.gen": {"name": "block_sparse"}}},
+                {"default": "TORCH_SDPA"},
+                "baseline (cosmos3.gen)",
+            ),
+            ({"default": "TORCH_SDPA"}, {"default": {"name": "block_sparse"}}, "profile 'candidate' (default)"),
+        ],
+    )
+    def test_schedule_rejects_block_sparse(self, baseline, profile, source):
+        with pytest.raises(ValueError, match="diffusion_attention_schedule does not support block_sparse") as exc:
+            OmniDiffusionConfig(
+                diffusion_attention_config=baseline,
+                diffusion_attention_schedule={"profiles": {"candidate": profile}},
+            )
+        assert source in str(exc.value)
+
     def test_unused_profiles_still_validate_backend_parameters(self):
         with pytest.raises(ValueError, match="skip_softmax"):
             OmniDiffusionConfig(
