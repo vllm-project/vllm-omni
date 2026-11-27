@@ -16,8 +16,10 @@ Rules under test (see docs section 9.5 of the incident analysis):
 2. ready chunks larger than the full step budget fail their request through
    the standard finish path and queue an explicit ERROR output, which a
    zero-token engine step must still emit exactly once;
-3. non-chunk inputs (sender-only adapter / plain prompts) keep their previous
-   behavior on both paths.
+3. full-payload stage inputs are also atomic because they carry one structured
+   model input rather than an independently decodable token stream;
+4. other non-chunk inputs (sender-only adapter / plain prompts) keep their
+   previous behavior on both paths.
 """
 
 from __future__ import annotations
@@ -781,6 +783,56 @@ class TestNonChunkBehaviorUnchanged:
         output = sched.schedule()
 
         assert output.num_scheduled_tokens == {}
+
+
+def test_full_payload_code2wav_prompts_are_not_split_to_fill_batch_budget():
+    """A codebook-major prompt must not be reshaped from arbitrary slices."""
+    budget = 65_536
+    prompt_tokens = 34_144
+    sched = _make_scheduler(
+        receive_path="native",
+        budget=budget,
+        enable_chunked_prefill=False,
+        receives_chunks=False,
+    )
+    sched.input_coordinator = OmniSchedulingCoordinator(stage_id=2, async_chunk=False)
+
+    first = _make_request("code2wav-first", prompt_tokens)
+    second = _make_request("code2wav-second", prompt_tokens)
+    for request in (first, second):
+        sched.requests[request.request_id] = request
+        sched.waiting.add_request(request)
+        sched.input_coordinator._full_payload_input_received.add(request.request_id)
+        sched.input_coordinator.finished_requests.add(request.request_id)
+
+    output = sched.schedule()
+
+    assert output.num_scheduled_tokens == {first.request_id: prompt_tokens}
+    assert second in sched.waiting
+    assert second.num_computed_tokens == 0
+
+    first.num_computed_tokens = prompt_tokens
+    first.num_in_flight_tokens = 0
+    next_output = sched.schedule()
+
+    assert next_output.num_scheduled_tokens == {second.request_id: prompt_tokens}
+
+
+def test_stage_zero_bookkeeping_coordinator_does_not_make_plain_prompt_atomic():
+    sched = _make_scheduler(
+        receive_path="native",
+        budget=128,
+        enable_chunked_prefill=True,
+        receives_chunks=False,
+    )
+    sched.input_coordinator = OmniSchedulingCoordinator(stage_id=0, async_chunk=True)
+    request = _make_request("stage-zero", 400)
+    sched.requests[request.request_id] = request
+    sched.waiting.add_request(request)
+
+    output = sched.schedule()
+
+    assert output.num_scheduled_tokens == {request.request_id: 128}
 
 
 @pytest.mark.parametrize("marker_only", [False, True])
