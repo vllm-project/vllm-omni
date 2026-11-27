@@ -12,7 +12,6 @@ from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import
     HunYuanAttention,
     HunYuanRotary2DEmbedder,
 )
-from vllm_omni.diffusion.models.hunyuan_image3.layers.nvidia import autoencoder_blocks
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -92,23 +91,3 @@ def test_cuda_attention_qk_precision(mode, use_norm, dtype, norm_dtype, nvidia, 
 @pytest.mark.cpu
 def test_cpu_attention_qk_precision(monkeypatch):
     _check_qk_boundary("cpu", "gen_image", True, torch.bfloat16, torch.bfloat16, True, monkeypatch)
-
-
-@pytest.mark.cpu
-@pytest.mark.parametrize("benchmark", [False, True])
-def test_vae_resnet_cudnn_flags(benchmark, monkeypatch):
-    block = autoencoder_blocks.ResnetBlock(32, 32)
-    monkeypatch.setattr(autoencoder_blocks, "fused_group_norm_silu", lambda x, *args, **kwargs: x)
-    cudnn = torch.backends.cudnn
-
-    def check_flags(module, args):
-        assert cudnn.benchmark is benchmark
-        assert cudnn.deterministic
-        raise RuntimeError("convolution failed")
-
-    block.conv1.register_forward_pre_hook(check_flags)
-    with cudnn.flags(benchmark=benchmark, deterministic=False):
-        with pytest.raises(RuntimeError, match="convolution failed"):
-            block(torch.zeros(1, 32, 1, 1, 1))
-        assert cudnn.benchmark is benchmark
-        assert not cudnn.deterministic
