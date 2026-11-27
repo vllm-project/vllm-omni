@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Legacy output loop polls DiT load independently of diffusion output.
+"""Legacy output loop keeps collecting DiT load independently of diffusion output.
 
-Review ask (PR #9634): with ``VLLM_OMNI_EVENT_DRIVEN_ORCH=0``, the throttled
-DTPS load update must run before the output-only early exits, so a replica
-that supplies a load response is still collected when
+Review ask (PR #9634): with ``VLLM_OMNI_EVENT_DRIVEN_ORCH=0``, a replica
+that supplies a load response must still be collected when
 ``poll_diffusion_output()`` returns ``None`` (no ready output, metrics-only
 ticks) and the AR scheduler never keeps scheduling on stale load during a
-long DiT request.
+long DiT request. The load update now runs in the background
+``_dit_load_poll_loop`` instead of inline before the drain, which keeps the
+guarantee while also satisfying the later review round: load feedback never
+sits on the output-drain path.
 """
 
 from __future__ import annotations
