@@ -16,6 +16,8 @@ For the full list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
+| Chatterbox Turbo / Original | `ResembleAI/chatterbox-turbo`, `ResembleAI/chatterbox` | ✓ (`ref_audio`, no transcript) | ✓ (PCM / WAV + WebSocket) | built-in `default` or uploaded audio | ✓ |
+| Confucius4-TTS | `netease-youdao/Confucius4-TTS` | ✓ (`ref_audio`, required) | — | uploaded audio voice supported; no presets | — |
 | Fish Audio Drama 3 | `fishaudio/drama-3` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker and event tags in `input` | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
@@ -31,6 +33,39 @@ For the full list of supported architectures across all modalities, see
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
+
+## Chatterbox Turbo and Original
+
+Two-stage English speech synthesis at 24 kHz, with a built-in voice or a single
+reference recording. No reference transcript is needed. Install the conditioning
+extra with `uv pip install -e '.[chatterbox]'`.
+
+```bash
+vllm-omni serve ResembleAI/chatterbox-turbo --omni --port 8091
+# Use ResembleAI/chatterbox for Original.
+```
+
+Use the common curl/SDK and PCM streaming clients above with `voice: default`,
+or supply `ref_audio` as a data URL. Both use the shared one-second minimum;
+Turbo repeats a clip of five seconds or less until it is longer, where
+upstream refuses it. Both expose WAV/PCM/MP3/FLAC
+non-streaming responses and PCM/WAV streaming. Original additionally accepts
+`extra_params: {exaggeration: 0.5, cfg_weight: 0.5}`; Turbo rejects those controls.
+
+For browser playback, install `vllm-omni[demo]` and run the shared
+[speech streaming player](../../../apps/tts_streaming_player/README.md):
+
+```bash
+uv run apps/tts_streaming_player/gradio_demo.py --sample-rate 24000
+```
+
+It does not sentence-segment long text; use the shared WebSocket speech
+frontend for long narration. Multilingual is unsupported.
+
+See the [H100 recipe](../../../recipes/ResembleAI/Chatterbox-H100.md) for
+profiles, qualification scope and concurrency limitations.
+
+---
 
 ## Common Quick Start
 
@@ -101,6 +136,63 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for Gepard and IndexTTS-2, and 24 kHz for many others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
+
+---
+
+## Confucius4-TTS
+
+Two-stage multilingual TTS at 22.05 kHz. The native vLLM talker generates
+semantic tokens, Stage 1 recomputes the aligned latents from the finished
+sequence, and the S2A diffusion model and BigVGAN produce the waveform. Every request needs one reference audio clip.
+
+The first connected launch automatically downloads
+`facebook/w2v-bert-2.0`, `funasr/campplus`, and
+`nvidia/bigvgan_v2_22khz_80band_256x` when they are not already cached. For a
+fully offline deployment, use the
+[self-contained download layout](../../offline_inference/text_to_speech/README.md#confucius4-tts)
+and serve that local model directory instead.
+
+### Launch
+
+```bash
+vllm serve netease-youdao/Confucius4-TTS \
+    --omni \
+    --trust-remote-code \
+    --port 8091
+```
+
+The packaged `vllm_omni/deploy/confucius4_tts.yaml` is selected automatically.
+
+### Sending requests
+
+Send a standard OpenAI Speech API request:
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "netease-youdao/Confucius4-TTS",
+        "input": "你好，这是一个语音合成测试。",
+        "ref_audio": "file:///path/to/reference.wav",
+        "response_format": "wav",
+        "extra_params": {"lang": "zh"}
+    }' \
+    --output output.wav
+```
+
+`ref_audio` accepts a local `file://` URI, an HTTP URL, or a
+`data:audio/wav;base64,...` URL.
+Supported language codes are `zh`, `en`, `ja`, `ko`, `de`, `fr`, `es`, `id`,
+`it`, `th`, `pt`, `ru`, `ms`, and `vi`; pass one through `language` or
+`extra_params.lang`. Streaming is not supported; omit `stream` or set it to
+`false`.
+
+The formatted prompt, including the language instruction, is limited to 520
+tokens. The adapter does not normalize or segment long text automatically.
+`max_new_tokens` limits the returned semantic sequence to at most 1518 tokens.
+At about 50 semantic tokens per second, one request yields at most about 30
+seconds of audio; longer text is cut off without an error, and the server logs
+a truncation warning. Split long text into shorter requests.
 
 ---
 
@@ -807,6 +899,12 @@ Three model variants exposed via separate checkpoints:
 | Base | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Voice cloning from a reference audio |
 
 Each variant ships smaller `0.6B` companions where available.
+
+For the three 1.7B variants on a single Ascend 910B3 64GB, see the
+[Ascend 910B3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-TTS-Ascend910B3.md).
+It records the tested vLLM-Omni 0.28.0 commit, image environment, unchanged
+deployment configuration, and verification scope; its measurements do not
+qualify current main.
 
 ### Launch
 

@@ -249,16 +249,23 @@ URL access policy.
 ### MiniMax H3 Samplers
 
 Set `"sampler"` in `extra_params` to select the sampler. Supported values are
-`euler` (default), `res_multistep`, and `heun`. Both request and step execution
-support them, and compatible requests share packed model evaluations, including
-Heun's correction stage. An N-step schedule ending at zero uses `2N - 1` model
-evaluations with Heun. Fixed distilled schedules remain Euler-only. Disable cache
-acceleration, including `quality=high`, when using Heun.
+`euler` (default), `res_multistep`, `heun`, and `dpmpp_2m`. Both request and
+step execution support them, and compatible requests share packed model
+evaluations, including Heun's correction stage. An N-step schedule ending at zero
+uses `2N - 1` model evaluations with Heun. Fixed distilled schedules remain
+Euler-only. Disable cache acceleration, including `quality=high`, when using Heun.
 
 ### MiniMax H3 control and inpainting
 
-MiniMax H3 FL2VA accepts preprocessed control videos when the server is
-started with `--controlnet-model-path /absolute/path/to/control.safetensors`.
+MiniMax H3 accepts preprocessed control videos when the server is started with
+`--controlnet-model-path /absolute/path/to/control.safetensors`. The control
+branch binds to the server's one DiT: an FL2VA server (`--task-type fl2va`)
+takes control on T2VA requests, and a Ref2VA server (`--task-type ref2va`, or
+the FastH3 Omni checkpoint) takes it on Ref2VA requests with references. A
+combined server serves no control.
+A control request may include `input_reference`/`input_references` or other
+reference inputs only when `extra_params.task` is `ref2va`; keyframes,
+latent-mask editing and continuation are rejected with control.
 Use the original MiniMax H3 Fun ControlNet Union checkpoint. The checkpoint
 is loaded at startup; requests cannot select or download weights.
 
@@ -453,10 +460,12 @@ curl -s http://localhost:8091/v1/videos/sync \
   output canvas and shortened to `5 + 17k` frames (1-4 frames keep the first
   frame); the result must fit in `[start, N)`. Audio starts at the same frame
   and is cropped to the remaining timeline.
-- Guided requests need base H3 weights, `quality=lossless`, and the media
-  encoder in the diffusion stage. Cache acceleration, FastH3, LoRA/Turbo,
-  distilled schedules, continuation, latent refine/upscale, latent-mask editing,
-  and `audio_mode=lock_source` are rejected. With first/last frames, the FL2VA
+- Guided requests need `quality=lossless` and the media encoder in the
+  diffusion stage. They run on base H3 weights, on the FastH3 Omni checkpoint
+  (Ref2VA, on its pinned eight-step schedule), and with LoRA adapters active,
+  including Turbo and other few-step adapters on their own schedule. Cache
+  acceleration, FastH3 Preview/V2, continuation, latent refine/upscale, latent-mask
+  editing, and `audio_mode=lock_source` are rejected. With first/last frames, the FL2VA
   keyframes are packed as image guides; with references, references are scaled
   down to the output area.
 

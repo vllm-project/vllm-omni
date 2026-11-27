@@ -18,6 +18,7 @@ For the full list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- |
 | AuK / AuK-Flash | assembled local bundle | ✓ (`ref_audio`) | HTTP audio after full generation | — | — |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | — |
+| Chatterbox Turbo / Original | `ResembleAI/chatterbox-turbo`, `ResembleAI/chatterbox` | ✓ (`ref_audio`, no transcript) | ✓ (PCM / WAV + WebSocket) | built-in `default` or uploaded audio | ✓ |
 | Fish Audio Drama 3 | `fishaudio/drama-3` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker and event tags in `input` | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
@@ -29,6 +30,39 @@ For the full list of supported architectures across all modalities, see
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
 For offline inference of any of these models, see the [offline TTS hub](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md).
+
+## Chatterbox Turbo and Original
+
+Two-stage English speech synthesis at 24 kHz, with a built-in voice or a single
+reference recording. No reference transcript is needed. Install the conditioning
+extra with `uv pip install -e '.[chatterbox]'`.
+
+```bash
+vllm-omni serve ResembleAI/chatterbox-turbo --omni --port 8091
+# Use ResembleAI/chatterbox for Original.
+```
+
+Use the common curl/SDK and PCM streaming clients above with `voice: default`,
+or supply `ref_audio` as a data URL. Both use the shared one-second minimum;
+Turbo repeats a clip of five seconds or less until it is longer, where
+upstream refuses it. Both expose WAV/PCM/MP3/FLAC
+non-streaming responses and PCM/WAV streaming. Original additionally accepts
+`extra_params: {exaggeration: 0.5, cfg_weight: 0.5}`; Turbo rejects those controls.
+
+For browser playback, install `vllm-omni[demo]` and run the shared
+[speech streaming player](https://github.com/vllm-project/vllm-omni/tree/main/apps/tts_streaming_player/README.md):
+
+```bash
+uv run apps/tts_streaming_player/gradio_demo.py --sample-rate 24000
+```
+
+It does not sentence-segment long text; use the shared WebSocket speech
+frontend for long narration. Multilingual is unsupported.
+
+See the [H100 recipe](https://github.com/vllm-project/vllm-omni/tree/main/recipes/ResembleAI/Chatterbox-H100.md) for
+profiles, qualification scope and concurrency limitations.
+
+---
 
 ## Common Quick Start
 
@@ -159,9 +193,11 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 
 Streaming is on by default. On CUDA Hopper GPUs with at least 140 GiB of device memory (H200), serving automatically selects `cosyvoice3_packed_streaming_optimized_standard.yaml` when `nvidia-cuda-mps-control` is available on `PATH`: AR32 / codec32, standard sampling, packed Flow, cached ISTFT, HiFT decode graphs, and local CUDA MPS. No `--hf-overrides` is needed. Other devices and environments without the MPS control tool use `cosyvoice3.yaml` with RAS sampling and AR8 / codec8.
 
-The optimized profile is not a universal hardware configuration. Its packed kernels are Hopper-only; the talker's Model Runner V2 is unsupported on NPU/XPU, and CUDA MPS requires a local NVIDIA GPU and its control tool. Larger batches, 25-frame chunks, and graph allocations also require per-device validation on smaller or slower GPUs. Automatic selection retains the generic profile outside the validated device class; an explicit deploy configuration takes precedence.
+The optimized profile is not a universal hardware configuration. Its packed Flow uses FlashAttention 3 on Hopper and FlashAttention 2 on other CUDA GPUs (set `COSYVOICE3_PACKED_ATTENTION_BACKEND=fa2` or `fa3` to pin one, or `flashinfer` to opt into FlashInfer); the talker's Model Runner V2 is unsupported on NPU/XPU, and CUDA MPS requires a local NVIDIA GPU and its control tool. Larger batches, 25-frame chunks, and graph allocations also require per-device validation on smaller or slower GPUs. Automatic selection retains the generic profile outside the validated device class; an explicit deploy configuration takes precedence.
 
 The H200 default targets streaming throughput at C32/C64. It changes sampling from RAS to standard (temperature 0.7, top-p 0.8, top-k 20, repetition penalty 1.21); output lengths and quality can differ. HiFT captures a recurring exact shape on its third use, which adds latency to that request, and its graph pool needs memory headroom beyond the engine reservations. This profile is not a claim of optimal first-audio latency at low concurrency. Pass `--deploy-config cosyvoice3.yaml` to retain the previous configuration, or `--deploy-config <path>` to select another profile.
+
+Compatibility note: explicitly selecting `cosyvoice3_full_response.yaml` or `cosyvoice3_packed_streaming.yaml` now enables packed Flow and batched HiFT on non-Hopper GPUs with supported FA2, where these optimizations previously fell back to stock Flow. This changes memory use and numerical behavior. FA2 serving was validated on a 96 GB RTX PRO 6000 Blackwell and a 32 GiB Ada instance, with Stage 0 using `model_runner: v1` in both cases. Other configurations, including 16/24 GiB cards, need separate validation. If the optimized profile causes memory pressure, pass `--deploy-config cosyvoice3.yaml` to use the generic profile. Pinning `COSYVOICE3_PACKED_ATTENTION_BACKEND` selects an attention backend; it does not reduce the profile's memory requirements.
 
 Pass `--no-async-chunk` (or `NO_ASYNC_CHUNK=1 ./cosyvoice3/run_server.sh`) for the legacy synchronous path; use `--deploy-config cosyvoice3.yaml` alongside it when selecting that path on H200.
 
@@ -172,7 +208,11 @@ export COSYVOICE3_BATCH_FLOW=1
 vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remote-code
 ```
 
-Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
+With TensorRT and batched flow enabled, a stage configured for multiple requests builds and caches one dual-profile estimator engine. Profile 0 preserves the legacy single-request CFG batch 2 path up to the full 3000-frame estimator limit. Profile 1 covers CFG batches from 4 up to twice the smaller of the configured stage-1 `max_num_seqs` and eight, with a 1024-frame limit to bound TensorRT activation memory. Groups outside these bounds run as serial CFG2 pairs through profile 0 within its 3000-frame limit. The engine cache key includes the TensorRT/GPU, batch-profile version, and batched-frame limit, so the build cost is not paid on every launch. If the dual-profile engine cannot be built at all, vLLM-Omni keeps the Torch estimator rather than installing a partial TensorRT path.
+
+This option enables TensorRT execution for batched CFG inputs; it does not guarantee an end-to-end throughput improvement. Actual batch sizes depend on the streaming groups: requests with different reference token or feature shapes are grouped separately, so mixed-reference workloads may expose little batching opportunity.
+
+Batching preserves output lengths and streaming cache alignment, but the different GEMM/TensorRT tactic shapes can produce small numerical differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
 ### Ascend Stage-1 graph regions
 

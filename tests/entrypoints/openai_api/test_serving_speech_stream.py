@@ -4,7 +4,9 @@
 import asyncio
 import base64
 import json
+import math
 import threading
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -688,12 +690,68 @@ class TestStreamingSpeechWebSocket:
             async def send_bytes(self, _data):
                 await self._write()
 
+            async def close(self):
+                await self._write()
+
         probe = ProbeWebSocket()
         websocket = streaming_speech_module._SerializedWebSocket(probe)
 
-        await asyncio.gather(websocket.send_json({"type": "error"}), websocket.send_bytes(b"audio"))
+        await asyncio.gather(websocket.send_json({"type": "error"}), websocket.send_bytes(b"audio"), websocket.close())
 
         assert probe.max_active_writes == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "operation, args",
+        [("send_json", ({"type": "probe"},)), ("send_bytes", (b"audio",)), ("close", ())],
+    )
+    @pytest.mark.parametrize("blocked_on", ["transport", "send_lock"])
+    @pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
+    async def test_websocket_writes_are_bounded_and_release_lock(
+        self, mocker, monkeypatch, operation, args, blocked_on, cancel
+    ):
+        monkeypatch.setattr(streaming_speech_module, "_SEND_TIMEOUT_SECONDS", 0.03)
+        write_started = asyncio.Event()
+        write_stopped = asyncio.Event()
+
+        async def blocked_write(*_args):
+            write_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                write_stopped.set()
+
+        raw_websocket = mocker.Mock(spec=WebSocket)
+        raw_websocket.send_json = mocker.AsyncMock()
+        write = mocker.AsyncMock(side_effect=blocked_write)
+        setattr(raw_websocket, operation, write)
+        websocket = streaming_speech_module._SerializedWebSocket(raw_websocket)
+        is_lock_held = blocked_on == "send_lock"
+        if is_lock_held:
+            await websocket._send_lock.acquire()
+        send = asyncio.create_task(getattr(websocket, operation)(*args))
+        try:
+            if not is_lock_held:
+                await asyncio.wait_for(write_started.wait(), timeout=3)
+            if cancel:
+                await asyncio.sleep(0)
+                send.cancel()
+            done, _ = await asyncio.wait({send}, timeout=1)
+            assert send in done
+            with pytest.raises(asyncio.CancelledError if cancel else TimeoutError):
+                await send
+            if is_lock_held:
+                write.assert_not_awaited()
+            else:
+                write.assert_awaited_once_with(*args)
+                assert write_stopped.is_set()
+        finally:
+            send.cancel()
+            await asyncio.gather(send, return_exceptions=True)
+            if is_lock_held:
+                websocket._send_lock.release()
+        raw_websocket.send_json.side_effect = None
+        await asyncio.wait_for(websocket.send_json({"type": "probe"}), timeout=3)
 
     @pytest.mark.parametrize("language", (None, "Auto", "French"))
     def test_commitment_mode_requires_chinese_or_english(self, language, mocker: MockerFixture):
@@ -1893,6 +1951,106 @@ class TestStreamingSpeechWebSocket:
         speech_service.engine_client.abort.assert_awaited_once_with("req-abort")
         assert websocket.send_json.await_count == 2
 
+    @pytest.mark.parametrize(("configure_session"), [True, False])
+    def test_ping_echoes_pong_response(self, mocker: MockerFixture, configure_session):
+        # Server should respond to ping message despite the state of the session config
+        app, _ = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                if configure_session:
+                    ws.send_json(
+                        {
+                            "type": "session.config",
+                            "voice": "Vivian",
+                            "stream_audio": True,
+                            "response_format": "pcm",
+                        }
+                    )
+
+                ws.send_json({"type": "session.ping"})
+                pong_response = ws.receive_json()
+                assert pong_response == {"type": "session.pong"}
+
+    @pytest.mark.parametrize(
+        ("delay", "expected_response", "extends_timeout"),
+        [
+            (0.2, {"type": "session.pong"}, True),
+            (0.75, {"type": "session.pong"}, True),
+            (1.5, {"type": "error", "message": "Idle timeout: no message received"}, False),
+        ],
+    )
+    def test_session_ping_extends_idle_timeout(self, mocker: MockerFixture, delay, expected_response, extends_timeout):
+        # Reduce length of idle_timeout for the purposes of this test
+        # to avoid long waits to simulate the scenarios where:
+        # 1. A user issues a ping request before the idle timeout
+        # 2. Ping request is issued just as the idle timeout is about to expire
+        # 3. User waits too long to issue the ping and the timeout message appears
+        idle_timeout = 1.00
+        app, _ = _build_test_app(mocker=mocker, idle_timeout=idle_timeout)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "stream_audio": True,
+                        "response_format": "pcm",
+                    }
+                )
+                t1 = time.monotonic()
+
+                time.sleep(delay)
+                ws.send_json({"type": "session.ping"})
+                t2 = time.monotonic()
+                response = ws.receive_json()
+                assert response == expected_response
+
+                if extends_timeout:
+                    response = ws.receive_json()
+                    t3 = time.monotonic()
+
+                    assert t3 - t1 > idle_timeout
+                    assert math.isclose(t3 - t2, idle_timeout, rel_tol=0.01)
+
+    def test_generation_unaffected_by_ping(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "session.ping"})
+
+                pong = ws.receive_json()
+                assert pong["type"] == "session.pong"
+
+                ws.send_json({"type": "input.done"})
+
+                start = ws.receive_json()
+                assert start["type"] == "audio.start"
+                assert start["sentence_index"] == 0
+                assert start["sentence_text"] == "Hello world."
+                assert start["format"] == "wav"
+
+                audio = ws.receive_bytes()
+                assert audio.startswith(b"RIFF")
+
+                done = ws.receive_json()
+                assert done == {
+                    "type": "audio.done",
+                    "utterance_index": 0,
+                    "sentence_index": 0,
+                    "total_bytes": len(audio),
+                    "error": False,
+                }
+
+                session_done = ws.receive_json()
+                assert session_done == {"type": "session.done", "utterance_index": 0, "total_sentences": 1}
+
+        assert speech_service._generate_audio_bytes.await_count == 1
+
 
 class TestWebSocketSentenceSplitting:
     def test_sentence_granularity_emits_one_request_per_sentence(self, mocker: MockerFixture):
@@ -2040,7 +2198,16 @@ class TestWebSocketSentenceSplitting:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian", "seed": 42, "watermarking": False})
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "seed": 42,
+                        "watermarking": False,
+                        "temperature": 0.7,
+                        "repetition_penalty": 1.1,
+                    }
+                )
                 ws.send_json({"type": "input.text", "text": "Hello."})
                 ws.send_json({"type": "input.done"})
                 ws.receive_json()
@@ -2051,6 +2218,8 @@ class TestWebSocketSentenceSplitting:
         speech_request = speech_service._generate_audio_bytes.await_args_list[0].args[0]
         assert speech_request.seed == 42
         assert speech_request.watermarking is False
+        assert speech_request.temperature == 0.7
+        assert speech_request.repetition_penalty == 1.1
 
 
 def _qwen3_sample_rate_check(request: OpenAICreateSpeechRequest) -> str | None:
@@ -2066,7 +2235,12 @@ class TestSessionConfigRestParameters:
         rest_fields = set(OpenAICreateSpeechRequest.model_fields)
         session_fields = set(StreamingSpeechSessionConfig.model_fields)
         assert rest_fields - session_fields == {"input", "stream", "stream_format"}
-        assert session_fields - rest_fields == {"text_input_mode", "split_granularity", "stream_audio"}
+        assert session_fields - rest_fields == {
+            "text_input_mode",
+            "model_input_mode",
+            "split_granularity",
+            "stream_audio",
+        }
 
     def test_every_shared_field_is_forwarded(self):
         config = StreamingSpeechSessionConfig()

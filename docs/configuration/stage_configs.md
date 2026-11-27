@@ -37,6 +37,7 @@ Common `StagePipelineConfig` fields include:
 | `final_output` / `final_output_type` | Whether the stage produces a user-visible output and its modality. |
 | `owns_tokenizer` | Whether this stage owns the pipeline tokenizer. |
 | `model_arch`, `hf_config_name` | Stage-specific model architecture and nested HF config selector. |
+| `scheduler_window_policy` | Optional dotted class path implementing `SchedulerWindowPolicy`. The scheduler creates one instance for this stage to handle window admission, appends and request lifecycle events. Defaults to `None`; the MiniCPM-o duplex Thinker stage supplies a policy. |
 | `engine_output_type` | Canonical runtime output type: `text`, `image`, `audio`, `latent`, or `token_ids`. |
 | `custom_process_input_func` | Processor applied to this stage's incoming payload. |
 | `custom_process_next_stage_input_func` | Processor used for full-payload handoff to the next stage. |
@@ -163,8 +164,11 @@ Placement selects an eligible group by its highest reserved-to-capacity ratio,
 then its total reserved count, with round-robin tie-breaking. Sessions keep
 their group across turns, cancellation, epochs and reconnects. Idle sessions
 hold their slots, and closing sessions release them after cleanup completes.
-When no group has capacity, opening a session fails with the retryable
-`resource_exhausted` error containing `replica_capacity_exhausted`.
+If a complete group is still live but session capacity is exhausted, opening
+a session returns the retryable `resource_exhausted` error. If replica failures leave this frontend with no
+complete group, opening a session returns `replica_unavailable`. A frontend
+that starts in this state logs a warning and skips duplex warmup. With multiple
+frontends, the client can reconnect to try another frontend.
 
 `least_sessions` supports replicas attached through distributed runtimes,
 including multiple runtimes serving the same stage across hosts. Declare the
@@ -324,16 +328,22 @@ model or deployment on a platform.
 
 Profiles that still resolve to V1 are unavailable with this version. These
 include Qwen3-TTS's and Qwen3-Omni's MUSA overrides, Fish-Omni's DAC stage,
-PersonaPlex's Talker, VibeVoice, YuE2, and the LFM3-Omni profiles. Selecting
+PersonaPlex's Talker, VibeVoice, and the LFM3-Omni profiles. Selecting
 `v2` manually does not establish support for those paths.
-YuE2's audio synthesis still depends on V1 model sampling hooks; its two
-offline audio export tests are not applicable to the V2 runtime.
 The complete PersonaPlex workflow is also unavailable: its Talker still
 requires V1, although its Code2Wav stage has V2 components.
 The Qwen3-TTS and Qwen3-Omni XPU profiles select V2; final-release XPU
 hardware validation remains pending. Retained V1 profiles identify unavailable
 workflows and preserve explicit configuration errors. They do not provide a V1
 fallback.
+
+YuE2's `yue2.yaml` uses the shared V2 AR runner with a model-owned sampler and
+model-state lifecycle hooks. The sampler preserves phase-specific sampling and
+paired CFG; the hooks release AR slots while NAR/VAE jobs complete and deliver audio by
+request ID. Automatic ABC transitions reset the same request's phase state.
+The profile requires one GPU, synchronous scheduling, and disabled prefix
+caching and external KV transfer. See the [YuE2 recipe](gh-file:recipes/m-a-p/YuE2-3B.md).
+
 Drama 3 / Fish-Omni serving and both LFM3-Omni speech and text-only profiles
 are unavailable. Their retired serving E2E tests covered speech generation,
 voice cloning, streaming, concurrency and request validation across those
@@ -740,7 +750,10 @@ Its inputs are token IDs, embeddings, previous hidden states and per-row
 conditioning; it returns updated embeddings and prediction codes. Models may
 supply `mtp_sampling_params` and `get_mtp_seed(sampling_params)` for model-local explicit seeds, and declare
 `mtp_accepts_per_row_generators`, `mtp_accepts_req_infos`, or `mtp_sample_uniforms`
-(with `mtp_sample_steps` and `mtp_sample_vocab_size`) as needed. Qwen3-TTS retains
+(with `mtp_sample_steps` and `mtp_sample_vocab_size`) as needed. A model whose
+buffered noise must preserve eager per-step RNG call shapes can also declare
+`mtp_sample_uniforms_preserve_eager_stream`; graph-padding rows then use a
+constant and do not advance any generator. Qwen3-TTS retains
 its existing `talker_mtp` entry point for V1.
 
 ### Selecting one or two Qwen3-TTS stages

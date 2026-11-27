@@ -13,6 +13,7 @@ from weakref import WeakKeyDictionary
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.minicpmo_4_5.config import stage_connector_extra
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 
 logger = init_logger(__name__)
@@ -151,7 +152,7 @@ def _graphable_estimator_step(
     # while the buffers kept across steps split K/V on a leading axis: pack on
     # the way in and unpack the result back into ``att_out``, so the graph's
     # output placeholder stays on the split layout the next step expects.
-    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
         _pack_att_cache,
         _packed_att_buffer,
         _unpack_att_cache,
@@ -359,7 +360,7 @@ def _patched_build_backend(self) -> None:
     if self.backend is not None:
         return
 
-    extra = self._extra_config()
+    extra = stage_connector_extra(self.vllm_config)
     if bool(extra.get(_BF16_ATTENTION_CACHE_KEY, False)):
         raise ValueError(
             "MiniCPM-o Code2Wav code2wav_bfloat16_attention_cache is "
@@ -367,6 +368,12 @@ def _patched_build_backend(self) -> None:
         )
 
     config = _graph_config(self)
+    if "code2wav_fused_qkv_norm" in config:
+        logger.warning_once(
+            "MiniCPM-o NPU additional_config.code2wav_fused_qkv_norm has been removed and is ignored, "
+            "including false. Eligible FP32 inputs automatically use fused QKV normalization; "
+            "unsupported inputs use the native fallback. Remove the stale key from your deployment or overlay YAML."
+        )
     cfm_config = getattr(self, "_cfm_graph_config", {})
     max_graphs = max(0, int(cast(int | str, config.get(_MAX_GRAPHS_KEY, cfm_config.get("max_graphs", 32)))))
     graph_enabled = max_graphs > 0 and _config_bool(config.get(_ENABLE_KEY), bool(cfm_config.get("enabled", False)))
@@ -376,7 +383,11 @@ def _patched_build_backend(self) -> None:
     # Preserve the NPU stage switches while routing enabled CFM work through
     # the shared Whole-Euler/step wrappers (including masks and shared arenas).
     if hasattr(self, "_cfm_graph_config"):
-        self._cfm_graph_config = {**self._cfm_graph_config, "enabled": graph_enabled, "max_graphs": max_graphs}
+        self._cfm_graph_config = {
+            **self._cfm_graph_config,
+            "enabled": graph_enabled,
+            "max_graphs": max_graphs,
+        }
     needs_runtime = graph_enabled or any(
         getattr(self, name, {}).get("enabled", False)
         for name in ("_hift_graph_config", "_chunk_encoder_graph_config", "_encoder_graph_config")
@@ -436,7 +447,7 @@ def apply_minicpmo_4_5_code2wav_patch() -> None:
     if _PATCHED:
         return
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
         BatchedToken2Wav,
     )
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (

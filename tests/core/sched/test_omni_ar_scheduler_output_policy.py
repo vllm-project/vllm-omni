@@ -41,3 +41,27 @@ def test_async_chunk_intermediate_stage_emits_only_control_outputs(
         )
         is expected
     )
+
+
+@pytest.mark.parametrize(
+    ("role", "stage_id", "expected"),
+    [
+        ("none", 0, True),  # orchestrator-fed Stage-0 ASR keeps emitting tokens
+        ("none", 1, True),  # orchestrator-fed intermediate stage keeps emitting
+        ("sender", 2, False),  # connector-fed Talker suppresses per-step IPC
+    ],
+)
+def test_async_chunk_orchestrator_only_stage_still_emits_tokens(
+    role: str,
+    stage_id: int,
+    expected: bool,
+) -> None:
+    model_config = SimpleNamespace(
+        stage_id=stage_id,
+        async_chunk=True,
+        final_output=False,
+        use_v2_model_runner=True,
+        stage_connector_config={"extra": {"role": role}},
+    )
+
+    assert _should_emit_engine_output(model_config, stopped=False, has_control=False) is expected

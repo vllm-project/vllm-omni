@@ -8,6 +8,7 @@ import pytest
 import requests
 
 from tests.examples.offline_inference import test_image_to_video as example
+from tests.helpers.media import generate_synthetic_video
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -29,7 +30,7 @@ def image_download(monkeypatch, tmp_path):
     get = Mock()
     sleep = Mock()
     monkeypatch.setattr(example.requests, "get", get)
-    monkeypatch.setattr(example.time, "sleep", sleep)
+    monkeypatch.setattr(example, "time", Mock(sleep=sleep))
     return get, sleep
 
 
@@ -114,7 +115,8 @@ def test_cli_examples_share_download_and_get_separate_copies(tmp_path, image_dow
     response.__exit__ = Mock(return_value=False)
     get.return_value = response
     runner = Mock(output_root=tmp_path / "runs")
-    runner.run.return_value = Mock(assets=[])
+    video = generate_synthetic_video(32, 32, 1, cache_dir=tmp_path)
+    runner.run.return_value = Mock(assets=[video["file_path"]])
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()
     snippets = [snippet for snippet in example.README_SNIPPETS if not snippet.skip[0]][:2]
