@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from Helios (https://github.com/BestWishYsh/Helios)
 
 import math
@@ -19,6 +19,17 @@ class HeliosSchedulerOutput(BaseOutput):
     model_outputs: torch.FloatTensor | None = None
     last_sample: torch.FloatTensor | None = None
     this_order: int | None = None
+
+
+def _solve_rho_system(matrix: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Use an explicit CPU solve for small UniPC systems on Ascend NPU."""
+    if matrix.device.type != "npu":
+        return torch.linalg.solve(matrix, rhs)
+
+    # Avoid torch_npu's implicit CPU fallback. The coefficients still have
+    # to be transferred to the host before solving.
+    solution = torch.linalg.solve(matrix.detach().cpu().double(), rhs.detach().cpu().double())
+    return solution.to(device=matrix.device, dtype=matrix.dtype)
 
 
 class HeliosScheduler(SchedulerMixin, ConfigMixin):
@@ -444,7 +455,7 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
             if order == 2:
                 rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
             else:
-                rhos_p = torch.linalg.solve(R[:-1, :-1], b[:-1]).to(device).to(x.dtype)
+                rhos_p = _solve_rho_system(R[:-1, :-1], b[:-1]).to(x.dtype)
         else:
             D1s = None
 
@@ -561,7 +572,7 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
         if order == 1:
             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
         else:
-            rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
+            rhos_c = _solve_rho_system(R, b).to(x.dtype)
 
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
