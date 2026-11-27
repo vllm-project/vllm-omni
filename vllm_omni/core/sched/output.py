@@ -7,6 +7,7 @@ from typing import Any
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
+from vllm_omni.core.sched.window_policy import WindowOperation
 from vllm_omni.engine import AdditionalInformationPayload, PayloadSenderInfo
 
 
@@ -32,6 +33,9 @@ class OmniNewRequestData(NewRequestData):
     additional_information: AdditionalInformationPayload | dict[str, object] | None = None
     model_intermediate_buffer: dict[str, object] | None = None
     resumable: bool = False
+    # Typed per-request opt-in for last-layer hidden-state return
+    # (RL teacher rollouts); read by the MRv2 runner's add_requests.
+    return_hidden_states: bool = False
     segment_generation: int | None = None
 
     @classmethod
@@ -48,6 +52,7 @@ class OmniNewRequestData(NewRequestData):
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
+            return_hidden_states=bool(getattr(request, "return_hidden_states", False)),
             segment_generation=getattr(request, "_omni_segment_generation", None),
         )
 
@@ -84,6 +89,7 @@ class OmniNewRequestData(NewRequestData):
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
+            return_hidden_states=bool(getattr(request, "return_hidden_states", False)),
             segment_generation=getattr(request, "_omni_segment_generation", None),
         )
 
@@ -162,3 +168,5 @@ class OmniSchedulerOutput(SchedulerOutput):
     # must be dropped instead of flushed. Empty unless the scheduler recorded
     # one of those terminal statuses.
     discarded_req_ids: set[str] = field(default_factory=set)
+    #: Apply in list order before worker cleanup, including steps with no scheduled tokens.
+    duplex_carry_ops: list[WindowOperation] = field(default_factory=list)

@@ -461,7 +461,7 @@ def _get_workspace(tensors: tuple[torch.Tensor, ...], group_name: str, world_siz
     global _WORKSPACE, _WORKSPACE_GROUP
     group = _resolve_group(group_name, world_size)
     if tensors[0].device.type != "npu":
-        raise ValueError("NPU ulysses_a2a_permute requires NPU tensors")
+        raise ValueError("NPU ulysses_a2a_backend='copy_engine' requires NPU tensors")
     if _WORKSPACE_GROUP is not None and group is not _WORKSPACE_GROUP:
         raise RuntimeError(
             "NPU symmetric memory Ulysses supports a single process group; clear it before reinitialization"

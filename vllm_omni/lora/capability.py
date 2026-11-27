@@ -571,12 +571,18 @@ AR_MERGED_LORA_REGISTRY: dict[str, MergedLoRARegistryEntry] = {
     "Audio8TTSCodecDecoder": _not_capable(_NON_LLM_STAGE),
     "Audio8TTSSlowARForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "AuraQwen3VLForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
+    "AuraQwen3_5ForConditionalGeneration": _not_capable(
+        "inherits upstream SupportsLoRA and packed_modules_mapping; "
+        "the AURA duplex stage does not implement SupportsMergedLoRA"
+    ),
     "BailingMM2NativeForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "BailingMoeV3AudioForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "BailingTalker2": _not_capable(_PENDING_AR_MAPPING),
     "BreezeCode2Wav": _not_capable(_NON_LLM_STAGE),
     "BreezeForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "ChatterboxForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
+    "Confucius4TTSS2ADecoder": _not_capable(_NON_LLM_STAGE),
+    "Confucius4TTSTalkerForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "CosyVoice3Model": _not_capable(_PENDING_AR_MAPPING),
     "CovoAudioCode2WavModel": _not_capable(_NON_LLM_STAGE),
     "CovoAudioForCausalLM": _not_capable(_PENDING_AR_MAPPING),
@@ -600,6 +606,9 @@ AR_MERGED_LORA_REGISTRY: dict[str, MergedLoRARegistryEntry] = {
     "IndexTTS25TalkerForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "IndexTTS2S2MelDecoder": _not_capable(_NON_LLM_STAGE),
     "IndexTTS2TalkerForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
+    "KimiAudioARStage": _not_capable(_PENDING_AR_MAPPING),
+    "KimiAudioDecoder": _not_capable(_NON_LLM_STAGE),
+    "KimiAudioForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "LayaDecisionModel": _not_capable(_NON_LLM_STAGE),
     "Lfm3AudioForConditionalGeneration": _not_capable(_PENDING_AR_MAPPING),
     "Lfm3OmniCode2Wav": _not_capable(_NON_LLM_STAGE),

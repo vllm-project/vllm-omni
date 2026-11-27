@@ -74,6 +74,7 @@ forbidden_prefixes = (
     "vllm_omni.model_executor.models.minicpmo_4_5.duplex",
     "vllm_omni.model_executor.models.nemotron_voicechat.duplex",
     "vllm_omni.model_executor.models.personaplex.duplex",
+    "vllm_omni.model_executor.models.sage_interaction.duplex",
 )
 loaded = sorted(
     name
@@ -114,6 +115,7 @@ forbidden_prefixes = (
     "vllm_omni.model_executor.models.minicpmo_4_5.duplex",
     "vllm_omni.model_executor.models.nemotron_voicechat.duplex",
     "vllm_omni.model_executor.models.personaplex.duplex",
+    "vllm_omni.model_executor.models.sage_interaction.duplex",
     "vllm_omni.model_executor.models.response_judge",
     "vllm_omni.engine.duplex.response_judge",
 )

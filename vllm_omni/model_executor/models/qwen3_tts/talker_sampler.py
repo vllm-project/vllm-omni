@@ -40,7 +40,9 @@ MAX_TOP_K = 64
 MAX_VOCAB = 8192
 
 
-@triton.jit
+# counts[1] (num_rejected) is 16-byte aligned only when the batch is a multiple
+# of 4. Specializing on that would compile the kernel again while serving.
+@triton.jit(do_not_specialize_on_alignment=["num_rejected_ptr"])
 def _talker_sample_kernel(
     logits_ptr,
     logits_stride,
