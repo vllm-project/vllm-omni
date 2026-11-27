@@ -83,7 +83,7 @@ VLLM_OMNI_ENABLE_RUN_ENDPOINT=1 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice 
   --omni
 ```
 
-When run in this way, the caller sends the stage 0 call to the talker's server, then sends its response to code2wav's server. These servers only serve `/v1/run`, `/health`, and `/metrics`; other routes return 400.
+When run in this way, the caller sends the stage 0 call to the talker's server, then sends its response to code2wav's server. These servers only serve `/v1/run`, `/health`, and `/metrics`; other http routes return 400, and websocket routes are removed.
 
 ## `POST /v1/run`
 
