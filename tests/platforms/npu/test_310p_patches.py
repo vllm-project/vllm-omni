@@ -772,3 +772,57 @@ def test_qwen3_tts_code2wav_npu_patch_preserves_stage_dtype(
     assert model.load_weights(iter(())) == {"loaded"}
     assert all(parameter.dtype is dtype for parameter in model.decoder.parameters())
     assert model.decoder.cache_precompute_calls == 1
+
+
+def test_is_310p_helper_falls_back_to_device_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: the helper must find is_310p even when vllm_ascend.utils
+    does not export it (vllm-ascend 0.30.0rc2 ships it only in
+    vllm_ascend.device.device_config). A silent False here skips every 310P
+    model patch on the worker path.
+    """
+    import vllm_ascend.device.device_config as device_config
+
+    try:
+        import vllm_ascend.utils as ascend_utils
+    except ImportError:
+        ascend_utils = None
+
+    registry = _load_source_module(
+        "vllm_omni_test_310p_is310p", _repo_root() / "vllm_omni" / "platforms" / "npu" / "_310p" / "__init__.py"
+    )
+
+    # Case 1: vllm_ascend.utils has the symbol -> it wins.
+    if ascend_utils is not None:
+        monkeypatch.setattr(ascend_utils, "is_310p", lambda: True, raising=False)
+        assert registry.is_310p() is True
+
+    # Case 2: vllm_ascend.utils lacks it (the 0.30.0rc2 shape) -> fall back to
+    # device_config.is_310p instead of returning False.
+    if ascend_utils is not None:
+        monkeypatch.delattr(ascend_utils, "is_310p", raising=False)
+    monkeypatch.setattr(device_config, "is_310p", lambda: True, raising=False)
+    assert registry.is_310p() is True
+
+    monkeypatch.setattr(device_config, "is_310p", lambda: False, raising=False)
+    assert registry.is_310p() is False
+
+
+def test_worker_base_applies_model_patches_on_310p(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: the worker base must install the 310P per-model patches
+    (Qwen3-TTS talker/code2wav/builder specializations) before the model is
+    instantiated. Without this gate the AR worker path loads the base
+    builder — stage-0 Qwen3-TTS silently ran the CPU mel front-end.
+    """
+    calls: list[object] = []
+    fake_patch = types.ModuleType("vllm_omni.platforms.npu._310p.patch")
+    fake_patch.apply_model_patches = lambda model_config: calls.append(model_config)
+    fake_pkg = types.ModuleType("vllm_omni.platforms.npu._310p")
+    fake_pkg.patch = fake_patch
+    monkeypatch.setitem(sys.modules, "vllm_omni.platforms.npu._310p", fake_pkg)
+    monkeypatch.setitem(sys.modules, "vllm_omni.platforms.npu._310p.patch", fake_patch)
+
+    source = (_repo_root() / "vllm_omni" / "platforms" / "npu" / "worker" / "base.py").read_text()
+    assert "apply_model_patches" in source, "worker base lost the 310P patch gate"
+
+    # And the gate is conditioned on is_310p (defined at module scope in base.py)
+    assert "if is_310p():" in source

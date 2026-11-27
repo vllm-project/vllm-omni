@@ -25,6 +25,17 @@ class OmniNPUWorkerBase(NPUWorker):
 
         self.use_v2_model_runner = True
 
+        # Apply 310P per-model patches (Qwen3-TTS talker/code2wav/builder
+        # specializations) before the model is instantiated. Without this
+        # gate the model-arch-specialized classes are never installed: the
+        # runner paths (AR and generation) load the base implementations, so
+        # e.g. stage-0 Qwen3-TTS on 310P silently runs the base builder with
+        # its CPU mel front-end instead of the NPU-native one.
+        if is_310p():
+            from vllm_omni.platforms.npu._310p.patch import apply_model_patches
+
+            apply_model_patches(self.vllm_config.model_config)
+
         # Replace vllm-ascend's profiler with OmniProfiler
         profiler_config = self.vllm_config.profiler_config
         if profiler_config and profiler_config.profiler == "torch":
